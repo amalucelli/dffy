@@ -460,7 +460,8 @@ fn doctor(ctx: &Ctx, dir: Option<&Path>, json: bool) -> Result<ExitCode, Error> 
     } else {
         let mut c = Canvas::default();
         let failed = facts.render(&mut c);
-        write_stdout(ctx, &c)?;
+        // Its exit code is always success; the checks decide doctor's.
+        let _ = write_stdout(ctx, &c)?;
         failed
     };
     Ok(if failed {

@@ -3,11 +3,11 @@
 use std::sync::Arc;
 
 use dffy_core::diff::Options;
-use dffy_core::diff::{Whitespace, emphasize};
+use dffy_core::diff::{Emphasis, Whitespace, emphasize};
 use dffy_core::git::{FileChange, FileDiff, Repo};
 
 use crate::config::{Config, Indicators};
-use crate::print::FileSyntax;
+use crate::print::{self, FileSyntax, HunkSyntax};
 use crate::term::{Input, Key, Mods};
 use crate::theme::Theme;
 use crate::tui::worker::{Job, Pool, Settings};
@@ -53,18 +53,7 @@ impl Frame {
         highlight: bool,
         config: &Config,
     ) -> Self {
-        let syntax = highlight.then(|| FileSyntax::new(&diff, None, false));
-        let hunks: Vec<_> = diff
-            .hunks
-            .iter()
-            .map(|h| match &syntax {
-                Some(s) => {
-                    let spans = s.hunk(&diff, h);
-                    (spans.emphasis(&diff, h), Some(spans))
-                }
-                None => (emphasize(&diff.old, &diff.new, h), None),
-            })
-            .collect();
+        let hunks = emphases(&diff, highlight);
         let mut app = App::new(
             config,
             Theme::default_theme(),
@@ -92,6 +81,18 @@ impl Frame {
             }));
         }
         Self { app }
+    }
+
+    /// The work the viewer's workers do to show `diff`, all on this thread:
+    /// the file's view, then every hunk's emphasis (with `highlight`, from
+    /// a parse of both sides) and, with `structural`, the syntax diff.
+    /// Returns the number of hunks, to keep the work observable.
+    #[must_use]
+    pub fn prepare(diff: FileDiff, highlight: bool, structural: bool) -> usize {
+        let hunks = emphases(&diff, highlight);
+        std::hint::black_box(structural.then(|| print::structural_diff(&diff, None)));
+        std::hint::black_box(Loaded::new(diff, Whitespace::Exact, highlight));
+        hunks.len()
     }
 
     /// A `width` × `height` viewer of every change in `changes` with the
@@ -255,4 +256,20 @@ impl Frame {
     pub fn invalidate(&mut self) {
         self.app.invalidate();
     }
+}
+
+/// Every hunk's emphasis and, with `highlight`, its syntax spans, as the
+/// workers compute them.
+fn emphases(diff: &FileDiff, highlight: bool) -> Vec<(Vec<Emphasis>, Option<HunkSyntax>)> {
+    let syntax = highlight.then(|| FileSyntax::new(diff, None, false));
+    diff.hunks
+        .iter()
+        .map(|h| match &syntax {
+            Some(s) => {
+                let spans = s.hunk(diff, h);
+                (spans.emphasis(diff, h), Some(spans))
+            }
+            None => (emphasize(&diff.old, &diff.new, h), None),
+        })
+        .collect()
 }

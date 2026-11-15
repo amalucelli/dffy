@@ -1,0 +1,18 @@
+---
+source: crates/dffy/src/tui/app.rs
+expression: "role_markup(&mut app, &roles)"
+---
+ commit <commit-header>eb34f50</><dim> · </>Merge branch side
+<commit-header>commit eb34f50ad38c77bb28f198cc66e0cdcf7c63e3e3</>
+<dim>Merge: 1fcf726 ae9f98b</>
+<dim>Author: Ada Lovelace <ada@example.com></>
+<dim>Date:   Sat Mar 2 09:30:00 2024 +0100</>
+
+    Merge branch side
+
+<dim>1 file </><added>+2</> <removed>-0</>
+  U notes.txt<added> +2</>
+
+
+
+»  commit 1/1  1 file  <dim>unified</>                                 <dim>/ search · tab tree · space commands</>

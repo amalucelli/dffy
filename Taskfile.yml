@@ -75,6 +75,31 @@ tasks:
     cmds:
       - cargo bench --workspace
 
+  bench:baseline:
+    desc: Build the benchmark executables into DIR as the baseline for bench:ab, e.g. task bench:baseline DIR=~/.cache/dffy-bench/baseline
+    requires:
+      vars: [DIR]
+    cmds:
+      - cargo xtask bench-baseline "{{.DIR}}"
+
+  bench:noise:
+    desc: Measure a baseline's noise into BASE/noise.tsv by comparing it with itself; ROUNDS (default 5) and ONLY (groups, comma-separated) narrow it
+    requires:
+      vars: [BASE, DFFY_BENCH_REPO]
+    env:
+      DFFY_BENCH_REPO: "{{.DFFY_BENCH_REPO}}"
+    cmds:
+      - cargo xtask bench-noise "{{.BASE}}" --rounds {{.ROUNDS | default 5}} {{if .ONLY}}--only {{.ONLY}}{{end}}
+
+  bench:ab:
+    desc: Gate the current tree against a baseline from bench:baseline, e.g. task bench:ab BASE=~/.cache/dffy-bench/baseline; ROUNDS (default 5) and ONLY (groups, comma-separated) narrow it
+    requires:
+      vars: [BASE, DFFY_BENCH_REPO]
+    env:
+      DFFY_BENCH_REPO: "{{.DFFY_BENCH_REPO}}"
+    cmds:
+      - cargo xtask bench-ab "{{.BASE}}" --rounds {{.ROUNDS | default 5}} {{if .ONLY}}--only {{.ONLY}}{{end}}
+
   build:
     desc: Build the release binary
     cmds:

@@ -35,20 +35,18 @@ fn render_hunks(old: &Text, new: &Text, hunks: &[dffy_core::diff::Hunk], layout:
             .iter()
             .map(|l| {
                 let (kind, text) = match l.kind {
-                    dffy_core::diff::LineKind::Context => (Kind::Context, new.line(l.new)),
-                    dffy_core::diff::LineKind::Removed => (Kind::Removed, old.line(l.old)),
-                    dffy_core::diff::LineKind::Added => (Kind::Added, new.line(l.new)),
+                    LineKind::Context => (Kind::Context, new.line(l.new)),
+                    LineKind::Removed => (Kind::Removed, old.line(l.old)),
+                    LineKind::Added => (Kind::Added, new.line(l.new)),
                 };
                 DiffLine {
-                    kind,
+                    state: LineState::of(l),
                     old: (kind != Kind::Added).then_some(l.old + 1),
                     new: (kind != Kind::Removed).then_some(l.new + 1),
                     text: text.strip_suffix(b"\n").unwrap_or(text),
                     emphasis: &l.emphasis,
                     syntax: None,
                     paint: &[],
-                    unchanged: l.unchanged,
-                    modified: l.paired,
                     block_start: l.block_start,
                 }
             })
@@ -111,15 +109,13 @@ fn word_rows(text: &str, paint: &[Paint], width: usize) -> Vec<String> {
         ..layout(false, Some(width + 3), true)
     };
     let line = DiffLine {
-        kind: Kind::Context,
+        state: LineState::Context,
         old: Some(1),
         new: Some(1),
         text: text.as_bytes(),
         emphasis: &[],
         syntax: None,
         paint,
-        unchanged: Unchanged::No,
-        modified: false,
         block_start: false,
     };
     let mut c = Canvas::default();
@@ -136,7 +132,7 @@ fn word_wrap_breaks_between_words_and_keeps_styles() {
         start: 4,
         end: 15,
         syntax: Some(dffy_core::highlight::Syntax::Keyword),
-        attributes: 0,
+        attributes: Attributes::NONE,
     }];
     assert_eq!(
         word_rows("the quick brown fox jumps over", &paint, 12),
@@ -362,27 +358,23 @@ fn highlighted_lines_keep_the_change_in_the_gutter_and_the_emphasis() {
     let context = [run(0, 2, Syntax::Keyword)];
     let lines = [
         DiffLine {
-            kind: Kind::Context,
+            state: LineState::Context,
             old: Some(1),
             new: Some(1),
             text: b"fn f() {",
             emphasis: &[],
             syntax: Some(&context),
             paint: &[],
-            unchanged: Unchanged::No,
-            modified: false,
             block_start: false,
         },
         DiffLine {
-            kind: Kind::Added,
+            state: LineState::Added,
             old: None,
             new: Some(2),
             text: b"let x = 1;",
             emphasis: std::slice::from_ref(&(8..9)),
             syntax: Some(&added),
             paint: &[],
-            unchanged: Unchanged::No,
-            modified: false,
             block_start: false,
         },
     ];
@@ -586,15 +578,13 @@ fn print_mode_stands_separators_for_unchanged_lines() {
 fn traced(layout: Layout, rows: &[(Option<&str>, Option<&str>)]) -> String {
     use std::fmt::Write as _;
     let line = |kind, text: &'static str, n| DiffLine {
-        kind,
+        state: LineState::new(kind, false, Unchanged::No),
         old: (kind == Kind::Removed).then_some(n),
         new: (kind == Kind::Added).then_some(n),
         text: text.as_bytes(),
         emphasis: &[],
         syntax: None,
         paint: &[],
-        unchanged: Unchanged::No,
-        modified: false,
         block_start: false,
     };
     let mut c = Canvas::mapped();
@@ -729,15 +719,13 @@ fn background_tints_cover_the_same_cells_on_both_sides() {
         ..layout(true, Some(41), true)
     };
     let line = |kind, old, new, text: &'static str| DiffLine {
-        kind,
+        state: LineState::new(kind, false, Unchanged::No),
         old,
         new,
         text: text.as_bytes(),
         emphasis: &[],
         syntax: None,
         paint: &[],
-        unchanged: Unchanged::No,
-        modified: false,
         block_start: false,
     };
     let mut c = Canvas::default();

@@ -43,7 +43,7 @@ use crate::daemon::client;
 use crate::keys::{Action as Act, Keys};
 use crate::plugin::{self, Program, Renderers};
 use crate::print;
-use crate::render::{Layout, escape, thousands};
+use crate::render::{Attributes, Layout, escape, thousands};
 use crate::term::{self, Input, Key, Mods, Screen};
 use crate::theme::{self, Role, Style, Theme};
 
@@ -622,7 +622,7 @@ impl App {
 
     /// Whether the layout splits at this width. Split asked for still
     /// renders a hunk unified when its halves would be too thin to read
-    /// ([`Layout::splits`]); split remembered from an earlier run renders
+    /// ([`Layout::arrangement`]); split remembered from an earlier run renders
     /// unified on a phone-sized screen, without forgetting it.
     fn splits(&self) -> bool {
         match self.view {
@@ -1992,7 +1992,7 @@ impl App {
     fn search_step(&mut self, forward: bool, here: bool) {
         let file = self.doc.pos.file;
         let top = Pos {
-            sub: 0,
+            offset: 0,
             ..self.doc.pos
         };
         let marks = self
@@ -2978,7 +2978,7 @@ fn draw_picker(
     }
     for (i, (row, selected)) in rows.iter().enumerate() {
         if let Some(cells) = row.rows().next() {
-            view::paint(grid, 0, top + i, width, cells, theme, 0);
+            view::paint(grid, 0, top + i, width, cells, theme, Attributes::NONE);
         }
         if *selected {
             grid.map_styles(0, top + i, width, |s| theme.selected(s, true));
@@ -5164,7 +5164,10 @@ mod tests {
         app.event(Event::Piped(piped::Item::Commit(Arc::new(piped::Commit {
             id: Some("0123abc".repeat(5) + "01234"),
             subject: "Change two files".to_owned(),
-            lines: vec![(Role::Plain, "    Change two files".into())],
+            lines: vec![(
+                crate::pager::parse::TextKind::CommitMessage,
+                "    Change two files".into(),
+            )],
         }))));
         for path in ["a.rs", "b.rs"] {
             app.event(Event::Enumerated(diff(path).change));
@@ -5543,5 +5546,187 @@ mod tests {
         key(&mut app, 'r');
         assert_eq!(app.programs.len(), 1, "looked up once r asked");
         assert!(!app.doc.rendered, "not on without the program");
+    }
+
+    /// Wrapped, a file left part way down a long row comes back at that
+    /// same screen row of it, not at the row's first.
+    #[test]
+    fn a_place_inside_a_wrapped_row_is_kept_across_files() {
+        let old = (1..=60)
+            .map(|i| format!("line {i}\n"))
+            .collect::<Vec<_>>()
+            .concat();
+        let long = "a line long enough to wrap ".repeat(10);
+        let new = old.replace("line 4\n", &format!("line 4 {long}\n"));
+        let (old, new) = (Text::new(old.into()), Text::new(new.into()));
+        let fd = FileDiff {
+            hunks: hunks(&old, &new, &Options::default()),
+            old,
+            new,
+            ..diff("src/a.rs")
+        };
+        let mut config = Config::default();
+        config.apply_source("wrap = true\n", &mut Vec::new());
+        let mut app = app_of(&config, "working tree", fd, (60, 10));
+        for _ in 0..20 {
+            if app.doc.pos.offset > 0 {
+                break;
+            }
+            key(&mut app, 'j');
+        }
+        assert!(app.doc.pos.offset > 0, "{:?}", app.doc.pos);
+        let (pos, before) = (app.doc.pos, screen(&mut app));
+        key(&mut app, 'j');
+        assert_ne!(app.doc.pos, pos, "not at the bottom");
+        key(&mut app, 'k');
+        key(&mut app, 'f');
+        assert_eq!(app.doc.pos.file, 1);
+        key(&mut app, 'F');
+        assert_eq!(app.doc.pos, pos);
+        let after = screen(&mut app);
+        assert_eq!(after, before);
+        insta::assert_snapshot!("wrapped_place_kept", after);
+    }
+
+    /// Thirty C functions, the 15th and 16th swapped: lines removed and
+    /// added to the line diff, code moved to the syntax diff.
+    fn moved_diff() -> FileDiff {
+        let f = |i: usize| format!("int f{i}(void) {{ return {i}; }}\n");
+        let old: String = (1..=30).map(f).collect();
+        let new: String = (1..=30)
+            .map(|i| match i {
+                15 => f(16),
+                16 => f(15),
+                _ => f(i),
+            })
+            .collect();
+        let (old, new) = (Text::new(old.into()), Text::new(new.into()));
+        FileDiff {
+            hunks: hunks(&old, &new, &Options::default()),
+            old,
+            new,
+            ..diff("src/f.c")
+        }
+    }
+
+    /// `d` between the line diff and the syntax diff keeps the view where
+    /// it was in the file's rows.
+    #[test]
+    fn the_syntax_diff_toggle_keeps_the_place() {
+        let mut app = app_of(&Config::default(), "working tree", moved_diff(), (100, 10));
+        for _ in 0..4 {
+            key(&mut app, 'j');
+        }
+        let lines = screen(&mut app);
+        key(&mut app, 'd');
+        assert!(app.doc.structural);
+        app.draw();
+        for job in app.jobs() {
+            if let Job::Structural {
+                file,
+                version,
+                diff,
+            } = job
+            {
+                app.event(Event::Diffed(Done::Structural {
+                    file,
+                    version,
+                    result: print::structural_diff(&diff, None),
+                    diff,
+                }));
+            }
+        }
+        let syntax = screen(&mut app);
+        assert!(syntax.contains("»│"), "the syntax diff shows:\n{syntax}");
+        insta::assert_snapshot!("syntax_diff_on", syntax);
+        key(&mut app, 'd');
+        let off = screen(&mut app);
+        assert_eq!(off, lines);
+        insta::assert_snapshot!("syntax_diff_off", off);
+    }
+
+    /// The screen with each run of cells in one of `roles`' styles in
+    /// `<role>…</>`.
+    fn role_markup(app: &mut App, roles: &[Role]) -> String {
+        app.draw();
+        let styles: Vec<_> = roles.iter().map(|&r| (app.theme.style(r), r)).collect();
+        let grid = app.screen.shown_grid();
+        (0..grid.height())
+            .map(|y| {
+                let mut line = String::new();
+                let mut current = None;
+                for cell in grid.row(y) {
+                    let role = styles
+                        .iter()
+                        .find(|(style, _)| *style == cell.style())
+                        .map(|&(_, r)| r);
+                    if role != current {
+                        if current.is_some() {
+                            line.push_str("</>");
+                        }
+                        if let Some(r) = role {
+                            line.extend(["<", r.key(), ">"]);
+                        }
+                        current = role;
+                    }
+                    line.push_str(cell.text());
+                }
+                if current.is_some() {
+                    line.push_str("</>");
+                }
+                line.trim_end().to_owned()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// `git show` of a merge in the viewer: the commit's header, metadata
+    /// and message in their colors, then the combined diff's lines colored
+    /// by their prefix columns.
+    #[test]
+    fn a_piped_merge_shows_its_commit_and_combined_diff_in_their_colors() {
+        let merge = include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/git-show-merge.diff"
+        ));
+        let roles = [
+            Role::CommitHeader,
+            Role::Dim,
+            Role::HunkHeader,
+            Role::Added,
+            Role::Removed,
+        ];
+        let mut app = piped_app(merge, 100, 14);
+        // The default theme shares colors between these roles and others
+        // (`warn` is yellow too): underlined, each is told apart.
+        app.theme = Theme::parse(
+            "roles",
+            "commit-header = yellow underline\ndim = dim underline\n\
+             hunk-header = cyan underline\nadded = green underline\nremoved = red underline\n",
+            &mut Vec::new(),
+        );
+        key(&mut app, 't');
+        read_back(&mut app);
+        insta::assert_snapshot!("piped_merge_commit", role_markup(&mut app, &roles));
+        key(&mut app, 'f');
+        read_back(&mut app);
+        insta::assert_snapshot!("piped_merge_combined", role_markup(&mut app, &roles));
+    }
+
+    /// `view = auto` splits from `split-min-width` columns of screen, 140
+    /// by default, and is unified a column short of it.
+    #[test]
+    fn auto_splits_from_the_split_min_width() {
+        let mut app = app(140, 12);
+        assert!(app.doc.layout.split);
+        let split = screen(&mut app);
+        assert!(
+            split.lines().any(|l| l.matches("line 4").count() == 2),
+            "side by side:\n{split}"
+        );
+        insta::assert_snapshot!("auto_at_split_min_width", split);
+        app.resize(139, 12);
+        assert!(!app.doc.layout.split);
+        insta::assert_snapshot!("auto_below_split_min_width", screen(&mut app));
     }
 }

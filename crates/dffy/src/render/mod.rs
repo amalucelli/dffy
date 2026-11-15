@@ -14,7 +14,7 @@ use std::fmt::Write as _;
 use std::io::{self, Write};
 use std::ops::{ControlFlow, Range};
 
-use dffy_core::diff::Unchanged;
+use dffy_core::diff::{Line, LineKind, Text, Unchanged};
 use dffy_core::highlight::Run;
 use unicode_width::UnicodeWidthChar;
 
@@ -368,9 +368,91 @@ pub(crate) enum Kind {
     NoNewline,
 }
 
+/// What a displayed line of a hunk is, as the diff found it. Nothing here
+/// says how it looks: a paired line shows as modified only where the
+/// modified-lines setting asks for that.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub(crate) enum LineState {
+    Context,
+    Removed,
+    Added,
+    /// Paired with an added line as its edited version
+    /// ([`dffy_core::diff::Line::paired`]).
+    RemovedPaired,
+    /// Paired with a removed line as its edited version.
+    AddedPaired,
+    /// The syntax diff found its code among the other side's changes:
+    /// moved, not edited.
+    RemovedMoved,
+    AddedMoved,
+    /// The syntax diff found the same code on the other side in its block:
+    /// only whitespace or line breaks changed.
+    RemovedReformatted,
+    AddedReformatted,
+    /// The `\ No newline at end of file` marker after the line before it.
+    NoNewline,
+}
+
+impl LineState {
+    /// A line of `kind`, `paired` with its edit or not. What the syntax
+    /// diff found `unchanged` outranks the pairing; context lines and the
+    /// marker are never either.
+    pub(crate) fn new(kind: Kind, paired: bool, unchanged: Unchanged) -> Self {
+        match (kind, unchanged, paired) {
+            (Kind::Context, ..) => Self::Context,
+            (Kind::NoNewline, ..) => Self::NoNewline,
+            (Kind::Removed, Unchanged::Moved, _) => Self::RemovedMoved,
+            (Kind::Added, Unchanged::Moved, _) => Self::AddedMoved,
+            (Kind::Removed, Unchanged::Layout, _) => Self::RemovedReformatted,
+            (Kind::Added, Unchanged::Layout, _) => Self::AddedReformatted,
+            (Kind::Removed, Unchanged::No, true) => Self::RemovedPaired,
+            (Kind::Added, Unchanged::No, true) => Self::AddedPaired,
+            (Kind::Removed, Unchanged::No, false) => Self::Removed,
+            (Kind::Added, Unchanged::No, false) => Self::Added,
+        }
+    }
+
+    /// The state of a line of a core hunk.
+    pub(crate) fn of(line: &Line) -> Self {
+        let kind = match line.kind {
+            LineKind::Context => Kind::Context,
+            LineKind::Removed => Kind::Removed,
+            LineKind::Added => Kind::Added,
+        };
+        Self::new(kind, line.paired, line.unchanged)
+    }
+
+    #[inline]
+    pub(crate) fn kind(self) -> Kind {
+        match self {
+            Self::Context => Kind::Context,
+            Self::Removed | Self::RemovedPaired | Self::RemovedMoved | Self::RemovedReformatted => {
+                Kind::Removed
+            }
+            Self::Added | Self::AddedPaired | Self::AddedMoved | Self::AddedReformatted => {
+                Kind::Added
+            }
+            Self::NoNewline => Kind::NoNewline,
+        }
+    }
+
+    /// Moved or reformatted: code the syntax diff found unchanged.
+    #[inline]
+    pub(crate) fn is_unchanged(self) -> bool {
+        matches!(
+            self,
+            Self::RemovedMoved
+                | Self::AddedMoved
+                | Self::RemovedReformatted
+                | Self::AddedReformatted
+        )
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct DiffLine<'a> {
-    pub kind: Kind,
+    pub state: LineState,
     /// 1-based line numbers; `None` on the side a line isn't on.
     pub old: Option<usize>,
     pub new: Option<usize>,
@@ -384,27 +466,56 @@ pub(crate) struct DiffLine<'a> {
     /// A renderer plugin's styles for `text`; empty on every other line.
     /// Like syntax runs, they color the text instead of the change.
     pub paint: &'a [Paint],
-    /// The syntax diff found the line's code unchanged: reformatted lines
-    /// are drawn dim with `~` for a sign, moved ones in the moved color
-    /// with `»`.
-    pub unchanged: Unchanged,
-    /// A removed or added line paired with one on the other side as its
-    /// edited version ([`dffy_core::diff::Line::paired`]).
-    pub modified: bool,
     /// Split view starts a new block of rows here (see
     /// [`dffy_core::diff::Line::block_start`]).
     pub block_start: bool,
 }
 
 /// A stretch of a rendered line (from a renderer plugin) in its own
-/// style: a syntax color and attributes, bits as in
-/// [`crate::theme::Style::attributes`]. Offsets are bytes of the line.
+/// style: a syntax color and attributes. Offsets are bytes of the line.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Paint {
     pub start: u32,
     pub end: u32,
     pub syntax: Option<dffy_core::highlight::Syntax>,
-    pub attributes: u8,
+    pub attributes: Attributes,
+}
+
+/// Text attributes, one bit each: bold 1, dim 2, italic 4, underline 8,
+/// reverse 16. Paint, themes and the screen's cells all hold this, so
+/// drawing combines them without converting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub(crate) struct Attributes(pub u8);
+
+impl Attributes {
+    pub(crate) const NONE: Self = Self(0);
+    pub(crate) const BOLD: Self = Self(1);
+    pub(crate) const DIM: Self = Self(1 << 1);
+    pub(crate) const ITALIC: Self = Self(1 << 2);
+    pub(crate) const UNDERLINE: Self = Self(1 << 3);
+    pub(crate) const REVERSE: Self = Self(1 << 4);
+
+    /// Whether every attribute of `other` is set.
+    #[inline]
+    pub(crate) const fn contains(self, other: Self) -> bool {
+        self.0 & other.0 == other.0
+    }
+}
+
+impl std::ops::BitOr for Attributes {
+    type Output = Self;
+
+    #[inline]
+    fn bitor(self, other: Self) -> Self {
+        Self(self.0 | other.0)
+    }
+}
+
+impl std::ops::BitOrAssign for Attributes {
+    #[inline]
+    fn bitor_assign(&mut self, other: Self) {
+        self.0 |= other.0;
+    }
 }
 
 /// What styles a line's text besides its role: emphasis ranges, syntax
@@ -425,6 +536,45 @@ pub(crate) struct HunkHeader<'a> {
     /// Unchanged lines left out before the hunk, when known: the header
     /// then shows as a separator saying so.
     pub hidden: usize,
+}
+
+/// How a hunk's lines are arranged into rows: one column, or old and new
+/// side by side. Which one a hunk gets is the frontend's choice; rows for
+/// either are the same whatever the screen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Arrangement {
+    Unified,
+    Split,
+}
+
+/// Appends the rows of a hunk body of `len` lines in `arrangement`,
+/// without the header row, given each line's kind and whether it starts a
+/// block of rows.
+pub(crate) fn hunk_rows(
+    arrangement: Arrangement,
+    len: usize,
+    line: impl Fn(usize) -> (Kind, bool),
+    rows: &mut Vec<HunkRow>,
+) {
+    match arrangement {
+        Arrangement::Split => split::rows(len, line, rows),
+        Arrangement::Unified => rows.extend((0..len).map(HunkRow::Line)),
+    }
+}
+
+/// The bytes `line` shows, with its terminator when it has one: a removed
+/// line's from the `old` side, any other's from the `new` one.
+pub(crate) fn line_bytes<'a>(old: &'a Text, new: &'a Text, line: &Line) -> &'a [u8] {
+    match line.kind {
+        LineKind::Removed => old.line(line.old),
+        LineKind::Added | LineKind::Context => new.line(line.new),
+    }
+}
+
+/// Whether `line` ends its side without a newline, so the `\ No newline
+/// at end of file` marker follows it.
+pub(crate) fn no_newline(old: &Text, new: &Text, line: &Line) -> bool {
+    !line_bytes(old, new, line).ends_with(b"\n")
 }
 
 /// A row of a hunk as laid out, before it becomes screen rows: one wraps
@@ -677,10 +827,10 @@ impl Layout {
             self.hunk_header(header, c);
         }
         let mut rows = Vec::new();
-        self.hunk_rows(
-            header,
+        hunk_rows(
+            self.arrangement(header),
             lines.len(),
-            |i| (lines[i].kind, lines[i].block_start),
+            |i| (lines[i].state.kind(), lines[i].block_start),
             &mut rows,
         );
         for row in rows {
@@ -688,37 +838,26 @@ impl Layout {
         }
     }
 
-    /// Whether this layout puts a hunk side by side; split falls back to
-    /// unified for hunks whose line numbers leave too little room.
-    pub(crate) fn splits(&self, header: &HunkHeader) -> bool {
+    /// How this layout arranges a hunk: side by side when split, except
+    /// for hunks whose line numbers leave too little room.
+    pub(crate) fn arrangement(&self, header: &HunkHeader) -> Arrangement {
         let half = self.width.unwrap_or(80).saturating_sub(1) / 2;
-        self.split
+        if self.split
             && !self.one_sided
             && half
                 >= self.lead_width()
                     + self.number_width(header)
                     + self.mark_width()
                     + MIN_SPLIT_TEXT
-    }
-
-    /// Appends the rows of a hunk body of `len` lines, without the header
-    /// row, given each line's kind and whether it starts a block of rows.
-    pub(crate) fn hunk_rows(
-        &self,
-        header: &HunkHeader,
-        len: usize,
-        line: impl Fn(usize) -> (Kind, bool),
-        rows: &mut Vec<HunkRow>,
-    ) {
-        if self.splits(header) {
-            split::rows(len, line, rows);
+        {
+            Arrangement::Split
         } else {
-            rows.extend((0..len).map(HunkRow::Line));
+            Arrangement::Unified
         }
     }
 
-    /// Draws one hunk row from [`Layout::hunk_rows`] (or the header), as one
-    /// screen row or several when it wraps. `line(i)` is line `i` of the body.
+    /// Draws one hunk row from [`hunk_rows`] (or the header), as one screen
+    /// row or several when it wraps. `line(i)` is line `i` of the body.
     pub(crate) fn hunk_row<'a>(
         &self,
         header: &HunkHeader,
@@ -901,7 +1040,7 @@ impl LineStyle {
 
     /// Whether the line's background reaches the edge of its pane.
     fn fills(&self, line: &DiffLine, indicators: Indicators) -> bool {
-        line.kind != Kind::Context
+        line.state != LineState::Context
             && (line.syntax.is_some()
                 || !line.paint.is_empty()
                 || (indicators == Indicators::Background && self.changed))
@@ -946,9 +1085,10 @@ impl LineStyle {
     }
 }
 
-/// How `line` is drawn. Under background tints a changed line's text
-/// always takes the line role, whose background carries the change. With
-/// the layout's `modified_lines`, a line paired with one on the other side
+/// How `line` is drawn. Reformatted lines are dim with `~` for a sign,
+/// moved ones in the moved color with `»`. Under background tints a
+/// changed line's text always takes the line role, whose background
+/// carries the change. With the layout's `modified_lines`, a paired line
 /// takes the modified roles, and only its changed tokens keep the removed
 /// or added color.
 fn line_style(line: &DiffLine, layout: &Layout) -> LineStyle {
@@ -961,43 +1101,39 @@ fn line_style(line: &DiffLine, layout: &Layout) -> LineStyle {
         sign_char,
         changed: true,
     };
-    if line.kind != Kind::Context {
-        match line.unchanged {
-            Unchanged::No => {}
-            Unchanged::Layout => return unchanged(Role::Dim, '~'),
-            Unchanged::Moved => return unchanged(Role::Moved, '»'),
-        }
-    }
     let highlighted =
         line.syntax.is_some() || !line.paint.is_empty() || indicators == Indicators::Background;
-    if line.modified && layout.modified_lines && matches!(line.kind, Kind::Removed | Kind::Added) {
-        let removed = line.kind == Kind::Removed;
-        return LineStyle {
-            text: if highlighted {
-                Role::ModifiedLine
-            } else {
-                Role::Modified
-            },
-            emph: if removed {
-                Role::RemovedEmph
-            } else {
-                Role::AddedEmph
-            },
-            sign: Role::Modified,
-            number: Role::ModifiedNumber,
-            sign_char: if removed { '-' } else { '+' },
-            changed: true,
-        };
-    }
-    let (text, emph, sign, number, sign_char) = match line.kind {
-        Kind::Context | Kind::NoNewline => (
+    let modified = |removed: bool| LineStyle {
+        text: if highlighted {
+            Role::ModifiedLine
+        } else {
+            Role::Modified
+        },
+        emph: if removed {
+            Role::RemovedEmph
+        } else {
+            Role::AddedEmph
+        },
+        sign: Role::Modified,
+        number: Role::ModifiedNumber,
+        sign_char: if removed { '-' } else { '+' },
+        changed: true,
+    };
+    let (text, emph, sign, number, sign_char) = match line.state {
+        LineState::RemovedReformatted | LineState::AddedReformatted => {
+            return unchanged(Role::Dim, '~');
+        }
+        LineState::RemovedMoved | LineState::AddedMoved => return unchanged(Role::Moved, '»'),
+        LineState::RemovedPaired if layout.modified_lines => return modified(true),
+        LineState::AddedPaired if layout.modified_lines => return modified(false),
+        LineState::Context | LineState::NoNewline => (
             Role::Context,
             Role::Context,
             Role::Context,
             Role::LineNumber,
             ' ',
         ),
-        Kind::Removed => (
+        LineState::Removed | LineState::RemovedPaired => (
             if highlighted {
                 Role::RemovedLine
             } else {
@@ -1008,7 +1144,7 @@ fn line_style(line: &DiffLine, layout: &Layout) -> LineStyle {
             Role::RemovedNumber,
             '-',
         ),
-        Kind::Added => (
+        LineState::Added | LineState::AddedPaired => (
             if highlighted {
                 Role::AddedLine
             } else {
@@ -1026,7 +1162,7 @@ fn line_style(line: &DiffLine, layout: &Layout) -> LineStyle {
         sign,
         number,
         sign_char,
-        changed: matches!(line.kind, Kind::Removed | Kind::Added),
+        changed: matches!(line.state.kind(), Kind::Removed | Kind::Added),
     }
 }
 
@@ -1378,7 +1514,7 @@ fn put_glyphs(
                 c.close_span(Ink {
                     role,
                     syntax: run_syntax,
-                    attributes: 0,
+                    attributes: Attributes::NONE,
                 });
                 used += n;
                 cursor.col += n;
@@ -1405,7 +1541,7 @@ fn put_glyphs(
         let ink = Ink {
             role,
             syntax: run_syntax.or_else(|| painted.and_then(|p| p.syntax)),
-            attributes: painted.map_or(0, |p| p.attributes),
+            attributes: painted.map_or(Attributes::NONE, |p| p.attributes),
         };
         c.note_glyph(offset..offset + glyph.len(), width);
         match glyph {
@@ -1436,15 +1572,13 @@ impl Layout {
     /// combined diffs show where they go on and let them be reached.
     pub(crate) fn text_row(&self, role: Role, text: &[u8], c: &mut Canvas) {
         let line = DiffLine {
-            kind: Kind::Context,
+            state: LineState::Context,
             old: None,
             new: None,
             text,
             emphasis: &[],
             syntax: None,
             paint: &[],
-            unchanged: Unchanged::No,
-            modified: false,
             block_start: false,
         };
         let layout = Self {

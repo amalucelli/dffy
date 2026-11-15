@@ -7,7 +7,7 @@ For contributors and coding agents.
 
 ## Crates
 
-The workspace has two crates. The experimental renderer plugins under `plugins/` are programs of their own and are never linked into dffy. Neither crate has a stable public API.
+The workspace has two crates, plus `xtask` for the benchmark tooling. The experimental renderer plugins under `plugins/` are programs of their own and are never linked into dffy. Neither crate has a stable public API.
 
 ### `dffy-core`
 
@@ -69,6 +69,10 @@ The viewer's submodules, under `tui`:
 ### `plugins/markdown`
 
 `dffy-render-markdown`, the Markdown renderer plugin. It turns pulldown-cmark events into blocks of styled lines and writes the protocol's JSON with serde_json. [plugins.md](plugins.md) has the protocol.
+
+### `xtask`
+
+`cargo xtask`, not published: the performance gate (`bench-baseline`, `bench-noise`, `bench-ab`) and the comparison with other diff tools (`compare`). [benchmarks.md](benchmarks.md) describes both.
 
 ## Data flow
 
@@ -216,6 +220,7 @@ Both skip without `DFFY_BENCH_REPO`.
 | `task ci` | `fmt:check`, `lint` (clippy, warnings are errors), `test`, `docs:check`, `doc`, `deny`, `machete`, `typos`, in order |
 | `task test` | Every unit and integration test with cargo-nextest, then doctests |
 | `task test:kernel` | The kernel tests in release mode; needs `DFFY_BENCH_REPO` |
+| `task bench:ab` | The current tree against a baseline from `task bench:baseline`, failing on a slowdown or an allocation increase past the baseline's noise from `task bench:noise` (`cargo xtask`, see [benchmarks.md](benchmarks.md#checking-a-change-for-regressions)) |
 | `task docs` | Regenerates [keys.md](keys.md) and the settings table in [config.md](config.md) |
 | `task setup` | Installs the tools the other tasks use |
 
@@ -253,6 +258,7 @@ A dependency must be an established crate, added only when a few lines can't do 
 |---|---|
 | dffy | gix, tree-sitter with 18 grammars, ignore, rustix, objc2 (macOS), signal-hook, unicode-width, memchr, clap (with clap_complete and clap_mangen), rustc-hash, thiserror |
 | `plugins/markdown` | pulldown-cmark, serde_json, unicode-width |
+| `xtask` | serde_json, portable-pty, vt100 |
 
 - **gix** is built without `max-performance`, which pulls in an MPL-2.0 crate.
 - **JSON:** dffy has no JSON crate; the renderer protocol's JSON is hand-written.

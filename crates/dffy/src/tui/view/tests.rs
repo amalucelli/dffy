@@ -135,6 +135,41 @@ fn split_grid() {
     "#);
 }
 
+/// A hunk drawn split and unified keeps the rows of both: switching back
+/// and forth draws what a document opened in either draws, the change
+/// blocks `n` stops at follow, and the second set of rows counts toward
+/// the cache once.
+#[test]
+fn rows_are_kept_for_each_arrangement() {
+    let starts = |doc: &mut Doc| -> Vec<usize> {
+        (1..doc.parts(0)).flat_map(|p| doc.starts(0, p)).collect()
+    };
+    let opened = |split: bool| {
+        let mut doc = doc(layout(split, false), 7);
+        (screen(&mut doc), starts(&mut doc))
+    };
+    let (split, unified) = (opened(true), opened(false));
+    assert_ne!(split.1, unified.1, "the arrangements' rows differ");
+    let mut doc = doc(layout(true, false), 7);
+    assert_eq!((screen(&mut doc), starts(&mut doc)), split);
+    let before = doc.loaded_bytes;
+    let mut sizes = Vec::new();
+    for on in [false, true, false, true] {
+        doc.layout.split = on;
+        doc.normalize();
+        let expected = if on { &split } else { &unified };
+        assert_eq!(
+            (screen(&mut doc), starts(&mut doc)),
+            *expected,
+            "split {on}"
+        );
+        sizes.push(doc.loaded_bytes);
+    }
+    assert!(sizes[0] > before);
+    assert!(sizes.iter().all(|&s| s == sizes[0]), "{sizes:?}");
+    assert_eq!(doc.loaded(0).map(|l| l.bytes), Some(sizes[0]));
+}
+
 #[test]
 fn cells_take_the_theme_style_of_their_role() {
     let theme = Theme::default_theme();
@@ -482,6 +517,82 @@ fn full_text_shows_every_line_in_both_layouts_and_toggles_back() {
     }
 }
 
+/// The top row after `step`, as `step: row`.
+fn top_after(doc: &mut Doc, step: &str) -> String {
+    let (_, rows) = grid_rows(doc, &Theme::default_theme());
+    format!("{step}: {}", rows[0])
+}
+
+/// With a hunk's line at the top, `X` there and back and `x` leave it
+/// there, `x` revealing lines above it as well as below.
+#[test]
+fn revealing_lines_keeps_a_hunks_line_at_the_top() {
+    let mut doc = doc_of(long_diff(), layout(false, false), 4);
+    doc.scroll(11);
+    let mut tops = vec![top_after(&mut doc, "start")];
+    doc.toggle_full();
+    tops.push(top_after(&mut doc, "X on"));
+    doc.toggle_full();
+    tops.push(top_after(&mut doc, "X off"));
+    assert!(
+        separators(&mut doc).is_empty(),
+        "x opens the gaps around the hunk"
+    );
+    assert!(doc.expand_target());
+    tops.push(top_after(&mut doc, "x"));
+    doc.scroll(-4);
+    tops.push(top_after(&mut doc, "up 4"));
+    insta::assert_snapshot!("hunk_line_kept", tops.join("\n"));
+}
+
+/// With a line of a gap at the top, more of the gap revealed above it
+/// (`x`, or `X` on) keeps it there, and `X` off brings it back to where it
+/// was; `X` off where the line is hidden again puts its separator at the
+/// top.
+#[test]
+fn revealing_lines_keeps_a_gap_line_at_the_top() {
+    let to_line = |doc: &mut Doc, number: &str| {
+        for _ in 0..100 {
+            if top_after(doc, "").starts_with(&format!(": {number} {number} ")) {
+                return;
+            }
+            doc.scroll(1);
+        }
+        panic!("line {number} never reached the top");
+    };
+    // Line 50 is below the separator that one `x` leaves in the gap.
+    let opened = || {
+        let mut doc = doc_of(long_diff(), layout(false, false), 8);
+        screen(&mut doc);
+        assert!(doc.expand_target());
+        to_line(&mut doc, "50");
+        doc
+    };
+    let mut doc = opened();
+    let mut tops = vec![top_after(&mut doc, "x")];
+    let row = doc.pos.row;
+    assert!(doc.expand_target());
+    tops.push(top_after(&mut doc, "x again"));
+    assert_ne!(doc.pos.row, row, "the line moved down the gap's rows");
+
+    let mut doc = opened();
+    tops.push(top_after(&mut doc, "x"));
+    doc.toggle_full();
+    tops.push(top_after(&mut doc, "X on"));
+    assert_ne!(doc.pos.row, row, "the line moved down the gap's rows");
+    doc.toggle_full();
+    tops.push(top_after(&mut doc, "X off"));
+    assert_eq!(doc.pos.row, row);
+
+    let mut doc = doc_of(long_diff(), layout(false, false), 8);
+    doc.toggle_full();
+    to_line(&mut doc, "30");
+    tops.push(top_after(&mut doc, "X on"));
+    doc.toggle_full();
+    tops.push(top_after(&mut doc, "X off"));
+    insta::assert_snapshot!("gap_line_kept", tops.join("\n"));
+}
+
 /// 500 lines, changed at lines 400 and 450.
 fn late_diff() -> FileDiff {
     let old = (1..=500)
@@ -668,13 +779,13 @@ fn background_tints_give_moved_code_its_own_hue() {
 
 /// Rows with each run of cells whose style has `attribute` bracketed,
 /// against a theme where nothing has it by itself.
-fn marked(grid: &Grid, attribute: u8) -> String {
+fn marked(grid: &Grid, attribute: Attributes) -> String {
     let mut out = String::new();
     for y in 0..grid.height() {
         let mut on = false;
         let mut row = String::new();
         for cell in grid.row(y) {
-            let now = cell.style().attributes & attribute != 0;
+            let now = cell.style().attributes.contains(attribute);
             if now != on {
                 row.push(if now { '[' } else { ']' });
                 on = now;
@@ -716,7 +827,7 @@ fn a_selection_shows_reversed_on_its_side_and_copies_that_sides_code() {
     doc.select_by(2);
     let mut grid = Grid::new(60, 7);
     doc.draw(&mut grid, 0, 60, 0, &theme, 1);
-    insta::assert_snapshot!(marked(&grid, Style::REVERSE), @r#"
+    insta::assert_snapshot!(marked(&grid, Attributes::REVERSE), @r#"
     @@ -1,5 +1,6 @@
     1  │ fn main() {             │[1  │ fn main() {              ]
     2 -│     let total = count +…│[2 +│     let total = items.le…]
@@ -740,7 +851,7 @@ fn a_selection_shows_reversed_on_its_side_and_copies_that_sides_code() {
     assert!(doc.select_other_side());
     let mut grid = Grid::new(60, 7);
     doc.draw(&mut grid, 0, 60, 0, &theme, 1);
-    insta::assert_snapshot!(marked(&grid, Style::REVERSE), @r#"
+    insta::assert_snapshot!(marked(&grid, Attributes::REVERSE), @r#"
     @@ -1,5 +1,6 @@
     [1  │ fn main() {             ]│1  │ fn main() {
     [2 -│     let total = count +…]│2 +│     let total = items.le…
@@ -769,7 +880,7 @@ fn a_unified_selection_skips_the_other_sides_lines_and_counts_hidden_ones() {
     doc.select_by(2);
     let mut grid = Grid::new(60, 40);
     doc.draw(&mut grid, 0, 60, 0, &theme, 1);
-    let rows: Vec<String> = marked(&grid, Style::REVERSE)
+    let rows: Vec<String> = marked(&grid, Attributes::REVERSE)
         .lines()
         .take(6)
         .map(str::to_owned)

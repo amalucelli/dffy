@@ -19,7 +19,7 @@ use dffy_core::highlight::{self, Language};
 
 use super::{Copied, Loaded, Side};
 use crate::plugin;
-use crate::render::{DiffLine, HunkHeader, Kind, Paint};
+use crate::render::{Attributes, DiffLine, HunkHeader, Kind, Paint};
 
 /// How many added blocks ahead a removed block looks for the one it was
 /// edited into; bounds the similarity tests in a long rewrite.
@@ -74,12 +74,12 @@ impl Rendered {
     /// block's first line only. A moved line keeps its own look, as a
     /// moved line of code drops its syntax colors.
     fn restyle<'a>(&'a self, mut line: DiffLine<'a>) -> DiffLine<'a> {
-        let (side, number) = if line.kind == Kind::Removed {
+        let (side, number) = if line.state.kind() == Kind::Removed {
             (Side::Old, line.old)
         } else {
             (Side::New, line.new)
         };
-        if line.unchanged == Unchanged::No
+        if !line.state.is_unchanged()
             && let Some(n) = number
         {
             line.paint = self.paint[side.index()]
@@ -219,7 +219,7 @@ fn highlighted(block: &plugin::Block) -> Option<Vec<Vec<Paint>>> {
                         start: run.start,
                         end: run.end,
                         syntax: Some(run.syntax),
-                        attributes: 0,
+                        attributes: Attributes::NONE,
                     })
                     .collect()
             })
@@ -268,7 +268,7 @@ struct Styles {
 impl Styles {
     /// The style of byte `i`: its paint's syntax color and attributes, and
     /// the hash of its link's target.
-    fn at(&self, i: usize) -> (Option<highlight::Syntax>, u8, u64) {
+    fn at(&self, i: usize) -> (Option<highlight::Syntax>, Attributes, u64) {
         let paint = self
             .paint
             .iter()
@@ -276,7 +276,7 @@ impl Styles {
         let link = self.links.iter().find(|(r, _)| r.contains(&i));
         (
             paint.and_then(|p| p.syntax),
-            paint.map_or(0, |p| p.attributes),
+            paint.map_or(Attributes::NONE, |p| p.attributes),
             link.map_or(0, |l| l.1),
         )
     }
@@ -807,7 +807,8 @@ mod tests {
             .iter()
             .flat_map(|h| &h.lines)
             .map(|l| {
-                let (line, _) = crate::print::diff_line(&loaded.diff, l, &[], None);
+                let state = crate::render::LineState::of(l);
+                let line = crate::print::diff_line(&loaded.diff, l, state, &[], None);
                 let line = rendered.restyle(line);
                 let sign = match (l.kind, l.unchanged, l.paired) {
                     (_, Unchanged::Moved, _) => '»',
@@ -915,8 +916,8 @@ mod tests {
         };
         let header = crate::print::hunk_header(hunk, b"");
         let mut rows = Vec::new();
-        layout.hunk_rows(
-            &header,
+        crate::render::hunk_rows(
+            layout.arrangement(&header),
             hunk.lines.len(),
             |i| {
                 let kind = match hunk.lines[i].kind {
@@ -967,16 +968,16 @@ mod tests {
             start: 0,
             end: 0,
             syntax: Some(highlight::Syntax::String),
-            attributes: 0,
+            attributes: Attributes::NONE,
         };
         let link = Paint {
             syntax: Some(highlight::Syntax::Function),
-            attributes: crate::theme::Style::UNDERLINE,
+            attributes: Attributes::UNDERLINE,
             ..code
         };
         let bold = Paint {
             syntax: None,
-            attributes: crate::theme::Style::BOLD,
+            attributes: Attributes::BOLD,
             ..code
         };
         let side = |code_span: bool, url: &str, bolded: bool| {
@@ -1413,7 +1414,7 @@ mod tests {
             start: 0,
             end: 12,
             syntax: Some(highlight::Syntax::String),
-            attributes: 0,
+            attributes: Attributes::NONE,
         });
         let sides = [plugin::Side::default(), plugin::Side { blocks: vec![code] }];
         let loaded = build(diff, sides, 3, 60);

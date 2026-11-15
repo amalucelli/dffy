@@ -22,15 +22,17 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 
 use dffy_core::bstr::{BString, ByteSlice};
-use dffy_core::diff::{Emphasis, Hunk, LineKind, Unchanged, Whitespace};
+use dffy_core::diff::{Emphasis, Hunk, LineKind, Whitespace};
 use dffy_core::git::{FileChange, FileDiff, Status, Update};
 use dffy_core::highlight::{Language, MAX_HIGHLIGHT_BYTES, Spans};
 use dffy_core::structural::{Structural, Unavailable};
 
 use super::piped::{Commit, PipedFile};
+use crate::pager;
 use crate::print::{self, FileSyntax, HunkSyntax};
 use crate::render::{
-    Canvas, DiffLine, FileStatus, HunkHeader, HunkRow, Kind, Layout, display_text,
+    Arrangement, Attributes, Canvas, DiffLine, FileStatus, HunkHeader, HunkRow, Kind, Layout,
+    LineState, display_text, hunk_rows, no_newline,
 };
 use crate::term::Grid;
 use crate::theme::{Ink, Role, Style, Theme};
@@ -123,14 +125,19 @@ struct SyntaxDiff {
 }
 
 struct HunkView {
-    heading: Option<usize>,
+    /// The old line its heading is on, a `u32` like the body's lines: every
+    /// hunk of every file loaded has a view, so its size counts.
+    heading: Option<u32>,
     body: Vec<BodyLine>,
-    /// Rows for the layout's split decision `rows_split`, computed when the
-    /// hunk is first drawn and again when that decision flips.
+    /// Rows in `arrangement`, computed when the hunk is first drawn in it.
     rows: Vec<HunkRow>,
-    rows_split: Option<bool>,
     /// The rows that start a block of changed lines, for `n` and `N`.
     starts: Vec<usize>,
+    /// What `rows` and `starts` are for; `None` until the hunk is drawn.
+    arrangement: Option<Arrangement>,
+    /// The other arrangement's rows and starts, once the hunk was drawn in
+    /// both (a resize across the split width, a layout toggle).
+    other: Option<Box<(Vec<HunkRow>, Vec<usize>)>>,
     /// Per line of the core hunk, once a worker has computed it.
     emphasis: Option<Vec<Emphasis>>,
     /// Computed along with the emphasis, for highlighted files.
@@ -138,14 +145,18 @@ struct HunkView {
 }
 
 /// A displayed line of a hunk: a line of the core hunk, or the
-/// no-newline marker after it.
+/// no-newline marker after it, with what it is.
 #[derive(Debug, Clone, Copy)]
 struct BodyLine {
     line: u32,
-    marker: bool,
+    state: LineState,
 }
 
-/// The views of `hunks` (of `diff`), without emphasis.
+// A hunk's body has a line each: it stays as small as its index.
+const _: () = assert!(size_of::<BodyLine>() == 8);
+
+/// The views of `hunks` (of `diff`), without emphasis. Their lines are
+/// paired already, so each line's state is final.
 fn views(diff: &FileDiff, hunks: &[Hunk]) -> Vec<HunkView> {
     let mut heading = print::Heading::default();
     hunks
@@ -156,21 +167,24 @@ fn views(diff: &FileDiff, hunks: &[Hunk]) -> Vec<HunkView> {
                 let line_index = u32::try_from(i).unwrap_or(u32::MAX);
                 body.push(BodyLine {
                     line: line_index,
-                    marker: false,
+                    state: LineState::of(line),
                 });
-                if print::diff_line(diff, line, &[], None).1 {
+                if no_newline(&diff.old, &diff.new, line) {
                     body.push(BodyLine {
                         line: line_index,
-                        marker: true,
+                        state: LineState::NoNewline,
                     });
                 }
             }
             HunkView {
-                heading: heading.find_line(&diff.old, hunk.old_start),
+                heading: heading
+                    .find_line(&diff.old, hunk.old_start)
+                    .and_then(|i| u32::try_from(i).ok()),
                 body,
                 rows: Vec::new(),
-                rows_split: None,
                 starts: Vec::new(),
+                arrangement: None,
+                other: None,
                 emphasis: None,
                 syntax: None,
             }
@@ -292,9 +306,9 @@ impl Loaded {
     fn heading(&self, views: &[HunkView], h: usize) -> &[u8] {
         match &self.headings {
             Some(headings) => headings.get(h).map_or(&b""[..], |s| &s[..]),
-            None => views[h]
-                .heading
-                .map_or(&b""[..], |i| print::heading_text(&self.diff.old, i)),
+            None => views[h].heading.map_or(&b""[..], |i| {
+                print::heading_text(&self.diff.old, i as usize)
+            }),
         }
     }
 
@@ -381,19 +395,25 @@ impl Loaded {
             .is_none_or(|m| (m.0, m.1) != (structural, modified))
         {
             let deleted = self.diff.new.is_empty();
-            let mut marks: Vec<(usize, Mark)> = self
-                .shown(structural)
-                .0
+            let (cores, views) = self.shown(structural);
+            let mut marks: Vec<(usize, Mark)> = cores
                 .iter()
-                .flat_map(|h| &h.lines)
-                .filter_map(|l| {
-                    let mark = match (l.unchanged, l.kind) {
-                        (_, LineKind::Context) | (Unchanged::Layout, _) => return None,
-                        (Unchanged::Moved, _) => Mark::Moved,
-                        (Unchanged::No, _) if modified && l.paired => Mark::Modified,
-                        (Unchanged::No, LineKind::Removed) => Mark::Removed,
-                        (Unchanged::No, LineKind::Added) => Mark::Added,
+                .zip(views)
+                .flat_map(|(core, view)| view.body.iter().map(move |b| (core, b)))
+                .filter_map(|(core, b)| {
+                    let mark = match b.state {
+                        LineState::Context
+                        | LineState::NoNewline
+                        | LineState::RemovedReformatted
+                        | LineState::AddedReformatted => return None,
+                        LineState::RemovedMoved | LineState::AddedMoved => Mark::Moved,
+                        LineState::RemovedPaired | LineState::AddedPaired if modified => {
+                            Mark::Modified
+                        }
+                        LineState::Removed | LineState::RemovedPaired => Mark::Removed,
+                        LineState::Added | LineState::AddedPaired => Mark::Added,
                     };
+                    let l = &core.lines[b.line as usize];
                     Some((if deleted { l.old } else { l.new }, mark))
                 })
                 .collect();
@@ -657,14 +677,19 @@ impl Shown {
 /// A place in a file: part `n` is its segment `n - 1`, and part 0 holds a
 /// sheet's rows ([`Entry::is_sheet`]), or the blank row of a file that has
 /// no segments (not diffed yet, binary, unchanged); a file with segments is
-/// never at part 0. `sub` is the screen row within a row that wraps.
-/// Ordered as in the document.
+/// never at part 0. Ordered as in the document.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
 pub(crate) struct Pos {
     pub file: usize,
     pub part: usize,
     pub row: usize,
-    pub sub: usize,
+    /// A sub-row inside the row, for a row drawn on several screen rows (a
+    /// wrapped line). Going to a row by what it shows (a change, a match, a
+    /// revealed line, the next row) sets it to 0, and a saved place keeps
+    /// it. Only the screen code, which knows how many screen rows a row
+    /// takes, gives it any other value or reads it: scrolling up into a
+    /// row lands on its last one, and a row whose height shrank clamps it.
+    pub offset: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1074,7 +1099,7 @@ impl Doc {
         }
         pos.part = pos.part.min(self.parts(pos.file) - 1);
         pos.row = pos.row.min(self.rows(pos.file, pos.part) - 1);
-        pos.sub = pos.sub.min(self.height(pos) - 1);
+        pos.offset = pos.offset.min(self.height(pos) - 1);
         self.pos = pos;
         self.clamp();
     }
@@ -1336,7 +1361,7 @@ impl Doc {
             file,
             part,
             row,
-            sub: 0,
+            offset: 0,
         };
         let context = OPEN_CONTEXT.unsigned_abs();
         let limit = self.height.saturating_sub(context).max(context + 1);
@@ -1684,12 +1709,18 @@ impl Doc {
     /// The line of the input a sheet shows at `row`: a commit's header and
     /// message, or a combined diff's line; `None` for the rows made here.
     fn sheet_text(&self, file: usize, row: usize) -> Option<(Role, BString)> {
-        let line = match &self.files.get(file)?.source {
-            Source::Commit(commit) => commit.lines.get(row).cloned(),
-            Source::Piped(piped) => piped.combined.as_ref()?.get(row).cloned(),
-            Source::Repo => None,
+        let (role, text) = match &self.files.get(file)?.source {
+            Source::Commit(commit) => {
+                let (kind, text) = commit.lines.get(row)?;
+                (pager::text_role(*kind), text)
+            }
+            Source::Piped(piped) => {
+                let (parents, line) = piped.combined.as_ref()?.get(row)?;
+                (pager::combined_role(*parents, line), line)
+            }
+            Source::Repo => return None,
         };
-        line.map(|(role, text)| (role, display_text(&text).into()))
+        Some((role, display_text(text).into()))
     }
 
     /// Row `row` of a sheet: a commit's lines, then how many files it has
@@ -1774,29 +1805,34 @@ impl Doc {
         };
         let (cores, views) = loaded.shown_mut(structural);
         let (core, view) = (&cores[hunk], &mut views[hunk]);
-        let header = print::hunk_header(core, b"");
-        let split = layout.splits(&header);
-        if view.rows_split == Some(split) {
-            return;
+        let arrangement = layout.arrangement(&print::hunk_header(core, b""));
+        match (view.arrangement, &mut view.other) {
+            (Some(shown), _) if shown == arrangement => return,
+            (Some(_), Some(other)) => {
+                std::mem::swap(&mut view.rows, &mut other.0);
+                std::mem::swap(&mut view.starts, &mut other.1);
+                view.arrangement = Some(arrangement);
+                return;
+            }
+            (Some(_), other @ None) => {
+                *other = Some(Box::new((
+                    std::mem::take(&mut view.rows),
+                    std::mem::take(&mut view.starts),
+                )));
+            }
+            (None, _) => {}
         }
-        view.rows.clear();
         let body = &view.body;
         let kind = |i: usize| {
-            if body[i].marker {
-                return (Kind::NoNewline, false);
-            }
-            let line = &core.lines[body[i].line as usize];
-            let kind = match line.kind {
-                LineKind::Context => Kind::Context,
-                LineKind::Removed => Kind::Removed,
-                LineKind::Added => Kind::Added,
-            };
-            (kind, line.block_start)
+            let BodyLine { line, state } = body[i];
+            let block_start =
+                state != LineState::NoNewline && core.lines[line as usize].block_start;
+            (state.kind(), block_start)
         };
-        layout.hunk_rows(&header, body.len(), kind, &mut view.rows);
+        hunk_rows(arrangement, body.len(), kind, &mut view.rows);
         let changed = |row: &HunkRow| match *row {
             HunkRow::Line(i) | HunkRow::Pair(Some(i), _) | HunkRow::Pair(None, Some(i)) => {
-                matches!(kind(i).0, Kind::Removed | Kind::Added)
+                matches!(body[i].state.kind(), Kind::Removed | Kind::Added)
             }
             HunkRow::Header | HunkRow::Marker | HunkRow::Pair(None, None) => false,
         };
@@ -1809,7 +1845,16 @@ impl Doc {
             }
             before = now;
         }
-        view.rows_split = Some(split);
+        // The first arrangement's rows are in the estimate the view was
+        // loaded with; a second one's are on top of it.
+        let second = view.other.is_some();
+        let added = view.rows.capacity() * size_of::<HunkRow>()
+            + view.starts.capacity() * size_of::<usize>();
+        view.arrangement = Some(arrangement);
+        if second {
+            loaded.bytes += added;
+            self.loaded_bytes += added;
+        }
     }
 
     /// Logical rows in a part.
@@ -1829,7 +1874,8 @@ impl Doc {
         }
     }
 
-    /// Appends the screen rows of the logical row at `pos` (ignoring `sub`).
+    /// Appends the screen rows of the logical row at `pos` (ignoring its
+    /// offset).
     fn render(&mut self, pos: Pos, c: &mut Canvas) {
         if pos.part == 0 && self.files.get(pos.file).is_some_and(Entry::is_sheet) {
             self.sheet_row(pos.file, pos.row, c);
@@ -1851,7 +1897,7 @@ impl Doc {
             Segment::Gap(g) => Some(self.gap_shown(pos.file, g)),
             _ => None,
         };
-        let target = self.target == Some(Pos { sub: 0, ..pos });
+        let target = self.target == Some(Pos { offset: 0, ..pos });
         let Some(loaded) = self.loaded(pos.file) else {
             return;
         };
@@ -1872,14 +1918,15 @@ impl Doc {
                     &header,
                     view.rows[pos.row],
                     |i| {
-                        let body = view.body[i];
-                        if body.marker {
+                        let BodyLine { line, state } = view.body[i];
+                        if state == LineState::NoNewline {
                             return print::NO_NEWLINE_LINE;
                         }
-                        let line = body.line as usize;
+                        let line = line as usize;
                         let emph = emphasis.map_or(NO_EMPHASIS, |e| &e[line][..]);
-                        let line = print::diff_line(&loaded.diff, &core.lines[line], emph, syntax);
-                        rendered::restyle(rendered, line.0)
+                        let core_line = &core.lines[line];
+                        let line = print::diff_line(&loaded.diff, core_line, state, emph, syntax);
+                        rendered::restyle(rendered, line)
                     },
                     c,
                 );
@@ -1896,15 +1943,13 @@ impl Doc {
                     let (old, new) = (span.old + offset, span.new + offset);
                     let raw = loaded.diff.new.line(new);
                     let line = DiffLine {
-                        kind: Kind::Context,
+                        state: LineState::Context,
                         old: Some(old + 1),
                         new: Some(new + 1),
                         text: display_text(raw.strip_suffix(b"\n").unwrap_or(raw)),
                         emphasis: &[],
                         syntax: loaded.gap_syntax[g].as_ref().map(|s| s.line(new)),
                         paint: &[],
-                        unchanged: Unchanged::No,
-                        modified: false,
                         block_start: false,
                     };
                     let line = rendered::restyle(rendered, line);
@@ -1917,10 +1962,9 @@ impl Doc {
                         heading: b"",
                         hidden: 0,
                     };
-                    let row = if layout.splits(&header) {
-                        HunkRow::Pair(Some(0), Some(0))
-                    } else {
-                        HunkRow::Line(0)
+                    let row = match layout.arrangement(&header) {
+                        Arrangement::Split => HunkRow::Pair(Some(0), Some(0)),
+                        Arrangement::Unified => HunkRow::Line(0),
                     };
                     layout.hunk_row(&header, row, |_| line, c);
                 }
@@ -1946,7 +1990,7 @@ impl Doc {
 
     /// Moves `pos` to the next logical row of its file; false at the end.
     fn next_row(&mut self, pos: &mut Pos) -> bool {
-        let mut next = Pos { sub: 0, ..*pos };
+        let mut next = Pos { offset: 0, ..*pos };
         if next.row + 1 < self.rows(next.file, next.part) {
             next.row += 1;
         } else if next.part + 1 < self.parts(next.file) {
@@ -1971,7 +2015,7 @@ impl Doc {
         } else {
             return false;
         }
-        prev.sub = self.height(prev) - 1;
+        prev.offset = self.height(prev) - 1;
         *pos = prev;
         true
     }
@@ -1984,14 +2028,14 @@ impl Doc {
         let mut pos = self.pos;
         for _ in 0..delta.unsigned_abs() {
             let moved = if delta > 0 {
-                if pos.sub + 1 < self.height(pos) {
-                    pos.sub += 1;
+                if pos.offset + 1 < self.height(pos) {
+                    pos.offset += 1;
                     true
                 } else {
                     self.next_row(&mut pos)
                 }
-            } else if pos.sub > 0 {
-                pos.sub -= 1;
+            } else if pos.offset > 0 {
+                pos.offset -= 1;
                 true
             } else {
                 self.prev_row(&mut pos)
@@ -2011,7 +2055,7 @@ impl Doc {
         }
         let mut pos = self.pos;
         let first = self.height(pos);
-        let mut rows = first - pos.sub.min(first - 1);
+        let mut rows = first - pos.offset.min(first - 1);
         while rows < self.height {
             if !self.next_row(&mut pos) {
                 break;
@@ -2020,8 +2064,8 @@ impl Doc {
         }
         while rows < self.height {
             let mut pos = self.pos;
-            let moved = if pos.sub > 0 {
-                pos.sub -= 1;
+            let moved = if pos.offset > 0 {
+                pos.offset -= 1;
                 true
             } else {
                 self.prev_row(&mut pos)
@@ -2123,9 +2167,9 @@ impl Doc {
             file,
             part,
             row,
-            sub: 0,
+            offset: 0,
         };
-        pos.sub = self.height(pos) - 1;
+        pos.offset = self.height(pos) - 1;
         self.pos = pos;
         self.clamp();
     }
@@ -2189,7 +2233,7 @@ impl Doc {
             file,
             part,
             row,
-            sub: 0,
+            offset: 0,
         };
         self.pos = pos;
         self.clamp();
@@ -2283,7 +2327,7 @@ impl Doc {
                 .starts(start.file, part)
                 .into_iter()
                 .rev()
-                .find(|&r| !here || r < start.row || (r == start.row && start.sub > 0))
+                .find(|&r| !here || r < start.row || (r == start.row && start.offset > 0))
             {
                 self.land(start.file, part, row);
                 return None;
@@ -2313,7 +2357,7 @@ impl Doc {
     fn reanchor(&mut self, file: usize, gap: usize, line: Option<usize>) {
         if let Some(line) = line {
             self.pos.row = self.gap_shown(file, gap).row(line);
-            self.pos.sub = 0;
+            self.pos.offset = 0;
         }
         self.normalize();
     }
@@ -2561,7 +2605,7 @@ impl Doc {
                 let wants_syntax = loaded.syntax.is_some() && loaded.gap_syntax[g].is_none();
                 let shown = self.gap_shown(pos.file, g);
                 match shown.line(pos.row) {
-                    None if pos.sub == 0 => self.separators.push((y, pos)),
+                    None if pos.offset == 0 => self.separators.push((y, pos)),
                     Some(_)
                         if wants_syntax
                             && self.missing_gap_syntax.last() != Some(&(pos.file, g)) =>
@@ -2607,15 +2651,15 @@ impl Doc {
             self.note_drawn(pos, y);
             c.clear();
             self.render(pos, &mut c);
-            for (i, row) in c.rows().enumerate().skip(pos.sub) {
+            for (i, row) in c.rows().enumerate().skip(pos.offset) {
                 if y == self.height {
                     break;
                 }
-                let after = paint(grid, x, top + y, end, row, theme, 0);
+                let after = paint(grid, x, top + y, end, row, theme, Attributes::NONE);
                 if let Some(fill) = c.fill(i) {
                     grid.fill(after, top + y, end, theme.ink_style(fill));
                 }
-                self.drawn[y] = Some(Pos { sub: i, ..pos });
+                self.drawn[y] = Some(Pos { offset: i, ..pos });
                 y += 1;
             }
             last = pos;
@@ -2644,7 +2688,7 @@ impl Doc {
             self.render(pos, &mut c);
             if let Some(row) = c.rows().next() {
                 grid.fill(x, top + y, end, Style::PLAIN);
-                paint(grid, x, top + y, end, row, theme, 0);
+                paint(grid, x, top + y, end, row, theme, Attributes::NONE);
             }
         }
         file..file + 1
@@ -2667,7 +2711,7 @@ impl Doc {
             if pos.file != selection.anchor.file {
                 continue;
             }
-            let logical = Pos { sub: 0, ..pos };
+            let logical = Pos { offset: 0, ..pos };
             if previous != Some(logical) {
                 lines = self.row_lines(logical);
                 previous = Some(logical);
@@ -2682,13 +2726,18 @@ impl Doc {
             if let (Some((from, to)), Some(map)) = (bytes, mapped.map()) {
                 let split = self.split_row(logical);
                 for g in &map.glyphs {
-                    let shown = g.row == pos.sub && (!split || g.side == side);
+                    let shown = g.row == pos.offset && (!split || g.side == side);
                     if shown
                         && (line > lo || g.bytes.start >= from)
                         && (line < hi || g.bytes.start < to)
                     {
                         let left = (x + g.col).min(end);
-                        grid.toggle(left, top + y, (left + g.width).min(end), Style::REVERSE);
+                        grid.toggle(
+                            left,
+                            top + y,
+                            (left + g.width).min(end),
+                            Attributes::REVERSE,
+                        );
                     }
                 }
                 continue;
@@ -2702,7 +2751,7 @@ impl Doc {
             } else {
                 x..end
             };
-            grid.toggle(columns.start, top + y, columns.end, Style::REVERSE);
+            grid.toggle(columns.start, top + y, columns.end, Attributes::REVERSE);
         }
         self.mapped = mapped;
     }
@@ -2718,7 +2767,7 @@ impl Doc {
         let mut previous = None;
         for y in 0..self.drawn.len() {
             let Some(pos) = self.drawn[y] else { continue };
-            let logical = Pos { sub: 0, ..pos };
+            let logical = Pos { offset: 0, ..pos };
             if pos.file != marks.file {
                 continue;
             }
@@ -2747,7 +2796,7 @@ impl Doc {
                 };
                 let bytes = found.start as usize..found.end as usize;
                 for g in &map.glyphs {
-                    if g.row == pos.sub
+                    if g.row == pos.offset
                         && (!split || g.side == found.side.index())
                         && bytes.contains(&g.bytes.start)
                     {
@@ -2791,7 +2840,7 @@ impl Doc {
                 file,
                 part,
                 row,
-                sub: 0,
+                offset: 0,
             });
         }
         let (cores, _) = loaded.shown(self.structural);
@@ -2809,7 +2858,7 @@ impl Doc {
         let (core, view) = (&cores[h], &views[h]);
         let body = view.body.iter().position(|b| {
             let l = &core.lines[b.line as usize];
-            !b.marker
+            b.state != LineState::NoNewline
                 && match m.side {
                     Side::Old => l.kind == LineKind::Removed && l.old == line,
                     Side::New => l.kind != LineKind::Removed && l.new == line,
@@ -2824,7 +2873,7 @@ impl Doc {
             file,
             part,
             row,
-            sub: 0,
+            offset: 0,
         })
     }
 
@@ -2850,7 +2899,7 @@ impl Doc {
                 let (core, view) = (&cores[h], &views[h]);
                 let line = |i: usize| {
                     let body = view.body[i];
-                    if body.marker {
+                    if body.state == LineState::NoNewline {
                         return [None, None];
                     }
                     let l = &core.lines[body.line as usize];
@@ -2888,8 +2937,9 @@ impl Doc {
             Some(Segment::Hunk(h)) => {
                 self.ensure_rows(pos.file, h);
                 let structural = self.structural;
-                self.loaded(pos.file)
-                    .is_some_and(|l| l.shown(structural).1[h].rows_split == Some(true))
+                self.loaded(pos.file).is_some_and(|l| {
+                    l.shown(structural).1[h].arrangement == Some(Arrangement::Split)
+                })
             }
             Some(Segment::Gap(_)) => {
                 let header = HunkHeader {
@@ -2900,7 +2950,7 @@ impl Doc {
                     heading: b"",
                     hidden: 0,
                 };
-                self.file_layout(pos.file).splits(&header)
+                self.file_layout(pos.file).arrangement(&header) == Arrangement::Split
             }
             Some(Segment::Start) | None => false,
         }
@@ -2912,7 +2962,7 @@ impl Doc {
             .get(y)
             .copied()
             .flatten()
-            .map(|p| Pos { sub: 0, ..p })
+            .map(|p| Pos { offset: 0, ..p })
     }
 
     /// Which side of the row at `pos` column `column` (from the pane's
@@ -2938,7 +2988,7 @@ impl Doc {
     /// row's start, one right of it the row's end.
     pub(crate) fn hit(&mut self, y: usize, column: usize, side: Option<Side>) -> Option<Hit> {
         let drawn = self.drawn.get(y).copied().flatten()?;
-        let pos = Pos { sub: 0, ..drawn };
+        let pos = Pos { offset: 0, ..drawn };
         let lines = self.row_lines(pos);
         let confined = side.is_some();
         let side = match side {
@@ -2950,18 +3000,18 @@ impl Doc {
         let mut c = std::mem::take(&mut self.mapped);
         c.clear();
         self.render(pos, &mut c);
-        let ours = |row: usize, s: usize| row == drawn.sub && (!split || s == side.index());
+        let ours = |row: usize, s: usize| row == drawn.offset && (!split || s == side.index());
         let map = c.map()?;
         let area = map.areas.iter().find(|a| ours(a.row, a.side)).copied();
         let row: Vec<_> = map.glyphs.iter().filter(|g| ours(g.row, g.side)).collect();
         let earlier = map
             .glyphs
             .iter()
-            .any(|g| g.row < drawn.sub && (!split || g.side == side.index()));
+            .any(|g| g.row < drawn.offset && (!split || g.side == side.index()));
         let later = map
             .glyphs
             .iter()
-            .any(|g| g.row > drawn.sub && (!split || g.side == side.index()));
+            .any(|g| g.row > drawn.offset && (!split || g.side == side.index()));
         let gutter = !confined && area.is_some_and(|a| column < a.col);
         let bytes = row
             .iter()
@@ -3127,7 +3177,7 @@ impl Doc {
             if !moved {
                 return None;
             }
-            pos.sub = 0;
+            pos.offset = 0;
             if let Some(line) = self.row_lines(pos)[side.index()] {
                 return Some((pos, line));
             }
@@ -3204,15 +3254,20 @@ impl Doc {
 
     /// Scrolls just enough that the logical row at `target` is on screen.
     fn reveal(&mut self, target: Pos) {
-        if target < (Pos { sub: 0, ..self.pos }) {
+        if target
+            < (Pos {
+                offset: 0,
+                ..self.pos
+            })
+        {
             self.pos = target;
             self.clamp();
             return;
         }
         // Screen rows from the top of the pane to the end of `target`.
         let mut pos = self.pos;
-        let mut rows = self.height(pos) - pos.sub;
-        while (Pos { sub: 0, ..pos }) < target && rows <= 2 * self.height {
+        let mut rows = self.height(pos) - pos.offset;
+        while (Pos { offset: 0, ..pos }) < target && rows <= 2 * self.height {
             if !self.next_row(&mut pos) {
                 break;
             }
@@ -3364,7 +3419,7 @@ pub(crate) fn paint<'a>(
     end: usize,
     row: impl Iterator<Item = (Ink, &'a str)>,
     theme: &Theme,
-    attributes: u8,
+    attributes: Attributes,
 ) -> usize {
     for (ink, text) in row {
         let mut style = theme.ink_style(ink);

@@ -1,10 +1,10 @@
 # Benchmarks and comparison
 
-dffy next to `delta`, `diff-so-fancy`, `difftastic`, `hunk`, `lumen`, git and GNU diff on the Linux kernel: how long each takes, how much memory it uses, and what each one does. The tables are the output of [`bench/compare.sh`](../bench/compare.sh), with tool and temporary paths shortened.
+dffy next to `delta`, `diff-so-fancy`, `difftastic`, `hunk`, `lumen`, git and GNU diff on the Linux kernel: how long each takes, how much memory it uses, and what each one does. The tables are the output of `cargo xtask compare` ([`crates/xtask`](../crates/xtask/src/compare.rs)), with tool and temporary paths shortened.
 
 ## Setup
 
-- **Date:** every table is from `bench/compare.sh`, run on 2026-11-15 on a release build (`cargo build --release`).
+- **Date:** every table was measured on 2026-11-15 on a release build (`cargo build --release`).
   - The `delta` row without highlighting is from a second run of that section the same hour, because its total spread over 0.8s in the first.
   - The range table's first three rows (git, dffy as git's pager, dffy without highlighting) are from a later run of that section the same day, after a change that sped up dffy's printed output. So is dffy's row in the viewer table for the range: the faster line diff moved its settled time, and its first frame stayed the same.
   - dffy's other rows were measured again after that change. They stayed within their spread, or within 5% when timed run for run against the previous build, so they keep their first measurement.
@@ -152,15 +152,15 @@ Both first frames wait for git's first byte, which comes after git's rename dete
 
 **Workload.** The Linux kernel repository with tags `v6.0` and `v6.1`. The range changes 13,168 files (12,914 entries once git pairs 254 renames), and `git diff` writes 48MB of patch for it. The single-file cases use kernel files at both tags, extracted to two folders so every tool reads the same two files.
 
-**Isolation.** Every command runs with an empty `HOME`, empty XDG config, state, cache and data directories, and git with no global or system config (`GIT_CONFIG_GLOBAL` pointing at an empty file, `GIT_CONFIG_NOSYSTEM=1`). That keeps a `diff.external`, a `delta` theme, `diff.renames = copies` or dffy's remembered viewer settings out of the numbers. Each tool runs with its defaults.
+**Isolation.** Every command runs with only `PATH` from the environment, `TERM=xterm-256color`, `COLORTERM=truecolor`, `LANG=C.UTF-8`, an empty `HOME`, empty XDG config, state, cache and data directories, and git with no global or system config (`GIT_CONFIG_GLOBAL` pointing at an empty file, `GIT_CONFIG_NOSYSTEM=1`). That keeps a `diff.external`, a `delta` theme, `diff.renames = copies` or dffy's remembered viewer settings out of the numbers. Each tool runs with its defaults.
 
 **Caches.** The page cache is warm: every repository object and file is read before timing (hyperfine's warmup run, or earlier rows). dffy keeps a disk cache of rename and syntax-diff results; it's emptied before every run, so no run reuses work from another. `hunk` starts a session daemon on first use, which stays up across its runs and is stopped after them.
 
 **What's timed.**
 - **Total:** wall time from start to exit, with output to `/dev/null`, from [hyperfine](https://github.com/sharkdp/hyperfine). The tables give the median, the standard deviation and the range.
-- **First byte:** time from spawning the command to the first byte on its stdout (a pipe), from [`bench/harness.py`](../bench/harness.py). It's what decides when a pager shows its first screen.
-- **Memory:** [`bench/harness.py`](../bench/harness.py) reads `/proc/<pid>/status` every 2ms for every process the command starts and keeps each program's peak, in separate runs from the timed ones. "Own memory" is `RssAnon`: the heap and stacks the program allocated. "Mapped files" is `RssFile`: pages of files the program has mapped, its own executable and, for git and dffy, the repository's pack files. Those pages are the OS file cache, shared with every other process that reads the same packs, so they aren't the program's to free. When git runs beside the tool, in a pipeline or as a viewer's helper, git's numbers get their own column. A daemon that leaves the command's session, like `hunk`'s session daemon, isn't counted.
-- **Interactive viewers:** each runs in a 200×60 pseudo-terminal. The harness timestamps every chunk of output, then replays the chunks into the [pyte](https://github.com/selectel/pyte) terminal emulator: "first frame" is the timestamp of the chunk after which the scenario's first changed line is on the screen, however the viewer draws it. "Settled" is the last chunk before a full second without output; a viewer that keeps redrawing gets 5 more seconds after its first frame and reads "still drawing". A viewer that doesn't show the line within 60 seconds is stopped and reads ">60s"; one that shows a notice in its place (`hunk`'s "File too large to render automatically.") reads "n/a" with the notice. The harness answers the queries a terminal would (device attributes, cursor position, colors, mode reports, window size). The "harness floor" row is `echo` of the same text: the cost of starting a process from Python. After the run, `q` is sent; memory is sampled from start to exit.
+- **First byte:** time from spawning the command to the first byte on its stdout (a pipe), from the harness in [`crates/xtask`](../crates/xtask/src/harness.rs). It's what decides when a pager shows its first screen.
+- **Memory:** the harness reads `/proc/<pid>/status` every 2ms for every process the command starts and keeps each program's peak, in separate runs from the timed ones. "Own memory" is `RssAnon`: the heap and stacks the program allocated. "Mapped files" is `RssFile`: pages of files the program has mapped, its own executable and, for git and dffy, the repository's pack files. Those pages are the OS file cache, shared with every other process that reads the same packs, so they aren't the program's to free. When git runs beside the tool, in a pipeline or as a viewer's helper, git's numbers get their own column. A daemon that leaves the command's process group, like `hunk`'s session daemon, isn't counted.
+- **Interactive viewers:** each runs in a 200×60 pseudo-terminal. The harness timestamps every chunk of output as it's read and feeds it to the [vt100](https://crates.io/crates/vt100) terminal emulator: "first frame" is the timestamp of the chunk after which the scenario's first changed line is on the screen, however the viewer draws it. "Settled" is the last chunk before a full second without output; a viewer that keeps redrawing gets 5 more seconds after its first frame and reads "still drawing". A viewer that doesn't show the line within 60 seconds is stopped and reads ">60s"; one that shows a notice in its place (`hunk`'s "File too large to render automatically.") reads "n/a" with the notice. The harness answers the queries a terminal would (device attributes, cursor position, colors, mode reports, window size). The "harness floor" row is `echo` of the same text: the cost of starting a process from the harness. After the run, `q` is sent; memory is sampled from start to exit.
 
 **The tools don't all do the same work:**
 - `delta` highlights syntax by default, and so does dffy when it reads the repository. dffy as a pager doesn't highlight, because a piped diff has only the lines git wrote. Both are shown with highlighting on and off where the tool allows it.
@@ -172,10 +172,12 @@ Both first frames wait for git's first byte, which comes after git's rename dete
 ## Reproducing
 
 ```sh
-DFFY_BENCH_REPO=~/src/linux bench/compare.sh > results.md
+DFFY_BENCH_REPO=~/src/linux cargo xtask compare > results.md
 ```
 
-The script needs Linux (memory is read from `/proc`), POSIX sh, git, GNU diff, hyperfine and python3; pyte (`pip install pyte`) for the viewer tables. Each tool is found on `PATH` or through its variable (`DFFY`, `DELTA`, `DIFFT`, `DIFF_SO_FANCY`, `HUNK`, `LUMEN`, `HYPERFINE`, `PYTHON`), and a tool it can't find is skipped. `RUNS`, `SLOW_RUNS` and `MEM_RUNS` set the number of runs, `SCENARIOS` picks sections (`range renames file syntax tui`, where `tui` is every viewer table). The working-tree viewer table needs uncommitted changes in the clone and is skipped without them. Every measurement waits until the one-minute load average is under 1, so the script stalls on a machine that never gets that quiet. A full run takes about an hour, half of it `difftastic` on the whole range.
+It needs git, GNU diff and hyperfine. Each tool is found on `PATH` or through its variable (`DFFY`, `DELTA`, `DIFFT`, `DIFF_SO_FANCY`, `HUNK`, `LUMEN`, `HYPERFINE`), and a tool it can't find is skipped. `--runs`, `--slow-runs` and `--mem-runs` (or `RUNS`, `SLOW_RUNS` and `MEM_RUNS`) set the number of runs, and `--scenarios` (or `SCENARIOS`) picks sections from `range,renames,file,syntax,tui`, where `tui` is every viewer table. The working-tree viewer table needs uncommitted changes in the clone and is skipped without them. On Linux every measurement waits until the one-minute load average is under 1, so the run stalls on a machine that never gets that quiet. A full run takes about an hour, half of it `difftastic` on the whole range.
+
+On macOS, "own memory" is the whole command's peak RSS from `/usr/bin/time -l`, and the mapped-files, git and viewer memory columns are empty.
 
 A shallow clone with both tags is enough (about 600MB of history):
 
@@ -197,6 +199,31 @@ npm install --prefix /tmp/tools/npm hunkdiff diff-so-fancy
 `hunk`'s npm package is a Node launcher around a compiled binary; `HUNK` points at that binary (`node_modules/hunkdiff-linux-x64/bin/hunk`), so Node's startup isn't counted against it.
 
 dffy's own budgets, measured inside the process with the divan benchmarks and the kernel tests, are in [architecture.md](architecture.md#performance).
+
+## Checking a change for regressions
+
+`cargo xtask bench-ab` ([`crates/xtask`](../crates/xtask/src/ab.rs)) compares the current tree with a baseline build of dffy on the same machine, and fails when the current tree is slower, uses more memory or allocates more. It runs the divan benchmarks (`frame` and `engine`), the `first_frame`, `count_pass` and `first_paint` examples, and hyperfine and peak-RSS runs of dffy printing the kernel range and reading its patch as a pager. Every round runs both builds, alternating which goes first, and a metric's value is its median over the rounds.
+
+```sh
+export DFFY_BENCH_REPO=~/.cache/dffy-bench/linux
+# Before the change: build the baseline, then measure its noise.
+task bench:baseline DIR=~/.cache/dffy-bench/baseline
+task bench:noise BASE=~/.cache/dffy-bench/baseline
+# After each step:
+task bench:ab BASE=~/.cache/dffy-bench/baseline
+```
+
+The tasks run `cargo xtask bench-baseline <dir>`, `cargo xtask bench-noise <base-dir>` and `cargo xtask bench-ab <base-dir>`. `bench-baseline` builds the tree and copies `dffy`, the three examples and the two bench executables into the directory, with the commit in `REV`. `bench-ab` builds the current tree the same way into a temporary directory and compares it with the baseline.
+
+`bench-noise` compares the baseline with itself and writes each metric's band to `noise.tsv` in the baseline directory: the largest difference between the two sides in any one round. A later comparison passes a metric when the candidate's median is at most the baseline's plus its band. Allocation counts and bytes per iteration, from divan's allocation profiler, get a band the same way, so one with a band of 0 fails on any increase. A noise run of some groups replaces only those groups' bands. Measure the noise on the machine the comparisons run on.
+
+Without a `noise.tsv`, `bench-ab` reports the deltas, warns that the gate is uncalibrated and passes. `count_pass` finding files whose count differs from their diff fails either way. A metric the baseline has and the candidate lacks fails once the gate is calibrated; one only the candidate has is listed.
+
+`--rounds` (default 5; `ROUNDS` for the tasks) sets the rounds and `--only` (`ONLY`) picks groups, so a step can gate only what it touched: `frame`, `engine`, `pty` (`first_frame`), `count` (`count_pass`), `paint` (`first_paint`), `print` and `pager`. The table goes to stdout and, with every program's raw output, to `~/.cache/dffy-bench/runs/<time>/`.
+
+Every command runs in the kernel clone with only `PATH` from the environment, an empty home and XDG directories, git with no global or system config, and `TERM=xterm-256color`. The pager group gives dffy a patch that git wrote once at the start of the run. Peak RSS needs `/usr/bin/time` (GNU time on Linux) and is skipped without it.
+
+All of `cargo xtask` runs on macOS and Linux. The Linux VM under [Setup](#setup) is the reference: published numbers and the regression gate of record come from it. A baseline and its `noise.tsv` hold only for the machine that measured them, so a Mac needs its own for local checks.
 
 ## Feature comparison sources
 

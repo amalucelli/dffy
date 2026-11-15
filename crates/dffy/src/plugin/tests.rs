@@ -69,7 +69,7 @@ fn answers_decode_into_blocks_with_styles() {
             start: 0,
             end: 5,
             syntax: Some(Syntax::Keyword),
-            attributes: Style::BOLD | Style::UNDERLINE
+            attributes: Attributes::BOLD | Attributes::UNDERLINE
         }]
     );
     let paragraph = &new.blocks[1];
@@ -82,13 +82,13 @@ fn answers_decode_into_blocks_with_styles() {
                 start: 6,
                 end: 10,
                 syntax: None,
-                attributes: Style::BOLD
+                attributes: Attributes::BOLD
             },
             Paint {
                 start: 10,
                 end: 12,
                 syntax: Some(Syntax::Keyword),
-                attributes: 0
+                attributes: Attributes::NONE
             }
         ]
     );

@@ -20,5 +20,5 @@ It runs on Linux and macOS. `docs/keys.md` and the settings table in `docs/confi
 ## Contributing
 
 - [Architecture](docs/architecture.md): crates and modules, data flow, the diff and syntax engines, the watcher and renderer, performance budgets, testing, dependencies and releases.
-- [Benchmarks](docs/benchmarks.md): dffy against delta, diff-so-fancy, difftastic, hunk and lumen on the Linux kernel's v6.0..v6.1 (time to first byte and frame, totals, peak memory), the feature comparison with a source for every cell, and `bench/compare.sh` to rerun them.
+- [Benchmarks](docs/benchmarks.md): dffy against delta, diff-so-fancy, difftastic, hunk and lumen on the Linux kernel's v6.0..v6.1 (time to first byte and frame, totals, peak memory), the feature comparison with a source for every cell, and `cargo xtask compare` to rerun them.
 - [README](README.md): the project overview.

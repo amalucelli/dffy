@@ -20,7 +20,7 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use super::fuzzy;
 use super::view::{Counts, Entry};
-use crate::render::{escape, stat};
+use crate::render::{Attributes, escape, stat};
 use crate::term::Grid;
 use crate::theme::{Role, Style, Theme};
 
@@ -821,7 +821,7 @@ impl Tree {
         let named = |role, dim: bool| {
             let mut s = style(role, dim);
             if selected.is_some() {
-                s.attributes |= Style::BOLD;
+                s.attributes |= Attributes::BOLD;
             }
             s
         };
@@ -1175,7 +1175,7 @@ mod tests {
                     "{text:?} fg {} bg {} attributes {}",
                     color(s.fg),
                     color(s.bg),
-                    s.attributes
+                    s.attributes.0
                 )
             })
             .collect::<Vec<_>>()

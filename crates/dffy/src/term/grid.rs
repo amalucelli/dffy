@@ -7,6 +7,7 @@ use std::io::Write as _;
 
 use unicode_width::UnicodeWidthChar;
 
+use crate::render::Attributes;
 use crate::theme::{ATTRIBUTES, Style};
 
 /// UTF-8 bytes a cell holds: a character plus a few combining marks.
@@ -110,13 +111,13 @@ impl Grid {
 
     /// Flips `attributes` on the cells in columns `x..end` of row `y`, so
     /// reverse video over text already reversed shows it plain again.
-    pub(crate) fn toggle(&mut self, x: usize, y: usize, end: usize, attributes: u8) {
+    pub(crate) fn toggle(&mut self, x: usize, y: usize, end: usize, attributes: Attributes) {
         if y >= self.height {
             return;
         }
         let row = y * self.width;
         for cell in &mut self.cells[row + x.min(self.width)..row + end.min(self.width)] {
-            cell.style.attributes ^= attributes;
+            cell.style.attributes.0 ^= attributes.0;
         }
     }
 
@@ -408,16 +409,16 @@ fn set_pen(out: &mut Vec<u8>, pen: &mut Style, to: Style, sgr: &mut String) {
         return;
     }
     sgr.clear();
-    let intensity_added =
-        to.attributes & INTENSITY == INTENSITY && pen.attributes & INTENSITY != INTENSITY;
-    let from = if pen.attributes & !to.attributes != 0 || to == Style::PLAIN || intensity_added {
+    let (pen_bits, to_bits) = (pen.attributes.0, to.attributes.0);
+    let intensity_added = to_bits & INTENSITY == INTENSITY && pen_bits & INTENSITY != INTENSITY;
+    let from = if pen_bits & !to_bits != 0 || to == Style::PLAIN || intensity_added {
         sgr.push('0');
         Style::PLAIN
     } else {
         *pen
     };
     for (i, (_, code)) in ATTRIBUTES.iter().enumerate() {
-        if to.attributes & !from.attributes & (1 << i) != 0 {
+        if to_bits & !from.attributes.0 & (1 << i) != 0 {
             let _ = write!(sgr, ";{code}");
         }
     }
@@ -447,11 +448,10 @@ mod tests {
     const GREEN: Style = Style {
         fg: Some(Color::Ansi(2)),
         bg: None,
-        attributes: 0,
+        attributes: Attributes::NONE,
     };
-    const BOLD: u8 = 1;
     const GREEN_BOLD: Style = Style {
-        attributes: BOLD,
+        attributes: Attributes::BOLD,
         ..GREEN
     };
 
@@ -515,15 +515,14 @@ mod tests {
     /// the pen held before.
     #[test]
     fn bold_and_dim_together_go_out_in_one_order() {
-        const DIM: u8 = 2;
         let old = Grid::new(2, 1);
         let mut new = Grid::new(2, 1);
         let style = |attributes| Style {
             attributes,
             ..Style::PLAIN
         };
-        new.put_char(0, 0, 2, 'a', style(DIM));
-        new.put_char(1, 0, 2, 'b', style(BOLD | DIM));
+        new.put_char(0, 0, 2, 'a', style(Attributes::DIM));
+        new.put_char(1, 0, 2, 'b', style(Attributes::BOLD | Attributes::DIM));
         assert_eq!(diffed(&old, &new), "\x1b[1H\x1b[2ma\x1b[0;1;2mb\x1b[0m");
     }
 
@@ -601,7 +600,7 @@ mod tests {
                         " "
                     };
                     assert_eq!(text, want.text(), "text at {x},{y}");
-                    assert_eq!(got.bold(), want.style.attributes & BOLD != 0);
+                    assert_eq!(got.bold(), want.style.attributes.contains(Attributes::BOLD));
                     let fg = match want.style.fg {
                         Some(Color::Ansi(n)) => vt100::Color::Idx(n),
                         _ => vt100::Color::Default,

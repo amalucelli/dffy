@@ -11,7 +11,7 @@ use std::path::{Component, Path, PathBuf};
 
 use dffy_core::bstr::{BStr, BString, ByteSlice};
 use dffy_core::cache::Cache;
-use dffy_core::diff::{Hunk, Line, LineKind, Options, Text, Unchanged, Whitespace, emphasize_with};
+use dffy_core::diff::{Hunk, Line, LineKind, Options, Text, Whitespace, emphasize_with};
 use dffy_core::git::{
     CommitInfo, DiffSpec, FileChange, FileDiff, Mode, Repo, Revisions, Side, Staging, Status,
 };
@@ -20,9 +20,12 @@ use dffy_core::structural::{self, Structural, Unavailable};
 
 use crate::config::DefaultDiff;
 use crate::output::Output;
+use crate::pager::parse::TextKind;
+use crate::pager::text_role;
 use crate::render::stat::{self, StatEntry};
 use crate::render::{
-    Canvas, DiffLine, FileHeader, FileStatus, HunkHeader, HunkRow, Kind, display_text, escape,
+    Arrangement, Canvas, DiffLine, FileHeader, FileStatus, HunkHeader, HunkRow, LineState,
+    display_text, escape, hunk_rows, line_bytes, no_newline,
 };
 use crate::theme::Role;
 use crate::{Ctx, Error};
@@ -239,8 +242,8 @@ impl Plan {
         };
         let mut canvas = Canvas::default();
         if let Some(commit) = &self.commit {
-            for (role, line) in commit_lines(commit) {
-                canvas.line(role, &escape(&line));
+            for (kind, line) in commit_lines(commit) {
+                canvas.line(text_role(kind), &escape(&line));
             }
             canvas.end_line();
             out.write(&canvas, theme)?;
@@ -681,42 +684,46 @@ impl Plan {
                 large: std::collections::VecDeque::new(),
             };
             let mut sent = 0;
-            let mut dispatch = |change: Option<FileChange>| -> Result<(), Error> {
-                let Some(change) = change else {
-                    return writer.wait_for(sent, out);
-                };
-                let sizes = self.repo.sizes(&change).ok();
-                let held = sizes.map_or(0, held_bytes);
-                // A thread hung up only if it panicked; waiting for its
-                // result reports that.
-                if held > writer.budget.limit {
-                    large.send((change, sizes)).ok();
-                    writer.large.push_back(sent);
-                    writer.give_turn();
-                } else {
-                    // Anything held belongs to a file not yet written, and
-                    // the first of those is being diffed, so a result is on
-                    // its way.
-                    while !writer.budget.fits(held) {
-                        writer.wait_one(out)?;
+            // The dispatcher borrows the writer until every change is sent.
+            let result = {
+                let mut dispatch = |change: Option<FileChange>| -> Result<(), Error> {
+                    let Some(change) = change else {
+                        return writer.wait_for(sent, out);
+                    };
+                    let sizes = self.repo.sizes(&change).ok();
+                    let held = sizes.map_or(0, held_bytes);
+                    // A thread hung up only if it panicked; waiting for its
+                    // result reports that.
+                    if held > writer.budget.limit {
+                        large.send((change, sizes)).ok();
+                        writer.large.push_back(sent);
+                        writer.give_turn();
+                    } else {
+                        // Anything held belongs to a file not yet written, and
+                        // the first of those is being diffed, so a result is on
+                        // its way.
+                        while !writer.budget.fits(held) {
+                            writer.wait_one(out)?;
+                        }
+                        writer.budget.take(held);
+                        jobs.send((sent, change, sizes, held)).ok();
                     }
-                    writer.budget.take(held);
-                    jobs.send((sent, change, sizes, held)).ok();
-                }
-                sent += 1;
-                // The first file goes out as soon as it's ready: the rest
-                // of the scan may take a while.
-                if sent == 1 {
-                    writer.wait_for(1, out)
+                    sent += 1;
+                    // The first file goes out as soon as it's ready: the rest
+                    // of the scan may take a while.
+                    if sent == 1 {
+                        writer.wait_for(1, out)
+                    } else {
+                        writer.write_ready(out)
+                    }
+                };
+                let result = self.for_each_change(ctx, &mut dispatch);
+                if result.is_ok() {
+                    dispatch(None)
                 } else {
-                    writer.write_ready(out)
+                    result
                 }
             };
-            let mut result = self.for_each_change(ctx, &mut dispatch);
-            if result.is_ok() {
-                result = dispatch(None);
-            }
-            drop(dispatch);
             drop((jobs, large));
             if result.is_err() {
                 stop.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -976,53 +983,44 @@ pub(crate) fn hunk_header<'a>(hunk: &Hunk, heading: &'a [u8]) -> HunkHeader<'a> 
     }
 }
 
-/// A hunk line as the renderer takes it, and whether its side of the file
-/// ends without a newline right after it.
+/// A hunk line as the renderer takes it; `state` is the line's
+/// [`LineState::of`], which a caller may have stored.
 pub(crate) fn diff_line<'a>(
     fd: &'a FileDiff,
     line: &Line,
+    state: LineState,
     emphasis: &'a [Range<usize>],
     syntax: Option<&'a HunkSyntax>,
-) -> (DiffLine<'a>, bool) {
-    let (kind, raw) = match line.kind {
-        LineKind::Context => (Kind::Context, fd.new.line(line.new)),
-        LineKind::Removed => (Kind::Removed, fd.old.line(line.old)),
-        LineKind::Added => (Kind::Added, fd.new.line(line.new)),
-    };
-    let content = raw.strip_suffix(b"\n");
+) -> DiffLine<'a> {
+    let raw = line_bytes(&fd.old, &fd.new, line);
     // A dimmed or moved line drops its syntax colors, or they'd hide its
     // color.
     let runs = syntax
-        .filter(|_| line.unchanged == Unchanged::No)
+        .filter(|_| !state.is_unchanged())
         .and_then(|s| match line.kind {
             LineKind::Removed => s.old.as_ref().map(|o| o.line(line.old)),
             LineKind::Added | LineKind::Context => s.new.as_ref().map(|n| n.line(line.new)),
         });
-    let diff_line = DiffLine {
-        kind,
-        old: (kind != Kind::Added).then_some(line.old + 1),
-        new: (kind != Kind::Removed).then_some(line.new + 1),
-        text: display_text(content.unwrap_or(raw)),
+    DiffLine {
+        state,
+        old: (line.kind != LineKind::Added).then_some(line.old + 1),
+        new: (line.kind != LineKind::Removed).then_some(line.new + 1),
+        text: display_text(raw.strip_suffix(b"\n").unwrap_or(raw)),
         emphasis,
         syntax: runs,
         paint: &[],
-        unchanged: line.unchanged,
-        modified: line.paired,
         block_start: line.block_start,
-    };
-    (diff_line, content.is_none())
+    }
 }
 
 pub(crate) const NO_NEWLINE_LINE: DiffLine<'static> = DiffLine {
-    kind: Kind::NoNewline,
+    state: LineState::NoNewline,
     old: None,
     new: None,
     text: b"",
     emphasis: &[],
     syntax: None,
     paint: &[],
-    unchanged: Unchanged::No,
-    modified: false,
     block_start: false,
 };
 
@@ -1219,7 +1217,7 @@ fn file_parts(
             .lines
             .iter()
             .enumerate()
-            .filter(|(_, line)| diff_line(fd, line, &[], None).1)
+            .filter(|(_, line)| no_newline(&fd.old, &fd.new, line))
             .map(|(i, _)| i)
             .collect();
         // The hunk line shown at row `i`, or `None` for a marker.
@@ -1235,7 +1233,10 @@ fn file_parts(
             Some(line)
         };
         let row_line = |i: usize| match line_at(i) {
-            Some(l) => diff_line(fd, &hunk.lines[l], &emphasis[l], spans).0,
+            Some(l) => {
+                let line = &hunk.lines[l];
+                diff_line(fd, line, LineState::of(line), &emphasis[l], spans)
+            }
             None => NO_NEWLINE_LINE,
         };
         let len = hunk.lines.len() + markers.len();
@@ -1248,14 +1249,14 @@ fn file_parts(
         draw(HunkRow::Header);
         // Unified rows are the lines in order, with nothing to work out
         // ahead of drawing them.
-        if layout.splits(&header) {
+        if layout.arrangement(&header) == Arrangement::Split {
             let mut rows = Vec::new();
-            layout.hunk_rows(
-                &header,
+            hunk_rows(
+                Arrangement::Split,
                 len,
                 |i| {
                     let line = row_line(i);
-                    (line.kind, line.block_start)
+                    (line.state.kind(), line.block_start)
                 },
                 &mut rows,
             );
@@ -1306,25 +1307,34 @@ pub(crate) fn heading_text(text: &Text, i: usize) -> &[u8] {
 }
 
 /// A commit's header as `git show` prints it, a line at a time.
-pub(crate) fn commit_lines(commit: &CommitInfo) -> Vec<(Role, BString)> {
-    let mut lines = vec![(Role::CommitHeader, format!("commit {}", commit.id).into())];
+pub(crate) fn commit_lines(commit: &CommitInfo) -> Vec<(TextKind, BString)> {
+    let mut lines = vec![(
+        TextKind::CommitHeader,
+        format!("commit {}", commit.id).into(),
+    )];
     if commit.parents.len() > 1 {
         let short: Vec<String> = commit
             .parents
             .iter()
             .map(|p| p.to_hex_with_len(7).to_string())
             .collect();
-        lines.push((Role::Dim, format!("Merge: {}", short.join(" ")).into()));
+        lines.push((
+            TextKind::CommitMeta,
+            format!("Merge: {}", short.join(" ")).into(),
+        ));
     }
     let mut author = BString::from("Author: ");
     author.extend_from_slice(&commit.author);
-    lines.push((Role::Dim, author));
-    lines.push((Role::Dim, format!("Date:   {}", commit.date).into()));
-    lines.push((Role::Plain, BString::default()));
+    lines.push((TextKind::CommitMeta, author));
+    lines.push((
+        TextKind::CommitMeta,
+        format!("Date:   {}", commit.date).into(),
+    ));
+    lines.push((TextKind::Plain, BString::default()));
     for line in commit.message.trim_end().lines() {
         let mut indented = BString::from("    ");
         indented.extend_from_slice(line);
-        lines.push((Role::Plain, indented));
+        lines.push((TextKind::CommitMessage, indented));
     }
     lines
 }

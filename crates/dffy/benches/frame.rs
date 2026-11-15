@@ -16,6 +16,11 @@ use dffy::bench::Frame;
 use dffy_core::diff::Options;
 use dffy_core::git::{FileChange, FileDiff, Repo};
 
+// Allocation counts are deterministic, so `task bench:ab` gates on them
+// with no noise band. Only the benchmark thread is counted.
+#[global_allocator]
+static ALLOC: divan::AllocProfiler = divan::AllocProfiler::system();
+
 const LARGEST: &str = "drivers/net/wireless/realtek/rtw89/rtw8852c_table.c";
 const HIGHLIGHTED: &str = "kernel/sched/fair.c";
 const SIZE: (usize, usize) = (200, 60);
@@ -111,6 +116,28 @@ fn scroll_by_one(bencher: divan::Bencher, case: &str) {
         down = !down;
         frame.draw()
     });
+}
+
+/// The workers' share of opening a file, run on the benchmark thread so the
+/// allocation profiler counts it: the view, every hunk's emphasis and,
+/// per case, highlighting and the syntax diff.
+#[divan::bench(args = ["table", "fair.c", "fair.c highlighted", "fair.c syntax diff"])]
+fn prepare_file(bencher: divan::Bencher, case: &str) {
+    let (largest, highlighted) = DIFFS.clone().expect("checked in main");
+    let diff = if case == "table" {
+        largest
+    } else {
+        highlighted
+    };
+    bencher
+        .with_inputs(|| diff.clone())
+        .bench_local_values(|diff| {
+            Frame::prepare(
+                diff,
+                case.ends_with("highlighted"),
+                case.ends_with("syntax diff"),
+            )
+        });
 }
 
 const FULL: [&str; 2] = ["table", "fair.c"];

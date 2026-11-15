@@ -12,6 +12,7 @@ use unicode_width::UnicodeWidthStr;
 
 use super::fuzzy;
 use crate::keys::{Action, Chord, Group, Keys};
+use crate::render::Attributes;
 use crate::term::{Grid, Key, Mods};
 use crate::theme::{Role, Style, Theme};
 
@@ -131,12 +132,12 @@ impl Line<'_> {
         match self {
             Self::Title(text) => {
                 let mut bold = theme.style(Role::Plain);
-                bold.attributes |= Style::BOLD;
+                bold.attributes |= Attributes::BOLD;
                 grid.put_str(x, y, end, text, bold);
             }
             Self::Entry(row, key_hits, label_hits) => {
                 let mut hit = theme.style(Role::Hint);
-                hit.attributes |= Style::UNDERLINE;
+                hit.attributes |= Attributes::UNDERLINE;
                 let mut keys = row.keys();
                 if keys.width() > key_w {
                     keys.clone_from(&row.key);
@@ -347,7 +348,7 @@ impl Help {
         for (i, name) in TABS.iter().enumerate() {
             let style = if i == self.tab && !searching {
                 let mut s = theme.selected(Style::PLAIN, true);
-                s.attributes |= Style::BOLD;
+                s.attributes |= Attributes::BOLD;
                 s
             } else {
                 Style::PLAIN

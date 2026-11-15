@@ -24,11 +24,10 @@ use dffy_core::git::{FileChange, FileDiff, Mode, Side, Status};
 
 use super::Event;
 use super::view::Counts;
+use crate::pager::for_each_line;
 use crate::pager::parse::{self, FileInfo, Parser, TextKind};
 use crate::pager::stdin::Stdin;
-use crate::pager::{self, for_each_line};
 use crate::render::{FileStatus, Kind};
-use crate::theme::Role;
 
 /// Entries read past the one the viewer shows.
 pub(crate) const READ_AHEAD: usize = 128;
@@ -50,8 +49,8 @@ pub(crate) const MAX_ENTRIES: usize = 1_000_000;
 /// this caps one file at about 150MB.
 const MAX_LINES: usize = 1 << 24;
 
-/// Lines of text with their colors.
-type Lines = Vec<(Role, BString)>;
+/// Lines of text with what each one is.
+type Lines = Vec<(TextKind, BString)>;
 
 pub(crate) enum Item {
     Commit(Arc<Commit>),
@@ -67,16 +66,18 @@ pub(crate) struct Commit {
     /// The commit's full id; `None` for text that isn't a commit.
     pub id: Option<String>,
     pub subject: String,
-    pub lines: Vec<(Role, BString)>,
+    pub lines: Lines,
 }
 
 impl Commit {
     /// The commit as git prints it: id, metadata and message, as the
     /// lines `git show` starts with.
-    pub(crate) fn new(id: String, lines: Vec<(Role, BString)>) -> Self {
+    pub(crate) fn new(id: String, lines: Lines) -> Self {
         let subject = lines
             .iter()
-            .find(|(role, text)| *role == Role::Plain && !text.trim().is_empty())
+            .find(|(kind, text)| {
+                matches!(kind, TextKind::Plain | TextKind::CommitMessage) && !text.trim().is_empty()
+            })
             .map(|(_, text)| text.trim().to_str_lossy().into_owned())
             .unwrap_or_default();
         Self {
@@ -107,8 +108,9 @@ pub(crate) struct PipedFile {
     pub binary: bool,
     pub counts: Counts,
     body: Body,
-    /// A combined diff's lines (`diff --cc`), shown as they came.
-    pub combined: Option<Vec<(Role, BString)>>,
+    /// A combined diff's lines (`diff --cc`), shown as they came, each
+    /// with its number of prefix columns (see [`parse::Event::Combined`]).
+    pub combined: Option<Vec<(usize, BString)>>,
 }
 
 /// A file's hunks as the patch had them, colors removed.
@@ -367,7 +369,7 @@ struct Building {
     info: FileInfo,
     body: Vec<u8>,
     counts: Counts,
-    combined: Option<Vec<(Role, BString)>>,
+    combined: Option<Vec<(usize, BString)>>,
 }
 
 struct Builder {
@@ -395,17 +397,12 @@ impl Builder {
                         .collect();
                     self.pending = Some((Some(id), Vec::new()));
                 }
-                let role = match kind {
-                    TextKind::CommitHeader => Role::CommitHeader,
-                    TextKind::CommitMeta | TextKind::Meta => Role::Dim,
-                    TextKind::Plain | TextKind::CommitMessage => Role::Plain,
-                };
                 // Blank lines don't start a block of text of their own.
                 if self.pending.is_none() && line.trim().is_empty() {
                     return Ok(());
                 }
                 let (_, lines) = self.pending.get_or_insert_with(|| (None, Vec::new()));
-                lines.push((role, line.into()));
+                lines.push((kind, line.into()));
             }
             parse::Event::File(info) => {
                 self.send_file()?;
@@ -461,7 +458,6 @@ impl Builder {
             parse::Event::HunkEnd | parse::Event::Stray(_) => {}
             parse::Event::Combined { parents, line } => {
                 if let Some(f) = &mut self.file {
-                    let role = pager::combined_role(parents, line);
                     let prefix = &line[..parents.min(line.len())];
                     if !line.starts_with(b"@@@") && parents > 0 {
                         f.counts.added += usize::from(prefix.contains(&b'+'));
@@ -470,7 +466,7 @@ impl Builder {
                     }
                     f.combined
                         .get_or_insert_with(Vec::new)
-                        .push((role, line.into()));
+                        .push((parents, line.into()));
                 }
             }
         }
@@ -709,7 +705,10 @@ mod tests {
                 Item::Commit(_) => None,
             })
             .flatten()
-            .map(|(role, line)| format!("{} {line}", role.key()))
+            .map(|(parents, line)| {
+                let role = crate::pager::combined_role(*parents, line);
+                format!("{} {line}", role.key())
+            })
             .collect();
         insta::assert_snapshot!(combined.join("\n"), @r"
         dim index e0fe810,218dcf7..2f61be3

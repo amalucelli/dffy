@@ -1,0 +1,11 @@
+---
+source: crates/dffy/src/tui/view/tests.rs
+expression: "tops.join(\"\\n\")"
+---
+x: 50 50  │ line 50
+x again: 50 50  │ line 50
+x: 50 50  │ line 50
+X on: 50 50  │ line 50
+X off: 50 50  │ line 50
+X on: 30 30  │ line 30
+X off: ⋯ 50 unchanged lines  @@ -57,7 +57,7 @@ line 56

@@ -1,0 +1,14 @@
+---
+source: crates/dffy/src/tui/app.rs
+expression: after
+---
+ ‹ 1/2 a.rs › +1 -1                         @@ -1,7 +1,7 @@
+       │ gh to wrap a line long enough to wrap a line long █
+       │ enough to wrap a line long enough to wrap a line l
+       │ ong enough to wrap a line long enough to wrap a li
+       │ ne long enough to wrap a line long enough to wrap
+       │ a line long enough to wrap
+ 5  5  │ line 5
+ 6  6  │ line 6
+ 7  7  │ line 7
+»  working tree  1/1 hunk  unified wrap          ␣ commands

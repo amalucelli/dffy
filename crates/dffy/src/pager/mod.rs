@@ -9,10 +9,10 @@ pub(crate) mod stdin;
 use std::io::{self, BufRead, BufReader, Read};
 use std::ops::Range;
 
-use dffy_core::diff::{Emphasis, emphasize_lines};
+use dffy_core::diff::{Emphasis, Unchanged, emphasize_lines};
 
 use crate::render::{
-    Canvas, DiffLine, FileHeader, FileStatus, HunkHeader, Kind, Layout, display_text,
+    Canvas, DiffLine, FileHeader, FileStatus, HunkHeader, Kind, Layout, LineState, display_text,
 };
 use crate::theme::Role;
 use parse::{Event, FileInfo, Parser, TextKind};
@@ -86,6 +86,16 @@ pub(crate) fn run(
         |line| parser.feed(line, &mut |event| renderer.borrow_mut().event(event)),
     )?;
     parser.finish(&mut |event| renderer.borrow_mut().event(event))
+}
+
+/// The color of a line of text outside the diff: a commit's header, its
+/// metadata, its message, or anything else.
+pub(crate) fn text_role(kind: TextKind) -> Role {
+    match kind {
+        TextKind::Plain | TextKind::CommitMessage => Role::Plain,
+        TextKind::CommitHeader => Role::CommitHeader,
+        TextKind::CommitMeta | TextKind::Meta => Role::Dim,
+    }
 }
 
 /// The color of a combined diff's line, by its prefix columns (`parents`
@@ -163,13 +173,8 @@ impl<F: FnMut(Sink) -> io::Result<()>> Renderer<F> {
     fn event(&mut self, event: Event) -> io::Result<()> {
         match event {
             Event::Text(kind, text) => {
-                let role = match kind {
-                    TextKind::Plain | TextKind::CommitMessage => Role::Plain,
-                    TextKind::CommitHeader => Role::CommitHeader,
-                    TextKind::CommitMeta | TextKind::Meta => Role::Dim,
-                };
                 self.layout
-                    .text_line(role, display_text(text), &mut self.canvas);
+                    .text_line(text_role(kind), display_text(text), &mut self.canvas);
                 self.prev_blank = text.is_empty();
             }
             Event::File(info) => self.file(info),
@@ -265,7 +270,7 @@ impl<F: FnMut(Sink) -> io::Result<()>> Renderer<F> {
             .iter()
             .zip(&emphasis)
             .map(|(l, (emphasis, paired))| DiffLine {
-                kind: l.kind,
+                state: LineState::new(l.kind, *paired, Unchanged::No),
                 old: l.old,
                 new: l.new,
                 text: if l.kind == Kind::NoNewline {
@@ -279,8 +284,6 @@ impl<F: FnMut(Sink) -> io::Result<()>> Renderer<F> {
                 // and hunk fragments parse poorly without their file.
                 syntax: None,
                 paint: &[],
-                unchanged: dffy_core::diff::Unchanged::No,
-                modified: *paired,
                 block_start: false,
             })
             .collect();

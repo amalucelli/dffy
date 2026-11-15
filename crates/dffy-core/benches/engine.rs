@@ -13,6 +13,11 @@ use std::sync::LazyLock;
 use dffy_core::diff::{self, Options, Text, Whitespace};
 use dffy_core::git::{DiffSpec, FileChange, Repo, Side, Status};
 
+// Allocation counts are deterministic, so `task bench:ab` gates on them
+// with no noise band. Only the benchmark thread is counted.
+#[global_allocator]
+static ALLOC: divan::AllocProfiler = divan::AllocProfiler::system();
+
 const LARGEST: &str = "drivers/net/wireless/realtek/rtw89/rtw8852c_table.c";
 
 struct Pair {

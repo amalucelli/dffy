@@ -11,8 +11,7 @@ dffy                   # everything you haven't committed
 dffy main..HEAD        # any revision git understands
 ```
 
-<!-- screenshot: add assets/screenshot.png (or a GIF) and uncomment the line below -->
-<!-- <p align="center"><img src="assets/screenshot.png" alt="dffy reviewing the Linux v6.0..v6.1 diff"></p> -->
+<p align="center"><img src="assets/screenshot.png" alt="dffy reviewing the Linux v6.0..v6.1 diff"></p>
 
 ## Install
 

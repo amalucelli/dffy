@@ -1,0 +1,9 @@
+---
+source: crates/dffy/src/render/stat.rs
+expression: c.markup()
+---
+ src/main.rs                                        | 150 <added>++++++++++++++++</><removed>-----</>
+ README.md                                          |   1 <added>+</>
+ .../that/does/not/fit/in/the/name/column/file.rs   |   2 <removed>-</>
+ logo.png                                           | Bin <removed>1024</> -> <added>2048</> bytes
+ 4 files changed, <added>121 insertions(+)</>, <removed>32 deletions(-)</>

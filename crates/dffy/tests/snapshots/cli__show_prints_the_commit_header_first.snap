@@ -1,0 +1,13 @@
+---
+source: crates/dffy/tests/cli.rs
+expression: stdout(&out)
+---
+commit 97f245f70caa92c8e45f9fa8a9d1e6044bbf9342
+Author: Ada Lovelace <ada@example.com>
+Date:   Fri Mar 1 12:00:00 2024 +0100
+
+    Widen add to i64
+
+M	README.md
+D	old.txt
+M	src/lib.rs

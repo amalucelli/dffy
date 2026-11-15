@@ -1,0 +1,16 @@
+---
+source: crates/dffy/src/tui/app.rs
+expression: screen(&mut app)
+---
+ ‹ 1/2 file.rs › +2 -2
+┌ Files · 2 +2 -2 ─────────────────────┐
+│ ▼ src/                               │
+│   ▼ some/deeply/nested/module/       │
+│     M file.rs                +2   -2 │
+│   M zz.rs                            │
+│                                      │
+│                                      │
+│                                      │
+│                                      │
+└«─────────────────────────────────────┘
+   working tree  1/2 hunk    ␣ commands

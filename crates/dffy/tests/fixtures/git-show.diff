@@ -1,0 +1,75 @@
+commit 80f116fc5dc99b9bc38a6e38344657fdf68f1cb4
+Author: Ada Lovelace <ada@example.com>
+Date:   Fri Mar 1 12:00:00 2024 +0100
+
+    Widen calc to long and tidy files
+    
+    Body paragraph explaining why.
+
+diff --git a/added.md b/added.md
+new file mode 100644
+index 0000000..133ab09
+--- /dev/null
++++ b/added.md
+@@ -0,0 +1 @@
++a brand new file
+diff --git a/build.sh b/build.sh
+old mode 100644
+new mode 100755
+diff --git a/calc.c b/calc.c
+index 6ff3ef8..f331ca1 100644
+--- a/calc.c
++++ b/calc.c
+@@ -1,13 +1,14 @@
+ #include <stdio.h>
+ 
+-static int add(int a, int b)
++static long add(long a, long b)
+ {
+ 	return a + b;
+ }
+ 
+ int main(void)
+ {
+-	int total = add(1, 2);
+-	printf("total: %d\n", total);
++	long total = add(1, 2);
++	printf("total: %ld\n", total);
++	printf("done\n");
+ 	return 0;
+ }
+diff --git a/gone.txt b/gone.txt
+deleted file mode 100644
+index 6e263ab..0000000
+--- a/gone.txt
++++ /dev/null
+@@ -1 +0,0 @@
+-obsolete
+diff --git a/old_name.py b/greetings.py
+similarity index 83%
+rename from old_name.py
+rename to greetings.py
+index ba08fcb..8a909fa 100644
+--- a/old_name.py
++++ b/greetings.py
+@@ -3,7 +3,7 @@ def greet(name):
+ 
+ 
+ def farewell(name):
+-    print("goodbye", name)
++    print("bye", name)
+ 
+ 
+ if __name__ == "__main__":
+diff --git a/logo.png b/logo.png
+index 029ace0..d186a24 100644
+Binary files a/logo.png and b/logo.png differ
+diff --git a/notes.txt b/notes.txt
+index 9c40573..1315b15 100644
+--- a/notes.txt
++++ b/notes.txt
+@@ -1,2 +1,2 @@
+ first line
+-second line
+\ No newline at end of file
++second line, edited

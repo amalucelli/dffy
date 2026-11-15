@@ -1,0 +1,20 @@
+[package]
+name = "dffy-render-markdown"
+description = "An experimental dffy renderer plugin that shows Markdown diffs rendered"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+readme.workspace = true
+keywords = ["diff", "markdown", "terminal", "dffy"]
+categories = ["command-line-utilities", "development-tools"]
+
+[lints]
+workspace = true
+
+[dependencies]
+pulldown-cmark = { version = "0.13.6", default-features = false }
+serde_json = "1.0.154"
+unicode-width = "0.2.3"

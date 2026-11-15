@@ -1,0 +1,56 @@
+---
+source: crates/dffy/src/pager/tests.rs
+expression: "render(fixture!(\"git-diff.diff\"), SPLIT)"
+---
+<file-header>new file: added.md</>
+<file-header>──────────────────</>
+<hunk-header>@@ -0,0 +1 @@</>
+<added-number>1</><dim> │</><added>+a brand new file</>
+
+<file-header>modified: build.sh</><dim> (mode 100644 → 100755)</>
+<file-header>─────────────────────────────────────────</>
+
+<file-header>modified: calc.c</>
+<file-header>────────────────</>
+<hunk-header>@@ -1,13 +1,14 @@</>
+<line-number> 1</><dim> │</> #include <stdio.h>                          <dim>│</><line-number> 1</><dim> │</> #include <stdio.h>
+<line-number> 2</><dim> │</>                                             <dim>│</><line-number> 2</><dim> │</> 
+<modified-number> 3</><dim> │</><modified>-static </><removed-emph>int</><modified> add(</><removed-emph>int</><modified> a, </><removed-emph>int</><modified> b)                </><dim>│</><modified-number> 3</><dim> │</><modified>+static </><added-emph>long</><modified> add(</><added-emph>long</><modified> a, </><added-emph>long</><modified> b)</>
+<line-number> 4</><dim> │</> {                                           <dim>│</><line-number> 4</><dim> │</> {
+<line-number> 5</><dim> │</>     return a + b;                           <dim>│</><line-number> 5</><dim> │</>     return a + b;
+<line-number> 6</><dim> │</> }                                           <dim>│</><line-number> 6</><dim> │</> }
+<line-number> 7</><dim> │</>                                             <dim>│</><line-number> 7</><dim> │</> 
+<line-number> 8</><dim> │</> int main(void)                              <dim>│</><line-number> 8</><dim> │</> int main(void)
+<line-number> 9</><dim> │</> {                                           <dim>│</><line-number> 9</><dim> │</> {
+<modified-number>10</><dim> │</><modified>-    </><removed-emph>int</><modified> total = add(1, 2);                  </><dim>│</><modified-number>10</><dim> │</><modified>+    </><added-emph>long</><modified> total = add(1, 2);</>
+<modified-number>11</><dim> │</><modified>-    printf("total: %</><removed-emph>d</><modified>\n", total);           </><dim>│</><modified-number>11</><dim> │</><modified>+    printf("total: %</><added-emph>ld</><modified>\n", total);</>
+  <dim> │</>                                             <dim>│</><added-number>12</><dim> │</><added>+    printf("done\n");</>
+<line-number>12</><dim> │</>     return 0;                               <dim>│</><line-number>13</><dim> │</>     return 0;
+<line-number>13</><dim> │</> }                                           <dim>│</><line-number>14</><dim> │</> }
+
+<file-header>deleted file: gone.txt</>
+<file-header>──────────────────────</>
+<hunk-header>@@ -1 +0,0 @@</>
+<removed-number>1</><dim> │</><removed>-obsolete</>
+
+<file-header>renamed: old_name.py → greetings.py</><dim> (83% similar)</>
+<file-header>─────────────────────────────────────────────────</>
+<dim>⋯ 2 unchanged lines  @@ -3,7 +3,7 @@ def greet(name):</>
+<line-number> 3</><dim> │</>                                             <dim>│</><line-number> 3</><dim> │</> 
+<line-number> 4</><dim> │</>                                             <dim>│</><line-number> 4</><dim> │</> 
+<line-number> 5</><dim> │</> def farewell(name):                         <dim>│</><line-number> 5</><dim> │</> def farewell(name):
+<modified-number> 6</><dim> │</><modified>-    print("</><removed-emph>goodbye</><modified>", name)                  </><dim>│</><modified-number> 6</><dim> │</><modified>+    print("</><added-emph>bye</><modified>", name)</>
+<line-number> 7</><dim> │</>                                             <dim>│</><line-number> 7</><dim> │</> 
+<line-number> 8</><dim> │</>                                             <dim>│</><line-number> 8</><dim> │</> 
+<line-number> 9</><dim> │</> if __name__ == "__main__":                  <dim>│</><line-number> 9</><dim> │</> if __name__ == "__main__":
+
+<file-header>modified: logo.png</>
+<file-header>──────────────────</>
+<dim>binary files differ</>
+
+<file-header>modified: notes.txt</>
+<file-header>───────────────────</>
+<hunk-header>@@ -1,2 +1,2 @@</>
+<line-number>1</><dim> │</> first line                                   <dim>│</><line-number>1</><dim> │</> first line
+<modified-number>2</><dim> │</><modified>-second line                                  </><dim>│</><modified-number>2</><dim> │</><modified>+second line</><added-emph>, edited</>
+ <dim> │\ No newline at end of file</>

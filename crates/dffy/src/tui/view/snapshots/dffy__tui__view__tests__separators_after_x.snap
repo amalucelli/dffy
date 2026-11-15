@@ -1,0 +1,6 @@
+---
+source: crates/dffy/src/tui/view/tests.rs
+expression: "separators(&mut doc).join(\"\\n\")"
+---
+⋯ 30 unchanged lines  @@ -57,7 +57,7 @@ line 56
+⋯ 17 unchanged lines

@@ -1,0 +1,16 @@
+---
+source: crates/dffy/src/tui/app.rs
+expression: shown
+---
+ ‹ 1/2 file.rs › +2 -2
+⋯                                                          █
+  │ line 1                                                 ┃
+  │ line 2
+  │ line 3
+ -│ line 4
+ +│ line four
+  │ line 5
+  │ line 6
+  │ line 7                                                 ▐
+⋯ 39 unchanged lines · line 46
+»  working tree  1/2 hunk  hunk headers off      ␣ commands

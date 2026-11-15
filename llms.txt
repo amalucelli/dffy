@@ -1,0 +1,24 @@
+# dffy
+
+> dffy is a terminal diff viewer for git, written in Rust and benchmarked on the Linux kernel repository. On a terminal it opens a full-screen viewer with split or unified layout, syntax highlighting, changed-word emphasis, an optional syntax-aware diff and watch mode. When output is piped it prints a diff instead. It works as git's pager (`core.pager = dffy`) and as the `git add -p` filter (`dffy --color-only`).
+
+It runs on Linux and macOS. `docs/keys.md` and the settings table in `docs/config.md` are generated from the binary.
+
+## Docs
+
+- [Install](docs/install.md): Homebrew, the install script, mise, building from source, renderer plugins, shell completions, the man page, platforms.
+- [Usage](docs/usage.md): every subcommand and flag, revision and path syntax, reading a diff from stdin, comparing two files or folders outside git (`dffy a b`, `--no-index`), exit codes, environment variables.
+- [Viewer](docs/viewer.md): the full-screen viewer's layout, panels, search, selection and copy, small screens.
+- [Keys](docs/keys.md): every viewer action with its default keys, the tree and command-panel keys, and `keybind` syntax.
+- [Configuration](docs/config.md): the config file format, every setting with its default and values, remembered settings and precedence.
+- [Themes](docs/themes.md): built-in themes, custom theme files and their roles.
+- [Git integration](docs/git.md): pager setup, `interactive.diffFilter`, `git difftool`, `diff.external`, piped input, staging, unborn repositories.
+- [Watch mode](docs/watch.md): what's watched, the `dffyd` broker, inotify limits, macOS FSEvents.
+- [Renderer plugins](docs/plugins.md): experimental `dffy-render-<name>` programs that show files rendered, diffed block by block, and the Markdown plugin; the `render` setting, `r`, the versioned JSON protocol over stdin and stdout, a minimal Python renderer, timeouts and caching.
+- [Troubleshooting](docs/troubleshooting.md): `dffy doctor` checks, clipboard and OSC 52, mouse selection, colors, terminal reset.
+
+## Contributing
+
+- [Architecture](docs/architecture.md): crates and modules, data flow, the diff and syntax engines, the watcher and renderer, performance budgets, testing, dependencies and releases.
+- [Benchmarks](docs/benchmarks.md): dffy against delta, diff-so-fancy, difftastic, hunk and lumen on the Linux kernel's v6.0..v6.1 (time to first byte and frame, totals, peak memory), the feature comparison with a source for every cell, and `bench/compare.sh` to rerun them.
+- [README](README.md): the project overview.

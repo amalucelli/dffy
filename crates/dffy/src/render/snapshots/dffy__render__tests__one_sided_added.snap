@@ -1,0 +1,9 @@
+---
+source: crates/dffy/src/render/tests.rs
+expression: "print_file(Status::Added, \"\", text, layout(true, Some(60), false))"
+---
+<file-header>new file: f.txt</>
+<file-header>───────────────</>
+<hunk-header>@@ -0,0 +1,2 @@</>
+<added-number>1</><dim> │</><added>+first line</>
+<added-number>2</><dim> │</><added>+a second line that is long enough to need more than hal</><dim>…</>

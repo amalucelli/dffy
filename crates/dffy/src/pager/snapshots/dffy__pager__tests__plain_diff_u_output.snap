@@ -1,0 +1,12 @@
+---
+source: crates/dffy/src/pager/tests.rs
+expression: "render(fixture!(\"diff-u.diff\"), UNIFIED)"
+---
+<file-header>modified: b/f.txt</>
+<file-header>─────────────────</>
+<hunk-header>@@ -1,3 +1,4 @@</>
+<line-number>1</> <line-number>1</><dim> │</> one
+<removed-number>2</>  <dim> │</><removed>-two</>
+  <added-number>2</><dim> │</><added>+2</>
+<line-number>3</> <line-number>3</><dim> │</> three
+  <added-number>4</><dim> │</><added>+four</>

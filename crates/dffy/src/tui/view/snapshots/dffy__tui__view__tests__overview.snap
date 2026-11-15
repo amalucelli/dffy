@@ -1,0 +1,5 @@
+---
+source: crates/dffy/src/tui/view/tests.rs
+expression: column
+---
+█┃┃┃┃         ▐

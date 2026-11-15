@@ -1,0 +1,14 @@
+---
+source: crates/dffy/src/tui/app.rs
+assertion_line: 3841
+expression: "tree_panel(120, &files)"
+---
+┌ Files · 4 +143 -0 ────────────┐
+│ M README.md             +3    │
+│ ▼ crates/dffy/src/tui/        │
+│   M app.rs            +127    │
+│   ▼ snapshots/                │
+│     M …long_name.snap  +12    │
+│ M x                     +1    │
+│                               │
+└«──────────────────────────────┘

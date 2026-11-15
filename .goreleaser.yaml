@@ -1,0 +1,111 @@
+version: 2
+
+project_name: dffy
+
+builds:
+  # Split by OS rather than one zigbuild block for everything: the release runs on macOS,
+  # where the Apple targets build with the native toolchain and only the Linux ones need
+  # zig to supply a glibc.
+  - id: darwin
+    builder: rust
+    binary: dffy
+    tool: cargo
+    command: build
+    # A workspace root has no binary of its own, so name the package that builds it.
+    flags: [--release, --package=dffy]
+    targets:
+      - aarch64-apple-darwin
+      - x86_64-apple-darwin
+
+  - id: linux
+    builder: rust
+    binary: dffy
+    flags: [--release, --package=dffy]
+    targets:
+      - aarch64-unknown-linux-gnu
+      - x86_64-unknown-linux-gnu
+
+  # The Markdown renderer plugin ships in the same release as its own opt-in archive.
+  - id: render-markdown-darwin
+    builder: rust
+    binary: dffy-render-markdown
+    tool: cargo
+    command: build
+    flags: [--release, --package=dffy-render-markdown]
+    targets:
+      - aarch64-apple-darwin
+      - x86_64-apple-darwin
+
+  - id: render-markdown-linux
+    builder: rust
+    binary: dffy-render-markdown
+    flags: [--release, --package=dffy-render-markdown]
+    targets:
+      - aarch64-unknown-linux-gnu
+      - x86_64-unknown-linux-gnu
+
+archives:
+  - id: dffy
+    ids: [darwin, linux]
+    # No version in the name: install.sh fetches releases/latest/download/<name>
+    # without asking the GitHub API which tag is latest.
+    name_template: "{{ .ProjectName }}_{{ .Os }}_{{ .Arch }}"
+    formats: [tar.gz]
+
+  - id: dffy-render-markdown
+    ids: [render-markdown-darwin, render-markdown-linux]
+    name_template: "dffy-render-markdown_{{ .Os }}_{{ .Arch }}"
+    formats: [tar.gz]
+
+checksum:
+  # install.sh fetches this by name.
+  name_template: checksums.txt
+
+homebrew_casks:
+  - name: dffy
+    ids: [dffy]
+    description: "A fast terminal diff viewer for large repos: side-by-side TUI, git pager, and watch mode."
+    homepage: https://github.com/amalucelli/dffy
+    repository:
+      owner: amalucelli
+      name: homebrew-tap
+    hooks:
+      post:
+        install: |
+          if system_command("/usr/bin/xattr", args: ["-h"]).exit_status == 0
+            system_command "/usr/bin/xattr", args: ["-dr", "com.apple.quarantine", "#{staged_path}/dffy"]
+          end
+
+  - name: dffy-render-markdown
+    ids: [dffy-render-markdown]
+    description: "Experimental Markdown renderer plugin for dffy"
+    homepage: https://github.com/amalucelli/dffy
+    repository:
+      owner: amalucelli
+      name: homebrew-tap
+    hooks:
+      post:
+        install: |
+          if system_command("/usr/bin/xattr", args: ["-h"]).exit_status == 0
+            system_command "/usr/bin/xattr", args: ["-dr", "com.apple.quarantine", "#{staged_path}/dffy-render-markdown"]
+          end
+
+changelog:
+  sort: asc
+  use: github
+  # The default template falls back to name and email when no GitHub account
+  # resolves for the commit author — drop the attribution instead.
+  format: "{{ .SHA }}: {{ .Message }}{{ if .Logins }} ({{ .Logins | englishJoin }}){{ end }}"
+  filters:
+    exclude:
+      - '^doc:'
+      - '^docs:'
+      - '^test:'
+      - '^chore:'
+  groups:
+    - title: 'New Features'
+      regexp: "^.*feat:+.*$"
+      order: 0
+    - title: 'Bug Fixes'
+      regexp: "^.*fix:+.*$"
+      order: 1

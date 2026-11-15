@@ -1,0 +1,5 @@
+exclude = ["target/**", ".claude/**"]
+
+[formatting]
+align_entries = false
+column_width = 100

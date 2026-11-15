@@ -1,0 +1,8 @@
+# The syntax diff's parse budget is wall-clock, so its kernel test fails when
+# the folder-comparison kernel test, which loads every core, runs beside it.
+[test-groups]
+kernel-heavy = { max-threads = 1 }
+
+[[profile.default.overrides]]
+filter = "test(=structural_research_files) | test(=two_copies_of_a_kernel_folder_match_git_no_index)"
+test-group = "kernel-heavy"

@@ -1,0 +1,8 @@
+---
+source: crates/dffy/src/render/tests.rs
+expression: "render(old, new, layout(true, Some(60), true))"
+---
+<hunk-header>@@ -1 +1 @@</> fn main()
+<modified-number>1</><dim> │</><modified>-a = "the quick brown </><removed-emph>fox</><modified> </><dim>│</><modified-number>1</><dim> │</><modified>+a = "the quick brown </><added-emph>cat</><modified> j</>
+ <dim> │</><modified> jumps over the lazy dog" </><dim>│</> <dim> │</><modified> umps over the lazy dog</><added-emph> and</>
+ <dim> │</><modified>                          </><dim>│</> <dim> │</><modified> </><added-emph> keeps going</><modified>"</>

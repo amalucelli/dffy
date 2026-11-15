@@ -1,0 +1,32 @@
+# Build output
+/target/
+/dist/
+
+# insta snapshot scratch files; reviewed snapshots are `.snap` and stay tracked
+*.pending-snap
+*.snap.new
+
+# Profiling and coverage
+perf.data*
+flamegraph*.svg
+*.profraw
+*.profdata
+/lcov.info
+
+# Python caches from bench/
+__pycache__/
+*.py[cod]
+.venv/
+
+# Claude Code machine-local state
+/.claude/settings.local.json
+/.claude/worktrees/
+/.claude/research/
+/.claude/specs/
+
+# OS and editor files
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*~

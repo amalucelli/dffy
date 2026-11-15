@@ -1,0 +1,8 @@
+---
+source: crates/dffy/src/render/tests.rs
+expression: "render(\"short\\n\", &new, layout(false, Some(40), true))"
+---
+<hunk-header>@@ -1 +1 @@</> fn main()
+<removed-number>1</>  <dim> │</><removed>-short</>
+  <added-number>1</><dim> │</><added>+word word word word word word word</>
+   <dim> │</><added>  word word word word word </>

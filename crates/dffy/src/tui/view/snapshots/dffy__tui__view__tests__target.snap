@@ -1,0 +1,5 @@
+---
+source: crates/dffy/src/tui/view/tests.rs
+expression: "marked.join(\"\\n\")"
+---
+x> ⋯ 50 unchanged lines  @@ -57,7 +57,7 @@ line 56

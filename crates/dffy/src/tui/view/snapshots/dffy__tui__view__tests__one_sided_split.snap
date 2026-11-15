@@ -1,0 +1,8 @@
+---
+source: crates/dffy/src/tui/view/tests.rs
+assertion_line: 315
+expression: screen(&mut doc)
+---
+1 +│ fn added() {
+2 +│     let a_long_line_that_uses_the_whole_width = 1;
+3 +│ }

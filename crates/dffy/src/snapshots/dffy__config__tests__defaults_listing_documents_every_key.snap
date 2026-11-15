@@ -1,0 +1,296 @@
+---
+source: crates/dffy/src/config.rs
+assertion_line: 1009
+expression: text
+---
+<dim># Color output: auto, always or never. With auto, NO_COLOR and CLICOLOR_FORCE apply.</>
+<hint>color</><dim> = </>auto
+
+<dim># Page output on a terminal: auto or never.</>
+<hint>paging</><dim> = </>auto
+
+<dim># Pager command, run through sh. Empty uses $PAGER, then less -RFX. DFFY_PAGER overrides it.</>
+<hint>pager</><dim> = </>
+
+<dim># Theme name: a built-in or a file in the themes directory next to this file.</>
+<hint>theme</><dim> = </>default
+
+<dim># Diff layout: auto, split or unified. Auto splits on terminals at least split-min-width wide.</>
+<hint>view</><dim> = </>auto
+
+<dim># How changed lines are marked besides their color: background (a tint behind the line and a stronger one behind its numbers), bars (a colored bar in the gutter), classic (+ and - signs) or none. Auto picks background on truecolor terminals (COLORTERM=truecolor or 24bit) and bars otherwise. Without color, classic signs are always used so the output stays a readable diff.</>
+<hint>indicators</><dim> = </>auto
+
+<dim># How a changed line is colored when it pairs with the line it was edited into: changed (both lines in the modified color, theme keys `modified`, `modified-line` and `modified-number`, with only the edited tokens in red and green) or added-removed (a red line and a green one, as for lines wholly removed or added). Lines without a partner are red or green either way. --color-only keeps red and green.</>
+<hint>modified-lines</><dim> = </>changed
+
+<dim># The terminal's background for the tints of indicators = background: auto, dark or light. Auto starts dark and asks the terminal (OSC 11), switching to light tints if it answers within 200ms; printed output uses dark.</>
+<hint>background</><dim> = </>auto
+
+<dim># Terminal width in columns from which view = auto picks the split layout.</>
+<hint>split-min-width</><dim> = </>140
+
+<dim># Wrap long lines instead of truncating them.</>
+<hint>wrap</><dim> = </>false
+
+<dim># Columns per tab stop.</>
+<hint>tab-width</><dim> = </>4
+
+<dim># Lines of context around each change (-U), or full for the whole file with changes inline. In the viewer, `X` switches every file between the two and is remembered; `x` reveals hidden lines in one file, for that run.</>
+<hint>context</><dim> = </>3
+
+<dim># Ignore all whitespace when comparing lines (-w). The command panel's `W` toggles it in the viewer.</>
+<hint>ignore-all-space</><dim> = </>false
+
+<dim># Ignore changes in the amount of whitespace (-b). The command panel's `W` toggles between ignoring all whitespace and none.</>
+<hint>ignore-space-change</><dim> = </>false
+
+<dim># What dffy without revisions shows: all (everything not committed: HEAD against the working tree, with staged, unstaged and untracked files, each file marked by its staging) or unstaged (the working tree against the index, as plain git diff, which hides staged and untracked files; the same as --unstaged). --staged and revisions are unaffected.</>
+<hint>default-diff</><dim> = </>all
+
+<dim># Detect renames as git diff -M does. Printed output waits for the rename pass when there are both added and deleted files; the viewer shows them unpaired first.</>
+<hint>renames</><dim> = </>true
+
+<dim># Syntax-highlight code in diffs (with color on). Files over 512KB are never highlighted.</>
+<hint>highlight</><dim> = </>true
+
+<dim># Diff code by syntax: emphasize only changed tokens (reordered arguments included), dim code that was only reformatted (~) and mark whole statements or items that moved (», theme key `moved`). `d` toggles it in the viewer. Files over 2MB or in unknown languages keep the line diff.</>
+<hint>syntax-diff</><dim> = </>false
+
+<dim># Experimental: renderer plugins by file extension, as space-separated extension:name pairs (md:markdown csv:csv). A file of a listed type can show rendered in the viewer, with `r`, by the program dffy-render-<name> on PATH, which is looked up and run only then. See docs/plugins.md.</>
+<hint>render</><dim> = </>
+
+<dim># Show files that have a renderer (see render) rendered in the viewer, diffed block by block, instead of as lines; `r` toggles it.</>
+<hint>rendered</><dim> = </>false
+
+<dim># Start the viewer in watch mode, refreshing as files, the index or refs change; `w` toggles it. With nothing to show, a watching viewer opens and waits for changes instead of printing that there are none.</>
+<hint>watch</><dim> = </>false
+
+<dim># Whether the viewer starts with the file tree: auto shows it on terminals at least 100 columns wide, show also opens it on narrower ones, over the diff, and hide starts without it. `t` and `T` toggle it; a `show` remembered from a wide terminal doesn't open it over the diff on a narrow one.</>
+<hint>tree</><dim> = </>auto
+
+<dim># The tree's width in columns, or auto for 28% of the terminal (24 to 60 columns). `+` and `-` in the tree change it.</>
+<hint>tree-width</><dim> = </>auto
+
+<dim># Where the viewer shows what's compared, the position, the modes and the key hints: bottom (in the frame's bottom border) or top (in its top border, after the file's name). The command panel's `b` switches it.</>
+<hint>status-bar</><dim> = </>bottom
+
+<dim># Show line numbers, in the viewer and in printed diffs. Without them the change marks stay.</>
+<hint>line-numbers</><dim> = </>true
+
+<dim># Show the @@ -a,b +c,d @@ numbers of hunks; without them a hunk shows only its function and the ⋯ N unchanged lines before it.</>
+<hint>hunk-headers</><dim> = </>true
+
+<dim># Copies from the viewer include each line's number and its +/- sign, for pasting into a review, rather than only the code.</>
+<hint>copy-decorations</><dim> = </>false
+
+<dim># Remember the view choices made in the viewer (layout, wrap, the tree and its width, the status bar, indicators, modified lines, syntax diff, rendered view, highlighting, theme, mouse, line numbers, hunk headers, copy decorations, whole files, ignored whitespace, watch mode) for the next run, in $XDG_STATE_HOME/dffy/state. A choice made in the viewer beats this file in the viewer; a flag beats both, for that run only. Printed output never takes them. A remembered split layout shows unified under 100 columns; --split doesn't.</>
+<hint>remember</><dim> = </>true
+
+<dim># Show the one-time tip about the command panel on the first run of the viewer.</>
+<hint>tips</><dim> = </>true
+
+<dim># Take mouse input in the viewer: clicks, the wheel, and dragging over code to select and copy it. `M` turns it off for the terminal's own selection (many terminals, Ghostty included, also select natively with shift held while dragging).</>
+<hint>mouse</><dim> = </>true
+
+<dim># Keep results that are slow to compute (renames, highlighting of large files) in $XDG_CACHE_HOME/dffy.</>
+<hint>cache</><dim> = </>true
+
+<dim># Size the disk cache is trimmed to, least recently used first: bytes, or a number with K, M or G.</>
+<hint>cache-size</><dim> = </>256M
+
+<dim># Keys in the viewer: keybind = <key>=<action>, or <key>=unbind to free a key. A key is a character as typed (n, N, <, ?) or a name (space, enter, tab, shift+tab, esc, backspace, up, down, left, right, home, end, page_up, page_down, insert, delete, f1 to f12), with ctrl+ or alt+ before it. Keys pressed in the file tree look in its own table first, set with tree: before the key (keybind = tree:v=mark_viewed). The command panel the leader key opens has its own table too, set with leader: (keybind = leader:z=toggle_wrap); the menu lists its entries in this order.</>
+
+<dim># leader: open the command panel; its next key runs a command</>
+<hint>keybind</><dim> = </>space=leader
+
+<dim># scroll_down: scroll down a line; in the tree, move down</>
+<hint>keybind</><dim> = </>j=scroll_down
+<hint>keybind</><dim> = </>down=scroll_down
+<hint>keybind</><dim> = </>enter=scroll_down
+<hint>keybind</><dim> = </>ctrl+e=scroll_down
+<hint>keybind</><dim> = </>ctrl+n=scroll_down
+
+<dim># scroll_up: scroll up a line; in the tree, move up</>
+<hint>keybind</><dim> = </>k=scroll_up
+<hint>keybind</><dim> = </>up=scroll_up
+<hint>keybind</><dim> = </>ctrl+y=scroll_up
+<hint>keybind</><dim> = </>ctrl+p=scroll_up
+
+<dim># page_down: scroll down a screen</>
+<hint>keybind</><dim> = </>page_down=page_down
+<hint>keybind</><dim> = </>ctrl+f=page_down
+
+<dim># page_up: scroll up a screen</>
+<hint>keybind</><dim> = </>b=page_up
+<hint>keybind</><dim> = </>page_up=page_up
+<hint>keybind</><dim> = </>ctrl+b=page_up
+
+<dim># half_page_down: scroll down half a screen</>
+<hint>keybind</><dim> = </>ctrl+d=half_page_down
+
+<dim># half_page_up: scroll up half a screen</>
+<hint>keybind</><dim> = </>ctrl+u=half_page_up
+
+<dim># top: top of the file</>
+<hint>keybind</><dim> = </>g=top
+<hint>keybind</><dim> = </>home=top
+
+<dim># bottom: bottom of the file</>
+<hint>keybind</><dim> = </>G=bottom
+<hint>keybind</><dim> = </>end=bottom
+
+<dim># next_change: next change, on into the next file</>
+<hint>keybind</><dim> = </>n=next_change
+<hint>keybind</><dim> = </>}=next_change
+
+<dim># prev_change: previous change, back into the previous file</>
+<hint>keybind</><dim> = </>N=prev_change
+<hint>keybind</><dim> = </>{=prev_change
+
+<dim># next_file: next file</>
+<hint>keybind</><dim> = </>f=next_file
+<hint>keybind</><dim> = </>]=next_file
+<hint>keybind</><dim> = </>leader:n=next_file
+
+<dim># prev_file: previous file</>
+<hint>keybind</><dim> = </>F=prev_file
+<hint>keybind</><dim> = </>[=prev_file
+<hint>keybind</><dim> = </>leader:p=prev_file
+
+<dim># expand: show more of the highlighted ⋯ gap</>
+<hint>keybind</><dim> = </>x=expand
+<hint>keybind</><dim> = </>leader:x=expand
+
+<dim># toggle_full: whole files or changes only, for every file</>
+<hint>keybind</><dim> = </>X=toggle_full
+<hint>keybind</><dim> = </>leader:X=toggle_full
+
+<dim># scroll_right: scroll the code right, without wrapping</>
+<hint>keybind</><dim> = </>>=scroll_right
+<hint>keybind</><dim> = </>L=scroll_right
+
+<dim># scroll_left: scroll the code left</>
+<hint>keybind</><dim> = </><=scroll_left
+<hint>keybind</><dim> = </>H=scroll_left
+
+<dim># scroll_reset: scroll the code back to its first column</>
+<hint>keybind</><dim> = </>0=scroll_reset
+
+<dim># select: select lines, from the top line or the one tapped</>
+<hint>keybind</><dim> = </>v=select
+
+<dim># copy: copy the selected lines' code</>
+<hint>keybind</><dim> = </>y=copy
+<hint>keybind</><dim> = </>leader:y=copy
+
+<dim># copy_path: copy the file's path</>
+<hint>keybind</><dim> = </>Y=copy_path
+<hint>keybind</><dim> = </>leader:Y=copy_path
+
+<dim># cancel: end the selection; in the tree, clear the filter</>
+<hint>keybind</><dim> = </>esc=cancel
+
+<dim># switch_pane: switch between the file tree and the diff</>
+<hint>keybind</><dim> = </>tab=switch_pane
+<hint>keybind</><dim> = </>shift+tab=switch_pane
+
+<dim># toggle_tree: show or hide the file tree</>
+<hint>keybind</><dim> = </>T=toggle_tree
+<hint>keybind</><dim> = </>t=toggle_tree
+<hint>keybind</><dim> = </>leader:t=toggle_tree
+
+<dim># open_picker: find a file: type part of its path, enter opens it</>
+<hint>keybind</><dim> = </>o=open_picker
+<hint>keybind</><dim> = </>leader:o=open_picker
+
+<dim># search: search the diff's text; n/N then go between matches, esc clears</>
+<hint>keybind</><dim> = </>/=search
+<hint>keybind</><dim> = </>leader:S=search
+
+<dim># filter_tree: filter the file tree, fuzzily; f/F and n/N keep to the files it keeps, esc clears</>
+<hint>keybind</><dim> = </>tree:/=filter_tree
+<hint>keybind</><dim> = </>leader:f=filter_tree
+
+<dim># open: open a file, or open or close a folder, in the tree</>
+<hint>keybind</><dim> = </>tree:enter=open
+<hint>keybind</><dim> = </>tree:l=open
+<hint>keybind</><dim> = </>tree:right=open
+
+<dim># collapse: collapse a folder in the tree</>
+<hint>keybind</><dim> = </>tree:h=collapse
+<hint>keybind</><dim> = </>tree:left=collapse
+
+<dim># parent_folder: go to the folder holding the file, in the tree</>
+<hint>keybind</><dim> = </>u=parent_folder
+
+<dim># mark_viewed: mark a file in the tree viewed</>
+<hint>keybind</><dim> = </>tree:v=mark_viewed
+
+<dim># tree_wider: widen the tree</>
+<hint>keybind</><dim> = </>tree:+=tree_wider
+
+<dim># tree_narrower: narrow the tree</>
+<hint>keybind</><dim> = </>tree:-=tree_narrower
+
+<dim># cycle_layout: layout: split, unified, then auto (split on wide screens); while selecting, the side copied</>
+<hint>keybind</><dim> = </>s=cycle_layout
+<hint>keybind</><dim> = </>leader:s=cycle_layout
+
+<dim># toggle_wrap: wrap or truncate long lines</>
+<hint>keybind</><dim> = </>W=toggle_wrap
+<hint>keybind</><dim> = </>leader:w=toggle_wrap
+
+<dim># toggle_syntax: diff by lines or by syntax</>
+<hint>keybind</><dim> = </>d=toggle_syntax
+<hint>keybind</><dim> = </>leader:d=toggle_syntax
+
+<dim># toggle_rendered: files with a renderer plugin rendered, or as lines (experimental, see render)</>
+<hint>keybind</><dim> = </>r=toggle_rendered
+<hint>keybind</><dim> = </>leader:r=toggle_rendered
+
+<dim># cycle_indicators: how changed lines are marked: background, bars, classic signs or none</>
+<hint>keybind</><dim> = </>leader:i=cycle_indicators
+
+<dim># cycle_modified_lines: a line and its edit in the modified color with red and green tokens, or red and green lines</>
+<hint>keybind</><dim> = </>leader:e=cycle_modified_lines
+
+<dim># toggle_highlight: syntax highlighting on or off</>
+<hint>keybind</><dim> = </>leader:H=toggle_highlight
+
+<dim># toggle_whitespace: ignore whitespace (-w) or not, diffing again</>
+<hint>keybind</><dim> = </>leader:W=toggle_whitespace
+
+<dim># toggle_line_numbers: show or hide line numbers</>
+<hint>keybind</><dim> = </>leader:L=toggle_line_numbers
+
+<dim># toggle_hunk_headers: show or hide the @@ numbers of hunks</>
+<hint>keybind</><dim> = </>leader:m=toggle_hunk_headers
+
+<dim># toggle_status_bar: the status bar in the frame's bottom border or its top one</>
+<hint>keybind</><dim> = </>leader:b=toggle_status_bar
+
+<dim># cycle_theme: the next theme, built-in or yours</>
+<hint>keybind</><dim> = </>leader:c=cycle_theme
+
+<dim># toggle_watch: watch for changes</>
+<hint>keybind</><dim> = </>w=toggle_watch
+<hint>keybind</><dim> = </>leader:a=toggle_watch
+
+<dim># toggle_mouse: take mouse input, or leave it to the terminal's own selection (many terminals select natively with shift held while dragging)</>
+<hint>keybind</><dim> = </>M=toggle_mouse
+<hint>keybind</><dim> = </>leader:M=toggle_mouse
+
+<dim># toggle_copy_decorations: copies include line numbers and +/- signs, or only the code</>
+<hint>keybind</><dim> = </>leader:D=toggle_copy_decorations
+
+<dim># edit: open the file in $EDITOR at the top line</>
+<hint>keybind</><dim> = </>e=edit
+
+<dim># help: show or hide this help</>
+<hint>keybind</><dim> = </>?=help
+<hint>keybind</><dim> = </>leader:?=help
+
+<dim># quit: quit</>
+<hint>keybind</><dim> = </>q=quit
+<hint>keybind</><dim> = </>ctrl+c=quit

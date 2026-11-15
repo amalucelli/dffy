@@ -1,0 +1,25 @@
+---
+source: crates/dffy/src/render/tests.rs
+expression: "print_file(dffy_core::git::Status::Modified, &old, &new,\nlayout(false, Some(60), false))"
+---
+<file-header>modified: f.txt</>
+<file-header>───────────────</>
+<dim>⋯ 1 unchanged line  @@ -2,7 +2,7 @@ line 1</>
+<line-number> 2</> <line-number> 2</><dim> │</> line 2
+<line-number> 3</> <line-number> 3</><dim> │</> line 3
+<line-number> 4</> <line-number> 4</><dim> │</> line 4
+<modified-number> 5</>   <dim> │</><modified>-line </><removed-emph>5</>
+   <modified-number> 5</><dim> │</><modified>+line </><added-emph>five</>
+<line-number> 6</> <line-number> 6</><dim> │</> line 6
+<line-number> 7</> <line-number> 7</><dim> │</> line 7
+<line-number> 8</> <line-number> 8</><dim> │</> line 8
+<dim>⋯ 10 unchanged lines  @@ -19,7 +19,7 @@ line 18</>
+<line-number>19</> <line-number>19</><dim> │</> line 19
+<line-number>20</> <line-number>20</><dim> │</> line 20
+<line-number>21</> <line-number>21</><dim> │</> line 21
+<modified-number>22</>   <dim> │</><modified>-line </><removed-emph>22</>
+   <modified-number>22</><dim> │</><modified>+line </><added-emph>22b</>
+<line-number>23</> <line-number>23</><dim> │</> line 23
+<line-number>24</> <line-number>24</><dim> │</> line 24
+<line-number>25</> <line-number>25</><dim> │</> line 25
+<dim>⋯ 5 unchanged lines</>

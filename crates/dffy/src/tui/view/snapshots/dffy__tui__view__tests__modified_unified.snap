@@ -1,0 +1,18 @@
+---
+source: crates/dffy/src/tui/view/tests.rs
+expression: "looks(&grid, &rows, &theme)"
+---
+@@ -1,4 +1,4 @@
+...............
+1 1  │ keep
+...........
+2   -│ int a = 1;
+m...m..RRRmmmmmmm
+3   -│ removed line here
+r...r..rrrrrrrrrrrrrrrrr
+  2 +│ long a = 1;
+..m.m..AAAAmmmmmmm
+4 3  │ keep 2
+.............
+  4 +│ added line
+..a.a..aaaaaaaaaa

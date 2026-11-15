@@ -1,0 +1,20 @@
+---
+source: crates/dffy/tests/cli.rs
+expression: "[run(&[\"--stat\", \"main~1\", \"main\"]), run(&[\"--name-only\", \"main~1\", \"main\"]),\nrun(&[\"--name-status\", \"main~1\", \"main\"]),\nrun(&[\"--name-status\", \"-R\", \"main~1\", \"main\"]),].join(\"--\\n\")"
+---
+ README.md  | 2 ++
+ old.txt    | 1 -
+ src/lib.rs | 2 +-
+ 3 files changed, 3 insertions(+), 2 deletions(-)
+--
+README.md
+old.txt
+src/lib.rs
+--
+M	README.md
+D	old.txt
+M	src/lib.rs
+--
+M	README.md
+A	old.txt
+M	src/lib.rs

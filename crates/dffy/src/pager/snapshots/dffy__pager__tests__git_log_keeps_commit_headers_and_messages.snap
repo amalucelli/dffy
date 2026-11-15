@@ -1,0 +1,82 @@
+---
+source: crates/dffy/src/pager/tests.rs
+expression: "render(fixture!(\"git-log-color.diff\"), UNIFIED)"
+---
+<commit-header>commit 1fcf7268004892fc2725c2c8ceca793cd5540679 (HEAD -> main)</>
+<dim>Author: Ada Lovelace <ada@example.com></>
+<dim>Date:   Sat Mar 2 09:30:00 2024 +0100</>
+
+    Add a third line to the notes
+
+<file-header>modified: notes.txt</>
+<file-header>───────────────────</>
+<hunk-header>@@ -1,2 +1,3 @@</>
+<line-number>1</> <line-number>1</><dim> │</> first line
+<line-number>2</> <line-number>2</><dim> │</> second line, edited
+  <added-number>3</><dim> │</><added>+third line</>
+
+<commit-header>commit 80f116fc5dc99b9bc38a6e38344657fdf68f1cb4</>
+<dim>Author: Ada Lovelace <ada@example.com></>
+<dim>Date:   Fri Mar 1 12:00:00 2024 +0100</>
+
+    Widen calc to long and tidy files
+    
+    Body paragraph explaining why.
+
+<file-header>new file: added.md</>
+<file-header>──────────────────</>
+<hunk-header>@@ -0,0 +1 @@</>
+<added-number>1</><dim> │</><added>+a brand new file</>
+
+<file-header>modified: build.sh</><dim> (mode 100644 → 100755)</>
+<file-header>─────────────────────────────────────────</>
+
+<file-header>modified: calc.c</>
+<file-header>────────────────</>
+<hunk-header>@@ -1,13 +1,14 @@</>
+<line-number> 1</> <line-number> 1</><dim> │</> #include <stdio.h>
+<line-number> 2</> <line-number> 2</><dim> │</> 
+<modified-number> 3</>   <dim> │</><modified>-static </><removed-emph>int</><modified> add(</><removed-emph>int</><modified> a, </><removed-emph>int</><modified> b)</>
+   <modified-number> 3</><dim> │</><modified>+static </><added-emph>long</><modified> add(</><added-emph>long</><modified> a, </><added-emph>long</><modified> b)</>
+<line-number> 4</> <line-number> 4</><dim> │</> {
+<line-number> 5</> <line-number> 5</><dim> │</>     return a + b;
+<line-number> 6</> <line-number> 6</><dim> │</> }
+<line-number> 7</> <line-number> 7</><dim> │</> 
+<line-number> 8</> <line-number> 8</><dim> │</> int main(void)
+<line-number> 9</> <line-number> 9</><dim> │</> {
+<modified-number>10</>   <dim> │</><modified>-    </><removed-emph>int</><modified> total = add(1, 2);</>
+<modified-number>11</>   <dim> │</><modified>-    printf("total: %</><removed-emph>d</><modified>\n", total);</>
+   <modified-number>10</><dim> │</><modified>+    </><added-emph>long</><modified> total = add(1, 2);</>
+   <modified-number>11</><dim> │</><modified>+    printf("total: %</><added-emph>ld</><modified>\n", total);</>
+   <added-number>12</><dim> │</><added>+    printf("done\n");</>
+<line-number>12</> <line-number>13</><dim> │</>     return 0;
+<line-number>13</> <line-number>14</><dim> │</> }
+
+<file-header>deleted file: gone.txt</>
+<file-header>──────────────────────</>
+<hunk-header>@@ -1 +0,0 @@</>
+<removed-number>1</><dim> │</><removed>-obsolete</>
+
+<file-header>renamed: old_name.py → greetings.py</><dim> (83% similar)</>
+<file-header>─────────────────────────────────────────────────</>
+<dim>⋯ 2 unchanged lines  @@ -3,7 +3,7 @@ def greet(name):</>
+<line-number> 3</> <line-number> 3</><dim> │</> 
+<line-number> 4</> <line-number> 4</><dim> │</> 
+<line-number> 5</> <line-number> 5</><dim> │</> def farewell(name):
+<modified-number> 6</>   <dim> │</><modified>-    print("</><removed-emph>goodbye</><modified>", name)</>
+   <modified-number> 6</><dim> │</><modified>+    print("</><added-emph>bye</><modified>", name)</>
+<line-number> 7</> <line-number> 7</><dim> │</> 
+<line-number> 8</> <line-number> 8</><dim> │</> 
+<line-number> 9</> <line-number> 9</><dim> │</> if __name__ == "__main__":
+
+<file-header>modified: logo.png</>
+<file-header>──────────────────</>
+<dim>binary files differ</>
+
+<file-header>modified: notes.txt</>
+<file-header>───────────────────</>
+<hunk-header>@@ -1,2 +1,2 @@</>
+<line-number>1</> <line-number>1</><dim> │</> first line
+<modified-number>2</>  <dim> │</><modified>-second line</>
+   <dim> │\ No newline at end of file</>
+  <modified-number>2</><dim> │</><modified>+second line</><added-emph>, edited</>

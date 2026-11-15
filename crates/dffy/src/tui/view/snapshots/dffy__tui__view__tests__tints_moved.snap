@@ -1,0 +1,8 @@
+---
+source: crates/dffy/src/tui/view/tests.rs
+assertion_line: 487
+expression: "backgrounds(&grid, 1..4)"
+---
+[312a46  1   │ int a(void) { return 1; }                            ]
+ 2 1 │ int b(void) { return 2; }                            
+[312a46    2 │ int a(void) { return 1; }                            ]

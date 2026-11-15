@@ -1,0 +1,8 @@
+---
+source: crates/dffy/src/doctor.rs
+expression: "broker.join(\"\\n\")"
+---
+<warn>!</> dffyd       running (pid 4242), 1 root(s), 3 subscriber(s); it's build 0.1.0+feedface, this dffy is 0.1.0+0123abcd
+  <hint>hint:</> dffy daemon stop; the next dffy --watch starts this build's broker
+<warn>!</> dffyd       a broker of protocol v2 runs too, from another dffy version
+  <hint>hint:</> it serves that version's views and exits a minute after the last one; dffy daemon stop from that version stops it now

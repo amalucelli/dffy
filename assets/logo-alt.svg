@@ -1,0 +1,76 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512" role="img" aria-label="dffy">
+  <defs>
+    <path id="squircle" d="M182 32H330C440 32 480 72 480 182V330C480 440 440 480 330 480H182C72 480 32 440 32 330V182C32 72 72 32 182 32Z"/>
+    <!-- Halves of one head, square at the seam. The new half is drawn one step lower. -->
+    <path id="old" d="M252 93H232C128.4 93 92 129.4 92 233V253C92 356.6 128.4 393 232 393H252Z"/>
+    <path id="new" d="M260 93H280C383.6 93 420 129.4 420 233V253C420 356.6 383.6 393 280 393H260Z"/>
+    <path id="smile" d="M146 262C178 336 334 336 366 262" fill="none" stroke="#1d1433" stroke-width="36" stroke-linecap="round"/>
+    <clipPath id="inside"><use href="#squircle"/></clipPath>
+    <clipPath id="old-clip"><use href="#old"/></clipPath>
+    <clipPath id="new-clip"><use href="#new"/></clipPath>
+    <linearGradient id="body" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#2c2f45"/>
+      <stop offset="1" stop-color="#13141d"/>
+    </linearGradient>
+    <linearGradient id="rim" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#ffffff" stop-opacity="0.3"/>
+      <stop offset="0.5" stop-color="#ffffff" stop-opacity="0.06"/>
+      <stop offset="1" stop-color="#ffffff" stop-opacity="0.14"/>
+    </linearGradient>
+    <linearGradient id="old-fill" gradientUnits="userSpaceOnUse" x1="130" y1="93" x2="220" y2="393">
+      <stop offset="0" stop-color="#ffb08a"/>
+      <stop offset="0.5" stop-color="#ff7479"/>
+      <stop offset="1" stop-color="#f23d7b"/>
+    </linearGradient>
+    <linearGradient id="new-fill" gradientUnits="userSpaceOnUse" x1="382" y1="93" x2="292" y2="393">
+      <stop offset="0" stop-color="#c2f99e"/>
+      <stop offset="0.5" stop-color="#55e4a6"/>
+      <stop offset="1" stop-color="#0dbd96"/>
+    </linearGradient>
+    <radialGradient id="warm" gradientUnits="userSpaceOnUse" cx="140" cy="110" r="180">
+      <stop offset="0" stop-color="#fff4d6" stop-opacity="0.55"/>
+      <stop offset="1" stop-color="#fff4d6" stop-opacity="0"/>
+    </radialGradient>
+    <radialGradient id="cool" gradientUnits="userSpaceOnUse" cx="372" cy="110" r="180">
+      <stop offset="0" stop-color="#effff6" stop-opacity="0.5"/>
+      <stop offset="1" stop-color="#effff6" stop-opacity="0"/>
+    </radialGradient>
+    <linearGradient id="edge" gradientUnits="userSpaceOnUse" x1="0" y1="93" x2="0" y2="233">
+      <stop offset="0" stop-color="#ffffff" stop-opacity="0.7"/>
+      <stop offset="1" stop-color="#ffffff" stop-opacity="0"/>
+    </linearGradient>
+    <filter id="soft" filterUnits="userSpaceOnUse" x="0" y="0" width="512" height="512">
+      <feGaussianBlur stdDeviation="12"/>
+    </filter>
+  </defs>
+
+  <use href="#squircle" y="8" opacity="0.35" filter="url(#soft)"/>
+  <use href="#squircle" fill="url(#body)"/>
+
+  <g clip-path="url(#inside)">
+    <g fill="#05060a" opacity="0.6" filter="url(#soft)">
+      <use href="#old" y="16"/>
+      <use href="#new" y="38"/>
+    </g>
+
+    <use href="#old" fill="url(#old-fill)"/>
+    <g clip-path="url(#old-clip)">
+      <rect x="92" y="93" width="160" height="300" fill="url(#warm)"/>
+      <path d="M252 93H232C128.4 93 92 129.4 92 233" fill="none" stroke="url(#edge)" stroke-width="5"/>
+      <use href="#smile"/>
+    </g>
+    <rect x="134" y="179" width="84" height="32" rx="16" fill="#1d1433"/>
+
+    <g transform="translate(0 22)">
+      <use href="#new" fill="url(#new-fill)"/>
+      <g clip-path="url(#new-clip)">
+        <rect x="260" y="93" width="160" height="300" fill="url(#cool)"/>
+        <path d="M260 93H280C383.6 93 420 129.4 420 233" fill="none" stroke="url(#edge)" stroke-width="5"/>
+        <use href="#smile"/>
+      </g>
+      <path d="M336 168V222M309 195H363" fill="none" stroke="#1d1433" stroke-width="32" stroke-linecap="round"/>
+    </g>
+
+    <use href="#squircle" fill="none" stroke="url(#rim)" stroke-width="6"/>
+  </g>
+</svg>

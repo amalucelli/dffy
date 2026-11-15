@@ -1,0 +1,21 @@
+---
+source: crates/dffy/src/tui/help.rs
+expression: "shown(&mut help, &keys, 100, 20)"
+---
+
+
+
+       ┌─ keybinds ──────────────────────────────────────────────────────────── esc close ─┐
+       │  Move  Files  View  Copy  Other                                                   │
+       │                                                                                   │
+       │ j J               scroll down             G end             bottom of file        │
+       │ k up              scroll up               }                 next change           │
+       │ page_down ctrl+f  page down               N {               prev change           │
+       │ b page_up         page up                 > L               scroll right          │
+       │ ctrl+d            half page down          < H               scroll left           │
+       │ ctrl+u            half page up            0                 scroll to line start  │
+       │ g home            top of file                                                     │
+       │                                                                                   │
+       │ more settings: space · all keys: docs/keys.md                                     │
+       │ tab section · / search · esc close                                                │
+       └───────────────────────────────────────────────────────────────────────────────────┘

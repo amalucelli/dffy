@@ -1,0 +1,26 @@
+---
+source: crates/dffy/src/doctor.rs
+assertion_line: 1276
+expression: text
+---
+<error>✗</> git         not found: No such file or directory (os error 2)
+  <hint>hint:</> install git; dffy reads repositories itself but checks against git
+<ok>✓</> repository  ~/src/linux · main · 265 staged, 3 unstaged, 4 untracked
+<warn>!</> watch       6,345 needed here · 8,150 of 8,192 in use
+  <warn>only 42 free: watch mode would poll this repository once a second</>
+  <hint>hint:</> raise the limit: sudo sysctl fs.inotify.max_user_watches=524288
+<dim>·</> speed       repo 3ms · first change 9ms · all 270 changes 41ms · untracked 18ms · largest diff 2ms (Cargo.lock)
+<warn>!</> terminal    TERM=dumb, COLORTERM=unset, stdout is not a terminal
+<dim>·</> multiplexer none detected
+<ok>✓</> color       off; the default theme uses the 16 ANSI colors
+<warn>!</> config      /home/u/.config/dffy/config: 1 problem(s)
+  <warn>line 3: unknown key 'colour'</>
+<ok>✓</> theme       default
+<ok>✓</> pager       none; output goes straight to the terminal
+<warn>!</> cache       can't read: /home/u/.cache/dffy: Permission denied (os error 13)
+  <hint>hint:</> fix its permissions or set cache = false; dffy works without it
+<ok>✓</> renderer    .md → markdown: ~/.local/bin/dffy-render-markdown
+<warn>!</> renderer    .csv → csv: dffy-render-csv isn't on PATH
+  <hint>hint:</> install it, or see docs/plugins.md; files of this type show as lines
+<warn>!</> dffyd       not answering: Connection refused (os error 111)
+  <hint>hint:</> remove its stale socket under $XDG_RUNTIME_DIR/dffy; views watch by themselves meanwhile

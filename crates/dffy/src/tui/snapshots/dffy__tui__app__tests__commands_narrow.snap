@@ -1,0 +1,35 @@
+---
+source: crates/dffy/src/tui/app.rs
+assertion_line: 3576
+expression: screen(&mut phone)
+---
+┌─ commands ───────────────────────── esc close ─┐
+│ Files                                         ┃│
+│     Find file…                            o   ┃│
+│     Filter tree…                          f / ┃│
+│     Search in diff…                       S / ┃│
+│ [ ] File tree                             t T ┃│
+│     Next file                             n f ┃│
+│     Previous file                         p F ┃│
+│                                               ┃│
+│ View                                          ┃│
+│     Layout ‹ auto (unified here) ›        s   ┃│
+│ [ ] Wrap long lines                       w W ┃│
+│ [ ] Syntax diff                           d   ┃│
+│ [ ] Rendered view                         r   ┃│
+│     More context                          x   ┃│
+│ [ ] Whole file                            X   ┃│
+│     Indicators ‹ classic ›                i   ┃│
+│     Modified lines ‹ changed ›            e   ┃│
+│ [x] Syntax highlighting                   H   ┃│
+│ [ ] Ignore whitespace                     W   ┃│
+│ [x] Line numbers                          L   ┃│
+│ [x] Hunk headers                          m   ││
+│     Status bar ‹ bottom ›                 b   ││
+│     Theme ‹ default ›                     c   ││
+│                                               ││
+│ Copy                                          ││
+│     Copy selection                        y   ││
+│     Copy file path                        Y   ││
+│ key or enter runs · j/k move · / search · esc  │
+└────────────────────────────────────────────────┘

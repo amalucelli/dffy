@@ -1,0 +1,16 @@
+commit eb34f50ad38c77bb28f198cc66e0cdcf7c63e3e3
+Merge: 1fcf726 ae9f98b
+Author: Ada Lovelace <ada@example.com>
+Date:   Sat Mar 2 09:30:00 2024 +0100
+
+    Merge branch side
+
+diff --cc notes.txt
+index e0fe810,218dcf7..2f61be3
+--- a/notes.txt
++++ b/notes.txt
+@@@ -1,3 -1,3 +1,4 @@@
+  first line
+  second line, edited
+ +third line
++ side line

@@ -1,0 +1,8 @@
+---
+source: crates/dffy/src/tui/view/tests.rs
+expression: "rows[..4].join(\"\\n\")"
+---
+60 -│ line 60                │60 +│ line sixty
+61  │ line 61                │61  │ line 61
+62  │ line 62                │62  │ line 62
+63  │ line 63                │63  │ line 63

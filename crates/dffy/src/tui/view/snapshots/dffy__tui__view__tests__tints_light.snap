@@ -1,0 +1,11 @@
+---
+source: crates/dffy/src/tui/view/tests.rs
+assertion_line: 643
+expression: "backgrounds(&grid, 1..7)"
+---
+ 1 1 │ fn main() {                                          
+[d3e4ff  2   │][e4efff      let total = ][fdc9c4 count][e4efff  + 1;                           ]
+[d3e4ff    2 │][e4efff      let total = ][c0e3c0 items.len()][e4efff  + 1;                     ]
+ 3 3 │     println!("{total}");                             
+[d2ebd2    4 │][e4f3e4      eprintln!("done");                               ]
+ 4 5 │ }

@@ -1,0 +1,73 @@
+[package]
+name = "dffy-core"
+description = "Git, diff, highlighting and view model behind the dffy diff viewer"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+readme.workspace = true
+keywords = ["diff", "git", "tree-sitter", "syntax-highlighting", "watcher"]
+categories = ["development-tools", "text-processing"]
+
+[lints]
+workspace = true
+
+[dependencies]
+gix = { version = "0.90.0", default-features = false, features = [
+  "attributes",
+  "revision",
+  "sha1",
+  "parallel",
+  "pack-cache-lru-dynamic",
+] }
+ignore = "0.4.34"
+memchr = "2.8.3"
+rustc-hash = "2.1.3"
+thiserror = "2.0.21"
+tree-sitter = "0.27.2"
+tree-sitter-bash = "0.25.1"
+tree-sitter-c = "0.24.2"
+tree-sitter-cpp = "0.23.4"
+tree-sitter-css = "0.25.0"
+tree-sitter-go = "0.25.0"
+tree-sitter-html = "0.23.2"
+tree-sitter-java = "0.23.5"
+tree-sitter-javascript = "0.25.0"
+tree-sitter-json = "0.24.8"
+tree-sitter-lua = "0.5.0"
+tree-sitter-md = "0.5.4"
+tree-sitter-python = "0.25.0"
+tree-sitter-ruby = "0.23.1"
+tree-sitter-rust = "0.24.2"
+tree-sitter-toml-ng = "0.7.0"
+tree-sitter-typescript = "0.23.2"
+tree-sitter-yaml = "0.7.2"
+
+[dev-dependencies]
+divan = "0.1.21"
+imara-diff = "0.2.0"
+insta = "1.49.0"
+proptest = "1.12.0"
+tempfile = "3.27.0"
+
+[[bench]]
+name = "engine"
+harness = false
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2-core-foundation = { version = "0.3.2", default-features = false, features = [
+  "std",
+  "CFArray",
+  "CFString",
+  "CFRunLoop",
+  "CFDate",
+] }
+objc2-core-services = { version = "0.3.2", default-features = false, features = [
+  "std",
+  "FSEvents",
+] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+rustix = { version = "1.1.6", features = ["fs", "event", "pipe"] }

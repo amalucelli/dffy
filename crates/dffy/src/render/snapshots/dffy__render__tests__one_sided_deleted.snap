@@ -1,0 +1,9 @@
+---
+source: crates/dffy/src/render/tests.rs
+expression: "print_file(Status::Deleted, text, \"\", layout(true, Some(60), false))"
+---
+<file-header>deleted file: f.txt</>
+<file-header>───────────────────</>
+<hunk-header>@@ -1,2 +0,0 @@</>
+<removed-number>1</><dim> │</><removed>-first line</>
+<removed-number>2</><dim> │</><removed>-a second line that is long enough to need more than hal</><dim>…</>

@@ -1,0 +1,3 @@
+[files]
+# Fixtures are captured git output; abbreviated object ids read as words.
+extend-exclude = [".claude/", "target/", "crates/dffy/tests/fixtures/"]

@@ -1,0 +1,11 @@
+---
+source: crates/dffy/src/render/tests.rs
+expression: "render_hunks(&old, &new, &s.hunks, layout)"
+---
+<hunk-header>@@ -1,4 +1,3 @@</> fn main()
+<moved>1</>   <moved>▌</> <moved>int a(void) { return 1; }</>
+<line-number>2</> <line-number>1</><dim> │</> int b(void) { return 2; }
+  <moved>2</> <moved>▌</> <moved>int a(void) { return 1; }</>
+<dim>3</>   <dim>▌</> <dim>int c = f(x,</>
+<dim>4</>   <dim>▌</> <dim>    y);</>
+  <dim>3</> <dim>▌</> <dim>int c = f(x, y);</>

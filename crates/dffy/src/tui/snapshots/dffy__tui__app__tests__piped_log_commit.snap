@@ -1,0 +1,29 @@
+---
+source: crates/dffy/src/tui/app.rs
+assertion_line: 4425
+expression: screen(&mut app)
+---
+┌ Files · 8 +8 -6 ──────────────┬─ commit 1fcf726 · Add a third line to the notes ─────────────────────────────────────┐
+│ ▼ 1fcf726 Add a third line t… │ commit 1fcf7268004892fc2725c2c8ceca793cd5540679 (HEAD -> main)                       │
+│   M notes.txt           +1    │ Author: Ada Lovelace <ada@example.com>                                               │
+│ ▼ 80f116f Widen calc to long… │ Date:   Sat Mar 2 09:30:00 2024 +0100                                                │
+│   A added.md            +1    │                                                                                      │
+│   M build.sh                  │     Add a third line to the notes                                                    │
+│   M calc.c              +4 -3 │                                                                                      │
+│   D gone.txt               -1 │ 1 file +1 -0                                                                         │
+│   R greetings.py        +1 -1 │   M notes.txt +1                                                                     │
+│   M logo.png                  │                                                                                      │
+│   M notes.txt           +1 -1 │                                                                                      │
+│                               │                                                                                      │
+│                               │                                                                                      │
+│                               │                                                                                      │
+│                               │                                                                                      │
+│                               │                                                                                      │
+│                               │                                                                                      │
+│                               │                                                                                      │
+│                               │                                                                                      │
+│                               │                                                                                      │
+│                               │                                                                                      │
+│                               │                                                                                      │
+│                               │                                                                                      │
+└«─  commit 1/2  1 file ────────┴─ unified ───────────────────────────────────── / search · tab tree · space commands ─┘

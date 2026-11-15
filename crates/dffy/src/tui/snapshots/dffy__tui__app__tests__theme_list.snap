@@ -1,0 +1,28 @@
+---
+source: crates/dffy/src/tui/app.rs
+expression: "list.join(\"\\n\")"
+---
+┌─ themes ─────────────────────────────── esc close ─┐
+│ Terminal palette                                   │
+│ * default                                          │
+│   mono                                             │
+│                                                    │
+│ Dark                                               │
+│   github-dark                                      │
+│   tokyo-night                                      │
+│   catppuccin-mocha                                 │
+│   gruvbox-dark                                     │
+│   nord                                             │
+│   dracula                                          │
+│   one-dark                                         │
+│   solarized-dark                                   │
+│   rose-pine                                        │
+│   kanagawa                                         │
+│                                                    │
+│ Light                                              │
+│   github-light                                     │
+│   catppuccin-latte                                 │
+│   gruvbox-light                                    │
+│   solarized-light                                  │
+│                                                    │
+│ type to filter · ↑/↓ try · enter keep · esc back   │

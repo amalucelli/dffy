@@ -1,0 +1,29 @@
+---
+source: crates/dffy/src/tui/app.rs
+assertion_line: 4428
+expression: screen(&mut app)
+---
+┌ Files · 8 +8 -6 ──────────────┬─ modified · notes.txt · +1 -0 ───────────────────────────────────── @@ -1,2 +1,3 @@ ─┐
+│ ▼ 1fcf726 Add a third line t… │ @@ -1,2 +1,3 @@                                                                      │
+│   M notes.txt           +1    │ 1 1  │ first line                                                                    │
+│ ▼ 80f116f Widen calc to long… │ 2 2  │ second line, edited                                                           │
+│   A added.md            +1    │   3 +│ third line                                                                    │
+│   M build.sh                  │                                                                                      │
+│   M calc.c              +4 -3 │                                                                                      │
+│   D gone.txt               -1 │                                                                                      │
+│   R greetings.py        +1 -1 │                                                                                      │
+│   M logo.png                  │                                                                                      │
+│   M notes.txt           +1 -1 │                                                                                      │
+│                               │                                                                                      │
+│                               │                                                                                      │
+│                               │                                                                                      │
+│                               │                                                                                      │
+│                               │                                                                                      │
+│                               │                                                                                      │
+│                               │                                                                                      │
+│                               │                                                                                      │
+│                               │                                                                                      │
+│                               │                                                                                      │
+│                               │                                                                                      │
+│                               │                                                                                      │
+└«─  commit 1/2  ───────────────┴─ 1/1 · 1/1 hunk  → next file: notes.txt ────── / search · tab tree · space commands ─┘

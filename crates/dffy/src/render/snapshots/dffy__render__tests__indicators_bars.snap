@@ -1,0 +1,10 @@
+---
+source: crates/dffy/src/render/tests.rs
+expression: "render(OLD, NEW, layout)"
+---
+<hunk-header>@@ -1,4 +1,5 @@</> fn main()
+<line-number>1</><dim> │</> fn main() {                             <dim>│</><line-number>1</><dim> │</> fn main() {
+<modified-number>2</> <modified>▌</> <modified>    let total = </><removed-emph>count</><modified> + 1;              </><dim>│</><modified-number>2</> <modified>▌</> <modified>    let total = </><added-emph>items.len()</><modified> + 1;</>
+<line-number>3</><dim> │</>     println!("{total}");                <dim>│</><line-number>3</><dim> │</>     println!("{total}");
+ <dim> │</>                                         <dim>│</><added-number>4</> <added>▌</> <added>    eprintln!("done");</>
+<line-number>4</><dim> │</> }                                       <dim>│</><line-number>5</><dim> │</> }

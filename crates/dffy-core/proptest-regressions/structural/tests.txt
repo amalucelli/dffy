@@ -1,0 +1,20 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 1656e3a84554378a332f49cb60a49abaec5d7cbaafc847ecc4f9f8799b585738 # shrinks to ids = [7, 15, 7, 0, 0], spaces = [0, 1]
+cc fba3a56427c3671fd2ee2633fca7fd12d2ee11fd87635673af9643bbd64581d4 # shrinks to (o, n) = ([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 8, 0, 0, 0, 0, 16, 0, 0, 0, 0, 0, 0, 0], [0, 0, 0, 0, 0, 0, 0, 0, 8, 0, 0, 8, 0, 0, 0, 0, 16, 0, 0, 0, 0, 0, 0]), lang = 0
+cc 6fb0efd480227f903d7a8706f2a985426d688920fbbacf8e3487a70b2f4f81fd # shrinks to ids = [13, 13, 13, 0, 0], spaces = [1, 1, 0, 1]
+cc 67cd9c8585d66fade239b4c05008883adab79155ac3dc8cc3ccc6f424d42f3ae # shrinks to ids = [0, 0, 0, 13, 15, 0, 13, 0], spaces = [0, 1, 0, 1, 1, 0]
+cc ce8e2dced0671c48d5e95504ce8968a3b7bd17a29d641fd13df4ac3c886bed88 # shrinks to ids = [0, 0, 6, 11, 11, 0, 10, 0, 6, 0, 6, 10, 6], spaces = [1, 0, 1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 1, 0, 0, 1]
+cc 1cae7055200006e2347fcafe8a52b1de990e1216aea654124e7023c92a15d271 # shrinks to ids = [6, 15, 8, 14, 13, 7, 12, 16, 2], spaces = [1]
+cc 21fa62eab3b22855a0adf0f2c4a7384c603c74aff2a8640228da0b8ad3dd81b7 # shrinks to ids = [4, 9, 1, 10, 15, 3, 13], spaces = [2]
+cc ba129115cc6deb0c7887c912d6e3ab707f6e0cfc37c32e165fe0b0e3b03b5613 # shrinks to ids = [11, 2, 16, 15, 7, 9, 14, 1], spaces = [0, 0, 0, 0, 0, 1, 2]
+cc aa4c776d8c9faedefa92cd103c1390b3bb3275844809fa6f32f46f5a9cdacb2e # shrinks to ids = [5, 12, 4, 14, 16, 7, 13, 6, 3, 11, 15, 1, 9], spaces = [0, 1, 1, 2]
+cc ece85cf6c4531fed074c24b448f801b8d972ff7904b08b4a02b773d713ab1322 # shrinks to ids = [9, 6, 7, 1, 0, 14, 5, 15], spaces = [0, 1, 0, 0, 1, 1, 0, 1]
+cc a7ddda06f77459f74ec1c9ec7fc4809ffb6b712d9c213b6a7a75ca11b10aad29 # shrinks to ids = [11, 8, 0, 15, 13, 14, 4, 7, 12, 10, 16, 6, 5, 2, 3, 1], spaces = [1, 0, 0, 0, 0, 1, 2, 2, 0, 0, 0]
+cc 72e1354ebc613d5ff72f1c18722eba815acbba72d79e7debeefb29cacfc119e4 # shrinks to ids = [1, 12, 2, 4, 15, 8, 16, 7, 9, 14, 3, 10, 13, 5, 6], spaces = [0, 0, 0, 1, 0, 1, 1, 1, 2]
+cc b0c3f58e688f830f842b21c5875e74256946c0acd96cac9f69392a0df0bf2534 # shrinks to ids = [15, 10, 0, 7, 12, 2, 9, 5, 1], spaces = [0, 0, 0, 1, 1, 0, 1]
+cc 8c6584ae20b5bc06e34e54a0fe26f7fb0817ef3562e0b6607146868aa370a037 # shrinks to ids = [11, 9, 15, 13, 8, 1, 2, 10, 4, 0, 3, 7, 12, 14, 16, 6], spaces = [1]

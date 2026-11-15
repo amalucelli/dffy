@@ -2,8 +2,8 @@
 //!
 //! - `bench-baseline`, `bench-ab` and `bench-noise` are the performance gate:
 //!   a baseline build kept on disk, compared with the current tree on the
-//!   same machine against the noise measured by comparing the baseline with
-//!   itself.
+//!   same machine, failing on a slowdown consistent across rounds or an
+//!   allocation increase.
 //! - `compare` times dffy against other diff tools on the kernel range and
 //!   prints the tables in `docs/benchmarks.md`.
 

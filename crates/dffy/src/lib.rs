@@ -253,7 +253,6 @@ impl Ctx {
 }
 
 /// Runs dffy with the process's arguments.
-#[must_use]
 pub fn main() -> ExitCode {
     let args = cli::with_default_subcommand(std::env::args_os().collect());
     let mut command = Cli::command();

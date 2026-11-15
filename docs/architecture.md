@@ -220,7 +220,7 @@ Both skip without `DFFY_BENCH_REPO`.
 | `task ci` | `fmt:check`, `lint` (clippy, warnings are errors), `test`, `docs:check`, `doc`, `deny`, `machete`, `typos`, in order |
 | `task test` | Every unit and integration test with cargo-nextest, then doctests |
 | `task test:kernel` | The kernel tests in release mode; needs `DFFY_BENCH_REPO` |
-| `task bench:ab` | The current tree against a baseline from `task bench:baseline`, failing on a slowdown or an allocation increase past the baseline's noise from `task bench:noise` (`cargo xtask`, see [benchmarks.md](benchmarks.md#checking-a-change-for-regressions)) |
+| `task bench:ab` | The current tree against a baseline from `task bench:baseline`, failing on a slowdown over 1% that's consistent across rounds, or an allocation increase (`cargo xtask`, see [benchmarks.md](benchmarks.md#checking-a-change-for-regressions)) |
 | `task docs` | Regenerates [keys.md](keys.md) and the settings table in [config.md](config.md) |
 | `task setup` | Installs the tools the other tasks use |
 

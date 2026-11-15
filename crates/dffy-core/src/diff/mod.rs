@@ -89,7 +89,6 @@ impl Text {
     }
 
     /// Every line in order, each with its terminator as in [`Text::line`].
-    #[must_use]
     pub fn lines(&self) -> impl ExactSizeIterator<Item = &[u8]> + '_ {
         self.starts.windows(2).map(|w| &self.bytes[w[0]..w[1]])
     }

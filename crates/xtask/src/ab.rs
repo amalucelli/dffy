@@ -4,10 +4,16 @@
 //! `count_pass`, `first_frame` and `first_paint`, and the divan benches
 //! `frame` and `engine`, with the commit in `REV`. Two sets, A and B, are
 //! measured round by round, alternating which goes first. A metric's value
-//! per side is
-//! the median of its per-round values, and B passes when it is at most A's
-//! plus the band in A's `noise.tsv`: the largest difference between the two
-//! sides of one round when A was compared with itself.
+//! per side is the median of its per-round values.
+//!
+//! B fails a timing or peak-RSS metric when its median is more than 1% above
+//! A's (criterion's default noise threshold) and it was slower than A in
+//! enough rounds that a one-sided sign test gives p < 0.05: 9 of 10, or 5 of
+//! 5. Divan's allocation counts and bytes fail on any increase, or on one
+//! past their band in A's `noise.tsv` when it's above 0: the largest
+//! difference between the two sides of one round when A was compared with
+//! itself. `count_pass` finding a file whose count differs from its diff
+//! fails.
 
 use std::collections::HashMap;
 use std::fmt::Write as _;
@@ -44,7 +50,7 @@ const COUNT_MISMATCH: &str = "count_pass differing files";
 
 pub(crate) fn main(cmd: &str, args: &[String]) -> Result<bool> {
     let mut dir = None;
-    let mut rounds = 5;
+    let mut rounds = 10;
     let mut groups = GROUPS.to_vec();
     let mut args = args.iter();
     while let Some(arg) = args.next() {
@@ -53,8 +59,9 @@ pub(crate) fn main(cmd: &str, args: &[String]) -> Result<bool> {
                 rounds = args
                     .next()
                     .and_then(|n| n.parse().ok())
-                    .filter(|&n| n > 0)
-                    .ok_or("--rounds takes a positive number")?;
+                    // The sign test's exact counts fit in a u128 to past 100.
+                    .filter(|n| (1..=100).contains(n))
+                    .ok_or("--rounds takes a number from 1 to 100")?;
             }
             "--only" if cmd != "bench-baseline" => {
                 let only: Vec<&str> = args.next().ok_or(USAGE)?.split(',').collect();
@@ -103,33 +110,20 @@ pub(crate) fn main(cmd: &str, args: &[String]) -> Result<bool> {
 
     let metrics = runner.rounds(rounds, [&base, &candidate], &groups)?;
     let noise_file = base.join("noise.tsv");
-    let mut summary = header([&base, &candidate], rounds, &groups);
-    let pass = if noise {
-        let (table, pass) = table(&metrics, &Gate::Measuring);
-        summary += &table;
+    if noise {
         write_noise(&noise_file, &metrics, rounds)?;
+    }
+    let mut summary = header([&base, &candidate], rounds, &groups);
+    let (table, pass) = table(&metrics, &read_noise(&noise_file), noise);
+    summary += &table;
+    if noise {
         let _ = write!(
             summary,
             "\nWrote the bands of {} metrics to {}.\n",
             metrics.len(),
             noise_file.display()
         );
-        pass
-    } else {
-        let bands = read_noise(&noise_file);
-        let gate = bands.as_ref().map_or(Gate::Uncalibrated, Gate::Bands);
-        let (table, pass) = table(&metrics, &gate);
-        summary += &table;
-        if bands.is_none() {
-            let _ = write!(
-                summary,
-                "\nWarning: {} is missing, so the gate is uncalibrated and only count_pass mismatches fail. Measure the noise with `cargo xtask bench-noise {}` on a quiet machine.\n",
-                noise_file.display(),
-                base.display()
-            );
-        }
-        pass
-    };
+    }
     print!("{summary}");
     let summary_path = runner.raw.join("summary.md");
     fs::write(&summary_path, summary).map_err(|e| format!("{}: {e}", summary_path.display()))?;
@@ -638,20 +632,21 @@ fn band(m: &Metric) -> f64 {
         .fold(0.0, f64::max)
 }
 
-fn read_noise(path: &Path) -> Option<HashMap<String, f64>> {
-    let text = fs::read_to_string(path).ok()?;
-    let bands = text
+/// The bands in `path`, none when it's missing.
+fn read_noise(path: &Path) -> HashMap<String, f64> {
+    fs::read_to_string(path)
+        .unwrap_or_default()
         .lines()
         .filter(|l| !l.starts_with('#'))
         .filter_map(|line| {
             let mut fields = line.split('\t');
             Some((fields.next()?.to_owned(), fields.next()?.parse().ok()?))
-        });
-    Some(bands.collect())
+        })
+        .collect()
 }
 
 /// Writes the measured bands into `path`, keeping the bands of metrics this
-/// run didn't measure, so a run of some groups doesn't ungate the others.
+/// run didn't measure, so a run of some groups leaves the others' bands.
 fn write_noise(path: &Path, metrics: &[Metric], rounds: usize) -> Result<()> {
     let measured = |name: &str| metrics.iter().any(|m| m.name == name);
     let mut out = format!(
@@ -672,19 +667,38 @@ fn write_noise(path: &Path, metrics: &[Metric], rounds: usize) -> Result<()> {
     fs::write(path, out).map_err(|e| format!("{}: {e}", path.display()))
 }
 
-enum Gate<'a> {
-    /// A compared with itself: the table shows the bands being measured.
-    Measuring,
-    /// No noise file: deltas are reported, and only `count_pass` fails.
-    Uncalibrated,
-    Bands(&'a HashMap<String, f64>),
+/// The one-sided sign test of B slower than A in `k` of `n` rounds: the
+/// p-value P(X ≥ k), X binomial with `n` trials of probability 1/2, as the
+/// number of outcomes at least that extreme and the number of outcomes, 2^n.
+fn sign_test(k: usize, n: usize) -> (u128, u128) {
+    let (mut tail, mut c) = (0, 1u128);
+    for i in 0..=n {
+        if i >= k {
+            tail += c;
+        }
+        c = c * (n - i) as u128 / (i + 1) as u128;
+    }
+    (tail, 1 << n)
 }
 
-/// The markdown table and whether every metric passed.
-fn table(metrics: &[Metric], gate: &Gate) -> (String, bool) {
-    let mut out =
-        "| Metric | A | B | Delta | Band | Result |\n|---|---|---|---|---|---|\n".to_owned();
-    let (mut failed, mut ungated) = (0, 0);
+/// Whether a timing or peak-RSS metric slowed down: B's median more than 1%
+/// above A's, and B slower in `k` of `n` rounds with a sign test p < 0.05.
+fn slower(a: f64, b: f64, k: usize, n: usize) -> bool {
+    let (tail, outcomes) = sign_test(k, n);
+    b > a * 1.01 && tail * 20 < outcomes
+}
+
+/// The markdown table and whether every metric passed. `measuring` is A
+/// compared with itself: the table adds the bands being measured, and a
+/// metric the rule fails is a false alarm, which doesn't fail the run.
+fn table(metrics: &[Metric], bands: &HashMap<String, f64>, measuring: bool) -> (String, bool) {
+    let mut out = if measuring {
+        "| Metric | A | B | Delta | Slower rounds | Band | Result |\n|---|---|---|---|---|---|---|\n"
+    } else {
+        "| Metric | A | B | Delta | Slower rounds | Result |\n|---|---|---|---|---|---|\n"
+    }
+    .to_owned();
+    let (mut failed, mut false_alarms) = (0, 0);
     for m in metrics {
         let a = median(&mut m.values[0].clone());
         let b = median(&mut m.values[1].clone());
@@ -694,54 +708,71 @@ fn table(metrics: &[Metric], gate: &Gate) -> (String, bool) {
             (Some(_), Some(_)) => "+0.0%".to_owned(),
             _ => "—".to_owned(),
         };
-        let mut band_cell = "—".to_owned();
+        let n = m.values[0].len().min(m.values[1].len());
+        let k = m.values[0]
+            .iter()
+            .zip(&m.values[1])
+            .filter(|(a, b)| b > a)
+            .count();
         let result = if m.name == COUNT_MISMATCH {
-            let sides = if matches!(gate, Gate::Measuring) {
-                0..2
-            } else {
-                1..2
-            };
+            let sides = if measuring { 0..2 } else { 1..2 };
             if m.values[sides].iter().flatten().any(|&n| n > 0.0) {
                 "FAIL"
             } else {
                 "PASS"
             }
+            .to_owned()
         } else {
-            match (a, b, gate) {
-                (_, _, Gate::Measuring) => {
-                    band_cell = show(band(m), m.unit);
-                    "measured"
+            match (a, b) {
+                (None, _) => "only in B".to_owned(),
+                (_, None) => "FAIL (missing in B)".to_owned(),
+                (Some(a), Some(b))
+                    if m.name.ends_with(" alloc count") || m.name.ends_with(" alloc bytes") =>
+                {
+                    let band = bands.get(&m.name).copied().unwrap_or(0.0);
+                    let result = if b > a + band { "FAIL" } else { "PASS" };
+                    if band > 0.0 && !measuring {
+                        format!("{result} (band {})", show(band, m.unit))
+                    } else {
+                        result.to_owned()
+                    }
                 }
-                (None, _, _) => "only in B",
-                (_, None, Gate::Uncalibrated) => "missing in B",
-                (_, None, Gate::Bands(_)) => "FAIL (missing in B)",
-                (Some(a), Some(b), Gate::Bands(bands)) if bands.contains_key(&m.name) => {
-                    let band = bands[&m.name];
-                    band_cell = show(band, m.unit);
-                    if b <= a + band { "PASS" } else { "FAIL" }
-                }
-                _ => {
-                    ungated += 1;
-                    "not gated"
-                }
+                (Some(a), Some(b)) => if slower(a, b, k, n) { "FAIL" } else { "PASS" }.to_owned(),
             }
+        };
+        let result = if measuring && m.name != COUNT_MISMATCH && result.starts_with("FAIL") {
+            false_alarms += 1;
+            "false alarm".to_owned()
+        } else {
+            result
         };
         if result.starts_with("FAIL") {
             failed += 1;
         }
+        let rounds = if n == 0 {
+            "—".to_owned()
+        } else {
+            format!("{k}/{n}")
+        };
+        let band_cell = match (measuring, m.name == COUNT_MISMATCH) {
+            (false, _) => String::new(),
+            (true, true) => " — |".to_owned(),
+            (true, false) => format!(" {} |", show(band(m), m.unit)),
+        };
         let cell = |v: Option<f64>| v.map_or_else(|| "—".to_owned(), |v| show(v, m.unit));
         let _ = writeln!(
             out,
-            "| {} | {} | {} | {delta} | {band_cell} | {result} |",
+            "| {} | {} | {} | {delta} | {rounds} |{band_cell} {result} |",
             m.name,
             cell(a),
             cell(b)
         );
     }
-    if ungated > 0 && matches!(gate, Gate::Bands(_)) {
+    if measuring {
         let _ = write!(
             out,
-            "\n{ungated} metrics have no band in noise.tsv and are not gated.\n"
+            "\nFalse alarms, metrics the rule fails with A against itself: {false_alarms} of {}.\n",
+            metrics.len()
         );
     }
     let _ = write!(out, "\nFailed: {failed} of {} metrics.\n", metrics.len());
@@ -838,5 +869,22 @@ frame                       fastest       │ slowest       │ median        �
         for (got, want) in parsed.iter().zip(expected) {
             assert!((got - want).abs() < 1e-3, "{got} != {want}");
         }
+    }
+
+    #[test]
+    fn sign_test_p_values() {
+        // 11/1024 ≈ 0.0107, 56/1024 ≈ 0.0547, 1/32 = 0.03125.
+        assert_eq!(sign_test(9, 10), (11, 1024));
+        assert_eq!(sign_test(8, 10), (56, 1024));
+        assert_eq!(sign_test(5, 5), (1, 32));
+        // The largest --rounds: every coefficient fits, and they sum to 2^n.
+        assert_eq!(sign_test(0, 100), (1 << 100, 1 << 100));
+    }
+
+    #[test]
+    fn timing_fails_on_a_consistent_slowdown_over_one_percent() {
+        assert!(!slower(100.0, 102.0, 8, 10));
+        assert!(slower(100.0, 102.0, 9, 10));
+        assert!(!slower(100.0, 100.5, 10, 10));
     }
 }

@@ -976,12 +976,12 @@ fn each_scroll_step_moves_the_code_one_row() {
                     break;
                 }
                 moves += 1;
-                for y in 0..HEIGHT {
+                for (y, row) in after.0.iter().enumerate().take(HEIGHT) {
                     let Some(from) = y.checked_add_signed(delta).filter(|&f| f < HEIGHT) else {
                         continue;
                     };
                     assert_eq!(
-                        after.0[y], before.0[from],
+                        row, &before.0[from],
                         "press {press} by {delta}, row {y}, full {full}"
                     );
                 }

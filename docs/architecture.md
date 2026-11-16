@@ -37,7 +37,7 @@ Layer 1 is the exception: `highlight` and `structural` store results through `ca
 | `diff::intraline` | Token-level emphasis inside changed lines, and the pairing of a change block's removed and added lines, for hunks and for a patch's lines alike. |
 | `view` | What a frontend draws, short of how it looks: a hunk's lines and their states (modified, moved, reformatted), headers, rows in the split or unified arrangement, syntax runs, paint and attributes, hunk headings. No widths, colors or cells. |
 | `patch` | Unified diffs read as text (`git diff`, `git log -p`, `diff -u`): the line-at-a-time parser and its events, what text lines and combined-diff lines are, and the builder that collects events into commits and files. No I/O: the host reads the input and stores what it keeps. |
-| `highlight` | tree-sitter highlighting of the requested lines, and a file's two sides prepared for it. The grammar registry (`Registry`) is a value the host builds and passes in, with the 30 bundled grammars as `Registry::builtin`; each grammar has an identity that goes into cache keys. |
+| `highlight` | tree-sitter highlighting of the requested lines, and a file's two sides prepared for it. The grammar registry (`Registry`) is a value the host builds and passes in, with the 30 bundled grammars as `Registry::builtin`. Matching a file to a language reads only names and extensions; a grammar is loaded on its language's first parse or query compile. Each grammar has an identity that goes into cache keys. |
 | `structural` | The syntax-aware diff: anchoring, per-region matching, the result cache. |
 | `git` | Revision resolution (through gix), streaming change enumeration, content loading. |
 | `git::spec` | `git diff`-style arguments resolved to the two sides of a diff. |

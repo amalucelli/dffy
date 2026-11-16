@@ -15,9 +15,9 @@ use crate::git::ObjectId;
 /// host, owned for text it loads at run time.
 pub type Words = Cow<'static, [Cow<'static, str>]>;
 
-/// A language as a host describes it to a [`Registry`]: plain data, with no
-/// code of its own. Text is borrowed or owned (see [`Words`]); the registry
-/// keeps it as given and matching files never copies it.
+/// A language as a host describes it to a [`Registry`]: plain data. Text is
+/// borrowed or owned (see [`Words`]); the registry keeps it as given and
+/// matching files never copies it.
 pub struct Grammar {
     /// Lowercase and stable: code fences name languages by it, and it's
     /// part of the language's [`Language::identity`].
@@ -30,7 +30,7 @@ pub struct Grammar {
     /// (`python` matches `python3.12`).
     pub interpreters: Words,
     /// The tree-sitter grammar.
-    pub language: tree_sitter::Language,
+    pub language: LanguageSource,
     /// The highlight query, as parts concatenated in order. When two
     /// patterns capture the same node the last one wins (as in
     /// tree-sitter's own highlighter), so a query extending another's goes
@@ -42,16 +42,29 @@ pub struct Grammar {
     pub indentation_is_syntax: bool,
 }
 
+/// Where a [`Grammar`]'s tree-sitter grammar comes from.
+pub enum LanguageSource {
+    /// A grammar compiled into the host, loaded on the language's first
+    /// parse, query compile or [`Language::identity`]: matching files to
+    /// languages never touches it, so a registry of many grammars costs
+    /// only those a run uses. For a grammar crate, write
+    /// `LanguageSource::Fn(|| tree_sitter_rust::LANGUAGE.into())`.
+    Fn(fn() -> tree_sitter::Language),
+    /// A grammar the host already holds, such as one loaded at run time.
+    Loaded(tree_sitter::Language),
+}
+
 /// A language of a [`Registry`]: a shared handle to its [`Grammar`], whose
-/// highlight query is compiled on first use (or ahead of it, by
-/// [`Language::prepare`]) and kept as long as any handle is. Cloning is
-/// cheap; two handles are equal when they're the same
-/// registry entry.
+/// grammar is loaded and highlight query compiled on first use (or ahead of
+/// it, by [`Language::prepare`]) and kept as long as any handle is. Cloning
+/// is cheap; two handles are equal when they're the same registry entry.
 #[derive(Clone)]
 pub struct Language(Arc<Entry>);
 
 struct Entry {
     grammar: Grammar,
+    /// The grammar of a [`LanguageSource::Fn`], once loaded.
+    loaded: OnceLock<tree_sitter::Language>,
     compiled: OnceLock<Option<Compiled>>,
     identity: OnceLock<ObjectId>,
     #[cfg(test)]
@@ -76,6 +89,7 @@ impl Language {
     fn new(grammar: Grammar) -> Self {
         Self(Arc::new(Entry {
             grammar,
+            loaded: OnceLock::new(),
             compiled: OnceLock::new(),
             identity: OnceLock::new(),
             #[cfg(test)]
@@ -99,7 +113,7 @@ impl Language {
     /// keys: a digest of its name, the grammar's ABI version, metadata
     /// version and table sizes, and its query text. Updating a grammar or
     /// its query changes it, which orphans the results cached under the old
-    /// one. Computed on first use.
+    /// one. Computed on first use, which loads the grammar.
     #[must_use]
     pub fn identity(&self) -> &ObjectId {
         self.0.identity.get_or_init(|| {
@@ -110,7 +124,7 @@ impl Language {
             };
             number(&mut hasher, g.name.len());
             hasher.update(g.name.as_bytes());
-            let ts = &g.language;
+            let ts = self.grammar();
             number(&mut hasher, ts.abi_version());
             let version = ts.metadata().map_or([u8::MAX; 3], |m| {
                 [m.major_version, m.minor_version, m.patch_version]
@@ -130,12 +144,23 @@ impl Language {
     }
 
     pub(crate) fn grammar(&self) -> &tree_sitter::Language {
-        &self.0.grammar.language
+        match &self.0.grammar.language {
+            LanguageSource::Fn(load) => self.0.loaded.get_or_init(*load),
+            LanguageSource::Loaded(language) => language,
+        }
     }
 
-    /// Compiles the highlight query now unless that's done, so the
-    /// language's first parse doesn't wait for it: call it on a spare
-    /// thread once a file of this language is known to be coming. Blocks
+    #[cfg(test)]
+    pub(super) fn is_loaded(&self) -> bool {
+        match self.0.grammar.language {
+            LanguageSource::Fn(_) => self.0.loaded.get().is_some(),
+            LanguageSource::Loaded(_) => true,
+        }
+    }
+
+    /// Loads the grammar and compiles the highlight query now unless that's
+    /// done, so the language's first parse doesn't wait for it: call it on a
+    /// spare thread once a file of this language is known to be coming. Blocks
     /// while the query compiles (up to about 140ms, Swift's), including
     /// when another thread started it; the query is compiled once however
     /// many threads ask. Afterwards it returns at once.
@@ -153,10 +178,7 @@ impl Language {
                 self.0
                     .compiles
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                Compiled::new(
-                    &self.0.grammar.language,
-                    &self.0.grammar.highlights.concat(),
-                )
+                Compiled::new(self.grammar(), &self.0.grammar.highlights.concat())
             })
             .as_ref()
     }
@@ -270,12 +292,12 @@ const KOTLIN_JUMPS: &str = r#"(jump_expression) @none
     reason = "a table with an entry per bundled grammar"
 )]
 fn builtin() -> [Grammar; 30] {
-    let grammar = |name, language: tree_sitter::Language| Grammar {
+    let grammar = |name, language: fn() -> tree_sitter::Language| Grammar {
         name: Cow::Borrowed(name),
         file_names: words![],
         extensions: words![],
         interpreters: words![],
-        language,
+        language: LanguageSource::Fn(language),
         highlights: words![],
         indentation_is_syntax: false,
     };
@@ -296,12 +318,12 @@ fn builtin() -> [Grammar; 30] {
             extensions: words!["sh", "bash", "zsh", "ksh", "bats", "ebuild"],
             interpreters: words!["sh", "bash", "zsh", "dash", "ksh", "ash"],
             highlights: words![tree_sitter_bash::HIGHLIGHT_QUERY],
-            ..grammar("bash", tree_sitter_bash::LANGUAGE.into())
+            ..grammar("bash", || tree_sitter_bash::LANGUAGE.into())
         },
         Grammar {
             extensions: words!["c", "h"],
             highlights: words![tree_sitter_c::HIGHLIGHT_QUERY],
-            ..grammar("c", tree_sitter_c::LANGUAGE.into())
+            ..grammar("c", || tree_sitter_c::LANGUAGE.into())
         },
         Grammar {
             extensions: words![
@@ -311,49 +333,49 @@ fn builtin() -> [Grammar; 30] {
                 tree_sitter_c::HIGHLIGHT_QUERY,
                 tree_sitter_cpp::HIGHLIGHT_QUERY,
             ],
-            ..grammar("cpp", tree_sitter_cpp::LANGUAGE.into())
+            ..grammar("cpp", || tree_sitter_cpp::LANGUAGE.into())
         },
         Grammar {
             extensions: words!["cs"],
             highlights: words![tree_sitter_c_sharp::HIGHLIGHTS_QUERY],
-            ..grammar("csharp", tree_sitter_c_sharp::LANGUAGE.into())
+            ..grammar("csharp", || tree_sitter_c_sharp::LANGUAGE.into())
         },
         Grammar {
             extensions: words!["css"],
             highlights: words![tree_sitter_css::HIGHLIGHTS_QUERY],
-            ..grammar("css", tree_sitter_css::LANGUAGE.into())
+            ..grammar("css", || tree_sitter_css::LANGUAGE.into())
         },
         Grammar {
             file_names: words!["Dockerfile", "Containerfile"],
             extensions: words!["dockerfile", "containerfile"],
             highlights: words![tree_sitter_containerfile::HIGHLIGHTS_QUERY],
-            ..grammar("dockerfile", tree_sitter_containerfile::LANGUAGE.into())
+            ..grammar("dockerfile", || tree_sitter_containerfile::LANGUAGE.into())
         },
         Grammar {
             extensions: words!["ex", "exs"],
             interpreters: words!["elixir"],
             highlights: words![tree_sitter_elixir::HIGHLIGHTS_QUERY],
-            ..grammar("elixir", tree_sitter_elixir::LANGUAGE.into())
+            ..grammar("elixir", || tree_sitter_elixir::LANGUAGE.into())
         },
         Grammar {
             extensions: words!["go"],
             highlights: words![tree_sitter_go::HIGHLIGHTS_QUERY],
-            ..grammar("go", tree_sitter_go::LANGUAGE.into())
+            ..grammar("go", || tree_sitter_go::LANGUAGE.into())
         },
         Grammar {
             extensions: words!["tf", "tfvars", "hcl"],
             highlights: words![include_str!("queries/hcl/highlights.scm")],
-            ..grammar("hcl", tree_sitter_hcl::LANGUAGE.into())
+            ..grammar("hcl", || tree_sitter_hcl::LANGUAGE.into())
         },
         Grammar {
             extensions: words!["html", "htm", "xhtml"],
             highlights: words![tree_sitter_html::HIGHLIGHTS_QUERY],
-            ..grammar("html", tree_sitter_html::LANGUAGE.into())
+            ..grammar("html", || tree_sitter_html::LANGUAGE.into())
         },
         Grammar {
             extensions: words!["java"],
             highlights: words![tree_sitter_java::HIGHLIGHTS_QUERY],
-            ..grammar("java", tree_sitter_java::LANGUAGE.into())
+            ..grammar("java", || tree_sitter_java::LANGUAGE.into())
         },
         Grammar {
             extensions: words!["js", "mjs", "cjs", "jsx"],
@@ -362,82 +384,82 @@ fn builtin() -> [Grammar; 30] {
                 tree_sitter_javascript::HIGHLIGHT_QUERY,
                 tree_sitter_javascript::JSX_HIGHLIGHT_QUERY,
             ],
-            ..grammar("javascript", tree_sitter_javascript::LANGUAGE.into())
+            ..grammar("javascript", || tree_sitter_javascript::LANGUAGE.into())
         },
         Grammar {
             extensions: words!["json", "jsonc", "json5", "geojson", "webmanifest"],
             highlights: words![tree_sitter_json::HIGHLIGHTS_QUERY],
-            ..grammar("json", tree_sitter_json::LANGUAGE.into())
+            ..grammar("json", || tree_sitter_json::LANGUAGE.into())
         },
         Grammar {
             extensions: words!["kt", "kts"],
             highlights: words![tree_sitter_kotlin_sg::HIGHLIGHTS_QUERY, KOTLIN_JUMPS],
-            ..grammar("kotlin", tree_sitter_kotlin_sg::LANGUAGE.into())
+            ..grammar("kotlin", || tree_sitter_kotlin_sg::LANGUAGE.into())
         },
         Grammar {
             extensions: words!["lua"],
             interpreters: words!["lua", "luajit"],
             highlights: words![tree_sitter_lua::HIGHLIGHTS_QUERY],
-            ..grammar("lua", tree_sitter_lua::LANGUAGE.into())
+            ..grammar("lua", || tree_sitter_lua::LANGUAGE.into())
         },
         Grammar {
             file_names: words!["Makefile", "makefile", "GNUmakefile"],
             extensions: words!["mk"],
             highlights: words![tree_sitter_make::HIGHLIGHTS_QUERY],
-            ..grammar("make", tree_sitter_make::LANGUAGE.into())
+            ..grammar("make", || tree_sitter_make::LANGUAGE.into())
         },
         Grammar {
             extensions: words!["md", "markdown", "mdx"],
             highlights: words![tree_sitter_md::HIGHLIGHT_QUERY_BLOCK],
             indentation_is_syntax: true,
-            ..grammar("markdown", tree_sitter_md::LANGUAGE.into())
+            ..grammar("markdown", || tree_sitter_md::LANGUAGE.into())
         },
         Grammar {
             extensions: words!["php"],
             interpreters: words!["php"],
             highlights: words![tree_sitter_php::HIGHLIGHTS_QUERY],
-            ..grammar("php", tree_sitter_php::LANGUAGE_PHP.into())
+            ..grammar("php", || tree_sitter_php::LANGUAGE_PHP.into())
         },
         Grammar {
             extensions: words!["py", "pyi", "pyw"],
             interpreters: words!["python", "pypy"],
             highlights: words![tree_sitter_python::HIGHLIGHTS_QUERY],
             indentation_is_syntax: true,
-            ..grammar("python", tree_sitter_python::LANGUAGE.into())
+            ..grammar("python", || tree_sitter_python::LANGUAGE.into())
         },
         Grammar {
             file_names: words!["Gemfile", "Rakefile", "Vagrantfile", "Podfile", "Brewfile"],
             extensions: words!["rb", "rake", "gemspec", "ru"],
             interpreters: words!["ruby"],
             highlights: words![tree_sitter_ruby::HIGHLIGHTS_QUERY],
-            ..grammar("ruby", tree_sitter_ruby::LANGUAGE.into())
+            ..grammar("ruby", || tree_sitter_ruby::LANGUAGE.into())
         },
         Grammar {
             extensions: words!["rs"],
             highlights: words![tree_sitter_rust::HIGHLIGHTS_QUERY],
-            ..grammar("rust", tree_sitter_rust::LANGUAGE.into())
+            ..grammar("rust", || tree_sitter_rust::LANGUAGE.into())
         },
         Grammar {
             extensions: words!["scala", "sc", "sbt"],
             highlights: words![tree_sitter_scala::HIGHLIGHTS_QUERY],
             indentation_is_syntax: true,
-            ..grammar("scala", tree_sitter_scala::LANGUAGE.into())
+            ..grammar("scala", || tree_sitter_scala::LANGUAGE.into())
         },
         Grammar {
             extensions: words!["sql"],
             highlights: words![tree_sitter_sequel::HIGHLIGHTS_QUERY],
-            ..grammar("sql", tree_sitter_sequel::LANGUAGE.into())
+            ..grammar("sql", || tree_sitter_sequel::LANGUAGE.into())
         },
         Grammar {
             extensions: words!["swift"],
             highlights: words![tree_sitter_swift::HIGHLIGHTS_QUERY],
-            ..grammar("swift", tree_sitter_swift::LANGUAGE.into())
+            ..grammar("swift", || tree_sitter_swift::LANGUAGE.into())
         },
         Grammar {
             file_names: words!["Cargo.lock", "Pipfile", "poetry.lock", "uv.lock"],
             extensions: words!["toml"],
             highlights: words![tree_sitter_toml_ng::HIGHLIGHTS_QUERY],
-            ..grammar("toml", tree_sitter_toml_ng::LANGUAGE.into())
+            ..grammar("toml", || tree_sitter_toml_ng::LANGUAGE.into())
         },
         Grammar {
             extensions: words!["tsx"],
@@ -446,7 +468,7 @@ fn builtin() -> [Grammar; 30] {
                 tree_sitter_javascript::JSX_HIGHLIGHT_QUERY,
                 tree_sitter_typescript::HIGHLIGHTS_QUERY,
             ],
-            ..grammar("tsx", tree_sitter_typescript::LANGUAGE_TSX.into())
+            ..grammar("tsx", || tree_sitter_typescript::LANGUAGE_TSX.into())
         },
         Grammar {
             extensions: words!["ts", "mts", "cts"],
@@ -454,26 +476,25 @@ fn builtin() -> [Grammar; 30] {
                 tree_sitter_javascript::HIGHLIGHT_QUERY,
                 tree_sitter_typescript::HIGHLIGHTS_QUERY,
             ],
-            ..grammar(
-                "typescript",
-                tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
-            )
+            ..grammar("typescript", || {
+                tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into()
+            })
         },
         Grammar {
             extensions: words!["xml", "xsd", "xsl", "svg", "plist"],
             highlights: words![tree_sitter_xml::XML_HIGHLIGHT_QUERY],
-            ..grammar("xml", tree_sitter_xml::LANGUAGE_XML.into())
+            ..grammar("xml", || tree_sitter_xml::LANGUAGE_XML.into())
         },
         Grammar {
             extensions: words!["yml", "yaml"],
             highlights: words![tree_sitter_yaml::HIGHLIGHTS_QUERY],
             indentation_is_syntax: true,
-            ..grammar("yaml", tree_sitter_yaml::LANGUAGE.into())
+            ..grammar("yaml", || tree_sitter_yaml::LANGUAGE.into())
         },
         Grammar {
             extensions: words!["zig", "zon"],
             highlights: words![tree_sitter_zig::HIGHLIGHTS_QUERY],
-            ..grammar("zig", tree_sitter_zig::LANGUAGE.into())
+            ..grammar("zig", || tree_sitter_zig::LANGUAGE.into())
         },
     ]
 }

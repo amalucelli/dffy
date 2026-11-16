@@ -75,6 +75,25 @@ fn prepare_compiles_a_query_once_however_many_threads_ask() {
 }
 
 #[test]
+fn a_grammar_loads_on_first_use_not_when_matching_files() {
+    let grammars = Registry::builtin();
+    let rust = grammars.detect(b"src/lib.rs", b"").expect("rust");
+    grammars.named("swift").expect("swift");
+    grammars.detect(b"run", b"#!/bin/sh\n").expect("bash");
+    let loaded = || {
+        grammars
+            .languages()
+            .iter()
+            .filter(|l| l.is_loaded())
+            .map(Language::name)
+            .collect::<Vec<_>>()
+    };
+    assert!(loaded().is_empty(), "{:?}", loaded());
+    rust.prepare();
+    assert_eq!(loaded(), ["rust"]);
+}
+
+#[test]
 fn detects_by_name_extension_and_shebang() {
     assert_eq!(detect("kernel/sched/fair.c", ""), Some("c"));
     assert_eq!(detect("include/linux/sched.h", ""), Some("c"));

@@ -20,7 +20,7 @@ use std::time::{Duration, Instant};
 use rustc_hash::FxHashMap;
 use tree_sitter::{Parser, Query, QueryCursor, StreamingIterator, Tree};
 
-pub use lang::{Grammar, Language, Registry, Words};
+pub use lang::{Grammar, Language, LanguageSource, Registry, Words};
 
 use crate::cache::{self, Cache};
 use crate::diff::{Emphasis, Hunk, Text, emphasize_with};

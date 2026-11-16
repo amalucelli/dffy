@@ -16,7 +16,7 @@ use dffy_core::document::{
     self, File, NO_NEWLINE_LINE, diff_line, file_header, hunk_header, structural_note,
 };
 use dffy_core::git::{CommitInfo, DiffSpec, FileChange, FileDiff, Repo, Revisions, Status};
-use dffy_core::highlight::{HunkSyntax, Language, PARALLEL_PARSE_BYTES, Registry};
+use dffy_core::highlight::{HunkSyntax, Language, PARALLEL_PARSE_BYTES};
 use dffy_core::patch::TextKind;
 use dffy_core::structural::{Structural, Unavailable};
 use dffy_core::view::{self, Arrangement, Heading, LineState, Row, Staging, no_newline};
@@ -421,7 +421,6 @@ struct Renderer<'a> {
     options: Options,
     highlight: bool,
     syntax_diff: bool,
-    grammars: &'a Registry,
     cache: Option<&'a Cache>,
     /// Threads the machine runs at once.
     cores: usize,
@@ -470,7 +469,8 @@ impl FileOutput for Renderer<'_> {
         sizes: Option<[u64; 2]>,
         emit: &mut dyn FnMut(Vec<u8>) -> Result<(), Error>,
     ) -> Result<bool, Error> {
-        let prepare = File::prepare(self.grammars, self.cache);
+        // Without highlighting or the syntax diff the registry is never built.
+        let prepare = || File::prepare(crate::grammars(), self.cache);
         let mut fd = self.diff(repo, change, sizes)?;
         if document::whitespace_only(&fd, self.options.whitespace) {
             return Ok(false);
@@ -500,7 +500,7 @@ impl FileOutput for Renderer<'_> {
                     // Each side's spans go out as soon as they're computed,
                     // so freeing its syntax tree overlaps the layout.
                     let work = move || {
-                        let h = prepare.highlighter(side);
+                        let h = prepare().highlighter(side);
                         let spans = h.as_ref().map(|h| {
                             ranges
                                 .into_iter()
@@ -517,7 +517,10 @@ impl FileOutput for Renderer<'_> {
                     rx
                 })
             });
-            let structural = self.syntax_diff.then(|| prepare.structural(&fd)).flatten();
+            let structural = self
+                .syntax_diff
+                .then(|| prepare().structural(&fd))
+                .flatten();
             // A syntax diff pairs its lines itself. Pairing finds the
             // emphasis on the way, kept when no syntax tokens will replace
             // it.
@@ -555,7 +558,7 @@ impl FileOutput for Renderer<'_> {
         {
             return;
         }
-        let Some(lang) = self.grammars.detect(&change.path, &[]) else {
+        let Some(lang) = crate::grammars().detect(&change.path, &[]) else {
             return;
         };
         let mut prepared = self
@@ -699,7 +702,6 @@ impl Plan {
             options,
             highlight: ctx.highlight(),
             syntax_diff: ctx.config.syntax_diff,
-            grammars: crate::grammars(),
             cache: ctx.cache.as_ref(),
             cores: cores(),
             parsing: std::sync::atomic::AtomicUsize::new(0),

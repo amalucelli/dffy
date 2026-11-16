@@ -12,7 +12,7 @@ use rustc_hash::FxHashMap;
 
 pub(crate) use intraline::paired_emphasis;
 pub use intraline::{
-    Emphasis, emphasize, emphasize_lines, emphasize_with, pair, similar, tokenize,
+    Emphasis, emphasize, emphasize_lines, emphasize_with, pair, pair_lines, similar, tokenize,
 };
 
 /// Lines longer than this get no intra-line emphasis; minified files would
@@ -331,9 +331,11 @@ fn diff_with(
     whitespace: Whitespace,
     algorithm: impl FnOnce(&[u32], &[u32], usize, &mut [bool], &mut [bool]),
 ) -> Changes {
+    let lens = [old.len(), new.len()];
     match whitespace {
         Whitespace::Exact => diff_keys(
-            [old.len(), new.len()],
+            lens,
+            common_lines(old, new),
             |i| old.line(i),
             |j| new.line(j),
             algorithm,
@@ -342,10 +344,13 @@ fn diff_with(
             let mut arena = Vec::with_capacity(old.bytes.len() + new.bytes.len());
             let old_ranges = normalize(old, mode, &mut arena);
             let new_ranges = normalize(new, mode, &mut arena);
+            let old_key = |i: usize| &arena[old_ranges[i].clone()];
+            let new_key = |j: usize| &arena[new_ranges[j].clone()];
             diff_keys(
-                [old.len(), new.len()],
-                |i| &arena[old_ranges[i].clone()],
-                |j| &arena[new_ranges[j].clone()],
+                lens,
+                common_keys(lens, old_key, new_key),
+                old_key,
+                new_key,
                 algorithm,
             )
         }
@@ -353,19 +358,16 @@ fn diff_with(
 }
 
 /// [`diff_with`] over each side's lines as compared, `old(i)` and `new(j)`.
-/// The common prefix and suffix are trimmed before interning: a large file
-/// with a small change then hashes only the lines around the change.
+/// The `(prefix, suffix)` lines both sides share are trimmed before
+/// interning: a large file with a small change then hashes only the lines
+/// around the change.
 fn diff_keys<'a>(
     [old_len, new_len]: [usize; 2],
+    (prefix, suffix): (usize, usize),
     old: impl Fn(usize) -> &'a [u8],
     new: impl Fn(usize) -> &'a [u8],
     algorithm: impl FnOnce(&[u32], &[u32], usize, &mut [bool], &mut [bool]),
 ) -> Changes {
-    let shorter = old_len.min(new_len);
-    let prefix = (0..shorter).take_while(|&i| old(i) == new(i)).count();
-    let suffix = (1..=shorter - prefix)
-        .take_while(|&k| old(old_len - k) == new(new_len - k))
-        .count();
     let (old_mid, new_mid) = (prefix..old_len - suffix, prefix..new_len - suffix);
     let interned = intern(old_mid.clone().map(old), new_mid.clone().map(new));
     let mut changes = Changes {
@@ -380,6 +382,85 @@ fn diff_keys<'a>(
         &mut changes.added[new_mid],
     );
     changes
+}
+
+/// How many lines `old` and `new` share at the start, then how many of the
+/// rest at the end, comparing keys `old(i)` and `new(j)`.
+fn common_keys<'a>(
+    [old_len, new_len]: [usize; 2],
+    old: impl Fn(usize) -> &'a [u8],
+    new: impl Fn(usize) -> &'a [u8],
+) -> (usize, usize) {
+    let shorter = old_len.min(new_len);
+    let prefix = (0..shorter).take_while(|&i| old(i) == new(i)).count();
+    let suffix = (1..=shorter - prefix)
+        .take_while(|&k| old(old_len - k) == new(new_len - k))
+        .count();
+    (prefix, suffix)
+}
+
+/// [`common_keys`] for lines compared byte for byte, from one scan of the
+/// bytes at each end of the texts instead of a comparison per line.
+fn common_lines(old: &Text, new: &Text) -> (usize, usize) {
+    let shorter = old.len().min(new.len());
+    let same = common_prefix(&old.bytes, &new.bytes);
+    // Lines end at the same offsets in both texts up to `same`, except that
+    // a last line without a newline can end there in one text only.
+    let mut prefix = 0;
+    while prefix < shorter
+        && old.starts[prefix + 1] <= same
+        && old.starts[prefix + 1] == new.starts[prefix + 1]
+    {
+        prefix += 1;
+    }
+    let same = common_suffix(
+        &old.bytes[old.starts[prefix]..],
+        &new.bytes[new.starts[prefix]..],
+    );
+    // The common tail can begin mid-line: a line is shared only if it
+    // starts inside the tail, as far from the end in both texts.
+    let mut suffix = 0;
+    while suffix < shorter - prefix {
+        let from_end = old.bytes.len() - old.starts[old.len() - suffix - 1];
+        if from_end > same || new.bytes.len() - new.starts[new.len() - suffix - 1] != from_end {
+            break;
+        }
+        suffix += 1;
+    }
+    (prefix, suffix)
+}
+
+/// The length of the longest common prefix of `a` and `b`. Whole 32-byte
+/// chunks compare inline as vectors.
+fn common_prefix(a: &[u8], b: &[u8]) -> usize {
+    let n = a.len().min(b.len());
+    let (a, b) = (&a[..n], &b[..n]);
+    let chunks = (a.as_chunks::<32>().0.iter())
+        .zip(b.as_chunks::<32>().0)
+        .take_while(|(x, y)| x == y)
+        .count();
+    let start = chunks * 32;
+    start
+        + (a[start..].iter())
+            .zip(&b[start..])
+            .take_while(|(x, y)| x == y)
+            .count()
+}
+
+/// The length of the longest common suffix of `a` and `b`.
+fn common_suffix(a: &[u8], b: &[u8]) -> usize {
+    let n = a.len().min(b.len());
+    let (a, b) = (&a[a.len() - n..], &b[b.len() - n..]);
+    let chunks = (a.as_rchunks::<32>().1.iter().rev())
+        .zip(b.as_rchunks::<32>().1.iter().rev())
+        .take_while(|(x, y)| x == y)
+        .count();
+    let end = n - chunks * 32;
+    chunks * 32
+        + (a[..end].iter().rev())
+            .zip(b[..end].iter().rev())
+            .take_while(|(x, y)| x == y)
+            .count()
 }
 
 struct Interned {

@@ -16,11 +16,12 @@ use std::cmp::Ordering;
 use std::collections::HashSet;
 
 use dffy_core::bstr::{BString, ByteSlice};
+use dffy_core::view::Attributes;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use super::fuzzy;
 use super::view::{Counts, Entry};
-use crate::render::{Attributes, escape, stat};
+use crate::render::{escape, stat};
 use crate::term::Grid;
 use crate::theme::{Role, Style, Theme};
 

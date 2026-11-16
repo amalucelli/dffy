@@ -42,7 +42,7 @@ use crate::diff::{
     Hunk, Line, LineKind, MAX_INTRALINE_LINE_BYTES, Text, Unchanged, common, paired_emphasis,
 };
 use crate::git::ObjectId;
-use crate::highlight::{Language, parse_tree};
+use crate::highlight::{Registry, parse_tree};
 use matcher::{LeafMatch, Mark, Matching, NONE};
 use tree::Tree;
 
@@ -110,20 +110,21 @@ impl Structural {
 }
 
 /// The structural diff of the file at `path` (repository-relative, for the
-/// language), given its line `hunks` from [`crate::diff::hunks`] or
-/// [`crate::git::Repo::file_diff`].
+/// language `grammars` detects), given its line `hunks` from
+/// [`crate::diff::hunks`] or [`crate::git::Repo::file_diff`].
 ///
 /// # Errors
 ///
 /// [`Unavailable`] when the language has no grammar, a side is too large,
 /// or parsing runs past its time budget.
 pub fn diff(
+    grammars: &Registry,
     path: &[u8],
     old: &Text,
     new: &Text,
     hunks: &[Hunk],
 ) -> Result<Structural, Unavailable> {
-    diff_with(path, old, new, hunks, Budget::DEFAULT)
+    diff_with(grammars, path, old, new, hunks, Budget::DEFAULT)
 }
 
 /// [`diff`] through the disk cache: when both sides are known blobs `ids`
@@ -135,6 +136,7 @@ pub fn diff(
 ///
 /// As [`diff`].
 pub fn diff_cached(
+    grammars: &Registry,
     path: &[u8],
     old: &Text,
     new: &Text,
@@ -151,7 +153,7 @@ pub fn diff_cached(
             return None;
         }
         let head = &new.bytes()[..new.bytes().len().min(256)];
-        let lang = Language::detect(path, head)?;
+        let lang = grammars.detect(path, head)?;
         Some((cache, stored::key(lang, [old_id, new_id], hunks)))
     })();
     if let Some((cache, key)) = &key
@@ -159,7 +161,7 @@ pub fn diff_cached(
     {
         return Ok(s);
     }
-    let s = diff(path, old, new, hunks)?;
+    let s = diff(grammars, path, old, new, hunks)?;
     if let Some((cache, key)) = key
         && s.complete
     {
@@ -169,6 +171,7 @@ pub fn diff_cached(
 }
 
 pub(crate) fn diff_with(
+    grammars: &Registry,
     path: &[u8],
     old: &Text,
     new: &Text,
@@ -176,7 +179,7 @@ pub(crate) fn diff_with(
     budget: Budget,
 ) -> Result<Structural, Unavailable> {
     let head = &new.bytes()[..new.bytes().len().min(256)];
-    let lang = Language::detect(path, head).ok_or(Unavailable::Language)?;
+    let lang = grammars.detect(path, head).ok_or(Unavailable::Language)?;
     if old.bytes().len() > MAX_BYTES || new.bytes().len() > MAX_BYTES {
         return Err(Unavailable::TooLarge);
     }

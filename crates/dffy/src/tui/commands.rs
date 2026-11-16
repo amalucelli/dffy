@@ -12,11 +12,11 @@
 
 use std::time::{Duration, Instant};
 
+use dffy_core::view::Attributes;
 use unicode_width::UnicodeWidthStr;
 
 use super::{fuzzy, help};
 use crate::keys::{Action, Group};
-use crate::render::Attributes;
 use crate::term::{Grid, Key, Mods};
 use crate::theme::{Role, Style, Theme};
 

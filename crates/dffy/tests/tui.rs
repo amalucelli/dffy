@@ -1541,6 +1541,16 @@ fn the_picker_reads_a_piped_diff_to_its_end() {
 
 /// Resident memory of process `pid`, in KB.
 fn rss_kb(pid: &str) -> usize {
+    if !cfg!(target_os = "linux") {
+        let ps = Command::new("ps")
+            .args(["-o", "rss=", "-p", pid])
+            .output()
+            .expect("ps");
+        return String::from_utf8_lossy(&ps.stdout)
+            .trim()
+            .parse()
+            .expect("ps rss");
+    }
     let status = std::fs::read_to_string(format!("/proc/{pid}/status")).expect("proc status");
     status
         .lines()

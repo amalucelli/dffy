@@ -12,7 +12,8 @@ use std::process::Command;
 use std::time::{Duration, Instant};
 
 use dffy_core::diff::Options;
-use dffy_core::git::{self, ChangeSet, FileChange, Head, Repo, Revisions, Staging, Status};
+use dffy_core::git::{self, ChangeSet, FileChange, Head, Repo, Revisions, Status};
+use dffy_core::view::Staging;
 
 use crate::Ctx;
 use crate::daemon::protocol::{self, VERSION};

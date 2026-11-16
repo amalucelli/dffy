@@ -24,10 +24,12 @@ pub mod bench;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::sync::LazyLock;
 
 use clap::{ColorChoice, CommandFactory, FromArgMatches};
 use dffy_core::cache::Cache;
 use dffy_core::git;
+use dffy_core::highlight::Registry;
 
 use cli::{Cli, Command, CommonArgs, DaemonAction, DiffArgs, ShowArgs, ViewArgs};
 use config::{Config, DefaultDiff, Indicators, ModifiedLines, Paging, View, Warning};
@@ -43,6 +45,14 @@ const INTERRUPTED: u8 = 130;
 
 /// The version and a hash of the sources this binary is built from.
 pub(crate) const BUILD: &str = concat!(env!("CARGO_PKG_VERSION"), "+", env!("DFFY_SOURCE_HASH"));
+
+/// The grammars dffy highlights and syntax-diffs with: the core's built-in
+/// set, built on first use and kept for the process, so each language's
+/// query is compiled at most once. Entry points fetch it and pass it down.
+pub(crate) fn grammars() -> &'static Registry {
+    static GRAMMARS: LazyLock<Registry> = LazyLock::new(Registry::builtin);
+    &GRAMMARS
+}
 
 #[derive(Debug)]
 pub(crate) enum Error {

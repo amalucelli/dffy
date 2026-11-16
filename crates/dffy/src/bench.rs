@@ -5,9 +5,10 @@ use std::sync::Arc;
 use dffy_core::diff::Options;
 use dffy_core::diff::{Emphasis, Whitespace, emphasize};
 use dffy_core::git::{FileChange, FileDiff, Repo};
+use dffy_core::highlight::{FileSyntax, HunkSyntax};
 
 use crate::config::{Config, Indicators};
-use crate::print::{self, FileSyntax, HunkSyntax};
+use crate::print;
 use crate::term::{Input, Key, Mods};
 use crate::theme::Theme;
 use crate::tui::worker::{Job, Pool, Settings};
@@ -62,7 +63,7 @@ impl Frame {
             (width, height),
             Indicators::Bars,
         );
-        let loaded = Loaded::new(diff, Whitespace::Exact, highlight);
+        let loaded = Loaded::new(diff, Whitespace::Exact, highlight.then(crate::grammars));
         let diff = Arc::clone(&loaded.diff);
         let version = app.version(0);
         app.event(Event::Diffed(Done::Diff {
@@ -90,8 +91,14 @@ impl Frame {
     #[must_use]
     pub fn prepare(diff: FileDiff, highlight: bool, structural: bool) -> usize {
         let hunks = emphases(&diff, highlight);
-        std::hint::black_box(structural.then(|| print::structural_diff(&diff, None)));
-        std::hint::black_box(Loaded::new(diff, Whitespace::Exact, highlight));
+        std::hint::black_box(
+            structural.then(|| print::structural_diff(crate::grammars(), &diff, None)),
+        );
+        std::hint::black_box(Loaded::new(
+            diff,
+            Whitespace::Exact,
+            highlight.then(crate::grammars),
+        ));
         hunks.len()
     }
 
@@ -143,7 +150,7 @@ impl Frame {
         app.event(Event::Diffed(Done::Diff {
             file,
             version,
-            result: Ok(Box::new(Loaded::new(diff, Whitespace::Exact, false))),
+            result: Ok(Box::new(Loaded::new(diff, Whitespace::Exact, None))),
         }));
         for _ in 0..file {
             app.event(Event::Input(Input::Key(Key::Char('f'), Mods::NONE)));
@@ -167,6 +174,7 @@ impl Frame {
         let settings = Settings {
             options: Options::default(),
             highlight: false,
+            grammars: crate::grammars(),
             cache: None,
         };
         let pool = Pool::new(Some(repo), &settings, &tx).expect("the pool starts");
@@ -261,13 +269,14 @@ impl Frame {
 /// Every hunk's emphasis and, with `highlight`, its syntax spans, as the
 /// workers compute them.
 fn emphases(diff: &FileDiff, highlight: bool) -> Vec<(Vec<Emphasis>, Option<HunkSyntax>)> {
-    let syntax = highlight.then(|| FileSyntax::new(diff, None, false));
+    let syntax =
+        highlight.then(|| FileSyntax::new(crate::grammars(), print::sources(diff), None, false));
     diff.hunks
         .iter()
         .map(|h| match &syntax {
             Some(s) => {
-                let spans = s.hunk(diff, h);
-                (spans.emphasis(diff, h), Some(spans))
+                let spans = s.hunk(&diff.old, &diff.new, h);
+                (spans.emphasis(&diff.old, &diff.new, h), Some(spans))
             }
             None => (emphasize(&diff.old, &diff.new, h), None),
         })

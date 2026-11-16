@@ -1,4 +1,5 @@
-//! The performance gate: `bench-baseline`, `bench-ab` and `bench-noise`.
+//! The performance gate: `bench-baseline`, `bench-ab`, `bench-noise` and
+//! `bench-layouts`.
 //!
 //! A set is a directory of release executables: `dffy`, the examples
 //! `count_pass`, `first_frame` and `first_paint`, and the divan benches
@@ -6,10 +7,17 @@
 //! measured round by round, alternating which goes first. A metric's value
 //! per side is the median of its per-round values.
 //!
-//! B fails a timing or peak-RSS metric when its median is more than 1% above
-//! A's (criterion's default noise threshold) and it was slower than A in
-//! enough rounds that a one-sided sign test gives p < 0.05: 9 of 10, or 5 of
-//! 5. Divan's allocation counts and bytes fail on any increase, or on one
+//! B fails a timing or peak-RSS metric when it was slower than A in enough
+//! rounds that a one-sided sign test gives p < 0.05 (9 of 10, or 5 of 5) and
+//! its median is above A's by more than 1% (criterion's default noise
+//! threshold) or the metric's band in A's `layout.tsv`, whichever is larger:
+//! the largest relative difference between sets of one tree built with
+//! different code layouts. It also fails when its instruction count fails.
+//! On Linux, the user-space instructions of `count_pass`, `first_paint` and
+//! one more run of each hyperfine command are counted, and after the rounds
+//! of `bench-ab` the instructions per iteration of each divan benchmark whose
+//! timing failed or that `--instructions` names. A count fails when B's
+//! median is more than 0.5% above A's. Divan's allocation counts and bytes fail on any increase, or on one
 //! past their band in A's `noise.tsv` when it's above 0: the largest
 //! difference between the two sides of one round when A was compared with
 //! itself. `count_pass` finding a file whose count differs from its diff
@@ -23,8 +31,8 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use crate::{
-    ROOT, Result, Sandbox, TIME, Timing, USAGE, bench_repo, date, describe, expand_tilde, median,
-    now, peak_rss, quote, time_flag, which,
+    ROOT, Result, Sandbox, TIME, Timing, USAGE, bench_repo, date, describe, expand_tilde,
+    instructions, median, now, peak_rss, quote, time_flag, which,
 };
 
 const GROUPS: [&str; 7] = ["frame", "engine", "pty", "count", "paint", "print", "pager"];
@@ -44,6 +52,10 @@ const EXECUTABLES: [(&str, &str); 6] = [
 
 const SIDES: [&str; 2] = ["A", "B"];
 
+/// The iterations, one per sample, of the two runs of a divan benchmark
+/// whose instructions are counted.
+const DIVAN_ITERATIONS: [u32; 2] = [50, 250];
+
 /// `count_pass`'s files whose count differs from their diff: any in B fails,
 /// whatever the noise.
 const COUNT_MISMATCH: &str = "count_pass differing files";
@@ -51,10 +63,22 @@ const COUNT_MISMATCH: &str = "count_pass differing files";
 pub(crate) fn main(cmd: &str, args: &[String]) -> Result<bool> {
     let mut dir = None;
     let mut rounds = 10;
+    let mut layouts = 4;
     let mut groups = GROUPS.to_vec();
+    let mut counted = Vec::new();
     let mut args = args.iter();
     while let Some(arg) = args.next() {
         match arg.as_str() {
+            "--instructions" if cmd == "bench-ab" => {
+                counted.extend(args.next().ok_or(USAGE)?.split(',').map(str::to_owned));
+            }
+            "--layouts" if cmd == "bench-layouts" => {
+                layouts = args
+                    .next()
+                    .and_then(|n| n.parse().ok())
+                    .filter(|&n| n >= 2)
+                    .ok_or("--layouts takes a number from 2")?;
+            }
             "--rounds" if cmd != "bench-baseline" => {
                 rounds = args
                     .next()
@@ -80,21 +104,38 @@ pub(crate) fn main(cmd: &str, args: &[String]) -> Result<bool> {
     let dir = dir.ok_or(USAGE)?;
     let noise = match cmd {
         "bench-baseline" => {
-            snapshot(&dir)?;
+            snapshot(&dir, None)?;
+            return Ok(true);
+        }
+        "bench-layouts" => {
+            let base = fs::canonicalize(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+            measure_layouts(&base, layouts, rounds, &groups)?;
             return Ok(true);
         }
         "bench-ab" => false,
         "bench-noise" => true,
         _ => return Err(USAGE.to_owned()),
     };
+    compare(&dir, rounds, &groups, noise, &counted)
+}
 
-    let base = fs::canonicalize(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
-    let runner = Runner::new(Sandbox::new(bench_repo()?, false)?, &groups)?;
+/// `bench-ab`, or with `noise` `bench-noise`, of the set in `dir`. `counted`
+/// names divan benchmarks to count the instructions of whatever their
+/// timing's result.
+fn compare(
+    dir: &Path,
+    rounds: usize,
+    groups: &[&str],
+    noise: bool,
+    counted: &[String],
+) -> Result<bool> {
+    let base = fs::canonicalize(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    let runner = Runner::new(Sandbox::new(bench_repo()?, false)?, groups)?;
     let candidate = if noise {
         base.clone()
     } else {
         let set = runner.sandbox.path("B");
-        snapshot(&set)?;
+        snapshot(&set, None)?;
         set
     };
     for set in [&base, &candidate] {
@@ -108,13 +149,29 @@ pub(crate) fn main(cmd: &str, args: &[String]) -> Result<bool> {
         }
     }
 
-    let metrics = runner.rounds(rounds, [&base, &candidate], &groups)?;
+    let mut metrics = runner.rounds(rounds, [&base, &candidate], groups)?;
     let noise_file = base.join("noise.tsv");
+    let layout = read_bands(&base.join("layout.tsv"));
     if noise {
         write_noise(&noise_file, &metrics, rounds)?;
+    } else {
+        let divan: Vec<String> = metrics
+            .iter()
+            .filter(|m| {
+                m.unit == Unit::Time && ["frame/", "engine/"].iter().any(|s| m.name.starts_with(s))
+            })
+            .filter(|m| counted.contains(&m.name) || timing_fails(m, &layout))
+            .map(|m| m.name.clone())
+            .collect();
+        for name in counted.iter().filter(|n| !divan.contains(n)) {
+            eprintln!("warning: --instructions {name}: no divan benchmark of that name measured");
+        }
+        for name in &divan {
+            metrics.push(runner.divan_instructions(name, [&base, &candidate])?);
+        }
     }
-    let mut summary = header([&base, &candidate], rounds, &groups);
-    let (table, pass) = table(&metrics, &read_noise(&noise_file), noise);
+    let mut summary = header([&base, &candidate], rounds, groups);
+    let (table, pass) = table(&metrics, &read_bands(&noise_file), &layout, noise);
     summary += &table;
     if noise {
         let _ = write!(
@@ -152,14 +209,16 @@ fn header(sets: [&Path; 2], rounds: usize, groups: &[&str]) -> String {
 }
 
 /// Builds the current tree and copies its executables into `dest`, with
-/// the commit in `dest/REV`.
-fn snapshot(dest: &Path) -> Result<()> {
+/// the commit in `dest/REV`. With `layout`, see [`cargo`].
+fn snapshot(dest: &Path, layout: Option<usize>) -> Result<()> {
     fs::create_dir_all(dest).map_err(|e| format!("{}: {e}", dest.display()))?;
     let mut found = artifacts(
+        cargo(layout),
         &["build", "--release", "--workspace", "--examples", "--bins"],
         &["bin", "example"],
     )?;
     found.extend(artifacts(
+        cargo(layout),
         &["bench", "--workspace", "--no-run"],
         &["bench"],
     )?);
@@ -191,11 +250,44 @@ fn snapshot(dest: &Path) -> Result<()> {
     Ok(())
 }
 
-/// The set's executables of the given kinds that `cargo args` built. The
+/// cargo, building with `layout`, a seed from 1, into its own target
+/// directory with the code laid out by the seed: on `x86_64` Linux, where
+/// rustc links with lld, lld shuffles the input sections, one per function;
+/// elsewhere the seed goes into every symbol's hash.
+fn cargo(layout: Option<usize>) -> Command {
+    let mut cmd = Command::new(std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into()));
+    let Some(seed) = layout else {
+        return cmd;
+    };
+    // lld takes seed 0 as a random seed.
+    let flag = if cfg!(all(target_os = "linux", target_arch = "x86_64")) {
+        format!("-Clink-arg=-Wl,--shuffle-sections=*={seed}")
+    } else {
+        format!("-Cmetadata=layout{seed}")
+    };
+    cmd.env("CARGO_TARGET_DIR", format!("{ROOT}/target/layouts"));
+    // Cargo takes rustflags from the first of these that's set, else from
+    // the config files, where the flag joins `build.rustflags` and loses to
+    // a `target.<triple>.rustflags`.
+    let var = [("CARGO_ENCODED_RUSTFLAGS", '\x1f'), ("RUSTFLAGS", ' ')]
+        .into_iter()
+        .find_map(|(var, sep)| Some((var, sep, std::env::var(var).ok()?)));
+    match var {
+        Some((var, _, flags)) if flags.is_empty() => cmd.env(var, flag),
+        Some((var, sep, flags)) => cmd.env(var, format!("{flags}{sep}{flag}")),
+        None => cmd.arg(format!("--config=build.rustflags=[{flag:?}]")),
+    };
+    cmd
+}
+
+/// The set's executables of the given kinds that `cmd args` built. The
 /// paths come from cargo's messages: target/release/deps keeps earlier
 /// builds' executables.
-fn artifacts(args: &[&str], kinds: &[&str]) -> Result<Vec<(&'static str, PathBuf)>> {
-    let mut cmd = Command::new(std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into()));
+fn artifacts(
+    mut cmd: Command,
+    args: &[&str],
+    kinds: &[&str],
+) -> Result<Vec<(&'static str, PathBuf)>> {
     cmd.args(args)
         .arg("--message-format=json-render-diagnostics")
         .current_dir(ROOT)
@@ -230,6 +322,7 @@ enum Unit {
     Time,
     Bytes,
     Count,
+    Instructions,
 }
 
 impl Unit {
@@ -237,12 +330,14 @@ impl Unit {
         match self {
             Self::Time => "ns",
             Self::Bytes => "B",
-            Self::Count => "n",
+            Self::Count | Self::Instructions => "n",
         }
     }
 }
 
-type Row = (String, Unit, f64);
+/// A metric's value from one run; none for an instruction count where
+/// there's no counter, so the table shows the metric without values.
+type Row = (String, Unit, Option<f64>);
 
 struct Metric {
     name: String,
@@ -259,6 +354,8 @@ struct Runner {
     patch: PathBuf,
     hyperfine: PathBuf,
     time: bool,
+    /// Whether the instruction counter opens.
+    counter: bool,
 }
 
 impl Runner {
@@ -273,6 +370,12 @@ impl Runner {
         let time = Path::new(TIME).exists();
         if !time {
             eprintln!("warning: {TIME} not found, peak RSS is skipped");
+        }
+        let counter = instructions(|| Ok(()))?.1.is_some();
+        if !counter {
+            eprintln!(
+                "warning: no hardware instruction counter (Linux only), instructions are skipped"
+            );
         }
         let patch = sandbox.path("range.patch");
         if needs("pager") {
@@ -290,6 +393,7 @@ impl Runner {
             patch,
             hyperfine,
             time,
+            counter,
         })
     }
 
@@ -321,12 +425,56 @@ impl Runner {
                                 });
                                 metrics.len() - 1
                             });
-                        metrics[i].values[side].push(value);
+                        metrics[i].values[side].extend(value);
                     }
                 }
             }
         }
         Ok(metrics)
+    }
+
+    /// Instructions per iteration of the divan benchmark `metric` in each
+    /// set, three measurements a side, alternating which goes first. A
+    /// measurement runs the benchmark alone at each of `DIVAN_ITERATIONS`
+    /// and divides the difference in instructions by the difference in
+    /// iterations, which cancels the fixture's loading and divan's start.
+    fn divan_instructions(&self, metric: &str, sets: [&Path; 2]) -> Result<Metric> {
+        let mut values = [Vec::new(), Vec::new()];
+        let (suite, _) = metric.split_once('/').unwrap_or_default();
+        // divan's path of the benchmark, which starts with the crate.
+        let exact = metric.replace('/', "::");
+        // Without a counter the metric has no values and shows as such.
+        let rounds = if self.counter { 3 } else { 0 };
+        for round in 1..=rounds {
+            let order = if round % 2 == 1 { [0, 1] } else { [1, 0] };
+            for side in order {
+                eprintln!("instructions {round}/3: {metric}, {}", SIDES[side]);
+                let mut counts = [0.0; 2];
+                for (count, iters) in counts.iter_mut().zip(DIVAN_ITERATIONS) {
+                    let mut cmd = self.command(sets[side].join(suite))?;
+                    cmd.args(["--bench", "--exact", &exact, "--threads", "1"])
+                        .args(["--sample-size", "1", "--sample-count", &iters.to_string()])
+                        .args(["--color", "never", "--bytes-format", "decimal"]);
+                    let tag = format!("instructions-{round}-{}", SIDES[side]);
+                    let (out, n) =
+                        self.run_counted(&mut cmd, &tag, &format!("{metric} {iters}"))?;
+                    if !parse_divan(suite, &out)?
+                        .iter()
+                        .any(|(name, ..)| name == metric)
+                    {
+                        return Err(format!("{}: ran no {exact}", describe(&cmd)));
+                    }
+                    *count = n.ok_or("the instruction counter stopped opening")?;
+                }
+                let iters = f64::from(DIVAN_ITERATIONS[1] - DIVAN_ITERATIONS[0]);
+                values[side].push((counts[1] - counts[0]) / iters);
+            }
+        }
+        Ok(Metric {
+            name: format!("{metric} instructions"),
+            unit: Unit::Instructions,
+            values,
+        })
     }
 
     /// The sandbox, emptied for one run.
@@ -358,6 +506,16 @@ impl Runner {
         result
     }
 
+    /// `run`'s stdout, and the instructions of `cmd` and what it started.
+    fn run_counted(
+        &self,
+        cmd: &mut Command,
+        tag: &str,
+        name: &str,
+    ) -> Result<(String, Option<f64>)> {
+        instructions(|| self.run(cmd, tag, name).map(|(out, _)| out))
+    }
+
     fn measure(&self, group: &str, set: &Path, tag: &str) -> Result<Vec<Row>> {
         let mut rows = Vec::new();
         match group {
@@ -372,23 +530,24 @@ impl Runner {
                 let mut cmd = self.command(set.join("first_frame"))?;
                 cmd.arg(set.join("dffy"));
                 for (name, value) in median_lines(&self.run(&mut cmd, tag, "first_frame")?.0) {
-                    rows.push((format!("pty/{name}"), Unit::Time, nanos(value)?));
+                    rows.push((format!("pty/{name}"), Unit::Time, Some(nanos(value)?)));
                 }
             }
             "count" => {
-                let (out, _) = self.run(
+                let (out, n) = self.run_counted(
                     &mut self.command(set.join("count_pass"))?,
                     tag,
                     "count_pass",
                 )?;
                 for (_, value) in median_lines(&out) {
-                    rows.push(("count_pass".to_owned(), Unit::Time, nanos(value)?));
+                    rows.push(("count_pass".to_owned(), Unit::Time, Some(nanos(value)?)));
                 }
+                rows.push(("count_pass instructions".to_owned(), Unit::Instructions, n));
                 for line in out.lines() {
                     if let Some(n) = line.strip_suffix(" files whose count differs from their diff")
                     {
                         let n = n.parse().map_err(|_| format!("count_pass: {line:?}"))?;
-                        rows.push((COUNT_MISMATCH.to_owned(), Unit::Count, n));
+                        rows.push((COUNT_MISMATCH.to_owned(), Unit::Count, Some(n)));
                     }
                 }
             }
@@ -398,10 +557,14 @@ impl Runner {
             "paint" => {
                 for mode in ["range", "worktree"] {
                     let mut out = String::new();
+                    let mut counts = Vec::new();
                     for _ in 0..5 {
                         let mut cmd = self.command(set.join("first_paint"))?;
                         cmd.arg(&self.sandbox.repo).arg(mode);
-                        out += &self.run(&mut cmd, tag, &format!("first_paint {mode}"))?.0;
+                        let name = format!("first_paint {mode}");
+                        let (run, n) = self.run_counted(&mut cmd, tag, &name)?;
+                        out += &run;
+                        counts.extend(n);
                     }
                     for key in ["first_1", "all"] {
                         let mut ms: Vec<f64> = out
@@ -409,63 +572,53 @@ impl Runner {
                             .filter_map(|kv| kv.strip_prefix(key)?.strip_prefix('=')?.parse().ok())
                             .collect();
                         if let Some(ms) = median(&mut ms) {
-                            rows.push((format!("paint/{mode} {key}"), Unit::Time, ms * 1e6));
+                            let name = format!("paint/{mode} {key}");
+                            rows.push((name, Unit::Time, Some(ms * 1e6)));
                         }
                     }
+                    let n = median(&mut counts);
+                    rows.push((format!("paint/{mode} instructions"), Unit::Instructions, n));
                 }
             }
             "print" => {
-                let dffy = quote(set.join("dffy"));
-                let range = format!("{dffy} v6.0..v6.1 --paging=never --color=always");
-                rows.push(self.hyperfine(tag, "print/range", 3, 0, None, &range)?);
-                let plain = format!("{range} --no-highlight");
-                rows.push(self.hyperfine(tag, "print/range no-highlight", 5, 1, None, &plain)?);
-                let fair = format!("{range} -- kernel/sched/fair.c");
-                rows.push(self.hyperfine(tag, "print/fair.c", 10, 1, None, &fair)?);
-                let status = format!("{dffy} --name-status --color=never v6.0..v6.1");
-                rows.push(self.hyperfine(tag, "print/name-status", 10, 1, None, &status)?);
-                let args = [
-                    "v6.0..v6.1",
-                    "--paging=never",
-                    "--color=always",
-                    "--no-highlight",
-                ];
-                rows.extend(self.peak_rss(
-                    tag,
-                    "print/range no-highlight peak RSS",
-                    set,
-                    &args,
-                    None,
-                )?);
+                let range = ["v6.0..v6.1", "--paging=never", "--color=always"];
+                let plain = [&range[..], &["--no-highlight"]].concat();
+                let fair = [&range[..], &["--", "kernel/sched/fair.c"]].concat();
+                let status = ["--name-status", "--color=never", "v6.0..v6.1"];
+                rows.extend(self.hyperfine(tag, "print/range", 3, 0, set, &range, None)?);
+                let name = "print/range no-highlight";
+                rows.extend(self.hyperfine(tag, name, 5, 1, set, &plain, None)?);
+                rows.extend(self.hyperfine(tag, "print/fair.c", 10, 1, set, &fair, None)?);
+                let name_status = "print/name-status";
+                rows.extend(self.hyperfine(tag, name_status, 10, 1, set, &status, None)?);
+                let rss = format!("{name} peak RSS");
+                rows.extend(self.peak_rss(tag, &rss, set, &plain, None)?);
             }
             "pager" => {
-                let pager = format!("{} --paging=never --color=always", quote(set.join("dffy")));
-                rows.push(self.hyperfine(tag, "pager/range", 5, 1, Some(&self.patch), &pager)?);
                 let args = ["--paging=never", "--color=always"];
-                rows.extend(self.peak_rss(
-                    tag,
-                    "pager/range peak RSS",
-                    set,
-                    &args,
-                    Some(&self.patch),
-                )?);
+                let patch = Some(self.patch.as_path());
+                rows.extend(self.hyperfine(tag, "pager/range", 5, 1, set, &args, patch)?);
+                rows.extend(self.peak_rss(tag, "pager/range peak RSS", set, &args, patch)?);
             }
             _ => return Err(format!("unknown group {group}")),
         }
         Ok(rows)
     }
 
-    /// hyperfine's median for `command`, run without a shell and with
-    /// dffy's disk cache emptied before every run.
+    /// hyperfine's median for dffy with `args` and `input` as its stdin, run
+    /// without a shell and with dffy's disk cache emptied before every run,
+    /// and the instructions of one more run.
+    #[expect(clippy::too_many_arguments, reason = "one per hyperfine setting")]
     fn hyperfine(
         &self,
         tag: &str,
         name: &str,
         runs: u32,
         warmup: u32,
+        set: &Path,
+        args: &[&str],
         input: Option<&Path>,
-        command: &str,
-    ) -> Result<Row> {
+    ) -> Result<[Row; 2]> {
         let json = self
             .raw
             .join(format!("{tag}-{}.json", name.replace([' ', '/'], "-")));
@@ -481,13 +634,27 @@ impl Runner {
         if let Some(input) = input {
             cmd.arg("--input").arg(input);
         }
-        cmd.arg(command);
+        let dffy = set.join("dffy");
+        let words: Vec<String> = std::iter::once(quote(&dffy))
+            .chain(args.iter().map(quote))
+            .collect();
+        cmd.arg(words.join(" "));
         self.run(&mut cmd, tag, name)?;
-        Ok((
-            name.to_owned(),
-            Unit::Time,
-            Timing::read(&json)?.median * 1e9,
-        ))
+        let time = Timing::read(&json)?.median * 1e9;
+
+        // Output to /dev/null as hyperfine's, and stdin /dev/null without
+        // an input.
+        let counted = format!("{name} instructions");
+        let mut cmd = self.command(&dffy)?;
+        cmd.args(args).stdout(Stdio::null());
+        if let Some(input) = input {
+            cmd.stdin(File::open(input).map_err(|e| format!("{}: {e}", input.display()))?);
+        }
+        let (_, n) = self.run_counted(&mut cmd, tag, &counted)?;
+        Ok([
+            (name.to_owned(), Unit::Time, Some(time)),
+            (counted, Unit::Instructions, n),
+        ])
     }
 
     /// Peak RSS of one run of dffy with `args`, and `input` as its stdin.
@@ -513,7 +680,7 @@ impl Runner {
         let (_, stderr) = self.run(&mut cmd, tag, name)?;
         let bytes = peak_rss(&stderr)
             .ok_or_else(|| format!("{}: no peak RSS in its output", describe(&cmd)))?;
-        Ok(Some((name.to_owned(), Unit::Bytes, bytes)))
+        Ok(Some((name.to_owned(), Unit::Bytes, Some(bytes))))
     }
 }
 
@@ -603,18 +770,26 @@ fn parse_divan(suite: &str, out: &str) -> Result<Vec<Row>> {
             let label = label.rsplitn(3, ' ').nth(2).unwrap_or_default().trim_end();
             path.push(label);
             bench = format!("{suite}/{}", path.join("/"));
-            rows.push((bench.clone(), Unit::Time, nanos(median)?));
+            rows.push((bench.clone(), Unit::Time, Some(nanos(median)?)));
             continue;
         }
         match first.trim_start_matches(['│', ' ']).trim_end() {
             "alloc:" => alloc = 2,
             label if label.ends_with(':') => alloc = 0,
             _ if alloc == 2 => {
-                rows.push((format!("{bench} alloc count"), Unit::Count, count(mean)?));
+                rows.push((
+                    format!("{bench} alloc count"),
+                    Unit::Count,
+                    Some(count(mean)?),
+                ));
                 alloc = 1;
             }
             _ if alloc == 1 => {
-                rows.push((format!("{bench} alloc bytes"), Unit::Bytes, bytes(mean)?));
+                rows.push((
+                    format!("{bench} alloc bytes"),
+                    Unit::Bytes,
+                    Some(bytes(mean)?),
+                ));
                 alloc = 0;
             }
             _ => {}
@@ -633,7 +808,7 @@ fn band(m: &Metric) -> f64 {
 }
 
 /// The bands in `path`, none when it's missing.
-fn read_noise(path: &Path) -> HashMap<String, f64> {
+fn read_bands(path: &Path) -> HashMap<String, f64> {
     fs::read_to_string(path)
         .unwrap_or_default()
         .lines()
@@ -645,14 +820,12 @@ fn read_noise(path: &Path) -> HashMap<String, f64> {
         .collect()
 }
 
-/// Writes the measured bands into `path`, keeping the bands of metrics this
-/// run didn't measure, so a run of some groups leaves the others' bands.
-fn write_noise(path: &Path, metrics: &[Metric], rounds: usize) -> Result<()> {
-    let measured = |name: &str| metrics.iter().any(|m| m.name == name);
-    let mut out = format!(
-        "# cargo xtask bench-noise ({rounds} rounds, {}): metric, the largest difference between A and B of one round with A and B the same set, unit\n",
-        now()
-    );
+/// Writes `bands`, each a metric, its band and unit, into `path` under the
+/// comment `header`, keeping the bands of metrics this run didn't measure,
+/// so a run of some groups leaves the others' bands.
+fn write_bands(path: &Path, header: &str, bands: &[(String, f64, &str)]) -> Result<()> {
+    let measured = |name: &str| bands.iter().any(|(n, ..)| n == name);
+    let mut out = format!("{header}\n");
     if let Ok(old) = fs::read_to_string(path) {
         for line in old.lines().filter(|l| !l.starts_with('#')) {
             if !measured(line.split('\t').next().unwrap_or_default()) {
@@ -661,10 +834,74 @@ fn write_noise(path: &Path, metrics: &[Metric], rounds: usize) -> Result<()> {
             }
         }
     }
-    for m in metrics.iter().filter(|m| m.name != COUNT_MISMATCH) {
-        let _ = writeln!(out, "{}\t{}\t{}", m.name, band(m), m.unit.symbol());
+    for (name, band, unit) in bands {
+        let _ = writeln!(out, "{name}\t{band}\t{unit}");
     }
     fs::write(path, out).map_err(|e| format!("{}: {e}", path.display()))
+}
+
+fn write_noise(path: &Path, metrics: &[Metric], rounds: usize) -> Result<()> {
+    let header = format!(
+        "# cargo xtask bench-noise ({rounds} rounds, {}): metric, the largest difference between A and B of one round with A and B the same set, unit",
+        now()
+    );
+    let bands: Vec<_> = metrics
+        .iter()
+        .filter(|m| m.name != COUNT_MISMATCH && !m.values[0].is_empty())
+        .map(|m| (m.name.clone(), band(m), m.unit.symbol()))
+        .collect();
+    write_bands(path, &header, &bands)
+}
+
+/// Builds `count` sets of the current tree, each with its own code layout,
+/// into `base/layouts/<k>`, measures every set after the first against the
+/// first, and writes each metric's layout band to `base/layout.tsv`: the
+/// largest difference of a set's median from the first set's, relative to
+/// the first set's.
+fn measure_layouts(base: &Path, count: usize, rounds: usize, groups: &[&str]) -> Result<()> {
+    let sets: Vec<PathBuf> = (0..count)
+        .map(|k| base.join("layouts").join(k.to_string()))
+        .collect();
+    for (k, set) in sets.iter().enumerate() {
+        snapshot(set, Some(k + 1))?;
+    }
+    let mut runner = Runner::new(Sandbox::new(bench_repo()?, false)?, groups)?;
+    let raw = runner.raw.clone();
+    let mut bands: Vec<(String, f64, &str)> = Vec::new();
+    for (k, set) in sets.iter().enumerate().skip(1) {
+        runner.raw = raw.join(format!("layout-{k}"));
+        fs::create_dir_all(&runner.raw).map_err(|e| format!("{}: {e}", runner.raw.display()))?;
+        for m in runner.rounds(rounds, [&sets[0], set], groups)? {
+            let ((Some(a), Some(b)), false) = (medians(&m), m.name == COUNT_MISMATCH) else {
+                continue;
+            };
+            let band = if a > 0.0 { (b - a).abs() / a } else { 0.0 };
+            match bands.iter_mut().find(|(name, ..)| *name == m.name) {
+                Some(entry) => entry.1 = entry.1.max(band),
+                None => bands.push((m.name, band, "rel")),
+            }
+        }
+    }
+    let path = base.join("layout.tsv");
+    let header = format!(
+        "# cargo xtask bench-layouts ({count} layouts, {rounds} rounds, {}): metric, the largest difference of a layout's median from layout 0's, as a fraction of layout 0's, rel",
+        now()
+    );
+    write_bands(&path, &header, &bands)?;
+    let mut summary = format!(
+        "# dffy layout bands\n\n- {count} layouts of {}; rounds: {rounds}; groups: {}\n\n| Metric | Layout band |\n|---|---|\n",
+        base.display(),
+        groups.join(", ")
+    );
+    for (name, band, _) in &bands {
+        let _ = writeln!(summary, "| {name} | {:.2}% |", band * 100.0);
+    }
+    let _ = write!(summary, "\nWrote the layout bands to {}.\n", path.display());
+    print!("{summary}");
+    let summary_path = raw.join("summary.md");
+    fs::write(&summary_path, summary).map_err(|e| format!("{}: {e}", summary_path.display()))?;
+    eprintln!("raw results: {}", raw.display());
+    Ok(())
 }
 
 /// The one-sided sign test of B slower than A in `k` of `n` rounds: the
@@ -681,17 +918,92 @@ fn sign_test(k: usize, n: usize) -> (u128, u128) {
     (tail, 1 << n)
 }
 
-/// Whether a timing or peak-RSS metric slowed down: B's median more than 1%
-/// above A's, and B slower in `k` of `n` rounds with a sign test p < 0.05.
-fn slower(a: f64, b: f64, k: usize, n: usize) -> bool {
+/// Whether a timing or peak-RSS metric slowed down: B's median more than
+/// `threshold`, a fraction, above A's, and B slower in `k` of `n` rounds
+/// with a sign test p < 0.05.
+fn slower(a: f64, b: f64, k: usize, n: usize, threshold: f64) -> bool {
     let (tail, outcomes) = sign_test(k, n);
-    b > a * 1.01 && tail * 20 < outcomes
+    b > a * (1.0 + threshold) && tail * 20 < outcomes
 }
 
-/// The markdown table and whether every metric passed. `measuring` is A
-/// compared with itself: the table adds the bands being measured, and a
-/// metric the rule fails is a false alarm, which doesn't fail the run.
-fn table(metrics: &[Metric], bands: &HashMap<String, f64>, measuring: bool) -> (String, bool) {
+/// Whether an instruction count grew: B's median more than 0.5% above A's.
+fn more_instructions(a: f64, b: f64) -> bool {
+    b > a * 1.005
+}
+
+/// The medians of A and B.
+fn medians(m: &Metric) -> (Option<f64>, Option<f64>) {
+    (
+        median(&mut m.values[0].clone()),
+        median(&mut m.values[1].clone()),
+    )
+}
+
+/// The rounds B was slower than A in, and the rounds both sides have.
+fn slower_rounds(metric: &Metric) -> (usize, usize) {
+    let [a, b] = &metric.values;
+    let slower = a.iter().zip(b).filter(|(a, b)| b > a).count();
+    (slower, a.len().min(b.len()))
+}
+
+/// How far above A's median a timing or peak-RSS metric's median in B may
+/// go, as a fraction: 1%, or the metric's band in `layout` when larger.
+fn threshold(metric: &str, layout: &HashMap<String, f64>) -> f64 {
+    layout.get(metric).copied().unwrap_or(0.0).max(0.01)
+}
+
+/// Whether a timing or peak-RSS metric fails the timing rule.
+fn timing_fails(metric: &Metric, layout: &HashMap<String, f64>) -> bool {
+    let (Some(a), Some(b)) = medians(metric) else {
+        return false;
+    };
+    let (k, n) = slower_rounds(metric);
+    slower(a, b, k, n, threshold(&metric.name, layout))
+}
+
+/// The Result cell of a timing or peak-RSS metric: a failure when its
+/// instruction count fails, else the timing rule's, noting the threshold
+/// when the metric's layout band raised it above 1% and the instruction
+/// count when there is one.
+fn timing_result(metric: &Metric, metrics: &[Metric], layout: &HashMap<String, f64>) -> String {
+    let counted = format!("{} instructions", metric.name);
+    let more = match metrics.iter().find(|i| i.name == counted).map(medians) {
+        Some((Some(a), Some(b))) => Some(more_instructions(a, b)),
+        _ => None,
+    };
+    if more == Some(true) {
+        return "FAIL (instructions)".to_owned();
+    }
+    let threshold = threshold(&metric.name, layout);
+    let mut notes = Vec::new();
+    if threshold > 0.01 {
+        notes.push(format!("threshold {:.1}%", threshold * 100.0));
+    }
+    if more == Some(false) {
+        notes.push("instructions flat".to_owned());
+    }
+    let result = if timing_fails(metric, layout) {
+        "FAIL"
+    } else {
+        "PASS"
+    };
+    if notes.is_empty() {
+        result.to_owned()
+    } else {
+        format!("{result} ({})", notes.join(", "))
+    }
+}
+
+/// The markdown table and whether every metric passed. `bands` are from
+/// `noise.tsv`, `layout` from `layout.tsv`. `measuring` is A compared with
+/// itself: the table adds the bands being measured, and a metric the rule
+/// fails is a false alarm, which doesn't fail the run.
+fn table(
+    metrics: &[Metric],
+    bands: &HashMap<String, f64>,
+    layout: &HashMap<String, f64>,
+    measuring: bool,
+) -> (String, bool) {
     let mut out = if measuring {
         "| Metric | A | B | Delta | Slower rounds | Band | Result |\n|---|---|---|---|---|---|---|\n"
     } else {
@@ -700,20 +1012,14 @@ fn table(metrics: &[Metric], bands: &HashMap<String, f64>, measuring: bool) -> (
     .to_owned();
     let (mut failed, mut false_alarms) = (0, 0);
     for m in metrics {
-        let a = median(&mut m.values[0].clone());
-        let b = median(&mut m.values[1].clone());
+        let (a, b) = medians(m);
         let delta = match (a, b) {
             (Some(a), Some(b)) if a > 0.0 => format!("{:+.1}%", (b - a) / a * 100.0),
             (Some(_), Some(b)) if b > 0.0 => "—".to_owned(),
             (Some(_), Some(_)) => "+0.0%".to_owned(),
             _ => "—".to_owned(),
         };
-        let n = m.values[0].len().min(m.values[1].len());
-        let k = m.values[0]
-            .iter()
-            .zip(&m.values[1])
-            .filter(|(a, b)| b > a)
-            .count();
+        let (k, n) = slower_rounds(m);
         let result = if m.name == COUNT_MISMATCH {
             let sides = if measuring { 0..2 } else { 1..2 };
             if m.values[sides].iter().flatten().any(|&n| n > 0.0) {
@@ -724,8 +1030,15 @@ fn table(metrics: &[Metric], bands: &HashMap<String, f64>, measuring: bool) -> (
             .to_owned()
         } else {
             match (a, b) {
+                (None, None) => "not measured".to_owned(),
                 (None, _) => "only in B".to_owned(),
                 (_, None) => "FAIL (missing in B)".to_owned(),
+                (Some(a), Some(b)) if m.unit == Unit::Instructions => if more_instructions(a, b) {
+                    "FAIL"
+                } else {
+                    "PASS"
+                }
+                .to_owned(),
                 (Some(a), Some(b))
                     if m.name.ends_with(" alloc count") || m.name.ends_with(" alloc bytes") =>
                 {
@@ -737,7 +1050,7 @@ fn table(metrics: &[Metric], bands: &HashMap<String, f64>, measuring: bool) -> (
                         result.to_owned()
                     }
                 }
-                (Some(a), Some(b)) => if slower(a, b, k, n) { "FAIL" } else { "PASS" }.to_owned(),
+                (Some(_), Some(_)) => timing_result(m, metrics, layout),
             }
         };
         let result = if measuring && m.name != COUNT_MISMATCH && result.starts_with("FAIL") {
@@ -754,7 +1067,7 @@ fn table(metrics: &[Metric], bands: &HashMap<String, f64>, measuring: bool) -> (
         } else {
             format!("{k}/{n}")
         };
-        let band_cell = match (measuring, m.name == COUNT_MISMATCH) {
+        let band_cell = match (measuring, m.name == COUNT_MISMATCH || n == 0) {
             (false, _) => String::new(),
             (true, true) => " — |".to_owned(),
             (true, false) => format!(" {} |", show(band(m), m.unit)),
@@ -785,6 +1098,7 @@ fn show(v: f64, unit: Unit) -> String {
         Unit::Time => &[(1e9, "s"), (1e6, "ms"), (1e3, "µs"), (1.0, "ns")],
         Unit::Bytes => &[(1e9, "GB"), (1e6, "MB"), (1e3, "KB"), (1.0, "B")],
         Unit::Count => return format!("{v}"),
+        Unit::Instructions => return format!("{v:.3e}"),
     };
     if v.abs() < 1e-9 {
         return "0".to_owned();
@@ -855,6 +1169,7 @@ frame                       fastest       │ slowest       │ median        �
         assert_eq!(rows.len(), expected.len(), "{rows:?}");
         for ((name, unit, value), (want_name, want_unit, want)) in rows.iter().zip(expected) {
             assert_eq!((name.as_str(), *unit), (want_name, want_unit));
+            let value = value.unwrap_or(f64::NAN);
             assert!((value - want).abs() < 1e-6, "{name}: {value} != {want}");
         }
     }
@@ -883,8 +1198,114 @@ frame                       fastest       │ slowest       │ median        �
 
     #[test]
     fn timing_fails_on_a_consistent_slowdown_over_one_percent() {
-        assert!(!slower(100.0, 102.0, 8, 10));
-        assert!(slower(100.0, 102.0, 9, 10));
-        assert!(!slower(100.0, 100.5, 10, 10));
+        assert!(!slower(100.0, 102.0, 8, 10, 0.01));
+        assert!(slower(100.0, 102.0, 9, 10, 0.01));
+        assert!(!slower(100.0, 100.5, 10, 10, 0.01));
+    }
+
+    fn metric(name: &str, unit: Unit, a: &[f64], b: &[f64]) -> Metric {
+        Metric {
+            name: name.to_owned(),
+            unit,
+            values: [a.to_vec(), b.to_vec()],
+        }
+    }
+
+    /// The Result cell of each row, in order.
+    fn results(metrics: &[Metric], layout: &[(&str, f64)]) -> Vec<String> {
+        let layout = layout.iter().map(|&(n, b)| (n.to_owned(), b)).collect();
+        let (out, _) = table(metrics, &HashMap::new(), &layout, false);
+        out.lines()
+            .skip(2)
+            .take(metrics.len())
+            .map(|row| row.rsplit('|').nth(1).unwrap_or_default().trim().to_owned())
+            .collect()
+    }
+
+    #[test]
+    fn instructions_fail_over_half_a_percent_with_no_sign_test() {
+        let metrics = [
+            metric(
+                "a instructions",
+                Unit::Instructions,
+                &[1e9; 3],
+                &[1.004e9; 3],
+            ),
+            metric(
+                "b instructions",
+                Unit::Instructions,
+                &[1e9; 3],
+                &[1.006e9; 3],
+            ),
+        ];
+        assert_eq!(results(&metrics, &[]), ["PASS", "FAIL"]);
+    }
+
+    #[test]
+    fn instructions_without_a_counter_show_no_values_and_pass() {
+        let metrics = [metric("a instructions", Unit::Instructions, &[], &[])];
+        let (out, pass) = table(&metrics, &HashMap::new(), &HashMap::new(), false);
+        assert!(pass);
+        assert!(
+            out.contains("| a instructions | — | — | — | — | not measured |"),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn timing_threshold_is_the_layout_band_when_larger() {
+        let slow = [100.0; 10];
+        let slower = [103.0; 10];
+        let metrics = [
+            metric("a", Unit::Time, &slow, &slower),
+            metric("b", Unit::Time, &slow, &slower),
+        ];
+        assert_eq!(
+            results(&metrics, &[("a", 0.05), ("b", 0.005)]),
+            ["PASS (threshold 5.0%)", "FAIL"]
+        );
+    }
+
+    #[test]
+    fn timing_fails_with_its_instruction_count() {
+        let metrics = [
+            metric("a", Unit::Time, &[100.0; 10], &[100.0; 10]),
+            metric(
+                "a instructions",
+                Unit::Instructions,
+                &[1e9; 10],
+                &[1.01e9; 10],
+            ),
+        ];
+        assert_eq!(results(&metrics, &[]), ["FAIL (instructions)", "FAIL"]);
+    }
+
+    #[test]
+    fn timing_with_flat_instructions_keeps_its_timing_rule() {
+        let metrics = [
+            metric("a", Unit::Time, &[100.0; 10], &[103.0; 10]),
+            metric(
+                "a instructions",
+                Unit::Instructions,
+                &[1e9; 10],
+                &[1.001e9; 10],
+            ),
+            metric("b", Unit::Time, &[100.0; 10], &[103.0; 10]),
+            metric(
+                "b instructions",
+                Unit::Instructions,
+                &[1e9; 10],
+                &[0.99e9; 10],
+            ),
+        ];
+        assert_eq!(
+            results(&metrics, &[("b", 0.05)]),
+            [
+                "FAIL (instructions flat)",
+                "PASS",
+                "PASS (threshold 5.0%, instructions flat)",
+                "PASS"
+            ]
+        );
     }
 }

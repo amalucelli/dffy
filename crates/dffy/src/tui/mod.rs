@@ -98,6 +98,10 @@ fn prepare(app: &mut App, ctx: &Ctx) {
 /// Runs the viewer on `tty` for `plan` until the user quits. An empty diff
 /// prints [`print::empty_message`] instead, without taking over the screen,
 /// unless watching: then the viewer waits for changes.
+#[expect(
+    clippy::too_many_lines,
+    reason = "the viewer's startup in order: workers, change set, first file, session"
+)]
 pub(crate) fn run(
     tty: &Tty,
     plan: Plan,
@@ -113,6 +117,7 @@ pub(crate) fn run(
             whitespace: ctx.config.whitespace,
         },
         highlight: ctx.highlight(),
+        grammars: crate::grammars(),
         cache: ctx.cache.clone(),
     };
     let pool = worker::Pool::new(Some(&plan.repo), &settings, &tx)?;
@@ -120,7 +125,7 @@ pub(crate) fn run(
     let root = plan.repo.watch_root().ok();
     let compared = plan.repo.compared_roots();
     let commit = plan.commit.as_ref().map(|info| {
-        Arc::new(piped::Commit::new(
+        Arc::new(dffy_core::patch::Commit::new(
             info.id.to_string(),
             print::commit_lines(info),
         ))
@@ -220,6 +225,7 @@ pub(crate) fn run_piped(tty: &Tty, stdin: Stdin, ctx: &Ctx) -> Result<ExitCode, 
     let settings = worker::Settings {
         options: Options::default(),
         highlight: false,
+        grammars: crate::grammars(),
         cache: None,
     };
     let pool = worker::Pool::new(None, &settings, &tx)?;

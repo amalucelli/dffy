@@ -11,9 +11,8 @@ use std::path::Path;
 use std::process::Command;
 
 use dffy_core::diff::Options;
-use dffy_core::git::{
-    DiffSpec, Error, FileChange, Mode, ObjectId, Repo, Revisions, Side, Staging, Status,
-};
+use dffy_core::git::{DiffSpec, Error, FileChange, Mode, ObjectId, Repo, Revisions, Side, Status};
+use dffy_core::view::Staging;
 
 fn git(dir: &Path, args: &[&str]) -> String {
     let out = Command::new("git")

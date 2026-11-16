@@ -156,6 +156,15 @@ proptest! {
     #![proptest_config(ProptestConfig::with_cases(512))]
 
     #[test]
+    fn byte_scan_trims_the_lines_a_line_comparison_does((o, n) in pair()) {
+        let (old, new) = (text(&o), text(&n));
+        prop_assert_eq!(
+            common_lines(&old, &new),
+            common_keys([old.len(), new.len()], |i| old.line(i), |j| new.line(j))
+        );
+    }
+
+    #[test]
     fn histogram_hunks_reproduce_new((o, n) in pair(), context in 0usize..5) {
         let (old, new) = (text(&o), text(&n));
         let c = changes(&old, &new, Whitespace::Exact);
@@ -352,6 +361,30 @@ fn pairing_stops_at_a_block_start() {
     hunk.lines[1].block_start = true;
     super::pair(&old, &new, &mut hunk);
     assert!(hunk.lines.iter().all(|l| !l.paired));
+}
+
+/// A patch's lines pair as a hunk's do, a no-newline marker between the
+/// removed and added lines notwithstanding; a removed line after the added
+/// ones starts a block of its own.
+#[test]
+fn patch_lines_pair_across_a_no_newline_marker() {
+    use crate::view::Kind;
+    let lines: [(Kind, &[u8]); 5] = [
+        (Kind::Removed, b"one two three"),
+        (Kind::NoNewline, b"\\ No newline at end of file"),
+        (Kind::Added, b"one two four"),
+        (Kind::Removed, b"one two five"),
+        (Kind::Context, b"end"),
+    ];
+    let got = pair_lines(lines.len(), |i| lines[i]);
+    let paired: Vec<bool> = got.iter().map(|(_, p)| *p).collect();
+    assert_eq!(paired, [true, false, true, false, false]);
+    let emphasized =
+        |i: usize| -> Vec<&[u8]> { got[i].0.iter().map(|r| &lines[i].1[r.clone()]).collect() };
+    assert_eq!(
+        (emphasized(0), emphasized(2)),
+        (vec![&b"three"[..]], vec![&b"four"[..]])
+    );
 }
 
 /// Units change whole: matched units stay unchanged, and a line inside a

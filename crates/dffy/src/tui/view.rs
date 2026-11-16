@@ -24,16 +24,19 @@ use std::sync::{Arc, OnceLock};
 use dffy_core::bstr::{BString, ByteSlice};
 use dffy_core::diff::{Emphasis, Hunk, LineKind, Whitespace};
 use dffy_core::git::{FileChange, FileDiff, Status, Update};
-use dffy_core::highlight::{Language, MAX_HIGHLIGHT_BYTES, Spans};
+use dffy_core::highlight::{FileSyntax, HunkSyntax, MAX_HIGHLIGHT_BYTES, Registry};
 use dffy_core::structural::{Structural, Unavailable};
-
-use super::piped::{Commit, PipedFile};
-use crate::pager;
-use crate::print::{self, FileSyntax, HunkSyntax};
-use crate::render::{
-    Arrangement, Attributes, Canvas, DiffLine, FileStatus, HunkHeader, HunkRow, Kind, Layout,
-    LineState, display_text, hunk_rows, no_newline,
+use dffy_core::view::{
+    Arrangement, Attributes, FileStatus, Heading, HunkHeader, Kind, Line, LineState, Row, Spans,
+    display_text, heading_text, no_newline, rows,
 };
+
+use dffy_core::patch::{self, Commit};
+
+use super::piped::PipedFile;
+use crate::pager;
+use crate::print;
+use crate::render::{Canvas, Layout};
 use crate::term::Grid;
 use crate::theme::{Ink, Role, Style, Theme};
 
@@ -76,7 +79,7 @@ pub(crate) struct Loaded {
     /// Each hunk's heading as a piped diff wrote it. Set for a piped file,
     /// which has only its hunks: the text between them is unknown, so its
     /// gaps never open and nothing searches it.
-    headings: Option<Vec<BString>>,
+    headings: Option<Vec<Vec<u8>>>,
     /// One hunk holding a whole added or deleted file, whose `@@` row
     /// would say nothing the title doesn't.
     whole: bool,
@@ -130,14 +133,14 @@ struct HunkView {
     heading: Option<u32>,
     body: Vec<BodyLine>,
     /// Rows in `arrangement`, computed when the hunk is first drawn in it.
-    rows: Vec<HunkRow>,
+    rows: Vec<Row>,
     /// The rows that start a block of changed lines, for `n` and `N`.
     starts: Vec<usize>,
     /// What `rows` and `starts` are for; `None` until the hunk is drawn.
     arrangement: Option<Arrangement>,
     /// The other arrangement's rows and starts, once the hunk was drawn in
     /// both (a resize across the split width, a layout toggle).
-    other: Option<Box<(Vec<HunkRow>, Vec<usize>)>>,
+    other: Option<Box<(Vec<Row>, Vec<usize>)>>,
     /// Per line of the core hunk, once a worker has computed it.
     emphasis: Option<Vec<Emphasis>>,
     /// Computed along with the emphasis, for highlighted files.
@@ -158,7 +161,7 @@ const _: () = assert!(size_of::<BodyLine>() == 8);
 /// The views of `hunks` (of `diff`), without emphasis. Their lines are
 /// paired already, so each line's state is final.
 fn views(diff: &FileDiff, hunks: &[Hunk]) -> Vec<HunkView> {
-    let mut heading = print::Heading::default();
+    let mut heading = Heading::default();
     hunks
         .iter()
         .map(|hunk| {
@@ -217,7 +220,13 @@ fn gaps(diff: &FileDiff) -> Vec<GapSpan> {
 }
 
 impl Loaded {
-    pub(crate) fn new(mut diff: FileDiff, whitespace: Whitespace, highlight: bool) -> Self {
+    /// `highlight` has the grammars to highlight with; `None` leaves the
+    /// file plain.
+    pub(crate) fn new(
+        mut diff: FileDiff,
+        whitespace: Whitespace,
+        highlight: Option<&Registry>,
+    ) -> Self {
         // Here, on the worker, rather than with the emphasis: whether a
         // line is modified decides its color from the first frame on, and
         // the overview marks every hunk, shown or not.
@@ -237,11 +246,11 @@ impl Loaded {
         let note = print::note(&diff).or_else(|| {
             print::whitespace_only(&diff, whitespace).then_some("only whitespace changed")
         });
-        let highlighted = |path: &[u8], bytes: &[u8]| {
+        let highlighted = |grammars: &Registry, path: &[u8], bytes: &[u8]| {
             let head = &bytes[..bytes.len().min(256)];
             !bytes.is_empty()
                 && bytes.len() <= MAX_HIGHLIGHT_BYTES
-                && Language::detect(path, head).is_some()
+                && grammars.detect(path, head).is_some()
         };
         let sides = [
             (diff.change.old_path().as_bytes(), diff.old.bytes()),
@@ -249,7 +258,11 @@ impl Loaded {
         ];
         let syntax_bytes: usize = sides
             .iter()
-            .filter(|(path, bytes)| highlight && !diff.hunks.is_empty() && highlighted(path, bytes))
+            .filter(|(path, bytes)| {
+                highlight.is_some_and(|grammars| {
+                    !diff.hunks.is_empty() && highlighted(grammars, path, bytes)
+                })
+            })
             // Measured on kernel/sched/fair.c: a first parse grew the process
             // by about 19 bytes per byte of source, an upper bound.
             .map(|(_, bytes)| bytes.len() * 20)
@@ -290,8 +303,8 @@ impl Loaded {
 
     /// A piped file's diff (see [`super::piped::PipedFile::diff`]), with
     /// its hunks' headings. Not highlighted: hunks alone parse poorly.
-    pub(crate) fn piped(diff: FileDiff, headings: Vec<BString>) -> Self {
-        let mut loaded = Self::new(diff, Whitespace::Exact, false);
+    pub(crate) fn piped(diff: FileDiff, headings: Vec<Vec<u8>>) -> Self {
+        let mut loaded = Self::new(diff, Whitespace::Exact, None);
         loaded.bytes += headings.iter().map(|h| h.len() + 24).sum::<usize>();
         loaded.headings = Some(headings);
         loaded
@@ -306,9 +319,9 @@ impl Loaded {
     fn heading(&self, views: &[HunkView], h: usize) -> &[u8] {
         match &self.headings {
             Some(headings) => headings.get(h).map_or(&b""[..], |s| &s[..]),
-            None => views[h].heading.map_or(&b""[..], |i| {
-                print::heading_text(&self.diff.old, i as usize)
-            }),
+            None => views[h]
+                .heading
+                .map_or(&b""[..], |i| heading_text(&self.diff.old, i as usize)),
         }
     }
 
@@ -1046,7 +1059,7 @@ pub(crate) struct Doc {
     /// The last heading search for the title's context: the diff, the line it
     /// searched up from, and the search, which continues forward from
     /// there for the next line down.
-    heading: Option<(Arc<FileDiff>, usize, print::Heading)>,
+    heading: Option<(Arc<FileDiff>, usize, Heading)>,
 }
 
 const NO_EMPHASIS: &[Range<usize>] = &[];
@@ -1716,7 +1729,10 @@ impl Doc {
             }
             Source::Piped(piped) => {
                 let (parents, line) = piped.combined.as_ref()?.get(row)?;
-                (pager::combined_role(*parents, line), line)
+                (
+                    pager::combined_role(patch::combined_kind(*parents, line)),
+                    line,
+                )
             }
             Source::Repo => return None,
         };
@@ -1829,12 +1845,12 @@ impl Doc {
                 state != LineState::NoNewline && core.lines[line as usize].block_start;
             (state.kind(), block_start)
         };
-        hunk_rows(arrangement, body.len(), kind, &mut view.rows);
-        let changed = |row: &HunkRow| match *row {
-            HunkRow::Line(i) | HunkRow::Pair(Some(i), _) | HunkRow::Pair(None, Some(i)) => {
+        rows(arrangement, body.len(), kind, &mut view.rows);
+        let changed = |row: &Row| match *row {
+            Row::Line(i) | Row::Pair(Some(i), _) | Row::Pair(None, Some(i)) => {
                 matches!(body[i].state.kind(), Kind::Removed | Kind::Added)
             }
-            HunkRow::Header | HunkRow::Marker | HunkRow::Pair(None, None) => false,
+            Row::Header | Row::Marker | Row::Pair(None, None) => false,
         };
         view.starts.clear();
         let mut before = false;
@@ -1848,8 +1864,8 @@ impl Doc {
         // The first arrangement's rows are in the estimate the view was
         // loaded with; a second one's are on top of it.
         let second = view.other.is_some();
-        let added = view.rows.capacity() * size_of::<HunkRow>()
-            + view.starts.capacity() * size_of::<usize>();
+        let added =
+            view.rows.capacity() * size_of::<Row>() + view.starts.capacity() * size_of::<usize>();
         view.arrangement = Some(arrangement);
         if second {
             loaded.bytes += added;
@@ -1907,7 +1923,7 @@ impl Doc {
         match (segment, shown) {
             (Segment::Start, _) => {
                 let header = loaded.header(&cores[0], heading(0));
-                layout.hunk_row(&header, HunkRow::Header, |_| print::NO_NEWLINE_LINE, c);
+                layout.hunk_row(&header, Row::Header, |_| print::NO_NEWLINE_LINE, c);
             }
             (Segment::Hunk(h), _) => {
                 let (core, view) = (&cores[h], &views[h]);
@@ -1942,7 +1958,7 @@ impl Doc {
                     let span = loaded.gaps[g];
                     let (old, new) = (span.old + offset, span.new + offset);
                     let raw = loaded.diff.new.line(new);
-                    let line = DiffLine {
+                    let line = Line {
                         state: LineState::Context,
                         old: Some(old + 1),
                         new: Some(new + 1),
@@ -1963,8 +1979,8 @@ impl Doc {
                         hidden: 0,
                     };
                     let row = match layout.arrangement(&header) {
-                        Arrangement::Split => HunkRow::Pair(Some(0), Some(0)),
-                        Arrangement::Unified => HunkRow::Line(0),
+                        Arrangement::Split => Row::Pair(Some(0), Some(0)),
+                        Arrangement::Unified => Row::Line(0),
                     };
                     layout.hunk_row(&header, row, |_| line, c);
                 }
@@ -2098,7 +2114,7 @@ impl Doc {
                 });
                 if let Some(line) = line {
                     let diff = &self.loaded(pos.file)?.diff;
-                    let text = display_text(print::heading_text(&diff.old, line));
+                    let text = display_text(heading_text(&diff.old, line));
                     return Some(Context {
                         numbers: None,
                         heading: crate::render::escape(text),
@@ -2139,11 +2155,7 @@ impl Doc {
                 *from = line;
                 heading
             }
-            slot => {
-                &mut slot
-                    .insert((Arc::clone(&diff), line, print::Heading::default()))
-                    .2
-            }
+            slot => &mut slot.insert((Arc::clone(&diff), line, Heading::default())).2,
         };
         heading.find_line(&diff.old, line)
     }
@@ -2576,10 +2588,8 @@ impl Doc {
         let (core, view) = (&cores[h], &views[h]);
         let first_body = (from..view.rows.len())
             .find_map(|r| match view.rows[r] {
-                HunkRow::Line(i) | HunkRow::Pair(_, Some(i)) | HunkRow::Pair(Some(i), None) => {
-                    Some(i)
-                }
-                HunkRow::Header | HunkRow::Marker | HunkRow::Pair(None, None) => None,
+                Row::Line(i) | Row::Pair(_, Some(i)) | Row::Pair(Some(i), None) => Some(i),
+                Row::Header | Row::Marker | Row::Pair(None, None) => None,
             })
             .unwrap_or(0);
         view.body
@@ -2865,9 +2875,9 @@ impl Doc {
                 }
         })?;
         let row = view.rows.iter().position(|r| match *r {
-            HunkRow::Line(i) => i == body,
-            HunkRow::Pair(old, new) => old == Some(body) || new == Some(body),
-            HunkRow::Header | HunkRow::Marker => false,
+            Row::Line(i) => i == body,
+            Row::Pair(old, new) => old == Some(body) || new == Some(body),
+            Row::Header | Row::Marker => false,
         })?;
         Some(Pos {
             file,
@@ -2910,8 +2920,8 @@ impl Doc {
                     }
                 };
                 match view.rows.get(pos.row) {
-                    Some(&HunkRow::Line(i)) => line(i),
-                    Some(&HunkRow::Pair(old, new)) => {
+                    Some(&Row::Line(i)) => line(i),
+                    Some(&Row::Pair(old, new)) => {
                         [old.and_then(|i| line(i)[0]), new.and_then(|i| line(i)[1])]
                     }
                     _ => [None, None],

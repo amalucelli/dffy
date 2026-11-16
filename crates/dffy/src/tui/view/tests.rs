@@ -606,10 +606,7 @@ fn late_diff() -> FileDiff {
 }
 
 fn load(doc: &mut Doc, file: usize, fd: FileDiff) {
-    assert!(doc.load(
-        file,
-        Ok(Box::new(Loaded::new(fd, Whitespace::Exact, false)))
-    ));
+    assert!(doc.load(file, Ok(Box::new(Loaded::new(fd, Whitespace::Exact, None)))));
 }
 
 /// The first time a file shows, in its full text, the view starts a few
@@ -760,7 +757,8 @@ fn background_tints_give_moved_code_its_own_hue() {
     let old = "int a(void) { return 1; }\nint b(void) { return 2; }\n";
     let new = "int b(void) { return 2; }\nint a(void) { return 1; }\n";
     let fd = file_diff("f.c", old, new);
-    let structural = dffy_core::structural::diff(b"f.c", &fd.old, &fd.new, &fd.hunks);
+    let structural =
+        dffy_core::structural::diff(crate::grammars(), b"f.c", &fd.old, &fd.new, &fd.hunks);
     let mut layout = layout(false, false);
     layout.indicators = Indicators::Background;
     let mut theme = Theme::default_theme();

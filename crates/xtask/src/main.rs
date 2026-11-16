@@ -1,9 +1,9 @@
 //! `cargo xtask`: dffy's benchmark tooling, on macOS and Linux.
 //!
-//! - `bench-baseline`, `bench-ab` and `bench-noise` are the performance gate:
-//!   a baseline build kept on disk, compared with the current tree on the
-//!   same machine, failing on a slowdown consistent across rounds or an
-//!   allocation increase.
+//! - `bench-baseline`, `bench-ab`, `bench-noise` and `bench-layouts` are the
+//!   performance gate: a baseline build kept on disk, compared with the
+//!   current tree on the same machine, failing on a slowdown consistent
+//!   across rounds, more instructions or an allocation increase.
 //! - `compare` times dffy against other diff tools on the kernel range and
 //!   prints the tables in `docs/benchmarks.md`.
 
@@ -19,8 +19,9 @@ use std::process::{Command, ExitCode};
 
 const USAGE: &str = "\
 usage: cargo xtask bench-baseline <dir>
-       cargo xtask bench-ab <base-dir> [--rounds N] [--only GROUP,...]
+       cargo xtask bench-ab <base-dir> [--rounds N] [--only GROUP,...] [--instructions METRIC,...]
        cargo xtask bench-noise <base-dir> [--rounds N] [--only GROUP,...]
+       cargo xtask bench-layouts <base-dir> [--layouts N] [--rounds N] [--only GROUP,...]
        cargo xtask compare [--scenarios S,...] [--runs N] [--slow-runs N] [--mem-runs N]
 
 GROUP is one of frame, engine, pty, count, paint, print, pager.
@@ -171,6 +172,36 @@ impl Timing {
             max: field("max")?,
         })
     }
+}
+
+/// `run`'s result and the user-space instructions retired while it ran by
+/// this thread and every thread and process it started, those that exited
+/// included. None off Linux, or when the kernel offers no hardware counter.
+#[cfg(target_os = "linux")]
+fn instructions<T>(run: impl FnOnce() -> Result<T>) -> Result<(T, Option<f64>)> {
+    use perf_event::{Builder, events::Hardware};
+    // pid 0 is the calling thread; with inherit, the processes it spawns
+    // add their counts to this counter when they exit.
+    let Ok(mut counter) = Builder::new(Hardware::INSTRUCTIONS).inherit(true).build() else {
+        return Ok((run()?, None));
+    };
+    counter
+        .enable()
+        .map_err(|e| format!("instruction counter: {e}"))?;
+    let out = run()?;
+    let n = counter
+        .read()
+        .map_err(|e| format!("instruction counter: {e}"))?;
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "counts stay far below 2^53, where f64 is exact"
+    )]
+    Ok((out, Some(n as f64)))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn instructions<T>(run: impl FnOnce() -> Result<T>) -> Result<(T, Option<f64>)> {
+    Ok((run()?, None))
 }
 
 const TIME: &str = "/usr/bin/time";

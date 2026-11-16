@@ -1,10 +1,10 @@
 //! One column: `old new │±text`, or `n │±text` for a one-sided file.
 
-use super::{Canvas, Cursor, DiffLine, Kind, Layout, LineState, NO_NEWLINE, line_style};
+use super::{Canvas, Cursor, Kind, Layout, Line, LineState, NO_NEWLINE, line_style};
 use crate::theme::Role;
 
 /// One line, spanning several screen rows when it wraps.
-pub(super) fn line(layout: &Layout, w: usize, line: &DiffLine, c: &mut Canvas) {
+pub(super) fn line(layout: &Layout, w: usize, line: &Line, c: &mut Canvas) {
     let columns = if layout.one_sided { 1 } else { 2 };
     if line.state == LineState::NoNewline {
         layout.lead(c, Role::Plain);

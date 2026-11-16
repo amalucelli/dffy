@@ -23,9 +23,11 @@ The engine: git access, diffing, highlighting. It has no terminal code and doesn
 | `git::changes` | A diff's file list kept current for watch mode, with the parsed index kept loaded. |
 | `git::paths` | Two files or folders compared outside git, behind the same `Repo` handle. Walks both trees in step; a worker per core stats and compares files, and results come back in path order. |
 | `diff` | The hunk model, and the line diff: histogram with a Myers fallback. |
-| `diff::intraline` | Token-level emphasis inside changed lines. |
+| `diff::intraline` | Token-level emphasis inside changed lines, and the pairing of a change block's removed and added lines, for hunks and for a patch's lines alike. |
+| `patch` | Unified diffs read as text (`git diff`, `git log -p`, `diff -u`): the line-at-a-time parser and its events, what text lines and combined-diff lines are, and the builder that collects events into commits and files. No I/O: the host reads the input and stores what it keeps. |
+| `view` | What a frontend draws, short of how it looks: a hunk's lines and their states (modified, moved, reformatted), headers, rows in the split or unified arrangement, syntax runs and paint, hunk headings. No widths, colors or cells. |
 | `structural` | The syntax-aware diff: anchoring, per-region matching, the result cache. |
-| `highlight` | tree-sitter highlighting of the requested lines; the bundled grammars. |
+| `highlight` | tree-sitter highlighting of the requested lines; the grammar registry (`Registry`), which the host builds and passes in, with the 18 bundled grammars as `Registry::builtin`. |
 | `watch` | The file watcher: inotify and FSEvents backends, coalescing, ignore rules, polling. |
 | `cache` | The content-addressed disk cache shared by every dffy process. |
 | `suggest` | Closest-name suggestions for "did you mean" hints. |
@@ -45,9 +47,9 @@ The `dffy` binary: CLI, printed output, pager mode, the viewer and the watch bro
 | `output` | Terminal facts, color decisions, stdout or a pager process. |
 | `print` | Printed output from the repository, streamed file by file. |
 | `no_index` | When two arguments are paths to compare rather than revisions, and what the comparison is called (`git difftool`'s temporary copies included). |
-| `pager` | Parsing a unified diff from stdin, the stdin reader, and `--color-only`. |
+| `pager` | Pager mode: the stdin reader and line splitting, streaming the core's `patch` events into rendered rows, and `--color-only`. |
 | `plugin` | Renderer plugins: the `render` setting, finding `dffy-render-<name>` on `PATH`, running one with a timeout, the protocol's JSON. |
-| `render` | Layout of diffs into role-tagged rows (split, unified, stat), shared by printed output and the viewer. |
+| `render` | Drawing the core's `view` lines into role-tagged rows (split, unified, stat): widths, wrapping, role selection and escaping, shared by printed output and the viewer. |
 | `term` | The terminal layer: cell grid, raw mode, input parsing, OSC 52. |
 | `tui` | The viewer (submodules below). |
 | `daemon` | `dffyd`: the broker, its client, and the socket protocol. |
@@ -63,7 +65,7 @@ The viewer's submodules, under `tui`:
 | `worker` | Diffs and renderings off the UI thread. |
 | `tree`, `picker`, `commands`, `help` | The file tree, the file picker, the command panel, the key list. |
 | `chrome` | The frame. |
-| `piped` | Diffs from a pipe. |
+| `piped` | Diffs from a pipe: the reader thread, its backpressure, and the spill file that keeps patches out of memory until drawn. |
 | `editor` | Opening `$VISUAL` or `$EDITOR` at a line. |
 
 ### `plugins/markdown`
@@ -175,7 +177,7 @@ dffy has its own terminal layer (`term`); it uses no TUI library.
   - rename results;
   - highlight spans and syntax diffs of files of 64KB or more;
   - renderer plugins' answers, keyed by the renderer's program as installed, both sides, the width and the background.
-- **Keys:** an entry's name hashes the dffy version, its kind and every input (blob ids, grammar, options), so entries never need invalidating.
+- **Keys:** an entry's name hashes the dffy version, its kind and every input (blob ids, the grammar's identity, options), so entries never need invalidating. A grammar's identity digests its name, ABI and metadata versions, table sizes and query text.
 - **Writes:** go through a temporary file renamed into place. Each entry has a length and a checksum.
 - **Trimming:** to `cache-size` (256MB), by removing the oldest entries down to 80%, at most every 10 minutes across processes.
 - **Speed:** a hit is 200 to 500 times faster than recomputing a syntax diff.

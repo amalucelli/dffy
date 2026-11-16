@@ -6,8 +6,10 @@ pub mod cache;
 pub mod diff;
 pub mod git;
 pub mod highlight;
+pub mod patch;
 pub mod structural;
 pub mod suggest;
+pub mod view;
 pub mod watch;
 
 /// Byte-string types used for paths and contents throughout the API.

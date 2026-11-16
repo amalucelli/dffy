@@ -1,7 +1,11 @@
+use std::sync::LazyLock;
+
 use proptest::prelude::*;
 
 use super::*;
 use crate::diff::{Options, hunks};
+
+static GRAMMARS: LazyLock<Registry> = LazyLock::new(Registry::builtin);
 
 fn texts(old: &str, new: &str) -> (Text, Text) {
     (Text::new(old.into()), Text::new(new.into()))
@@ -12,7 +16,7 @@ fn line_hunks(old: &Text, new: &Text) -> Vec<Hunk> {
 }
 
 fn structural(path: &str, old: &Text, new: &Text) -> Structural {
-    diff(path.as_bytes(), old, new, &line_hunks(old, new)).expect("structural diff")
+    diff(&GRAMMARS, path.as_bytes(), old, new, &line_hunks(old, new)).expect("structural diff")
 }
 
 /// Rebuilds the new text from the old one and the hunks, checking that
@@ -181,12 +185,12 @@ fn unknown_languages_and_oversized_sides_are_unavailable() {
     let (old, new) = texts("a\n", "b\n");
     let h = line_hunks(&old, &new);
     assert_eq!(
-        diff(b"notes.unknown", &old, &new, &h).err(),
+        diff(&GRAMMARS, b"notes.unknown", &old, &new, &h).err(),
         Some(Unavailable::Language)
     );
     let big = Text::new(vec![b'x'; MAX_BYTES + 1]);
     assert_eq!(
-        diff(b"big.c", &old, &big, &h).err(),
+        diff(&GRAMMARS, b"big.c", &old, &big, &h).err(),
         Some(Unavailable::TooLarge)
     );
 }
@@ -540,7 +544,15 @@ fn a_region_over_budget_falls_back_alone() {
         region_work: 150,
         ..Budget::DEFAULT
     };
-    let s = diff_with(b"a.c", &old, &new, &line_hunks(&old, &new), budget).expect("diff");
+    let s = diff_with(
+        &GRAMMARS,
+        b"a.c",
+        &old,
+        &new,
+        &line_hunks(&old, &new),
+        budget,
+    )
+    .expect("diff");
     assert_eq!(apply(&old, &new, &s.hunks), new.bytes());
     assert_eq!((s.regions.matched, s.regions.fell_back), (1, 1));
     assert!(s.note().is_some());
@@ -557,7 +569,7 @@ fn a_region_over_budget_falls_back_alone() {
         file_time: Duration::ZERO,
         ..Budget::DEFAULT
     };
-    let s = diff_with(b"a.c", &old, &new, &line_hunks(&old, &new), none).expect("diff");
+    let s = diff_with(&GRAMMARS, b"a.c", &old, &new, &line_hunks(&old, &new), none).expect("diff");
     assert_eq!(s.regions.fell_back, 2);
     assert_eq!(s.hunks, line);
 }

@@ -15,11 +15,11 @@ use dffy_core::diff::{
     emphasize_lines, similar, tokenize, unit_hunks,
 };
 use dffy_core::git::FileDiff;
-use dffy_core::highlight::{self, Language};
+use dffy_core::highlight::{self, Language, Registry};
+use dffy_core::view::{self, Attributes, HunkHeader, Kind, Paint, Syntax};
 
 use super::{Copied, Loaded, Side};
 use crate::plugin;
-use crate::render::{Attributes, DiffLine, HunkHeader, Kind, Paint};
 
 /// How many added blocks ahead a removed block looks for the one it was
 /// edited into; bounds the similarity tests in a long rewrite.
@@ -61,7 +61,7 @@ pub(crate) struct Rendered {
 
 /// `line` as drawn: unchanged for a line diff, restyled by `rendered` for
 /// a rendered view.
-pub(super) fn restyle<'a>(rendered: Option<&'a Rendered>, line: DiffLine<'a>) -> DiffLine<'a> {
+pub(super) fn restyle<'a>(rendered: Option<&'a Rendered>, line: view::Line<'a>) -> view::Line<'a> {
     match rendered {
         Some(rendered) => rendered.restyle(line),
         None => line,
@@ -73,7 +73,7 @@ impl Rendered {
     /// its styles, and numbered with its block's first source line on the
     /// block's first line only. A moved line keeps its own look, as a
     /// moved line of code drops its syntax colors.
-    fn restyle<'a>(&'a self, mut line: DiffLine<'a>) -> DiffLine<'a> {
+    fn restyle<'a>(&'a self, mut line: view::Line<'a>) -> view::Line<'a> {
         let (side, number) = if line.state.kind() == Kind::Removed {
             (Side::Old, line.old)
         } else {
@@ -190,18 +190,17 @@ fn bounds(origins: &[Origin], lines: usize) -> Vec<u32> {
 
 /// The language a code block's fence names: `rust`, or an extension such
 /// as `rs`.
-fn language(name: &str) -> Option<Language> {
+fn language<'g>(grammars: &'g Registry, name: &str) -> Option<&'g Language> {
     let name = name.trim().to_ascii_lowercase();
-    Language::ALL
-        .into_iter()
-        .find(|l| l.name() == name)
-        .or_else(|| Language::detect(format!("x.{name}").as_bytes(), b""))
+    grammars
+        .named(&name)
+        .or_else(|| grammars.detect(format!("x.{name}").as_bytes(), b""))
 }
 
 /// Syntax colors for a code block's lines, from the bundled highlighter;
 /// `None` when its language is unknown or it doesn't parse in time.
-fn highlighted(block: &plugin::Block) -> Option<Vec<Vec<Paint>>> {
-    let lang = language(block.language.as_deref()?)?;
+fn highlighted(grammars: &Registry, block: &plugin::Block) -> Option<Vec<Vec<Paint>>> {
+    let lang = language(grammars, block.language.as_deref()?)?;
     let mut bytes = Vec::new();
     for line in &block.lines {
         bytes.extend_from_slice(line.text.as_bytes());
@@ -268,7 +267,7 @@ struct Styles {
 impl Styles {
     /// The style of byte `i`: its paint's syntax color and attributes, and
     /// the hash of its link's target.
-    fn at(&self, i: usize) -> (Option<highlight::Syntax>, Attributes, u64) {
+    fn at(&self, i: usize) -> (Option<Syntax>, Attributes, u64) {
         let paint = self
             .paint
             .iter()
@@ -331,8 +330,9 @@ impl Layout {
     }
 }
 
-/// One side of the rendered view, from the blocks drawn of `source`.
-fn lay_out(side: plugin::Side, source: &Text) -> Layout {
+/// One side of the rendered view, from the blocks drawn of `source`, with
+/// code blocks highlighted in `grammars`' languages.
+fn lay_out(side: plugin::Side, source: &Text, grammars: &Registry) -> Layout {
     let mut out = Layout::default();
     for block in side.blocks.into_iter().filter(|b| !b.lines.is_empty()) {
         let id = identity(&block, source);
@@ -344,7 +344,7 @@ fn lay_out(side: plugin::Side, source: &Text) -> Layout {
             words.write_u8(0xff);
         }
         out.words.push(words.finish());
-        let colors = highlighted(&block);
+        let colors = highlighted(grammars, &block);
         let index = u32::try_from(out.units.len()).unwrap_or(u32::MAX);
         out.units.push((id, block.lines.len()));
         let (start, end) = (
@@ -593,17 +593,22 @@ fn rearrange(
 }
 
 /// The rendered view of `source`, the line diff of the file `sides` were
-/// drawn from at `width`, with `context` lines around each change. Edited
-/// blocks pair as [`pair_blocks`] says, and a changed block whose identity
-/// is also among the other side's changed blocks is marked moved.
+/// drawn from at `width`, with `context` lines around each change and code
+/// blocks highlighted in `grammars`' languages. Edited blocks pair as
+/// [`pair_blocks`] says, and a changed block whose identity is also among
+/// the other side's changed blocks is marked moved.
 pub(crate) fn build(
     source: Arc<FileDiff>,
     sides: [plugin::Side; 2],
+    grammars: &Registry,
     context: usize,
     width: usize,
 ) -> Loaded {
     let [old, new] = sides;
-    let (mut old, mut new) = (lay_out(old, &source.old), lay_out(new, &source.new));
+    let (mut old, mut new) = (
+        lay_out(old, &source.old, grammars),
+        lay_out(new, &source.new, grammars),
+    );
     let (old_text, new_text) = (
         Text::new(std::mem::take(&mut old.bytes)),
         Text::new(std::mem::take(&mut new.bytes)),
@@ -663,7 +668,7 @@ pub(crate) fn build(
         note: None,
         hunks,
     };
-    let mut loaded = Loaded::new(diff, Whitespace::Exact, false);
+    let mut loaded = Loaded::new(diff, Whitespace::Exact, None);
     if loaded.diff.hunks.is_empty() {
         loaded.note = Some("renders the same; r shows the lines");
     }
@@ -710,7 +715,7 @@ mod tests {
     use super::super::{Doc, Pos, Render, Selection, Source, State};
     use super::*;
     use crate::config::Indicators;
-    use crate::render::{HunkRow, Layout};
+    use crate::render::Layout;
 
     const OLD: &str =
         "# Title\n\nMoved para.\n\nThe quick brown fox.\n\nGone paragraph here.\n\nKeep.\n";
@@ -774,7 +779,7 @@ mod tests {
         };
         let mut doc = Doc::new(layout, 20);
         doc.push(fd.change.clone(), Source::Repo);
-        assert!(doc.load(0, Ok(Box::new(Loaded::new(fd, Whitespace::Exact, false)))));
+        assert!(doc.load(0, Ok(Box::new(Loaded::new(fd, Whitespace::Exact, None)))));
         let diff = Arc::clone(doc.diff_of(0).expect("loaded"));
         (doc, diff)
     }
@@ -807,7 +812,7 @@ mod tests {
             .iter()
             .flat_map(|h| &h.lines)
             .map(|l| {
-                let state = crate::render::LineState::of(l);
+                let state = view::LineState::of(l);
                 let line = crate::print::diff_line(&loaded.diff, l, state, &[], None);
                 let line = rendered.restyle(line);
                 let sign = match (l.kind, l.unchanged, l.paired) {
@@ -834,7 +839,7 @@ mod tests {
     #[test]
     fn blocks_diff_whole_and_number_their_source() {
         let (_, diff) = doc();
-        let loaded = build(Arc::clone(&diff), sides(), 3, 60);
+        let loaded = build(Arc::clone(&diff), sides(), crate::grammars(), 3, 60);
         assert_eq!(
             lines(&loaded),
             [
@@ -888,7 +893,7 @@ mod tests {
                 ],
             },
         ];
-        let loaded = build(diff, sides, 3, 60);
+        let loaded = build(diff, sides, crate::grammars(), 3, 60);
         assert_eq!(
             lines(&loaded),
             [
@@ -916,7 +921,7 @@ mod tests {
         };
         let header = crate::print::hunk_header(hunk, b"");
         let mut rows = Vec::new();
-        crate::render::hunk_rows(
+        view::rows(
             layout.arrangement(&header),
             hunk.lines.len(),
             |i| {
@@ -929,8 +934,11 @@ mod tests {
             },
             &mut rows,
         );
-        assert!(rows.contains(&HunkRow::Pair(Some(4), Some(6))), "{rows:?}");
-        assert!(rows.contains(&HunkRow::Pair(Some(2), None)), "{rows:?}");
+        assert!(
+            rows.contains(&view::Row::Pair(Some(4), Some(6))),
+            "{rows:?}"
+        );
+        assert!(rows.contains(&view::Row::Pair(Some(2), None)), "{rows:?}");
     }
 
     /// `block` with `style` (and `url`) on the bytes of its first line
@@ -967,11 +975,11 @@ mod tests {
         let code = Paint {
             start: 0,
             end: 0,
-            syntax: Some(highlight::Syntax::String),
+            syntax: Some(Syntax::String),
             attributes: Attributes::NONE,
         };
         let link = Paint {
-            syntax: Some(highlight::Syntax::Function),
+            syntax: Some(Syntax::Function),
             attributes: Attributes::UNDERLINE,
             ..code
         };
@@ -1003,6 +1011,7 @@ mod tests {
         let loaded = build(
             diff,
             [side(false, "a.md", false), side(true, "b.md", true)],
+            crate::grammars(),
             3,
             60,
         );
@@ -1081,7 +1090,7 @@ mod tests {
         let sides = [false, true].map(|edited| plugin::Side {
             blocks: vec![code(edited)],
         });
-        let loaded = build(diff, sides, 3, 60);
+        let loaded = build(diff, sides, crate::grammars(), 3, 60);
         let lines = &loaded.diff.hunks[0].lines;
         assert!(lines.iter().all(|l| l.paired), "every line pairs");
         let emphasis = loaded.hunks[0].emphasis.as_deref().expect("emphasis");
@@ -1104,7 +1113,7 @@ mod tests {
             return;
         };
         let (_, diff) = doc_of(old, new);
-        let loaded = build(diff, sides, 3, 60);
+        let loaded = build(diff, sides, crate::grammars(), 3, 60);
         assert_eq!(
             lines(&loaded),
             ["~ 1 . See docs.", "~ . 1 See docs.", "  . . "]
@@ -1141,7 +1150,7 @@ mod tests {
             side(["Alpha.", "Gone para.", "Keep."]),
             side(["Alpha.", "Keep.", "Fresh text."]),
         ];
-        let shown = lines(&build(diff, sides, 3, 60));
+        let shown = lines(&build(diff, sides, crate::grammars(), 3, 60));
         assert!(
             shown.iter().any(|l| l == "- . . ") && shown.iter().any(|l| l == "+ . . "),
             "{shown:?}"
@@ -1289,7 +1298,7 @@ mod tests {
                 })
                 .collect()
         });
-        let loaded = build(Arc::clone(&diff), sides, 3, 60);
+        let loaded = build(Arc::clone(&diff), sides, crate::grammars(), 3, 60);
         let mut shown: [HashSet<usize>; 2] = Default::default();
         for l in loaded.diff.hunks.iter().flat_map(|h| &h.lines) {
             match l.kind {
@@ -1372,7 +1381,13 @@ mod tests {
                 })
                 .collect(),
         };
-        let loaded = build(Arc::clone(&diff), [side(false), side(true)], 1, 60);
+        let loaded = build(
+            Arc::clone(&diff),
+            [side(false), side(true)],
+            crate::grammars(),
+            1,
+            60,
+        );
         assert!(doc.set_rendered(0, &diff, Ok(Box::new(loaded))));
         doc.set_rendered_mode(true);
         doc.top();
@@ -1413,16 +1428,16 @@ mod tests {
         code.lines[0].paint.push(Paint {
             start: 0,
             end: 12,
-            syntax: Some(highlight::Syntax::String),
+            syntax: Some(Syntax::String),
             attributes: Attributes::NONE,
         });
         let sides = [plugin::Side::default(), plugin::Side { blocks: vec![code] }];
-        let loaded = build(diff, sides, 3, 60);
+        let loaded = build(diff, sides, crate::grammars(), 3, 60);
         let rendered = loaded.rendered.as_deref().expect("a rendered view");
         let keyword = rendered.paint[1][0].first().copied();
         assert_eq!(
             keyword.map(|p| (p.start, p.end, p.syntax)),
-            Some((0, 2, Some(highlight::Syntax::Keyword)))
+            Some((0, 2, Some(Syntax::Keyword)))
         );
     }
 
@@ -1434,7 +1449,13 @@ mod tests {
         assert!(doc.set_rendered(
             0,
             &diff,
-            Ok(Box::new(build(Arc::clone(&diff), sides(), 3, 60)))
+            Ok(Box::new(build(
+                Arc::clone(&diff),
+                sides(),
+                crate::grammars(),
+                3,
+                60
+            )))
         ));
         assert!(matches!(
             doc.files[0].render.as_deref(),

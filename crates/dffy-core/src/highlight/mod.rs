@@ -4,23 +4,24 @@
 //! lines on screen. The same pass collects leaf-node boundaries, which
 //! intra-line emphasis uses as tokens.
 //!
-//! Queries are compiled on first use per language and kept for the process:
-//! compiling all of them costs about 80ms, one costs 3–35ms.
+//! Which grammar a file gets comes from the host's [`Registry`]. Queries are
+//! compiled on first use per language and kept as long as its registry
+//! entry: compiling all of them costs about 80ms, one costs 3–35ms.
 
 mod lang;
 
 use std::ops::{ControlFlow, Range};
-use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 use rustc_hash::FxHashMap;
 use tree_sitter::{Parser, Query, QueryCursor, StreamingIterator, Tree};
 
-pub use lang::Language;
+pub use lang::{Grammar, Language, Registry, Words};
 
 use crate::cache::{self, Cache};
-use crate::diff::{Text, tokenize};
+use crate::diff::{Emphasis, Hunk, Text, emphasize_with};
 use crate::git::ObjectId;
+use crate::view::{Run, Spans, Syntax, content_len, len_u32};
 
 /// Sides larger than this aren't highlighted. A 1.8MB C file takes about
 /// 250ms to parse and 86MB to hold; this keeps the parse under about 80ms.
@@ -34,168 +35,64 @@ const PARSE_BUDGET: Duration = Duration::from_millis(200);
 /// cache, where a hit beats the parse it replaces (see [`Highlighter`]).
 pub const CACHE_MIN_BYTES: usize = 64 << 10;
 
-/// What a highlighted stretch of text is. Capture names from the bundled
-/// queries map onto these; a theme gives each one a style.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-#[repr(u8)]
-pub enum Syntax {
-    /// Keywords, conditionals, loops, includes and storage classes; also
-    /// markup headings.
-    Keyword,
-    /// String and character literals; also markup code spans.
-    String,
-    /// Escape sequences inside strings.
-    Escape,
-    /// Comments of every kind.
-    Comment,
-    /// Function and method names; also markup links.
-    Function,
-    /// Type names and constructors.
-    Type,
-    /// Integer and float literals.
-    Number,
-    /// Constants and booleans.
-    Constant,
-    /// Operators.
-    Operator,
-    /// Brackets, delimiters and separators.
-    Punctuation,
-    /// Properties, fields and mapping keys.
-    Property,
-    /// Built-in variables such as `self` or `this`.
-    VariableBuiltin,
-    /// Attributes and annotations.
-    Attribute,
-    /// Markup tags.
-    Tag,
-    /// Labels, as for `goto`.
-    Label,
-}
+/// Sides at least this large are parsed on two threads at once by
+/// [`FileSyntax::new`]. Smaller ones parse in a few milliseconds, where a
+/// second thread gains little.
+pub const PARALLEL_PARSE_BYTES: usize = 32 << 10;
 
-impl Syntax {
-    /// Every role, in discriminant order. Disk cache keys include each
-    /// role's [`Syntax::key`], so changing this invalidates cached spans.
-    pub const ALL: [Self; 15] = [
-        Self::Keyword,
-        Self::String,
-        Self::Escape,
-        Self::Comment,
-        Self::Function,
-        Self::Type,
-        Self::Number,
-        Self::Constant,
-        Self::Operator,
-        Self::Punctuation,
-        Self::Property,
-        Self::VariableBuiltin,
-        Self::Attribute,
-        Self::Tag,
-        Self::Label,
-    ];
-
-    /// The name themes use, after a `syntax-` prefix.
-    #[must_use]
-    pub fn key(self) -> &'static str {
-        match self {
-            Self::Keyword => "keyword",
-            Self::String => "string",
-            Self::Escape => "escape",
-            Self::Comment => "comment",
-            Self::Function => "function",
-            Self::Type => "type",
-            Self::Number => "number",
-            Self::Constant => "constant",
-            Self::Operator => "operator",
-            Self::Punctuation => "punctuation",
-            Self::Property => "property",
-            Self::VariableBuiltin => "variable-builtin",
-            Self::Attribute => "attribute",
-            Self::Tag => "tag",
-            Self::Label => "label",
-        }
-    }
-
-    fn from_u8(n: u8) -> Option<Self> {
-        Self::ALL.get(usize::from(n)).copied()
-    }
-
-    /// The role of a query capture name such as `function.method`. Names
-    /// without one (`variable`, `none`, `embedded`) leave the text plain.
-    fn from_capture(name: &str) -> Option<Self> {
-        let specific = match name {
-            "variable.builtin" => Some(Self::VariableBuiltin),
-            "string.escape" | "escape" => Some(Self::Escape),
-            "string.special.key" => Some(Self::Property),
-            "constructor" => Some(Self::Type),
-            "text.title" | "markup.heading" => Some(Self::Keyword),
-            "text.literal" | "markup.raw" => Some(Self::String),
-            "text.uri" | "text.reference" | "markup.link" => Some(Self::Function),
-            _ => None,
-        };
-        specific.or_else(|| {
-            Some(match name.split('.').next().unwrap_or(name) {
-                "keyword" | "conditional" | "repeat" | "include" | "exception" | "storageclass" => {
-                    Self::Keyword
-                }
-                "string" | "character" => Self::String,
-                "comment" => Self::Comment,
-                "function" | "method" => Self::Function,
-                "type" => Self::Type,
-                "number" | "float" => Self::Number,
-                "constant" | "boolean" => Self::Constant,
-                "operator" => Self::Operator,
-                "punctuation" | "delimiter" => Self::Punctuation,
-                "property" | "field" => Self::Property,
-                "attribute" => Self::Attribute,
-                "tag" => Self::Tag,
-                "label" => Self::Label,
-                _ => return None,
-            })
+/// The role of a query capture name such as `function.method`. Names
+/// without one (`variable`, `none`, `embedded`) leave the text plain.
+fn role(name: &str) -> Option<Syntax> {
+    let specific = match name {
+        "variable.builtin" => Some(Syntax::VariableBuiltin),
+        "string.escape" | "escape" => Some(Syntax::Escape),
+        "string.special.key" => Some(Syntax::Property),
+        "constructor" => Some(Syntax::Type),
+        "text.title" | "markup.heading" => Some(Syntax::Keyword),
+        "text.literal" | "markup.raw" => Some(Syntax::String),
+        "text.uri" | "text.reference" | "markup.link" => Some(Syntax::Function),
+        _ => None,
+    };
+    specific.or_else(|| {
+        Some(match name.split('.').next().unwrap_or(name) {
+            "keyword" | "conditional" | "repeat" | "include" | "exception" | "storageclass" => {
+                Syntax::Keyword
+            }
+            "string" | "character" => Syntax::String,
+            "comment" => Syntax::Comment,
+            "function" | "method" => Syntax::Function,
+            "type" => Syntax::Type,
+            "number" | "float" => Syntax::Number,
+            "constant" | "boolean" => Syntax::Constant,
+            "operator" => Syntax::Operator,
+            "punctuation" | "delimiter" => Syntax::Punctuation,
+            "property" | "field" => Syntax::Property,
+            "attribute" => Syntax::Attribute,
+            "tag" => Syntax::Tag,
+            "label" => Syntax::Label,
+            _ => return None,
         })
-    }
+    })
 }
 
-/// A highlighted stretch of one line, as byte offsets from the line's start.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Run {
-    /// First byte, inclusive.
-    pub start: u32,
-    /// Past the last byte; runs on one line never overlap and come in order.
-    pub end: u32,
-    /// What the text is.
-    pub syntax: Syntax,
-}
-
+/// A language's highlight query, compiled.
 struct Compiled {
     query: Query,
     /// The role of each capture, by capture index.
     roles: Vec<Option<Syntax>>,
 }
 
-/// Where the compiled highlight query of `lang` is kept.
-fn query_slot(lang: Language) -> Option<&'static OnceLock<Option<Compiled>>> {
-    static QUERIES: [OnceLock<Option<Compiled>>; Language::ALL.len()] =
-        [const { OnceLock::new() }; Language::ALL.len()];
-    Language::ALL
-        .iter()
-        .position(|&l| l == lang)
-        .map(|index| &QUERIES[index])
-}
-
-/// The compiled highlight query of `lang`, compiling it on first use.
-/// `None` if the bundled query doesn't compile, which a test rules out.
-fn compiled(lang: Language) -> Option<&'static Compiled> {
-    query_slot(lang)?
-        .get_or_init(|| {
-            let query = Query::new(&lang.grammar(), &lang.highlights().concat()).ok()?;
-            let roles = query
-                .capture_names()
-                .iter()
-                .map(|name| Syntax::from_capture(name))
-                .collect();
-            Some(Compiled { query, roles })
-        })
-        .as_ref()
+impl Compiled {
+    /// `None` if `source` doesn't compile against `grammar`.
+    fn new(grammar: &tree_sitter::Language, source: &str) -> Option<Self> {
+        let query = Query::new(grammar, source).ok()?;
+        let roles = query
+            .capture_names()
+            .iter()
+            .map(|name| role(name))
+            .collect();
+        Some(Self { query, roles })
+    }
 }
 
 /// A parsed side.
@@ -208,18 +105,18 @@ pub struct Parsed {
 /// [`MAX_HIGHLIGHT_BYTES`], the parse runs past its time budget, or the
 /// language's query doesn't compile.
 #[must_use]
-pub fn parse(lang: Language, source: &[u8]) -> Option<Parsed> {
+pub fn parse(lang: &Language, source: &[u8]) -> Option<Parsed> {
     if source.len() > MAX_HIGHLIGHT_BYTES {
         return None;
     }
-    let tree = if query_slot(lang)?.get().is_some() {
-        compiled(lang)?;
+    let tree = if lang.is_compiled() {
+        lang.compiled()?;
         parse_tree(lang, source, PARSE_BUDGET)?
     } else {
         // The language's first parse compiles its query beside it, rather
         // than waiting the compile out first.
         std::thread::scope(|s| {
-            let query = std::thread::Builder::new().spawn_scoped(s, || compiled(lang).is_some());
+            let query = std::thread::Builder::new().spawn_scoped(s, || lang.compiled().is_some());
             let tree = parse_tree(lang, source, PARSE_BUDGET);
             let query = match query {
                 Ok(query) => query
@@ -227,19 +124,22 @@ pub fn parse(lang: Language, source: &[u8]) -> Option<Parsed> {
                     .unwrap_or_else(|e| std::panic::resume_unwind(e)),
                 // Out of threads: compile here instead of losing the
                 // highlighting (or the process, as `Scope::spawn` panics).
-                Err(_) => compiled(lang).is_some(),
+                Err(_) => lang.compiled().is_some(),
             };
             query.then_some(tree).flatten()
         })?
     };
-    Some(Parsed { tree, lang })
+    Some(Parsed {
+        tree,
+        lang: lang.clone(),
+    })
 }
 
 /// The syntax tree of `source`, or `None` when parsing takes longer than
 /// `budget`.
-pub(crate) fn parse_tree(lang: Language, source: &[u8], budget: Duration) -> Option<Tree> {
+pub(crate) fn parse_tree(lang: &Language, source: &[u8], budget: Duration) -> Option<Tree> {
     let mut parser = Parser::new();
-    parser.set_language(&lang.grammar()).ok()?;
+    parser.set_language(lang.grammar()).ok()?;
     let started = Instant::now();
     let mut over_budget = |_: &tree_sitter::ParseState| {
         if started.elapsed() > budget {
@@ -264,7 +164,7 @@ impl Parsed {
         let start = text.offset(lines.start);
         let end = text.offset(lines.end);
         let mut roles = vec![PLAIN; end - start];
-        if let Some(compiled) = compiled(self.lang) {
+        if let Some(compiled) = self.lang.compiled() {
             paint(compiled, &self.tree, text.bytes(), start..end, &mut roles);
         }
         let mut spans = Spans {
@@ -386,122 +286,7 @@ fn collect_leaves(tree: &Tree, range: Range<usize>, out: &mut Vec<(u32, u32)>) {
     }
 }
 
-#[expect(
-    clippy::expect_used,
-    reason = "a Parsed comes only from parse, which refuses sources over MAX_HIGHLIGHT_BYTES (512 KiB), and spans requires that same text, so offsets and run counts stay far below 2^32"
-)]
-fn len_u32(n: usize) -> u32 {
-    u32::try_from(n).expect("highlighted text is under MAX_HIGHLIGHT_BYTES")
-}
-
-fn content_len(line: &[u8]) -> usize {
-    let line = line.strip_suffix(b"\n").unwrap_or(line);
-    line.strip_suffix(b"\r").unwrap_or(line).len()
-}
-
-/// Syntax runs and leaf tokens for a range of lines of one side.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub struct Spans {
-    first: usize,
-    /// For each line, the index of its first run, plus a final entry.
-    line_runs: Vec<u32>,
-    runs: Vec<Run>,
-    /// Leaf nodes as byte ranges of the whole text, in order, clipped to
-    /// the lines.
-    leaves: Vec<(u32, u32)>,
-}
-
 impl Spans {
-    /// The lines covered.
-    #[must_use]
-    pub fn lines(&self) -> Range<usize> {
-        self.first..self.first + self.line_runs.len().saturating_sub(1)
-    }
-
-    /// The runs of line `i`; none outside [`Spans::lines`].
-    #[must_use]
-    pub fn line(&self, i: usize) -> &[Run] {
-        if !self.lines().contains(&i) {
-            return &[];
-        }
-        let k = i - self.first;
-        &self.runs[self.line_runs[k] as usize..self.line_runs[k + 1] as usize]
-    }
-
-    /// The spans of `lines`, which must lie within [`Spans::lines`].
-    #[must_use]
-    pub fn slice(&self, text: &Text, lines: Range<usize>) -> Self {
-        let k = lines.start - self.first..lines.end - self.first;
-        let first_run = self.line_runs[k.start];
-        let (start, end) = (
-            len_u32(text.offset(lines.start)),
-            len_u32(text.offset(lines.end)),
-        );
-        let from = self.leaves.partition_point(|&(_, e)| e <= start);
-        let to = self.leaves.partition_point(|&(s, _)| s < end);
-        Self {
-            first: lines.start,
-            line_runs: self.line_runs[k.start..=k.end]
-                .iter()
-                .map(|&r| r - first_run)
-                .collect(),
-            runs: self.runs[first_run as usize..self.line_runs[k.end] as usize].to_vec(),
-            leaves: self.leaves[from..to]
-                .iter()
-                .map(|&(s, e)| (s.max(start), e.min(end)))
-                .collect(),
-        }
-    }
-
-    /// Token boundaries for intra-line emphasis on line `i` of `text`
-    /// (without its terminator): each leaf node is a token, except that
-    /// leaves holding whitespace (strings, comments) and the gaps between
-    /// leaves are split further by [`tokenize`]. Lines outside
-    /// [`Spans::lines`] are tokenized plainly.
-    #[must_use]
-    pub fn tokens(&self, text: &Text, i: usize) -> Vec<Range<usize>> {
-        let line = text.line(i);
-        let content = &line[..content_len(line)];
-        if !self.lines().contains(&i) {
-            return tokenize(content);
-        }
-        let start = text.offset(i);
-        let end = start + content.len();
-        let mut out = Vec::new();
-        let mut pos = 0;
-        let split = |out: &mut Vec<Range<usize>>, from: usize, to: usize| {
-            out.extend(
-                tokenize(&content[from..to])
-                    .into_iter()
-                    .map(|r| r.start + from..r.end + from),
-            );
-        };
-        let first = self.leaves.partition_point(|&(_, e)| e as usize <= start);
-        for &(s, e) in &self.leaves[first..] {
-            let (s, e) = (s as usize, e as usize);
-            if s >= end {
-                break;
-            }
-            let (from, to) = (s.max(start) - start, e.min(end) - start);
-            if from >= to || from < pos {
-                continue;
-            }
-            if from > pos {
-                split(&mut out, pos, from);
-            }
-            if content[from..to].iter().any(u8::is_ascii_whitespace) {
-                split(&mut out, from, to);
-            } else {
-                out.push(from..to);
-            }
-            pos = to;
-        }
-        if pos < content.len() {
-            split(&mut out, pos, content.len());
-        }
-        out
-    }
-
     /// A compact binary form for the disk cache.
     #[must_use]
     pub fn encode(&self) -> Vec<u8> {
@@ -569,6 +354,19 @@ impl Spans {
     }
 }
 
+/// One side of a file to highlight.
+#[derive(Debug, Clone, Copy)]
+pub struct Source<'a> {
+    /// Repository-relative, for the language.
+    pub path: &'a [u8],
+    /// The side's content.
+    pub text: &'a Text,
+    /// The blob id results are cached under: only for content read from
+    /// the object database, as a working-tree file may have changed since
+    /// its id was computed.
+    pub id: Option<ObjectId>,
+}
+
 /// One side of a file, ready to give the spans of any of its lines: either
 /// its syntax tree, or its whole-file spans from the disk cache (or just
 /// computed to go there).
@@ -590,7 +388,7 @@ impl Highlighter {
     /// can't be highlighted (see [`parse`]).
     #[must_use]
     pub fn prepare(
-        lang: Language,
+        lang: &Language,
         text: &Text,
         id: Option<ObjectId>,
         cache: Option<&Cache>,
@@ -622,6 +420,24 @@ impl Highlighter {
         }
     }
 
+    /// [`Highlighter::prepare`] for `side`, in the language `grammars`
+    /// detects for it. `None` when it has no language or no lines, or
+    /// can't be highlighted.
+    #[must_use]
+    pub fn for_side(
+        grammars: &Registry,
+        side: Source,
+        cache: Option<&Cache>,
+        store: bool,
+    ) -> Option<Self> {
+        let bytes = side.text.bytes();
+        let lang = grammars.detect(side.path, &bytes[..bytes.len().min(256)])?;
+        if side.text.is_empty() {
+            return None;
+        }
+        Self::prepare(lang, side.text, side.id, cache, store)
+    }
+
     /// The spans of `lines` of `text`, the side this was prepared from.
     #[must_use]
     pub fn spans(&self, text: &Text, lines: Range<usize>) -> Spans {
@@ -632,28 +448,112 @@ impl Highlighter {
     }
 }
 
-/// The version of what cached spans mean: bump it when
-/// [`Syntax::from_capture`] maps names differently or [`Spans`] change
-/// shape. Renumbering [`Syntax`] changes the key by itself.
+/// The version of what cached spans mean: bump it when [`role`] maps
+/// names differently or [`Spans`] change shape. Renumbering [`Syntax`]
+/// changes the key by itself.
 const SPANS_VERSION: u8 = 1;
 
-/// What a cached whole-file highlight depends on: the content, the language
-/// and its query (which changes with the grammar version), and how
-/// captures become [`Syntax`] roles.
-fn cache_key(lang: Language, id: ObjectId) -> Vec<u8> {
-    let mut key = Vec::with_capacity(64);
+/// What a cached whole-file highlight depends on: the content, the
+/// language's [`Language::identity`], and how captures become [`Syntax`]
+/// roles.
+fn cache_key(lang: &Language, id: ObjectId) -> Vec<u8> {
+    let mut key = Vec::with_capacity(160);
     key.push(SPANS_VERSION);
     for syntax in Syntax::ALL {
         key.extend_from_slice(syntax.key().as_bytes());
         key.push(0);
     }
-    key.extend_from_slice(lang.name().as_bytes());
-    key.push(0);
+    key.extend_from_slice(lang.identity().as_bytes());
     key.extend_from_slice(id.as_bytes());
-    for part in lang.highlights() {
-        key.extend_from_slice(cache::digest(part.as_bytes()).as_bytes());
-    }
     key
+}
+
+/// The two sides of a file, prepared for highlighting where its language
+/// is known and each side is small enough.
+pub struct FileSyntax {
+    old: Option<Highlighter>,
+    new: Option<Highlighter>,
+}
+
+impl FileSyntax {
+    /// Prepares both sides of a file, each in the language `grammars`
+    /// detects for it, on two threads when both are at least
+    /// [`PARALLEL_PARSE_BYTES`]. With `store`, large sides' spans go to
+    /// `cache` (see [`Highlighter::prepare`]).
+    #[must_use]
+    pub fn new(
+        grammars: &Registry,
+        [old, new]: [Source; 2],
+        cache: Option<&Cache>,
+        store: bool,
+    ) -> Self {
+        let parallel = old.text.bytes().len().min(new.text.bytes().len()) >= PARALLEL_PARSE_BYTES;
+        let old = || Highlighter::for_side(grammars, old, cache, store);
+        let new = || Highlighter::for_side(grammars, new, cache, store);
+        let (old, new) = if parallel {
+            std::thread::scope(|s| {
+                let spawned = std::thread::Builder::new().spawn_scoped(s, old);
+                let new = new();
+                let old = match spawned {
+                    Ok(spawned) => spawned
+                        .join()
+                        .unwrap_or_else(|e| std::panic::resume_unwind(e)),
+                    // Out of threads: parse here, as `Scope::spawn` would panic.
+                    Err(_) => old(),
+                };
+                (old, new)
+            })
+        } else {
+            (old(), new())
+        };
+        Self { old, new }
+    }
+
+    /// Neither side is highlighted.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.old.is_none() && self.new.is_none()
+    }
+
+    /// The spans of `lines` of the `new` side, if it's highlighted.
+    #[must_use]
+    pub fn new_spans(&self, new: &Text, lines: Range<usize>) -> Option<Spans> {
+        self.new.as_ref().map(|h| h.spans(new, lines))
+    }
+
+    /// The spans of the lines `hunk` shows on each side of `old` and
+    /// `new`, the texts this was prepared from.
+    #[must_use]
+    pub fn hunk(&self, old: &Text, new: &Text, hunk: &Hunk) -> HunkSyntax {
+        HunkSyntax {
+            old: self
+                .old
+                .as_ref()
+                .map(|h| h.spans(old, hunk.old_start..hunk.old_start + hunk.old_len)),
+            new: self
+                .new
+                .as_ref()
+                .map(|h| h.spans(new, hunk.new_start..hunk.new_start + hunk.new_len)),
+        }
+    }
+}
+
+/// Syntax spans of the lines one hunk shows, per side.
+#[derive(Debug, Default, Clone)]
+pub struct HunkSyntax {
+    /// The old side's, if it's highlighted.
+    pub old: Option<Spans>,
+    /// The new side's, if it's highlighted.
+    pub new: Option<Spans>,
+}
+
+impl HunkSyntax {
+    /// The intra-line emphasis of `hunk` of `old` and `new`, with tokens
+    /// from the spans.
+    #[must_use]
+    pub fn emphasis(&self, old: &Text, new: &Text, hunk: &Hunk) -> Vec<Emphasis> {
+        emphasize_with(old, new, hunk, self.old.as_ref(), self.new.as_ref())
+    }
 }
 
 #[cfg(test)]

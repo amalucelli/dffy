@@ -23,6 +23,7 @@ use std::time::{Duration, Instant};
 use dffy_core::bstr::BString;
 use dffy_core::diff::Whitespace;
 use dffy_core::git::{FileChange, FileDiff, Revisions, Status, Update};
+use dffy_core::view::Attributes;
 use dffy_core::watch::Notice;
 use unicode_width::UnicodeWidthStr;
 
@@ -43,7 +44,7 @@ use crate::daemon::client;
 use crate::keys::{Action as Act, Keys};
 use crate::plugin::{self, Program, Renderers};
 use crate::print;
-use crate::render::{Attributes, Layout, escape, thousands};
+use crate::render::{Layout, escape, thousands};
 use crate::term::{self, Input, Key, Mods, Screen};
 use crate::theme::{self, Role, Style, Theme};
 
@@ -723,7 +724,7 @@ impl App {
                 match item {
                     piped::Item::Commit(commit) => {
                         let change = FileChange {
-                            path: commit.label(),
+                            path: commit.label().into(),
                             status: Status::Modified,
                             old: None,
                             new: None,
@@ -3267,7 +3268,7 @@ mod tests {
         );
         app.event(Event::Enumerated(diff("src/zz.rs").change));
         app.event(Event::EnumerationDone(None));
-        let loaded = Loaded::new(first, Whitespace::Exact, false);
+        let loaded = Loaded::new(first, Whitespace::Exact, None);
         app.event(Event::Diffed(Done::Diff {
             file: 0,
             version: app.version(0),
@@ -3340,7 +3341,7 @@ mod tests {
         app.event(Event::Diffed(Done::Diff {
             file,
             version,
-            result: Ok(Box::new(Loaded::new(added(60), Whitespace::Exact, false))),
+            result: Ok(Box::new(Loaded::new(added(60), Whitespace::Exact, None))),
         }));
         assert!(screen(&mut app).contains("line 60"));
         app.event(Event::Diffed(Done::Emphasis {
@@ -3412,7 +3413,7 @@ mod tests {
             Done::Diff {
                 file,
                 version: app.version(file),
-                result: Ok(Box::new(Loaded::new(fd, Whitespace::Exact, false))),
+                result: Ok(Box::new(Loaded::new(fd, Whitespace::Exact, None))),
             }
         };
         for file in [0, 1] {
@@ -4138,7 +4139,7 @@ mod tests {
             app.event(Event::Diffed(Done::Diff {
                 file: i,
                 version,
-                result: Ok(Box::new(Loaded::new(fd, Whitespace::Exact, false))),
+                result: Ok(Box::new(Loaded::new(fd, Whitespace::Exact, None))),
             }));
         }
         app
@@ -4295,7 +4296,7 @@ mod tests {
             app.event(Event::Diffed(Done::Diff {
                 file,
                 version,
-                result: Ok(Box::new(Loaded::new(fd, Whitespace::Exact, false))),
+                result: Ok(Box::new(Loaded::new(fd, Whitespace::Exact, None))),
             }));
         }
         app.draw();
@@ -4684,7 +4685,7 @@ mod tests {
         app.event(Event::Diffed(Done::Diff {
             file: 0,
             version: app.version(0),
-            result: Ok(Box::new(Loaded::new(first, Whitespace::Exact, false))),
+            result: Ok(Box::new(Loaded::new(first, Whitespace::Exact, None))),
         }));
         // Split, a row shows its line on both halves; unified, once.
         let halves = |app: &mut App| {
@@ -4830,7 +4831,7 @@ mod tests {
         key(&mut app, 'n');
         assert_eq!((app.doc.pos.file, app.doc.pos.part), (1, 0));
         assert!(screen(&mut app).contains("waiting for this file's diff"));
-        let loaded = Loaded::new(diff("src/zz.rs"), Whitespace::Exact, false);
+        let loaded = Loaded::new(diff("src/zz.rs"), Whitespace::Exact, None);
         app.event(Event::Diffed(Done::Diff {
             file: 1,
             version: app.version(1),
@@ -4881,7 +4882,7 @@ mod tests {
                 app.event(Event::Diffed(Done::Diff {
                     file: 1,
                     version: app.version(1),
-                    result: Ok(Box::new(Loaded::new(late(), Whitespace::Exact, false))),
+                    result: Ok(Box::new(Loaded::new(late(), Whitespace::Exact, None))),
                 }));
             };
             if diff_first {
@@ -5161,14 +5162,16 @@ mod tests {
             (100, 20),
             Indicators::Classic,
         );
-        app.event(Event::Piped(piped::Item::Commit(Arc::new(piped::Commit {
-            id: Some("0123abc".repeat(5) + "01234"),
-            subject: "Change two files".to_owned(),
-            lines: vec![(
-                crate::pager::parse::TextKind::CommitMessage,
-                "    Change two files".into(),
-            )],
-        }))));
+        app.event(Event::Piped(piped::Item::Commit(Arc::new(
+            dffy_core::patch::Commit {
+                id: Some("0123abc".repeat(5) + "01234"),
+                subject: "Change two files".to_owned(),
+                lines: vec![(
+                    dffy_core::patch::TextKind::CommitMessage,
+                    "    Change two files".into(),
+                )],
+            },
+        ))));
         for path in ["a.rs", "b.rs"] {
             app.event(Event::Enumerated(diff(path).change));
         }
@@ -5507,7 +5510,7 @@ mod tests {
             },
         ];
         let diff = Arc::clone(app.doc.diff_of(0).expect("diffed"));
-        let rendered = view::rendered::build(Arc::clone(&diff), sides, 3, 60);
+        let rendered = view::rendered::build(Arc::clone(&diff), sides, crate::grammars(), 3, 60);
         assert_eq!((rendered.added, rendered.removed), (1, 3));
         app.event(Event::Diffed(Done::Rendered {
             file: 0,
@@ -5631,7 +5634,7 @@ mod tests {
                 app.event(Event::Diffed(Done::Structural {
                     file,
                     version,
-                    result: print::structural_diff(&diff, None),
+                    result: print::structural_diff(crate::grammars(), &diff, None),
                     diff,
                 }));
             }

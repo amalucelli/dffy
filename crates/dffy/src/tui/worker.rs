@@ -18,15 +18,16 @@ use dffy_core::bstr::BString;
 use dffy_core::cache::Cache;
 use dffy_core::diff::{Emphasis, Options, emphasize};
 use dffy_core::git::{ChangeSet, FileChange, FileDiff, Repo, Revisions};
-use dffy_core::highlight::Spans;
+use dffy_core::highlight::{FileSyntax, HunkSyntax, Registry};
 use dffy_core::structural::{Structural, Unavailable};
+use dffy_core::view::Spans;
 use dffy_core::watch::MAX_BATCH;
 
 use super::Event;
 use super::piped::PipedFile;
 use super::view::{self, Counts, Loaded, Matches, Needle, SyntaxSlot};
 use crate::plugin::{self, Program};
-use crate::print::{self, FileSyntax, HunkSyntax};
+use crate::print;
 
 /// What to bring the file list up to date with.
 pub(crate) enum Request {
@@ -383,6 +384,8 @@ pub(crate) struct Settings {
     pub options: Options,
     /// Files get syntax slots only with this set.
     pub highlight: bool,
+    /// What highlighting and the syntax diff detect languages with.
+    pub grammars: &'static Registry,
     pub cache: Option<Cache>,
 }
 
@@ -497,7 +500,10 @@ fn diff(
             .map_err(|e| format!("reading the diff back failed: {e}")),
         (None, Some(repo)) => repo
             .file_diff(change, options)
-            .map(|fd| Box::new(Loaded::new(fd, options.whitespace, settings.highlight)))
+            .map(|fd| {
+                let highlight = settings.highlight.then_some(settings.grammars);
+                Box::new(Loaded::new(fd, options.whitespace, highlight))
+            })
             .map_err(|e| e.to_string()),
         (None, None) => Err("there's no repository to diff this file in".to_owned()),
     }
@@ -555,14 +561,21 @@ fn hunk_emphasis(
 ) -> (Vec<Emphasis>, Option<HunkSyntax>) {
     let core = &diff.hunks[hunk];
     let syntax = slot
-        .map(|slot| slot.get_or_init(|| FileSyntax::new(diff, settings.cache.as_ref(), true)))
+        .map(|slot| slot.get_or_init(|| file_syntax(diff, settings)))
         .filter(|s| !s.is_empty())
-        .map(|s| s.hunk(diff, core));
+        .map(|s| s.hunk(&diff.old, &diff.new, core));
     let emphasis = match &syntax {
-        Some(spans) => spans.emphasis(diff, core),
+        Some(spans) => spans.emphasis(&diff.old, &diff.new, core),
         None => emphasize(&diff.old, &diff.new, core),
     };
     (emphasis, syntax)
+}
+
+/// `diff`'s sides prepared for highlighting, their large sides' spans
+/// stored in the disk cache.
+fn file_syntax(diff: &FileDiff, settings: &Settings) -> FileSyntax {
+    let sources = print::sources(diff);
+    FileSyntax::new(settings.grammars, sources, settings.cache.as_ref(), true)
 }
 
 fn run(job: Job, repo: Option<&Repo>, settings: &Settings) -> Done {
@@ -638,7 +651,7 @@ fn run(job: Job, repo: Option<&Repo>, settings: &Settings) -> Done {
         } => Done::Structural {
             file,
             version,
-            result: print::structural_diff(&diff, settings.cache.as_ref()),
+            result: print::structural_diff(settings.grammars, &diff, settings.cache.as_ref()),
             diff,
         },
         Job::GapSyntax {
@@ -653,8 +666,8 @@ fn run(job: Job, repo: Option<&Repo>, settings: &Settings) -> Done {
             version,
             gap,
             spans: syntax
-                .get_or_init(|| FileSyntax::new(&diff, settings.cache.as_ref(), true))
-                .new_spans(&diff, lines),
+                .get_or_init(|| file_syntax(&diff, settings))
+                .new_spans(&diff.new, lines),
             diff,
         },
         Job::Render(job) => Done::Rendered {
@@ -704,6 +717,7 @@ fn render(job: &RenderJob, settings: &Settings) -> Result<Box<Loaded>, Option<St
         Ok(sides) => Ok(Box::new(view::rendered::build(
             Arc::clone(diff),
             sides,
+            settings.grammars,
             settings.options.context,
             *width,
         ))),
@@ -760,6 +774,7 @@ mod tests {
         let settings = Settings {
             options: Options::default(),
             highlight: false,
+            grammars: crate::grammars(),
             cache: None,
         };
         let pool = Pool::new(None, &settings, &tx).expect("pool");

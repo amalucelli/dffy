@@ -8,7 +8,7 @@ use std::ops::Range;
 use rustc_hash::FxHashMap;
 
 use super::{Hunk, LineKind, MAX_INTRALINE_LINE_BYTES, Text, myers};
-use crate::highlight::Spans;
+use crate::view::{Kind, Spans};
 
 /// How far ahead in the added lines a removed line looks for a partner. Lets
 /// pairing recover from an inserted or deleted line without going quadratic
@@ -115,32 +115,77 @@ pub(crate) fn paired_emphasis(
         }
     }
     let lines = &hunk.lines;
-    let mut out = vec![(Vec::new(), false); lines.len()];
+    pair_blocks(
+        lines.len(),
+        |i| Some(lines[i].kind),
+        |i| lines[i].block_start,
+        |i| tokens(old, old_spans, lines[i].old),
+        |i| tokens(new, new_spans, lines[i].new),
+    )
+}
+
+/// [`pair`] for a hunk held as its lines rather than as two [`Text`]s, such
+/// as one read from a patch: `line(i)` gives each of the `len` lines' kind
+/// and its text without the sign (a terminator may stay). Returns each
+/// line's emphasis and whether it was paired. A no-newline marker among a
+/// change block's lines is skipped, as if it weren't there.
+pub fn pair_lines<'a>(
+    len: usize,
+    line: impl Fn(usize) -> (Kind, &'a [u8]),
+) -> Vec<(Emphasis, bool)> {
+    pair_blocks(
+        len,
+        |i| match line(i).0 {
+            Kind::Context => Some(LineKind::Context),
+            Kind::Removed => Some(LineKind::Removed),
+            Kind::Added => Some(LineKind::Added),
+            Kind::NoNewline => None,
+        },
+        |_| false,
+        |i| Tokens::plain(line(i).1),
+        |i| Tokens::plain(line(i).1),
+    )
+}
+
+/// Emphasis and pairing for `len` hunk lines, block by block. A change
+/// block is removed lines, then added lines, up to context or a line that
+/// `block_start`s the next block. `kind` is `None` for a line of neither
+/// side (a no-newline marker), which a block takes in and pairing skips.
+fn pair_blocks<'a>(
+    len: usize,
+    kind: impl Fn(usize) -> Option<LineKind>,
+    block_start: impl Fn(usize) -> bool,
+    old_line: impl Fn(usize) -> Tokens<'a>,
+    new_line: impl Fn(usize) -> Tokens<'a>,
+) -> Vec<(Emphasis, bool)> {
+    let mut out = vec![(Vec::new(), false); len];
     let mut i = 0;
-    while i < lines.len() {
-        if lines[i].kind == LineKind::Context {
+    while i < len {
+        if kind(i) == Some(LineKind::Context) {
             i += 1;
             continue;
         }
-        // A change block: removed lines, then added lines, up to context or
-        // a line that starts the next block.
         let start = i;
-        let continues = |i: usize| i == start || !lines[i].block_start;
-        while i < lines.len() && lines[i].kind == LineKind::Removed && continues(i) {
+        let continues = |i: usize| i == start || !block_start(i);
+        while i < len && matches!(kind(i), Some(LineKind::Removed) | None) && continues(i) {
             i += 1;
         }
         let plus = i;
-        while i < lines.len() && lines[i].kind == LineKind::Added && continues(i) {
+        while i < len && matches!(kind(i), Some(LineKind::Added) | None) && continues(i) {
             i += 1;
         }
+        if plus == start || i == plus {
+            continue;
+        }
         pair_block(
-            plus - start,
-            i - plus,
-            |k| tokens(old, old_spans, lines[start + k].old),
-            |k| tokens(new, new_spans, lines[plus + k].new),
+            start..plus,
+            plus..i,
+            |k| kind(k).is_some(),
+            &old_line,
+            &new_line,
             |a, b, old_emph, new_emph| {
-                out[start + a] = (old_emph, true);
-                out[plus + b] = (new_emph, true);
+                out[a] = (old_emph, true);
+                out[b] = (new_emph, true);
             },
         );
     }
@@ -148,21 +193,24 @@ pub(crate) fn paired_emphasis(
 }
 
 /// Emphasis for a change block given as its removed and added lines, for
-/// callers that hold lines rather than a [`Text`] (a parsed patch). Lines may
-/// keep their terminators. Calls `set(i, j, removed_emphasis, added_emphasis)`
-/// for each paired removed line `i` and added line `j`; unpaired lines get no
+/// callers that hold lines rather than a [`Text`]. Lines may keep their
+/// terminators. Calls `set(i, j, removed_emphasis, added_emphasis)` for each
+/// paired removed line `i` and added line `j`; unpaired lines get no
 /// emphasis. Pairing is the same as for [`super::hunks`].
 pub fn emphasize_lines(
     removed: &[&[u8]],
     added: &[&[u8]],
-    set: impl FnMut(usize, usize, Emphasis, Emphasis),
+    mut set: impl FnMut(usize, usize, Emphasis, Emphasis),
 ) {
+    // One index space for both: removed lines first, then added ones.
+    let r = removed.len();
     pair_block(
-        removed.len(),
-        added.len(),
+        0..r,
+        r..r + added.len(),
+        |_| true,
         |i| Tokens::plain(removed[i]),
-        |j| Tokens::plain(added[j]),
-        set,
+        |j| Tokens::plain(added[j - r]),
+        |i, j, old_emph, new_emph| set(i, j - r, old_emph, new_emph),
     );
 }
 
@@ -203,22 +251,29 @@ impl<'a> Tokens<'a> {
     }
 }
 
+/// Pairs the removed lines `removed` with the added lines `added`, both
+/// hunk line indices; indices that aren't `is_line` (markers) are skipped.
+/// Calls `set(i, j, removed_emphasis, added_emphasis)` for each pair.
 fn pair_block<'a>(
-    removed: usize,
-    added: usize,
+    removed: Range<usize>,
+    added: Range<usize>,
+    is_line: impl Fn(usize) -> bool,
     old_line: impl Fn(usize) -> Tokens<'a>,
     new_line: impl Fn(usize) -> Tokens<'a>,
     mut set: impl FnMut(usize, usize, Emphasis, Emphasis),
 ) {
-    let mut next_plus = 0;
+    let mut next_plus = added.start;
     // An added line is tried against up to PAIR_WINDOW removed lines, so
     // its tokens are kept once made.
-    let mut news: Vec<Option<Tokens>> = std::iter::repeat_with(|| None).take(added).collect();
+    let mut news: Vec<Option<Tokens>> = std::iter::repeat_with(|| None).take(added.len()).collect();
     let mut ids = FxHashMap::default();
-    for i in 0..removed {
+    for i in removed.filter(|&i| is_line(i)) {
         let old = old_line(i);
-        for j in (next_plus..added).take(PAIR_WINDOW) {
-            let new = news[j].get_or_insert_with(|| new_line(j));
+        for j in (next_plus..added.end)
+            .filter(|&j| is_line(j))
+            .take(PAIR_WINDOW)
+        {
+            let new = news[j - added.start].get_or_insert_with(|| new_line(j));
             if let Some((old_emph, new_emph)) = emphasize_pair(&old, new, &mut ids) {
                 set(i, j, old_emph, new_emph);
                 next_plus = j + 1;

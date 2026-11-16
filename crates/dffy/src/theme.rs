@@ -15,10 +15,10 @@
 use std::fmt::Write as _;
 use std::path::PathBuf;
 
-use dffy_core::highlight::Syntax;
+use dffy_core::view::{Attributes, Syntax};
 
 use crate::config::{self, Indicators, Warning};
-use crate::render::{Attributes, Canvas};
+use crate::render::Canvas;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum Role {

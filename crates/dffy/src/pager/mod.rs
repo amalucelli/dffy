@@ -3,19 +3,17 @@
 //! by the longest hunk part kept for pairing, not by the input.
 
 pub(crate) mod color_only;
-pub(crate) mod parse;
 pub(crate) mod stdin;
 
 use std::io::{self, BufRead, BufReader, Read};
 use std::ops::Range;
 
-use dffy_core::diff::{Emphasis, Unchanged, emphasize_lines};
+use dffy_core::diff::{Unchanged, pair_lines};
+use dffy_core::patch::{self, CombinedKind, Event, FileInfo, Parser, TextKind, strip_ansi};
+use dffy_core::view::{FileHeader, FileStatus, HunkHeader, Kind, Line, LineState, display_text};
 
-use crate::render::{
-    Canvas, DiffLine, FileHeader, FileStatus, HunkHeader, Kind, Layout, LineState, display_text,
-};
+use crate::render::{Canvas, Layout};
 use crate::theme::Role;
-use parse::{Event, FileInfo, Parser, TextKind};
 
 /// Calls `line` with each line of `input`, without its newline and with
 /// escape sequences removed, and `blocked` before a read that may wait.
@@ -37,7 +35,7 @@ pub(crate) fn for_each_line<E: From<io::Error>>(
         }
         let text = raw.strip_suffix(b"\n").unwrap_or(&raw);
         let text = if text.contains(&0x1b) {
-            parse::strip_ansi(text, &mut clean);
+            strip_ansi(text, &mut clean);
             &clean[..]
         } else {
             text
@@ -98,62 +96,15 @@ pub(crate) fn text_role(kind: TextKind) -> Role {
     }
 }
 
-/// The color of a combined diff's line, by its prefix columns (`parents`
-/// of them, 0 before the first `@@@`).
-pub(crate) fn combined_role(parents: usize, line: &[u8]) -> Role {
-    if line.starts_with(b"@@@") {
-        Role::HunkHeader
-    } else if parents == 0 {
-        Role::Dim
-    } else {
-        let prefix = &line[..parents.min(line.len())];
-        if prefix.contains(&b'-') {
-            Role::Removed
-        } else if prefix.contains(&b'+') {
-            Role::Added
-        } else {
-            Role::Context
-        }
+/// The color of a combined diff's line.
+pub(crate) fn combined_role(kind: CombinedKind) -> Role {
+    match kind {
+        CombinedKind::Header => Role::Dim,
+        CombinedKind::HunkHeader => Role::HunkHeader,
+        CombinedKind::Removed => Role::Removed,
+        CombinedKind::Added => Role::Added,
+        CombinedKind::Context => Role::Context,
     }
-}
-
-/// Intra-line emphasis for `len` hunk lines, `line(i)` giving each one's
-/// kind and text without its prefix, and whether each line was paired:
-/// removed lines pair with the added lines right after them, within each
-/// change block.
-pub(crate) fn emphasis<'a>(
-    len: usize,
-    line: impl Fn(usize) -> (Kind, &'a [u8]),
-) -> Vec<(Emphasis, bool)> {
-    let mut out = vec![(Vec::new(), false); len];
-    let mut i = 0;
-    while i < len {
-        if line(i).0 == Kind::Context {
-            i += 1;
-            continue;
-        }
-        let mut removed = Vec::new();
-        let mut added = Vec::new();
-        while i < len && line(i).0 != Kind::Context {
-            match line(i).0 {
-                Kind::Removed if added.is_empty() => removed.push(i),
-                Kind::Removed => break,
-                Kind::Added => added.push(i),
-                Kind::Context | Kind::NoNewline => {}
-            }
-            i += 1;
-        }
-        if removed.is_empty() || added.is_empty() {
-            continue;
-        }
-        let old: Vec<&[u8]> = removed.iter().map(|&k| line(k).1).collect();
-        let new: Vec<&[u8]> = added.iter().map(|&k| line(k).1).collect();
-        emphasize_lines(&old, &new, |a, b, old_emph, new_emph| {
-            out[removed[a]] = (old_emph, true);
-            out[added[b]] = (new_emph, true);
-        });
-    }
-    out
 }
 
 struct Renderer<F> {
@@ -207,7 +158,7 @@ impl<F: FnMut(Sink) -> io::Result<()>> Renderer<F> {
             }
             Event::Combined { parents, line } => {
                 self.layout.text_line(
-                    combined_role(parents, line),
+                    combined_role(patch::combined_kind(parents, line)),
                     display_text(line),
                     &mut self.canvas,
                 );
@@ -262,14 +213,14 @@ impl<F: FnMut(Sink) -> io::Result<()>> Renderer<F> {
             heading: &h.heading,
             hidden: h.hidden,
         };
-        let emphasis = emphasis(end, |i| {
+        let emphasis = pair_lines(end, |i| {
             let l = &h.lines[i];
             (l.kind, &h.text[l.range.clone()])
         });
-        let lines: Vec<DiffLine> = h.lines[..end]
+        let lines: Vec<Line> = h.lines[..end]
             .iter()
             .zip(&emphasis)
-            .map(|(l, (emphasis, paired))| DiffLine {
+            .map(|(l, (emphasis, paired))| Line {
                 state: LineState::new(l.kind, *paired, Unchanged::No),
                 old: l.old,
                 new: l.new,
@@ -324,7 +275,7 @@ struct HunkBuf {
 }
 
 impl HunkBuf {
-    fn start(&mut self, h: parse::Hunk, hidden: usize) {
+    fn start(&mut self, h: patch::Hunk, hidden: usize) {
         self.active = true;
         self.hidden = hidden;
         self.old_start = h.old_start;

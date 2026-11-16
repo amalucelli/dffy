@@ -26,6 +26,7 @@ pub use spec::{DiffSpec, Revisions};
 pub(crate) use status::excludes_file;
 
 use crate::diff::{self, Hunk, Options, Text};
+use crate::view::Staging;
 
 /// Files at or above this size are not diffed and get a one-line summary,
 /// like binaries. The largest file in the Linux tree is 24 MB.
@@ -233,19 +234,6 @@ pub enum Status {
         /// 0 to 100.
         similarity: u8,
     },
-}
-
-/// Where an uncommitted change sits, as `git status` splits it: `HEAD` to
-/// the index is staged, the index to the working tree unstaged.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum Staging {
-    /// The index differs from `HEAD` and the working tree matches the index.
-    Staged,
-    /// The index matches `HEAD` and the working tree differs; untracked
-    /// files too.
-    Unstaged,
-    /// Both differ: committing now would leave part of the change behind.
-    Partly,
 }
 
 /// One changed path.

@@ -8,11 +8,11 @@
 
 use std::ops::Range;
 
+use dffy_core::view::Attributes;
 use unicode_width::UnicodeWidthStr;
 
 use super::fuzzy;
 use crate::keys::{Action, Chord, Group, Keys};
-use crate::render::Attributes;
 use crate::term::{Grid, Key, Mods};
 use crate::theme::{Role, Style, Theme};
 

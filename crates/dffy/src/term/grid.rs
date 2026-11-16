@@ -5,9 +5,9 @@
 use std::fmt::Write as _;
 use std::io::Write as _;
 
+use dffy_core::view::Attributes;
 use unicode_width::UnicodeWidthChar;
 
-use crate::render::Attributes;
 use crate::theme::{ATTRIBUTES, Style};
 
 /// UTF-8 bytes a cell holds: a character plus a few combining marks.

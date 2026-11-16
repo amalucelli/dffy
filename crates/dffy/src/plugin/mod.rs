@@ -26,9 +26,8 @@ use std::time::{Duration, Instant, UNIX_EPOCH};
 use rustix::process::{Pid, WaitId, WaitIdOptions};
 
 use dffy_core::cache::{self, Cache};
-use dffy_core::highlight::Syntax;
+use dffy_core::view::{Attributes, Paint, Syntax};
 
-use crate::render::{Attributes, Paint};
 use json::Value;
 
 /// The protocol version: in every request and every answer. An answer of

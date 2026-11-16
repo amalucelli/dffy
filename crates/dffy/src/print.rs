@@ -9,24 +9,25 @@
 use std::ops::{ControlFlow, Range};
 use std::path::{Component, Path, PathBuf};
 
-use dffy_core::bstr::{BStr, BString, ByteSlice};
+use dffy_core::bstr::{BString, ByteSlice};
 use dffy_core::cache::Cache;
-use dffy_core::diff::{Hunk, Line, LineKind, Options, Text, Whitespace, emphasize_with};
+use dffy_core::diff::{self, Hunk, LineKind, Options, Text, Whitespace, emphasize_with};
 use dffy_core::git::{
-    CommitInfo, DiffSpec, FileChange, FileDiff, Mode, Repo, Revisions, Side, Staging, Status,
+    CommitInfo, DiffSpec, FileChange, FileDiff, Mode, Repo, Revisions, Side, Status,
 };
-use dffy_core::highlight::{Highlighter, Language, Spans};
+use dffy_core::highlight::{Highlighter, HunkSyntax, PARALLEL_PARSE_BYTES, Registry, Source};
+use dffy_core::patch::TextKind;
 use dffy_core::structural::{self, Structural, Unavailable};
+use dffy_core::view::{
+    self, Arrangement, FileHeader, FileStatus, Heading, HunkHeader, Line, LineState, Row, Staging,
+    display_text, line_bytes, no_newline,
+};
 
 use crate::config::DefaultDiff;
 use crate::output::Output;
-use crate::pager::parse::TextKind;
 use crate::pager::text_role;
 use crate::render::stat::{self, StatEntry};
-use crate::render::{
-    Arrangement, Canvas, DiffLine, FileHeader, FileStatus, HunkHeader, HunkRow, LineState,
-    display_text, escape, hunk_rows, line_bytes, no_newline,
-};
+use crate::render::{Canvas, escape};
 use crate::theme::Role;
 use crate::{Ctx, Error};
 
@@ -386,6 +387,7 @@ struct Renderer<'a> {
     options: Options,
     highlight: bool,
     syntax_diff: bool,
+    grammars: &'a Registry,
     cache: Option<&'a Cache>,
     /// Threads the machine runs at once.
     cores: usize,
@@ -435,23 +437,25 @@ impl Renderer<'_> {
         }
         std::thread::scope(|s| {
             let pending = self.highlight.then(|| {
-                let change = &fd.change;
                 let shown = |range: fn(&Hunk) -> Range<usize>| -> Vec<_> {
                     fd.hunks.iter().map(range).collect()
                 };
+                // Built field by field, as the hunks are paired while the
+                // sides parse.
+                let change = &fd.change;
+                let old = Source {
+                    path: change.old_path().as_bytes(),
+                    text: &fd.old,
+                    id: cache_id(change.old),
+                };
+                let new = Source {
+                    path: change.path.as_bytes(),
+                    text: &fd.new,
+                    id: cache_id(change.new),
+                };
                 let both = [
-                    (
-                        change.old_path(),
-                        &fd.old,
-                        change.old,
-                        shown(|h| h.old_start..h.old_start + h.old_len),
-                    ),
-                    (
-                        change.path.as_bstr(),
-                        &fd.new,
-                        change.new,
-                        shown(|h| h.new_start..h.new_start + h.new_len),
-                    ),
+                    (old, shown(|h| h.old_start..h.old_start + h.old_len)),
+                    (new, shown(|h| h.new_start..h.new_start + h.new_len)),
                 ];
                 // Two threads for one file only while cores are free: when
                 // every core has a file, splitting each one only delays the
@@ -461,16 +465,16 @@ impl Renderer<'_> {
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 let parallel = (others + 1) * 2 <= self.cores
                     && fd.old.bytes().len().min(fd.new.bytes().len()) >= PARALLEL_PARSE_BYTES;
-                both.map(|(path, text, side, ranges)| {
+                both.map(|(side, ranges)| {
                     let (tx, rx) = std::sync::mpsc::sync_channel(1);
                     // Each side's spans go out as soon as they're computed,
                     // so freeing its syntax tree overlaps the layout.
                     let work = move || {
-                        let h = prepare_side(path, text, side, self.cache, false);
+                        let h = Highlighter::for_side(self.grammars, side, self.cache, false);
                         let spans = h.as_ref().map(|h| {
                             ranges
                                 .into_iter()
-                                .map(|r| h.spans(text, r))
+                                .map(|r| h.spans(side.text, r))
                                 .collect::<Vec<_>>()
                         });
                         tx.send(spans).ok();
@@ -485,7 +489,7 @@ impl Renderer<'_> {
             });
             let structural = self
                 .syntax_diff
-                .then(|| structural_diff(&fd, self.cache))
+                .then(|| structural_diff(self.grammars, &fd, self.cache))
                 .flatten();
             // A syntax diff pairs its lines itself. Pairing finds the
             // emphasis on the way, kept when no syntax tokens will replace
@@ -493,7 +497,7 @@ impl Renderer<'_> {
             let mut plain = Vec::new();
             if !matches!(structural, Some(Ok(_))) {
                 for hunk in &mut fd.hunks {
-                    let emphasis = dffy_core::diff::pair(&fd.old, &fd.new, hunk);
+                    let emphasis = diff::pair(&fd.old, &fd.new, hunk);
                     if pending.is_none() {
                         plain.push(emphasis);
                     }
@@ -523,7 +527,7 @@ impl Renderer<'_> {
         fd: &FileDiff,
         syntax: Option<Vec<HunkSyntax>>,
         structural: Option<Result<Structural, Unavailable>>,
-        plain: &mut [Vec<dffy_core::diff::Emphasis>],
+        plain: &mut [Vec<diff::Emphasis>],
         emit: &mut dyn FnMut(Vec<u8>) -> Result<(), Error>,
     ) -> Result<(), Error> {
         let (mut c, mut emitted) = (Canvas::default(), Ok(()));
@@ -635,6 +639,7 @@ impl Plan {
             options,
             highlight: ctx.highlight(),
             syntax_diff: ctx.config.syntax_diff,
+            grammars: crate::grammars(),
             cache: ctx.cache.as_ref(),
             cores: std::thread::available_parallelism().map_or(1, std::num::NonZero::get),
             parsing: std::sync::atomic::AtomicUsize::new(0),
@@ -987,11 +992,11 @@ pub(crate) fn hunk_header<'a>(hunk: &Hunk, heading: &'a [u8]) -> HunkHeader<'a> 
 /// [`LineState::of`], which a caller may have stored.
 pub(crate) fn diff_line<'a>(
     fd: &'a FileDiff,
-    line: &Line,
+    line: &diff::Line,
     state: LineState,
     emphasis: &'a [Range<usize>],
     syntax: Option<&'a HunkSyntax>,
-) -> DiffLine<'a> {
+) -> Line<'a> {
     let raw = line_bytes(&fd.old, &fd.new, line);
     // A dimmed or moved line drops its syntax colors, or they'd hide its
     // color.
@@ -1001,7 +1006,7 @@ pub(crate) fn diff_line<'a>(
             LineKind::Removed => s.old.as_ref().map(|o| o.line(line.old)),
             LineKind::Added | LineKind::Context => s.new.as_ref().map(|n| n.line(line.new)),
         });
-    DiffLine {
+    Line {
         state,
         old: (line.kind != LineKind::Added).then_some(line.old + 1),
         new: (line.kind != LineKind::Removed).then_some(line.new + 1),
@@ -1013,7 +1018,7 @@ pub(crate) fn diff_line<'a>(
     }
 }
 
-pub(crate) const NO_NEWLINE_LINE: DiffLine<'static> = DiffLine {
+pub(crate) const NO_NEWLINE_LINE: Line<'static> = Line {
     state: LineState::NoNewline,
     old: None,
     new: None,
@@ -1027,13 +1032,14 @@ pub(crate) const NO_NEWLINE_LINE: DiffLine<'static> = DiffLine {
 /// A file's syntax diff, through `cache` for large files: `None` for files
 /// with nothing to diff (binary, too large, only a mode change).
 pub(crate) fn structural_diff(
+    grammars: &Registry,
     fd: &FileDiff,
     cache: Option<&Cache>,
 ) -> Option<Result<Structural, Unavailable>> {
     let ids = [cache_id(fd.change.old), cache_id(fd.change.new)];
     (!fd.binary && !fd.too_large && !fd.hunks.is_empty()).then(|| {
         let path = fd.change.path.as_bytes();
-        structural::diff_cached(path, &fd.old, &fd.new, &fd.hunks, ids, cache)
+        structural::diff_cached(grammars, path, &fd.old, &fd.new, &fd.hunks, ids, cache)
     })
 }
 
@@ -1043,86 +1049,6 @@ pub(crate) fn structural_note(result: &Result<Structural, Unavailable>) -> Optio
         Ok(s) => s.note(),
         Err(e) => Some(e.note().to_owned()),
     }
-}
-
-/// Sides at least this large are parsed on two threads at once. Smaller
-/// ones parse in a few milliseconds, where a second thread gains little.
-const PARALLEL_PARSE_BYTES: usize = 32 << 10;
-
-/// The two sides of a file, prepared for highlighting where its language
-/// is known and each side is small enough.
-pub(crate) struct FileSyntax {
-    old: Option<Highlighter>,
-    new: Option<Highlighter>,
-}
-
-impl FileSyntax {
-    /// Prepares `fd`'s sides; with `store`, large sides' spans go to
-    /// `cache` (see [`Highlighter::prepare`]).
-    pub(crate) fn new(fd: &FileDiff, cache: Option<&Cache>, store: bool) -> Self {
-        let change = &fd.change;
-        let old = || prepare_side(change.old_path(), &fd.old, change.old, cache, store);
-        let new = || prepare_side(change.path.as_bstr(), &fd.new, change.new, cache, store);
-        let parallel = fd.old.bytes().len().min(fd.new.bytes().len()) >= PARALLEL_PARSE_BYTES;
-        let (old, new) = if parallel {
-            std::thread::scope(|s| {
-                let spawned = std::thread::Builder::new().spawn_scoped(s, old);
-                let new = new();
-                let old = match spawned {
-                    Ok(spawned) => spawned
-                        .join()
-                        .unwrap_or_else(|e| std::panic::resume_unwind(e)),
-                    // Out of threads: parse here, as `Scope::spawn` would panic.
-                    Err(_) => old(),
-                };
-                (old, new)
-            })
-        } else {
-            (old(), new())
-        };
-        Self { old, new }
-    }
-
-    pub(crate) fn is_empty(&self) -> bool {
-        self.old.is_none() && self.new.is_none()
-    }
-
-    /// The spans of `lines` of the new side, if it's highlighted.
-    pub(crate) fn new_spans(&self, fd: &FileDiff, lines: Range<usize>) -> Option<Spans> {
-        self.new.as_ref().map(|h| h.spans(&fd.new, lines))
-    }
-
-    /// The spans of the lines `hunk` shows on each side.
-    pub(crate) fn hunk(&self, fd: &FileDiff, hunk: &Hunk) -> HunkSyntax {
-        HunkSyntax {
-            old: self
-                .old
-                .as_ref()
-                .map(|h| h.spans(&fd.old, hunk.old_start..hunk.old_start + hunk.old_len)),
-            new: self
-                .new
-                .as_ref()
-                .map(|h| h.spans(&fd.new, hunk.new_start..hunk.new_start + hunk.new_len)),
-        }
-    }
-}
-
-/// One side of a file at `path`, prepared for highlighting where its
-/// language is known and it's small enough; see [`Highlighter::prepare`]
-/// for `store`.
-fn prepare_side(
-    path: &BStr,
-    text: &Text,
-    side: Option<Side>,
-    cache: Option<&Cache>,
-    store: bool,
-) -> Option<Highlighter> {
-    let head = &text.bytes()[..text.bytes().len().min(256)];
-    let lang = Language::detect(path, head)?;
-    if text.is_empty() {
-        return None;
-    }
-    Highlighter::prepare(lang, text, cache_id(side), cache, store)
 }
 
 /// The id a side's cached results are stored under. A working-tree side's id
@@ -1135,18 +1061,21 @@ fn cache_id(side: Option<Side>) -> Option<dffy_core::git::ObjectId> {
     }
 }
 
-/// Syntax spans of the lines one hunk shows, per side.
-#[derive(Debug, Default, Clone)]
-pub(crate) struct HunkSyntax {
-    pub old: Option<Spans>,
-    pub new: Option<Spans>,
-}
-
-impl HunkSyntax {
-    /// The hunk's intra-line emphasis, with tokens from the spans.
-    pub(crate) fn emphasis(&self, fd: &FileDiff, hunk: &Hunk) -> Vec<dffy_core::diff::Emphasis> {
-        emphasize_with(&fd.old, &fd.new, hunk, self.old.as_ref(), self.new.as_ref())
-    }
+/// `fd`'s old and new sides, as highlighting takes them.
+pub(crate) fn sources(fd: &FileDiff) -> [Source<'_>; 2] {
+    let change = &fd.change;
+    [
+        Source {
+            path: change.old_path().as_bytes(),
+            text: &fd.old,
+            id: cache_id(change.old),
+        },
+        Source {
+            path: change.path.as_bytes(),
+            text: &fd.new,
+            id: cache_id(change.new),
+        },
+    ]
 }
 
 /// [`file_parts`] into one canvas.
@@ -1168,7 +1097,7 @@ const PART_ROWS: usize = 1024;
 /// with `--syntax`) the syntax diff's, falling back to the line hunks with
 /// a note when there is none. `syntax` has the spans of each of `fd`'s
 /// hunks, which the syntax diff's match one for one. `plain` may have each
-/// of `fd`'s hunks' emphasis from [`dffy_core::diff::pair`], taken for the
+/// of `fd`'s hunks' emphasis from [`diff::pair`], taken for the
 /// hunks without syntax spans. Every [`PART_ROWS`] rows or so, always
 /// between rows, `flush` gets the canvas, so a long file needn't be laid out
 /// whole; it may clear the canvas, and whatever it leaves is drawn on.
@@ -1177,7 +1106,7 @@ fn file_parts(
     fd: &FileDiff,
     syntax: Option<&[HunkSyntax]>,
     structural: Option<&Result<Structural, Unavailable>>,
-    plain: &mut [Vec<dffy_core::diff::Emphasis>],
+    plain: &mut [Vec<diff::Emphasis>],
     c: &mut Canvas,
     flush: &mut dyn FnMut(&mut Canvas),
 ) {
@@ -1246,12 +1175,12 @@ fn file_parts(
                 flush(c);
             }
         };
-        draw(HunkRow::Header);
+        draw(Row::Header);
         // Unified rows are the lines in order, with nothing to work out
         // ahead of drawing them.
         if layout.arrangement(&header) == Arrangement::Split {
             let mut rows = Vec::new();
-            hunk_rows(
+            view::rows(
                 Arrangement::Split,
                 len,
                 |i| {
@@ -1262,7 +1191,7 @@ fn file_parts(
             );
             rows.into_iter().for_each(draw);
         } else {
-            (0..len).map(HunkRow::Line).for_each(draw);
+            (0..len).map(Row::Line).for_each(draw);
         }
     }
     if !hunks.is_empty() && shown_to < fd.old.len() {
@@ -1270,44 +1199,8 @@ fn file_parts(
     }
 }
 
-/// git's default hunk heading: the nearest line above the hunk that starts
-/// with a letter, `_` or `$`. Each search stops where the previous one
-/// started, so a file costs one backward pass in total.
-#[derive(Default)]
-pub(crate) struct Heading {
-    searched_to: usize,
-    found: Option<usize>,
-}
-
-impl Heading {
-    fn find<'t>(&mut self, text: &'t Text, start: usize) -> &'t [u8] {
-        self.find_line(text, start)
-            .map_or(b"", |i| heading_text(text, i))
-    }
-
-    /// The index of the heading line for a hunk starting at old line `start`.
-    pub(crate) fn find_line(&mut self, text: &Text, start: usize) -> Option<usize> {
-        let start = start.min(text.len());
-        if let Some(i) = (self.searched_to..start).rev().find(|&i| {
-            text.line(i)
-                .first()
-                .is_some_and(|&b| b.is_ascii_alphabetic() || b == b'_' || b == b'$')
-        }) {
-            self.found = Some(i);
-        }
-        self.searched_to = self.searched_to.max(start);
-        self.found
-    }
-}
-
-/// Line `i` of `text` as a hunk heading.
-pub(crate) fn heading_text(text: &Text, i: usize) -> &[u8] {
-    let line = text.line(i).trim_end();
-    &line[..line.len().min(80)]
-}
-
 /// A commit's header as `git show` prints it, a line at a time.
-pub(crate) fn commit_lines(commit: &CommitInfo) -> Vec<(TextKind, BString)> {
+pub(crate) fn commit_lines(commit: &CommitInfo) -> Vec<(TextKind, Vec<u8>)> {
     let mut lines = vec![(
         TextKind::CommitHeader,
         format!("commit {}", commit.id).into(),
@@ -1323,16 +1216,16 @@ pub(crate) fn commit_lines(commit: &CommitInfo) -> Vec<(TextKind, BString)> {
             format!("Merge: {}", short.join(" ")).into(),
         ));
     }
-    let mut author = BString::from("Author: ");
+    let mut author = b"Author: ".to_vec();
     author.extend_from_slice(&commit.author);
     lines.push((TextKind::CommitMeta, author));
     lines.push((
         TextKind::CommitMeta,
         format!("Date:   {}", commit.date).into(),
     ));
-    lines.push((TextKind::Plain, BString::default()));
+    lines.push((TextKind::Plain, Vec::new()));
     for line in commit.message.trim_end().lines() {
-        let mut indented = BString::from("    ");
+        let mut indented = b"    ".to_vec();
         indented.extend_from_slice(line);
         lines.push((TextKind::CommitMessage, indented));
     }
@@ -1379,15 +1272,6 @@ mod tests {
         assert_eq!(held_bytes([3, 4]), 7);
         let large = dffy_core::git::MAX_DIFF_BYTES;
         assert_eq!(held_bytes([large, 1]), 0);
-    }
-
-    #[test]
-    fn heading_is_the_nearest_unindented_line_above() {
-        let text = Text::new(b"int a;\nstatic void f(void)\n{\n\tx();\n\ty();\n}\n".to_vec());
-        let mut h = Heading::default();
-        assert_eq!(h.find(&text, 0), b"");
-        assert_eq!(h.find(&text, 3), b"static void f(void)");
-        assert_eq!(h.find(&text, 5), b"static void f(void)");
     }
 
     /// With `default-diff = unstaged`, staged files point at `--staged`, and

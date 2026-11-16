@@ -154,8 +154,14 @@ const DEFAULTS: &[(Table, &str, Action)] = &[
     (M, "{", Action::PrevChange),
     (M, "f", Action::NextFile),
     (M, "]", Action::NextFile),
+    // Option+arrows: macOS terminals send them as alt+f/alt+b (word moves),
+    // others as alt+right/alt+left. Unbound, alt+b would fall back to `b`.
+    (M, "alt+f", Action::NextFile),
+    (M, "alt+right", Action::NextFile),
     (M, "F", Action::PrevFile),
     (M, "[", Action::PrevFile),
+    (M, "alt+b", Action::PrevFile),
+    (M, "alt+left", Action::PrevFile),
     (M, "x", Action::Expand),
     (M, "X", Action::ToggleFull),
     (M, ">", Action::ScrollRight),
@@ -795,6 +801,17 @@ mod tests {
             Some(Action::ScrollUp)
         );
         assert_eq!(action(false, Key::PageDown, none), Some(Action::Bottom));
+        // Option+arrows go between files, as alt+f/alt+b or alt+right/alt+left.
+        assert_eq!(
+            action(false, Key::Char('b'), Mods::ALT),
+            Some(Action::PrevFile)
+        );
+        assert_eq!(action(true, Key::Left, Mods::ALT), Some(Action::PrevFile));
+        assert_eq!(
+            action(false, Key::Char('f'), Mods::ALT),
+            Some(Action::NextFile)
+        );
+        assert_eq!(action(true, Key::Right, Mods::ALT), Some(Action::NextFile));
         // `dffy config` shows the changes as the lines that make them.
         let mut c = Canvas::default();
         keys.render_changes(&mut c);

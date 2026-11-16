@@ -2350,3 +2350,29 @@ fn scrolling_with_matches_lit_matches_full_redraws() {
 fn scrolling_unified_beside_the_tree_with_matches_lit_matches_full_redraws() {
     scrolls_like_full_redraws(120, 30, "tree = show\nview = unified\n", "/line 1\r");
 }
+
+#[test]
+fn option_arrows_go_between_files() {
+    let repo = repo();
+    let mut term = Term::spawn(repo.path(), 100, 12, &[]);
+    term.wait_for("the diffs", |t| t.contains("More.") && t.contains(" +3 -3"));
+    assert!(term.status().contains(" 1/2"), "{}", term.status());
+    // macOS terminals send option+arrows as alt+f / alt+b ...
+    term.send("\x1bf");
+    term.wait_for("alt+f to the next file", |t| t.status().contains(" 2/2"));
+    term.send("\x1bb");
+    term.wait_for("alt+b to the previous file", |t| {
+        t.status().contains(" 1/2")
+    });
+    // ... others as alt+right / alt+left.
+    term.send("\x1b[1;3C");
+    term.wait_for("alt+right to the next file", |t| {
+        t.status().contains(" 2/2")
+    });
+    term.send("\x1b[1;3D");
+    term.wait_for("alt+left to the previous file", |t| {
+        t.status().contains(" 1/2")
+    });
+    term.send("q");
+    term.wait_exit();
+}

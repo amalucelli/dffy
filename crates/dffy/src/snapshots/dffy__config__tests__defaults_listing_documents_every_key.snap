@@ -1,6 +1,5 @@
 ---
 source: crates/dffy/src/config.rs
-assertion_line: 1009
 expression: text
 ---
 <dim># Color output: auto, always or never. With auto, NO_COLOR and CLICOLOR_FORCE apply.</>
@@ -151,11 +150,15 @@ expression: text
 <dim># next_file: next file</>
 <hint>keybind</><dim> = </>f=next_file
 <hint>keybind</><dim> = </>]=next_file
+<hint>keybind</><dim> = </>alt+f=next_file
+<hint>keybind</><dim> = </>alt+right=next_file
 <hint>keybind</><dim> = </>leader:n=next_file
 
 <dim># prev_file: previous file</>
 <hint>keybind</><dim> = </>F=prev_file
 <hint>keybind</><dim> = </>[=prev_file
+<hint>keybind</><dim> = </>alt+b=prev_file
+<hint>keybind</><dim> = </>alt+left=prev_file
 <hint>keybind</><dim> = </>leader:p=prev_file
 
 <dim># expand: show more of the highlighted ⋯ gap</>

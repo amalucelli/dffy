@@ -1,0 +1,17 @@
+---
+source: crates/dffy/src/render/tests.rs
+assertion_line: 585
+expression: "print_file(Status::Unmerged, ours, worktree, layout(false, Some(60), false))"
+---
+<file-header>conflicted: f.txt</>
+<file-header>─────────────────</>
+<hunk-header>@@ -1 +1,9 @@</>
+  <added-number>1</><dim> │</><conflict-marker>+<<<<<<< ours</>
+<line-number>1</> <line-number>2</><dim> │</> fn a() {}
+  <added-number>3</><dim> │</><conflict-marker>+||||||| base</>
+  <added-number>4</><dim> │</><added>+fn b() {}</>
+  <added-number>5</><dim> │</><conflict-marker>+=======</>
+  <added-number>6</><dim> │</><added>+fn c() {}</>
+  <added-number>7</><dim> │</><conflict-marker>+>>>>>>> theirs</>
+  <added-number>8</><dim> │</><added>+======= not a marker</>
+  <added-number>9</><dim> │</><added>+<<<<<<<< eight</>

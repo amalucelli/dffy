@@ -172,7 +172,7 @@ Binary files, and files of 64MB or more, get a one-line summary instead of a dif
 |---|---|
 | `--stat` | A diffstat, as `git diff --stat` |
 | `--name-only` | Changed paths |
-| `--name-status` | Changed paths with a status letter: `A` added, `D` deleted, `M` modified, `R` renamed, `T` type changed, `?` untracked |
+| `--name-status` | Changed paths with a status letter: `A` added, `D` deleted, `M` modified, `R` renamed, `T` type changed, `U` unmerged (still conflicted), `?` untracked |
 | `--exit-code` | The diff, then exits with 1 if there were differences and 0 if not |
 
 The three summaries exclude each other. `--exit-code` is for `diff` only and combines with them:

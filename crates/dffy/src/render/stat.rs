@@ -214,6 +214,7 @@ pub(crate) fn status_letter(status: super::FileStatus) -> (&'static str, Role) {
         S::TypeChange => ("T", Role::Hint),
         S::Untracked => ("?", Role::Dim),
         S::Combined => ("U", Role::Warn),
+        S::Unmerged => ("U", Role::Removed),
     }
 }
 

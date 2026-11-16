@@ -40,10 +40,15 @@ pub(super) fn index_worktree(
 ) -> Result<ControlFlow<()>> {
     let scan = Scan::new(repo, index)?;
     let flow = scan.run(filter, &mut |m| {
+        let change = if m.unmerged {
+            FileChange::unmerged
+        } else {
+            FileChange::new
+        };
         Ok(match (m.old, m.new) {
             // An intent-to-add entry that's gone from the worktree.
             (None, None) => ControlFlow::Continue(()),
-            (old, new) => emit(FileChange::new(m.path.to_owned(), old, new)),
+            (old, new) => emit(change(m.path.to_owned(), old, new)),
         })
     })?;
     if flow.is_break() || !untracked {
@@ -106,6 +111,12 @@ pub(super) fn tree_worktree(
             }
         }
         let change = match staged.next_if(|s| s.path.as_bstr() == m.path) {
+            // Listed even when the file matches the tree again: the conflict
+            // is still in the index. `git status` marks both columns.
+            Some(s) if m.unmerged => Some(staging(
+                FileChange::unmerged(m.path.to_owned(), s.old, m.new),
+                Staging::Partly,
+            )),
             // The worktree side wins; the index side in between is irrelevant.
             Some(s) => scan
                 .overlay(m.path, s.old, m.new, &mut to_git)?
@@ -159,6 +170,8 @@ struct Modified<'a> {
     old: Option<Side>,
     /// `None` when the file is gone from the worktree.
     new: Option<Side>,
+    /// The index has conflict stages for it; `old` is one of them.
+    unmerged: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -292,7 +305,8 @@ impl<'a> Scan<'a> {
     fn modified(&self, i: usize, outcome: Outcome) -> Modified<'a> {
         let entries = self.index.entries();
         let e = &entries[i];
-        let old = if e.stage_raw() != 0 {
+        let unmerged = e.stage_raw() != 0;
+        let old = if unmerged {
             conflict_side(entries, i, self.index)
         } else if e.flags.contains(Flags::INTENT_TO_ADD) {
             None
@@ -307,6 +321,7 @@ impl<'a> Scan<'a> {
             path: e.path(self.index),
             old,
             new,
+            unmerged,
         }
     }
 
@@ -562,7 +577,8 @@ pub(super) fn untracked_files(
             let Some(file_type) = entry.file_type() else {
                 return ignore::WalkState::Continue;
             };
-            let in_index = index.entry_by_path(rel.as_bstr()).is_some();
+            // Any stage: `entry_by_path` misses a conflict without ours.
+            let in_index = index.entry_index_by_path(rel.as_bstr()).is_ok();
             let push = |mode| {
                 if let Ok(mut found) = found.lock() {
                     found.push((BString::from(rel), mode));

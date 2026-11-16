@@ -46,6 +46,8 @@ pub(crate) enum Role {
     /// A line of code the syntax diff found moved whole: its text, sign
     /// and line number.
     Moved,
+    /// A conflict marker line added to an unmerged file.
+    ConflictMarker,
     FileHeader,
     HunkHeader,
     CommitHeader,
@@ -72,7 +74,7 @@ pub(crate) enum Role {
 impl Role {
     /// Every role a theme can set, in the order `dffy config` and theme files
     /// list them.
-    pub(crate) const THEMED: [Self; 27] = [
+    pub(crate) const THEMED: [Self; 28] = [
         Self::Context,
         Self::Added,
         Self::Removed,
@@ -87,6 +89,7 @@ impl Role {
         Self::ModifiedLine,
         Self::ModifiedNumber,
         Self::Moved,
+        Self::ConflictMarker,
         Self::FileHeader,
         Self::HunkHeader,
         Self::CommitHeader,
@@ -119,6 +122,7 @@ impl Role {
             Self::ModifiedLine => "modified-line",
             Self::ModifiedNumber => "modified-number",
             Self::Moved => "moved",
+            Self::ConflictMarker => "conflict-marker",
             Self::FileHeader => "file-header",
             Self::HunkHeader => "hunk-header",
             Self::CommitHeader => "commit-header",
@@ -347,7 +351,7 @@ const EMPH_TINT: f64 = 0.35;
 
 /// The tints of `indicators = background`: each role's hue (`None` for the
 /// theme's modified hue) and share; reformatted code (dim) gets none.
-const TINTS: [(Role, Option<f64>, f64); 9] = [
+const TINTS: [(Role, Option<f64>, f64); 10] = [
     (Role::AddedLine, Some(ADDED_HUE), LINE_TINT),
     (Role::AddedNumber, Some(ADDED_HUE), GUTTER_TINT),
     (Role::AddedEmph, Some(ADDED_HUE), EMPH_TINT),
@@ -357,6 +361,7 @@ const TINTS: [(Role, Option<f64>, f64); 9] = [
     (Role::ModifiedLine, None, LINE_TINT),
     (Role::ModifiedNumber, None, GUTTER_TINT),
     (Role::Moved, Some(MOVED_HUE), LINE_TINT),
+    (Role::ConflictMarker, Some(ADDED_HUE), LINE_TINT),
 ];
 
 /// Color math for the tints: sRGB to Oklab and back, where mixing keeps
@@ -499,6 +504,7 @@ modified = blue
 modified-line =
 modified-number = blue
 moved = magenta
+conflict-marker = bold yellow
 file-header = bold blue
 hunk-header = cyan
 commit-header = yellow
@@ -546,6 +552,7 @@ modified = underline
 modified-line =
 modified-number = underline
 moved = italic
+conflict-marker = bold reverse
 file-header = bold underline
 hunk-header = italic
 commit-header = bold
@@ -669,6 +676,7 @@ modified = {modified}
 modified-line = {fg}
 modified-number = {modified}
 moved = {purple}
+conflict-marker = bold {yellow}
 file-header = bold {blue}
 hunk-header = {cyan}
 commit-header = {yellow}

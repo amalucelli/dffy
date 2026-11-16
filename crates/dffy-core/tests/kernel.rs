@@ -58,6 +58,7 @@ fn letter(status: &Status) -> &'static str {
         Status::Modified => "M",
         Status::TypeChange => "T",
         Status::Untracked => "??",
+        Status::Unmerged => "U",
         Status::Renamed { .. } => "R",
     }
 }

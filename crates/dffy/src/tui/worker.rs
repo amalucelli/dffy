@@ -10,16 +10,16 @@
 use std::collections::VecDeque;
 use std::io;
 use std::ops::{ControlFlow, Range};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Sender};
-use std::sync::{Arc, Condvar, Mutex, PoisonError};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::thread;
 
 use dffy_core::bstr::BString;
 use dffy_core::cache::Cache;
 use dffy_core::diff::{Emphasis, Options};
 use dffy_core::document::{self, Counts, File, Matches, Needle, Prepare, SyntaxSlot};
-use dffy_core::git::{ChangeSet, FileChange, FileDiff, Repo, Revisions};
+use dffy_core::git::{ChangeSet, FileChange, FileDiff, Repo, Revisions, StatStore};
 use dffy_core::highlight::{HunkSyntax, Language, Registry};
 use dffy_core::structural::{Structural, Unavailable};
 use dffy_core::view::Spans;
@@ -360,6 +360,36 @@ impl Done {
 /// enough that counts appear steadily.
 const COUNT_CHUNK: usize = 32;
 
+struct Shared {
+    queue: Mutex<Queue>,
+    ready: Condvar,
+    /// How many jobs wait, read between the files of a chunk of the count
+    /// pass without taking the lock. Changed only under it.
+    waiting: AtomicUsize,
+    /// How many jobs are being run, likewise.
+    running: AtomicUsize,
+    /// Where the count pass finds files counted before and keeps the rest;
+    /// `None` without a disk cache.
+    stats: Option<StatStore>,
+}
+
+impl Shared {
+    fn new(queue: Queue) -> Self {
+        let stats = queue.settings.cache.clone().map(StatStore::new);
+        Self {
+            queue: Mutex::new(queue),
+            ready: Condvar::new(),
+            waiting: AtomicUsize::new(0),
+            running: AtomicUsize::new(0),
+            stats,
+        }
+    }
+
+    fn lock(&self) -> MutexGuard<'_, Queue> {
+        self.queue.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
 struct Queue {
     waiting: VecDeque<Job>,
     /// Jobs taken by a worker whose result the viewer hasn't taken yet
@@ -378,15 +408,38 @@ struct Queue {
     /// It's set once per list rather than with every frame's jobs, since it
     /// covers every file.
     counting: VecDeque<Counted>,
+    /// Which count pass `counting` is, so a chunk of a replaced one doesn't
+    /// hand its uncounted files back to the new one.
+    pass: u64,
+    /// Chunks of the count pass being counted.
+    chunks: usize,
     /// What jobs are done with; set before any job is.
     settings: Settings,
+}
+
+impl Queue {
+    fn new(settings: Settings) -> Self {
+        Self {
+            waiting: VecDeque::new(),
+            running: Vec::new(),
+            preparing: VecDeque::new(),
+            compiling: false,
+            counting: VecDeque::new(),
+            pass: 0,
+            chunks: 0,
+            settings,
+        }
+    }
 }
 
 /// A file for the count pass: its position, version and change.
 pub(crate) type Counted = (usize, u64, FileChange);
 
 pub(crate) struct Pool {
-    shared: Arc<(Mutex<Queue>, Condvar)>,
+    shared: Arc<Shared>,
+    /// The threads that only count, started with the first count pass so
+    /// they don't hold up the first paint: how many, and what with.
+    counters: Mutex<Option<(usize, Repo, Sender<Event>)>>,
 }
 
 #[derive(Clone)]
@@ -413,32 +466,31 @@ impl Pool {
         settings: &Settings,
         tx: &Sender<Event>,
     ) -> io::Result<Self> {
-        let queue = Queue {
-            waiting: VecDeque::new(),
-            running: Vec::new(),
-            preparing: VecDeque::new(),
-            compiling: false,
-            counting: VecDeque::new(),
-            settings: settings.clone(),
-        };
-        let shared = Arc::new((Mutex::new(queue), Condvar::new()));
+        let shared = Arc::new(Shared::new(Queue::new(settings.clone())));
+        let cores = thread::available_parallelism().map_or(2, std::num::NonZero::get);
         // One core stays free for the UI and the enumeration.
-        let threads = thread::available_parallelism()
-            .map_or(2, std::num::NonZero::get)
-            .saturating_sub(1)
-            .clamp(1, 3);
+        let threads = cores.saturating_sub(1).clamp(1, 3);
         for _ in 0..threads {
             let (shared, repo, tx) = (Arc::clone(&shared), repo.cloned(), tx.clone());
             thread::Builder::new()
                 .name("dffy-diff".into())
-                .spawn(move || work(&shared, repo.as_ref(), &tx))?;
+                .spawn(move || work(&shared, repo.as_ref(), &tx, false))?;
         }
-        Ok(Self { shared })
+        // The count pass also takes the cores left over, the UI's included:
+        // it starts once the list is complete, and these threads stop
+        // between files whenever a job waits or runs.
+        let counters = repo
+            .filter(|_| cores > threads)
+            .map(|r| (cores - threads, r.clone(), tx.clone()));
+        Ok(Self {
+            shared,
+            counters: Mutex::new(counters),
+        })
     }
 
     /// Diffs and highlights with these from the next job on.
     pub(crate) fn set(&self, highlight: bool, whitespace: dffy_core::diff::Whitespace) {
-        let mut queue = self.shared.0.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut queue = self.shared.lock();
         queue.settings.highlight = highlight;
         queue.settings.options.whitespace = whitespace;
     }
@@ -447,77 +499,106 @@ impl Pool {
     /// are running, or whose result the viewer hasn't taken yet, aren't
     /// queued again.
     pub(crate) fn replace(&self, jobs: Vec<Job>) {
-        let (queue, ready) = &*self.shared;
-        let mut queue = queue.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut queue = self.shared.lock();
         let Queue {
             waiting, running, ..
         } = &mut *queue;
         waiting.clear();
         waiting.extend(jobs.into_iter().filter(|j| !running.contains(&j.key())));
-        ready.notify_all();
+        self.shared.waiting.store(waiting.len(), Ordering::Relaxed);
+        self.shared.ready.notify_all();
     }
 
     /// The viewer took `done`: its job may be asked for again.
     pub(crate) fn finish(&self, done: &Done) {
         if let Some(job) = done.job() {
-            self.shared
-                .0
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .running
-                .retain(|k| *k != job);
+            self.shared.lock().running.retain(|k| *k != job);
         }
     }
 
     /// Compiles the highlight queries of `languages` once nothing else is
     /// waiting, in order.
     pub(crate) fn prepare(&self, languages: Vec<Language>) {
-        let (queue, ready) = &*self.shared;
-        let mut queue = queue.lock().unwrap_or_else(PoisonError::into_inner);
-        queue.preparing.extend(languages);
-        ready.notify_all();
+        self.shared.lock().preparing.extend(languages);
+        self.shared.ready.notify_all();
+    }
+
+    /// Writes the counts kept for the disk cache now, or waits for the
+    /// write under way. The pool writes them itself after each pass.
+    pub(crate) fn flush(&self) {
+        if let Some(stats) = &self.shared.stats {
+            stats.flush();
+        }
     }
 
     /// Replaces the count pass with `files`, in the order to count them;
     /// an empty list cancels it.
     pub(crate) fn count(&self, files: Vec<Counted>) {
-        let (queue, ready) = &*self.shared;
-        let mut queue = queue.lock().unwrap_or_else(PoisonError::into_inner);
+        let counters = self
+            .counters
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
+        if let Some((n, repo, tx)) = counters {
+            // Counting reads each blob once: a cache of them would only
+            // hold copies.
+            for _ in 0..n {
+                let (shared, repo, tx) = (
+                    Arc::clone(&self.shared),
+                    repo.without_object_cache(),
+                    tx.clone(),
+                );
+                // One that can't start leaves the count pass to the others.
+                drop(
+                    thread::Builder::new()
+                        .name("dffy-count".into())
+                        .spawn(move || work(&shared, Some(&repo), &tx, true)),
+                );
+            }
+        }
+        let mut queue = self.shared.lock();
         queue.counting = files.into();
-        ready.notify_all();
+        queue.pass += 1;
+        self.shared.ready.notify_all();
     }
 }
 
 /// What a worker takes next, a job, a query to compile or a chunk of the
-/// count pass, with the settings to do it with.
+/// count pass (of pass `u64`), with the settings to do it with.
 enum Work {
     Job(Job, Settings),
     Prepare(Language),
-    Count(Vec<Counted>, Settings),
+    Count(Vec<Counted>, u64, Settings),
 }
 
 /// Waits for the next job, or with none waiting a query to compile, then a
-/// chunk of the count pass.
-fn next(shared: &(Mutex<Queue>, Condvar)) -> Work {
-    let (queue, ready) = shared;
-    let mut q = queue.lock().unwrap_or_else(PoisonError::into_inner);
+/// chunk of the count pass. A `counter` takes only chunks, and only while
+/// no job waits or runs.
+fn next(shared: &Shared, counter: bool) -> Work {
+    let mut q = shared.lock();
     loop {
-        if let Some(job) = q.waiting.pop_front() {
-            q.running.push(job.key());
-            return Work::Job(job, q.settings.clone());
+        if !counter {
+            if let Some(job) = q.waiting.pop_front() {
+                shared.waiting.store(q.waiting.len(), Ordering::Relaxed);
+                shared.running.fetch_add(1, Ordering::Relaxed);
+                q.running.push(job.key());
+                return Work::Job(job, q.settings.clone());
+            }
+            if !q.compiling
+                && let Some(language) = q.preparing.pop_front()
+            {
+                q.compiling = true;
+                return Work::Prepare(language);
+            }
         }
-        if !q.compiling
-            && let Some(language) = q.preparing.pop_front()
-        {
-            q.compiling = true;
-            return Work::Prepare(language);
-        }
-        if !q.counting.is_empty() {
+        let idle = !counter || q.waiting.is_empty() && shared.running.load(Ordering::Relaxed) == 0;
+        if idle && !q.counting.is_empty() {
             let n = q.counting.len().min(COUNT_CHUNK);
             let chunk = q.counting.drain(..n).collect();
-            return Work::Count(chunk, q.settings.clone());
+            q.chunks += 1;
+            return Work::Count(chunk, q.pass, q.settings.clone());
         }
-        q = ready.wait(q).unwrap_or_else(PoisonError::into_inner);
+        q = shared.ready.wait(q).unwrap_or_else(PoisonError::into_inner);
     }
 }
 
@@ -547,53 +628,83 @@ fn diff(
     }
 }
 
-/// Each file's added and removed lines, for the tree; a file that can't
-/// be read counts as nothing changed.
+/// Each file's added and removed lines, for the tree, until a job waits
+/// (or for a `counter`, runs); a file that can't be read counts as nothing
+/// changed. Returns the counts and the files left uncounted.
 fn count(
+    shared: &Shared,
     repo: Option<&Repo>,
     settings: &Settings,
     files: Vec<Counted>,
-) -> Vec<(usize, u64, Counts)> {
-    files
-        .into_iter()
-        .map(|(file, version, change)| {
-            let stat = repo
-                .and_then(|r| r.stat(&change, settings.options.whitespace).ok())
-                .unwrap_or_default();
-            (
-                file,
-                version,
-                Counts {
-                    added: stat.added,
-                    removed: stat.removed,
-                },
-            )
-        })
-        .collect()
+    counter: bool,
+) -> (Vec<(usize, u64, Counts)>, Vec<Counted>) {
+    let whitespace = settings.options.whitespace;
+    let mut out = Vec::with_capacity(files.len());
+    let mut files = files.into_iter();
+    for (file, version, change) in files.by_ref() {
+        let stat = repo
+            .and_then(|r| match &shared.stats {
+                Some(stats) => stats.stat(r, &change, whitespace).ok(),
+                None => r.stat(&change, whitespace).ok(),
+            })
+            .unwrap_or_default();
+        out.push((
+            file,
+            version,
+            Counts {
+                added: stat.added,
+                removed: stat.removed,
+            },
+        ));
+        if shared.waiting.load(Ordering::Relaxed) > 0
+            || counter && shared.running.load(Ordering::Relaxed) > 0
+        {
+            break;
+        }
+    }
+    (out, files.collect())
 }
 
 /// Takes work until nobody listens. A job stays in the running list after
 /// it's done, until the viewer takes its result ([`Pool::finish`]).
-fn work(shared: &(Mutex<Queue>, Condvar), repo: Option<&Repo>, tx: &Sender<Event>) {
+fn work(shared: &Shared, repo: Option<&Repo>, tx: &Sender<Event>, counter: bool) {
     loop {
-        let done = match next(shared) {
-            Work::Job(job, settings) => run(job, repo, &settings),
+        let (done, pass_done) = match next(shared, counter) {
+            Work::Job(job, settings) => {
+                let done = run(job, repo, &settings);
+                let q = shared.lock();
+                shared.running.fetch_sub(1, Ordering::Relaxed);
+                if !q.counting.is_empty() {
+                    shared.ready.notify_all();
+                }
+                (done, false)
+            }
             Work::Prepare(language) => {
                 language.prepare();
-                let (queue, ready) = shared;
-                queue
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner)
-                    .compiling = false;
-                ready.notify_all();
+                shared.lock().compiling = false;
+                shared.ready.notify_all();
                 continue;
             }
-            Work::Count(files, settings) => Done::Counts {
-                counts: count(repo, &settings, files),
-            },
+            Work::Count(files, pass, settings) => {
+                let (counts, left) = count(shared, repo, &settings, files, counter);
+                let mut q = shared.lock();
+                if pass == q.pass {
+                    for file in left.into_iter().rev() {
+                        q.counting.push_front(file);
+                    }
+                }
+                q.chunks -= 1;
+                (
+                    Done::Counts { counts },
+                    q.chunks == 0 && q.counting.is_empty(),
+                )
+            }
         };
         if tx.send(Event::Diffed(done)).is_err() {
             return;
+        }
+        if pass_done && let Some(stats) = &shared.stats {
+            stats.flush();
         }
     }
 }
@@ -795,28 +906,67 @@ mod tests {
                 diff: Arc::clone(&diff),
                 syntax: None,
             }]),
-            running: Vec::new(),
             preparing: VecDeque::from([lang("swift"), lang("kotlin")]),
-            compiling: false,
             counting: VecDeque::from([(0, 0, diff.change.clone())]),
-            settings: Settings {
+            ..Queue::new(Settings {
                 options: Options::default(),
                 highlight: true,
                 grammars,
                 cache: None,
-            },
+            })
         };
-        let shared = (Mutex::new(queue), Condvar::new());
+        let shared = Shared::new(queue);
         let taken = |work: Work| match work {
             Work::Job(..) => "job".to_owned(),
             Work::Prepare(language) => language.name().to_owned(),
             Work::Count(..) => "count".to_owned(),
         };
-        assert_eq!(taken(next(&shared)), "job");
-        assert_eq!(taken(next(&shared)), "swift");
-        assert_eq!(taken(next(&shared)), "count", "a second compile at once");
-        shared.0.lock().expect("queue").compiling = false;
-        assert_eq!(taken(next(&shared)), "kotlin");
+        assert_eq!(taken(next(&shared, false)), "job");
+        assert_eq!(taken(next(&shared, false)), "swift");
+        assert_eq!(
+            taken(next(&shared, false)),
+            "count",
+            "a second compile at once"
+        );
+        shared.lock().compiling = false;
+        assert_eq!(taken(next(&shared, false)), "kotlin");
+    }
+
+    /// The threads that only count stay off the count pass while a job
+    /// waits or runs, and a worker counting a chunk hands the rest back
+    /// once a job waits.
+    #[test]
+    fn counting_yields_to_jobs() {
+        let diff = modified();
+        let files = (0..4).map(|i| (i, 0, diff.change.clone()));
+        let shared = Shared::new(Queue {
+            counting: files.collect(),
+            ..Queue::new(Settings {
+                options: Options::default(),
+                highlight: false,
+                grammars: crate::grammars(),
+                cache: None,
+            })
+        });
+        shared.running.store(1, Ordering::Relaxed);
+        let shared = Arc::new(shared);
+        let waiter = Arc::clone(&shared);
+        let counter = thread::spawn(move || matches!(next(&waiter, true), Work::Count(..)));
+        thread::sleep(Duration::from_millis(100));
+        assert!(!counter.is_finished(), "counted while a job ran");
+        {
+            let _q = shared.lock();
+            shared.running.store(0, Ordering::Relaxed);
+            shared.ready.notify_all();
+        }
+        assert!(counter.join().expect("counter"), "counts once idle");
+
+        shared.waiting.store(1, Ordering::Relaxed);
+        let chunk: Vec<Counted> = (10..13).map(|i| (i, 0, diff.change.clone())).collect();
+        let settings = shared.lock().settings.clone();
+        let (done, left) = count(&shared, None, &settings, chunk, false);
+        assert_eq!(done.len(), 1, "stops after the file it's on");
+        assert_eq!(left.iter().map(|f| f.0).collect::<Vec<_>>(), [11, 12]);
     }
 
     /// A job's result either makes the job unwanted (it's stored) or wanted

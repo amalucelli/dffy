@@ -241,15 +241,21 @@ impl<'a> TreeIndex<'a> {
             return ControlFlow::Break(());
         }
         let old = object_side(e);
-        let new = if self.cursor < self.len() && self.path(self.cursor) == path.as_bstr() {
-            self.take_index_side()
-        } else {
-            None
-        };
-        if old == new || !self.filter.matches(path) {
+        let (new, unmerged) =
+            if self.cursor < self.len() && self.path(self.cursor) == path.as_bstr() {
+                self.take_index_side()
+            } else {
+                (None, false)
+            };
+        if old == new && !unmerged || !self.filter.matches(path) {
             return ControlFlow::Continue(());
         }
-        (self.emit)(FileChange::new(path.clone(), old, new))
+        let change = if unmerged {
+            FileChange::unmerged
+        } else {
+            FileChange::new
+        };
+        (self.emit)(change(path.clone(), old, new))
     }
 
     /// Emits index entries sorting before `bound` (all remaining for `None`)
@@ -260,18 +266,24 @@ impl<'a> TreeIndex<'a> {
             if bound.is_some_and(|b| path >= b.as_bstr()) {
                 break;
             }
-            let new = self.take_index_side();
-            if new.is_some() && self.filter.matches(path) {
-                (self.emit)(FileChange::new(path.to_owned(), None, new))?;
+            let (new, unmerged) = self.take_index_side();
+            if (new.is_some() || unmerged) && self.filter.matches(path) {
+                let change = if unmerged {
+                    FileChange::unmerged
+                } else {
+                    FileChange::new
+                };
+                (self.emit)(change(path.to_owned(), None, new))?;
             }
         }
         ControlFlow::Continue(())
     }
 
     /// Consumes every entry for the path at the cursor and returns what the
-    /// index holds there: nothing for an intent-to-add entry, and the
-    /// working-tree file for a conflict, since no single stage stands for it.
-    fn take_index_side(&mut self) -> Option<Side> {
+    /// index holds there, and whether it's unmerged: nothing for an
+    /// intent-to-add entry, and for a conflict the working-tree file, if
+    /// there is one, since no single stage stands for it.
+    fn take_index_side(&mut self) -> (Option<Side>, bool) {
         let entries = self.index.entries();
         let first = &entries[self.cursor];
         let path = self.path(self.cursor);
@@ -279,17 +291,24 @@ impl<'a> TreeIndex<'a> {
         while self.cursor < entries.len() && self.path(self.cursor) == path {
             self.cursor += 1;
         }
-        let mode = Mode::from_index(first.mode)?;
-        if first.stage_raw() != 0 {
-            Some(Side::Worktree { mode, id: None })
-        } else if first
-            .flags
-            .contains(gix::index::entry::Flags::INTENT_TO_ADD)
-        {
-            None
-        } else {
-            Some(Side::Object { id: first.id, mode })
-        }
+        let unmerged = first.stage_raw() != 0;
+        let side = Mode::from_index(first.mode).and_then(|mode| {
+            if unmerged {
+                let on_disk = self
+                    .repo
+                    .worktree_path(path)
+                    .is_ok_and(|full| full.symlink_metadata().is_ok_and(|m| !m.is_dir()));
+                on_disk.then_some(Side::Worktree { mode, id: None })
+            } else if first
+                .flags
+                .contains(gix::index::entry::Flags::INTENT_TO_ADD)
+            {
+                None
+            } else {
+                Some(Side::Object { id: first.id, mode })
+            }
+        });
+        (side, unmerged)
     }
 
     /// Whether the `n` entries at the cursor are exactly those under `dir`.

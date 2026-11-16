@@ -182,6 +182,7 @@ impl Ctx {
             tab_width: self.config.tab_width,
             indicators: self.indicators(),
             one_sided: false,
+            unmerged: false,
             digits: 0,
             inline_signs: !self.color_out,
             scroll: 0,

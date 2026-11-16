@@ -18,12 +18,12 @@ use std::ops::{ControlFlow, Range};
 use std::time::{Duration, Instant};
 
 use rustc_hash::FxHashMap;
-use tree_sitter::{Parser, Query, QueryCursor, StreamingIterator, Tree};
+use tree_sitter::{InputEdit, Parser, Point, Query, QueryCursor, StreamingIterator, Tree};
 
 pub use lang::{Grammar, Language, LanguageSource, Registry, Words};
 
 use crate::cache::{self, Cache};
-use crate::diff::{Emphasis, Hunk, Text, emphasize_with};
+use crate::diff::{Emphasis, Hunk, LineKind, Text, emphasize_with};
 use crate::git::ObjectId;
 use crate::view::{Run, Spans, Syntax, content_len, len_u32};
 
@@ -41,7 +41,8 @@ pub const CACHE_MIN_BYTES: usize = 64 << 10;
 
 /// Sides at least this large are parsed on two threads at once by
 /// [`FileSyntax::new`]. Smaller ones parse in a few milliseconds, where a
-/// second thread gains little.
+/// second thread gains little, and one after the other the new side
+/// reuses the old side's tree.
 pub const PARALLEL_PARSE_BYTES: usize = 32 << 10;
 
 /// The role of a query capture name such as `function.method`. Names
@@ -125,13 +126,13 @@ pub fn parse(lang: &Language, source: &[u8]) -> Option<Parsed> {
     }
     let tree = if lang.is_compiled() {
         lang.compiled()?;
-        parse_tree(lang, source, PARSE_BUDGET)?
+        parse_tree(lang, source, PARSE_BUDGET, None)?
     } else {
         // The language's first parse compiles its query beside it, rather
         // than waiting the compile out first.
         std::thread::scope(|s| {
             let query = std::thread::Builder::new().spawn_scoped(s, || lang.compiled().is_some());
-            let tree = parse_tree(lang, source, PARSE_BUDGET);
+            let tree = parse_tree(lang, source, PARSE_BUDGET, None);
             let query = match query {
                 Ok(query) => query
                     .join()
@@ -150,8 +151,14 @@ pub fn parse(lang: &Language, source: &[u8]) -> Option<Parsed> {
 }
 
 /// The syntax tree of `source`, or `None` when parsing takes longer than
-/// `budget`.
-pub(crate) fn parse_tree(lang: &Language, source: &[u8], budget: Duration) -> Option<Tree> {
+/// `budget`. With `old`, a tree of an earlier text edited into `source`'s
+/// shape by [`edit`], whose untouched subtrees are reused.
+pub(crate) fn parse_tree(
+    lang: &Language,
+    source: &[u8],
+    budget: Duration,
+    old: Option<&Tree>,
+) -> Option<Tree> {
     let mut parser = Parser::new();
     parser.set_language(lang.grammar()).ok()?;
     let started = Instant::now();
@@ -165,9 +172,145 @@ pub(crate) fn parse_tree(lang: &Language, source: &[u8], budget: Duration) -> Op
     let options = tree_sitter::ParseOptions::new().progress_callback(&mut over_budget);
     parser.parse_with_options(
         &mut |offset, _| source.get(offset..).unwrap_or_default(),
-        None,
+        old,
         Some(options),
     )
+}
+
+/// Edits `tree`, parsed from `old`, into the shape of `new`: one edit per
+/// run of lines `hunks` change, so a parse of `new` from it parses only
+/// those runs again, with the nodes that span them. `false` when `hunks`
+/// don't account for every byte: the lines they keep must be the same on
+/// both sides, which a diff that ignores whitespace doesn't promise. `tree`
+/// is then partly edited and only fit to drop.
+pub(crate) fn edit(tree: &mut Tree, old: &Text, new: &Text, hunks: &[Hunk]) -> bool {
+    let mut e = Editor {
+        tree,
+        old,
+        new,
+        o: 0,
+        n: 0,
+    };
+    for h in hunks {
+        let Some(gap) = h.old_start.checked_sub(e.o) else {
+            return false;
+        };
+        if h.new_start.checked_sub(e.n) != Some(gap) || !e.to(e.o, e.n, gap) {
+            return false;
+        }
+        for line in h.lines.iter().filter(|l| l.kind == LineKind::Context) {
+            if !e.to(line.old, line.new, 1) {
+                return false;
+            }
+        }
+        if !e.to(h.old_start + h.old_len, h.new_start + h.new_len, 0) {
+            return false;
+        }
+    }
+    let tail = old.len().saturating_sub(e.o);
+    new.len().checked_sub(e.n) == Some(tail) && e.to(e.o, e.n, tail)
+}
+
+/// [`edit`]'s walk. Edits go in order, each in the coordinates the ones
+/// before it left: everything before line `n` of `new` is already `new`'s.
+struct Editor<'a> {
+    tree: &'a mut Tree,
+    old: &'a Text,
+    new: &'a Text,
+    /// The first old line not yet kept or edited.
+    o: usize,
+    /// The first new line not yet kept or edited.
+    n: usize,
+}
+
+impl Editor<'_> {
+    /// Replaces the old lines up to `o` with the new lines up to `n`, then
+    /// keeps `kept` lines; `false` when those aren't the same on both
+    /// sides, or the lines run backwards or past the end.
+    fn to(&mut self, o: usize, n: usize, kept: usize) -> bool {
+        let (old, new) = (self.old, self.new);
+        if o < self.o || n < self.n || o + kept > old.len() || n + kept > new.len() {
+            return false;
+        }
+        if (o, n) != (self.o, self.n) {
+            let removed = &old.bytes()[old.offset(self.o)..old.offset(o)];
+            let start_byte = new.offset(self.n);
+            let start_position = point(new, self.n);
+            self.tree.edit(&InputEdit {
+                start_byte,
+                old_end_byte: start_byte + removed.len(),
+                new_end_byte: new.offset(n),
+                start_position,
+                old_end_position: advance(start_position, removed),
+                new_end_position: point(new, n),
+            });
+        }
+        (self.o, self.n) = (o + kept, n + kept);
+        old.bytes()[old.offset(o)..old.offset(o + kept)]
+            == new.bytes()[new.offset(n)..new.offset(n + kept)]
+    }
+}
+
+/// Where line `i` of `text` starts, or for `text.len()` where the text
+/// ends, as tree-sitter counts: rows at each `\n`, columns in bytes.
+fn point(text: &Text, i: usize) -> Point {
+    match i.checked_sub(1) {
+        Some(last) if i == text.len() && !text.line(last).ends_with(b"\n") => {
+            Point::new(last, text.line(last).len())
+        }
+        _ => Point::new(i, 0),
+    }
+}
+
+/// The point after `bytes`, from `from`.
+fn advance(from: Point, bytes: &[u8]) -> Point {
+    match memchr::memrchr(b'\n', bytes) {
+        Some(last) => Point::new(
+            from.row + memchr::memchr_iter(b'\n', bytes).count(),
+            bytes.len() - last - 1,
+        ),
+        None => Point::new(from.row, from.column + bytes.len()),
+    }
+}
+
+impl Parsed {
+    /// [`parse`] of `new` in this side's language, from this side's tree of
+    /// `old`: only the lines `hunks` change are parsed again, with the
+    /// nodes that span them.
+    ///
+    /// The tree must come out as a parse from scratch makes it, which
+    /// tree-sitter's reuse gives only where no error recovery is involved:
+    /// recovering differently around reused nodes can lex a token inside
+    /// an error as another kind, or end top-level nodes elsewhere. So `new`
+    /// is parsed from scratch when this tree has an error, when the result
+    /// has one, and when `hunks` don't account for every byte of `new` (see
+    /// [`edit`]).
+    #[must_use]
+    pub fn reparse(&self, old: &Text, new: &Text, hunks: &[Hunk]) -> Option<Self> {
+        if new.bytes().len() > MAX_HIGHLIGHT_BYTES {
+            return None;
+        }
+        // TODO(amalucelli): tree-sitter 0.27.2 skips the keyword fallback on
+        // a reused node's first leaf (https://github.com/tree-sitter/tree-sitter/pull/6149,
+        // backported in #6152). Once a release has it, upgrade and rerun the
+        // per-file incremental-vs-fresh sweep without the error checks here
+        // and below; drop them if it finds no mismatch.
+        if self.tree.root_node().has_error() {
+            return parse(&self.lang, new.bytes());
+        }
+        let mut tree = self.tree.clone();
+        if !edit(&mut tree, old, new, hunks) {
+            return parse(&self.lang, new.bytes());
+        }
+        let tree = parse_tree(&self.lang, new.bytes(), PARSE_BUDGET, Some(&tree))?;
+        if tree.root_node().has_error() {
+            return parse(&self.lang, new.bytes());
+        }
+        Some(Self {
+            tree,
+            lang: self.lang.clone(),
+        })
+    }
 }
 
 impl Parsed {
@@ -408,6 +551,20 @@ impl Highlighter {
         cache: Option<&Cache>,
         store: bool,
     ) -> Option<Self> {
+        match Self::lookup(lang, text, id, cache)? {
+            Lookup::Hit(spans) => Some(Self::Cached(spans)),
+            Lookup::Miss(key) => Some(Self::finish(parse(lang, text.bytes())?, text, key, store)),
+        }
+    }
+
+    /// The cache's side of [`Highlighter::prepare`]; `None` when `text` is
+    /// too large to highlight.
+    fn lookup<'c>(
+        lang: &Language,
+        text: &Text,
+        id: Option<ObjectId>,
+        cache: Option<&'c Cache>,
+    ) -> Option<Lookup<'c>> {
         let bytes = text.bytes();
         if bytes.len() > MAX_HIGHLIGHT_BYTES {
             return None;
@@ -421,16 +578,21 @@ impl Highlighter {
                 .and_then(|b| Spans::decode(&b))
             && spans.lines() == (0..text.len())
         {
-            return Some(Self::Cached(spans));
+            return Some(Lookup::Hit(spans));
         }
-        let parsed = parse(lang, bytes)?;
+        Some(Lookup::Miss(key))
+    }
+
+    /// `parsed`, the tree of `text`, with its whole-file spans stored under
+    /// `key` when there is one and `store` is set.
+    fn finish(parsed: Parsed, text: &Text, key: Option<(&Cache, Vec<u8>)>, store: bool) -> Self {
         match key {
             Some((cache, key)) if store => {
                 let spans = parsed.spans(text, 0..text.len());
                 cache.put(cache::Kind::Highlight, &key, &spans.encode());
-                Some(Self::Cached(spans))
+                Self::Cached(spans)
             }
-            _ => Some(Self::Tree(parsed)),
+            _ => Self::Tree(parsed),
         }
     }
 
@@ -444,12 +606,47 @@ impl Highlighter {
         cache: Option<&Cache>,
         store: bool,
     ) -> Option<Self> {
-        let bytes = side.text.bytes();
-        let lang = grammars.detect(side.path, &bytes[..bytes.len().min(256)])?;
-        if side.text.is_empty() {
+        Self::after(grammars, side, None, cache, store)
+    }
+
+    /// [`Highlighter::for_side`] for the new side of a file, given its old
+    /// side `old` as prepared and the line diff's `hunks` between their
+    /// texts. When `old` is a tree in the new side's language and the new
+    /// side isn't cached, the new side is parsed from that tree (see
+    /// [`Parsed::reparse`]).
+    #[must_use]
+    pub fn after(
+        grammars: &Registry,
+        new: Source,
+        old: Option<(&Self, &Text, &[Hunk])>,
+        cache: Option<&Cache>,
+        store: bool,
+    ) -> Option<Self> {
+        let bytes = new.text.bytes();
+        let lang = grammars.detect(new.path, &bytes[..bytes.len().min(256)])?;
+        if new.text.is_empty() {
             return None;
         }
-        Self::prepare(lang, side.text, side.id, cache, store)
+        let key = match Self::lookup(lang, new.text, new.id, cache)? {
+            Lookup::Hit(spans) => return Some(Self::Cached(spans)),
+            Lookup::Miss(key) => key,
+        };
+        let parsed = match old {
+            Some((Self::Tree(old), old_text, hunks)) if old.lang == *lang => {
+                old.reparse(old_text, new.text, hunks)
+            }
+            _ => parse(lang, bytes),
+        };
+        Some(Self::finish(parsed?, new.text, key, store))
+    }
+
+    /// Whether [`Highlighter::after`] can parse the next side from this
+    /// one: it's a tree, without the errors that rule reuse out. A host
+    /// holding both sides drops one that can't before the next side's
+    /// parse.
+    #[must_use]
+    pub fn can_seed(&self) -> bool {
+        matches!(self, Self::Tree(parsed) if !parsed.tree.root_node().has_error())
     }
 
     /// The spans of `lines` of `text`, the side this was prepared from.
@@ -460,6 +657,13 @@ impl Highlighter {
             Self::Cached(spans) => spans.slice(text, lines),
         }
     }
+}
+
+/// A side's whole-file spans from the cache, or on a miss the entry a
+/// parse may fill.
+enum Lookup<'c> {
+    Hit(Spans),
+    Miss(Option<(&'c Cache, Vec<u8>)>),
 }
 
 /// The version of what cached spans mean: bump it when [`role`] maps
@@ -492,36 +696,39 @@ pub struct FileSyntax {
 
 impl FileSyntax {
     /// Prepares both sides of a file, each in the language `grammars`
-    /// detects for it, on two threads when both are at least
-    /// [`PARALLEL_PARSE_BYTES`]. With `store`, large sides' spans go to
-    /// `cache` (see [`Highlighter::prepare`]).
+    /// detects for it: on two threads from scratch when both are at least
+    /// [`PARALLEL_PARSE_BYTES`], otherwise one after the other, the new
+    /// side from the old side's tree (see [`Highlighter::after`]; `hunks`
+    /// are the line diff's). With `store`, large sides' spans go to `cache`
+    /// (see [`Highlighter::prepare`]).
     #[must_use]
     pub fn new(
         grammars: &Registry,
         [old, new]: [Source; 2],
+        hunks: &[Hunk],
         cache: Option<&Cache>,
         store: bool,
     ) -> Self {
-        let parallel = old.text.bytes().len().min(new.text.bytes().len()) >= PARALLEL_PARSE_BYTES;
+        if old.text.bytes().len().min(new.text.bytes().len()) < PARALLEL_PARSE_BYTES {
+            let old_h = Highlighter::for_side(grammars, old, cache, store);
+            let seed = old_h.as_ref().map(|h| (h, old.text, hunks));
+            let new = Highlighter::after(grammars, new, seed, cache, store);
+            return Self { old: old_h, new };
+        }
         let old = || Highlighter::for_side(grammars, old, cache, store);
         let new = || Highlighter::for_side(grammars, new, cache, store);
-        let (old, new) = if parallel {
-            std::thread::scope(|s| {
-                let spawned = std::thread::Builder::new().spawn_scoped(s, old);
-                let new = new();
-                let old = match spawned {
-                    Ok(spawned) => spawned
-                        .join()
-                        .unwrap_or_else(|e| std::panic::resume_unwind(e)),
-                    // Out of threads: parse here, as `Scope::spawn` would panic.
-                    Err(_) => old(),
-                };
-                (old, new)
-            })
-        } else {
-            (old(), new())
-        };
-        Self { old, new }
+        std::thread::scope(|s| {
+            let spawned = std::thread::Builder::new().spawn_scoped(s, old);
+            let new = new();
+            let old = match spawned {
+                Ok(spawned) => spawned
+                    .join()
+                    .unwrap_or_else(|e| std::panic::resume_unwind(e)),
+                // Out of threads: parse here, as `Scope::spawn` would panic.
+                Err(_) => old(),
+            };
+            Self { old, new }
+        })
     }
 
     /// Neither side is highlighted.

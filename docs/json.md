@@ -93,7 +93,7 @@ A side is one of:
 |---|---|
 | `path` | The path on the new side, relative to the repository root (or to the compared folder), with `/` between directories. For a deletion, the path that was deleted. |
 | `old_path` | The path on the old side: the same as `path` unless the file was renamed. |
-| `status` | `added`, `deleted`, `modified`, `renamed`, `type_changed` (between regular file, symlink and submodule) or `untracked`. |
+| `status` | `added`, `deleted`, `modified`, `renamed`, `type_changed` (between regular file, symlink and submodule), `unmerged` (still conflicted in the index; the new side is the working-tree file, `new_mode` null when it's gone) or `untracked`. |
 | `similarity` | A rename's similarity, 0 to 100, as git computes it; `null` otherwise. |
 | `old_mode`, `new_mode` | The octal mode on each side (`100644`, `100755`, `120000`, `160000`); `null` for a side that doesn't exist. |
 | `binary` | A NUL byte in the first 8000 bytes of either side. The file then has no hunks. |

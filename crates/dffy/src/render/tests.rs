@@ -12,6 +12,7 @@ fn layout(split: bool, width: Option<usize>, wrap: bool) -> Layout {
         tab_width: 4,
         indicators: Indicators::Classic,
         one_sided: false,
+        unmerged: false,
         digits: 0,
         inline_signs: true,
         scroll: 0,
@@ -573,6 +574,30 @@ fn print_mode_stands_separators_for_unchanged_lines() {
             layout(false, Some(60), false)
         )
     );
+}
+
+#[test]
+fn conflict_markers_stand_out_in_unmerged_files_only() {
+    use dffy_core::git::Status;
+    let ours = "fn a() {}\n";
+    let worktree = "<<<<<<< ours\nfn a() {}\n||||||| base\nfn b() {}\n=======\nfn c() {}\n\
+                    >>>>>>> theirs\n======= not a marker\n<<<<<<<< eight\n";
+    insta::assert_snapshot!(
+        "conflict_markers",
+        print_file(
+            Status::Unmerged,
+            ours,
+            worktree,
+            layout(false, Some(60), false)
+        )
+    );
+    let modified = print_file(
+        Status::Modified,
+        ours,
+        worktree,
+        layout(true, Some(80), false),
+    );
+    assert!(!modified.contains("<warn>"), "{modified}");
 }
 
 /// The cells a mapped canvas traces back to code, one per glyph:

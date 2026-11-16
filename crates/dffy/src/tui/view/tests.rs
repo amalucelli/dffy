@@ -50,6 +50,7 @@ fn layout(split: bool, wrap: bool) -> Layout {
         tab_width: 4,
         indicators: Indicators::Classic,
         one_sided: false,
+        unmerged: false,
         digits: 0,
         inline_signs: false,
         scroll: 0,

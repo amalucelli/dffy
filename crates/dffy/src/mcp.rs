@@ -65,7 +65,7 @@ const TOOLS: &str = r#"[
 {
   "name": "changed_files",
   "title": "Changed files",
-  "description": "List the files a diff changes, without their content: path, status (added, deleted, modified, renamed, type_changed, untracked), lines added and removed, language. Start here: it's cheap even for thousands of files. Then call file_diff for the files that matter. Without range it lists uncommitted changes: HEAD against the working tree, staged and unstaged, untracked files included. Set syntax: true to classify each file as formatting_only (only whitespace or line breaks changed) or moved_only (code moved, not edited), so you can skip files without real edits; it diffs every file of the page. Paged: when next_cursor isn't null, call again with it as cursor and the same arguments. For very large ranges, counts: false lists files without reading them.",
+  "description": "List the files a diff changes, without their content: path, status (added, deleted, modified, renamed, type_changed, unmerged, untracked), lines added and removed, language. Start here: it's cheap even for thousands of files. Then call file_diff for the files that matter. Without range it lists uncommitted changes: HEAD against the working tree, staged and unstaged, untracked files included. Set syntax: true to classify each file as formatting_only (only whitespace or line breaks changed) or moved_only (code moved, not edited), so you can skip files without real edits; it diffs every file of the page. Paged: when next_cursor isn't null, call again with it as cursor and the same arguments. For very large ranges, counts: false lists files without reading them.",
   "inputSchema": {
     "type": "object",
     "properties": {
@@ -1086,6 +1086,7 @@ fn letter(status: &str) -> &'static str {
         "renamed" => "R",
         "type_changed" => "T",
         "untracked" => "?",
+        "unmerged" => "U",
         _ => "M",
     }
 }

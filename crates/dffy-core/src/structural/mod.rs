@@ -192,7 +192,7 @@ pub(crate) fn diff_with(
         });
     }
     let side = |text: &Text| {
-        let parsed = parse_tree(lang, text.bytes(), PARSE_BUDGET)?;
+        let parsed = parse_tree(lang, text.bytes(), PARSE_BUDGET, None)?;
         Some(Tree::build(&parsed, text.bytes()))
     };
     let (old_tree, new_tree, lines) = std::thread::scope(|s| {

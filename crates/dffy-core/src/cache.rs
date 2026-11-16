@@ -47,6 +47,9 @@ pub enum Kind {
     Structural = 3,
     /// A renderer plugin's answer for a file.
     Rendered = 4,
+    /// A shard of line counts by content (see [`crate::git::StatStore`]):
+    /// unlike the other kinds, rewritten as records are added.
+    Stats = 5,
 }
 
 /// A cache directory with a size budget.

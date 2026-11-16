@@ -16,7 +16,7 @@ use dffy_core::document::{
     self, File, NO_NEWLINE_LINE, diff_line, file_header, hunk_header, structural_note,
 };
 use dffy_core::git::{CommitInfo, DiffSpec, FileChange, FileDiff, Repo, Revisions, Status};
-use dffy_core::highlight::{HunkSyntax, Language, PARALLEL_PARSE_BYTES};
+use dffy_core::highlight::{Highlighter, HunkSyntax, Language, PARALLEL_PARSE_BYTES, Source};
 use dffy_core::patch::TextKind;
 use dffy_core::structural::{Structural, Unavailable};
 use dffy_core::view::{self, Arrangement, Heading, LineState, Row, Staging, no_newline};
@@ -267,6 +267,10 @@ impl Plan {
         let mut stats = Vec::new();
         let mut any = false;
         let mut first = true;
+        // Written when dropped, at the end of the run.
+        let stored = (self.summary == Summary::Stat)
+            .then(|| ctx.cache.clone().map(dffy_core::git::StatStore::new))
+            .flatten();
         let mut emit = |change: Option<FileChange>| -> Result<(), Error> {
             let Some(change) = change else {
                 return Ok(());
@@ -281,7 +285,10 @@ impl Plan {
                     any = true;
                 }
                 Summary::Stat => {
-                    let s = self.repo.stat(&change, options.whitespace)?;
+                    let s = match &stored {
+                        Some(stored) => stored.stat(&self.repo, &change, options.whitespace)?,
+                        None => self.repo.stat(&change, options.whitespace)?,
+                    };
                     let path = match &change.status {
                         Status::Renamed { from, .. } => stat::rename_name(from, &change.path),
                         _ => escape(&change.path),
@@ -495,25 +502,40 @@ impl FileOutput for Renderer<'_> {
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 let parallel = (others + 1) * 2 <= self.cores
                     && fd.old.bytes().len().min(fd.new.bytes().len()) >= PARALLEL_PARSE_BYTES;
-                both.map(|(side, ranges)| {
-                    let (tx, rx) = std::sync::mpsc::sync_channel(1);
-                    // Each side's spans go out as soon as they're computed,
-                    // so freeing its syntax tree overlaps the layout.
-                    let work = move || {
-                        let h = prepare().highlighter(side);
-                        let spans = h.as_ref().map(|h| {
-                            ranges
-                                .into_iter()
-                                .map(|r| h.spans(side.text, r))
-                                .collect::<Vec<_>>()
+                let spans = |h: Option<&Highlighter>, side: Source, ranges: Vec<Range<usize>>| {
+                    h.map(|h| {
+                        ranges
+                            .into_iter()
+                            .map(|r| h.spans(side.text, r))
+                            .collect::<Vec<_>>()
+                    })
+                };
+                if parallel {
+                    return both.map(|(side, ranges)| {
+                        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+                        // Each side's spans go out as soon as they're
+                        // computed, so freeing its syntax tree overlaps the
+                        // layout.
+                        s.spawn(move || {
+                            let h = prepare().highlighter(side);
+                            tx.send(spans(h.as_ref(), side, ranges)).ok();
                         });
-                        tx.send(spans).ok();
-                    };
-                    if parallel {
-                        s.spawn(work);
-                    } else {
-                        work();
-                    }
+                        rx
+                    });
+                }
+                // One after the other, the new side parsed from the old
+                // side's tree. A tree it can't be parsed from is freed
+                // before that parse, so two whole trees are never held.
+                let [(old, old_ranges), (new, new_ranges)] = both;
+                let old_h = prepare().highlighter(old);
+                let old_spans = spans(old_h.as_ref(), old, old_ranges);
+                let seed = old_h.filter(Highlighter::can_seed);
+                let from = seed.as_ref().map(|h| (h, old.text, fd.hunks.as_slice()));
+                let new_h = prepare().highlighter_after(new, from);
+                drop(seed);
+                [old_spans, spans(new_h.as_ref(), new, new_ranges)].map(|spans| {
+                    let (tx, rx) = std::sync::mpsc::sync_channel(1);
+                    tx.send(spans).ok();
                     rx
                 })
             });

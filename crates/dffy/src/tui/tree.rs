@@ -564,16 +564,34 @@ impl Tree {
         }
     }
 
-    /// The files on the rows the panel showed last.
-    pub(super) fn files_on_screen(&self) -> Vec<usize> {
-        self.rows
+    /// The files of rows `from..to`, as far as there are rows.
+    fn files_in(&self, from: usize, to: usize) -> impl Iterator<Item = usize> + '_ {
+        let to = to.min(self.rows.len());
+        self.rows[from.min(to)..to]
             .iter()
-            .skip(self.scroll)
-            .take(self.height)
             .filter_map(|r| match self.nodes[r.node].kind {
                 Kind::File(file) => Some(file),
                 Kind::Dir { .. } | Kind::Commit { .. } => None,
             })
+    }
+
+    /// The first row the panel showed last.
+    pub(super) fn scroll(&self) -> usize {
+        self.scroll
+    }
+
+    /// The files on the rows the panel showed last.
+    pub(super) fn files_on_screen(&self) -> impl Iterator<Item = usize> + '_ {
+        self.files_in(self.scroll, self.scroll + self.height)
+    }
+
+    /// [`Tree::files_on_screen`], then the files of a panel's height of
+    /// rows below them and above them, where a scroll goes next.
+    pub(super) fn files_near_screen(&self) -> Vec<usize> {
+        let (top, height) = (self.scroll, self.height);
+        self.files_on_screen()
+            .chain(self.files_in(top + height, top + 2 * height))
+            .chain(self.files_in(top.saturating_sub(height), top))
             .collect()
     }
 

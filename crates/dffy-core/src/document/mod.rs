@@ -1549,6 +1549,7 @@ pub fn file_status(status: &Status) -> FileStatus {
         Status::Modified => FileStatus::Modified,
         Status::TypeChange => FileStatus::TypeChange,
         Status::Untracked => FileStatus::Untracked,
+        Status::Unmerged => FileStatus::Unmerged,
         Status::Renamed { .. } => FileStatus::Renamed,
     }
 }
@@ -1672,6 +1673,7 @@ pub fn file_change(info: FileInfo) -> FileChange {
             new,
         ),
         FileStatus::TypeChange => (new_path, Status::TypeChange, old, new),
+        FileStatus::Unmerged => (new_path, Status::Unmerged, old, new),
         FileStatus::Modified | FileStatus::Combined => (new_path, Status::Modified, old, new),
     };
     FileChange {

@@ -14,7 +14,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use dffy_core::cache::Cache;
 use dffy_core::diff::{self, Hunk, LineKind, Options, Text, Unchanged, Whitespace};
 use dffy_core::document::{self, File};
-use dffy_core::git::{DiffSpec, FileChange, FileDiff, MAX_DIFF_BYTES, Repo, Status};
+use dffy_core::git::{DiffSpec, FileChange, FileDiff, MAX_DIFF_BYTES, Repo, StatStore, Status};
 use dffy_core::highlight::{HunkSyntax, Registry, Source};
 use dffy_core::structural::{Structural, Unavailable};
 use dffy_core::view::{Heading, Spans, line_bytes};
@@ -178,6 +178,9 @@ pub(crate) struct Files<'a> {
     summary: bool,
     grammars: &'a Registry,
     cache: Option<&'a Cache>,
+    /// A summary's counts, found in and kept in the disk cache; written
+    /// when the files are dropped.
+    stats: Option<StatStore>,
     totals: Totals,
 }
 
@@ -222,13 +225,17 @@ impl<'a> Files<'a> {
         detail: Detail,
         cache: Option<&'a Cache>,
     ) -> Self {
+        let summary = detail == Detail::Summary;
         Self {
             options,
             syntax_diff,
             highlights: detail == Detail::Highlights,
-            summary: detail == Detail::Summary,
+            summary,
             grammars: crate::grammars(),
             cache,
+            stats: cache
+                .filter(|_| summary && !syntax_diff)
+                .map(|c| StatStore::new(c.clone())),
             totals: Totals::default(),
         }
     }
@@ -304,7 +311,11 @@ impl Files<'_> {
         emit: &mut dyn FnMut(Vec<u8>) -> Result<(), Error>,
     ) -> Result<bool, Error> {
         let whitespace = self.options.whitespace;
-        let (stat, note) = match repo.stat(&change, whitespace) {
+        let stat = match &self.stats {
+            Some(stats) => stats.stat(repo, &change, whitespace),
+            None => repo.stat(&change, whitespace),
+        };
+        let (stat, note) = match stat {
             Ok(stat) => (Some(stat), None),
             Err(e @ dffy_core::git::Error::Io { .. }) => (None, Some(e.to_string())),
             Err(e) => return Err(e.into()),
@@ -643,6 +654,7 @@ fn file_fields(fd: &FileDiff, file: &FileFields, s: &mut String) {
         Status::Modified => "modified",
         Status::TypeChange => "type_changed",
         Status::Untracked => "untracked",
+        Status::Unmerged => "unmerged",
         Status::Renamed { .. } => "renamed",
     };
     s.push_str(r#"{"type":"file","path":"#);

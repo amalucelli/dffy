@@ -2,6 +2,7 @@
 
 use std::sync::Arc;
 
+use dffy_core::cache::Cache;
 use dffy_core::diff::Options;
 use dffy_core::diff::{Emphasis, Whitespace, emphasize};
 use dffy_core::document::{self, Counts, File, Prepare};
@@ -165,17 +166,32 @@ impl Frame {
     ///
     /// When the pool can't start or stops early.
     #[must_use]
+    pub fn count_pass(repo: &Repo, changes: Vec<FileChange>) -> Vec<(usize, usize)> {
+        Self::count_pass_cached(repo, changes, None)
+    }
+
+    /// [`Frame::count_pass`] with the counts found in and kept in `cache`,
+    /// written by the time it returns.
+    ///
+    /// # Panics
+    ///
+    /// When the pool can't start or stops early.
+    #[must_use]
     #[expect(
         clippy::expect_used,
         reason = "benchmark setup: without the pool there is nothing to measure"
     )]
-    pub fn count_pass(repo: &Repo, changes: Vec<FileChange>) -> Vec<(usize, usize)> {
+    pub fn count_pass_cached(
+        repo: &Repo,
+        changes: Vec<FileChange>,
+        cache: Option<Cache>,
+    ) -> Vec<(usize, usize)> {
         let (tx, rx) = std::sync::mpsc::channel();
         let settings = Settings {
             options: Options::default(),
             highlight: false,
             grammars: crate::grammars(),
-            cache: None,
+            cache,
         };
         let pool = Pool::new(Some(repo), &settings, &tx).expect("the pool starts");
         let mut counts = vec![(0, 0); changes.len()];
@@ -195,6 +211,7 @@ impl Frame {
                 }
             }
         }
+        pool.flush();
         counts
     }
 

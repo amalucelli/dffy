@@ -6,6 +6,7 @@
 )]
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::io::Write as _;
 use std::ops::ControlFlow;
 use std::path::Path;
 use std::process::Command;
@@ -67,6 +68,7 @@ fn letter(status: &Status) -> &'static str {
         Status::Modified => "M",
         Status::TypeChange => "T",
         Status::Untracked => "??",
+        Status::Unmerged => "U",
         Status::Renamed { .. } => "R",
     }
 }
@@ -396,6 +398,112 @@ fn staged_changes_stay_listed_with_their_staging() {
     let oracle = git_staging(d);
     assert_eq!(oracle.get("a.txt"), Some(&Staging::Partly));
     assert_eq!(oracle.get("c.txt"), Some(&Staging::Partly));
+}
+
+/// An index stopped mid-merge, built stage by stage with one path for each
+/// conflict `git status` names: both modified (`uu`), both added (`aa`),
+/// both deleted (`dd`, gone from disk), added by them (`ua`), added by us
+/// (`au`, and `gone`, missing on disk), deleted by them (`ud`, back to its
+/// committed content on disk).
+fn conflicted_repo() -> tempfile::TempDir {
+    let dir = init();
+    let d = dir.path();
+    for path in ["uu", "dd", "ud", "clean"] {
+        write(d, path, "base\n");
+    }
+    git(d, &["add", "-A"]);
+    git(d, &["commit", "-q", "-m", "base"]);
+    let blob = |content: &str| {
+        write(d, "blob", content);
+        git(d, &["hash-object", "-w", "blob"]).trim().to_owned()
+    };
+    let (base, ours, theirs) = (blob("base\n"), blob("ours\n"), blob("theirs\n"));
+    std::fs::remove_file(d.join("blob")).expect("rm");
+    git(d, &["rm", "-q", "--cached", "uu", "dd", "ud"]);
+    let stages = [
+        (&base, 1, "uu"),
+        (&ours, 2, "uu"),
+        (&theirs, 3, "uu"),
+        (&ours, 2, "aa"),
+        (&theirs, 3, "aa"),
+        (&base, 1, "dd"),
+        (&theirs, 3, "ua"),
+        (&ours, 2, "au"),
+        (&ours, 2, "gone"),
+        (&base, 1, "ud"),
+        (&ours, 2, "ud"),
+    ];
+    let mut child = Command::new("git")
+        .arg("-C")
+        .arg(d)
+        .args(["update-index", "--index-info"])
+        .stdin(std::process::Stdio::piped())
+        .spawn()
+        .expect("git runs");
+    let mut stdin = child.stdin.take().expect("stdin");
+    for (id, stage, path) in stages {
+        writeln!(stdin, "100644 {id} {stage}\t{path}").expect("feed stages");
+    }
+    drop(stdin);
+    assert!(child.wait().expect("git exits").success());
+    write(
+        d,
+        "uu",
+        "<<<<<<< ours\nours\n||||||| base\nbase\n=======\ntheirs\n>>>>>>> theirs\n",
+    );
+    write(
+        d,
+        "aa",
+        "<<<<<<< ours\nours\n=======\ntheirs\n>>>>>>> theirs\n",
+    );
+    std::fs::remove_file(d.join("dd")).expect("rm");
+    write(d, "ua", "theirs\n");
+    write(d, "au", "ours\n");
+    dir
+}
+
+/// Every unmerged path is one `U` row in every diff that involves the
+/// index, whatever its stages and working-tree file (git's plain diff adds
+/// an `M` row for some, and `git diff HEAD` names none of them `U`), with
+/// the working-tree file as its new side and both columns of `git status`
+/// for its staging.
+#[test]
+fn unmerged_paths_are_listed_once_as_u() {
+    let dir = conflicted_repo();
+    let d = dir.path();
+    let repo = Repo::discover(d).expect("repo");
+    let unmerged = diff_name_status(d, &["--cached"]);
+    assert_eq!(unmerged.len(), 7, "{unmerged:?}");
+    let mut worktree = diff_name_status(d, &[]);
+    worktree.dedup_by(|a, b| a.1 == b.1);
+    assert_eq!(worktree, unmerged);
+
+    let oracle = git_staging(d);
+    let specs = [
+        DiffSpec::IndexToWorktree { untracked: true },
+        repo.resolve(&[], true, false).expect("spec"),
+        repo.resolve(&["HEAD"], false, false).expect("spec"),
+        repo.resolve(&[], false, false).expect("spec"),
+    ];
+    for spec in specs {
+        let changes = collect(&repo, &spec, &[]);
+        assert_eq!(ours(&changes), unmerged, "{spec:?}");
+        for change in changes {
+            if matches!(spec, DiffSpec::Uncommitted { .. }) {
+                assert_eq!(
+                    change.staging,
+                    oracle.get(&change.path.to_string()).copied()
+                );
+            }
+            assert_eq!(change.clone().reversed().status, Status::Unmerged);
+            let fd = repo
+                .file_diff(change, &Options::default())
+                .expect("both sides load");
+            if fd.change.path == "uu" {
+                assert!(fd.new.bytes().starts_with(b"<<<<<<< ours\n"), "{spec:?}");
+            }
+        }
+    }
 }
 
 /// Gives `path` an mtime its index entry doesn't have, so the scan has to

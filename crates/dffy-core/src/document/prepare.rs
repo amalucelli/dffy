@@ -26,7 +26,8 @@ pub type SyntaxSlot = Arc<OnceLock<FileSyntax>>;
 /// for each gap whose lines it draws, and [`Prepare::structural`] for the
 /// files on screen while the syntax diff is on. Print streams a file
 /// without building a [`File`]: [`super::whitespace_only`], a
-/// [`Prepare::highlighter`] per side on threads it schedules,
+/// [`Prepare::highlighter`] per side on threads it schedules, or on one
+/// thread the old side's then [`Prepare::highlighter_after`],
 /// [`Prepare::structural`] when asked, then [`pair`].
 #[derive(Clone, Copy)]
 pub struct Prepare<'a> {
@@ -58,7 +59,7 @@ impl Prepare<'_> {
     /// spans go to the cache.
     #[must_use]
     pub fn syntax(&self, diff: &FileDiff, store: bool) -> FileSyntax {
-        FileSyntax::new(self.grammars, sources(diff), self.cache, store)
+        FileSyntax::new(self.grammars, sources(diff), &diff.hunks, self.cache, store)
     }
 
     /// One side prepared for highlighting, without storing its spans in the
@@ -67,6 +68,18 @@ impl Prepare<'_> {
     #[must_use]
     pub fn highlighter(&self, side: Source) -> Option<Highlighter> {
         Highlighter::for_side(self.grammars, side, self.cache, false)
+    }
+
+    /// The new side `side` prepared for highlighting from the old side's
+    /// highlighter, text and the line diff's hunks, without storing its
+    /// spans in the cache (see [`Highlighter::after`]).
+    #[must_use]
+    pub fn highlighter_after(
+        &self,
+        side: Source,
+        old: Option<(&Highlighter, &Text, &[Hunk])>,
+    ) -> Option<Highlighter> {
+        Highlighter::after(self.grammars, side, old, self.cache, false)
     }
 
     /// The emphasis of hunk `hunk` of `diff`, and its syntax spans when

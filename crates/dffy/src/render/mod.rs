@@ -337,6 +337,9 @@ pub(crate) struct Layout {
     /// The file exists on one side only (added, untracked or deleted): one
     /// full-width pane with one column of line numbers, even when split.
     pub one_sided: bool,
+    /// The file is unmerged: conflict markers among its added and
+    /// unchanged lines take the warning color, over syntax colors.
+    pub unmerged: bool,
     /// Columns for line numbers across a whole file, so they line up from
     /// hunk to hunk; 0 sizes them per hunk (a piped diff's file lengths are
     /// unknown).
@@ -388,9 +391,30 @@ impl Layout {
                 status,
                 FileStatus::Added | FileStatus::Untracked | FileStatus::Deleted
             ),
+            unmerged: status == FileStatus::Unmerged,
             digits: if lines == 0 { 0 } else { digits(lines) },
             ..self
         }
+    }
+
+    /// Whether `line` is a conflict marker git wrote into an unmerged file:
+    /// seven `<`, `|`, `=` or `>`, then the end of the line or a space and
+    /// a label (`=======` takes none). Removed lines never count.
+    fn conflict_marker(&self, line: &Line) -> bool {
+        if !self.unmerged || !matches!(line.state.kind(), Kind::Context | Kind::Added) {
+            return false;
+        }
+        let Some(&c @ (b'<' | b'|' | b'=' | b'>')) = line.text.first() else {
+            return false;
+        };
+        line.text
+            .get(..7)
+            .is_some_and(|run| run.iter().all(|&b| b == c))
+            && match line.text.get(7) {
+                None => true,
+                Some(b' ') => c != b'=',
+                Some(_) => false,
+            }
     }
 
     /// Columns of each line number; 0 without line numbers.
@@ -476,7 +500,10 @@ impl Layout {
 
     pub(crate) fn file_header(&self, h: &FileHeader, c: &mut Canvas) {
         let status = h.status.word();
-        let label = match h.staging.filter(|_| h.status != FileStatus::Untracked) {
+        let label = match h
+            .staging
+            .filter(|_| !matches!(h.status, FileStatus::Untracked | FileStatus::Unmerged))
+        {
             Some(staging) => format!("{status} · {}: ", stat::staging_word(staging)),
             None => format!("{status}: "),
         };
@@ -582,6 +609,19 @@ impl Layout {
         c: &mut Canvas,
     ) {
         let w = self.number_width(header);
+        let line = |i| {
+            let l = line(i);
+            if self.conflict_marker(&l) {
+                Line {
+                    emphasis: &[],
+                    syntax: None,
+                    paint: &[],
+                    ..l
+                }
+            } else {
+                l
+            }
+        };
         match row {
             view::Row::Header => self.hunk_header(header, c),
             view::Row::Line(i) => unified::line(self, w, &line(i), c),
@@ -806,8 +846,29 @@ impl LineStyle {
 /// changed line's text always takes the line role, whose background
 /// carries the change. With the layout's `modified_lines`, a paired line
 /// takes the modified roles, and only its changed tokens keep the removed
-/// or added color.
+/// or added color. An unmerged file's conflict markers are in the warning
+/// color whatever else they are.
 fn line_style(line: &Line, layout: &Layout) -> LineStyle {
+    if layout.conflict_marker(line) {
+        let added = line.state.kind() == Kind::Added;
+        let role = if added {
+            Role::ConflictMarker
+        } else {
+            Role::Warn
+        };
+        return LineStyle {
+            text: role,
+            emph: role,
+            sign: role,
+            number: if added {
+                Role::AddedNumber
+            } else {
+                Role::LineNumber
+            },
+            sign_char: if added { '+' } else { ' ' },
+            changed: added,
+        };
+    }
     let indicators = layout.indicators;
     let unchanged = |role, sign_char| LineStyle {
         text: role,

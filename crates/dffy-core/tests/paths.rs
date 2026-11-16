@@ -62,6 +62,7 @@ fn listing(repo: &Repo) -> Vec<String> {
                 Status::Modified => "M",
                 Status::TypeChange => "T",
                 Status::Untracked => "?",
+                Status::Unmerged => "U",
                 Status::Renamed { .. } => "R",
             };
             format!("{letter} {}", c.path)

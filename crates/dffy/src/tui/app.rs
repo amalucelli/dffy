@@ -274,6 +274,9 @@ pub(crate) struct App {
     pane: Pane,
     /// The count pass should be (re)started for the current list.
     count_pass: bool,
+    /// The tree's first row when the count pass last started, to start it
+    /// again with the files scrolled into view first.
+    count_scroll: Option<usize>,
     /// Each language a listed file has, by path, in the order they first
     /// came, and how many of them went to the pool to compile ahead.
     languages: Vec<Language>,
@@ -332,6 +335,7 @@ impl App {
             tab_width: config.tab_width,
             indicators,
             one_sided: false,
+            unmerged: false,
             digits: 0,
             inline_signs: false,
             scroll: 0,
@@ -412,6 +416,7 @@ impl App {
                 || (config.tree == TreeMode::Auto && width >= SIDE_TREE_WIDTH),
             pane: Pane::Diff,
             count_pass: false,
+            count_scroll: None,
             languages,
             prepared: 0,
             help: None,
@@ -676,6 +681,7 @@ impl App {
             tab_width: self.tab_width,
             indicators: self.indicators,
             one_sided: false,
+            unmerged: false,
             digits: 0,
             inline_signs: false,
             scroll: if self.wrap { 0 } else { self.scroll },
@@ -1052,17 +1058,30 @@ impl App {
     }
 
     /// The count pass to start, once per list and only while the tree
-    /// shows: the files on screen in the tree first, then the rest in
-    /// order.
+    /// shows: the files on screen in the tree first, then those near them,
+    /// then the rest in order. Started again when the tree scrolls to files
+    /// not counted yet.
     pub(crate) fn take_count_pass(&mut self) -> Option<Vec<Counted>> {
-        if !self.count_pass || !self.tree_shown || self.enumerating {
+        if !self.tree_shown || self.enumerating {
+            return None;
+        }
+        let files = self.doc.document.files();
+        let scrolled = self
+            .count_scroll
+            .is_some_and(|row| row != self.tree.scroll())
+            && self
+                .tree
+                .files_on_screen()
+                .any(|f| files.get(f).is_some_and(view::Entry::wants_counts));
+        if !self.count_pass && !scrolled {
             return None;
         }
         self.count_pass = false;
-        let files = self.doc.document.files();
-        let mut first = self.tree.files_on_screen();
-        first.retain(|&f| files.get(f).is_some_and(view::Entry::wants_counts));
-        let rest = (0..files.len()).filter(|f| files[*f].wants_counts() && !first.contains(f));
+        self.count_scroll = Some(self.tree.scroll());
+        let mut first = self.tree.files_near_screen();
+        let mut wanted: Vec<bool> = files.iter().map(view::Entry::wants_counts).collect();
+        first.retain(|&f| wanted.get_mut(f).is_some_and(std::mem::take));
+        let rest = (0..files.len()).filter(|&f| wanted[f]);
         Some(
             first
                 .iter()
@@ -3211,7 +3230,9 @@ fn heading(app: &App) -> Option<Heading> {
     let staging = entry
         .change()
         .staging
-        .filter(|_| !commit && entry.change().status != Status::Untracked)
+        .filter(|_| {
+            !commit && !matches!(entry.change().status, Status::Untracked | Status::Unmerged)
+        })
         .map(crate::render::stat::staging_word);
     let path = escape(&entry.change().path);
     let (dir, name) = match path.rfind('/') {
@@ -5465,6 +5486,53 @@ mod tests {
             .collect();
         app.event(Event::Diffed(Done::Counts { counts }));
         app
+    }
+
+    /// The count pass starts with the files on the tree's screen, then a
+    /// screen's worth below and above them, and starts again with what's on
+    /// screen when the tree scrolls to files not counted yet.
+    #[test]
+    fn the_count_pass_starts_where_the_tree_shows() {
+        let mut app = App::new(
+            &Config::default(),
+            Theme::default_theme(),
+            "range".to_owned(),
+            None,
+            (200, 12),
+            Indicators::Classic,
+        );
+        for i in 0..80 {
+            app.event(Event::Enumerated(diff(&format!("f{i:02}")).change));
+        }
+        app.event(Event::EnumerationDone(None));
+        screen(&mut app);
+        app.tree.scroll_by(20);
+        screen(&mut app);
+        let shown: Vec<usize> = app.tree.files_on_screen().collect();
+        let (top, height) = (shown[0], shown.len());
+        let pass = |app: &mut App| -> Option<Vec<usize>> {
+            Some(app.take_count_pass()?.iter().map(|f| f.0).collect())
+        };
+        let first = pass(&mut app).expect("a pass once the list is complete");
+        let near: Vec<usize> = (top..top + 2 * height).chain(top - height..top).collect();
+        assert_eq!(first[..near.len()], near[..]);
+        assert_eq!(first.len(), 80);
+        assert_eq!(pass(&mut app), None, "started again unasked");
+
+        let counts = near
+            .iter()
+            .map(|&f| (f, app.version(f), Counts::default()))
+            .collect();
+        app.event(Event::Diffed(Done::Counts { counts }));
+        app.tree.scroll_by(height.cast_signed());
+        screen(&mut app);
+        assert_eq!(pass(&mut app), None, "scrolled to files already counted");
+        app.tree.scroll_by((2 * height).cast_signed());
+        screen(&mut app);
+        let shown: Vec<usize> = app.tree.files_on_screen().collect();
+        let again = pass(&mut app).expect("scrolled to files not counted");
+        assert_eq!(again[..shown.len()], shown[..]);
+        assert_eq!(again.len(), 80 - near.len());
     }
 
     fn typed(app: &mut App, text: &str) {

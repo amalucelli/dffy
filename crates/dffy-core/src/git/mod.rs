@@ -7,6 +7,7 @@ mod changes;
 mod paths;
 mod rename;
 mod spec;
+mod stats;
 mod status;
 mod tree;
 mod worktree;
@@ -23,6 +24,7 @@ pub use changes::{ChangeSet, Update};
 pub use gix::ObjectId;
 pub use paths::{Compare, Endpoint};
 pub use spec::{DiffSpec, Revisions};
+pub use stats::StatStore;
 pub(crate) use status::excludes_file;
 
 use crate::diff::{self, Hunk, Options, Text};
@@ -225,6 +227,14 @@ pub enum Status {
     /// [`DiffSpec::Uncommitted`] and for [`DiffSpec::IndexToWorktree`] with
     /// `untracked` set.
     Untracked,
+    /// Has conflict stages in the index, from a merge, rebase or
+    /// cherry-pick that stopped. Reported once in every diff of the index
+    /// or the working tree, whatever the sides. The new side is the
+    /// working-tree file, `None` when it's gone; the old side is what the
+    /// diff compares against: the tree, or for
+    /// [`DiffSpec::IndexToWorktree`] the stage that stands for the index
+    /// (ours, then the base, then theirs).
+    Unmerged,
     /// A deletion at `from` and an addition at the change's path, paired by
     /// [`Repo::detect_renames`]. `similarity` is git's percentage: 100 for
     /// identical content.
@@ -242,7 +252,8 @@ pub struct FileChange {
     /// Repository-relative, `/`-separated. An untracked nested repository is
     /// reported as its directory with a [`Mode::Gitlink`] side.
     pub path: BString,
-    /// Derived from the sides, or set by rename detection.
+    /// Derived from the sides, except for unmerged paths and the renames
+    /// rename detection pairs.
     pub status: Status,
     /// Where the old content is; `None` for additions and untracked files.
     pub old: Option<Side>,
@@ -269,9 +280,16 @@ impl FileChange {
         }
     }
 
+    fn unmerged(path: BString, old: Option<Side>, new: Option<Side>) -> Self {
+        Self {
+            status: Status::Unmerged,
+            ..Self::new(path, old, new)
+        }
+    }
+
     /// The same change seen backwards (`git diff -R`): sides swapped, so
     /// additions become deletions and renames go the other way. Untracked
-    /// files read as deletions.
+    /// files read as deletions; unmerged paths stay unmerged.
     #[must_use]
     pub fn reversed(self) -> Self {
         let staging = self.staging;
@@ -285,6 +303,11 @@ impl FileChange {
                 old: self.new,
                 new: self.old,
                 staging,
+            },
+            Status::Unmerged => Self {
+                old: self.new,
+                new: self.old,
+                ..self
             },
             _ => Self {
                 staging,

@@ -565,6 +565,8 @@ pub enum FileStatus {
     Untracked,
     /// A merge's combined diff (`diff --cc`), passed through unpaired.
     Combined,
+    /// Still conflicted in the index, shown against the working-tree file.
+    Unmerged,
 }
 
 impl FileStatus {
@@ -580,6 +582,7 @@ impl FileStatus {
             Self::TypeChange => "type changed",
             Self::Untracked => "untracked file",
             Self::Combined => "merged",
+            Self::Unmerged => "conflicted",
         }
     }
 }

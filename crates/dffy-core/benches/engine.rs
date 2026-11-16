@@ -79,6 +79,12 @@ fn main() {
         eprintln!("DFFY_BENCH_REPO unset, skipping benchmarks");
         return;
     }
+    // glibc serves allocations above its mmap threshold with fresh pages,
+    // faulted in on every use, and raises the threshold to the size of a
+    // freed mapped block. dffy reads many blobs before it diffs any one, so
+    // freeing one large block here puts the benchmarks' multi-megabyte
+    // buffers on the reused heap, as in a real run.
+    drop(std::hint::black_box(vec![0_u8; 16 << 20]));
     divan::main();
 }
 

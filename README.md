@@ -19,7 +19,7 @@ dffy main..HEAD        # any revision git understands
 brew install --cask amalucelli/tap/dffy
 # or
 curl -fsSL https://raw.githubusercontent.com/amalucelli/dffy/main/install.sh | sh
-# plus the experimental Markdown renderer: … | sh -s -- --plugin markdown
+# plus the experimental renderers: … | sh -s -- --plugin markdown --plugin mermaid
 ```
 
 Then try it in any repository: `dffy HEAD~10`.
@@ -55,6 +55,7 @@ It fits into how you already work. Every action is a single key, the layout adap
 
 **Git**
 - 🧾 [Staged, unstaged and untracked](docs/git.md#staged-unstaged-and-untracked) changes in one view, or [any revision](docs/usage.md#what-to-compare).
+- ⚔️ [Conflicted files](docs/git.md#staged-unstaged-and-untracked) from a merge, rebase or cherry-pick, with their conflict markers highlighted.
 - 📟 Works as [git's pager](docs/git.md#as-gits-pager), [`git add -p` filter](docs/git.md#git-add--p) and [difftool](docs/git.md#git-difftool).
 - 📁 [Compares files and folders](docs/usage.md#comparing-files-and-folders) outside a repository too.
 
@@ -62,7 +63,11 @@ It fits into how you already work. Every action is a single key, the layout adap
 - 📱 [Works on phones over SSH](docs/viewer.md#phones-and-small-screens), with plain-letter keys and a frameless layout.
 - 🖱️ [Mouse selection](docs/viewer.md#selection-and-copy) that copies over SSH.
 - 🎨 [16 themes](docs/themes.md) and a [config file](docs/config.md) for your dotfiles.
-- 🧩 [Renderer plugins](docs/plugins.md) (experimental), such as Markdown diffed as rendered text.
+- 🧩 [Renderer plugins](docs/plugins.md) (experimental): Markdown diffed as rendered text, and Mermaid flowcharts and sequence diagrams drawn in the terminal.
+
+**Scripts and agents**
+- 🧱 [`--json`](docs/json.md): the diff as JSON Lines, with each line's kind and whether it moved or was only reformatted.
+- 🤖 [`dffy mcp`](docs/mcp.md): an MCP server that lets coding agents list a change's files and read its diffs a page at a time.
 
 ## Usage
 
@@ -77,6 +82,8 @@ dffy a.txt b.txt            # two files or folders, no repository needed
 dffy --watch                # refresh on every change
 dffy --syntax v6.0 v6.1     # diff by syntax
 dffy --stat main..          # also --name-only, --name-status, --exit-code
+dffy --json main..          # JSON Lines for scripts and agents
+dffy mcp                    # an MCP server for coding agents
 ```
 
 With git:
@@ -125,6 +132,7 @@ As git's pager, `dffy` streams the whole 48MB patch in 3.0MB of its own memory, 
 
 `dffy` is written in Rust.
 
+- 📚 [A library at its core](docs/architecture.md#crates), `dffy-core`: the diff model the viewer, printed output, JSON and the MCP server all share.
 - 🧮 [Its own diff engine](docs/architecture.md#the-engine): histogram and syntax-aware diffs, renames matching git's.
 - 🖼️ [Its own terminal renderer](docs/architecture.md#the-renderer), with no TUI framework. A full frame takes about 200µs.
 - 🌊 [Streamed input and output](docs/architecture.md#data-flow), so the first screen doesn't wait for the whole diff.
@@ -132,7 +140,7 @@ As git's pager, `dffy` streams the whole 48MB patch in 3.0MB of its own memory, 
 
 ## Docs
 
-The [documentation](docs/README.md) covers every key, flag and setting: [installation](docs/install.md), [usage](docs/usage.md), [the viewer](docs/viewer.md), [keys](docs/keys.md), [configuration](docs/config.md), [themes](docs/themes.md), [git integration](docs/git.md), [watch mode](docs/watch.md), [renderer plugins](docs/plugins.md), [troubleshooting](docs/troubleshooting.md), [architecture](docs/architecture.md) and [benchmarks](docs/benchmarks.md).
+The [documentation](docs/README.md) covers every key, flag and setting: [installation](docs/install.md), [usage](docs/usage.md), [the viewer](docs/viewer.md), [keys](docs/keys.md), [configuration](docs/config.md), [themes](docs/themes.md), [git integration](docs/git.md), [watch mode](docs/watch.md), [renderer plugins](docs/plugins.md), [JSON output](docs/json.md), [the MCP server](docs/mcp.md), [troubleshooting](docs/troubleshooting.md), [architecture](docs/architecture.md) and [benchmarks](docs/benchmarks.md).
 
 ## License
 

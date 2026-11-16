@@ -16,11 +16,12 @@ use std::cmp::Ordering;
 use std::collections::HashSet;
 
 use dffy_core::bstr::{BString, ByteSlice};
+use dffy_core::document::Counts;
 use dffy_core::view::Attributes;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use super::fuzzy;
-use super::view::{Counts, Entry};
+use super::view::Entry;
 use crate::render::{escape, stat};
 use crate::term::Grid;
 use crate::theme::{Role, Style, Theme};
@@ -132,7 +133,7 @@ impl Totals {
         };
         for e in files.iter().filter(|e| !e.is_commit()) {
             t.files += 1;
-            match e.counts {
+            match e.counts() {
                 Some(c) => {
                     t.added += c.added;
                     t.removed += c.removed;
@@ -360,9 +361,9 @@ impl Tree {
         };
         for (i, e) in files.iter().enumerate() {
             if e.is_commit() {
-                self.insert_commit(i, &e.change.path);
+                self.insert_commit(i, &e.change().path);
             } else {
-                self.insert(i, &e.change.path);
+                self.insert(i, &e.change().path);
             }
         }
         self.stale = true;
@@ -870,11 +871,11 @@ impl Tree {
             }
             Kind::File(file) => {
                 let entry = &files[file];
-                let dim = entry.viewed;
+                let dim = entry.viewed();
                 let (letter, role) = stat::status_letter(entry.status());
                 let x = grid.put_str(x, line, end, letter, style(role, dim)) + 1;
                 let name = escape(&self.nodes[row.node].name);
-                let (stats_x, counts) = place_counts(entry.counts, (x, end), totals);
+                let (stats_x, counts) = place_counts(entry.counts(), (x, end), totals);
                 let room = stats_x.saturating_sub(x + 1);
                 let shown = fit_left(&name, room);
                 // The filter's matches, when the name shows whole.
@@ -952,10 +953,11 @@ pub(super) fn fit_left(path: &str, max: usize) -> String {
 
 #[cfg(test)]
 mod tests {
+    use dffy_core::document::{Document, Source};
     use dffy_core::git::{FileChange, Mode, Side, Status};
 
     use super::*;
-    use crate::tui::view::Doc;
+    use crate::tui::piped::Body;
 
     fn change(path: &str, status: Status) -> FileChange {
         let side = Some(Side::Worktree {
@@ -979,30 +981,15 @@ mod tests {
     /// A path, its status and its counts when known.
     type Listed<'a> = (&'a str, Status, Option<(usize, usize)>);
 
-    fn files(list: &[Listed]) -> Vec<Entry> {
-        let layout = crate::render::Layout {
-            split: false,
-            width: Some(80),
-            wrap: false,
-            words: false,
-            tab_width: 4,
-            indicators: crate::config::Indicators::Classic,
-            one_sided: false,
-            digits: 0,
-            inline_signs: false,
-            scroll: 0,
-            line_numbers: true,
-            hunk_headers: true,
-            modified_lines: true,
-        };
-        let mut doc = Doc::new(layout, 10);
+    fn files(list: &[Listed]) -> Document<Body> {
+        let mut doc = Document::default();
         for (i, (path, status, counts)) in list.iter().enumerate() {
-            doc.push(change(path, status.clone()), crate::tui::view::Source::Repo);
+            doc.push(change(path, status.clone()), Source::Repo);
             if let Some((added, removed)) = *counts {
                 doc.set_counts(i, Counts { added, removed });
             }
         }
-        doc.files
+        doc
     }
 
     fn draw(tree: &mut Tree, files: &[Entry], height: usize) -> String {
@@ -1024,7 +1011,7 @@ mod tests {
             .join("\n")
     }
 
-    fn sample(counted: bool) -> Vec<Entry> {
+    fn sample(counted: bool) -> Document<Body> {
         let n = |a, r| counted.then_some((a, r));
         files(&[
             ("README.md", Status::Modified, n(3, 1)),
@@ -1038,16 +1025,17 @@ mod tests {
     fn tree_of(files: &[Entry]) -> Tree {
         let mut tree = Tree::default();
         for (i, e) in files.iter().enumerate() {
-            tree.insert(i, &e.change.path);
+            tree.insert(i, &e.change().path);
         }
         tree
     }
 
     #[test]
     fn single_child_folders_compact_and_directories_collapse() {
-        let files = sample(true);
-        let mut tree = tree_of(&files);
-        insta::assert_snapshot!(draw(&mut tree, &files, 10), @r"
+        let files_doc = sample(true);
+        let files = files_doc.files();
+        let mut tree = tree_of(files);
+        insta::assert_snapshot!(draw(&mut tree, files, 10), @r"
         ┌ Files · 5 +615 -165 ───────────┐
         │ M README.md            +3   -1 │
         │ ▼ crates/dffy/src/tui/         │
@@ -1062,7 +1050,7 @@ mod tests {
         // Down to the chain's row, then collapse it.
         tree.step(1);
         tree.set_open(false);
-        insta::assert_snapshot!(draw(&mut tree, &files, 10), @r"
+        insta::assert_snapshot!(draw(&mut tree, files, 10), @r"
         ┌ Files · 5 +615 -165 ───────────┐
         │ M README.md            +3   -1 │
         │ ▶ crates/dffy/src/tui/         │
@@ -1084,15 +1072,18 @@ mod tests {
     #[test]
     fn a_large_count_arriving_mid_pass_moves_nothing() {
         let mut files = sample(false);
-        let mut tree = tree_of(&files);
-        let before = draw(&mut tree, &files, 10);
+        let mut tree = tree_of(files.files());
+        let before = draw(&mut tree, files.files(), 10);
         // app.rs, counted while the others aren't yet: shown in thousands
         // within the placeholder.
-        files[1].counts = Some(Counts {
-            added: 12345,
-            removed: 0,
-        });
-        let after = draw(&mut tree, &files, 10);
+        files.set_counts(
+            1,
+            Counts {
+                added: 12345,
+                removed: 0,
+            },
+        );
+        let after = draw(&mut tree, files.files(), 10);
         for (a, b) in before.lines().zip(after.lines()).skip(1) {
             if b.contains("app.rs") {
                 assert_eq!(b, "│   M app.rs           +12k      │");
@@ -1105,10 +1096,12 @@ mod tests {
 
     #[test]
     fn counts_arriving_never_move_names() {
-        let unknown = sample(false);
-        let known = sample(true);
-        let mut tree = tree_of(&known);
-        let (before, after) = (draw(&mut tree, &unknown, 10), draw(&mut tree, &known, 10));
+        let unknown_doc = sample(false);
+        let unknown = unknown_doc.files();
+        let known_doc = sample(true);
+        let known = known_doc.files();
+        let mut tree = tree_of(known);
+        let (before, after) = (draw(&mut tree, unknown, 10), draw(&mut tree, known, 10));
         for (a, b) in before.lines().zip(after.lines()).skip(1) {
             // Everything left of the counts column is the same.
             let cut = |s: &str| s.chars().take(20).collect::<String>();
@@ -1130,17 +1123,18 @@ mod tests {
 
     #[test]
     fn a_selected_row_leaves_a_zero_count_blank_in_the_row_style() {
-        let files = sample(true);
-        let mut tree = tree_of(&files);
+        let files_doc = sample(true);
+        let files = files_doc.files();
+        let mut tree = tree_of(files);
         // tree.rs: +480, no deletions.
         tree.step(4);
         let mut grid = Grid::new(34, 10);
         let theme = Theme::default_theme();
-        let totals = Totals::of(&files, false);
+        let totals = Totals::of(files, false);
         tree.draw(
             &mut grid,
             (0, 10, 34),
-            &files,
+            files,
             &totals,
             false,
             true,
@@ -1188,12 +1182,13 @@ mod tests {
     /// blocks of color.
     #[test]
     fn the_selected_row_lifts_its_background_and_keeps_letter_and_count_colors() {
-        let files = sample(true);
-        let mut tree = tree_of(&files);
+        let files_doc = sample(true);
+        let files = files_doc.files();
+        let mut tree = tree_of(files);
         tree.step(4);
         let source = crate::theme::dump("dracula").expect("built-in");
         let theme = Theme::parse("dracula", &source, &mut Vec::new());
-        let totals = Totals::of(&files, false);
+        let totals = Totals::of(files, false);
         let rows: Vec<String> = [true, false]
             .into_iter()
             .map(|focused| {
@@ -1201,7 +1196,7 @@ mod tests {
                 tree.draw(
                     &mut grid,
                     (0, 10, 34),
-                    &files,
+                    files,
                     &totals,
                     false,
                     focused,
@@ -1236,10 +1231,11 @@ mod tests {
 
     #[test]
     fn the_filter_keeps_matching_files_and_their_folders() {
-        let files = sample(true);
-        let mut tree = tree_of(&files);
+        let files_doc = sample(true);
+        let files = files_doc.files();
+        let mut tree = tree_of(files);
         tree.set_filter("TREE");
-        insta::assert_snapshot!(draw(&mut tree, &files, 6), @r"
+        insta::assert_snapshot!(draw(&mut tree, files, 6), @r"
         ┌ Files · 1/5 · tree ────────────┐
         │ ▼ crates/dffy/src/tui/         │
         │   A tree.rs          +480      │
@@ -1251,18 +1247,19 @@ mod tests {
 
     #[test]
     fn a_title_too_long_drops_whole_totals_deletions_first() {
-        let files = files(&[("a.rs", Status::Modified, Some((1_234_567, 7_654_321)))]);
-        let mut tree = tree_of(&files);
+        let files_doc = files(&[("a.rs", Status::Modified, Some((1_234_567, 7_654_321)))]);
+        let files = files_doc.files();
+        let mut tree = tree_of(files);
         let titles: Vec<String> = [34, 24, 20, 12]
             .into_iter()
             .map(|width| {
                 let mut grid = Grid::new(width, 4);
-                let totals = Totals::of(&files, false);
+                let totals = Totals::of(files, false);
                 let theme = Theme::default_theme();
                 tree.draw(
                     &mut grid,
                     (0, 4, width),
-                    &files,
+                    files,
                     &totals,
                     false,
                     true,

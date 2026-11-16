@@ -11,7 +11,7 @@ The workspace has two crates, plus `xtask` for the benchmark tooling. The experi
 
 ### `dffy-core`
 
-The engine: git access, diffing, highlighting. It has no terminal code and doesn't assume which process hosts it.
+The engine: git access, diffing, highlighting, and the document a frontend shows. It has no terminal code and doesn't assume which process hosts it.
 
 | Module | What it owns |
 |---|---|
@@ -28,6 +28,7 @@ The engine: git access, diffing, highlighting. It has no terminal code and doesn
 | `view` | What a frontend draws, short of how it looks: a hunk's lines and their states (modified, moved, reformatted), headers, rows in the split or unified arrangement, syntax runs and paint, hunk headings. No widths, colors or cells. |
 | `structural` | The syntax-aware diff: anchoring, per-region matching, the result cache. |
 | `highlight` | tree-sitter highlighting of the requested lines; the grammar registry (`Registry`), which the host builds and passes in, with the 18 bundled grammars as `Registry::builtin`. |
+| `document` | A diff as a frontend shows it, one file at a time. `Document` holds every entry (files, and a piped log's commits) with its diff once prepared, revealed lines, counts, version, saved position and rendered view; the position, and navigation by row, change and file; the syntax-diff, full-text and rendered toggles; eviction of least recently shown diffs; the search's matches; and `Document::missing`, the work the rows about to be shown still lack. Moves that need the host's screen come back as a `Settle` the host finishes. `File` is one entry's diff: its parts (hunks and gaps of unchanged lines), rows per arrangement, gap reveal, the overview's marks, search, and rendered views' mapping to their source. `File::prepare` is the per-file work, split per file, hunk and gap so a host runs only what it draws. No I/O and no threads: the host fetches content and schedules the work. Uses `git`, `highlight`, `structural` and `cache`; none of them use it. |
 | `watch` | The file watcher: inotify and FSEvents backends, coalescing, ignore rules, polling. |
 | `cache` | The content-addressed disk cache shared by every dffy process. |
 | `suggest` | Closest-name suggestions for "did you mean" hints. |
@@ -45,7 +46,7 @@ The `dffy` binary: CLI, printed output, pager mode, the viewer and the watch bro
 | `docs` | The generated reference pages (`dffy config --markdown`). |
 | `theme` | Roles, themes and tints. |
 | `output` | Terminal facts, color decisions, stdout or a pager process. |
-| `print` | Printed output from the repository, streamed file by file. |
+| `print` | Printed output from the repository, streamed file by file: the threads and output budget around the core's per-file steps, and laying each file out. |
 | `no_index` | When two arguments are paths to compare rather than revisions, and what the comparison is called (`git difftool`'s temporary copies included). |
 | `pager` | Pager mode: the stdin reader and line splitting, streaming the core's `patch` events into rendered rows, and `--color-only`. |
 | `plugin` | Renderer plugins: the `render` setting, finding `dffy-render-<name>` on `PATH`, running one with a timeout, the protocol's JSON. |
@@ -61,8 +62,8 @@ The viewer's submodules, under `tui`:
 | Submodule | What it owns |
 |---|---|
 | `app` | State and event handling. |
-| `view` | One file's rows. `view::rendered` turns a renderer's blocks into a view. |
-| `worker` | Diffs and renderings off the UI thread. |
+| `view` | The screen over the core's `Document`: rows' heights when wrapping, scrolling and keeping the screen full, opening a file a few rows above its first change, drawing, the overview column, selections and the mouse. `view::rendered` turns a renderer's blocks into a rendered `File`. |
+| `worker` | The pool that runs the core's per-file work (what `Document::missing` names for the rows drawn), diffs and renderings off the UI thread. |
 | `tree`, `picker`, `commands`, `help` | The file tree, the file picker, the command panel, the key list. |
 | `chrome` | The frame. |
 | `piped` | Diffs from a pipe: the reader thread, its backpressure, and the spill file that keeps patches out of memory until drawn. |
@@ -82,9 +83,9 @@ The viewer never waits for the whole diff.
 
 1. A change-set thread lists changed files in git's path order and sends them as they're found. For a range that's a tree merge-join; for the working tree, a parallel stat scan of the index, then the untracked walk. The first files paint before the scan finishes.
 2. Once the list is complete, the rename pass pairs deletions with additions and updates the list in place.
-3. A worker pool diffs a file when it's about to be drawn, then computes emphasis and highlighting for the hunks on screen only. The syntax diff, when on, runs on the files on screen after the line diff has painted. When idle, the pool counts every file's lines for the tree.
+3. A worker pool diffs a file when it's about to be drawn, then computes emphasis and highlighting for the hunks on screen only, as the core's `Document::missing` names them for the rows drawn. The syntax diff, when on, runs on the files on screen after the line diff has painted. When idle, the pool counts every file's lines for the tree.
 4. Rendering touches only the rows drawn. A view's position is anchored to a row of a hunk instead of a screen row, so loading a diff, resizing or switching layout never measures a whole file.
-5. Renderer plugins run last, and only when asked. With the rendered view on, a worker sends the file shown to its renderer once its line diff is loaded. The answer's blocks are diffed as units (`diff::unit_hunks`) into an ordinary view (`view::rendered`) that takes the line diff's place. Without a `render` setting, nothing about renderers happens.
+5. Renderer plugins run last, and only when asked. With the rendered view on, a worker sends the file shown to its renderer once its line diff is loaded. The answer's blocks are diffed as units (`diff::unit_hunks`) into an ordinary `document::File` (built by `view::rendered`) that takes the line diff's place. Without a `render` setting, nothing about renderers happens.
 
 ### Printed output
 

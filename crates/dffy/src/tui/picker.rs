@@ -6,16 +6,17 @@
 //! query only narrows the last result, so typing stays fast on large
 //! lists; only the rows on screen are drawn.
 
+use dffy_core::document::Source;
 use unicode_width::UnicodeWidthStr;
 
 use super::fuzzy::score;
-use super::view::{Entry, Source};
+use super::view::Entry;
 use crate::render::{Canvas, escape, stat, thousands};
 use crate::theme::Role;
 
 /// What the picker lists for an entry: its path, or `None` for a commit.
 fn label(entry: &Entry) -> Option<String> {
-    (!entry.is_commit()).then(|| escape(&entry.change.path))
+    (!entry.is_commit()).then(|| escape(&entry.change().path))
 }
 
 /// Whether the list is still growing, for the header.
@@ -233,7 +234,7 @@ impl Picker {
         // `+N` right-aligned in one, `-N` in the next, zeros left blank.
         let width_of = |n: usize| if n > 0 { n.to_string().len() + 1 } else { 0 };
         let columns = shown().fold((0, 0), |(a, r), (_, &(_, f))| {
-            let counts = files[f].counts.unwrap_or_default();
+            let counts = files[f].counts().unwrap_or_default();
             (
                 a.max(width_of(counts.added)),
                 r.max(width_of(counts.removed)),
@@ -265,7 +266,7 @@ impl Picker {
         c.push(Role::Plain, " ");
         let mut used = 3;
         let commit = commits.partition_point(|&e| e <= file).checked_sub(1);
-        if let Some(Source::Commit(commit)) = commit.map(|i| &files[commits[i]].source)
+        if let Some(Source::Commit(commit)) = commit.map(|i| files[commits[i]].source())
             && let Some(id) = &commit.id
         {
             let short = &id[..id.len().min(7)];
@@ -273,7 +274,7 @@ impl Picker {
             c.push(Role::Plain, " ");
             used += short.len() + 1;
         }
-        let counts = entry.counts.unwrap_or_default();
+        let counts = entry.counts().unwrap_or_default();
         let field = |w: usize| if w > 0 { w + 1 } else { 0 };
         let right = field(columns.0) + field(columns.1);
         let path = label(entry).unwrap_or_default();
@@ -390,9 +391,9 @@ mod tests {
                 new: None,
                 staging: None,
             };
-            doc.push(change, Source::Repo);
+            doc.document.push(change, Source::Repo);
         }
-        let files = &doc.files;
+        let files = doc.document.files();
         let started = std::time::Instant::now();
         let mut picker = Picker::new(files);
         eprintln!("open: {:?}", started.elapsed());
@@ -440,7 +441,7 @@ mod tests {
             new: None,
             staging: None,
         };
-        doc.push(change, Source::Repo);
+        doc.document.push(change, Source::Repo);
     }
 
     /// Files listed while the picker is open are matched as they come and
@@ -448,20 +449,20 @@ mod tests {
     #[test]
     fn files_that_arrive_later_are_merged_in() {
         let mut doc = doc(&["src/one.rs", "src/two.rs"]);
-        let mut picker = Picker::new(&doc.files);
-        picker.push(&doc.files, 'r');
-        picker.push(&doc.files, 's');
+        let mut picker = Picker::new(doc.document.files());
+        picker.push(doc.document.files(), 'r');
+        picker.push(doc.document.files(), 's');
         picker.step(1);
         assert_eq!(picker.file(), Some(1));
         // Shorter, so it scores higher.
         push(&mut doc, "rs");
         push(&mut doc, "docs/readme.md");
-        picker.catch_up(&doc.files);
+        picker.catch_up(doc.document.files());
         let order: Vec<usize> = picker.matches.iter().map(|&(_, f)| f).collect();
         assert_eq!(order, [2, 0, 1]);
         assert_eq!(picker.file(), Some(1), "still on src/two.rs");
         assert_eq!(picker.total, 4);
-        let header = picker.rows(&doc.files, &[], (60, 10), Progress::Reading);
+        let header = picker.rows(doc.document.files(), &[], (60, 10), Progress::Reading);
         let text: String = header[0]
             .0
             .rows()

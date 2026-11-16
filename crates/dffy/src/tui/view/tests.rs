@@ -1,10 +1,12 @@
 use std::fmt::Write as _;
 
-use dffy_core::diff::{Options, Text, emphasize, hunks};
+use dffy_core::diff::{Options, Text, Whitespace, emphasize, hunks};
+use dffy_core::document::State;
 use dffy_core::git::{FileChange, FileDiff, Mode, Side, Status};
 
 use super::*;
 use crate::config::Indicators;
+use crate::print;
 use crate::theme::Role;
 
 const OLD: &str = "fn main() {\n    let total = count + 1;\n    println!(\"{total}\");\n}\n\
@@ -65,11 +67,11 @@ fn doc_of(fd: FileDiff, layout: Layout, height: usize) -> Doc {
         .map(|h| emphasize(&fd.old, &fd.new, h))
         .collect();
     let mut doc = Doc::new(layout, height);
-    doc.push(fd.change.clone(), Source::Repo);
+    doc.document.push(fd.change.clone(), Source::Repo);
     load(&mut doc, 0, fd);
-    let diff = Arc::clone(doc.diff_of(0).expect("loaded"));
+    let diff = Arc::clone(doc.document.diff_of(0).expect("loaded"));
     for (hunk, e) in emphasis.into_iter().enumerate() {
-        doc.set_emphasis(0, &diff, hunk, e, None);
+        doc.document.set_emphasis(0, &diff, hunk, e, None);
     }
     doc
 }
@@ -141,8 +143,17 @@ fn split_grid() {
 /// the cache once.
 #[test]
 fn rows_are_kept_for_each_arrangement() {
-    let starts = |doc: &mut Doc| -> Vec<usize> {
-        (1..doc.parts(0)).flat_map(|p| doc.starts(0, p)).collect()
+    let starts = |doc: &mut Doc| -> Vec<Pos> {
+        let (layout, shown) = (doc.file_layout(0), doc.document.pos);
+        doc.document.top();
+        let mut starts = Vec::new();
+        while let Some(Settle::Land(at)) = doc.document.next_change(arrange(&layout)) {
+            doc.document.pos = at;
+            doc.document.landed(at);
+            starts.push(at);
+        }
+        doc.document.pos = shown;
+        starts
     };
     let opened = |split: bool| {
         let mut doc = doc(layout(split, false), 7);
@@ -152,7 +163,7 @@ fn rows_are_kept_for_each_arrangement() {
     assert_ne!(split.1, unified.1, "the arrangements' rows differ");
     let mut doc = doc(layout(true, false), 7);
     assert_eq!((screen(&mut doc), starts(&mut doc)), split);
-    let before = doc.loaded_bytes;
+    let before = doc.document.loaded_bytes();
     let mut sizes = Vec::new();
     for on in [false, true, false, true] {
         doc.layout.split = on;
@@ -163,11 +174,11 @@ fn rows_are_kept_for_each_arrangement() {
             *expected,
             "split {on}"
         );
-        sizes.push(doc.loaded_bytes);
+        sizes.push(doc.document.loaded_bytes());
     }
     assert!(sizes[0] > before);
     assert!(sizes.iter().all(|&s| s == sizes[0]), "{sizes:?}");
-    assert_eq!(doc.loaded(0).map(|l| l.bytes), Some(sizes[0]));
+    assert_eq!(doc.document.file(0).map(File::bytes), Some(sizes[0]));
 }
 
 #[test]
@@ -284,7 +295,7 @@ fn scrolling_moves_one_screen_row_at_a_time_through_wrapped_rows() {
     assert_eq!(rows, expected[expected.len() - height..]);
     doc.scroll(-100);
     assert_eq!(
-        doc.pos,
+        doc.document.pos,
         Pos {
             part: 1,
             ..Pos::default()
@@ -309,13 +320,13 @@ fn an_empty_document_ignores_moves_and_draws_nothing() {
         doc.draw(&mut grid, 0, 60, 0, &Theme::default_theme(), 1),
         0..0
     );
-    assert_eq!(doc.pos, Pos::default());
+    assert_eq!(doc.document.pos, Pos::default());
 }
 
 #[test]
 fn change_and_file_jumps() {
     let mut doc = doc(layout(false, false), 3);
-    doc.push(diff().change, Source::Repo);
+    doc.document.push(diff().change, Source::Repo);
     doc.next_change();
     let (_, rows) = grid_rows(&mut doc, &Theme::default_theme());
     assert!(rows[0].contains("-│     let total"), "{rows:?}");
@@ -326,19 +337,30 @@ fn change_and_file_jumps() {
     // Past the last change, the next file opens; it isn't diffed yet, so
     // at its top until it is.
     assert_eq!(doc.next_change(), Some(1));
-    assert_eq!((doc.pos.file, doc.pos.part, doc.pos.row), (1, 0, 0));
+    assert_eq!(
+        (
+            doc.document.pos.file,
+            doc.document.pos.part,
+            doc.document.pos.row
+        ),
+        (1, 0, 0)
+    );
     // Back, the previous file opens at its last change.
     assert_eq!(doc.prev_change(), Some(0));
     let (_, rows) = grid_rows(&mut doc, &Theme::default_theme());
     assert!(rows[0].contains("// a comment"), "{rows:?}");
     // Each file keeps its place.
     doc.next_file();
-    assert_eq!(doc.pos.file, 1);
+    assert_eq!(doc.document.pos.file, 1);
     doc.prev_file();
     let (_, rows) = grid_rows(&mut doc, &Theme::default_theme());
     assert!(rows[0].contains("// a comment"), "{rows:?}");
-    doc.top();
-    assert_eq!((doc.pos.file, doc.pos.part), (0, 1), "the first hunk");
+    doc.document.top();
+    assert_eq!(
+        (doc.document.pos.file, doc.document.pos.part),
+        (0, 1),
+        "the first hunk"
+    );
     assert_eq!(doc.line_at_top(), 1);
 }
 
@@ -348,17 +370,29 @@ fn change_and_file_jumps() {
 #[test]
 fn shift_n_into_a_file_not_diffed_yet_lands_on_its_last_change_when_it_arrives() {
     let mut doc = Doc::new(layout(false, false), 3);
-    doc.push(diff().change, Source::Repo);
-    doc.push(file_diff("src/zz.rs", OLD, NEW).change, Source::Repo);
+    doc.document.push(diff().change, Source::Repo);
+    doc.document
+        .push(file_diff("src/zz.rs", OLD, NEW).change, Source::Repo);
     let load = |doc: &mut Doc, file: usize| {
-        let fd = file_diff(&doc.files[file].change.path.to_string(), OLD, NEW);
+        let fd = file_diff(
+            &doc.document.files()[file].change().path.to_string(),
+            OLD,
+            NEW,
+        );
         load(doc, file, fd);
     };
     load(&mut doc, 1);
     doc.goto_file(1);
     assert_eq!(doc.next_change(), None);
     assert_eq!(doc.prev_change(), Some(0));
-    assert_eq!((doc.pos.file, doc.pos.part, doc.pos.row), (0, 0, 0));
+    assert_eq!(
+        (
+            doc.document.pos.file,
+            doc.document.pos.part,
+            doc.document.pos.row
+        ),
+        (0, 0, 0)
+    );
     load(&mut doc, 0);
     let (_, rows) = grid_rows(&mut doc, &Theme::default_theme());
     assert!(rows[0].contains("-│ // a comment"), "{rows:?}");
@@ -370,13 +404,13 @@ fn shift_n_into_a_file_not_diffed_yet_lands_on_its_last_change_when_it_arrives()
 #[test]
 fn scrolling_stops_at_the_edges_of_the_file_shown() {
     let mut doc = doc(layout(false, false), 4);
-    doc.push(diff().change, Source::Repo);
+    doc.document.push(diff().change, Source::Repo);
     doc.scroll(1000);
-    assert_eq!(doc.pos.file, 0);
+    assert_eq!(doc.document.pos.file, 0);
     doc.goto_file(1);
     doc.scroll(-1000);
     assert_eq!(
-        doc.pos,
+        doc.document.pos,
         Pos {
             file: 1,
             ..Pos::default()
@@ -570,19 +604,25 @@ fn revealing_lines_keeps_a_gap_line_at_the_top() {
     };
     let mut doc = opened();
     let mut tops = vec![top_after(&mut doc, "x")];
-    let row = doc.pos.row;
+    let row = doc.document.pos.row;
     assert!(doc.expand_target());
     tops.push(top_after(&mut doc, "x again"));
-    assert_ne!(doc.pos.row, row, "the line moved down the gap's rows");
+    assert_ne!(
+        doc.document.pos.row, row,
+        "the line moved down the gap's rows"
+    );
 
     let mut doc = opened();
     tops.push(top_after(&mut doc, "x"));
     doc.toggle_full();
     tops.push(top_after(&mut doc, "X on"));
-    assert_ne!(doc.pos.row, row, "the line moved down the gap's rows");
+    assert_ne!(
+        doc.document.pos.row, row,
+        "the line moved down the gap's rows"
+    );
     doc.toggle_full();
     tops.push(top_after(&mut doc, "X off"));
-    assert_eq!(doc.pos.row, row);
+    assert_eq!(doc.document.pos.row, row);
 
     let mut doc = doc_of(long_diff(), layout(false, false), 8);
     doc.toggle_full();
@@ -606,7 +646,8 @@ fn late_diff() -> FileDiff {
 }
 
 fn load(doc: &mut Doc, file: usize, fd: FileDiff) {
-    assert!(doc.load(file, Ok(Box::new(Loaded::new(fd, Whitespace::Exact, None)))));
+    let loaded = File::prepare(crate::grammars(), None).file(fd, Whitespace::Exact, false);
+    assert!(doc.load(file, Ok(Box::new(loaded))));
 }
 
 /// The first time a file shows, in its full text, the view starts a few
@@ -616,9 +657,9 @@ fn load(doc: &mut Doc, file: usize, fd: FileDiff) {
 fn a_file_opens_at_its_first_change_and_keeps_its_place_after() {
     for loaded_first in [false, true] {
         let mut doc = Doc::new(layout(false, false), 20);
-        doc.full = true;
-        doc.push(diff().change, Source::Repo);
-        doc.push(late_diff().change, Source::Repo);
+        doc.document.full = true;
+        doc.document.push(diff().change, Source::Repo);
+        doc.document.push(late_diff().change, Source::Repo);
         load(&mut doc, 0, diff());
         if loaded_first {
             load(&mut doc, 1, late_diff());
@@ -635,15 +676,15 @@ fn a_file_opens_at_its_first_change_and_keeps_its_place_after() {
         assert_eq!(doc.next_change(), None);
         assert_eq!(doc.line_at_top(), 450);
         doc.scroll(30);
-        let left = doc.pos;
+        let left = doc.document.pos;
         doc.prev_file();
         doc.next_file();
-        assert_eq!(doc.pos, left, "restored");
+        assert_eq!(doc.document.pos, left, "restored");
         // A reload (a refresh, the cache cap) doesn't move it either.
-        doc.files[1].stale = true;
+        doc.document.restale();
         load(&mut doc, 1, late_diff());
-        assert_eq!(doc.pos, left, "not moved by a reload");
-        doc.top();
+        assert_eq!(doc.document.pos, left, "not moved by a reload");
+        doc.document.top();
         assert_eq!(doc.line_at_top(), 1, "g still goes to the top");
     }
 }
@@ -677,14 +718,14 @@ fn a_change_on_the_first_screen_keeps_the_top() {
     };
     for (fd, full) in [(late_diff(), false), (added, true), (long_diff(), true)] {
         let mut doc = Doc::new(layout(false, false), 20);
-        doc.full = full;
-        doc.push(fd.change.clone(), Source::Repo);
+        doc.document.full = full;
+        doc.document.push(fd.change.clone(), Source::Repo);
         load(&mut doc, 0, fd);
         let top = Pos {
-            part: doc.first_part(0),
+            part: doc.document.first_part(0),
             ..Pos::default()
         };
-        assert_eq!(doc.pos, top, "full {full}");
+        assert_eq!(doc.document.pos, top, "full {full}");
     }
 }
 
@@ -764,12 +805,12 @@ fn background_tints_give_moved_code_its_own_hue() {
     let mut theme = Theme::default_theme();
     theme.tint(crate::theme::DARK_BACKGROUND);
     let mut doc = doc_of(fd, layout, 6);
-    let State::Loaded(loaded) = &doc.files[0].state else {
+    let State::Loaded(loaded) = doc.document.files()[0].state() else {
         panic!("loaded");
     };
-    let diff = Arc::clone(&loaded.diff);
-    assert!(doc.set_structural(0, &diff, Some(structural)));
-    doc.structural = true;
+    let diff = Arc::clone(loaded.diff());
+    assert!(doc.document.set_structural(0, &diff, Some(structural)));
+    doc.document.structural = true;
     let mut grid = Grid::new(60, 6);
     doc.draw(&mut grid, 0, 60, 0, &theme, 1);
     insta::assert_snapshot!("tints_moved", backgrounds(&grid, 1..4));
@@ -930,7 +971,7 @@ fn the_context_is_the_hunk_or_heading_the_top_row_is_in() {
     // Revealed unchanged lines: git's kind of heading, the nearest line
     // above that starts with a letter.
     doc.toggle_full();
-    doc.top();
+    doc.document.top();
     doc.scroll(20);
     assert!(
         screen(&mut doc).starts_with("19 19  │ line 19"),
@@ -956,14 +997,14 @@ fn each_scroll_step_moves_the_code_one_row() {
         let mut grid = Grid::new(60, HEIGHT);
         doc.draw(&mut grid, 0, 60, 0, &theme, 1);
         let rows: Vec<String> = (0..HEIGHT).map(|y| grid.row_text(y)).collect();
-        (rows, doc.pos)
+        (rows, doc.document.pos)
     };
     for full in [false, true] {
         let mut doc = doc_of(long_diff(), layout(false, false), HEIGHT);
         if full {
             doc.toggle_full();
         }
-        let top = doc.pos;
+        let top = doc.document.pos;
         let mut moves = 0;
         for delta in [1, -1] {
             let mut before = frame(&mut doc);
@@ -990,7 +1031,7 @@ fn each_scroll_step_moves_the_code_one_row() {
             moves > if full { 100 } else { 6 },
             "{moves} moves, full {full}"
         );
-        assert_eq!(doc.pos, top, "back at the top, full {full}");
+        assert_eq!(doc.document.pos, top, "back at the top, full {full}");
     }
 }
 
@@ -1052,21 +1093,21 @@ fn the_file_shown_in_place_of_one_gone_keeps_its_place_on_reload() {
     let spec = repo.resolve(&[], false, false).expect("spec");
     let mut set = ChangeSet::new(repo.clone(), spec, Revisions::default(), &[], false);
     let mut doc = Doc::new(layout(false, false), 20);
-    doc.full = true;
+    doc.document.full = true;
     set.enumerate(|change| {
-        doc.push(change, Source::Repo);
+        doc.document.push(change, Source::Repo);
         ControlFlow::Continue(())
     })
     .expect("enumerate");
     let diff = |file: usize, doc: &Doc| {
-        let change = doc.files[file].change.clone();
+        let change = doc.document.files()[file].change().clone();
         repo.file_diff(change, &Options::default()).expect("diff")
     };
     for file in [0, 1] {
         let fd = diff(file, &doc);
         load(&mut doc, file, fd);
     }
-    assert_eq!(doc.pos.file, 0);
+    assert_eq!(doc.document.pos.file, 0);
 
     std::fs::write(d.join("a.txt"), "one\n").expect("write");
     let update = set
@@ -1074,12 +1115,15 @@ fn the_file_shown_in_place_of_one_gone_keeps_its_place_on_reload() {
         .expect("refresh")
         .expect("changed");
     doc.replace(&update);
-    assert_eq!(doc.files[doc.pos.file].change.path, "z.txt");
+    assert_eq!(
+        doc.document.files()[doc.document.pos.file].change().path,
+        "z.txt"
+    );
     assert_eq!(doc.line_at_top(), 397, "opened at its first change");
     doc.scroll(20);
-    let left = doc.pos;
-    doc.files[0].stale = true;
+    let left = doc.document.pos;
+    doc.document.restale();
     let fd = diff(0, &doc);
     load(&mut doc, 0, fd);
-    assert_eq!(doc.pos, left);
+    assert_eq!(doc.document.pos, left);
 }

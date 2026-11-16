@@ -4,15 +4,21 @@ use std::sync::Arc;
 
 use dffy_core::diff::Options;
 use dffy_core::diff::{Emphasis, Whitespace, emphasize};
+use dffy_core::document::{self, Counts, File, Prepare};
 use dffy_core::git::{FileChange, FileDiff, Repo};
-use dffy_core::highlight::{FileSyntax, HunkSyntax};
+use dffy_core::highlight::HunkSyntax;
 
 use crate::config::{Config, Indicators};
-use crate::print;
 use crate::term::{Input, Key, Mods};
 use crate::theme::Theme;
 use crate::tui::worker::{Job, Pool, Settings};
-use crate::tui::{App, Counts, Done, Event, Loaded};
+use crate::tui::{App, Done, Event};
+
+/// The core's per-file work as the viewer's workers run it, without the
+/// disk cache.
+fn prepare() -> Prepare<'static> {
+    File::prepare(crate::grammars(), None)
+}
 
 /// The TUI showing one file diff, drawing frames without a terminal.
 pub struct Frame {
@@ -63,8 +69,8 @@ impl Frame {
             (width, height),
             Indicators::Bars,
         );
-        let loaded = Loaded::new(diff, Whitespace::Exact, highlight.then(crate::grammars));
-        let diff = Arc::clone(&loaded.diff);
+        let loaded = prepare().file(diff, Whitespace::Exact, highlight);
+        let diff = Arc::clone(loaded.diff());
         let version = app.version(0);
         app.event(Event::Diffed(Done::Diff {
             file: 0,
@@ -91,14 +97,8 @@ impl Frame {
     #[must_use]
     pub fn prepare(diff: FileDiff, highlight: bool, structural: bool) -> usize {
         let hunks = emphases(&diff, highlight);
-        std::hint::black_box(
-            structural.then(|| print::structural_diff(crate::grammars(), &diff, None)),
-        );
-        std::hint::black_box(Loaded::new(
-            diff,
-            Whitespace::Exact,
-            highlight.then(crate::grammars),
-        ));
+        std::hint::black_box(structural.then(|| prepare().structural(&diff)));
+        std::hint::black_box(prepare().file(diff, Whitespace::Exact, highlight));
         hunks.len()
     }
 
@@ -150,7 +150,7 @@ impl Frame {
         app.event(Event::Diffed(Done::Diff {
             file,
             version,
-            result: Ok(Box::new(Loaded::new(diff, Whitespace::Exact, None))),
+            result: Ok(Box::new(prepare().file(diff, Whitespace::Exact, false))),
         }));
         for _ in 0..file {
             app.event(Event::Input(Input::Key(Key::Char('f'), Mods::NONE)));
@@ -207,8 +207,8 @@ impl Frame {
     /// found the way the viewer's workers find them for the diff search.
     #[must_use]
     pub fn search(diff: &FileDiff, pattern: &str) -> usize {
-        let needle = crate::tui::view::Needle::new(pattern);
-        crate::tui::view::find(diff, None, &needle, || false).map_or(0, |m| m.list.len())
+        let needle = document::Needle::new(pattern);
+        document::find(diff, None, &needle, || false).map_or(0, |m| m.list.len())
     }
 
     /// Does the diff search's scan of the file shown on this thread, as a
@@ -225,7 +225,7 @@ impl Frame {
                 ..
             } = job
             {
-                let matches = crate::tui::view::find(&diff, Some(&hidden), &needle, || false);
+                let matches = document::find(&diff, Some(&hidden), &needle, || false);
                 self.app.event(Event::Diffed(Done::Found {
                     file,
                     version,
@@ -269,8 +269,7 @@ impl Frame {
 /// Every hunk's emphasis and, with `highlight`, its syntax spans, as the
 /// workers compute them.
 fn emphases(diff: &FileDiff, highlight: bool) -> Vec<(Vec<Emphasis>, Option<HunkSyntax>)> {
-    let syntax =
-        highlight.then(|| FileSyntax::new(crate::grammars(), print::sources(diff), None, false));
+    let syntax = highlight.then(|| prepare().syntax(diff, false));
     diff.hunks
         .iter()
         .map(|h| match &syntax {

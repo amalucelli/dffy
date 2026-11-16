@@ -31,7 +31,6 @@ use dffy_core::git::{ChangeSet, FileChange, Repo, Revisions, Update};
 use dffy_core::watch::{Change, Notice, Plain, Root, Watcher};
 
 pub(crate) use app::{Action, App};
-pub(crate) use view::{Counts, Loaded};
 pub(crate) use worker::Done;
 
 use crate::daemon::client::{self, Subscription};

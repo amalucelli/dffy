@@ -11,17 +11,15 @@ use std::path::{Component, Path, PathBuf};
 
 use dffy_core::bstr::{BString, ByteSlice};
 use dffy_core::cache::Cache;
-use dffy_core::diff::{self, Hunk, LineKind, Options, Text, Whitespace, emphasize_with};
-use dffy_core::git::{
-    CommitInfo, DiffSpec, FileChange, FileDiff, Mode, Repo, Revisions, Side, Status,
+use dffy_core::diff::{self, Hunk, Options, Text, emphasize_with};
+use dffy_core::document::{
+    self, File, NO_NEWLINE_LINE, diff_line, file_header, hunk_header, structural_note,
 };
-use dffy_core::highlight::{Highlighter, HunkSyntax, PARALLEL_PARSE_BYTES, Registry, Source};
+use dffy_core::git::{CommitInfo, DiffSpec, FileChange, FileDiff, Repo, Revisions, Status};
+use dffy_core::highlight::{HunkSyntax, PARALLEL_PARSE_BYTES, Registry};
 use dffy_core::patch::TextKind;
-use dffy_core::structural::{self, Structural, Unavailable};
-use dffy_core::view::{
-    self, Arrangement, FileHeader, FileStatus, Heading, HunkHeader, Line, LineState, Row, Staging,
-    display_text, line_bytes, no_newline,
-};
+use dffy_core::structural::{Structural, Unavailable};
+use dffy_core::view::{self, Arrangement, Heading, LineState, Row, Staging, no_newline};
 
 use crate::config::DefaultDiff;
 use crate::output::Output;
@@ -431,8 +429,9 @@ impl Renderer<'_> {
         sizes: Option<[u64; 2]>,
         emit: &mut dyn FnMut(Vec<u8>) -> Result<(), Error>,
     ) -> Result<bool, Error> {
+        let prepare = File::prepare(self.grammars, self.cache);
         let mut fd = self.diff(repo, change, sizes)?;
-        if whitespace_only(&fd, self.options.whitespace) {
+        if document::whitespace_only(&fd, self.options.whitespace) {
             return Ok(false);
         }
         std::thread::scope(|s| {
@@ -440,19 +439,9 @@ impl Renderer<'_> {
                 let shown = |range: fn(&Hunk) -> Range<usize>| -> Vec<_> {
                     fd.hunks.iter().map(range).collect()
                 };
-                // Built field by field, as the hunks are paired while the
-                // sides parse.
-                let change = &fd.change;
-                let old = Source {
-                    path: change.old_path().as_bytes(),
-                    text: &fd.old,
-                    id: cache_id(change.old),
-                };
-                let new = Source {
-                    path: change.path.as_bytes(),
-                    text: &fd.new,
-                    id: cache_id(change.new),
-                };
+                // Of the sides' fields alone, as the hunks are paired while
+                // the sides parse.
+                let [old, new] = document::side_sources(&fd.change, &fd.old, &fd.new);
                 let both = [
                     (old, shown(|h| h.old_start..h.old_start + h.old_len)),
                     (new, shown(|h| h.new_start..h.new_start + h.new_len)),
@@ -470,7 +459,7 @@ impl Renderer<'_> {
                     // Each side's spans go out as soon as they're computed,
                     // so freeing its syntax tree overlaps the layout.
                     let work = move || {
-                        let h = Highlighter::for_side(self.grammars, side, self.cache, false);
+                        let h = prepare.highlighter(side);
                         let spans = h.as_ref().map(|h| {
                             ranges
                                 .into_iter()
@@ -487,22 +476,15 @@ impl Renderer<'_> {
                     rx
                 })
             });
-            let structural = self
-                .syntax_diff
-                .then(|| structural_diff(self.grammars, &fd, self.cache))
-                .flatten();
+            let structural = self.syntax_diff.then(|| prepare.structural(&fd)).flatten();
             // A syntax diff pairs its lines itself. Pairing finds the
             // emphasis on the way, kept when no syntax tokens will replace
             // it.
-            let mut plain = Vec::new();
-            if !matches!(structural, Some(Ok(_))) {
-                for hunk in &mut fd.hunks {
-                    let emphasis = diff::pair(&fd.old, &fd.new, hunk);
-                    if pending.is_none() {
-                        plain.push(emphasis);
-                    }
-                }
-            }
+            let mut plain = if matches!(structural, Some(Ok(_))) {
+                Vec::new()
+            } else {
+                document::pair(&fd.old, &fd.new, &mut fd.hunks, pending.is_none())
+            };
             let syntax = pending.map(|sides| {
                 let [old, new] = sides.map(|rx| rx.recv().ok().flatten().unwrap_or_default());
                 self.parsing
@@ -902,7 +884,7 @@ fn output_len(rendered: &Rendered) -> usize {
 /// A `--name-status` line: the letter (with the score for a rename), then
 /// the path or paths.
 fn name_status(change: &FileChange, c: &mut Canvas) {
-    let (letter, role) = stat::status_letter(file_status(&change.status));
+    let (letter, role) = stat::status_letter(document::file_status(&change.status));
     c.push(role, letter);
     if let Status::Renamed { from, similarity } = &change.status {
         c.push(role, &format!("{similarity:03}"));
@@ -911,171 +893,6 @@ fn name_status(change: &FileChange, c: &mut Canvas) {
     }
     c.push(Role::Plain, "\t");
     c.line(Role::Plain, &escape(&change.path));
-}
-
-/// With `-w`/`-b`, a file whose changes are all whitespace has no hunks and
-/// is left out, as git does. One with a note (a read or a filter failed)
-/// stays, to show it.
-pub(crate) fn whitespace_only(fd: &FileDiff, whitespace: Whitespace) -> bool {
-    whitespace != Whitespace::Exact
-        && fd.hunks.is_empty()
-        && !fd.binary
-        && !fd.too_large
-        && fd.note.is_none()
-        && fd.change.status == Status::Modified
-        && fd.change.old.map(|s| s.mode()) == fd.change.new.map(|s| s.mode())
-}
-
-pub(crate) fn file_status(status: &Status) -> FileStatus {
-    match status {
-        Status::Added => FileStatus::Added,
-        Status::Deleted => FileStatus::Deleted,
-        Status::Modified => FileStatus::Modified,
-        Status::TypeChange => FileStatus::TypeChange,
-        Status::Untracked => FileStatus::Untracked,
-        Status::Renamed { .. } => FileStatus::Renamed,
-    }
-}
-
-fn mode_str(mode: Mode) -> &'static str {
-    match mode {
-        Mode::File => "100644",
-        Mode::Executable => "100755",
-        Mode::Symlink => "120000",
-        Mode::Gitlink => "160000",
-    }
-}
-
-/// The header of a file diff; `note` replaces its hunks.
-pub(crate) fn file_header<'a>(change: &'a FileChange, note: Option<&'a str>) -> FileHeader<'a> {
-    FileHeader {
-        status: file_status(&change.status),
-        old_path: change.old_path().as_bytes(),
-        new_path: change.path.as_bytes(),
-        old_mode: change.old.map(|s| mode_str(s.mode())),
-        new_mode: change.new.map(|s| mode_str(s.mode())),
-        similarity: match change.status {
-            Status::Renamed { similarity, .. } => Some(similarity),
-            _ => None,
-        },
-        note,
-        // The viewer words staging in its header; printed output doesn't.
-        staging: None,
-    }
-}
-
-/// Why a file diff has no hunks to show, if it's for a reason worth a note.
-pub(crate) fn note(fd: &FileDiff) -> Option<&'static str> {
-    if fd.binary {
-        Some("binary files differ")
-    } else if fd.too_large {
-        Some("file too large to diff")
-    } else {
-        None
-    }
-}
-
-/// A hunk's numbers as git prints them, 1-based.
-pub(crate) fn hunk_header<'a>(hunk: &Hunk, heading: &'a [u8]) -> HunkHeader<'a> {
-    let one_based = |start: usize, len: usize| if len == 0 { start } else { start + 1 };
-    HunkHeader {
-        old_start: one_based(hunk.old_start, hunk.old_len),
-        old_len: hunk.old_len,
-        new_start: one_based(hunk.new_start, hunk.new_len),
-        new_len: hunk.new_len,
-        heading,
-        hidden: 0,
-    }
-}
-
-/// A hunk line as the renderer takes it; `state` is the line's
-/// [`LineState::of`], which a caller may have stored.
-pub(crate) fn diff_line<'a>(
-    fd: &'a FileDiff,
-    line: &diff::Line,
-    state: LineState,
-    emphasis: &'a [Range<usize>],
-    syntax: Option<&'a HunkSyntax>,
-) -> Line<'a> {
-    let raw = line_bytes(&fd.old, &fd.new, line);
-    // A dimmed or moved line drops its syntax colors, or they'd hide its
-    // color.
-    let runs = syntax
-        .filter(|_| !state.is_unchanged())
-        .and_then(|s| match line.kind {
-            LineKind::Removed => s.old.as_ref().map(|o| o.line(line.old)),
-            LineKind::Added | LineKind::Context => s.new.as_ref().map(|n| n.line(line.new)),
-        });
-    Line {
-        state,
-        old: (line.kind != LineKind::Added).then_some(line.old + 1),
-        new: (line.kind != LineKind::Removed).then_some(line.new + 1),
-        text: display_text(raw.strip_suffix(b"\n").unwrap_or(raw)),
-        emphasis,
-        syntax: runs,
-        paint: &[],
-        block_start: line.block_start,
-    }
-}
-
-pub(crate) const NO_NEWLINE_LINE: Line<'static> = Line {
-    state: LineState::NoNewline,
-    old: None,
-    new: None,
-    text: b"",
-    emphasis: &[],
-    syntax: None,
-    paint: &[],
-    block_start: false,
-};
-
-/// A file's syntax diff, through `cache` for large files: `None` for files
-/// with nothing to diff (binary, too large, only a mode change).
-pub(crate) fn structural_diff(
-    grammars: &Registry,
-    fd: &FileDiff,
-    cache: Option<&Cache>,
-) -> Option<Result<Structural, Unavailable>> {
-    let ids = [cache_id(fd.change.old), cache_id(fd.change.new)];
-    (!fd.binary && !fd.too_large && !fd.hunks.is_empty()).then(|| {
-        let path = fd.change.path.as_bytes();
-        structural::diff_cached(grammars, path, &fd.old, &fd.new, &fd.hunks, ids, cache)
-    })
-}
-
-/// The note a syntax diff adds under the file header, if any.
-pub(crate) fn structural_note(result: &Result<Structural, Unavailable>) -> Option<String> {
-    match result {
-        Ok(s) => s.note(),
-        Err(e) => Some(e.note().to_owned()),
-    }
-}
-
-/// The id a side's cached results are stored under. A working-tree side's id
-/// is the one the scan hashed, and the file may have changed since, so only
-/// a side read from the object database has one.
-fn cache_id(side: Option<Side>) -> Option<dffy_core::git::ObjectId> {
-    match side? {
-        Side::Object { id, .. } => Some(id),
-        Side::Worktree { .. } | Side::Path { .. } => None,
-    }
-}
-
-/// `fd`'s old and new sides, as highlighting takes them.
-pub(crate) fn sources(fd: &FileDiff) -> [Source<'_>; 2] {
-    let change = &fd.change;
-    [
-        Source {
-            path: change.old_path().as_bytes(),
-            text: &fd.old,
-            id: cache_id(change.old),
-        },
-        Source {
-            path: change.path.as_bytes(),
-            text: &fd.new,
-            id: cache_id(change.new),
-        },
-    ]
 }
 
 /// [`file_parts`] into one canvas.
@@ -1111,7 +928,7 @@ fn file_parts(
     flush: &mut dyn FnMut(&mut Canvas),
 ) {
     let structural_note = structural.and_then(structural_note);
-    let header_note = note(fd)
+    let header_note = document::note(fd)
         .or(fd.note.as_deref())
         .or(structural_note.as_deref());
     let header = file_header(&fd.change, header_note);

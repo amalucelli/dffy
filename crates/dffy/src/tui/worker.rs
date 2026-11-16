@@ -16,16 +16,17 @@ use std::thread;
 
 use dffy_core::bstr::BString;
 use dffy_core::cache::Cache;
-use dffy_core::diff::{Emphasis, Options, emphasize};
+use dffy_core::diff::{Emphasis, Options};
+use dffy_core::document::{self, Counts, File, Matches, Needle, Prepare, SyntaxSlot};
 use dffy_core::git::{ChangeSet, FileChange, FileDiff, Repo, Revisions};
-use dffy_core::highlight::{FileSyntax, HunkSyntax, Registry};
+use dffy_core::highlight::{HunkSyntax, Registry};
 use dffy_core::structural::{Structural, Unavailable};
 use dffy_core::view::Spans;
 use dffy_core::watch::MAX_BATCH;
 
 use super::Event;
 use super::piped::PipedFile;
-use super::view::{self, Counts, Loaded, Matches, Needle, SyntaxSlot};
+use super::view;
 use crate::plugin::{self, Program};
 use crate::print;
 
@@ -256,7 +257,7 @@ pub(crate) enum Done {
     Diff {
         file: usize,
         version: u64,
-        result: Result<Box<Loaded>, String>,
+        result: Result<Box<File>, String>,
     },
     Emphasis {
         file: usize,
@@ -308,7 +309,7 @@ pub(crate) enum Done {
         version: u64,
         id: u64,
         diff: Arc<FileDiff>,
-        result: Result<Box<Loaded>, Option<String>>,
+        result: Result<Box<File>, Option<String>>,
     },
     /// Line counts from the background pass, a chunk at a time, each with
     /// its file's position and version. A file that can't be read counts
@@ -387,6 +388,13 @@ pub(crate) struct Settings {
     /// What highlighting and the syntax diff detect languages with.
     pub grammars: &'static Registry,
     pub cache: Option<Cache>,
+}
+
+impl Settings {
+    /// The core's per-file work, with these grammars and cache.
+    fn prepare(&self) -> Prepare<'_> {
+        File::prepare(self.grammars, self.cache.as_ref())
+    }
 }
 
 impl Pool {
@@ -491,18 +499,20 @@ fn diff(
     settings: &Settings,
     change: FileChange,
     piped: Option<Arc<PipedFile>>,
-) -> Result<Box<Loaded>, String> {
+) -> Result<Box<File>, String> {
     let options = &settings.options;
     match (piped, repo) {
-        (Some(piped), _) => piped
-            .diff(change)
-            .map(|(fd, headings)| Box::new(Loaded::piped(fd, headings)))
+        (Some(piped), _) => super::piped::read(&piped, change)
+            .map(Box::new)
             .map_err(|e| format!("reading the diff back failed: {e}")),
         (None, Some(repo)) => repo
             .file_diff(change, options)
             .map(|fd| {
-                let highlight = settings.highlight.then_some(settings.grammars);
-                Box::new(Loaded::new(fd, options.whitespace, highlight))
+                Box::new(
+                    settings
+                        .prepare()
+                        .file(fd, options.whitespace, settings.highlight),
+                )
             })
             .map_err(|e| e.to_string()),
         (None, None) => Err("there's no repository to diff this file in".to_owned()),
@@ -550,34 +560,6 @@ fn work(shared: &(Mutex<Queue>, Condvar), repo: Option<&Repo>, tx: &Sender<Event
     }
 }
 
-/// The emphasis of hunk `hunk`, and its syntax spans when the file has a
-/// slot for them. The first hunk of a file to get here parses it; the parse
-/// gives the emphasis its tokens too.
-fn hunk_emphasis(
-    diff: &FileDiff,
-    hunk: usize,
-    slot: Option<&SyntaxSlot>,
-    settings: &Settings,
-) -> (Vec<Emphasis>, Option<HunkSyntax>) {
-    let core = &diff.hunks[hunk];
-    let syntax = slot
-        .map(|slot| slot.get_or_init(|| file_syntax(diff, settings)))
-        .filter(|s| !s.is_empty())
-        .map(|s| s.hunk(&diff.old, &diff.new, core));
-    let emphasis = match &syntax {
-        Some(spans) => spans.emphasis(&diff.old, &diff.new, core),
-        None => emphasize(&diff.old, &diff.new, core),
-    };
-    (emphasis, syntax)
-}
-
-/// `diff`'s sides prepared for highlighting, their large sides' spans
-/// stored in the disk cache.
-fn file_syntax(diff: &FileDiff, settings: &Settings) -> FileSyntax {
-    let sources = print::sources(diff);
-    FileSyntax::new(settings.grammars, sources, settings.cache.as_ref(), true)
-}
-
 fn run(job: Job, repo: Option<&Repo>, settings: &Settings) -> Done {
     match job {
         Job::Diff {
@@ -597,7 +579,7 @@ fn run(job: Job, repo: Option<&Repo>, settings: &Settings) -> Done {
             diff,
             syntax,
         } => {
-            let (emphasis, syntax) = hunk_emphasis(&diff, hunk, syntax.as_ref(), settings);
+            let (emphasis, syntax) = settings.prepare().emphasis(&diff, hunk, syntax.as_ref());
             Done::Emphasis {
                 file,
                 version,
@@ -620,7 +602,7 @@ fn run(job: Job, repo: Option<&Repo>, settings: &Settings) -> Done {
             version,
             id,
             count: diff(repo, settings, change, piped).ok().and_then(|loaded| {
-                view::find(&loaded.diff, None, &needle, || {
+                document::find(loaded.diff(), None, &needle, || {
                     live.load(Ordering::Relaxed) != id
                 })
                 .map(|m| m.list.len())
@@ -638,7 +620,7 @@ fn run(job: Job, repo: Option<&Repo>, settings: &Settings) -> Done {
             file,
             version,
             id,
-            matches: view::find(&diff, Some(&hidden), &needle, || {
+            matches: document::find(&diff, Some(&hidden), &needle, || {
                 live.load(Ordering::Relaxed) != id
             }),
             diff,
@@ -651,7 +633,7 @@ fn run(job: Job, repo: Option<&Repo>, settings: &Settings) -> Done {
         } => Done::Structural {
             file,
             version,
-            result: print::structural_diff(settings.grammars, &diff, settings.cache.as_ref()),
+            result: settings.prepare().structural(&diff),
             diff,
         },
         Job::GapSyntax {
@@ -665,9 +647,7 @@ fn run(job: Job, repo: Option<&Repo>, settings: &Settings) -> Done {
             file,
             version,
             gap,
-            spans: syntax
-                .get_or_init(|| file_syntax(&diff, settings))
-                .new_spans(&diff.new, lines),
+            spans: settings.prepare().gap_syntax(&diff, &syntax, lines),
             diff,
         },
         Job::Render(job) => Done::Rendered {
@@ -690,7 +670,7 @@ fn side_text(present: bool, side: &dffy_core::diff::Text) -> Result<Option<&str>
 
 /// The job's diff rendered and diffed block by block. A side that isn't
 /// whole UTF-8 text is never sent: the line diff stays.
-fn render(job: &RenderJob, settings: &Settings) -> Result<Box<Loaded>, Option<String>> {
+fn render(job: &RenderJob, settings: &Settings) -> Result<Box<File>, Option<String>> {
     let RenderJob {
         diff,
         program,

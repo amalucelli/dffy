@@ -1,9 +1,10 @@
 //! A file's rendered view: the blocks a renderer plugin drew of each side,
-//! laid out as lines of text and diffed block by block. The result is an
-//! ordinary [`Loaded`] over that text, so tints, word emphasis, search,
-//! `n`/`N` and the gaps work on it as on any diff; what's added here is
-//! what the text alone can't say: each line's styles, and the source lines
-//! it came from, for the gutter, hunk headers, copies and the editor.
+//! laid out as lines of text and diffed block by block. The result is a
+//! core [`File`] over that text, which the core keeps each line's styles
+//! and source lines for, so tints, word emphasis, search, `n`/`N` and the
+//! gaps work on it as on any diff. What's here is the plugin protocol's
+//! side: laying the blocks out, pairing edited blocks, and the emphasis of
+//! restyled words.
 
 use std::collections::{HashMap, HashSet};
 use std::hash::{DefaultHasher, Hash as _, Hasher as _};
@@ -11,181 +12,47 @@ use std::ops::Range;
 use std::sync::Arc;
 
 use dffy_core::diff::{
-    Emphasis, Hunk, Line, LineKind, MAX_INTRALINE_LINE_BYTES, Text, Unchanged, Whitespace,
-    emphasize_lines, similar, tokenize, unit_hunks,
+    Emphasis, Hunk, Line, LineKind, MAX_INTRALINE_LINE_BYTES, Text, Unchanged, emphasize_lines,
+    similar, tokenize, unit_hunks,
 };
+use dffy_core::document::{File, Origin, Rendered, Side};
 use dffy_core::git::FileDiff;
 use dffy_core::highlight::{self, Language, Registry};
-use dffy_core::view::{self, Attributes, HunkHeader, Kind, Paint, Syntax};
+use dffy_core::view::{Attributes, Paint, Syntax};
 
-use super::{Copied, Loaded, Side};
+use super::Copied;
 use crate::plugin;
 
 /// How many added blocks ahead a removed block looks for the one it was
 /// edited into; bounds the similarity tests in a long rewrite.
 const PAIR_WINDOW: usize = 8;
 
-/// The source lines a rendered line's block was drawn from, and whether
-/// it's the block's first line.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct Origin {
-    start: u32,
-    end: u32,
-    first: bool,
-}
-
-impl Origin {
-    /// Drawn from no source line, as the blank line a renderer leaves
-    /// between blocks: it has no line number, and like a blank line in a
-    /// line diff it's never marked moved.
-    fn spacer(self) -> bool {
-        self.start == self.end
+/// A copy of rendered lines `lo..=hi` of `side` of `rendered`: the source
+/// of every block they touch, whole.
+pub(super) fn copy(rendered: &Rendered, side: Side, lo: usize, hi: usize) -> Copied {
+    let lines = rendered.source_lines(side, lo, hi);
+    let source = match side {
+        Side::Old => &rendered.source().old,
+        Side::New => &rendered.source().new,
+    };
+    let mut text: Vec<u8> = lines
+        .clone()
+        .flat_map(|i| source.line(i))
+        .copied()
+        .collect();
+    // No line break after the last line: pasted into a shell, it would
+    // run what was copied.
+    if text.ends_with(b"\n") {
+        text.pop();
     }
-}
-
-pub(crate) struct Rendered {
-    /// The line diff it was drawn from, whose text copies take.
-    source: Arc<FileDiff>,
-    /// Per side, per rendered line.
-    origins: [Vec<Origin>; 2],
-    /// Per side, for each rendered line and the end, the source line that
-    /// stretch of the view starts at: its block's first line, or past the
-    /// block for a block's later lines. Never decreasing, from 0 to the
-    /// side's last line, so any run of rendered lines maps to the source
-    /// lines it stands for, blank lines between blocks included.
-    bounds: [Vec<u32>; 2],
-    paint: [Vec<Vec<Paint>>; 2],
-    /// The width it was drawn for.
-    pub width: usize,
-}
-
-/// `line` as drawn: unchanged for a line diff, restyled by `rendered` for
-/// a rendered view.
-pub(super) fn restyle<'a>(rendered: Option<&'a Rendered>, line: view::Line<'a>) -> view::Line<'a> {
-    match rendered {
-        Some(rendered) => rendered.restyle(line),
-        None => line,
+    Copied {
+        text,
+        lines: lines.len(),
+        chars: None,
+        decorated: false,
+        hidden: 0,
+        missing: 0,
     }
-}
-
-impl Rendered {
-    /// `line`, a line of this view as the diff has it, as it's drawn: in
-    /// its styles, and numbered with its block's first source line on the
-    /// block's first line only. A moved line keeps its own look, as a
-    /// moved line of code drops its syntax colors.
-    fn restyle<'a>(&'a self, mut line: view::Line<'a>) -> view::Line<'a> {
-        let (side, number) = if line.state.kind() == Kind::Removed {
-            (Side::Old, line.old)
-        } else {
-            (Side::New, line.new)
-        };
-        if !line.state.is_unchanged()
-            && let Some(n) = number
-        {
-            line.paint = self.paint[side.index()]
-                .get(n - 1)
-                .map_or(&[], Vec::as_slice);
-        }
-        line.old = line.old.and_then(|n| self.number(Side::Old, n - 1));
-        line.new = line.new.and_then(|n| self.number(Side::New, n - 1));
-        line
-    }
-
-    fn number(&self, side: Side, line: usize) -> Option<usize> {
-        let origin = self.origins[side.index()].get(line)?;
-        (origin.first && !origin.spacer()).then_some(origin.start as usize + 1)
-    }
-
-    /// The source lines that rendered lines `lo..=hi` of `side` came from:
-    /// every line of every block they touch.
-    pub(super) fn source_lines(&self, side: Side, lo: usize, hi: usize) -> Range<usize> {
-        let origins = &self.origins[side.index()];
-        let touched = origins.get(lo..=hi.min(origins.len().saturating_sub(1)));
-        let start = touched.and_then(|o| o.iter().map(|o| o.start).min());
-        let end = touched.and_then(|o| o.iter().map(|o| o.end).max());
-        start.zip(end).map_or(0..0, |(s, e)| s as usize..e as usize)
-    }
-
-    /// A copy of rendered lines `lo..=hi` of `side`: the source of every
-    /// block they touch, whole.
-    pub(super) fn copy(&self, side: Side, lo: usize, hi: usize) -> Copied {
-        let lines = self.source_lines(side, lo, hi);
-        let source = match side {
-            Side::Old => &self.source.old,
-            Side::New => &self.source.new,
-        };
-        let mut text: Vec<u8> = lines
-            .clone()
-            .flat_map(|i| source.line(i))
-            .copied()
-            .collect();
-        // No line break after the last line: pasted into a shell, it would
-        // run what was copied.
-        if text.ends_with(b"\n") {
-            text.pop();
-        }
-        Copied {
-            text,
-            lines: lines.len(),
-            chars: None,
-            decorated: false,
-            hidden: 0,
-            missing: 0,
-        }
-    }
-
-    /// Lines of the longer source side, which the gutter's numbers go up to.
-    pub(super) fn source_len(&self) -> usize {
-        self.source.old.len().max(self.source.new.len())
-    }
-
-    /// The source lines rendered lines `lines` of `side` stand for.
-    fn source_span(&self, side: Side, lines: Range<usize>) -> Range<usize> {
-        let bounds = &self.bounds[side.index()];
-        let at = |i: usize| {
-            bounds
-                .get(i)
-                .or_else(|| bounds.last())
-                .map_or(0, |&b| b as usize)
-        };
-        at(lines.start)..at(lines.end)
-    }
-
-    /// Source lines among rendered lines `lines` of the old side.
-    pub(super) fn old_count(&self, lines: Range<usize>) -> usize {
-        self.source_span(Side::Old, lines).len()
-    }
-
-    /// `hunk`'s numbers in source lines, as the gutter has them.
-    pub(super) fn header<'a>(&self, hunk: &Hunk, heading: &'a [u8]) -> HunkHeader<'a> {
-        let old = self.source_span(Side::Old, hunk.old_start..hunk.old_start + hunk.old_len);
-        let new = self.source_span(Side::New, hunk.new_start..hunk.new_start + hunk.new_len);
-        let one_based = |r: &Range<usize>| if r.is_empty() { r.start } else { r.start + 1 };
-        HunkHeader {
-            old_start: one_based(&old),
-            old_len: old.len(),
-            new_start: one_based(&new),
-            new_len: new.len(),
-            heading,
-            hidden: 0,
-        }
-    }
-}
-
-/// [`Rendered::bounds`] for one side's `origins`, whose source has `lines`
-/// lines.
-fn bounds(origins: &[Origin], lines: usize) -> Vec<u32> {
-    let end = u32::try_from(lines).unwrap_or(u32::MAX);
-    let mut at = 0;
-    let mut out = Vec::with_capacity(origins.len() + 1);
-    for (i, o) in origins.iter().enumerate() {
-        if i > 0 {
-            at = at.max(if o.first { o.start } else { o.end }).min(end);
-        }
-        out.push(at);
-    }
-    out.push(end.max(at));
-    out
 }
 
 /// The language a code block's fence names: `rust`, or an extension such
@@ -603,7 +470,7 @@ pub(crate) fn build(
     grammars: &Registry,
     context: usize,
     width: usize,
-) -> Loaded {
+) -> File {
     let [old, new] = sides;
     let (mut old, mut new) = (
         lay_out(old, &source.old, grammars),
@@ -668,51 +535,30 @@ pub(crate) fn build(
         note: None,
         hunks,
     };
-    let mut loaded = Loaded::new(diff, Whitespace::Exact, None);
-    if loaded.diff.hunks.is_empty() {
-        loaded.note = Some("renders the same; r shows the lines");
-    }
-    // A file's counts are its changed source lines in every view, as the
-    // tree shows them.
-    (loaded.added, loaded.removed) = (0, 0);
-    for line in source.hunks.iter().flat_map(|h| &h.lines) {
-        match line.kind {
-            LineKind::Added => loaded.added += 1,
-            LineKind::Removed => loaded.removed += 1,
-            LineKind::Context => {}
-        }
-    }
-    let diff = Arc::clone(&loaded.diff);
-    for (view, hunk) in loaded.hunks.iter_mut().zip(&diff.hunks) {
-        view.emphasis = Some(emphasis(&diff, hunk, [&old.styles, &new.styles]));
-    }
-    let paint_bytes: usize = [&old.paint, &new.paint]
-        .iter()
-        .flat_map(|side| side.iter())
-        .map(|p| 24 + p.len() * size_of::<Paint>())
-        .sum();
-    loaded.bytes += paint_bytes + (old.origins.len() + new.origins.len()) * size_of::<Origin>();
-    let bounds = [
-        bounds(&old.origins, source.old.len()),
-        bounds(&new.origins, source.new.len()),
-    ];
-    loaded.bytes += (bounds[0].len() + bounds[1].len()) * size_of::<u32>();
-    loaded.rendered = Some(Box::new(Rendered {
+    let mut file = File::rendered_view(
         source,
-        origins: [old.origins, new.origins],
-        bounds,
-        paint: [old.paint, new.paint],
+        diff,
+        [old.origins, new.origins],
+        [old.paint, new.paint],
         width,
-    }));
-    loaded
+        "renders the same; r shows the lines",
+    );
+    let diff = Arc::clone(file.diff());
+    for (h, hunk) in diff.hunks.iter().enumerate() {
+        let emphasis = emphasis(&diff, hunk, [&old.styles, &new.styles]);
+        file.set_emphasis(&diff, h, emphasis, None);
+    }
+    file
 }
 
 #[cfg(test)]
 mod tests {
-    use dffy_core::diff::{Options, hunks};
+    use dffy_core::diff::{Options, Whitespace, hunks};
+    use dffy_core::document::{self, Pos, Render, Source, State};
     use dffy_core::git::{FileChange, Mode, Status};
+    use dffy_core::view::{self, Kind};
 
-    use super::super::{Doc, Pos, Render, Selection, Source, State};
+    use super::super::{Doc, Selection};
     use super::*;
     use crate::config::Indicators;
     use crate::render::Layout;
@@ -778,9 +624,10 @@ mod tests {
             modified_lines: true,
         };
         let mut doc = Doc::new(layout, 20);
-        doc.push(fd.change.clone(), Source::Repo);
-        assert!(doc.load(0, Ok(Box::new(Loaded::new(fd, Whitespace::Exact, None)))));
-        let diff = Arc::clone(doc.diff_of(0).expect("loaded"));
+        doc.document.push(fd.change.clone(), Source::Repo);
+        let file = File::prepare(crate::grammars(), None).file(fd, Whitespace::Exact, false);
+        assert!(doc.load(0, Ok(Box::new(file))));
+        let diff = Arc::clone(doc.document.diff_of(0).expect("loaded"));
         (doc, diff)
     }
 
@@ -804,17 +651,22 @@ mod tests {
 
     /// Each line of the view's hunks: its sign (`»` for moved, `~` for a
     /// line paired with its edit), its text, and its gutter numbers.
-    fn lines(loaded: &Loaded) -> Vec<String> {
-        let rendered = loaded.rendered.as_deref().expect("a rendered view");
+    fn lines(loaded: &File) -> Vec<String> {
+        assert!(loaded.rendered().is_some(), "a rendered view");
+        // Rendered text ends every line, so a hunk's body has no
+        // no-newline markers: its lines are the core hunk's, in order.
         loaded
-            .diff
+            .diff()
             .hunks
             .iter()
-            .flat_map(|h| &h.lines)
-            .map(|l| {
-                let state = view::LineState::of(l);
-                let line = crate::print::diff_line(&loaded.diff, l, state, &[], None);
-                let line = rendered.restyle(line);
+            .enumerate()
+            .flat_map(|(h, hunk)| {
+                hunk.lines
+                    .iter()
+                    .enumerate()
+                    .map(move |(i, l)| (loaded.lines(false, h).line(i), l))
+            })
+            .map(|(line, l)| {
                 let sign = match (l.kind, l.unchanged, l.paired) {
                     (_, Unchanged::Moved, _) => '»',
                     (LineKind::Context, ..) => ' ',
@@ -831,6 +683,11 @@ mod tests {
                 )
             })
             .collect()
+    }
+
+    /// The emphasis of line `i` of the view's first hunk.
+    fn emphasized(loaded: &File, i: usize) -> &[Range<usize>] {
+        loaded.lines(false, 0).line(i).emphasis
     }
 
     /// Blocks change whole: the edited paragraph pairs with its old self
@@ -909,17 +766,17 @@ mod tests {
                 "  . . ",
             ]
         );
-        let hunk = &loaded.diff.hunks[0];
-        let emphasis = loaded.hunks[0].emphasis.as_deref().expect("emphasis");
+        let hunk = &loaded.diff().hunks[0];
         for line in [4, 6] {
-            assert_eq!(emphasis[line].first(), Some(&(11..15)), "line {line}");
-            assert_eq!(emphasis[line].len(), 1, "line {line}");
+            let emphasis = emphasized(&loaded, line);
+            assert_eq!(emphasis.first(), Some(&(11..15)), "line {line}");
+            assert_eq!(emphasis.len(), 1, "line {line}");
         }
         let layout = Layout {
             split: true,
             ..doc_of(old, new).0.layout
         };
-        let header = crate::print::hunk_header(hunk, b"");
+        let header = document::hunk_header(hunk, b"");
         let mut rows = Vec::new();
         view::rows(
             layout.arrangement(&header),
@@ -1031,15 +888,15 @@ mod tests {
                 "  6 6 • other",
             ]
         );
-        let emphasis = loaded.hunks[0].emphasis.as_deref().expect("emphasis");
         let words = |i: usize| -> Vec<&str> {
-            let l = &loaded.diff.hunks[0].lines[i];
+            let diff = loaded.diff();
+            let l = &diff.hunks[0].lines[i];
             let text = if l.kind == LineKind::Removed {
-                loaded.diff.old.line(l.old)
+                diff.old.line(l.old)
             } else {
-                loaded.diff.new.line(l.new)
+                diff.new.line(l.new)
             };
-            emphasis[i]
+            emphasized(&loaded, i)
                 .iter()
                 .map(|r| std::str::from_utf8(&text[r.clone()]).expect("utf-8"))
                 .collect()
@@ -1091,13 +948,12 @@ mod tests {
             blocks: vec![code(edited)],
         });
         let loaded = build(diff, sides, crate::grammars(), 3, 60);
-        let lines = &loaded.diff.hunks[0].lines;
+        let lines = &loaded.diff().hunks[0].lines;
         assert!(lines.iter().all(|l| l.paired), "every line pairs");
-        let emphasis = loaded.hunks[0].emphasis.as_deref().expect("emphasis");
-        let emphasized: Vec<usize> = (0..lines.len())
-            .filter(|&i| !emphasis[i].is_empty())
+        let changed: Vec<usize> = (0..lines.len())
+            .filter(|&i| !emphasized(&loaded, i).is_empty())
             .collect();
-        assert_eq!(emphasized, [150, 450]);
+        assert_eq!(changed, [150, 450]);
     }
 
     /// A reference link's target changes in a line no block holds; the
@@ -1118,9 +974,8 @@ mod tests {
             lines(&loaded),
             ["~ 1 . See docs.", "~ . 1 See docs.", "  . . "]
         );
-        let emphasis = loaded.hunks[0].emphasis.as_deref().expect("emphasis");
-        assert_eq!(emphasis[0].first(), Some(&(4..8)));
-        assert_eq!(emphasis[1].first(), Some(&(4..8)));
+        assert_eq!(emphasized(&loaded, 0).first(), Some(&(4..8)));
+        assert_eq!(emphasized(&loaded, 1).first(), Some(&(4..8)));
     }
 
     /// A blank line drawn from no source line is never moved: removing a
@@ -1300,7 +1155,7 @@ mod tests {
         });
         let loaded = build(Arc::clone(&diff), sides, crate::grammars(), 3, 60);
         let mut shown: [HashSet<usize>; 2] = Default::default();
-        for l in loaded.diff.hunks.iter().flat_map(|h| &h.lines) {
+        for l in loaded.diff().hunks.iter().flat_map(|h| &h.lines) {
             match l.kind {
                 LineKind::Removed => shown[0].insert(l.old),
                 LineKind::Added => shown[1].insert(l.new),
@@ -1328,8 +1183,8 @@ mod tests {
                 .collect::<Vec<_>>()
         };
         let kept = [
-            kept(0, loaded.diff.old.len()),
-            kept(1, loaded.diff.new.len()),
+            kept(0, loaded.diff().old.len()),
+            kept(1, loaded.diff().new.len()),
         ];
         assert_eq!(kept[0].len(), kept[1].len(), "{context}");
         for (&o, &n) in kept[0].iter().zip(&kept[1]) {
@@ -1390,7 +1245,7 @@ mod tests {
         );
         assert!(doc.set_rendered(0, &diff, Ok(Box::new(loaded))));
         doc.set_rendered_mode(true);
-        doc.top();
+        doc.document.top();
         let mut grid = crate::term::Grid::new(60, 8);
         doc.height = 8;
         doc.draw(
@@ -1433,8 +1288,8 @@ mod tests {
         });
         let sides = [plugin::Side::default(), plugin::Side { blocks: vec![code] }];
         let loaded = build(diff, sides, crate::grammars(), 3, 60);
-        let rendered = loaded.rendered.as_deref().expect("a rendered view");
-        let keyword = rendered.paint[1][0].first().copied();
+        let rendered = loaded.rendered().expect("a rendered view");
+        let keyword = rendered.paint(Side::New, 0).first().copied();
         assert_eq!(
             keyword.map(|p| (p.start, p.end, p.syntax)),
             Some((0, 2, Some(Syntax::Keyword)))
@@ -1458,14 +1313,13 @@ mod tests {
             )))
         ));
         assert!(matches!(
-            doc.files[0].render.as_deref(),
+            doc.document.files()[0].render(),
             Some(Render::Hidden(_))
         ));
         doc.set_rendered_mode(true);
-        let rendered =
-            |doc: &Doc| matches!(&doc.files[0].state, State::Loaded(l) if l.rendered.is_some());
+        let rendered = |doc: &Doc| matches!(doc.document.files()[0].state(), State::Loaded(l) if l.rendered().is_some());
         assert!(rendered(&doc));
-        assert!(doc.files[0].wants_render().is_none());
+        assert!(doc.document.files()[0].wants_render().is_none());
         doc.selection = Some(Selection {
             side: Side::New,
             anchor: Pos::default(),
@@ -1478,7 +1332,7 @@ mod tests {
         assert_eq!(copied.lines, 3);
         doc.set_rendered_mode(false);
         assert!(!rendered(&doc));
-        assert!(Arc::ptr_eq(doc.diff_of(0).expect("loaded"), &diff));
+        assert!(Arc::ptr_eq(doc.document.diff_of(0).expect("loaded"), &diff));
         doc.set_rendered_mode(true);
         assert!(rendered(&doc));
     }

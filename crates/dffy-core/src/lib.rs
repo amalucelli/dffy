@@ -4,6 +4,7 @@
 
 pub mod cache;
 pub mod diff;
+pub mod document;
 pub mod git;
 pub mod highlight;
 pub mod patch;

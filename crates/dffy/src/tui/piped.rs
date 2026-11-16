@@ -18,13 +18,11 @@ use std::sync::mpsc::Sender;
 use std::sync::{Arc, Condvar, Mutex, PoisonError};
 use std::thread;
 
-use dffy_core::bstr::BString;
-use dffy_core::git::{FileChange, FileDiff, Mode, Side, Status};
-use dffy_core::patch::{self, Builder, Commit, FileInfo, Parser};
-use dffy_core::view::FileStatus;
+use dffy_core::document::{self, Counts};
+use dffy_core::git::FileChange;
+use dffy_core::patch::{self, Builder, Commit, Parser};
 
 use super::Event;
-use super::view::Counts;
 use crate::pager::for_each_line;
 use crate::pager::stdin::Stdin;
 
@@ -51,20 +49,13 @@ pub(crate) enum Item {
     File(FileChange, Arc<PipedFile>),
 }
 
-/// What's known of a piped file besides its [`FileChange`].
-pub(crate) struct PipedFile {
-    /// As the patch's header said; finer than the change's status.
-    pub status: FileStatus,
-    pub binary: bool,
-    pub counts: Counts,
-    body: Body,
-    /// A combined diff's lines, shown as they came (see
-    /// [`patch::File::combined`]).
-    pub combined: Option<Vec<(usize, Vec<u8>)>>,
-}
+/// What's known of a piped file besides its [`FileChange`]; its hunks are
+/// in the spill.
+pub(crate) type PipedFile = document::Piped<Body>;
 
 /// A file's hunks as the patch had them, colors removed.
-enum Body {
+#[derive(Debug)]
+pub(crate) enum Body {
     Spilled {
         spill: Arc<File>,
         offset: u64,
@@ -73,78 +64,21 @@ enum Body {
     Kept(Box<[u8]>),
 }
 
-/// The file a patch header describes, as the rest of the viewer knows
-/// files. The sides have no object ids; nothing reads them for a piped
-/// file.
-fn change(info: FileInfo) -> FileChange {
-    let mode = |mode: Option<&str>| match mode {
-        Some("100755") => Mode::Executable,
-        Some("120000") => Mode::Symlink,
-        Some("160000") => Mode::Gitlink,
-        _ => Mode::File,
+/// Reads `piped`'s hunks back as `change`'s diff (see
+/// [`document::File::piped`]).
+pub(crate) fn read(piped: &PipedFile, change: FileChange) -> io::Result<document::File> {
+    let read;
+    let body: &[u8] = match &piped.patch {
+        Body::Spilled { spill, offset, len } => {
+            let mut bytes = vec![0; *len];
+            spill.read_exact_at(&mut bytes, *offset)?;
+            read = bytes;
+            &read
+        }
+        Body::Kept(bytes) => bytes,
     };
-    let side = |m: Option<&String>| {
-        Some(Side::Worktree {
-            mode: mode(m.map(String::as_str)),
-            id: None,
-        })
-    };
-    let (old, new) = (side(info.old_mode.as_ref()), side(info.new_mode.as_ref()));
-    let (old_path, new_path) = (BString::from(info.old_path), BString::from(info.new_path));
-    let (path, status, old, new) = match info.status {
-        FileStatus::Added | FileStatus::Untracked => (new_path, Status::Added, None, new),
-        FileStatus::Deleted => (old_path, Status::Deleted, old, None),
-        FileStatus::Renamed | FileStatus::Copied => (
-            new_path,
-            Status::Renamed {
-                from: old_path,
-                similarity: info.similarity.unwrap_or(0),
-            },
-            old,
-            new,
-        ),
-        FileStatus::TypeChange => (new_path, Status::TypeChange, old, new),
-        FileStatus::Modified | FileStatus::Combined => (new_path, Status::Modified, old, new),
-    };
-    FileChange {
-        path,
-        status,
-        old,
-        new,
-        staging: None,
-    }
-}
-
-impl PipedFile {
-    /// Reads the file's hunks back and lays them out over its real line
-    /// numbers (see [`patch::sides`]). The lines the patch left out are
-    /// never shown, since a piped file's gaps don't open. Also returns
-    /// each hunk's heading as git wrote it.
-    pub(crate) fn diff(&self, change: FileChange) -> io::Result<(FileDiff, Vec<Vec<u8>>)> {
-        let read;
-        let body: &[u8] = match &self.body {
-            Body::Spilled { spill, offset, len } => {
-                let mut bytes = vec![0; *len];
-                spill.read_exact_at(&mut bytes, *offset)?;
-                read = bytes;
-                &read
-            }
-            Body::Kept(bytes) => bytes,
-        };
-        let sides = patch::sides(body).map_err(io::Error::other)?;
-        Ok((
-            FileDiff {
-                change,
-                old: sides.old,
-                new: sides.new,
-                binary: self.binary,
-                too_large: false,
-                note: None,
-                hunks: sides.hunks,
-            },
-            sides.headings,
-        ))
-    }
+    let sides = patch::sides(body).map_err(io::Error::other)?;
+    Ok(document::File::piped(change, sides, piped.binary))
 }
 
 /// How far the parser may read: it waits while it has sent `limit`
@@ -254,10 +188,10 @@ impl Sink {
                         added: f.added,
                         removed: f.removed,
                     },
-                    body: self.spill.store(f.hunks),
+                    patch: self.spill.store(f.hunks),
                     combined: f.combined,
                 };
-                Item::File(change(f.info), Arc::new(file))
+                Item::File(document::file_change(f.info), Arc::new(file))
             }
         };
         self.gate.wait(self.sent);
@@ -380,11 +314,8 @@ mod tests {
             panic!("one file");
         };
         assert!(file.binary);
-        let loaded = super::super::view::Loaded::piped(
-            file.diff(change.clone()).expect("in memory").0,
-            Vec::new(),
-        );
-        assert!(loaded.diff.binary && loaded.diff.hunks.is_empty());
+        let loaded = read(file, change.clone()).expect("in memory");
+        assert!(loaded.diff().binary && loaded.diff().hunks.is_empty());
 
         let merge = include_bytes!(concat!(
             env!("CARGO_MANIFEST_DIR"),

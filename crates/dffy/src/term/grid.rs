@@ -221,6 +221,10 @@ impl Grid {
 
     /// Stores a cell, blanking the other half of any wide character it
     /// overwrites half of.
+    // Inlined so a cell its caller builds goes straight into the grid: out
+    // of line it goes through the stack in narrow stores and comes back in
+    // wide loads, which can't be forwarded from them.
+    #[inline]
     fn set(&mut self, x: usize, y: usize, cell: Cell) {
         let i = y * self.width + x;
         let old = self.cells[i];

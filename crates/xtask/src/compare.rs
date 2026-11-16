@@ -1,9 +1,10 @@
 //! `cargo xtask compare`: dffy timed against delta, diff-so-fancy,
 //! difftastic, hunk and lumen on the kernel's v6.0..v6.1, printed as the
-//! tables in `docs/benchmarks.md`. The clone is never modified; the
-//! working-tree viewer table needs uncommitted changes in it and is skipped
-//! without them.
+//! tables in `docs/benchmarks.md` and kept, with every run's numbers, in
+//! the run's `results.json`. The clone is never modified; the working-tree
+//! viewer table needs uncommitted changes in it and is skipped without them.
 
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
@@ -12,7 +13,31 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::harness::{self, BUSY, Memory, Run, TIMEOUT};
-use crate::{Result, Sandbox, Timing, USAGE, bench_repo, median, now, output, which};
+use crate::results::{Entry, Header, Results, Section};
+use crate::{Result, Sandbox, Timing, USAGE, bench_repo, median, output, which};
+
+/// The columns of a table of commands run to completion.
+const COMMAND_COLUMNS: [&str; 7] = [
+    "Tool",
+    "Command",
+    "First byte, median (min–max)",
+    "Total, median ± σ (min–max)",
+    "Own memory",
+    "Mapped files",
+    "git beside it, own / mapped",
+];
+
+/// The columns of a viewer table.
+const VIEWER_COLUMNS: [&str; 8] = [
+    "Viewer",
+    "Command",
+    "First byte",
+    "First frame",
+    "Settled",
+    "Own memory",
+    "Mapped files",
+    "git beside it, own / mapped",
+];
 
 const SCENARIOS: [&str; 5] = ["range", "renames", "file", "syntax", "tui"];
 const FAIR: &str = "kernel/sched/fair.c";
@@ -41,6 +66,16 @@ struct Compare {
     /// For commands that take more than about ten seconds.
     slow_runs: usize,
     mem_runs: usize,
+    doc: RefCell<Doc>,
+}
+
+/// What a comparison has printed so far, as text and as the tables and
+/// numbers that go into `results.json`.
+#[derive(Default)]
+struct Doc {
+    text: String,
+    sections: Vec<Section>,
+    metrics: Vec<Entry>,
 }
 
 pub(crate) fn main(args: &[String]) -> Result<()> {
@@ -94,8 +129,11 @@ pub(crate) fn main(args: &[String]) -> Result<()> {
         runs: runs?,
         slow_runs: slow_runs?,
         mem_runs: mem_runs?,
+        doc: RefCell::default(),
     };
-    compare.header()?;
+    let dir = crate::results::run_dir()?;
+    let header = Header::gather("compare", "", "", &scenarios);
+    compare.header(&header)?;
     for (path, rev, side) in FILES
         .iter()
         .flat_map(|f| [(f, "v6.0", "old"), (f, "v6.1", "new")])
@@ -112,8 +150,8 @@ pub(crate) fn main(args: &[String]) -> Result<()> {
                 .stdout(file),
         )?;
     }
-    for scenario in scenarios {
-        match scenario {
+    for scenario in &scenarios {
+        match *scenario {
             "range" => compare.range()?,
             "renames" => compare.renames()?,
             "file" => compare.file()?,
@@ -121,7 +159,13 @@ pub(crate) fn main(args: &[String]) -> Result<()> {
             _ => compare.tui()?,
         }
     }
-    Ok(())
+    let doc = compare.doc.into_inner();
+    let results = Results {
+        header,
+        metrics: doc.metrics,
+        sections: doc.sections,
+    };
+    results.write(&dir, &doc.text)
 }
 
 /// Waits until the one-minute load average is below 1, so a measurement
@@ -181,15 +225,15 @@ fn mb(kb: f64) -> String {
 }
 
 /// Three table cells: the tool's own memory, the files it has mapped, and
-/// git's own / mapped when git runs beside it. The tool is the program
-/// other than git with the most memory of its own.
-fn memory_cells(memory: &Memory) -> String {
+/// git's own / mapped when git runs beside it; and the tool's own memory in
+/// KB. The tool is the program other than git with the most memory of its
+/// own.
+fn memory_cells(memory: &Memory) -> ([String; 3], Option<f64>) {
+    let dash = || "—".to_owned();
     let runs = match memory {
         Memory::Peak(kb) => {
-            return format!(
-                "{} | — | —",
-                median(&mut kb.clone()).map_or_else(|| "—".to_owned(), mb)
-            );
+            let own = median(&mut kb.clone());
+            return ([own.map_or_else(dash, mb), dash(), dash()], own);
         }
         Memory::Programs(runs) => runs,
     };
@@ -212,14 +256,14 @@ fn memory_cells(memory: &Memory) -> String {
         .map(|(name, _)| *name)
         .or_else(|| medians.contains_key("git").then_some("git"));
     let Some(tool) = tool else {
-        return "— | — | —".to_owned();
+        return ([dash(), dash(), dash()], None);
     };
     let other = match medians.get("git") {
         Some(&(anon, mapped)) if tool != "git" => format!("{} / {}", mb(anon), mb(mapped)),
-        _ => "—".to_owned(),
+        _ => dash(),
     };
     let (anon, mapped) = medians[tool];
-    format!("{} | {} | {other}", mb(anon), mb(mapped))
+    ([mb(anon), mb(mapped), other], Some(anon))
 }
 
 fn first_line(out: &str) -> &str {
@@ -227,6 +271,66 @@ fn first_line(out: &str) -> &str {
 }
 
 impl Compare {
+    /// Prints `text` as a line of the output.
+    fn say(&self, text: &str) {
+        println!("{text}");
+        let doc = &mut self.doc.borrow_mut().text;
+        doc.push_str(text);
+        doc.push('\n');
+    }
+
+    /// Starts a table under `## title` and `note`.
+    fn section(&self, title: &str, note: &str, columns: &[&str]) {
+        let note = if note.is_empty() {
+            String::new()
+        } else {
+            format!("\n{note}\n")
+        };
+        self.say(&format!(
+            "\n## {title}\n{note}\n| {} |\n|{}",
+            columns.join(" | "),
+            "---|".repeat(columns.len())
+        ));
+        self.doc.borrow_mut().sections.push(Section {
+            title: title.to_owned(),
+            note: note.trim().to_owned(),
+            columns: columns.iter().map(|&c| c.to_owned()).collect(),
+            ..Section::default()
+        });
+    }
+
+    /// A row of the current table.
+    fn cells(&self, cells: Vec<String>) {
+        self.say(&format!("| {} |", cells.join(" | ")));
+        if let Some(section) = self.doc.borrow_mut().sections.last_mut() {
+            section.rows.push(cells);
+        }
+    }
+
+    /// Text after the current table.
+    fn after(&self, text: &str) {
+        self.say(&format!("\n{text}"));
+        if let Some(section) = self.doc.borrow_mut().sections.last_mut() {
+            text.clone_into(&mut section.after);
+        }
+    }
+
+    /// The values behind a cell of `row` in the current table.
+    fn metric(&self, row: &str, measure: &str, unit: &str, runs: Vec<f64>) {
+        let mut doc = self.doc.borrow_mut();
+        let title = doc
+            .sections
+            .last()
+            .map(|s| s.title.clone())
+            .unwrap_or_default();
+        doc.metrics.push(Entry {
+            name: format!("{title}: {row}, {measure}"),
+            unit: unit.to_owned(),
+            series: vec![("runs".to_owned(), runs)],
+            result: String::new(),
+        });
+    }
+
     fn tools(&self) -> impl Iterator<Item = &String> {
         let t = &self.tools;
         [&t.dffy, &t.delta, &t.difft, &t.dsf, &t.hunk, &t.lumen]
@@ -266,7 +370,7 @@ impl Compare {
             .unwrap_or_default()
     }
 
-    fn header(&self) -> Result<()> {
+    fn header(&self, header: &Header) -> Result<()> {
         let sandbox = &self.sandbox;
         let (describe, _) = output(
             sandbox
@@ -280,33 +384,35 @@ impl Compare {
             "v6.0",
             "v6.1",
         ]))?;
-        println!("# dffy comparison benchmark\n");
-        println!("- Date: {}", now());
-        println!("- Machine: {}", machine());
+        self.say("# dffy comparison benchmark\n");
+        self.say(header.markdown().trim_end());
+        if let Some(ram) = ram() {
+            self.say(&format!("- RAM: {ram}"));
+        }
         if let Ok(load) = fs::read_to_string("/proc/loadavg") {
-            println!(
+            self.say(&format!(
                 "- Load average at start: {}",
                 load.split_whitespace()
                     .take(3)
                     .collect::<Vec<_>>()
                     .join(" ")
-            );
+            ));
         }
-        println!(
+        self.say(&format!(
             "- Repository: {} ({} files changed in v6.0..v6.1)",
             describe.trim(),
             names.lines().count()
-        );
-        println!(
+        ));
+        self.say(&format!(
             "- Runs: {} ({} for commands over ~10s, {} sampling memory), warm page cache, dffy's disk cache emptied before each run",
             self.runs, self.slow_runs, self.mem_runs
-        );
+        ));
         if !cfg!(target_os = "linux") {
-            println!(
+            self.say(&format!(
                 "- Memory: without /proc, own memory is the peak RSS of the whole command from {} {}, mapped files and git's share aren't measured, and the viewer tables have none",
                 crate::TIME,
                 crate::time_flag()
-            );
+            ));
         }
         let word = |s: String, n: usize| s.split(' ').nth(n).unwrap_or_default().to_owned();
         let dffy = self
@@ -314,15 +420,15 @@ impl Compare {
             .dffy
             .as_deref()
             .map(|d| word(self.version(d, &["--version"]), 1));
-        println!(
+        self.say(&format!(
             "- Versions: dffy {}, {}, {}, hyperfine {}",
             dffy.unwrap_or_default(),
             self.version("git", &["--version"]),
             self.version("diff", &["--version"]),
             word(self.version(&self.hyperfine, &["--version"]), 1),
-        );
+        ));
         for tool in [&self.tools.delta, &self.tools.difft].into_iter().flatten() {
-            println!("  {}", self.version(tool, &["--version"]));
+            self.say(&format!("  {}", self.version(tool, &["--version"])));
         }
         // diff-so-fancy prints its version only when stdin is a terminal.
         if let Some(dsf) = &self.tools.dsf {
@@ -332,13 +438,13 @@ impl Compare {
             let version = script
                 .lines()
                 .find_map(|l| l.strip_prefix("my $VERSION = \"")?.strip_suffix("\";"));
-            println!("  diff-so-fancy {}", version.unwrap_or_default());
+            self.say(&format!("  diff-so-fancy {}", version.unwrap_or_default()));
         }
         if let Some(hunk) = &self.tools.hunk {
-            println!("  hunk {}", self.version(hunk, &["--version"]));
+            self.say(&format!("  hunk {}", self.version(hunk, &["--version"])));
         }
         if let Some(lumen) = &self.tools.lumen {
-            println!("  {}", self.version(lumen, &["--version"]));
+            self.say(&format!("  {}", self.version(lumen, &["--version"])));
         }
         Ok(())
     }
@@ -367,14 +473,6 @@ impl Compare {
         Timing::read(&json)
     }
 
-    fn table_header() {
-        println!();
-        println!(
-            "| Tool | Command | First byte, median (min–max) | Total, median ± σ (min–max) | Own memory | Mapped files | git beside it, own / mapped |"
-        );
-        println!("|---|---|---|---|---|---|---|");
-    }
-
     /// One table row for `cmd` reading `input`'s output, or `cmd` alone
     /// when `input` is empty: total time from hyperfine, first byte and
     /// memory from the harness.
@@ -385,26 +483,34 @@ impl Compare {
             format!("{input} | {cmd}")
         };
         idle();
-        let time = stats(&self.hyperfine(&full, usize::from(runs == self.runs), runs, true)?);
+        let time = self.hyperfine(&full, usize::from(runs == self.runs), runs, true)?;
         idle();
-        let first = summary(&harness::first_byte(&self.sandbox, runs, &full)?);
+        let first = harness::first_byte(&self.sandbox, runs, &full)?;
         idle();
-        let memory = memory_cells(&harness::memory(
+        let (memory, own) = memory_cells(&harness::memory(
             &self.sandbox,
             self.mem_runs.min(runs),
             &full,
         )?);
-        println!(
-            "| {name} | `{}` | {first} | {time} | {memory} |",
-            self.show(&full)
-        );
+        let [own_cell, mapped, git] = memory;
+        self.cells(vec![
+            name.to_owned(),
+            format!("`{}`", self.show(&full)),
+            summary(&first),
+            stats(&time),
+            own_cell,
+            mapped,
+            git,
+        ]);
+        self.metric(name, "total", "s", time.times);
+        self.metric(name, "first byte", "ms", first);
+        self.metric(name, "own memory", "KB", own.into_iter().collect());
         Ok(())
     }
 
     fn range(&self) -> Result<()> {
         let (t, runs, slow) = (&self.tools, self.runs, self.slow_runs);
-        println!("\n## The whole v6.0..v6.1 range, printed");
-        Self::table_header();
+        self.section("The whole v6.0..v6.1 range, printed", "", &COMMAND_COLUMNS);
         let git_in = "git diff --no-ext-diff --color=always v6.0 v6.1";
         self.row("git diff (baseline)", runs, "", git_in)?;
         if let Some(dffy) = &t.dffy {
@@ -452,8 +558,11 @@ impl Compare {
     }
 
     fn renames(&self) -> Result<()> {
-        println!("\n## The range's file list, with rename detection");
-        Self::table_header();
+        self.section(
+            "The range's file list, with rename detection",
+            "",
+            &COMMAND_COLUMNS,
+        );
         let git = "git diff --no-ext-diff --name-status v6.0 v6.1";
         self.row("git diff --name-status", self.runs, "", git)?;
         let Some(dffy) = &self.tools.dffy else {
@@ -469,12 +578,12 @@ impl Compare {
         if git == dffy {
             let text = String::from_utf8_lossy(&git);
             let renames = text.lines().filter(|l| l.starts_with('R')).count();
-            println!(
-                "\nBoth lists are identical: {} entries, {renames} of them renames.",
+            self.after(&format!(
+                "Both lists are identical: {} entries, {renames} of them renames.",
                 text.lines().count()
-            );
+            ));
         } else {
-            println!("\nThe lists differ.");
+            self.after("The lists differ.");
         }
         Ok(())
     }
@@ -483,8 +592,11 @@ impl Compare {
         let (t, runs) = (&self.tools, self.runs);
         let old = self.sandbox.path("old").join(FAIR).display().to_string();
         let new = self.sandbox.path("new").join(FAIR).display().to_string();
-        println!("\n## One large file: {FAIR}, v6.0 to v6.1");
-        Self::table_header();
+        self.section(
+            &format!("One large file: {FAIR}, v6.0 to v6.1"),
+            "",
+            &COMMAND_COLUMNS,
+        );
         self.row("GNU diff", runs, "", &format!("diff -u {old} {new}"))?;
         let git = format!("git diff --no-index --color=always {old} {new}");
         self.row("git diff --no-index", runs, "", &git)?;
@@ -523,11 +635,18 @@ impl Compare {
     }
 
     fn syntax(&self) -> Result<()> {
-        println!("\n## Syntax-aware diffs of five large files\n");
-        println!(
-            "| File (old → new) | Tool | Time, median ± σ (min–max) | Own memory | Mapped files | What it showed |"
+        self.section(
+            "Syntax-aware diffs of five large files",
+            "",
+            &[
+                "File (old → new)",
+                "Tool",
+                "Time, median ± σ (min–max)",
+                "Own memory",
+                "Mapped files",
+                "What it showed",
+            ],
         );
-        println!("|---|---|---|---|---|---|");
         for f in FILES {
             let (old, new) = (
                 self.sandbox.path("old").join(f),
@@ -536,17 +655,32 @@ impl Compare {
             let kb = |p: &Path| p.metadata().map_or(0, |m| m.len() / 1024);
             let size = format!("{}KB → {}KB", kb(&old), kb(&new));
             let (old, new) = (old.display(), new.display());
-            // Memory without git's column: no git runs beside these.
-            let memory = |cmd: &str| -> Result<String> {
-                let cells = memory_cells(&harness::memory(&self.sandbox, self.mem_runs, cmd)?);
-                Ok(cells
-                    .rsplit_once(" | ")
-                    .map_or_else(|| cells.clone(), |(cells, _)| cells.to_owned()))
+            let memory = |cmd: &str| -> Result<_> {
+                Ok(memory_cells(&harness::memory(
+                    &self.sandbox,
+                    self.mem_runs,
+                    cmd,
+                )?))
+            };
+            // A row without git's memory column: no git runs beside these.
+            let row = |tool: &str, time: Timing, memory: ([String; 3], Option<f64>), note: &str| {
+                let ([own_cell, mapped, _], own) = memory;
+                self.cells(vec![
+                    format!("{f} ({size})"),
+                    tool.to_owned(),
+                    stats(&time),
+                    own_cell,
+                    mapped,
+                    note.to_owned(),
+                ]);
+                let name = format!("{f}, {tool}");
+                self.metric(&name, "time", "s", time.times);
+                self.metric(&name, "own memory", "KB", own.into_iter().collect());
             };
             if let Some(dffy) = &self.tools.dffy {
                 let cmd = format!("{dffy} --syntax --paging=never --color=never {old} {new}");
                 idle();
-                let time = stats(&self.hyperfine(&cmd, 1, self.runs, true)?);
+                let time = self.hyperfine(&cmd, 1, self.runs, true)?;
                 let memory = memory(&cmd)?;
                 self.sandbox.empty_dffy_cache()?;
                 // dffy writes a note into the diff when a region or the whole
@@ -556,18 +690,18 @@ impl Compare {
                     .lines()
                     .find(|l| l.contains("syntax diff"))
                     .unwrap_or("syntax diff, nothing fell back");
-                println!("| {f} ({size}) | dffy --syntax | {time} | {memory} | {note} |");
+                row("dffy --syntax", time, memory, note);
             }
             if let Some(difft) = &self.tools.difft {
                 let cmd = format!("DFT_COLOR=never {difft} {old} {new}");
                 idle();
-                let time = stats(&self.hyperfine(&cmd, 1, self.runs, false)?);
+                let time = self.hyperfine(&cmd, 1, self.runs, false)?;
                 let memory = memory(&cmd)?;
                 // difftastic names a fallback in its file header, after the language.
                 let text = self.text(&cmd);
                 let header = first_line(&text);
                 let note = header.split_once(" --- ").map_or(header, |(_, note)| note);
-                println!("| {f} ({size}) | difftastic | {time} | {memory} | {note} |");
+                row("difftastic", time, memory, note);
             }
         }
         Ok(())
@@ -587,8 +721,12 @@ impl Compare {
         idle();
         let (results, peaks) = harness::pty(&self.sandbox, runs, argv, matched, refusal)?;
         let times = match results.last() {
-            Some(Run::Timeout) => format!(">{0}s | >{0}s | >{0}s", TIMEOUT.as_secs()),
-            Some(Run::Refused) => format!("n/a | n/a (shows \"{refusal}\") | n/a"),
+            Some(Run::Timeout) => [(); 3].map(|()| format!(">{}s", TIMEOUT.as_secs())),
+            Some(Run::Refused) => [
+                "n/a".to_owned(),
+                format!("n/a (shows \"{refusal}\")"),
+                "n/a".to_owned(),
+            ],
             _ => {
                 let shown: Vec<_> = results
                     .iter()
@@ -600,25 +738,29 @@ impl Compare {
                         }
                     })
                     .collect();
-                let column = |f: fn(&(f64, f64, Option<f64>)) -> f64| {
-                    summary(&shown.iter().map(f).collect::<Vec<_>>())
-                };
+                let bytes: Vec<f64> = shown.iter().map(|r| r.0).collect();
+                let frames: Vec<f64> = shown.iter().map(|r| r.1).collect();
                 let settled: Option<Vec<f64>> = shown.iter().map(|r| r.2).collect();
-                let settled = settled.map_or_else(
+                let settled_cell = settled.as_deref().map_or_else(
                     || format!("still drawing {}s later", BUSY.as_secs()),
-                    |s| summary(&s),
+                    summary,
                 );
-                format!("{} | {} | {settled}", column(|r| r.0), column(|r| r.1))
+                let cells = [summary(&bytes), summary(&frames), settled_cell];
+                self.metric(name, "first byte", "ms", bytes);
+                self.metric(name, "first frame", "ms", frames);
+                self.metric(name, "settled", "ms", settled.unwrap_or_default());
+                cells
             }
         };
         // A pipeline runs under sh -c; the table shows the pipeline.
         let cmd = argv.join(" ");
         let cmd = cmd.strip_prefix("sh -c ").unwrap_or(&cmd);
-        println!(
-            "| {name} | `{}` | {times} | {} |",
-            self.show(cmd),
-            memory_cells(&Memory::Programs(peaks))
-        );
+        let (memory, own) = memory_cells(&Memory::Programs(peaks));
+        self.metric(name, "own memory", "KB", own.into_iter().collect());
+        let mut cells = vec![name.to_owned(), format!("`{}`", self.show(cmd))];
+        cells.extend(times);
+        cells.extend(memory);
+        self.cells(cells);
         // hunk starts a session daemon on first use, outside the viewer's session.
         if let Some(hunk) = &self.tools.hunk {
             Command::new("pkill")
@@ -629,18 +771,26 @@ impl Compare {
         Ok(())
     }
 
-    fn viewers(title: &str, note: &str) {
-        println!("\n## Interactive viewers: {title}\n\n{note}\n");
-        println!(
-            "| Viewer | Command | First byte | First frame | Settled | Own memory | Mapped files | git beside it, own / mapped |"
+    fn viewers(&self, title: &str, note: &str) {
+        self.section(
+            &format!("Interactive viewers: {title}"),
+            note,
+            &VIEWER_COLUMNS,
         );
-        println!("|---|---|---|---|---|---|---|---|");
+    }
+
+    /// A viewer row with a reason in place of measurements.
+    fn not_applicable(&self, name: &str, reason: &str) {
+        let mut cells = vec![name.to_owned(), String::new(), "n/a".to_owned()];
+        cells.extend([format!("n/a ({reason})"), "n/a".to_owned()]);
+        cells.extend([(); 3].map(|()| String::new()));
+        self.cells(cells);
     }
 
     fn tui(&self) -> Result<()> {
         let (t, runs, slow) = (&self.tools, self.runs, self.slow_runs);
         let first = FIRST_CHANGE;
-        Self::viewers(
+        self.viewers(
             "v6.0..v6.1, 200×60 pty",
             "First frame: the first changed line of the first file (in .clang-format) is on screen. Settled: the last byte before a second with no output.",
         );
@@ -677,7 +827,7 @@ impl Compare {
                         .command("git")
                         .args(["diff", "--no-ext-diff", "--name-only"]),
                 )?;
-            Self::viewers(
+            self.viewers(
                 "the working tree, 200×60 pty",
                 &format!(
                     "Uncommitted changes to {} files. First frame: the first added line of the first file is on screen.",
@@ -694,7 +844,7 @@ impl Compare {
                 self.pty("hunk", runs, &edit, "", &[hunk, "diff"])?;
             }
         } else {
-            println!("\nWorking tree skipped: the clone has no uncommitted changes.");
+            self.after("Working tree skipped: the clone has no uncommitted changes.");
         }
         self.large_files()?;
         self.pager()
@@ -710,7 +860,7 @@ impl Compare {
         ] {
             let old = self.sandbox.path("old").join(path).display().to_string();
             let new = self.sandbox.path("new").join(path).display().to_string();
-            Self::viewers(
+            self.viewers(
                 &format!("one large file, {path}, 200×60 pty"),
                 "First frame: the file's first changed line is on screen. Each viewer reads it from the repository with a path filter, and from two extracted files where it can.",
             );
@@ -726,7 +876,7 @@ impl Compare {
                     "",
                     &[lumen, "diff", "v6.0..v6.1", "--file", path],
                 )?;
-                println!("| lumen, two files | | n/a | n/a (no two-file mode) | n/a | | | |");
+                self.not_applicable("lumen, two files", "no two-file mode");
             }
             if let Some(hunk) = &t.hunk {
                 self.pty(
@@ -752,7 +902,7 @@ impl Compare {
         let (t, runs, slow) = (&self.tools, self.runs, self.slow_runs);
         let first = FIRST_CHANGE;
         let git_in = "git diff --no-ext-diff v6.0 v6.1";
-        Self::viewers(
+        self.viewers(
             "as a pager, v6.0..v6.1, 200×60 pty",
             &format!(
                 "The viewer reads the range's patch from `{git_in}` on stdin, with the pty as its terminal. First frame: the first changed line of .clang-format is on screen."
@@ -777,44 +927,21 @@ impl Compare {
             )?;
         }
         if t.lumen.is_some() {
-            println!(
-                "| lumen | | n/a | n/a (not a pager: reads revisions, not a patch) | n/a | | | |"
-            );
+            self.not_applicable("lumen", "not a pager: reads revisions, not a patch");
         }
         Ok(())
     }
 }
 
-fn machine() -> String {
-    let cores = thread::available_parallelism().map_or(0, std::num::NonZero::get);
-    let uname = output(Command::new("uname").arg("-sr"))
-        .map(|(s, _)| s.trim().to_owned())
-        .unwrap_or_default();
-    let Ok(cpuinfo) = fs::read_to_string("/proc/cpuinfo") else {
-        return format!("{cores} cores, {uname}");
-    };
-    let model = cpuinfo
-        .lines()
-        .find_map(|l| Some(l.strip_prefix("model name")?.split_once(':')?.1.trim()));
-    let meminfo = fs::read_to_string("/proc/meminfo").unwrap_or_default();
-    let kb: f64 = meminfo
-        .lines()
-        .find_map(|l| {
-            l.strip_prefix("MemTotal:")?
-                .split_whitespace()
-                .next()?
-                .parse()
-                .ok()
-        })
-        .unwrap_or_default();
-    let release = fs::read_to_string("/etc/os-release").unwrap_or_default();
-    let os = release
-        .lines()
-        .find_map(|l| l.strip_prefix("PRETTY_NAME=\"")?.strip_suffix('"'))
-        .unwrap_or_default();
-    format!(
-        "{}, {cores} cores, {:.0}GB RAM, {os}, {uname}",
-        model.unwrap_or_default(),
-        kb / 1_048_576.0
-    )
+/// The machine's memory, from `/proc/meminfo` where there is one.
+fn ram() -> Option<String> {
+    let meminfo = fs::read_to_string("/proc/meminfo").ok()?;
+    let kb: f64 = meminfo.lines().find_map(|l| {
+        l.strip_prefix("MemTotal:")?
+            .split_whitespace()
+            .next()?
+            .parse()
+            .ok()
+    })?;
+    Some(format!("{:.1}GB", kb / 1_048_576.0))
 }

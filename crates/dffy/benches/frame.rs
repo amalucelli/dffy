@@ -16,7 +16,7 @@ use dffy::bench::Frame;
 use dffy_core::diff::Options;
 use dffy_core::git::{FileChange, FileDiff, Repo};
 
-// Allocation counts are deterministic, so `task bench:ab` gates on them
+// Allocation counts are deterministic, so `cargo xtask perf` gates on them
 // with no noise band. Only the benchmark thread is counted.
 #[global_allocator]
 static ALLOC: divan::AllocProfiler = divan::AllocProfiler::system();

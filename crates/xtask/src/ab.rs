@@ -1,5 +1,6 @@
-//! The performance gate: `bench-baseline`, `bench-ab`, `bench-noise` and
-//! `bench-layouts`.
+//! The performance gate's measurement, which `cargo xtask perf` drives,
+//! and its parts as the advanced commands `bench-baseline`, `bench-ab`,
+//! `bench-noise` and `bench-layouts`.
 //!
 //! A set is a directory of release executables: `dffy`, the examples
 //! `count_pass`, `first_frame` and `first_paint`, and the divan benches
@@ -10,18 +11,24 @@
 //! B fails a timing or peak-RSS metric when it was slower than A in enough
 //! rounds that a one-sided sign test gives p < 0.05 (9 of 10, or 5 of 5) and
 //! its median is above A's by more than 1% (criterion's default noise
-//! threshold) or the metric's band in A's `layout.tsv`, whichever is larger:
-//! the largest relative difference between sets of one tree built with
-//! different code layouts. It also fails when its instruction count fails.
-//! On Linux, the user-space instructions of `count_pass`, `first_paint` and
-//! one more run of each hyperfine command are counted, and after the rounds
-//! of `bench-ab` the instructions per iteration of each divan benchmark whose
-//! timing failed or that `--instructions` names. A count fails when B's
-//! median is more than 0.5% above A's. Divan's allocation counts and bytes fail on any increase, or on one
-//! past their band in A's `noise.tsv` when it's above 0: the largest
-//! difference between the two sides of one round when A was compared with
-//! itself. `count_pass` finding a file whose count differs from its diff
-//! fails.
+//! threshold) or the metric's layout band, whichever is larger: the largest
+//! relative difference between sets of one tree built with different code
+//! layouts, from `target/perf/layout.tsv` for `perf` and from A's
+//! `layout.tsv` for `bench-ab`. It also fails when its instruction count
+//! fails. On Linux, the user-space instructions of `count_pass`,
+//! `first_paint` and one more run of each hyperfine command are counted, and
+//! after the rounds the instructions per iteration of each divan benchmark
+//! whose timing failed or that `--instructions` names. A count fails when
+//! B's median is more than 0.5% above A's. Divan's allocation counts and
+//! bytes fail on any increase, or, when A has a `noise.tsv` from
+//! `bench-noise`, on one past its band there: the largest difference between
+//! the two sides of one round when A was compared with itself. `count_pass`
+//! finding a file whose count differs from its diff fails.
+//!
+//! The quick tier keeps only the deterministic metrics: instruction and
+//! allocation counts, three rounds by default, the divan benchmarks each
+//! counted alone, and a subset of the kernel range in place of the whole one
+//! for print and pager.
 
 use std::collections::HashMap;
 use std::fmt::Write as _;
@@ -29,19 +36,21 @@ use std::fs::{self, File, OpenOptions};
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::time::Instant;
 
+use crate::results::{Entry, Header, Results};
 use crate::{
-    ROOT, Result, Sandbox, TIME, Timing, USAGE, bench_repo, date, describe, expand_tilde,
-    instructions, median, now, peak_rss, quote, time_flag, which,
+    ROOT, Result, Sandbox, TIME, Timing, USAGE, bench_repo, describe, expand_tilde, instructions,
+    median, now, peak_rss, quote, time_flag, which,
 };
 
-const GROUPS: [&str; 7] = ["frame", "engine", "pty", "count", "paint", "print", "pager"];
+pub(crate) const GROUPS: [&str; 7] = ["frame", "engine", "pty", "count", "paint", "print", "pager"];
 
 /// A set's executables by cargo target kind and name. cargo also builds
 /// test harnesses for the `dffy` lib and bin when it builds the benches, so
 /// a match takes kind and name, and bin and example come only from the
 /// build, bench only from the bench build.
-const EXECUTABLES: [(&str, &str); 6] = [
+pub(crate) const EXECUTABLES: [(&str, &str); 6] = [
     ("bin", "dffy"),
     ("example", "count_pass"),
     ("example", "first_frame"),
@@ -56,22 +65,55 @@ const SIDES: [&str; 2] = ["A", "B"];
 /// whose instructions are counted.
 const DIVAN_ITERATIONS: [u32; 2] = [50, 250];
 
+/// The iterations of the first of `--quick`'s two runs of a divan
+/// benchmark; the second adds [`added_iterations`].
+const FIRST_ITERATIONS: u32 = 2;
+
 /// `count_pass`'s files whose count differs from their diff: any in B fails,
 /// whatever the noise.
 const COUNT_MISMATCH: &str = "count_pass differing files";
 
+/// `--quick`'s stand-in for the whole range in print and pager: 421 of its
+/// 12,914 changes, with C sources and headers, Makefiles and Kconfig, Rust,
+/// docs, YAML, JSON, 16 renames and the largest file, `rtw8852c_table.c`.
+const SUBSET: [&str; 10] = [
+    "kernel/sched",
+    "mm",
+    "include/net",
+    "rust",
+    "Documentation/rust",
+    "Documentation/filesystems",
+    "Documentation/devicetree/bindings/pinctrl",
+    "tools/perf/pmu-events/arch/arm64",
+    "arch/powerpc/kernel",
+    "drivers/net/wireless/realtek/rtw89",
+];
+
+/// `--quick`'s print runs on [`SUBSET`], and the arguments each adds. Named
+/// apart from the full range's runs, so no band measured on the whole range
+/// in `noise.tsv` or `layout.tsv` applies to them.
+const PRINT_SUBSET: [(&str, &[&str]); 2] = [
+    ("print/subset", &[]),
+    ("print/subset no-highlight", &["--no-highlight"]),
+];
+
+/// `--quick`'s pager run, on [`SUBSET`]'s patch.
+const PAGER_SUBSET: &str = "pager/subset";
+
 pub(crate) fn main(cmd: &str, args: &[String]) -> Result<bool> {
     let mut dir = None;
-    let mut rounds = 10;
+    let mut rounds = None;
     let mut layouts = 4;
     let mut groups = GROUPS.to_vec();
     let mut counted = Vec::new();
+    let mut quick = false;
     let mut args = args.iter();
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--instructions" if cmd == "bench-ab" => {
                 counted.extend(args.next().ok_or(USAGE)?.split(',').map(str::to_owned));
             }
+            "--quick" if cmd == "bench-ab" => quick = true,
             "--layouts" if cmd == "bench-layouts" => {
                 layouts = args
                     .next()
@@ -79,79 +121,151 @@ pub(crate) fn main(cmd: &str, args: &[String]) -> Result<bool> {
                     .filter(|&n| n >= 2)
                     .ok_or("--layouts takes a number from 2")?;
             }
-            "--rounds" if cmd != "bench-baseline" => {
-                rounds = args
-                    .next()
-                    .and_then(|n| n.parse().ok())
-                    // The sign test's exact counts fit in a u128 to past 100.
-                    .filter(|n| (1..=100).contains(n))
-                    .ok_or("--rounds takes a number from 1 to 100")?;
-            }
+            "--rounds" if cmd != "bench-baseline" => rounds = Some(rounds_arg(args.next())?),
             "--only" if cmd != "bench-baseline" => {
-                let only: Vec<&str> = args.next().ok_or(USAGE)?.split(',').collect();
-                if let Some(bad) = only.iter().find(|g| !GROUPS.contains(g)) {
-                    return Err(format!(
-                        "unknown group {bad}; groups are {}",
-                        GROUPS.join(", ")
-                    ));
-                }
-                groups.retain(|g| only.contains(g));
+                let only = only_arg(args.next())?;
+                groups.retain(|g| only.iter().any(|o| o == g));
             }
             _ if dir.is_none() && !arg.starts_with('-') => dir = Some(expand_tilde(arg)),
             _ => return Err(USAGE.to_owned()),
         }
     }
     let dir = dir.ok_or(USAGE)?;
-    let noise = match cmd {
+    let rounds = rounds.unwrap_or(if quick { 3 } else { 10 });
+    let tier = match cmd {
         "bench-baseline" => {
-            snapshot(&dir, None)?;
+            snapshot(&dir, None, None)?;
             return Ok(true);
         }
         "bench-layouts" => {
             let base = fs::canonicalize(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
-            measure_layouts(&base, layouts, rounds, &groups)?;
+            measure_layouts(
+                &base,
+                layouts,
+                rounds,
+                &groups,
+                None,
+                &base.join("layout.tsv"),
+            )?;
             return Ok(true);
         }
-        "bench-ab" => false,
-        "bench-noise" => true,
+        "bench-ab" if quick => "quick",
+        "bench-ab" => "normal",
+        "bench-noise" => "noise",
         _ => return Err(USAGE.to_owned()),
     };
-    compare(&dir, rounds, &groups, noise, &counted)
+    if quick {
+        quick_supported()?;
+        if !counted.is_empty() {
+            return Err("--quick counts every divan benchmark; drop --instructions".to_owned());
+        }
+        groups.retain(|&g| g != "pty");
+    }
+    let base = baseline(&dir)?;
+    run(
+        &base,
+        rounds,
+        &groups,
+        tier,
+        &base.join("layout.tsv"),
+        &counted,
+    )
 }
 
-/// `bench-ab`, or with `noise` `bench-noise`, of the set in `dir`. `counted`
-/// names divan benchmarks to count the instructions of whatever their
-/// timing's result.
-fn compare(
-    dir: &Path,
+/// `--rounds`' value.
+pub(crate) fn rounds_arg(arg: Option<&String>) -> Result<usize> {
+    arg.and_then(|n| n.parse().ok())
+        // The sign test's exact counts fit in a u128 to past 100.
+        .filter(|n| (1..=100).contains(n))
+        .ok_or_else(|| "--rounds takes a number from 1 to 100".to_owned())
+}
+
+/// `--only`'s groups.
+pub(crate) fn only_arg(arg: Option<&String>) -> Result<Vec<String>> {
+    let only: Vec<String> = arg
+        .ok_or("--only takes groups")?
+        .split(',')
+        .map(str::to_owned)
+        .collect();
+    if let Some(bad) = only.iter().find(|g| !GROUPS.contains(&g.as_str())) {
+        return Err(format!(
+            "unknown group {bad}; groups are {}",
+            GROUPS.join(", ")
+        ));
+    }
+    Ok(only)
+}
+
+/// Whether this machine can run the quick tier, which counts instructions.
+pub(crate) fn quick_supported() -> Result<()> {
+    if cfg!(target_os = "linux") {
+        return Ok(());
+    }
+    Err(format!(
+        "the quick tier counts instructions with Linux perf events, which {} doesn't have; use task perf here, or task perf:quick on Linux",
+        std::env::consts::OS
+    ))
+}
+
+/// The set in `dir`, canonical, or how to build one.
+fn baseline(dir: &Path) -> Result<PathBuf> {
+    let missing = |what: String| {
+        format!(
+            "{}: {what}; build a set there with cargo xtask bench-baseline {}, or use cargo xtask perf, which builds its baselines",
+            dir.display(),
+            dir.display()
+        )
+    };
+    let base = fs::canonicalize(dir).map_err(|e| missing(e.to_string()))?;
+    match EXECUTABLES
+        .iter()
+        .find(|(_, name)| !base.join(name).is_file())
+    {
+        Some((_, name)) => Err(missing(format!("no {name}"))),
+        None => Ok(base),
+    }
+}
+
+/// The checkout measured against the set in `base`, the A side, in `tier`:
+/// `normal` and `full` measure everything, `quick` only instruction and
+/// allocation counts, and `noise` measures `base` against itself and writes
+/// its bands to `noise.tsv`. Timings are held to the layout bands in
+/// `layout`. `counted` names divan benchmarks to count the instructions of
+/// whatever their timing's result.
+pub(crate) fn run(
+    base: &Path,
     rounds: usize,
     groups: &[&str],
-    noise: bool,
+    tier: &str,
+    layout: &Path,
     counted: &[String],
 ) -> Result<bool> {
-    let base = fs::canonicalize(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
-    let runner = Runner::new(Sandbox::new(bench_repo()?, false)?, groups)?;
+    let (quick, noise) = (tier == "quick", tier == "noise");
+    let base = base.to_path_buf();
+    // Before the build, so the commit and uncommitted changes are what's built.
+    let built = fs::read_to_string(base.join("REV")).unwrap_or_default();
+    let header = Header::gather("perf", tier, built.trim(), groups);
+    let mut runner = Runner::new(Sandbox::new(bench_repo()?, false)?, groups, quick)?;
+    if quick && !runner.counter {
+        return Err(
+            "the quick tier needs a hardware instruction counter, and perf_event_open offers none here"
+                .to_owned(),
+        );
+    }
     let candidate = if noise {
         base.clone()
     } else {
         let set = runner.sandbox.path("B");
-        snapshot(&set, None)?;
-        set
+        snapshot(&set, None, None)?;
+        baseline(&set)?
     };
-    for set in [&base, &candidate] {
-        for (_, name) in EXECUTABLES {
-            if !set.join(name).is_file() {
-                return Err(format!(
-                    "{}: no {name}; build the set with cargo xtask bench-baseline",
-                    set.display()
-                ));
-            }
-        }
+    if quick {
+        runner.plan_divan([&base, &candidate], groups)?;
     }
 
     let mut metrics = runner.rounds(rounds, [&base, &candidate], groups)?;
     let noise_file = base.join("noise.tsv");
-    let layout = read_bands(&base.join("layout.tsv"));
+    let layout = read_bands(layout);
     if noise {
         write_noise(&noise_file, &metrics, rounds)?;
     } else {
@@ -170,9 +284,27 @@ fn compare(
             metrics.push(runner.divan_instructions(name, [&base, &candidate])?);
         }
     }
-    let mut summary = header([&base, &candidate], rounds, groups);
-    let (table, pass) = table(&metrics, &read_bands(&noise_file), &layout, noise);
+
+    let mut summary = format!("# dffy A/B benchmark\n\n{}", header.markdown());
+    let b = if noise {
+        "the same set"
+    } else {
+        "the checkout"
+    };
+    let _ = writeln!(summary, "- Rounds: {rounds}; A: {}; B: {b}", base.display());
+    if quick {
+        summary += "- Quick: instruction and allocation counts only; print and pager on a subset of the range\n";
+    }
+    summary.push('\n');
+    let (table, pass, verdicts) = table(&metrics, &read_bands(&noise_file), &layout, noise);
     summary += &table;
+    if let Some((spread, name)) = largest_spread(&metrics).filter(|_| quick) {
+        let _ = write!(
+            summary,
+            "\nLargest spread of an instruction count over one side's rounds: {:.3}% ({name}).\n",
+            spread * 100.0
+        );
+    }
     if noise {
         let _ = write!(
             summary,
@@ -182,43 +314,43 @@ fn compare(
         );
     }
     print!("{summary}");
-    let summary_path = runner.raw.join("summary.md");
-    fs::write(&summary_path, summary).map_err(|e| format!("{}: {e}", summary_path.display()))?;
-    eprintln!("raw results: {}", runner.raw.display());
+    let results = Results {
+        header,
+        metrics: metrics
+            .iter()
+            .zip(verdicts)
+            .map(|(m, result)| Entry {
+                name: m.name.clone(),
+                unit: m.unit.name().to_owned(),
+                series: SIDES
+                    .iter()
+                    .zip(&m.values)
+                    .map(|(side, values)| ((*side).to_owned(), values.clone()))
+                    .collect(),
+                result,
+            })
+            .collect(),
+        sections: Vec::new(),
+    };
+    results.write(&runner.raw, &summary)?;
     Ok(pass)
 }
 
-fn header(sets: [&Path; 2], rounds: usize, groups: &[&str]) -> String {
-    let mut out = "# dffy A/B benchmark\n\n".to_owned();
-    for (side, set) in SIDES.iter().zip(sets) {
-        let rev = fs::read_to_string(set.join("REV")).map_or_else(
-            |_| "no REV".to_owned(),
-            |r| r.trim().chars().take(12).collect(),
-        );
-        let _ = writeln!(out, "- {side}: {} ({rev})", set.display());
-    }
-    let _ = write!(
-        out,
-        "- Rounds: {rounds}; groups: {}\n- {} {}, {}\n\n",
-        groups.join(", "),
-        std::env::consts::OS,
-        std::env::consts::ARCH,
-        now(),
-    );
-    out
-}
-
 /// Builds the current tree and copies its executables into `dest`, with
-/// the commit in `dest/REV`. With `layout`, see [`cargo`].
-fn snapshot(dest: &Path, layout: Option<usize>) -> Result<()> {
+/// the commit in `dest/REV`. With `layout`, see [`cargo`]. With `worktree`,
+/// builds that tree, a worktree of another commit, instead of the checkout.
+pub(crate) fn snapshot(dest: &Path, layout: Option<usize>, worktree: Option<&Path>) -> Result<()> {
     fs::create_dir_all(dest).map_err(|e| format!("{}: {e}", dest.display()))?;
+    let tree = worktree.unwrap_or_else(|| Path::new(ROOT));
     let mut found = artifacts(
-        cargo(layout),
+        cargo(layout, worktree.is_some()),
+        tree,
         &["build", "--release", "--workspace", "--examples", "--bins"],
         &["bin", "example"],
     )?;
     found.extend(artifacts(
-        cargo(layout),
+        cargo(layout, worktree.is_some()),
+        tree,
         &["bench", "--workspace", "--no-run"],
         &["bench"],
     )?);
@@ -242,7 +374,7 @@ fn snapshot(dest: &Path, layout: Option<usize>) -> Result<()> {
     let rev = crate::output(
         Command::new("git")
             .args(["rev-parse", "HEAD"])
-            .current_dir(ROOT),
+            .current_dir(tree),
     )
     .map_or_else(|_| "unknown\n".to_owned(), |(rev, _)| rev);
     fs::write(dest.join("REV"), &rev).map_err(|e| format!("{}: {e}", dest.display()))?;
@@ -253,9 +385,15 @@ fn snapshot(dest: &Path, layout: Option<usize>) -> Result<()> {
 /// cargo, building with `layout`, a seed from 1, into its own target
 /// directory with the code laid out by the seed: on `x86_64` Linux, where
 /// rustc links with lld, lld shuffles the input sections, one per function;
-/// elsewhere the seed goes into every symbol's hash.
-fn cargo(layout: Option<usize>) -> Command {
+/// elsewhere the seed goes into every symbol's hash. A `worktree` build,
+/// with a layout or not, goes to `target/perf/build`, which `perf` removes
+/// after every run, so the checkout's `target/release` keeps the checkout's
+/// executables.
+fn cargo(layout: Option<usize>, worktree: bool) -> Command {
     let mut cmd = Command::new(std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into()));
+    if worktree {
+        cmd.env("CARGO_TARGET_DIR", format!("{ROOT}/target/perf/build"));
+    }
     let Some(seed) = layout else {
         return cmd;
     };
@@ -265,7 +403,9 @@ fn cargo(layout: Option<usize>) -> Command {
     } else {
         format!("-Cmetadata=layout{seed}")
     };
-    cmd.env("CARGO_TARGET_DIR", format!("{ROOT}/target/layouts"));
+    if !worktree {
+        cmd.env("CARGO_TARGET_DIR", format!("{ROOT}/target/layouts"));
+    }
     // Cargo takes rustflags from the first of these that's set, else from
     // the config files, where the flag joins `build.rustflags` and loses to
     // a `target.<triple>.rustflags`.
@@ -285,12 +425,13 @@ fn cargo(layout: Option<usize>) -> Command {
 /// builds' executables.
 fn artifacts(
     mut cmd: Command,
+    tree: &Path,
     args: &[&str],
     kinds: &[&str],
 ) -> Result<Vec<(&'static str, PathBuf)>> {
     cmd.args(args)
         .arg("--message-format=json-render-diagnostics")
-        .current_dir(ROOT)
+        .current_dir(tree)
         .stderr(Stdio::inherit());
     let (stdout, _) = crate::output(&mut cmd)?;
     let mut found: Vec<(&str, PathBuf)> = Vec::new();
@@ -333,6 +474,16 @@ impl Unit {
             Self::Count | Self::Instructions => "n",
         }
     }
+
+    /// The unit as `results.json` names it.
+    fn name(self) -> &'static str {
+        match self {
+            Self::Time => "ns",
+            Self::Bytes => "B",
+            Self::Count => "count",
+            Self::Instructions => "instructions",
+        }
+    }
 }
 
 /// A metric's value from one run; none for an instruction count where
@@ -348,7 +499,7 @@ struct Metric {
 
 struct Runner {
     sandbox: Sandbox,
-    /// This run's directory under ~/.cache/dffy-bench/runs.
+    /// This run's directory under `target/perf/runs`.
     raw: PathBuf,
     /// The range's patch for the pager group, written once per run.
     patch: PathBuf,
@@ -356,15 +507,28 @@ struct Runner {
     time: bool,
     /// Whether the instruction counter opens.
     counter: bool,
+    /// `bench-ab --quick`: only instruction and allocation counts.
+    quick: bool,
+    /// With `quick`, the divan benchmarks to count, from [`Self::plan_divan`].
+    divan: Vec<DivanBench>,
+}
+
+/// A divan benchmark that `--quick` counts, every round, by running it alone
+/// at [`FIRST_ITERATIONS`] and at `added` more: the difference in
+/// instructions over `added` is its instructions per iteration.
+struct DivanBench {
+    metric: String,
+    added: u32,
+    /// Whether each side has the benchmark.
+    sides: [bool; 2],
 }
 
 impl Runner {
-    fn new(sandbox: Sandbox, groups: &[&str]) -> Result<Self> {
-        let raw = expand_tilde("~/.cache/dffy-bench/runs").join(date(&["+%Y%m%d-%H%M%S"]));
-        fs::create_dir_all(&raw).map_err(|e| format!("{}: {e}", raw.display()))?;
+    fn new(sandbox: Sandbox, groups: &[&str], quick: bool) -> Result<Self> {
+        let raw = crate::results::run_dir()?;
         let needs = |g: &str| groups.contains(&g);
         let hyperfine = which("hyperfine").unwrap_or_default();
-        if (needs("print") || needs("pager")) && hyperfine.as_os_str().is_empty() {
+        if !quick && (needs("print") || needs("pager")) && hyperfine.as_os_str().is_empty() {
             return Err("hyperfine not found, needed for print and pager".to_owned());
         }
         let time = Path::new(TIME).exists();
@@ -380,12 +544,12 @@ impl Runner {
         let patch = sandbox.path("range.patch");
         if needs("pager") {
             let out = File::create(&patch).map_err(|e| format!("{}: {e}", patch.display()))?;
-            crate::output(
-                sandbox
-                    .command("git")
-                    .args(["diff", "--no-ext-diff", "--color=always", "v6.0", "v6.1"])
-                    .stdout(out),
-            )?;
+            let mut cmd = sandbox.command("git");
+            cmd.args(["diff", "--no-ext-diff", "--color=always", "v6.0", "v6.1"]);
+            if quick {
+                cmd.arg("--").args(SUBSET);
+            }
+            crate::output(cmd.stdout(out))?;
         }
         Ok(Self {
             sandbox,
@@ -394,7 +558,62 @@ impl Runner {
             hyperfine,
             time,
             counter,
+            quick,
+            divan: Vec::new(),
         })
+    }
+
+    /// Lists the divan benchmarks of the suites in `groups` in both sets,
+    /// with the [`added_iterations`] of each from its time and the
+    /// fixture's in A.
+    fn plan_divan(&mut self, sets: [&Path; 2], groups: &[&str]) -> Result<()> {
+        for suite in ["frame", "engine"]
+            .into_iter()
+            .filter(|s| groups.contains(s))
+        {
+            // Per benchmark, its time per iteration in each set.
+            let mut times: Vec<(String, [Option<f64>; 2])> = Vec::new();
+            for side in 0..2 {
+                eprintln!("listing {suite}, {}", SIDES[side]);
+                let mut cmd = self.command(sets[side].join(suite))?;
+                // Three samples, so the median isn't the cold first one.
+                cmd.args(["--bench", "--threads", "1", "--sample-size", "1"])
+                    .args(["--sample-count", "3", "--color", "never"])
+                    .args(["--bytes-format", "decimal"]);
+                let out = self
+                    .run(&mut cmd, &format!("list-{}", SIDES[side]), suite)?
+                    .0;
+                for (name, unit, ns) in parse_divan(suite, &out)? {
+                    if unit != Unit::Time {
+                        continue;
+                    }
+                    let i = times
+                        .iter()
+                        .position(|(n, _)| *n == name)
+                        .unwrap_or_else(|| {
+                            times.push((name, [None; 2]));
+                            times.len() - 1
+                        });
+                    times[i].1[side] = ns;
+                }
+            }
+            // The fixture's time: the suite run with a filter that matches
+            // no benchmark still loads it.
+            let mut cmd = self.command(sets[0].join(suite))?;
+            cmd.args(["--bench", "--exact", &format!("{suite}::no benchmark")]);
+            let start = Instant::now();
+            self.run(&mut cmd, "fixture-A", suite)?;
+            let fixture = start.elapsed().as_secs_f64() * 1e9;
+            for (metric, ns) in times {
+                let iteration = ns[0].or(ns[1]).unwrap_or_default();
+                self.divan.push(DivanBench {
+                    metric,
+                    added: added_iterations(iteration, fixture),
+                    sides: ns.map(|t| t.is_some()),
+                });
+            }
+        }
+        Ok(())
     }
 
     fn rounds(&self, rounds: usize, sets: [&Path; 2], groups: &[&str]) -> Result<Vec<Metric>> {
@@ -404,8 +623,11 @@ impl Runner {
             for group in groups {
                 for side in order {
                     eprintln!("round {round}/{rounds}: {group}, {}", SIDES[side]);
-                    let rows =
-                        self.measure(group, sets[side], &format!("{round}-{}", SIDES[side]))?;
+                    let tag = format!("{round}-{}", SIDES[side]);
+                    let mut rows = self.measure(group, sets[side], side, &tag)?;
+                    if self.quick {
+                        rows = counts_only(rows);
+                    }
                     if rows.is_empty() {
                         return Err(format!(
                             "{group}: nothing parsed from {}'s output in {}",
@@ -440,9 +662,6 @@ impl Runner {
     /// iterations, which cancels the fixture's loading and divan's start.
     fn divan_instructions(&self, metric: &str, sets: [&Path; 2]) -> Result<Metric> {
         let mut values = [Vec::new(), Vec::new()];
-        let (suite, _) = metric.split_once('/').unwrap_or_default();
-        // divan's path of the benchmark, which starts with the crate.
-        let exact = metric.replace('/', "::");
         // Without a counter the metric has no values and shows as such.
         let rounds = if self.counter { 3 } else { 0 };
         for round in 1..=rounds {
@@ -451,20 +670,8 @@ impl Runner {
                 eprintln!("instructions {round}/3: {metric}, {}", SIDES[side]);
                 let mut counts = [0.0; 2];
                 for (count, iters) in counts.iter_mut().zip(DIVAN_ITERATIONS) {
-                    let mut cmd = self.command(sets[side].join(suite))?;
-                    cmd.args(["--bench", "--exact", &exact, "--threads", "1"])
-                        .args(["--sample-size", "1", "--sample-count", &iters.to_string()])
-                        .args(["--color", "never", "--bytes-format", "decimal"]);
                     let tag = format!("instructions-{round}-{}", SIDES[side]);
-                    let (out, n) =
-                        self.run_counted(&mut cmd, &tag, &format!("{metric} {iters}"))?;
-                    if !parse_divan(suite, &out)?
-                        .iter()
-                        .any(|(name, ..)| name == metric)
-                    {
-                        return Err(format!("{}: ran no {exact}", describe(&cmd)));
-                    }
-                    *count = n.ok_or("the instruction counter stopped opening")?;
+                    *count = self.divan_run(metric, sets[side], iters, &tag)?.0;
                 }
                 let iters = f64::from(DIVAN_ITERATIONS[1] - DIVAN_ITERATIONS[0]);
                 values[side].push((counts[1] - counts[0]) / iters);
@@ -475,6 +682,58 @@ impl Runner {
             unit: Unit::Instructions,
             values,
         })
+    }
+
+    /// `--quick`'s rows of the divan suite `suite` in `set`, side `side`:
+    /// each benchmark's instructions per iteration and its allocations.
+    fn divan_counts(&self, suite: &str, set: &Path, side: usize, tag: &str) -> Result<Vec<Row>> {
+        let mut rows = Vec::new();
+        for bench in self
+            .divan
+            .iter()
+            .filter(|b| b.metric.split('/').next() == Some(suite))
+        {
+            if !bench.sides[side] {
+                continue;
+            }
+            let (first, _) = self.divan_run(&bench.metric, set, FIRST_ITERATIONS, tag)?;
+            let iterations = FIRST_ITERATIONS + bench.added;
+            let (n, runs) = self.divan_run(&bench.metric, set, iterations, tag)?;
+            let per_iteration = (n - first) / f64::from(bench.added);
+            let name = format!("{} instructions", bench.metric);
+            rows.push((name, Unit::Instructions, Some(per_iteration)));
+            rows.extend(runs);
+        }
+        Ok(rows)
+    }
+
+    /// The divan benchmark `metric` of `set` run alone for `iterations`,
+    /// one per sample: the run's instructions, and the benchmark's rows.
+    fn divan_run(
+        &self,
+        metric: &str,
+        set: &Path,
+        iterations: u32,
+        tag: &str,
+    ) -> Result<(f64, Vec<Row>)> {
+        let (suite, _) = metric.split_once('/').unwrap_or_default();
+        // divan's path of the benchmark, which starts with the crate.
+        let exact = metric.replace('/', "::");
+        let mut cmd = self.command(set.join(suite))?;
+        cmd.args(["--bench", "--exact", &exact, "--threads", "1"])
+            .args([
+                "--sample-size",
+                "1",
+                "--sample-count",
+                &iterations.to_string(),
+            ])
+            .args(["--color", "never", "--bytes-format", "decimal"]);
+        let (out, n) = self.run_counted(&mut cmd, tag, &format!("{metric} {iterations}"))?;
+        let rows = parse_divan(suite, &out)?;
+        if !rows.iter().any(|(name, ..)| name == metric) {
+            return Err(format!("{}: ran no {exact}", describe(&cmd)));
+        }
+        Ok((n.ok_or("the instruction counter stopped opening")?, rows))
     }
 
     /// The sandbox, emptied for one run.
@@ -516,9 +775,11 @@ impl Runner {
         instructions(|| self.run(cmd, tag, name).map(|(out, _)| out))
     }
 
-    fn measure(&self, group: &str, set: &Path, tag: &str) -> Result<Vec<Row>> {
+    /// `group`'s rows for `set`, which is side `side`.
+    fn measure(&self, group: &str, set: &Path, side: usize, tag: &str) -> Result<Vec<Row>> {
         let mut rows = Vec::new();
         match group {
+            "frame" | "engine" if self.quick => rows = self.divan_counts(group, set, side, tag)?,
             "frame" | "engine" => {
                 let mut cmd = self.command(set.join(group))?;
                 cmd.args(["--bench", "--color", "never", "--bytes-format", "decimal"]);
@@ -585,6 +846,15 @@ impl Runner {
                 let plain = [&range[..], &["--no-highlight"]].concat();
                 let fair = [&range[..], &["--", "kernel/sched/fair.c"]].concat();
                 let status = ["--name-status", "--color=never", "v6.0..v6.1"];
+                if self.quick {
+                    for (name, extra) in PRINT_SUBSET {
+                        let args = [&range[..], extra, &["--"], &SUBSET].concat();
+                        rows.push(self.counted(tag, name, set, &args, None)?);
+                    }
+                    rows.push(self.counted(tag, "print/fair.c", set, &fair, None)?);
+                    rows.push(self.counted(tag, "print/name-status", set, &status, None)?);
+                    return Ok(rows);
+                }
                 rows.extend(self.hyperfine(tag, "print/range", 3, 0, set, &range, None)?);
                 let name = "print/range no-highlight";
                 rows.extend(self.hyperfine(tag, name, 5, 1, set, &plain, None)?);
@@ -597,6 +867,10 @@ impl Runner {
             "pager" => {
                 let args = ["--paging=never", "--color=always"];
                 let patch = Some(self.patch.as_path());
+                if self.quick {
+                    rows.push(self.counted(tag, PAGER_SUBSET, set, &args, patch)?);
+                    return Ok(rows);
+                }
                 rows.extend(self.hyperfine(tag, "pager/range", 5, 1, set, &args, patch)?);
                 rows.extend(self.peak_rss(tag, "pager/range peak RSS", set, &args, patch)?);
             }
@@ -641,20 +915,32 @@ impl Runner {
         cmd.arg(words.join(" "));
         self.run(&mut cmd, tag, name)?;
         let time = Timing::read(&json)?.median * 1e9;
+        Ok([
+            (name.to_owned(), Unit::Time, Some(time)),
+            self.counted(tag, name, set, args, input)?,
+        ])
+    }
 
+    /// The instructions of one run of dffy with `args` and `input` as its
+    /// stdin, as `<name> instructions`.
+    fn counted(
+        &self,
+        tag: &str,
+        name: &str,
+        set: &Path,
+        args: &[&str],
+        input: Option<&Path>,
+    ) -> Result<Row> {
         // Output to /dev/null as hyperfine's, and stdin /dev/null without
         // an input.
         let counted = format!("{name} instructions");
-        let mut cmd = self.command(&dffy)?;
+        let mut cmd = self.command(set.join("dffy"))?;
         cmd.args(args).stdout(Stdio::null());
         if let Some(input) = input {
             cmd.stdin(File::open(input).map_err(|e| format!("{}: {e}", input.display()))?);
         }
         let (_, n) = self.run_counted(&mut cmd, tag, &counted)?;
-        Ok([
-            (name.to_owned(), Unit::Time, Some(time)),
-            (counted, Unit::Instructions, n),
-        ])
+        Ok((counted, Unit::Instructions, n))
     }
 
     /// Peak RSS of one run of dffy with `args`, and `input` as its stdin.
@@ -798,6 +1084,53 @@ fn parse_divan(suite: &str, out: &str) -> Result<Vec<Row>> {
     Ok(rows)
 }
 
+/// `--quick`'s rows of one run: instruction counts, allocations and
+/// `count_pass`'s mismatches, with no timings.
+fn counts_only(mut rows: Vec<Row>) -> Vec<Row> {
+    rows.retain(|(_, unit, _)| *unit != Unit::Time);
+    rows
+}
+
+/// Iterations the second counted run of a divan benchmark adds to the
+/// first: enough to take a quarter of the time its suite's fixture takes to
+/// load, and at least 50ms, which covers a benchmark's own setup where that
+/// outweighs the fixture. So the variation in each run's instructions,
+/// mostly the fixture's and the setup's, stays small against the
+/// difference. A power of two from 2: even, so a benchmark alternating two
+/// inputs counts both alike, and unchanged by small differences in timing
+/// from one invocation to the next.
+fn added_iterations(iteration_ns: f64, fixture_ns: f64) -> u32 {
+    const MOST: u32 = 1 << 16;
+    let wanted = (f64::max(fixture_ns / 4.0, 50e6) / iteration_ns.max(1.0)).ceil();
+    if wanted >= f64::from(MOST) {
+        return MOST;
+    }
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "below 2^16, and negative only for a nonsensical time, which then gets 2"
+    )]
+    let wanted = wanted as u32;
+    wanted.next_power_of_two().max(2)
+}
+
+/// The instruction count whose values on one side are furthest apart,
+/// relative to their median, and that distance.
+fn largest_spread(metrics: &[Metric]) -> Option<(f64, &str)> {
+    metrics
+        .iter()
+        .filter(|m| m.unit == Unit::Instructions)
+        .flat_map(|m| m.values.iter().map(move |v| (v, m.name.as_str())))
+        .filter_map(|(values, name)| {
+            let mid = median(&mut values.clone()).filter(|&mid| mid > 0.0)?;
+            let (lo, hi) = values
+                .iter()
+                .fold((f64::MAX, f64::MIN), |(lo, hi), &v| (lo.min(v), hi.max(v)));
+            Some(((hi - lo) / mid, name))
+        })
+        .max_by(|a, b| a.0.total_cmp(&b.0))
+}
+
 /// The largest difference between the two sides of one round.
 fn band(m: &Metric) -> f64 {
     m.values[0]
@@ -808,7 +1141,7 @@ fn band(m: &Metric) -> f64 {
 }
 
 /// The bands in `path`, none when it's missing.
-fn read_bands(path: &Path) -> HashMap<String, f64> {
+pub(crate) fn read_bands(path: &Path) -> HashMap<String, f64> {
     fs::read_to_string(path)
         .unwrap_or_default()
         .lines()
@@ -853,19 +1186,26 @@ fn write_noise(path: &Path, metrics: &[Metric], rounds: usize) -> Result<()> {
     write_bands(path, &header, &bands)
 }
 
-/// Builds `count` sets of the current tree, each with its own code layout,
-/// into `base/layouts/<k>`, measures every set after the first against the
-/// first, and writes each metric's layout band to `base/layout.tsv`: the
+/// Builds `count` sets of the checkout, or of `worktree`, each with its own
+/// code layout, into `base/layouts/<k>`, measures every set after the first
+/// against the first, and writes each metric's layout band to `out`: the
 /// largest difference of a set's median from the first set's, relative to
 /// the first set's.
-fn measure_layouts(base: &Path, count: usize, rounds: usize, groups: &[&str]) -> Result<()> {
+pub(crate) fn measure_layouts(
+    base: &Path,
+    count: usize,
+    rounds: usize,
+    groups: &[&str],
+    worktree: Option<&Path>,
+    out: &Path,
+) -> Result<()> {
     let sets: Vec<PathBuf> = (0..count)
         .map(|k| base.join("layouts").join(k.to_string()))
         .collect();
     for (k, set) in sets.iter().enumerate() {
-        snapshot(set, Some(k + 1))?;
+        snapshot(set, Some(k + 1), worktree)?;
     }
-    let mut runner = Runner::new(Sandbox::new(bench_repo()?, false)?, groups)?;
+    let mut runner = Runner::new(Sandbox::new(bench_repo()?, false)?, groups, false)?;
     let raw = runner.raw.clone();
     let mut bands: Vec<(String, f64, &str)> = Vec::new();
     for (k, set) in sets.iter().enumerate().skip(1) {
@@ -882,12 +1222,14 @@ fn measure_layouts(base: &Path, count: usize, rounds: usize, groups: &[&str]) ->
             }
         }
     }
-    let path = base.join("layout.tsv");
+    let path = out;
+    let commit = fs::read_to_string(sets[0].join("REV")).unwrap_or_default();
     let header = format!(
-        "# cargo xtask bench-layouts ({count} layouts, {rounds} rounds, {}): metric, the largest difference of a layout's median from layout 0's, as a fraction of layout 0's, rel",
+        "# cargo xtask bench-layouts (commit {}, {count} layouts, {rounds} rounds, {}): metric, the largest difference of a layout's median from layout 0's, as a fraction of layout 0's, rel",
+        crate::results::short(commit.trim()),
         now()
     );
-    write_bands(&path, &header, &bands)?;
+    write_bands(path, &header, &bands)?;
     let mut summary = format!(
         "# dffy layout bands\n\n- {count} layouts of {}; rounds: {rounds}; groups: {}\n\n| Metric | Layout band |\n|---|---|\n",
         base.display(),
@@ -994,16 +1336,18 @@ fn timing_result(metric: &Metric, metrics: &[Metric], layout: &HashMap<String, f
     }
 }
 
-/// The markdown table and whether every metric passed. `bands` are from
-/// `noise.tsv`, `layout` from `layout.tsv`. `measuring` is A compared with
-/// itself: the table adds the bands being measured, and a metric the rule
-/// fails is a false alarm, which doesn't fail the run.
+/// The markdown table, whether every metric passed, and each metric's
+/// Result cell. `bands` are from `noise.tsv`, `layout` from `layout.tsv`.
+/// `measuring` is A compared with itself: the table adds the bands being
+/// measured, and a metric the rule fails is a false alarm, which doesn't
+/// fail the run.
 fn table(
     metrics: &[Metric],
     bands: &HashMap<String, f64>,
     layout: &HashMap<String, f64>,
     measuring: bool,
-) -> (String, bool) {
+) -> (String, bool, Vec<String>) {
+    let mut verdicts = Vec::new();
     let mut out = if measuring {
         "| Metric | A | B | Delta | Slower rounds | Band | Result |\n|---|---|---|---|---|---|---|\n"
     } else {
@@ -1080,6 +1424,7 @@ fn table(
             cell(a),
             cell(b)
         );
+        verdicts.push(result);
     }
     if measuring {
         let _ = write!(
@@ -1089,34 +1434,11 @@ fn table(
         );
     }
     let _ = write!(out, "\nFailed: {failed} of {} metrics.\n", metrics.len());
-    (out, failed == 0)
+    (out, failed == 0, verdicts)
 }
 
-/// Four significant digits in the largest unit under the value.
 fn show(v: f64, unit: Unit) -> String {
-    let scales: &[(f64, &str)] = match unit {
-        Unit::Time => &[(1e9, "s"), (1e6, "ms"), (1e3, "µs"), (1.0, "ns")],
-        Unit::Bytes => &[(1e9, "GB"), (1e6, "MB"), (1e3, "KB"), (1.0, "B")],
-        Unit::Count => return format!("{v}"),
-        Unit::Instructions => return format!("{v:.3e}"),
-    };
-    if v.abs() < 1e-9 {
-        return "0".to_owned();
-    }
-    let (scale, suffix) = scales
-        .iter()
-        .find(|(s, _)| v.abs() >= *s)
-        .copied()
-        .unwrap_or((1.0, scales[3].1));
-    let x = v / scale;
-    let digits = if x.abs() >= 100.0 {
-        1
-    } else if x.abs() >= 10.0 {
-        2
-    } else {
-        3
-    };
-    format!("{x:.digits$} {suffix}")
+    crate::results::show(v, unit.name())
 }
 
 #[cfg(test)]
@@ -1214,7 +1536,7 @@ frame                       fastest       │ slowest       │ median        �
     /// The Result cell of each row, in order.
     fn results(metrics: &[Metric], layout: &[(&str, f64)]) -> Vec<String> {
         let layout = layout.iter().map(|&(n, b)| (n.to_owned(), b)).collect();
-        let (out, _) = table(metrics, &HashMap::new(), &layout, false);
+        let (out, ..) = table(metrics, &HashMap::new(), &layout, false);
         out.lines()
             .skip(2)
             .take(metrics.len())
@@ -1244,7 +1566,7 @@ frame                       fastest       │ slowest       │ median        �
     #[test]
     fn instructions_without_a_counter_show_no_values_and_pass() {
         let metrics = [metric("a instructions", Unit::Instructions, &[], &[])];
-        let (out, pass) = table(&metrics, &HashMap::new(), &HashMap::new(), false);
+        let (out, pass, _) = table(&metrics, &HashMap::new(), &HashMap::new(), false);
         assert!(pass);
         assert!(
             out.contains("| a instructions | — | — | — | — | not measured |"),
@@ -1307,5 +1629,96 @@ frame                       fastest       │ slowest       │ median        �
                 "PASS"
             ]
         );
+    }
+
+    #[test]
+    fn quick_keeps_counts_and_drops_timings() {
+        let rows = vec![
+            ("count_pass".to_owned(), Unit::Time, Some(1.0)),
+            (
+                "count_pass instructions".to_owned(),
+                Unit::Instructions,
+                Some(1.0),
+            ),
+            (COUNT_MISMATCH.to_owned(), Unit::Count, Some(0.0)),
+            ("frame/a alloc count".to_owned(), Unit::Count, Some(1.0)),
+            ("frame/a alloc bytes".to_owned(), Unit::Bytes, Some(1.0)),
+        ];
+        let kept: Vec<String> = counts_only(rows).into_iter().map(|r| r.0).collect();
+        assert_eq!(
+            kept,
+            [
+                "count_pass instructions",
+                COUNT_MISMATCH,
+                "frame/a alloc count",
+                "frame/a alloc bytes"
+            ]
+        );
+    }
+
+    #[test]
+    fn quick_fails_on_instructions_over_half_a_percent_or_any_new_allocation() {
+        let metrics = [
+            metric(
+                "frame/a instructions",
+                Unit::Instructions,
+                &[1e6; 3],
+                &[1.004e6; 3],
+            ),
+            metric(
+                "frame/b instructions",
+                Unit::Instructions,
+                &[1e6; 3],
+                &[1.006e6; 3],
+            ),
+            metric("frame/a alloc count", Unit::Count, &[87.0; 3], &[88.0; 3]),
+            metric("frame/b alloc count", Unit::Count, &[87.0; 3], &[88.0; 3]),
+            metric(
+                "frame/a alloc bytes",
+                Unit::Bytes,
+                &[2488.0; 3],
+                &[2488.0; 3],
+            ),
+        ];
+        let bands = HashMap::from([("frame/b alloc count".to_owned(), 1.0)]);
+        let (out, pass, _) = table(&metrics, &bands, &HashMap::new(), false);
+        assert!(!pass);
+        let results: Vec<&str> = out
+            .lines()
+            .skip(2)
+            .take(metrics.len())
+            .map(|row| row.rsplit('|').nth(1).unwrap_or_default().trim())
+            .collect();
+        assert_eq!(results, ["PASS", "FAIL", "FAIL", "PASS (band 1)", "PASS"]);
+    }
+
+    #[test]
+    fn quick_names_its_subset_runs_apart_from_the_whole_range() {
+        let full = ["print/range", "print/range no-highlight", "pager/range"];
+        let quick = PRINT_SUBSET.map(|(name, _)| name);
+        for name in quick.iter().chain([&PAGER_SUBSET]) {
+            assert!(name.contains("/subset"), "{name}");
+            assert!(full.iter().all(|f| !name.starts_with(f)), "{name}");
+        }
+    }
+
+    #[test]
+    fn added_iterations_cover_a_quarter_of_the_fixture_or_50ms() {
+        // 100µs per iteration, a 400ms fixture: 1000 wanted, 1024 given.
+        assert_eq!(added_iterations(100e3, 400e6), 1024);
+        // A fast fixture: 50ms of iterations, 500 wanted.
+        assert_eq!(added_iterations(100e3, 30e6), 512);
+        // Slower than the fixture's quarter: the fewest, still even.
+        assert_eq!(added_iterations(150e6, 1.2e9), 2);
+        // A few nanoseconds against a slow fixture: capped.
+        assert_eq!(added_iterations(5.0, 1.2e9), 1 << 16);
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn quick_off_linux_says_it_needs_linux() {
+        let args = ["base".to_owned(), "--quick".to_owned()];
+        let err = main("bench-ab", &args).unwrap_err();
+        assert!(err.contains("Linux"), "{err}");
     }
 }

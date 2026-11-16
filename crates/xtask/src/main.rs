@@ -1,15 +1,18 @@
 //! `cargo xtask`: dffy's benchmark tooling, on macOS and Linux.
 //!
-//! - `bench-baseline`, `bench-ab`, `bench-noise` and `bench-layouts` are the
-//!   performance gate: a baseline build kept on disk, compared with the
-//!   current tree on the same machine, failing on a slowdown consistent
-//!   across rounds, more instructions or an allocation increase.
+//! - `perf` is the performance gate: the checkout compared with a build of
+//!   another commit on the same machine, failing on a slowdown consistent
+//!   across rounds, more instructions or an allocation increase. `bench-*`
+//!   are its steps, for running by hand.
 //! - `compare` times dffy against other diff tools on the kernel range and
 //!   prints the tables in `docs/benchmarks.md`.
+//! - `report` prints a run's tables from its `results.json`.
 
 mod ab;
 mod compare;
 mod harness;
+mod perf;
+mod results;
 
 use std::ffi::{OsStr, OsString};
 use std::fs;
@@ -18,12 +21,18 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 
 const USAGE: &str = "\
-usage: cargo xtask bench-baseline <dir>
-       cargo xtask bench-ab <base-dir> [--rounds N] [--only GROUP,...] [--instructions METRIC,...]
+usage: cargo xtask perf [--quick | --full] [--rev REV] [--rounds N] [--only GROUP,...]
+       cargo xtask compare [--scenarios S,...] [--runs N] [--slow-runs N] [--mem-runs N]
+       cargo xtask report <run-dir>
+advanced:
+       cargo xtask bench-baseline <dir>
+       cargo xtask bench-ab <base-dir> [--quick] [--rounds N] [--only GROUP,...] [--instructions METRIC,...]
        cargo xtask bench-noise <base-dir> [--rounds N] [--only GROUP,...]
        cargo xtask bench-layouts <base-dir> [--layouts N] [--rounds N] [--only GROUP,...]
-       cargo xtask compare [--scenarios S,...] [--runs N] [--slow-runs N] [--mem-runs N]
 
+perf measures the checkout against a build of --rev (default HEAD~1), every
+group unless --only narrows it; --quick (Linux) only instruction and
+allocation counts, of every group; --full with fresh layout bands.
 GROUP is one of frame, engine, pty, count, paint, print, pager.
 S is one of range, renames, file, syntax, tui; tui is every viewer table.
 compare's defaults come from SCENARIOS, RUNS (10), SLOW_RUNS (3) and
@@ -39,8 +48,10 @@ type Result<T, E = String> = std::result::Result<T, E>;
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let result = match args.split_first() {
+        Some((cmd, rest)) if cmd == "perf" => perf::main(rest),
         Some((cmd, rest)) if cmd.starts_with("bench-") => ab::main(cmd, rest),
         Some((cmd, rest)) if cmd == "compare" => compare::main(rest).map(|()| true),
+        Some((cmd, rest)) if cmd == "report" => results::main(rest).map(|()| true),
         _ => Err(USAGE.to_owned()),
     };
     match result {
@@ -71,15 +82,15 @@ fn bench_repo() -> Result<PathBuf> {
     fs::canonicalize(expand_tilde(&repo)).map_err(|e| format!("DFFY_BENCH_REPO={repo}: {e}"))
 }
 
-/// `name` as `command -v` finds it: a path as given, or the first
-/// executable of that name on PATH.
+/// `name` as `command -v` finds it: a path, made absolute since commands
+/// run in the kernel clone, or the first executable of that name on PATH.
 fn which(name: &str) -> Option<PathBuf> {
     let executable = |p: &Path| {
         p.metadata()
             .is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
     };
     if name.contains('/') {
-        let path = expand_tilde(name);
+        let path = std::path::absolute(expand_tilde(name)).ok()?;
         return executable(&path).then_some(path);
     }
     std::env::split_paths(&std::env::var_os("PATH")?)
@@ -146,6 +157,8 @@ struct Timing {
     stddev: f64,
     min: f64,
     max: f64,
+    /// Every run's.
+    times: Vec<f64>,
 }
 
 impl Timing {
@@ -170,6 +183,19 @@ impl Timing {
             stddev: t["stddev"].as_f64().unwrap_or(0.0),
             min: field("min")?,
             max: field("max")?,
+            // hyperfine 2 keeps each run under measurements, 1.x in times.
+            times: match result["measurements"].as_array() {
+                Some(runs) => runs
+                    .iter()
+                    .filter_map(|r| r["time_wall_clock"]["value"].as_f64())
+                    .collect(),
+                None => result["times"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(serde_json::Value::as_f64)
+                    .collect(),
+            },
         })
     }
 }

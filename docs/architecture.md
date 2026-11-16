@@ -108,7 +108,7 @@ Each module draws once, at the narrowest label wrap that fits the width; sizes a
 
 ### `xtask`
 
-`cargo xtask`, not published: the performance gate (`bench-baseline`, `bench-noise`, `bench-ab`, `bench-layouts`) and the comparison with other diff tools (`compare`). [benchmarks.md](benchmarks.md) describes both.
+`cargo xtask`, not published: the performance gate (`perf`, with its steps `bench-baseline`, `bench-ab`, `bench-noise` and `bench-layouts`), the comparison with other diff tools (`compare`), and `report`, which prints a run's tables from its `results.json`. [benchmarks.md](benchmarks.md) describes them.
 
 ## Data flow
 
@@ -259,16 +259,19 @@ Both skip without `DFFY_BENCH_REPO`.
 
 ### Checking a change
 
-A change that could affect speed or memory is gated A/B against a baseline build on the same machine, with `cargo xtask bench-ab` (`task bench:ab`). [benchmarks.md](benchmarks.md#checking-a-change-for-regressions) has the commands and the exact rules.
+A change that could affect speed or memory is gated A/B against a build of another commit on the same machine, with `task perf` (`cargo xtask perf`). [benchmarks.md](benchmarks.md#checking-a-change-for-regressions) has the commands and the exact rules.
 
-- **What runs:** the divan benchmarks, the `first_frame`, `count_pass` and `first_paint` examples, and dffy printing the kernel range and reading its patch as a pager. Both builds run in every round, alternating which goes first.
+- **Tiers:** `task perf:quick` counts instructions and allocations only, on every change (Linux). `task perf` adds timing and peak memory, for hot paths or when the quick tier fails. `task perf:full` runs every group before a release.
+- **Baseline:** the commit given with `--rev`, `HEAD~1` unless given, built fresh by every run from a git worktree of that commit. The candidate is the checkout, uncommitted changes included. Each run removes its builds afterwards, keeping only `target/perf/runs/` and `target/perf/layout.tsv`.
+- **What runs:** the divan benchmarks, the `first_frame`, `count_pass` and `first_paint` examples, and dffy printing the kernel range and reading its patch as a pager; the quick tier prints and pages a 421-file subset of the range. Both builds run in every round, alternating which goes first.
+- **Groups:** `perf:quick` and `perf:full` measure every group; `task perf` does too unless `--only` narrows it, e.g. `task perf -- --only frame,print`.
 - **Timing and peak memory:** a metric fails when the candidate is worse consistently across rounds and by more than 1% or the metric's layout band, whichever is larger, or when its instruction count fails.
 - **Instruction counts:** on Linux, user-space instructions are counted too, and a count more than 0.5% above the baseline's fails.
-- **Layout bands:** `cargo xtask bench-layouts` builds the same tree with several randomized code layouts and records how far each metric moves from layout alone.
 - **Allocations:** allocation counts and bytes per iteration fail on any increase.
-- **Noise:** `cargo xtask bench-noise` compares the baseline with itself on the machine that runs the comparisons.
+- **Layout bands:** how far each metric moves between builds with different code layouts, kept in `target/perf/layout.tsv` for every baseline and measured again by `perf:full` when missing or more than 30 days old. `perf` and `perf:quick` never calibrate.
+- **Results:** every run, and `task bench:compare`, writes `results.json` and a summary to `target/perf/runs/<time>/`; `cargo xtask report <run-dir>` prints its tables as markdown.
 
-The Linux VM above is the reference runner: published numbers and the gate of record come from it. A Mac needs its own baseline and noise run for local checks.
+Published numbers come from the Linux VM above. Layout bands hold only for the machine that measured them.
 
 ## Testing
 
@@ -277,7 +280,10 @@ The Linux VM above is the reference runner: published numbers and the gate of re
 | `task ci` | `fmt:check`, `lint` (clippy, warnings are errors), `test`, `docs:check`, `doc`, `deny`, `machete`, `typos`, in order |
 | `task test` | Every unit and integration test with cargo-nextest, then doctests |
 | `task test:kernel` | The kernel tests in release mode; needs `DFFY_BENCH_REPO` |
-| `task bench:ab` | The current tree against a baseline from `task bench:baseline`, failing on a slowdown over 1% that's consistent across rounds, or an allocation increase (`cargo xtask`, see [benchmarks.md](benchmarks.md#checking-a-change-for-regressions)) |
+| `task perf` | The checkout against a build of the revision given with `--rev` (default `HEAD~1`), every group unless `--only` narrows it, failing on a slowdown over 1% that's consistent across rounds, more instructions or an allocation increase (see [benchmarks.md](benchmarks.md#checking-a-change-for-regressions)) |
+| `task perf:quick` | Every group's instruction and allocation counts only; Linux only |
+| `task perf:full` | Every group, measuring layout bands again when missing or more than 30 days old |
+| `task bench:compare` | dffy, built from the checkout, against other diff tools: the tables in [benchmarks.md](benchmarks.md) |
 | `task docs` | Regenerates [keys.md](keys.md) and the settings table in [config.md](config.md) |
 | `task setup` | Installs the tools the other tasks use |
 

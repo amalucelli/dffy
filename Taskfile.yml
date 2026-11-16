@@ -75,30 +75,46 @@ tasks:
     cmds:
       - cargo bench --workspace
 
-  bench:baseline:
-    desc: Build the benchmark executables into DIR as the baseline for bench:ab, e.g. task bench:baseline DIR=~/.cache/dffy-bench/baseline
+  bench:compare:
+    desc: Time dffy, built from the checkout, against other diff tools on the kernel range, for the tables in docs/benchmarks.md; results in target/perf/runs
     requires:
-      vars: [DIR]
+      vars: [DFFY_BENCH_REPO]
+    env:
+      DFFY_BENCH_REPO: "{{.DFFY_BENCH_REPO}}"
+      DFFY: '{{.DFFY | default "target/release/dffy"}}'
     cmds:
-      - cargo xtask bench-baseline "{{.DIR}}"
+      - cargo build --release -p dffy
+      - cargo xtask compare
 
-  bench:noise:
-    desc: Measure a baseline's noise into BASE/noise.tsv by comparing it with itself, showing any metric the gate would fail; ROUNDS (default 10) and ONLY (groups, comma-separated) narrow it
+  # The perf tasks measure the checkout against a build of a revision
+  # (default HEAD~1) and only print and save results in target/perf/runs.
+  # Arguments after `--` go to `cargo xtask perf`.
+  perf:
+    desc: "Timing, instructions and allocations of the checkout against a revision, every group unless --only narrows it, e.g. task perf -- --rev main --only frame,print"
     requires:
-      vars: [BASE, DFFY_BENCH_REPO]
+      vars: [DFFY_BENCH_REPO]
     env:
       DFFY_BENCH_REPO: "{{.DFFY_BENCH_REPO}}"
     cmds:
-      - cargo xtask bench-noise "{{.BASE}}" --rounds {{.ROUNDS | default 10}} {{if .ONLY}}--only {{.ONLY}}{{end}}
+      - cargo xtask perf {{.CLI_ARGS}}
 
-  bench:ab:
-    desc: Gate the current tree against a baseline from bench:baseline, e.g. task bench:ab BASE=~/.cache/dffy-bench/baseline; ROUNDS (default 10) and ONLY (groups, comma-separated) narrow it
+  perf:quick:
+    desc: "Instruction and allocation counts of the checkout against a revision, every group; Linux only. e.g. task perf:quick -- --rev main"
     requires:
-      vars: [BASE, DFFY_BENCH_REPO]
+      vars: [DFFY_BENCH_REPO]
     env:
       DFFY_BENCH_REPO: "{{.DFFY_BENCH_REPO}}"
     cmds:
-      - cargo xtask bench-ab "{{.BASE}}" --rounds {{.ROUNDS | default 10}} {{if .ONLY}}--only {{.ONLY}}{{end}}
+      - cargo xtask perf --quick {{.CLI_ARGS}}
+
+  perf:full:
+    desc: "Every group of the checkout against a revision, measuring layout bands when missing or more than 30 days old. e.g. task perf:full -- --rev main"
+    requires:
+      vars: [DFFY_BENCH_REPO]
+    env:
+      DFFY_BENCH_REPO: "{{.DFFY_BENCH_REPO}}"
+    cmds:
+      - cargo xtask perf --full {{.CLI_ARGS}}
 
   build:
     desc: Build the release binary

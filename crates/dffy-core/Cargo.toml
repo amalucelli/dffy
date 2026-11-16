@@ -1,7 +1,9 @@
 [package]
 name = "dffy-core"
 description = "Git, diff, highlighting and view model behind the dffy diff viewer"
-version.workspace = true
+version = "0.1.0"
+# Unpublished until the embedding API settles.
+publish = false
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true

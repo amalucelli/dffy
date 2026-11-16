@@ -1,6 +1,6 @@
 //! A content-addressed disk cache shared by every dffy process of a user,
 //! for results that take far longer to compute than to read back. An entry's
-//! name is a hash of the dffy version, its kind and every input it depends
+//! name is a hash of the dffy-core version, its kind and every input it depends
 //! on, so entries never need invalidating; old ones age out under the size
 //! budget.
 //!

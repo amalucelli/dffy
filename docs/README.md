@@ -2,6 +2,8 @@
 
 - [install.md](install.md): Homebrew, building from source, shell completions, the man page, supported platforms.
 - [usage.md](usage.md): every subcommand and flag, revision and path syntax, stdin, comparing files and folders outside git, exit codes.
+- [json.md](json.md): `--json` output for scripts and agents, the versioned schema of its header, file, hunk and line objects.
+- [mcp.md](mcp.md): `dffy mcp`, the Model Context Protocol server for coding agents: registering it, its three tools, paging and truncation.
 - [viewer.md](viewer.md): the full-screen viewer's layout, panels, search, selection and copy, phones.
 - [keys.md](keys.md): every action with its default keys, and how to rebind them (generated).
 - [config.md](config.md): the config file, every setting (generated), remembered settings.

@@ -13,11 +13,6 @@ flamegraph*.svg
 *.profdata
 /lcov.info
 
-# Python caches from bench/
-__pycache__/
-*.py[cod]
-.venv/
-
 # Claude Code machine-local state
 /.claude/settings.local.json
 /.claude/worktrees/

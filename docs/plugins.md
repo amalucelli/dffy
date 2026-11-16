@@ -18,14 +18,21 @@ The viewer works as on any diff:
 
 ## Enabling one
 
-1. **Install it.** The Markdown plugin, `dffy-render-markdown`, comes with each dffy release as a separate download:
+1. **Install it.** Two plugins come from this repository:
+
+   | Plugin | Draws |
+   |---|---|
+   | `dffy-render-markdown` | Markdown files, with ```` ```mermaid ```` fences drawn as diagrams. |
+   | `dffy-render-mermaid` | Mermaid files (`.mmd`, `.mermaid`): [flowcharts and sequence diagrams](#the-mermaid-plugin) drawn in text. |
+
+   Both plugins come with each dffy release as separate downloads:
 
    ```sh
-   brew install --cask amalucelli/tap/dffy-render-markdown     # or:
-   curl -fsSL https://raw.githubusercontent.com/amalucelli/dffy/main/install.sh | sh -s -- --plugin markdown
+   brew install --cask amalucelli/tap/dffy-render-markdown amalucelli/tap/dffy-render-mermaid     # or:
+   curl -fsSL https://raw.githubusercontent.com/amalucelli/dffy/main/install.sh | sh -s -- --plugin markdown --plugin mermaid
    ```
 
-   It must be on `PATH`. [install.md](install.md#plugins) also covers `cargo install --git`, and from a clone `task install:plugins` puts it in `~/.local/bin`.
+   A plugin must be on `PATH`. [install.md](install.md#plugins) also covers `cargo install --git`, and from a clone `task install:plugins` puts both in `~/.local/bin`.
 
 2. **Map file types to it** in the config file, by extension:
 
@@ -33,7 +40,7 @@ The viewer works as on any diff:
    render = md:markdown
    ```
 
-   Each pair is `extension:name`, and the name picks the program `dffy-render-<name>` on `PATH`. List several pairs separated by spaces, e.g. `render = md:markdown markdown:markdown` to cover `.markdown` files too.
+   Each pair is `extension:name`, and the name picks the program `dffy-render-<name>` on `PATH`. List several pairs separated by spaces, e.g. `render = md:markdown markdown:markdown` to cover `.markdown` files too, or `render = md:markdown mmd:mermaid mermaid:mermaid` for Mermaid files.
 
 3. **Press `r`** in the viewer on a file of that type, and `r` again to go back to the lines. The status bar says `rendered` while it's on.
 
@@ -56,6 +63,31 @@ When a file can't be rendered, its lines show and the status bar says why:
 - the file is binary or too large, or isn't UTF-8 text (it's never sent then).
 
 A diff piped to dffy has only its hunks, so there's nothing to render.
+
+## The Mermaid plugin
+
+`dffy-render-mermaid` draws a Mermaid file's diagram with box characters, so its diff reads as a diagram. A file holds one diagram. The Markdown plugin draws ```` ```mermaid ```` fences the same way.
+
+- **Flowcharts** (`graph`, `flowchart`; `TD`/`TB`, `BT`, `LR`, `RL`):
+  - nodes with their labels, in shapes for `[rect]`, `(round)`, `([stadium])`, `((circle))`, `[[subroutine]]`, `[(cylinder)]`, `{diamond}`, `{{hexagon}}`, `>flag]` and `[/lean/]`, and a box for any other;
+  - edges `-->`, `---`, `-.->`, `==>`, `--o`, `--x`, `<-->` and `~~~` (spacing only), labeled with `-->|text|` or `-- text -->`, chained (`A --> B --> C`) and grouped with `&`;
+  - an edge from a node to itself as `↻` in the node;
+  - `subgraph … end` as a titled frame. A frame that would overlap a node outside it or another frame is left out, and a line under the drawing lists its nodes instead.
+  - `classDef`, `class`, `style`, `linkStyle` and `click` are skipped. An edge to a subgraph goes to a node of the subgraph's name.
+- **Sequence diagrams** (`sequenceDiagram`):
+  - a lifeline per `participant` or `actor` (an actor's box has round corners), with `as` aliases;
+  - messages `->`, `-->`, `->>`, `-->>`, `-x`, `--x`, `-)`, `--)`, `<<->>` and `<<-->>`, a message to oneself as a loop, and `autonumber`;
+  - notes `left of`, `right of` and `over` one or two participants;
+  - `loop`, `alt`/`else`, `opt`, `par`/`and`, `critical`/`option` and `break` as titled frames.
+  - `activate` and `deactivate` are skipped, as are `box` groups and `rect` highlights.
+- **Anything else**, a diagram that doesn't parse, and a diagram past the size limits show as their source lines, a block per line, so their diff is a line diff. The limits: 300 nodes, 600 edges, 100 subgraphs, or 3000 nodes and edge bends in a flowchart; 60 participants or 2000 statements in a sequence diagram; a drawing over a million characters. Node ids are letters, digits and `_`; an id with `-` or `.` doesn't parse.
+
+Blocks:
+
+- A flowchart is one block. When it changes, the old and new drawings show side by side, and words that changed on a line are emphasized. An edge label edited within the room it had changes only its own line. An edit that needs more room, such as a longer node label, moves what's beside or after it, and those lines show as changed too.
+- A sequence diagram is a block per statement: the participants, each message, each note, and each frame's top, divider and bottom. An added or edited message shows as that message alone. A message long enough to widen a column also changes every arrow that crosses that column.
+
+Diagrams are fit to the pane's width by wrapping labels and messages. A diagram that's still wider keeps its width, and dffy wraps its lines.
 
 ## The protocol, version 1
 
@@ -178,7 +210,10 @@ The Markdown plugin in `plugins/markdown` is a fuller example in Rust. It uses p
 - lists with bullets and numbers;
 - quotes with a `│` bar;
 - tables with box characters, wrapped to the width;
-- links underlined, images as `[image: alt]`, and HTML dim.
+- links underlined, images as `[image: alt]`, and HTML dim;
+- Mermaid fences through the Mermaid plugin's library.
+
+The Mermaid plugin in `plugins/mermaid` lays out graphs itself, with no dependency beyond JSON and character widths.
 
 ## Performance and safety
 

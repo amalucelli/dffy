@@ -22,7 +22,7 @@ curl -fsSL https://raw.githubusercontent.com/amalucelli/dffy/main/install.sh | s
 # plus the experimental Markdown renderer: … | sh -s -- --plugin markdown
 ```
 
-[docs/install.md](docs/install.md) covers mise, building from source and the renderer plugins. Then try it in any repository: `dffy HEAD~10`.
+Then try it in any repository: `dffy HEAD~10`.
 
 ## About
 
@@ -44,7 +44,7 @@ It fits into how you already work. Every action is a single key, the layout adap
 
 **Reading diffs**
 - 🪟 [Split or unified](docs/config.md#settings), picked by terminal width.
-- 🌈 Syntax highlighting for 18 languages, with [changed words emphasized](docs/viewer.md#modified-lines).
+- 🌈 Syntax highlighting for 30 languages, with [changed words emphasized](docs/viewer.md#modified-lines).
 - 🌳 [A syntax-aware diff](docs/architecture.md#the-engine) (`d`) that marks reformatted (`~`) and moved (`»`) code.
 - 🔁 Renames detected the way git detects them.
 
@@ -107,7 +107,7 @@ In the viewer, `n`/`N` move between changes, `f`/`F` between files, `/` searches
 | AI or agent annotations | ❌ | ✅ | 🟡 | ❌ | ❌ | ❌ | ❌ |
 | Other VCSs (Jujutsu, Mercurial, Sapling) | ❌ | ✅ | ✅ | ✅ | ✅ | 🟡 | — |
 
-🟡 means partial support; [docs/benchmarks.md](docs/benchmarks.md#feature-comparison-sources) explains each one. All seven are open source. GNU diff is GPL-3.0-or-later and the rest are MIT. Checked against `hunk` 0.25.0, `lumen` 2.32.0, `difftastic` 0.72.0, `delta` 0.20.1, `diff-so-fancy` 1.4.14 and GNU diffutils 3.10; [docs/benchmarks.md](docs/benchmarks.md#feature-comparison-sources) links the source for every cell.
+🟡 means partial support. All seven are open source. GNU diff is GPL-3.0-or-later and the rest are MIT. Checked against `hunk` 0.25.0, `lumen` 2.32.0, `difftastic` 0.72.0, `delta` 0.20.1, `diff-so-fancy` 1.4.14 and GNU diffutils 3.10, with [a source for every cell](docs/benchmarks.md#feature-comparison-sources).
 
 ## Benchmarks
 
@@ -121,12 +121,9 @@ Opening Linux v6.0..v6.1 (13,168 changed files, a 48MB patch) in a viewer, time 
 | Memory, opening the range | 90MB | 676MB | 4.26GB |
 
 As git's pager, `dffy` streams the whole 48MB patch in 3.0MB of its own memory, about as fast as plain `git diff`.
-
-[docs/benchmarks.md](docs/benchmarks.md) has the machine, the method, every command and the full results, including printed output against `delta`, `diff-so-fancy` and `difftastic`.
-
 ## Architecture
 
-`dffy` is written in Rust. [docs/architecture.md](docs/architecture.md) covers the crates, the data flow and the engine.
+`dffy` is written in Rust.
 
 - 🧮 [Its own diff engine](docs/architecture.md#the-engine): histogram and syntax-aware diffs, renames matching git's.
 - 🖼️ [Its own terminal renderer](docs/architecture.md#the-renderer), with no TUI framework. A full frame takes about 200µs.
@@ -135,7 +132,7 @@ As git's pager, `dffy` streams the whole 48MB patch in 3.0MB of its own memory, 
 
 ## Docs
 
-[docs/](docs/README.md) covers every key, flag and setting: [usage](docs/usage.md), [the viewer](docs/viewer.md), [keys](docs/keys.md), [configuration](docs/config.md), [themes](docs/themes.md), [git integration](docs/git.md), [watch mode](docs/watch.md), [renderer plugins](docs/plugins.md), [troubleshooting](docs/troubleshooting.md), [architecture](docs/architecture.md) and [benchmarks](docs/benchmarks.md).
+The [documentation](docs/README.md) covers every key, flag and setting: [installation](docs/install.md), [usage](docs/usage.md), [the viewer](docs/viewer.md), [keys](docs/keys.md), [configuration](docs/config.md), [themes](docs/themes.md), [git integration](docs/git.md), [watch mode](docs/watch.md), [renderer plugins](docs/plugins.md), [troubleshooting](docs/troubleshooting.md), [architecture](docs/architecture.md) and [benchmarks](docs/benchmarks.md).
 
 ## License
 

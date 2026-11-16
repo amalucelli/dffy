@@ -1,0 +1,18 @@
+---
+source: crates/dffy/src/tui/app.rs
+expression: "role_markup(&mut app, &roles)"
+---
+ merged<dim> · </>notes.txt<dim> · </><added>+2</><removed> -0</>
+<dim>index e0fe810,218dcf7..2f61be3</>
+<dim>--- a/notes.txt</>
+<dim>+++ b/notes.txt</>
+<hunk-header>@@@ -1,3 -1,3 +1,4 @@@</>
+  first line
+  second line, edited
+<added> +third line</>
+<added>+ side line</>
+
+
+
+
+»  commit 1/1  1/1  <dim>unified</>                                    <dim>/ search · tab tree · space commands</>

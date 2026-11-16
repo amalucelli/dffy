@@ -11,13 +11,16 @@
 //! file or commit starts. A wrong guess costs a color, never text.
 //!
 //! Code isn't syntax-highlighted: hunk fragments parse poorly without
-//! their file, and compiling one language's query costs up to 35ms.
+//! their file, and compiling one language's query costs up to about
+//! 140ms (Swift's).
 
 use std::io::{self, BufRead, BufReader, Read, Write};
 
-use super::parse::{self, strip_ansi};
-use super::{MAX_BLOCK_LINES, combined_role, emphasis};
-use crate::render::Kind;
+use dffy_core::diff::pair_lines;
+use dffy_core::patch::{self, strip_ansi};
+use dffy_core::view::Kind;
+
+use super::{MAX_BLOCK_LINES, combined_role};
 use crate::theme::{Role, Theme};
 
 #[derive(Debug, Clone, Copy)]
@@ -200,7 +203,7 @@ impl<W: Write> Colorer<'_, W> {
                     return Class::Role(Role::HunkHeader);
                 }
                 if !starts_section(line) {
-                    return Class::Role(combined_role(parents, line));
+                    return Class::Role(combined_role(patch::combined_kind(parents, line)));
                 }
                 self.state = State::Text;
             }
@@ -214,7 +217,7 @@ impl<W: Write> Colorer<'_, W> {
         }
         if line.starts_with(b"@@ ") {
             let (old, new) =
-                parse::parse_hunk_header(line).map_or((0, 0), |h| (h.old_len, h.new_len));
+                patch::parse_hunk_header(line).map_or((0, 0), |h| (h.old_len, h.new_len));
             self.state = State::Hunk { old, new };
             return Class::Role(Role::HunkHeader);
         }
@@ -230,7 +233,7 @@ impl<W: Write> Colorer<'_, W> {
             self.state = State::Header;
             return Class::Role(Role::Dim);
         }
-        if parse::is_commit_header(line) {
+        if patch::is_commit_header(line) {
             self.state = State::Text;
             self.commit_meta = true;
             return Class::Role(Role::CommitHeader);
@@ -251,7 +254,7 @@ impl<W: Write> Colorer<'_, W> {
         }
         if line.is_empty() {
             self.commit_meta = false;
-        } else if self.commit_meta && parse::is_meta_line(line) {
+        } else if self.commit_meta && patch::is_meta_line(line) {
             return Class::Role(Role::Dim);
         }
         Class::Role(Role::Plain)
@@ -267,7 +270,7 @@ impl<W: Write> Colorer<'_, W> {
 
     fn flush_block(&mut self) -> io::Result<()> {
         let block = std::mem::take(&mut self.block);
-        let emphasis = emphasis(block.len(), |i| {
+        let emphasis = pair_lines(block.len(), |i| {
             (block[i].kind, block[i].text.get(1..).unwrap_or_default())
         });
         // Paired lines stay red and green here: this output stands in for
@@ -334,7 +337,7 @@ impl<W: Write> Colorer<'_, W> {
 
 /// Whether `line` starts a hunk, a file or a commit.
 fn starts_section(line: &[u8]) -> bool {
-    line.starts_with(b"@@ ") || line.starts_with(b"diff ") || parse::is_commit_header(line)
+    line.starts_with(b"@@ ") || line.starts_with(b"diff ") || patch::is_commit_header(line)
 }
 
 #[cfg(test)]

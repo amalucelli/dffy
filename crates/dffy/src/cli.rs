@@ -125,6 +125,15 @@ pub(crate) enum Command {
         #[command(subcommand)]
         action: DaemonAction,
     },
+    /// Serve diffs to coding agents over the Model Context Protocol, on stdin and stdout
+    #[command(
+        long_about = "Serve diffs to coding agents over the Model Context Protocol.\n\n\
+        Speaks MCP on stdin and stdout for the repository at -C or the current \
+        directory, with three tools: changed_files, file_diff and diff. They return \
+        the objects of dffy --json, a page at a time. Register it with an agent, as \
+        in: claude mcp add dffy -- dffy mcp. See docs/mcp.md."
+    )]
+    Mcp,
     /// Print a shell completion script
     Completions {
         #[arg(value_enum)]
@@ -210,6 +219,12 @@ pub(crate) struct DiffArgs {
         ]
     )]
     pub color_only: bool,
+    /// Print the diff as JSON Lines for scripts and agents (docs/json.md): a header, an object per file, an end object; with --stat, --name-only or --name-status, files without hunks. Never colored or paged; named like doctor --json
+    #[arg(long, conflicts_with_all = ["color_only", "watch"])]
+    pub json: bool,
+    /// With --json, add each line's syntax highlighting as role names
+    #[arg(long, requires = "json", conflicts_with = "summary")]
+    pub highlight_spans: bool,
     #[command(flatten)]
     pub common: CommonArgs,
 }

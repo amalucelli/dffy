@@ -58,6 +58,7 @@ fn letter(status: &Status) -> &'static str {
         Status::Modified => "M",
         Status::TypeChange => "T",
         Status::Untracked => "??",
+        Status::Unmerged => "U",
         Status::Renamed { .. } => "R",
     }
 }
@@ -404,6 +405,7 @@ fn structural_research_files() {
         eprintln!("skipping in a debug build; run `task test:kernel`");
         return;
     }
+    let grammars = dffy_core::highlight::Registry::builtin();
     for path in RESEARCH_FILES {
         let fd = range_diff(&dir, path);
         let mut line = fd.hunks.clone();
@@ -420,7 +422,7 @@ fn structural_research_files() {
             reset_peak();
             let before = rss();
             let start = Instant::now();
-            let s = structural::diff(path.as_bytes(), &fd.old, &fd.new, &fd.hunks)
+            let s = structural::diff(&grammars, path.as_bytes(), &fd.old, &fd.new, &fd.hunks)
                 .unwrap_or_else(|e| panic!("{path}: {}", e.note()));
             times.push(start.elapsed());
             memory = memory.max(peak().saturating_sub(before));
@@ -439,6 +441,7 @@ fn structural_research_files() {
         let cached = || {
             let start = Instant::now();
             let s = structural::diff_cached(
+                &grammars,
                 path.as_bytes(),
                 &fd.old,
                 &fd.new,
@@ -493,6 +496,7 @@ fn structural_hunks_reproduce_new_on_sampled_c_files() {
         })
         .collect();
     let step = (c_files.len() / 120).max(1);
+    let grammars = dffy_core::highlight::Registry::builtin();
     let (mut checked, mut regions, mut fell_back) = (0, 0, 0);
     for change in c_files.into_iter().step_by(step) {
         let path = change.path.to_string();
@@ -502,8 +506,9 @@ fn structural_hunks_reproduce_new_on_sampled_c_files() {
         if fd.binary || fd.too_large {
             continue;
         }
-        let s = dffy_core::structural::diff(path.as_bytes(), &fd.old, &fd.new, &fd.hunks)
-            .unwrap_or_else(|e| panic!("{path}: {}", e.note()));
+        let s =
+            dffy_core::structural::diff(&grammars, path.as_bytes(), &fd.old, &fd.new, &fd.hunks)
+                .unwrap_or_else(|e| panic!("{path}: {}", e.note()));
         assert_eq!(apply(&fd.old, &fd.new, &s.hunks), fd.new.bytes(), "{path}");
         checked += 1;
         regions += s.regions.matched + s.regions.fell_back;
@@ -533,10 +538,12 @@ fn range_diff(dir: &Path, path: &str) -> dffy_core::git::FileDiff {
 #[test]
 fn highlight_timings() {
     use dffy_core::cache::Cache;
-    use dffy_core::highlight::{self, Highlighter, Language};
+    use dffy_core::highlight::{self, Highlighter, Registry};
     use std::time::Instant;
 
     let Some(dir) = bench_repo() else { return };
+    let grammars = Registry::builtin();
+    let c = grammars.named("c").expect("C is bundled");
     // The parse budget is wall-clock, and a debug build under the load of
     // the whole suite runs past it, which leaves a side plain and stores
     // nothing. So the best of the runs that finished, if any did.
@@ -557,7 +564,7 @@ fn highlight_timings() {
     let screen = first..(first + 60).min(text.len());
     // Before any other parse, so the allocator has no freed pages to reuse.
     let before = rss();
-    let Some(parsed) = highlight::parse(Language::C, text.bytes()) else {
+    let Some(parsed) = highlight::parse(c, text.bytes()) else {
         eprintln!("fair.c: the parse ran past its budget; run `task test:kernel`");
         return;
     };
@@ -565,7 +572,7 @@ fn highlight_timings() {
         "fair.c tree: about {} bytes of memory per byte of source",
         rss().saturating_sub(before) / text.bytes().len()
     );
-    let parse = best(&mut || highlight::parse(Language::C, text.bytes()).is_some());
+    let parse = best(&mut || highlight::parse(c, text.bytes()).is_some());
     let screens: Vec<usize> = fair.hunks.iter().step_by(7).map(|h| h.new_start).collect();
     let full = parsed.spans(text, 0..text.len());
     for &start in &screens {
@@ -585,12 +592,12 @@ fn highlight_timings() {
     let id = fair.change.new.and_then(|s| s.id());
     let miss = best(&mut || {
         std::fs::remove_dir_all(cache_dir.path()).ok();
-        Highlighter::prepare(Language::C, text, id, Some(&cache), true).is_some()
+        Highlighter::prepare(c, text, id, Some(&cache), true).is_some()
     });
     // Without storing, so a missing entry (the last miss ran past the
     // budget) parses and doesn't count as a hit.
     let hit = best(
-        &mut || match Highlighter::prepare(Language::C, text, id, Some(&cache), false) {
+        &mut || match Highlighter::prepare(c, text, id, Some(&cache), false) {
             Some(h @ Highlighter::Cached(_)) => {
                 drop(h.spans(text, screen.clone()));
                 true

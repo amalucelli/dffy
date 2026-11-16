@@ -1,58 +1,11 @@
 //! Two columns, old on the left and new on the right. Removed and added
 //! lines of a change block pair up in order, one row per pair.
 
-use super::{Canvas, Cursor, DiffLine, HunkRow, Kind, Layout, NO_NEWLINE, line_style};
+use super::{Canvas, Cursor, Layout, Line, NO_NEWLINE, line_style};
 use crate::theme::Role;
 
-/// Pairs the lines of a hunk into rows, given each line's kind and whether
-/// it starts a new block of rows.
-pub(super) fn rows(len: usize, line: impl Fn(usize) -> (Kind, bool), rows: &mut Vec<HunkRow>) {
-    let kind = |i| line(i).0;
-    let mut i = 0;
-    let mut added = Vec::new();
-    while i < len {
-        match kind(i) {
-            Kind::Context => {
-                rows.push(HunkRow::Pair(Some(i), Some(i)));
-                i += 1;
-            }
-            Kind::NoNewline => {
-                rows.push(HunkRow::Marker);
-                i += 1;
-            }
-            Kind::Removed | Kind::Added => {
-                let start = i;
-                let continues = |i: usize| i == start || !line(i).1;
-                while i < len && kind(i) == Kind::Removed && continues(i) {
-                    i += 1;
-                }
-                let removed = start..i;
-                added.clear();
-                let mut marker = false;
-                while i < len && matches!(kind(i), Kind::Added | Kind::NoNewline) && continues(i) {
-                    if kind(i) == Kind::Added {
-                        added.push(i);
-                    } else {
-                        marker = true;
-                    }
-                    i += 1;
-                }
-                for k in 0..removed.len().max(added.len()) {
-                    rows.push(HunkRow::Pair(
-                        Some(removed.start + k).filter(|r| removed.contains(r)),
-                        added.get(k).copied(),
-                    ));
-                }
-                if marker {
-                    rows.push(HunkRow::Marker);
-                }
-            }
-        }
-    }
-}
-
 /// One logical row, spanning several screen rows when a side wraps.
-pub(super) fn row(layout: &Layout, w: usize, lines: [Option<&DiffLine>; 2], c: &mut Canvas) {
+pub(super) fn row(layout: &Layout, w: usize, lines: [Option<&Line>; 2], c: &mut Canvas) {
     let width = layout.width.unwrap_or(80);
     let left = (width - 1) / 2;
     let right = width - 1 - left;

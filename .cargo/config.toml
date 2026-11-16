@@ -1,0 +1,10 @@
+[alias]
+xtask = "run --release --package xtask --"
+
+# The bundled tree-sitter grammars are C, linked after dffy's own code, so
+# any change in the size of dffy's code moves every parser function. Aligned
+# to 64 bytes, their place in a cache line no longer depends on dffy's size,
+# and printed output with highlighting stops changing speed with unrelated
+# edits.
+[env]
+CFLAGS = "-falign-functions=64"

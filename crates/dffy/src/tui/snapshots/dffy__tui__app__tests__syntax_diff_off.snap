@@ -1,0 +1,14 @@
+---
+source: crates/dffy/src/tui/app.rs
+expression: screen(&mut app)
+---
+ modified · src/f.c · +1 -1                                         @@ int f11(void) { return 11; }
+┌ Files · 2 +1 -1 ─────────┐ 14 14  │ int f14(void) { return 14; }
+│ ▼ src/                   │ 15    -│ int f15(void) { return 15; }
+│   M f.c          +1   -1 │ 16 15  │ int f16(void) { return 16; }
+│   M zz.rs                │    16 +│ int f15(void) { return 15; }                                 █
+│                          │ 17 17  │ int f17(void) { return 17; }                                 █
+│                          │ 18 18  │ int f18(void) { return 18; }                                 ┃
+│                          │ 19 19  │ int f19(void) { return 19; }
+└«─────────────────────────┘ ⋯ 11 unchanged lines
+   working tree  1/2 · 1/1 hunk  unified                       / search · tab tree · space commands

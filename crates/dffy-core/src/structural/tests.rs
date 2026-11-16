@@ -1,7 +1,11 @@
+use std::sync::LazyLock;
+
 use proptest::prelude::*;
 
 use super::*;
 use crate::diff::{Options, hunks};
+
+static GRAMMARS: LazyLock<Registry> = LazyLock::new(Registry::builtin);
 
 fn texts(old: &str, new: &str) -> (Text, Text) {
     (Text::new(old.into()), Text::new(new.into()))
@@ -12,7 +16,7 @@ fn line_hunks(old: &Text, new: &Text) -> Vec<Hunk> {
 }
 
 fn structural(path: &str, old: &Text, new: &Text) -> Structural {
-    diff(path.as_bytes(), old, new, &line_hunks(old, new)).expect("structural diff")
+    diff(&GRAMMARS, path.as_bytes(), old, new, &line_hunks(old, new)).expect("structural diff")
 }
 
 /// Rebuilds the new text from the old one and the hunks, checking that
@@ -158,6 +162,21 @@ fn hunks_reproduce_new_in_every_fixture_language() {
             "{\"a\": [1, 2, 3], \"b\": {\"c\": true}}\n",
             "{\n  \"b\": {\"c\": false},\n  \"a\": [1, 2, 3, 4]\n}\n",
         ),
+        (
+            "a.kt",
+            "fun f(a: Int): Int {\n    return a + 1\n}\nval x = f(3)\n",
+            "val x = f(3)\nfun f(a: Int, b: Int): Int {\n    return a + b\n}\n",
+        ),
+        (
+            "main.tf",
+            "variable \"a\" {\n  default = 1\n}\nresource \"r\" \"b\" { count = var.a }\n",
+            "resource \"r\" \"b\" {\n  count = var.a\n}\nvariable \"a\" {\n  default = 2\n}\n",
+        ),
+        (
+            "a.sql",
+            "SELECT a, b FROM t WHERE c = 1;\nDELETE FROM u;\n",
+            "DELETE FROM u;\nSELECT\n  b,\n  a\nFROM t\nWHERE c = 2;\n",
+        ),
         // Syntax errors on both sides.
         (
             "broken.c",
@@ -181,12 +200,12 @@ fn unknown_languages_and_oversized_sides_are_unavailable() {
     let (old, new) = texts("a\n", "b\n");
     let h = line_hunks(&old, &new);
     assert_eq!(
-        diff(b"notes.unknown", &old, &new, &h).err(),
+        diff(&GRAMMARS, b"notes.unknown", &old, &new, &h).err(),
         Some(Unavailable::Language)
     );
     let big = Text::new(vec![b'x'; MAX_BYTES + 1]);
     assert_eq!(
-        diff(b"big.c", &old, &big, &h).err(),
+        diff(&GRAMMARS, b"big.c", &old, &big, &h).err(),
         Some(Unavailable::TooLarge)
     );
 }
@@ -309,6 +328,15 @@ fn reindenting_is_a_change_where_indentation_is_syntax() {
     insta::assert_snapshot!(show(&o, &n, &s.hunks), @r"
     -        b(2)
     +    b(2)
+    ");
+    // Scala 3's braceless syntax: the same move out of the `if`.
+    let old = "def f(x: Int) =\n  if x > 0 then\n    a(1)\n    b(2)\n";
+    let new = "def f(x: Int) =\n  if x > 0 then\n    a(1)\n  b(2)\n";
+    let s = check("a.scala", old, new);
+    let (o, n) = texts(old, new);
+    insta::assert_snapshot!(show(&o, &n, &s.hunks), @r"
+    -    b(2)
+    +  b(2)
     ");
 }
 
@@ -540,7 +568,15 @@ fn a_region_over_budget_falls_back_alone() {
         region_work: 150,
         ..Budget::DEFAULT
     };
-    let s = diff_with(b"a.c", &old, &new, &line_hunks(&old, &new), budget).expect("diff");
+    let s = diff_with(
+        &GRAMMARS,
+        b"a.c",
+        &old,
+        &new,
+        &line_hunks(&old, &new),
+        budget,
+    )
+    .expect("diff");
     assert_eq!(apply(&old, &new, &s.hunks), new.bytes());
     assert_eq!((s.regions.matched, s.regions.fell_back), (1, 1));
     assert!(s.note().is_some());
@@ -557,7 +593,7 @@ fn a_region_over_budget_falls_back_alone() {
         file_time: Duration::ZERO,
         ..Budget::DEFAULT
     };
-    let s = diff_with(b"a.c", &old, &new, &line_hunks(&old, &new), none).expect("diff");
+    let s = diff_with(&GRAMMARS, b"a.c", &old, &new, &line_hunks(&old, &new), none).expect("diff");
     assert_eq!(s.regions.fell_back, 2);
     assert_eq!(s.hunks, line);
 }

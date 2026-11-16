@@ -1,15 +1,23 @@
-//! A line-at-a-time parser for unified diffs as `git diff`, `git show`,
-//! `git log -p` and `diff -u` print them. It keeps only the current file's
-//! header, so memory doesn't grow with the input.
+//! Unified diffs read as text, as `git diff`, `git show`, `git log -p` and
+//! `diff -u` print them: a line-at-a-time [`Parser`] that turns them into
+//! [`Event`]s, and a [`Builder`] that collects those into the commits and
+//! files of the patch. The host reads the input and decides what to keep;
+//! nothing here does I/O or spawns threads, and the parser keeps only the
+//! current file's header, so its memory doesn't grow with the input.
 //!
 //! Hunk bodies are delimited by the line counts in their `@@` header, not by
 //! what lines look like: a removed line reading `-- foo` is content, not a
 //! file header.
 
-use crate::render::{FileStatus, Kind};
+use std::fmt;
 
+use crate::diff::{self, LineKind, Text, Unchanged};
+use crate::view::{FileStatus, HunkHeader, Kind};
+
+/// What a line outside any file's hunks is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum TextKind {
+pub enum TextKind {
+    /// Anything not listed below.
     Plain,
     /// `commit <id>`.
     CommitHeader,
@@ -21,15 +29,20 @@ pub(crate) enum TextKind {
     Meta,
 }
 
+/// What [`Parser::feed`] found, borrowing the line fed or the parser's
+/// file header.
 #[derive(Debug, Clone, Copy)]
-pub(crate) enum Event<'a> {
+pub enum Event<'a> {
+    /// A line outside any file's hunks.
     Text(TextKind, &'a [u8]),
     /// A file's header is complete; sent before its first hunk.
     File(&'a FileInfo),
+    /// A hunk's `@@` line.
     Hunk(Hunk<'a>),
     /// A hunk line without its prefix, or the whole `\ No newline` marker.
     /// A marker may also follow a finished hunk.
     Line(Kind, &'a [u8]),
+    /// The hunk's counts are used up, or a line broke them.
     HunkEnd,
     /// A whole `+`, `-` or ` ` line inside a file but past its hunk's
     /// counts. It belongs to no hunk, so it's no change; the file goes on,
@@ -37,35 +50,53 @@ pub(crate) enum Event<'a> {
     Stray(&'a [u8]),
     /// A line of a combined diff (`diff --cc`), passed through whole.
     /// `parents` is the number of prefix columns, 0 for the header lines
-    /// before the first `@@@`.
+    /// before the first `@@@` (see [`combined_kind`]).
     Combined {
+        /// Prefix columns of `line`.
         parents: usize,
+        /// The whole line.
         line: &'a [u8],
     },
 }
 
+/// A hunk's `@@ -a,b +c,d @@ heading` line.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct Hunk<'a> {
+pub struct Hunk<'a> {
+    /// First old line, 1-based (the line before, for an empty range).
     pub old_start: usize,
+    /// Old lines covered; 1 when the header leaves it out.
     pub old_len: usize,
+    /// First new line, 1-based (the line before, for an empty range).
     pub new_start: usize,
+    /// New lines covered; 1 when the header leaves it out.
     pub new_len: usize,
+    /// The text after the second `@@`, without the space before it.
     pub heading: &'a [u8],
 }
 
+/// A file's header, as its `diff`, `---`/`+++` and extended header lines
+/// give it.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct FileInfo {
+pub struct FileInfo {
+    /// How the file changed.
     pub status: FileStatus,
+    /// The old path, unquoted and without git's `a/` prefix; empty when
+    /// the header named none.
     pub old_path: Vec<u8>,
+    /// The new path, as `old_path`.
     pub new_path: Vec<u8>,
+    /// The old side's octal mode, when a header line gave one.
     pub old_mode: Option<String>,
+    /// The new side's octal mode, when a header line gave one.
     pub new_mode: Option<String>,
+    /// A rename's, copy's or rewrite's similarity index, 0 to 100.
     pub similarity: Option<u8>,
+    /// `Binary files ... differ` or a `GIT binary patch`: no hunks follow.
     pub binary: bool,
 }
 
 impl FileInfo {
-    pub(crate) fn new(old_path: Vec<u8>, new_path: Vec<u8>) -> Self {
+    fn new(old_path: Vec<u8>, new_path: Vec<u8>) -> Self {
         Self {
             status: FileStatus::Modified,
             old_path,
@@ -95,7 +126,8 @@ enum State {
     BinaryPatch,
 }
 
-pub(crate) struct Parser {
+/// Turns the lines of a patch into [`Event`]s as they're fed.
+pub struct Parser {
     state: State,
     file: FileInfo,
     /// The file header hasn't been sent yet.
@@ -124,8 +156,18 @@ impl Default for Parser {
 
 impl Parser {
     /// Parses one line, without its newline and with escape sequences
-    /// already removed.
-    pub(crate) fn feed<E>(
+    /// already removed (see [`strip_ansi`]), passing what it finds to
+    /// `emit`. A line may produce no event (a header line the file's event
+    /// carries later) or several.
+    ///
+    /// A carriage return before the newline is dropped from header and
+    /// text lines, so a patch saved with CRLF line ends reads the same; in
+    /// hunk lines it's content and stays.
+    ///
+    /// # Errors
+    ///
+    /// The first error `emit` returns, which stops the line there.
+    pub fn feed<E>(
         &mut self,
         line: &[u8],
         emit: &mut impl FnMut(Event) -> Result<(), E>,
@@ -159,11 +201,13 @@ impl Parser {
         }
     }
 
-    /// Flushes whatever is pending at the end of the input.
-    pub(crate) fn finish<E>(
-        &mut self,
-        emit: &mut impl FnMut(Event) -> Result<(), E>,
-    ) -> Result<(), E> {
+    /// Flushes whatever is pending at the end of the input: the open
+    /// hunk's end, a file header without hunks, a held `--- ` line.
+    ///
+    /// # Errors
+    ///
+    /// The first error `emit` returns.
+    pub fn finish<E>(&mut self, emit: &mut impl FnMut(Event) -> Result<(), E>) -> Result<(), E> {
         if let State::Hunk { .. } = self.state {
             emit(Event::HunkEnd)?;
         }
@@ -409,8 +453,11 @@ fn starts_file_or_commit(line: &[u8]) -> bool {
     line.starts_with(b"diff ") || is_commit_header(line)
 }
 
-/// `commit <hex id>`, optionally followed by decorations.
-pub(crate) fn is_commit_header(line: &[u8]) -> bool {
+/// Whether `line` is `commit <hex id>`, optionally followed by
+/// decorations, with an id of at least 7 digits.
+#[inline]
+#[must_use]
+pub fn is_commit_header(line: &[u8]) -> bool {
     let Some(rest) = line.strip_prefix(b"commit ") else {
         return false;
     };
@@ -418,14 +465,20 @@ pub(crate) fn is_commit_header(line: &[u8]) -> bool {
     id_len >= 7 && (rest.len() == id_len || rest[id_len] == b' ')
 }
 
-/// `Name: value` with a capitalized name, as in `Author:` or `CommitDate:`.
-pub(crate) fn is_meta_line(line: &[u8]) -> bool {
+/// Whether `line` is `Name: value` with a capitalized name, as in
+/// `Author:` or `CommitDate:`.
+#[inline]
+#[must_use]
+pub fn is_meta_line(line: &[u8]) -> bool {
     let name_len = line.iter().take_while(|b| b.is_ascii_alphabetic()).count();
     name_len > 0 && line[0].is_ascii_uppercase() && line.get(name_len) == Some(&b':')
 }
 
-/// Parses `@@ -a[,b] +c[,d] @@[ heading]`.
-pub(crate) fn parse_hunk_header(line: &[u8]) -> Option<Hunk<'_>> {
+/// Parses `@@ -a[,b] +c[,d] @@[ heading]`. `None` for anything else,
+/// including a combined diff's `@@@` and a range ending past the largest
+/// `usize`.
+#[must_use]
+pub fn parse_hunk_header(line: &[u8]) -> Option<Hunk<'_>> {
     let rest = line.strip_prefix(b"@@ -")?;
     let end = rest.windows(3).position(|w| w == b" @@")?;
     let (ranges, tail) = (&rest[..end], &rest[end + 3..]);
@@ -572,9 +625,10 @@ fn unquote(s: &[u8]) -> Vec<u8> {
     out
 }
 
-/// Removes escape sequences (SGR colors, OSC hyperlinks, others) from
-/// `line` into `out`.
-pub(crate) fn strip_ansi(line: &[u8], out: &mut Vec<u8>) {
+/// Copies `line` into `out` without its escape sequences (SGR colors, OSC
+/// hyperlinks, others), clearing `out` first. A sequence cut off by the
+/// end of the line is dropped.
+pub fn strip_ansi(line: &[u8], out: &mut Vec<u8>) {
     out.clear();
     let mut i = 0;
     while i < line.len() {
@@ -612,167 +666,420 @@ pub(crate) fn strip_ansi(line: &[u8], out: &mut Vec<u8>) {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+/// What a line of a combined diff (`diff --cc`) is, by its prefix columns.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CombinedKind {
+    /// A header line before the first hunk: `index`, `---`, `+++`, modes.
+    Header,
+    /// A hunk's `@@@ ... @@@` line.
+    HunkHeader,
+    /// Not in the result: some column is `-`.
+    Removed,
+    /// In the result and not in some parent: a column is `+`, none `-`.
+    Added,
+    /// In the result and every parent.
+    Context,
+}
 
-    #[test]
-    fn strips_sgr_and_osc_sequences() {
-        let mut out = Vec::new();
-        strip_ansi(
-            b"\x1b[1mdiff --git\x1b[m a\x1b]8;;http://x\x07link\x1b]8;;\x1b\\",
-            &mut out,
-        );
-        assert_eq!(out, b"diff --git alink");
-        strip_ansi(b"\x1b[32m+\x1b[m\x1b[32madded\x1b[m", &mut out);
-        assert_eq!(out, b"+added");
-        strip_ansi(b"trailing\x1b", &mut out);
-        assert_eq!(out, b"trailing");
-    }
-
-    #[test]
-    fn hunk_headers_default_lengths_to_one() {
-        let h = parse_hunk_header(b"@@ -3 +4,0 @@ fn main()").expect("valid");
-        assert_eq!(
-            (h.old_start, h.old_len, h.new_start, h.new_len),
-            (3, 1, 4, 0)
-        );
-        assert_eq!(h.heading, b"fn main()");
-        assert!(parse_hunk_header(b"@@ -x +1 @@").is_none());
-        assert!(parse_hunk_header(b"@@@ -1,2 -1,2 +1,3 @@@").is_none());
-        // Ends past the largest line number.
-        assert!(parse_hunk_header(b"@@ -18446744073709551615 +1 @@").is_none());
-        assert!(parse_hunk_header(b"@@ -5 +5,18446744073709551615 @@").is_none());
-    }
-
-    #[test]
-    fn modes_are_octal_digits_only() {
-        let mut parser = Parser::default();
-        let mut modes = None;
-        for line in [
-            &b"diff --git a/x b/x"[..],
-            b"old mode 100644\x07\xc2\x9b2J",
-            b"new mode 100755",
-        ] {
-            parser
-                .feed(line, &mut |e| {
-                    if let Event::File(f) = e {
-                        modes = Some((f.old_mode.clone(), f.new_mode.clone()));
-                    }
-                    Ok::<(), ()>(())
-                })
-                .expect("feeds");
+/// What `line` of a combined diff is, given its `parents` prefix columns
+/// (see [`Event::Combined`]).
+#[inline]
+#[must_use]
+pub fn combined_kind(parents: usize, line: &[u8]) -> CombinedKind {
+    if line.starts_with(b"@@@") {
+        CombinedKind::HunkHeader
+    } else if parents == 0 {
+        CombinedKind::Header
+    } else {
+        let prefix = &line[..parents.min(line.len())];
+        if prefix.contains(&b'-') {
+            CombinedKind::Removed
+        } else if prefix.contains(&b'+') {
+            CombinedKind::Added
+        } else {
+            CombinedKind::Context
         }
-        parser
-            .finish(&mut |e| {
-                if let Event::File(f) = e {
-                    modes = Some((f.old_mode.clone(), f.new_mode.clone()));
-                }
-                Ok::<(), ()>(())
-            })
-            .expect("finishes");
-        assert_eq!(modes, Some((None, Some("100755".to_owned()))));
-    }
-
-    /// The events of `lines`, as text: `file <old> <new>`, `hunk <heading>`,
-    /// `+`/`-`/` ` lines, `end`, `stray <line>`, `text <line>`.
-    fn events(lines: &[&[u8]]) -> Vec<String> {
-        let mut parser = Parser::default();
-        let mut out = Vec::new();
-        let mut take = |e: Event| {
-            let s = |b: &[u8]| String::from_utf8_lossy(b).into_owned();
-            out.push(match e {
-                Event::File(f) => format!("file {} {}", s(&f.old_path), s(&f.new_path)),
-                Event::Hunk(h) => format!("hunk {}", s(h.heading)),
-                Event::Line(Kind::Added, t) => format!("+{}", s(t)),
-                Event::Line(Kind::Removed, t) => format!("-{}", s(t)),
-                Event::Line(_, t) => format!(" {}", s(t)),
-                Event::HunkEnd => "end".to_owned(),
-                Event::Stray(t) => format!("stray {}", s(t)),
-                Event::Text(_, t) | Event::Combined { line: t, .. } => {
-                    format!("text {}", s(t))
-                }
-            });
-            Ok::<(), ()>(())
-        };
-        for line in lines {
-            parser.feed(line, &mut take).expect("feeds");
-        }
-        parser.finish(&mut take).expect("finishes");
-        out
-    }
-
-    /// A line past a hunk's counts ends the hunk and shows as no change;
-    /// the file's next hunk is still read as one.
-    #[test]
-    fn a_stray_line_past_the_counts_resyncs_at_the_next_hunk() {
-        let got = events(&[
-            b"diff --git a/x b/x",
-            b"--- a/x",
-            b"+++ b/x",
-            b"@@ -1 +1 @@",
-            b"-a",
-            b"+b",
-            b"+stray",
-            b"@@ -5 +5 @@ f",
-            b"-c",
-            b"+d",
-        ]);
-        assert_eq!(
-            got,
-            [
-                "file x x",
-                "hunk ",
-                "-a",
-                "+b",
-                "end",
-                "stray +stray",
-                "hunk f",
-                "-c",
-                "+d",
-                "end",
-            ]
-        );
-    }
-
-    /// A patch saved with CRLF line ends: headers lose the carriage return,
-    /// hunk lines keep it as content.
-    #[test]
-    fn crlf_headers_are_read_without_the_carriage_return() {
-        let got = events(&[
-            b"diff --git a/x b/x\r",
-            b"index 0123456..789abcd 100644\r",
-            b"--- a/x\r",
-            b"+++ b/x\r",
-            b"@@ -1 +1 @@ f\r",
-            b"-a\r",
-            b"+b\r",
-        ]);
-        assert_eq!(got, ["file x x", "hunk f", "-a\r", "+b\r", "end"]);
-    }
-
-    #[test]
-    fn git_header_paths_handle_spaces_and_quotes() {
-        assert_eq!(
-            git_header_paths(b"a/my file.c b/my file.c"),
-            (b"my file.c".to_vec(), b"my file.c".to_vec())
-        );
-        assert_eq!(
-            git_header_paths(b"a/old.c b/new name.c"),
-            (b"old.c".to_vec(), b"new name.c".to_vec())
-        );
-        assert_eq!(
-            git_header_paths(b"\"a/t\\303\\251st\\tx\" \"b/t\\303\\251st\\tx\""),
-            ("tést\tx".as_bytes().to_vec(), "tést\tx".as_bytes().to_vec())
-        );
-    }
-
-    #[test]
-    fn commit_headers_need_a_hex_id() {
-        assert!(is_commit_header(b"commit 0123abc"));
-        assert!(is_commit_header(b"commit 0123abcdef (HEAD -> main)"));
-        assert!(!is_commit_header(b"commit message"));
-        assert!(is_meta_line(b"Author: A <a@b>"));
-        assert!(!is_meta_line(b"    Signed-off-by: x"));
     }
 }
+
+/// A commit's header and message, or text that came between files.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Commit {
+    /// The commit's full id; `None` for text that isn't a commit.
+    pub id: Option<String>,
+    /// The first non-blank message line, trimmed; empty for text that
+    /// isn't a commit.
+    pub subject: String,
+    /// The lines as they came, without trailing blank ones.
+    pub lines: Vec<(TextKind, Vec<u8>)>,
+}
+
+impl Commit {
+    /// The commit `id` with `lines`, as `git show` starts with them: its
+    /// header, metadata and message. The subject is read from the lines.
+    #[must_use]
+    pub fn new(id: String, lines: Vec<(TextKind, Vec<u8>)>) -> Self {
+        let subject = lines
+            .iter()
+            .find(|(kind, text)| {
+                matches!(kind, TextKind::Plain | TextKind::CommitMessage) && !trim(text).is_empty()
+            })
+            .map(|(_, text)| String::from_utf8_lossy(trim(text)).into_owned())
+            .unwrap_or_default();
+        Self {
+            id: Some(id),
+            subject,
+            lines,
+        }
+    }
+
+    /// A one-line name: the short id and the subject, or the text's first
+    /// line, trimmed.
+    #[must_use]
+    pub fn label(&self) -> Vec<u8> {
+        match &self.id {
+            Some(id) => format!("{} {}", &id[..id.len().min(7)], self.subject).into_bytes(),
+            None => self
+                .lines
+                .first()
+                .map(|(_, text)| trim(text).to_vec())
+                .unwrap_or_default(),
+        }
+    }
+}
+
+/// A file of a patch, as [`Builder`] completes it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct File {
+    /// The file's header.
+    pub info: FileInfo,
+    /// Added lines in its hunks; for a combined diff, lines with a `+`
+    /// column.
+    pub added: usize,
+    /// Removed lines in its hunks; for a combined diff, lines with a `-`
+    /// column and no `+`.
+    pub removed: usize,
+    /// A combined diff's lines (`diff --cc`), each whole with its number
+    /// of prefix columns (see [`Event::Combined`]); `None` for any other
+    /// file, which has its hunks in `hunks`.
+    pub combined: Option<Vec<(usize, Vec<u8>)>>,
+    /// The hunks as unified diff text without colors: each `@@` line, then
+    /// its lines with their prefixes and markers, every line ending in a
+    /// newline. [`sides`] reads it back.
+    pub hunks: Vec<u8>,
+}
+
+/// A commit or a file of a patch, in input order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Item {
+    /// A commit's header and message, or text between files.
+    Commit(Commit),
+    /// A file and its hunks.
+    File(File),
+}
+
+/// Lines of text with what each one is.
+type Lines = Vec<(TextKind, Vec<u8>)>;
+
+/// Collects a [`Parser`]'s events into [`Item`]s. Each item goes out once
+/// the next one starts (or at [`Builder::finish`]), so a host holds at most
+/// one commit's lines and one file's hunks at a time.
+#[derive(Debug, Default)]
+pub struct Builder {
+    /// A commit's id (`None` for a text block) and its lines.
+    pending: Option<(Option<String>, Lines)>,
+    file: Option<File>,
+}
+
+impl Builder {
+    /// Takes in one event, passing any item it completes to `emit`. Blank
+    /// lines outside a commit start no text block of their own; a stray
+    /// line changes nothing.
+    ///
+    /// # Errors
+    ///
+    /// The error `emit` returns.
+    pub fn event<E>(
+        &mut self,
+        event: Event,
+        emit: &mut impl FnMut(Item) -> Result<(), E>,
+    ) -> Result<(), E> {
+        match event {
+            Event::Text(kind, line) => {
+                self.send_file(emit)?;
+                if kind == TextKind::CommitHeader {
+                    self.send_pending(emit)?;
+                    let id = line[b"commit ".len()..]
+                        .iter()
+                        .take_while(|b| b.is_ascii_hexdigit())
+                        .map(|&b| char::from(b))
+                        .collect();
+                    self.pending = Some((Some(id), Vec::new()));
+                }
+                if self.pending.is_none() && trim(line).is_empty() {
+                    return Ok(());
+                }
+                let (_, lines) = self.pending.get_or_insert_with(|| (None, Vec::new()));
+                lines.push((kind, line.to_vec()));
+            }
+            Event::File(info) => {
+                self.send_file(emit)?;
+                self.send_pending(emit)?;
+                self.file = Some(File {
+                    info: info.clone(),
+                    added: 0,
+                    removed: 0,
+                    combined: (info.status == FileStatus::Combined).then(Vec::new),
+                    hunks: Vec::new(),
+                });
+            }
+            Event::Hunk(h) => {
+                if let Some(f) = &mut self.file {
+                    let numbers = HunkHeader {
+                        old_start: h.old_start,
+                        old_len: h.old_len,
+                        new_start: h.new_start,
+                        new_len: h.new_len,
+                        heading: h.heading,
+                        hidden: 0,
+                    }
+                    .numbers();
+                    f.hunks.extend_from_slice(numbers.as_bytes());
+                    if !h.heading.is_empty() {
+                        f.hunks.push(b' ');
+                        f.hunks.extend_from_slice(h.heading);
+                    }
+                    f.hunks.push(b'\n');
+                }
+            }
+            Event::Line(kind, text) => {
+                if let Some(f) = &mut self.file {
+                    let prefix = match kind {
+                        Kind::Context => Some(b' '),
+                        Kind::Removed => {
+                            f.removed += 1;
+                            Some(b'-')
+                        }
+                        Kind::Added => {
+                            f.added += 1;
+                            Some(b'+')
+                        }
+                        // The whole marker line.
+                        Kind::NoNewline => None,
+                    };
+                    f.hunks.extend(prefix);
+                    f.hunks.extend_from_slice(text);
+                    f.hunks.push(b'\n');
+                }
+            }
+            // The hunks are read back by their counts, which a stray line
+            // isn't part of.
+            Event::HunkEnd | Event::Stray(_) => {}
+            Event::Combined { parents, line } => {
+                if let Some(f) = &mut self.file {
+                    let prefix = &line[..parents.min(line.len())];
+                    if !line.starts_with(b"@@@") && parents > 0 {
+                        f.added += usize::from(prefix.contains(&b'+'));
+                        f.removed += usize::from(prefix.contains(&b'-') && !prefix.contains(&b'+'));
+                    }
+                    f.combined
+                        .get_or_insert_with(Vec::new)
+                        .push((parents, line.to_vec()));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Passes the last file or commit to `emit`, at the end of the input
+    /// and after [`Parser::finish`].
+    ///
+    /// # Errors
+    ///
+    /// The first error `emit` returns.
+    pub fn finish<E>(&mut self, emit: &mut impl FnMut(Item) -> Result<(), E>) -> Result<(), E> {
+        self.send_file(emit)?;
+        self.send_pending(emit)
+    }
+
+    fn send_pending<E>(&mut self, emit: &mut impl FnMut(Item) -> Result<(), E>) -> Result<(), E> {
+        let Some((id, mut lines)) = self.pending.take() else {
+            return Ok(());
+        };
+        while lines.last().is_some_and(|(_, l)| trim(l).is_empty()) {
+            lines.pop();
+        }
+        let commit = match id {
+            Some(id) => Commit::new(id, lines),
+            None if lines.is_empty() => return Ok(()),
+            None => Commit {
+                id: None,
+                subject: String::new(),
+                lines,
+            },
+        };
+        emit(Item::Commit(commit))
+    }
+
+    fn send_file<E>(&mut self, emit: &mut impl FnMut(Item) -> Result<(), E>) -> Result<(), E> {
+        match self.file.take() {
+            Some(file) => emit(Item::File(file)),
+            None => Ok(()),
+        }
+    }
+}
+
+/// The line a file's hunks may start at, at most, for [`sides`]. A file is
+/// laid out over its real line numbers, at about 9 bytes per line before a
+/// hunk, so this caps one file at about 150MB.
+pub const MAX_LINES: usize = 1 << 24;
+
+/// A hunk starts past [`MAX_LINES`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TooFar;
+
+impl fmt::Display for TooFar {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "a hunk starts past line {MAX_LINES}, more than a piped file can hold"
+        )
+    }
+}
+
+impl std::error::Error for TooFar {}
+
+/// A file's sides as far as its hunks show them (see [`sides`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Sides {
+    /// The old side.
+    pub old: Text,
+    /// The new side.
+    pub new: Text,
+    /// The hunks, numbered by lines of `old` and `new`, with no emphasis
+    /// and nothing paired.
+    pub hunks: Vec<diff::Hunk>,
+    /// Each hunk's heading as the patch had it.
+    pub headings: Vec<Vec<u8>>,
+}
+
+/// Lays a file's [`File::hunks`] out over its real line numbers: each
+/// side's text holds the lines the hunks show, at their place, and an empty
+/// line for each line the patch left out. A no-newline marker takes the
+/// newline off the line before it, on that line's side or sides.
+///
+/// # Errors
+///
+/// [`TooFar`] when a hunk starts past [`MAX_LINES`], as a corrupt or
+/// hostile patch can claim, instead of filling memory with the lines
+/// before it.
+pub fn sides(hunks: &[u8]) -> Result<Sides, TooFar> {
+    let (mut old, mut new) = (Vec::new(), Vec::new());
+    let (mut old_n, mut new_n) = (0, 0);
+    let mut out = Vec::new();
+    let mut headings = Vec::new();
+    // The side or sides of the last line, for a no-newline marker.
+    let mut last = None;
+    // Split on newlines alone: a carriage return is content.
+    for line in hunks
+        .strip_suffix(b"\n")
+        .unwrap_or(hunks)
+        .split(|&b| b == b'\n')
+    {
+        if let Some(h) = parse_hunk_header(line) {
+            let zero = |start: usize, len: usize| {
+                if len == 0 {
+                    start
+                } else {
+                    start.saturating_sub(1)
+                }
+            };
+            let (os, ns) = (zero(h.old_start, h.old_len), zero(h.new_start, h.new_len));
+            if os.max(ns) > MAX_LINES {
+                return Err(TooFar);
+            }
+            // A byte and a line start per line left out: a hunk at line
+            // 1,000,000 costs 9MB while the file is loaded. A sparse text
+            // is the upgrade if that shows up.
+            old.resize(old.len() + os.saturating_sub(old_n), b'\n');
+            new.resize(new.len() + ns.saturating_sub(new_n), b'\n');
+            (old_n, new_n) = (old_n.max(os), new_n.max(ns));
+            out.push(diff::Hunk {
+                old_start: old_n,
+                old_len: h.old_len,
+                new_start: new_n,
+                new_len: h.new_len,
+                lines: Vec::new(),
+            });
+            headings.push(h.heading.to_vec());
+            last = None;
+            continue;
+        }
+        let Some(hunk) = out.last_mut() else {
+            continue;
+        };
+        let (kind, text) = match line.split_first() {
+            Some((b'-', text)) => (LineKind::Removed, text),
+            Some((b'+', text)) => (LineKind::Added, text),
+            Some((b'\\', _)) => {
+                // The line before has no newline on its side(s).
+                if matches!(last, Some(LineKind::Removed | LineKind::Context)) {
+                    old.pop();
+                }
+                if matches!(last, Some(LineKind::Added | LineKind::Context)) {
+                    new.pop();
+                }
+                last = None;
+                continue;
+            }
+            Some((_, text)) => (LineKind::Context, text),
+            None => (LineKind::Context, line),
+        };
+        hunk.lines.push(diff::Line {
+            kind,
+            old: old_n,
+            new: new_n,
+            emphasis: Vec::new(),
+            unchanged: Unchanged::No,
+            block_start: false,
+            paired: false,
+        });
+        if kind != LineKind::Added {
+            old.extend_from_slice(text);
+            old.push(b'\n');
+            old_n += 1;
+        }
+        if kind != LineKind::Removed {
+            new.extend_from_slice(text);
+            new.push(b'\n');
+            new_n += 1;
+        }
+        last = Some(kind);
+    }
+    Ok(Sides {
+        old: Text::new(old),
+        new: Text::new(new),
+        hunks: out,
+        headings,
+    })
+}
+
+/// `text` without leading and trailing Unicode whitespace. Bytes that
+/// aren't UTF-8 are never whitespace.
+fn trim(text: &[u8]) -> &[u8] {
+    let start = text.utf8_chunks().next().map_or(0, |chunk| {
+        chunk.valid().len() - chunk.valid().trim_start().len()
+    });
+    let end = text.utf8_chunks().last().map_or(0, |chunk| {
+        let trailing = if chunk.invalid().is_empty() {
+            chunk.valid().len() - chunk.valid().trim_end().len()
+        } else {
+            0
+        };
+        text.len() - trailing
+    });
+    &text[start..end.max(start)]
+}
+
+#[cfg(test)]
+mod tests;

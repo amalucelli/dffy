@@ -1,6 +1,6 @@
 //! A content-addressed disk cache shared by every dffy process of a user,
 //! for results that take far longer to compute than to read back. An entry's
-//! name is a hash of the dffy version, its kind and every input it depends
+//! name is a hash of the dffy-core version, its kind and every input it depends
 //! on, so entries never need invalidating; old ones age out under the size
 //! budget.
 //!
@@ -47,6 +47,9 @@ pub enum Kind {
     Structural = 3,
     /// A renderer plugin's answer for a file.
     Rendered = 4,
+    /// A shard of line counts by content (see [`crate::git::StatStore`]):
+    /// unlike the other kinds, rewritten as records are added.
+    Stats = 5,
 }
 
 /// A cache directory with a size budget.

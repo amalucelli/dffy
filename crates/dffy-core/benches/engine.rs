@@ -13,6 +13,11 @@ use std::sync::LazyLock;
 use dffy_core::diff::{self, Options, Text, Whitespace};
 use dffy_core::git::{DiffSpec, FileChange, Repo, Side, Status};
 
+// Allocation counts are deterministic, so `cargo xtask perf` gates on them
+// with no noise band. Only the benchmark thread is counted.
+#[global_allocator]
+static ALLOC: divan::AllocProfiler = divan::AllocProfiler::system();
+
 const LARGEST: &str = "drivers/net/wireless/realtek/rtw89/rtw8852c_table.c";
 
 struct Pair {
@@ -20,16 +25,15 @@ struct Pair {
     new: Vec<u8>,
 }
 
-struct Fixture {
-    root: PathBuf,
-    largest: Pair,
-    median: Pair,
-    changes: [FileChange; 2],
-}
+// Each input loads on first use, so a process that runs one benchmark, as
+// `cargo xtask perf` runs them, loads only what that benchmark reads.
+static ROOT: LazyLock<Option<PathBuf>> =
+    LazyLock::new(|| std::env::var_os("DFFY_BENCH_REPO").map(PathBuf::from));
 
-static FIXTURE: LazyLock<Option<Fixture>> = LazyLock::new(|| {
-    let root = PathBuf::from(std::env::var_os("DFFY_BENCH_REPO")?);
-    let repo = Repo::discover(&root).expect("bench repo opens");
+/// The range's modified C files the file benchmarks read: the largest, and
+/// the median by the new side's size.
+static CHANGES: LazyLock<[FileChange; 2]> = LazyLock::new(|| {
+    let repo = Repo::discover(root()).expect("bench repo opens");
     let spec = repo
         .resolve(&["v6.0", "v6.1"], false, false)
         .expect("tags resolve");
@@ -41,47 +45,57 @@ static FIXTURE: LazyLock<Option<Fixture>> = LazyLock::new(|| {
         ControlFlow::Continue(())
     })
     .expect("enumerates");
-    let load = |c: &FileChange| {
-        let side = |s: Option<Side>| {
-            repo.load(c.path.as_ref(), &s.expect("both sides"))
-                .expect("loads")
-        };
-        Pair {
-            old: side(c.old),
-            new: side(c.new),
-        }
-    };
     let largest = modified_c
         .iter()
         .find(|c| c.path == LARGEST)
         .expect("largest file changed");
-    let mut sized: Vec<_> = modified_c.iter().map(|c| (load(c).new.len(), c)).collect();
+    // A blob's size from its object header is its length once loaded.
+    let mut sized: Vec<_> = modified_c
+        .iter()
+        .map(|c| (repo.sizes(c).expect("sizes")[1], c))
+        .collect();
     sized.sort_by_key(|(len, _)| *len);
     let median = sized[sized.len() / 2].1;
-    Some(Fixture {
-        root,
-        largest: load(largest),
-        median: load(median),
-        changes: [largest.clone(), median.clone()],
-    })
+    [largest.clone(), median.clone()]
 });
 
+fn load(change: &FileChange) -> Pair {
+    let repo = Repo::discover(root()).expect("bench repo opens");
+    let side = |s: Option<Side>| {
+        repo.load(change.path.as_ref(), &s.expect("both sides"))
+            .expect("loads")
+    };
+    Pair {
+        old: side(change.old),
+        new: side(change.new),
+    }
+}
+
+static LARGEST_PAIR: LazyLock<Pair> = LazyLock::new(|| load(&CHANGES[0]));
+static MEDIAN_PAIR: LazyLock<Pair> = LazyLock::new(|| load(&CHANGES[1]));
+
 fn main() {
-    if FIXTURE.is_none() {
+    if ROOT.is_none() {
         eprintln!("DFFY_BENCH_REPO unset, skipping benchmarks");
         return;
     }
+    // glibc serves allocations above its mmap threshold with fresh pages,
+    // faulted in on every use, and raises the threshold to the size of a
+    // freed mapped block. dffy reads many blobs before it diffs any one, so
+    // freeing one large block here puts the benchmarks' multi-megabyte
+    // buffers on the reused heap, as in a real run.
+    drop(std::hint::black_box(vec![0_u8; 16 << 20]));
     divan::main();
 }
 
-fn fixture() -> &'static Fixture {
-    FIXTURE.as_ref().expect("checked in main")
+fn root() -> &'static PathBuf {
+    ROOT.as_ref().expect("checked in main")
 }
 
 fn pair(name: &str) -> &'static Pair {
     match name {
-        "largest" => &fixture().largest,
-        _ => &fixture().median,
+        "largest" => &LARGEST_PAIR,
+        _ => &MEDIAN_PAIR,
     }
 }
 
@@ -122,10 +136,10 @@ fn imara_histogram(bencher: divan::Bencher, file: &str) {
 #[divan::bench(args = FILES)]
 fn dffy_file_diff_with_intraline(bencher: divan::Bencher, file: &str) {
     // Without the object cache, as print mode's workers read blobs.
-    let repo = Repo::discover(&fixture().root)
+    let repo = Repo::discover(root())
         .expect("opens")
         .without_object_cache();
-    let change = &fixture().changes[usize::from(file != "largest")];
+    let change = &CHANGES[usize::from(file != "largest")];
     bencher.bench_local(|| {
         let mut fd = repo
             .file_diff(change.clone(), &Options::default())
@@ -142,7 +156,7 @@ fn dffy_file_diff_with_intraline(bencher: divan::Bencher, file: &str) {
 /// Enumerates the changes of `revs`, stopping after `limit`, with the
 /// repository opened fresh each time as a new process would.
 fn enumerate(revs: &[&str], limit: usize) -> usize {
-    let repo = Repo::discover(&fixture().root).expect("opens");
+    let repo = Repo::discover(root()).expect("opens");
     let spec = repo.resolve(revs, false, false).expect("resolves");
     count(&repo, &spec, limit)
 }
@@ -172,7 +186,7 @@ fn range_all_paths() -> usize {
 }
 
 fn worktree(untracked: bool, limit: usize) -> usize {
-    let repo = Repo::discover(&fixture().root).expect("opens");
+    let repo = Repo::discover(root()).expect("opens");
     count(&repo, &DiffSpec::IndexToWorktree { untracked }, limit)
 }
 

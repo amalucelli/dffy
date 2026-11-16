@@ -6,6 +6,11 @@
 //! ```sh
 //! cargo run --release --example count_pass
 //! ```
+//!
+//! Without a disk cache, every run counts every file. With
+//! `DFFY_BENCH_CACHE` naming a directory, counts are found in and kept in a
+//! cache there, and each run's time is printed: the first run on an empty
+//! directory is the cold one.
 #![expect(
     clippy::expect_used,
     reason = "a measuring tool: a failed step ends the run with its message"
@@ -15,6 +20,7 @@ use std::ops::ControlFlow;
 use std::time::Instant;
 
 use dffy::bench::Frame;
+use dffy_core::cache::Cache;
 use dffy_core::diff::{LineKind, Options};
 use dffy_core::git::Repo;
 
@@ -35,12 +41,28 @@ fn main() {
         ControlFlow::Continue(())
     })
     .expect("enumerates");
+    let cache = std::env::var_os("DFFY_BENCH_CACHE").map(|dir| Cache::new(dir.into(), 1 << 30));
     let mut times = Vec::new();
     let mut counts = Vec::new();
-    for _ in 0..RUNS {
+    for run in 1..=RUNS {
         let start = Instant::now();
-        counts = Frame::count_pass(&repo, changes.clone());
+        let previous = std::mem::replace(
+            &mut counts,
+            match &cache {
+                Some(cache) => {
+                    Frame::count_pass_cached(&repo, changes.clone(), Some(cache.clone()))
+                }
+                None => Frame::count_pass(&repo, changes.clone()),
+            },
+        );
         times.push(start.elapsed());
+        if cache.is_some() {
+            let differing = previous.iter().zip(&counts).filter(|(a, b)| a != b).count();
+            println!(
+                "run {run} with the disk cache: {:?}, {differing} counts differ from the run before",
+                times[run - 1]
+            );
+        }
     }
     times.sort();
     println!(

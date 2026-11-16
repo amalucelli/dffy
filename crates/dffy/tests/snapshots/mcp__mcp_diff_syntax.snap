@@ -1,0 +1,31 @@
+---
+source: crates/dffy/tests/mcp.rs
+expression: "snapshot(&[call.raw_structured(), call.text().to_owned()])"
+---
+{"header":{"type":"header","version":1,"old":{"kind":"tree","id":"3c7dcae4d2474c9ab3cca259da3f74f76e7cc041"},"new":{"kind":"tree","id":"999d2ed097b841160702f909a1516b735d182f99"},"untracked":false,"revisions":["main~1","main"],"paths":["math.c","spacing.c"],"options":{"context":3,"whitespace":"exact","syntax":true,"renames":true,"highlights":false,"summary":false}},"files":[{"type":"file","path":"math.c","old_path":"math.c","status":"modified","similarity":null,"old_mode":"100644","new_mode":"100644","binary":false,"too_large":false,"language":"c","added":5,"removed":5,"syntax":"complete","classification":"moved_only","note":null,"hunks":[{"old_start":1,"old_lines":9,"new_start":1,"new_lines":9,"heading":null,"lines":[{"kind":"removed","mark":"moved","old":1,"new":null,"text":"int add(int a, int b)"},{"kind":"removed","mark":"moved","old":2,"new":null,"text":"{"},{"kind":"removed","mark":"moved","old":3,"new":null,"text":"\treturn a + b;"},{"kind":"removed","mark":"moved","old":4,"new":null,"text":"}"},{"kind":"removed","mark":"moved","old":5,"new":null,"text":""},{"kind":"context","old":6,"new":1,"text":"int sub(int a, int b)"},{"kind":"context","old":7,"new":2,"text":"{"},{"kind":"context","old":8,"new":3,"text":"\treturn a - b;"},{"kind":"added","mark":"moved","old":null,"new":4,"text":"}"},{"kind":"added","mark":"moved","old":null,"new":5,"text":""},{"kind":"added","mark":"moved","old":null,"new":6,"text":"int add(int a, int b)"},{"kind":"added","mark":"moved","old":null,"new":7,"text":"{"},{"kind":"added","mark":"moved","old":null,"new":8,"text":"\treturn a + b;"},{"kind":"context","old":9,"new":9,"text":"}"}]}]},{"type":"file","path":"spacing.c","old_path":"spacing.c","status":"modified","similarity":null,"old_mode":"100644","new_mode":"100644","binary":false,"too_large":false,"language":"c","added":1,"removed":1,"syntax":"complete","classification":"formatting_only","note":null,"hunks":[{"old_start":1,"old_lines":3,"new_start":1,"new_lines":3,"heading":null,"lines":[{"kind":"context","old":1,"new":1,"text":"int x = 1;"},{"kind":"removed","mark":"reformatted","old":2,"new":null,"text":"int y = 2;"},{"kind":"added","mark":"reformatted","old":null,"new":2,"text":"int  y=2;"},{"kind":"context","old":3,"new":3,"text":"int z = 3;"}]}]}],"truncated_files":[],"total_files":2,"next_cursor":null}
+--
+2 files changed in main~1 main, showing 1-2
+marks after the sign: > moved, ~ reformatted (the code wasn't edited)
+M math.c +5 -5 [moved_only]
+@@ -1,9 +1,9 @@
+->int add(int a, int b)
+->{
+->	return a + b;
+->}
+->
+  int sub(int a, int b)
+  {
+  	return a - b;
++>}
++>
++>int add(int a, int b)
++>{
++>	return a + b;
+  }
+
+M spacing.c +1 -1 [formatting_only]
+@@ -1,3 +1,3 @@
+  int x = 1;
+-~int y = 2;
++~int  y=2;
+  int z = 3;

@@ -62,6 +62,7 @@ fn listing(repo: &Repo) -> Vec<String> {
                 Status::Modified => "M",
                 Status::TypeChange => "T",
                 Status::Untracked => "?",
+                Status::Unmerged => "U",
                 Status::Renamed { .. } => "R",
             };
             format!("{letter} {}", c.path)
@@ -448,7 +449,24 @@ fn deep_trees_are_walked() {
         tempfile::tempdir().expect("a"),
         tempfile::tempdir().expect("b"),
     );
-    let deep = "d/".repeat(1500);
+    // macOS allows 1024 bytes for a whole path, NUL included, where Linux
+    // allows 4096 and fits all 1500 levels.
+    let limit = if cfg!(target_os = "macos") {
+        1024
+    } else {
+        4096
+    };
+    // Resolved, since macOS counts the target of a symlink on the way,
+    // `/var` to `/private/var`, against the limit.
+    let resolved = |p: &Path| {
+        std::fs::canonicalize(p)
+            .expect("canonical")
+            .as_os_str()
+            .len()
+    };
+    let root = resolved(a.path()).max(resolved(b.path()));
+    let levels = ((limit - 1 - root - "/f.txt".len()) / 2).min(1500);
+    let deep = "d/".repeat(levels);
     write(a.path(), &format!("{deep}f.txt"), "old\n");
     write(b.path(), &format!("{deep}f.txt"), "new\n");
     assert_eq!(

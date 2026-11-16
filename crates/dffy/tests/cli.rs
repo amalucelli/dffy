@@ -167,6 +167,130 @@ fn syntax_flag_marks_moved_code_and_notes_unknown_languages() {
     assert!(!stdout(&line).contains(['»', '~']), "{}", stdout(&line));
 }
 
+/// A commit with one file for each kind of change `--json` describes:
+/// an edit, an addition, a rename, a binary file, two functions swapped,
+/// spacing changed and nothing else, and text that isn't UTF-8.
+fn json_repo() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let d = dir.path();
+    let bytes = |path: &str, content: &[u8]| std::fs::write(d.join(path), content).expect("write");
+    git(d, &["init", "-q", "-b", "main"]);
+    write(
+        d,
+        "lib.rs",
+        "pub fn add(a: i32, b: i32) -> i32 {\n    a + b\n}\n",
+    );
+    write(d, "docs/guide.md", "# Guide\n\nRead me.\n");
+    bytes("logo.bin", b"\x00\x01\x02");
+    let add = "int add(int a, int b)\n{\n\treturn a + b;\n}\n";
+    let sub = "int sub(int a, int b)\n{\n\treturn a - b;\n}\n";
+    write(d, "math.c", &format!("{add}\n{sub}"));
+    write(d, "spacing.c", "int x = 1;\nint y = 2;\nint z = 3;\n");
+    bytes("latin1.txt", b"price \xa31\nthe end\n");
+    git(d, &["add", "-A"]);
+    git(d, &["commit", "-q", "-m", "base"]);
+    write(
+        d,
+        "lib.rs",
+        "pub fn add(a: i64, b: i64) -> i64 {\n    a + b\n}\n",
+    );
+    std::fs::create_dir_all(d.join("docs/user")).expect("mkdir");
+    std::fs::rename(d.join("docs/guide.md"), d.join("docs/user/guide.md")).expect("mv");
+    write(d, "new.txt", "brand new\nno newline");
+    bytes("logo.bin", b"\x00\x01\x03");
+    write(d, "math.c", &format!("{sub}\n{add}"));
+    write(d, "spacing.c", "int x = 1;\nint  y=2;\nint z = 3;\n");
+    bytes("latin1.txt", b"price \xa32\nthe end\n");
+    git(d, &["add", "-A"]);
+    git(d, &["commit", "-q", "-m", "change"]);
+    dir
+}
+
+/// `--json` for the range limited to `paths`, with `args` before them.
+fn json(d: &Path, args: &[&str], paths: &[&str]) -> String {
+    let mut full = vec!["--json"];
+    full.extend_from_slice(args);
+    full.extend_from_slice(&["main~1", "main", "--"]);
+    full.extend_from_slice(paths);
+    let out = dffy(d, &full);
+    assert!(out.status.success(), "{full:?}: {}", stderr(&out));
+    stdout(&out)
+}
+
+/// A paired edit carries its emphasis; an addition, a rename and a binary
+/// file each have their own fields; a paired line that isn't UTF-8 is lossy
+/// and has no emphasis.
+#[test]
+fn json_describes_each_kind_of_change() {
+    let repo = json_repo();
+    let d = repo.path();
+    insta::assert_snapshot!("json_modified", json(d, &[], &["lib.rs"]));
+    insta::assert_snapshot!("json_added", json(d, &[], &["new.txt"]));
+    insta::assert_snapshot!("json_renamed", json(d, &[], &["docs"]));
+    insta::assert_snapshot!("json_binary", json(d, &[], &["logo.bin"]));
+    insta::assert_snapshot!("json_not_utf8", json(d, &[], &["latin1.txt"]));
+}
+
+/// `--syntax` marks swapped functions moved, and the file `moved_only`;
+/// spacing changes are `formatting_only` by the syntax diff's marks, and
+/// by `-w`, which leaves the file no hunks.
+#[test]
+fn json_classifies_moved_and_formatting_only_files() {
+    let repo = json_repo();
+    let d = repo.path();
+    insta::assert_snapshot!("json_moved", json(d, &["--syntax"], &["math.c"]));
+    insta::assert_snapshot!(
+        "json_formatting",
+        [
+            json(d, &["--syntax"], &["spacing.c"]),
+            json(d, &["-w"], &["spacing.c"]),
+        ]
+        .join("--\n")
+    );
+    // A file only -w finds unchanged is no difference for --exit-code.
+    let exit = |args: &[&str]| {
+        let mut full = vec!["--json", "--exit-code"];
+        full.extend_from_slice(args);
+        full.extend_from_slice(&["main~1", "main", "--", "spacing.c"]);
+        dffy(d, &full).status.code()
+    };
+    assert_eq!(exit(&[]), Some(1));
+    assert_eq!(exit(&["-w"]), Some(0));
+}
+
+/// With a summary flag, file objects have their counts, flags and language
+/// but no hunks; `-w` still classifies whitespace-only files, and
+/// `--syntax` adds what only the syntax diff can tell.
+#[test]
+fn json_summaries_leave_out_hunks() {
+    let repo = json_repo();
+    let d = repo.path();
+    insta::assert_snapshot!(
+        "json_summary",
+        [
+            json(d, &["--stat"], &[]),
+            json(d, &["--name-status", "-w"], &["spacing.c"]),
+            json(d, &["--name-only", "--syntax"], &["math.c"]),
+        ]
+        .join("--\n")
+    );
+    // Every summary flag gives the same objects, and the counts of the
+    // full output.
+    let summary = json(d, &["--stat"], &[]);
+    assert_eq!(summary, json(d, &["--name-status"], &[]));
+    let end = |out: &str| out.lines().last().map(str::to_owned);
+    assert_eq!(end(&summary), end(&json(d, &[], &[])));
+}
+
+/// `--json` describes the repository; a diff on stdin isn't one.
+#[test]
+fn json_refuses_a_diff_on_stdin() {
+    let repo = json_repo();
+    let out = dffy(repo.path(), &["--json", "-"]);
+    assert_eq!(out.status.code(), Some(128));
+    assert!(stderr(&out).contains("--json"), "{}", stderr(&out));
+}
+
 #[test]
 fn show_prints_the_commit_header_first() {
     let repo = repo();

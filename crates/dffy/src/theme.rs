@@ -15,7 +15,7 @@
 use std::fmt::Write as _;
 use std::path::PathBuf;
 
-use dffy_core::highlight::Syntax;
+use dffy_core::view::{Attributes, Syntax};
 
 use crate::config::{self, Indicators, Warning};
 use crate::render::Canvas;
@@ -46,6 +46,8 @@ pub(crate) enum Role {
     /// A line of code the syntax diff found moved whole: its text, sign
     /// and line number.
     Moved,
+    /// A conflict marker line added to an unmerged file.
+    ConflictMarker,
     FileHeader,
     HunkHeader,
     CommitHeader,
@@ -72,7 +74,7 @@ pub(crate) enum Role {
 impl Role {
     /// Every role a theme can set, in the order `dffy config` and theme files
     /// list them.
-    pub(crate) const THEMED: [Self; 27] = [
+    pub(crate) const THEMED: [Self; 28] = [
         Self::Context,
         Self::Added,
         Self::Removed,
@@ -87,6 +89,7 @@ impl Role {
         Self::ModifiedLine,
         Self::ModifiedNumber,
         Self::Moved,
+        Self::ConflictMarker,
         Self::FileHeader,
         Self::HunkHeader,
         Self::CommitHeader,
@@ -119,6 +122,7 @@ impl Role {
             Self::ModifiedLine => "modified-line",
             Self::ModifiedNumber => "modified-number",
             Self::Moved => "moved",
+            Self::ConflictMarker => "conflict-marker",
             Self::FileHeader => "file-header",
             Self::HunkHeader => "hunk-header",
             Self::CommitHeader => "commit-header",
@@ -149,9 +153,9 @@ const SYNTAX_COUNT: usize = Syntax::ALL.len();
 pub(crate) struct Ink {
     pub role: Role,
     pub syntax: Option<Syntax>,
-    /// Added to the style, bits as in [`Style::attributes`]. Only the
-    /// viewer draws them: printed output never has any.
-    pub attributes: u8,
+    /// Added to the style. Only the viewer draws them: printed output
+    /// never has any.
+    pub attributes: Attributes,
 }
 
 impl From<Role> for Ink {
@@ -159,7 +163,7 @@ impl From<Role> for Ink {
         Self {
             role,
             syntax: None,
-            attributes: 0,
+            attributes: Attributes::NONE,
         }
     }
 }
@@ -226,7 +230,8 @@ impl Color {
     }
 }
 
-/// Text attributes as SGR codes, in emission order.
+/// Text attributes as SGR codes, in emission order: entry `i` is bit `i`
+/// of [`Attributes`].
 pub(crate) const ATTRIBUTES: [(&str, u8); 5] = [
     ("bold", 1),
     ("dim", 2),
@@ -239,21 +244,15 @@ pub(crate) const ATTRIBUTES: [(&str, u8); 5] = [
 pub(crate) struct Style {
     pub fg: Option<Color>,
     pub bg: Option<Color>,
-    /// Bit `i` set means `ATTRIBUTES[i]` is on.
-    pub attributes: u8,
+    pub attributes: Attributes,
 }
 
 impl Style {
     pub(crate) const PLAIN: Self = Self {
         fg: None,
         bg: None,
-        attributes: 0,
+        attributes: Attributes::NONE,
     };
-    pub(crate) const REVERSE: u8 = 1 << 4;
-    pub(crate) const UNDERLINE: u8 = 1 << 3;
-    pub(crate) const ITALIC: u8 = 1 << 2;
-    pub(crate) const DIM: u8 = 1 << 1;
-    pub(crate) const BOLD: u8 = 1;
 
     /// Parses a theme value: space-separated words, where a color sets the
     /// foreground, `on <color>` sets the background, and `bold`, `dim`,
@@ -267,7 +266,7 @@ impl Style {
                 let color = words.next().ok_or("`on` needs a color after it")?;
                 style.bg = Some(Color::parse(color).ok_or_else(|| bad_color(color))?);
             } else if let Some(i) = ATTRIBUTES.iter().position(|(name, _)| *name == word) {
-                style.attributes |= 1 << i;
+                style.attributes |= Attributes(1 << i);
             } else {
                 style.fg = Some(Color::parse(word).ok_or_else(|| bad_color(word))?);
             }
@@ -283,7 +282,7 @@ impl Style {
         }
         let mut out = String::from("\x1b[0");
         for (i, (_, code)) in ATTRIBUTES.iter().enumerate() {
-            if self.attributes & (1 << i) != 0 {
+            if self.attributes.0 & (1 << i) != 0 {
                 let _ = write!(out, ";{code}");
             }
         }
@@ -352,7 +351,7 @@ const EMPH_TINT: f64 = 0.35;
 
 /// The tints of `indicators = background`: each role's hue (`None` for the
 /// theme's modified hue) and share; reformatted code (dim) gets none.
-const TINTS: [(Role, Option<f64>, f64); 9] = [
+const TINTS: [(Role, Option<f64>, f64); 10] = [
     (Role::AddedLine, Some(ADDED_HUE), LINE_TINT),
     (Role::AddedNumber, Some(ADDED_HUE), GUTTER_TINT),
     (Role::AddedEmph, Some(ADDED_HUE), EMPH_TINT),
@@ -362,6 +361,7 @@ const TINTS: [(Role, Option<f64>, f64); 9] = [
     (Role::ModifiedLine, None, LINE_TINT),
     (Role::ModifiedNumber, None, GUTTER_TINT),
     (Role::Moved, Some(MOVED_HUE), LINE_TINT),
+    (Role::ConflictMarker, Some(ADDED_HUE), LINE_TINT),
 ];
 
 /// Color math for the tints: sRGB to Oklab and back, where mixing keeps
@@ -504,6 +504,7 @@ modified = blue
 modified-line =
 modified-number = blue
 moved = magenta
+conflict-marker = bold yellow
 file-header = bold blue
 hunk-header = cyan
 commit-header = yellow
@@ -551,6 +552,7 @@ modified = underline
 modified-line =
 modified-number = underline
 moved = italic
+conflict-marker = bold reverse
 file-header = bold underline
 hunk-header = italic
 commit-header = bold
@@ -674,6 +676,7 @@ modified = {modified}
 modified-line = {fg}
 modified-number = {modified}
 moved = {purple}
+conflict-marker = bold {yellow}
 file-header = bold {blue}
 hunk-header = {cyan}
 commit-header = {yellow}
@@ -1249,7 +1252,7 @@ impl Theme {
                 let ink = Ink {
                     role,
                     syntax,
-                    attributes: 0,
+                    attributes: Attributes::NONE,
                 };
                 sgr[ink.index()] = self.ink_style(ink).sgr();
             }
@@ -1300,8 +1303,8 @@ impl Theme {
             if style.bg.is_some() && !ours {
                 continue;
             }
-            if style.attributes & Style::REVERSE != 0 {
-                style.attributes &= !Style::REVERSE;
+            if style.attributes.contains(Attributes::REVERSE) {
+                style.attributes.0 &= !Attributes::REVERSE.0;
                 style.fg = text;
             }
             let tint = color::blend(bg, color::oklch(HUE_LIGHTNESS, HUE_CHROMA, hue), share);
@@ -1382,7 +1385,7 @@ impl Theme {
     pub(crate) fn ink_style(&self, ink: Ink) -> Style {
         let base = self.style(ink.role);
         let mut style = match ink.syntax {
-            Some(syntax) if base.attributes & Style::REVERSE == 0 => {
+            Some(syntax) if !base.attributes.contains(Attributes::REVERSE) => {
                 let over = self.syntax[syntax as usize];
                 Style {
                     fg: over.fg.or(base.fg),
@@ -1652,7 +1655,7 @@ fn preview(c: &mut Canvas, indicators: Indicators, width: Option<usize>) {
                 Ink {
                     role,
                     syntax,
-                    attributes: 0,
+                    attributes: Attributes::NONE,
                 },
                 piece,
             );
@@ -1761,7 +1764,7 @@ mod tests {
             let style = theme.ink_style(Ink {
                 role: Role::AddedLine,
                 syntax: Some(syntax),
-                attributes: 0,
+                attributes: Attributes::NONE,
             });
             assert!(style.fg.is_none_or(|c| matches!(c, Color::Ansi(_))));
         }
@@ -1777,7 +1780,7 @@ mod tests {
         let ink = |role| Ink {
             role,
             syntax: Some(Syntax::Keyword),
-            attributes: 0,
+            attributes: Attributes::NONE,
         };
         assert_eq!(
             theme.ink_style(ink(Role::AddedEmph)),
@@ -1786,7 +1789,7 @@ mod tests {
         let line = theme.ink_style(ink(Role::AddedLine));
         assert_eq!(line.fg, Some(Color::Ansi(5)));
         assert_eq!(line.bg, Some(Color::Rgb(0x10, 0x20, 0x30)));
-        assert_eq!(line.attributes, 1);
+        assert_eq!(line.attributes, Attributes::BOLD);
         assert_eq!(
             theme.sgr(ink(Role::AddedLine)),
             "\x1b[0;1;35;48;2;16;32;48m"

@@ -113,6 +113,7 @@ fn row(c: &FileChange) -> String {
         Status::Modified => "M",
         Status::TypeChange => "T",
         Status::Untracked => "?",
+        Status::Unmerged => "U",
     };
     format!("{letter}\t{}", c.path)
 }

@@ -1,0 +1,11 @@
+---
+source: plugins/mermaid/src/flowchart/tests.rs
+expression: text
+---
+flowchart 0..2
+  ┌─────────┐   ┌────────────┐
+  │ A label │   │  Another   │
+  │ that is │   │ label that │
+  │ rather  ├──▶│  is long   │
+  │  long   │   │    too     │
+  └─────────┘   └────────────┘

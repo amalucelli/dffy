@@ -917,11 +917,11 @@ impl Matcher<'_> {
         pairs.sort_unstable_by_key(|&(o, _)| std::cmp::Reverse((to.node(o).solid, o)));
         let mut matched = 0;
         for (o, n) in pairs {
-            let (lo, ln) = (to.leaves(o), tn.leaves(n));
+            let (mut lo, mut ln) = (to.leaves(o), tn.leaves(n));
             self.spend(lo.len() + ln.len())?;
             if lo.len() == ln.len()
-                && lo.clone().all(|l| self.m.old[l].free())
-                && ln.clone().all(|l| self.m.new[l].free())
+                && lo.all(|l| self.m.old[l].free())
+                && ln.all(|l| self.m.new[l].free())
             {
                 matched += self.same(o, n);
             }

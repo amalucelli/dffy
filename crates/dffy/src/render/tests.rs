@@ -1,4 +1,5 @@
-use dffy_core::diff::{Options, Text, hunks};
+use dffy_core::diff::{LineKind, Options, Text, Unchanged, hunks};
+use dffy_core::view::{Staging, Syntax};
 
 use super::*;
 
@@ -11,6 +12,7 @@ fn layout(split: bool, width: Option<usize>, wrap: bool) -> Layout {
         tab_width: 4,
         indicators: Indicators::Classic,
         one_sided: false,
+        unmerged: false,
         digits: 0,
         inline_signs: true,
         scroll: 0,
@@ -30,25 +32,23 @@ fn render(old: &str, new: &str, layout: Layout) -> String {
 fn render_hunks(old: &Text, new: &Text, hunks: &[dffy_core::diff::Hunk], layout: Layout) -> String {
     let mut c = Canvas::default();
     for hunk in hunks {
-        let lines: Vec<DiffLine> = hunk
+        let lines: Vec<Line> = hunk
             .lines
             .iter()
             .map(|l| {
                 let (kind, text) = match l.kind {
-                    dffy_core::diff::LineKind::Context => (Kind::Context, new.line(l.new)),
-                    dffy_core::diff::LineKind::Removed => (Kind::Removed, old.line(l.old)),
-                    dffy_core::diff::LineKind::Added => (Kind::Added, new.line(l.new)),
+                    LineKind::Context => (Kind::Context, new.line(l.new)),
+                    LineKind::Removed => (Kind::Removed, old.line(l.old)),
+                    LineKind::Added => (Kind::Added, new.line(l.new)),
                 };
-                DiffLine {
-                    kind,
+                Line {
+                    state: LineState::of(l),
                     old: (kind != Kind::Added).then_some(l.old + 1),
                     new: (kind != Kind::Removed).then_some(l.new + 1),
                     text: text.strip_suffix(b"\n").unwrap_or(text),
                     emphasis: &l.emphasis,
                     syntax: None,
                     paint: &[],
-                    unchanged: l.unchanged,
-                    modified: l.paired,
                     block_start: l.block_start,
                 }
             })
@@ -110,16 +110,14 @@ fn word_rows(text: &str, paint: &[Paint], width: usize) -> Vec<String> {
         line_numbers: false,
         ..layout(false, Some(width + 3), true)
     };
-    let line = DiffLine {
-        kind: Kind::Context,
+    let line = Line {
+        state: LineState::Context,
         old: Some(1),
         new: Some(1),
         text: text.as_bytes(),
         emphasis: &[],
         syntax: None,
         paint,
-        unchanged: Unchanged::No,
-        modified: false,
         block_start: false,
     };
     let mut c = Canvas::default();
@@ -135,8 +133,8 @@ fn word_wrap_breaks_between_words_and_keeps_styles() {
     let paint = [Paint {
         start: 4,
         end: 15,
-        syntax: Some(dffy_core::highlight::Syntax::Keyword),
-        attributes: 0,
+        syntax: Some(Syntax::Keyword),
+        attributes: Attributes::NONE,
     }];
     assert_eq!(
         word_rows("the quick brown fox jumps over", &paint, 12),
@@ -298,7 +296,7 @@ fn file_headers_name_the_change() {
 /// status; an untracked file can't be staged, so it gets no word.
 #[test]
 fn file_headers_word_the_staging() {
-    use dffy_core::git::Staging;
+    use Staging;
     let mut c = Canvas::default();
     let l = layout(false, Some(80), false);
     for (status, path, staging) in [
@@ -356,33 +354,28 @@ fn ansi_writer_switches_styles_and_resets_each_row() {
 
 #[test]
 fn highlighted_lines_keep_the_change_in_the_gutter_and_the_emphasis() {
-    use dffy_core::highlight::{Run, Syntax};
     let run = |start, end, syntax| Run { start, end, syntax };
     let added = [run(0, 3, Syntax::Keyword), run(8, 9, Syntax::Number)];
     let context = [run(0, 2, Syntax::Keyword)];
     let lines = [
-        DiffLine {
-            kind: Kind::Context,
+        Line {
+            state: LineState::Context,
             old: Some(1),
             new: Some(1),
             text: b"fn f() {",
             emphasis: &[],
             syntax: Some(&context),
             paint: &[],
-            unchanged: Unchanged::No,
-            modified: false,
             block_start: false,
         },
-        DiffLine {
-            kind: Kind::Added,
+        Line {
+            state: LineState::Added,
             old: None,
             new: Some(2),
             text: b"let x = 1;",
             emphasis: std::slice::from_ref(&(8..9)),
             syntax: Some(&added),
             paint: &[],
-            unchanged: Unchanged::No,
-            modified: false,
             block_start: false,
         },
     ];
@@ -410,7 +403,8 @@ fn syntax_diff_dims_unchanged_code_and_pairs_matched_lines() {
     let new = "int f(void)\n{\n\treturn compute(a, c);\n}\n";
     let (old, new) = (Text::new(old.into()), Text::new(new.into()));
     let line = hunks(&old, &new, &Options::default());
-    let s = dffy_core::structural::diff(b"f.c", &old, &new, &line).expect("syntax diff");
+    let s = dffy_core::structural::diff(crate::grammars(), b"f.c", &old, &new, &line)
+        .expect("syntax diff");
     // The matched line sits beside its counterpart, not beside the removed
     // line before it.
     insta::assert_snapshot!(render_hunks(&old, &new, &s.hunks, layout(true, Some(70), false)), @r"
@@ -430,7 +424,8 @@ fn syntax_diff_marks_moved_code_apart_from_reformatted_code() {
     let new = "int b(void) { return 2; }\nint a(void) { return 1; }\nint c = f(x, y);\n";
     let (old, new) = (Text::new(old.into()), Text::new(new.into()));
     let line = hunks(&old, &new, &Options::default());
-    let s = dffy_core::structural::diff(b"f.c", &old, &new, &line).expect("syntax diff");
+    let s = dffy_core::structural::diff(crate::grammars(), b"f.c", &old, &new, &line)
+        .expect("syntax diff");
     insta::assert_snapshot!(render_hunks(&old, &new, &s.hunks, layout(false, Some(60), false)), @r"
     <hunk-header>@@ -1,4 +1,3 @@</> fn main()
     <moved>1</>  <dim> │</><moved>»int a(void) { return 1; }</>
@@ -512,7 +507,8 @@ fn moved_and_reformatted_lines_keep_their_marks_as_bars() {
     let new = "int b(void) { return 2; }\nint a(void) { return 1; }\nint c = f(x, y);\n";
     let (old, new) = (Text::new(old.into()), Text::new(new.into()));
     let line = hunks(&old, &new, &Options::default());
-    let s = dffy_core::structural::diff(b"f.c", &old, &new, &line).expect("syntax diff");
+    let s = dffy_core::structural::diff(crate::grammars(), b"f.c", &old, &new, &line)
+        .expect("syntax diff");
     let mut layout = layout(false, Some(60), false);
     layout.indicators = Indicators::Bars;
     insta::assert_snapshot!("moved_bars", render_hunks(&old, &new, &s.hunks, layout));
@@ -580,21 +576,43 @@ fn print_mode_stands_separators_for_unchanged_lines() {
     );
 }
 
+#[test]
+fn conflict_markers_stand_out_in_unmerged_files_only() {
+    use dffy_core::git::Status;
+    let ours = "fn a() {}\n";
+    let worktree = "<<<<<<< ours\nfn a() {}\n||||||| base\nfn b() {}\n=======\nfn c() {}\n\
+                    >>>>>>> theirs\n======= not a marker\n<<<<<<<< eight\n";
+    insta::assert_snapshot!(
+        "conflict_markers",
+        print_file(
+            Status::Unmerged,
+            ours,
+            worktree,
+            layout(false, Some(60), false)
+        )
+    );
+    let modified = print_file(
+        Status::Modified,
+        ours,
+        worktree,
+        layout(true, Some(80), false),
+    );
+    assert!(!modified.contains("<warn>"), "{modified}");
+}
+
 /// The cells a mapped canvas traces back to code, one per glyph:
 /// `row:col+width side bytes` (side 0 old, 1 new), then the columns each
 /// side's code starts at.
 fn traced(layout: Layout, rows: &[(Option<&str>, Option<&str>)]) -> String {
     use std::fmt::Write as _;
-    let line = |kind, text: &'static str, n| DiffLine {
-        kind,
+    let line = |kind, text: &'static str, n| Line {
+        state: LineState::new(kind, false, Unchanged::No),
         old: (kind == Kind::Removed).then_some(n),
         new: (kind == Kind::Added).then_some(n),
         text: text.as_bytes(),
         emphasis: &[],
         syntax: None,
         paint: &[],
-        unchanged: Unchanged::No,
-        modified: false,
         block_start: false,
     };
     let mut c = Canvas::mapped();
@@ -728,16 +746,14 @@ fn background_tints_cover_the_same_cells_on_both_sides() {
         indicators: Indicators::Background,
         ..layout(true, Some(41), true)
     };
-    let line = |kind, old, new, text: &'static str| DiffLine {
-        kind,
+    let line = |kind, old, new, text: &'static str| Line {
+        state: LineState::new(kind, false, Unchanged::No),
         old,
         new,
         text: text.as_bytes(),
         emphasis: &[],
         syntax: None,
         paint: &[],
-        unchanged: Unchanged::No,
-        modified: false,
         block_start: false,
     };
     let mut c = Canvas::default();

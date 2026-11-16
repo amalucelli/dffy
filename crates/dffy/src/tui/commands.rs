@@ -12,6 +12,7 @@
 
 use std::time::{Duration, Instant};
 
+use dffy_core::view::Attributes;
 use unicode_width::UnicodeWidthStr;
 
 use super::{fuzzy, help};
@@ -394,7 +395,7 @@ impl Commands {
             match *line {
                 Line::Title(text) => {
                     let mut bold = theme.style(Role::Plain);
-                    bold.attributes |= Style::BOLD;
+                    bold.attributes |= Attributes::BOLD;
                     grid.put_str(x, y, right, text, bold);
                 }
                 Line::Entry(k) => {
@@ -470,7 +471,7 @@ impl Row {
         let after = grid.put_str(x, y, right, state, mark(style));
         let bold = |mut s: Style| {
             if self.selected {
-                s.attributes |= Style::BOLD;
+                s.attributes |= Attributes::BOLD;
             }
             s
         };
@@ -696,7 +697,7 @@ impl ThemeList {
             match *line {
                 Line::Title(text) => {
                     let mut bold = theme.style(Role::Plain);
-                    bold.attributes |= Style::BOLD;
+                    bold.attributes |= Attributes::BOLD;
                     grid.put_str(x, y, right, text, bold);
                 }
                 Line::Entry(entry) => {
@@ -706,7 +707,7 @@ impl ThemeList {
                     let mark = |s: Style| {
                         if selected {
                             let mut s = theme.selected(s, true);
-                            s.attributes |= Style::BOLD;
+                            s.attributes |= Attributes::BOLD;
                             s
                         } else {
                             s

@@ -62,7 +62,7 @@ For example `bold #f8f8f2 on #44475a`.
 | --- | --- |
 | `background` | Not drawn. The background the theme is made for: tints mix into it, and it sorts the theme into dark or light. `#rrggbb` or empty. |
 | `context` | Unchanged lines. |
-| `added`, `removed` | Changed lines without syntax colors, their signs and bars, the `+N`/`-N` counts, and the `A` and `D` letters in the file tree. |
+| `added`, `removed` | Changed lines without syntax colors, their signs and bars, the `+N`/`-N` counts, and the `A` and `D` letters in the file tree; `removed` also the `U` of a conflicted file. |
 | `added-emph`, `removed-emph` | The changed words inside a changed line. |
 | `added-line`, `removed-line` | Changed lines with syntax colors, which replace this text color; their background is the line's tint. |
 | `line-number` | Line numbers of unchanged lines. |
@@ -71,10 +71,11 @@ For example `bold #f8f8f2 on #44475a`.
 | `modified-line` | Modified lines with syntax colors or tints; their background is the line's tint. |
 | `modified-number` | Line numbers of modified lines; their background is the gutter's tint. |
 | `moved` | Lines the syntax diff found moved whole: their text, `»` sign and numbers. |
+| `conflict-marker` | Added conflict markers (`<<<<<<<`, `=======`, `>>>>>>>` and diff3's base marker) in a conflicted file; their background is the added line's tint. |
 | `file-header` | File names in headers, the `‹ 3/12 name ›` switcher and panel titles. |
 | `hunk-header` | `@@` lines. |
 | `commit-header` | Commit lines from `dffy show` and `git log -p`, and commit ids in the tree. |
-| `error`, `warn`, `ok`, `hint` | Messages. `warn` also colors modified files (`M`) in the tree; `hint` colors renamed and copied files (`R`, `C`), the border of the panel that has the keys, keys in the panels, and filter matches. |
+| `error`, `warn`, `ok`, `hint` | Messages. `warn` also colors modified files (`M`) in the tree and conflict markers already in the file before the merge; `hint` colors renamed and copied files (`R`, `C`), the border of the panel that has the keys, keys in the panels, and filter matches. |
 | `dim` | Secondary text: borders, separators, `⋯ unchanged lines`, untracked files (`?`), files marked viewed, and lines the syntax diff found only reformatted. |
 | `search-match`, `search-current` | Search matches, and the one `n`/`N` went to. |
 | `status-tag` | The chip in the status bar naming what's compared (`uncommitted`, `v6.0..v6.1`). |

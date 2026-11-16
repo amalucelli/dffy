@@ -1541,6 +1541,16 @@ fn the_picker_reads_a_piped_diff_to_its_end() {
 
 /// Resident memory of process `pid`, in KB.
 fn rss_kb(pid: &str) -> usize {
+    if !cfg!(target_os = "linux") {
+        let ps = Command::new("ps")
+            .args(["-o", "rss=", "-p", pid])
+            .output()
+            .expect("ps");
+        return String::from_utf8_lossy(&ps.stdout)
+            .trim()
+            .parse()
+            .expect("ps rss");
+    }
     let status = std::fs::read_to_string(format!("/proc/{pid}/status")).expect("proc status");
     status
         .lines()
@@ -2162,4 +2172,181 @@ fn two_files_open_in_the_viewer_and_refresh_when_watched() {
     term.wait_for("the old side's repaint", |t| t.contains("old side edited"));
     term.send("q");
     assert!(term.wait_exit().success());
+}
+
+/// One file whose diff is seven hunks with gaps between them, every ninth
+/// line long enough to wrap in either layout.
+fn scroll_repo() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let d = dir.path();
+    git(d, &["init", "-q", "-b", "main"]);
+    let line = |i: usize, word: &str| {
+        if i.is_multiple_of(9) {
+            format!("{word} {i} {}\n", "words that wrap ".repeat(12))
+        } else {
+            format!("{word} {i}\n")
+        }
+    };
+    let lines: Vec<String> = (1..=300).map(|i| line(i, "line")).collect();
+    std::fs::write(d.join("lib.rs"), lines.concat()).expect("write");
+    git(d, &["add", "-A"]);
+    git(d, &["commit", "-q", "-m", "init"]);
+    let mut changed = lines;
+    for i in [12, 40, 41, 42, 90, 140, 141, 200, 260, 295] {
+        changed[i - 1] = line(i * 3, "changed");
+    }
+    std::fs::write(d.join("lib.rs"), changed.concat()).expect("write");
+    dir
+}
+
+/// Every cell's text, colors and attributes, an empty cell as a space: two
+/// screens equal by this look the same, however their cells were written.
+type Cells = Vec<(String, vt100::Color, vt100::Color, [bool; 5])>;
+
+fn cells(term: &Term) -> Cells {
+    let screen = term.vt.screen();
+    let (rows, cols) = screen.size();
+    (0..rows.get())
+        .flat_map(|y| (0..cols.get()).map(move |x| (y, x)))
+        .map(|(y, x)| {
+            let c = screen.cell(y, x).expect("in range");
+            let text = if c.has_contents() { c.contents() } else { " " };
+            let attributes = [c.bold(), c.dim(), c.italic(), c.underline(), c.inverse()];
+            (text.to_owned(), c.fgcolor(), c.bgcolor(), attributes)
+        })
+        .collect()
+}
+
+/// The keys scrolled through: by one, by the wheel's three, by half and
+/// whole screens, both ways, at both ends of the file, then a change of
+/// layout drawn over what scrolling left.
+const SCROLLS: &[&str] = &[
+    "j",
+    "j",
+    "j",
+    "WHEEL_DOWN",
+    "\x04",
+    "j",
+    "j",
+    "\x06",
+    "k",
+    "k",
+    "WHEEL_UP",
+    "\x15",
+    "k",
+    "G",
+    "j",
+    "k",
+    "k",
+    "\x02",
+    "g",
+    "k",
+    "j",
+    "j",
+    "s",
+];
+
+/// Scrolling lays out only the rows that come into view and has the
+/// terminal move the rest, the tree's columns too when it's beside the
+/// diff, whose cells are then sent again. The terminal must scroll the
+/// diff's rows at least once, and after every key, the screen must be the
+/// one a full redraw at the same place gives:
+/// a second viewer gets each key, then `e` with an editor that exits at
+/// once, after which it redraws on a cleared terminal.
+///
+/// Both first page through the whole file, so every hunk's emphasis is in
+/// and no worker's result redraws a frame after the key's. Highlighting is
+/// off: a parse over its time budget leaves a side plain in one viewer and
+/// not the other.
+fn scrolls_like_full_redraws(cols: u16, rows: u16, settings: &str, setup: &str) {
+    let repo = scroll_repo();
+    let config = config(&format!("highlight = false\n{settings}"));
+    let env = [
+        ("XDG_CONFIG_HOME", path(&config)),
+        ("EDITOR", "true".to_owned()),
+    ];
+    let env: Vec<(&str, &str)> = env.iter().map(|(k, v)| (*k, v.as_str())).collect();
+    let mut scrolled = Term::spawn(repo.path(), cols, rows, &env);
+    let mut redrawn = Term::spawn(repo.path(), cols, rows, &env);
+    for term in [&mut scrolled, &mut redrawn] {
+        term.wait_for("the diff", |t| t.contains("changed 36"));
+        for _ in 0..8 {
+            term.send("\x06");
+        }
+        term.send("g");
+        term.send(setup);
+    }
+    let wheel = |button| format!("\x1b[<{button};{};10M", cols - 4);
+    let before = scrolled.output().len();
+    for (step, key) in SCROLLS.iter().enumerate() {
+        let key = match *key {
+            "WHEEL_DOWN" => wheel(65),
+            "WHEEL_UP" => wheel(64),
+            key => key.to_owned(),
+        };
+        scrolled.send(&key);
+        let sent = redrawn.output().len();
+        redrawn.send(&format!("{key}e"));
+        redrawn.wait_for("the redraw after the editor", |t| {
+            t.output()[sent..].windows(4).any(|w| w == b"\x1b[2J")
+        });
+        redrawn.settle();
+        let start = Instant::now();
+        loop {
+            scrolled.update();
+            redrawn.update();
+            let (got, want) = (cells(&scrolled), cells(&redrawn));
+            let Some(i) = (0..got.len()).find(|&i| got[i] != want[i]) else {
+                break;
+            };
+            assert!(
+                start.elapsed() < TIMEOUT,
+                "after key {step} ({key:?}), the cell at row {}, column {} is {:?}, not \
+                 {:?}\nscrolled:\n{}\nredrawn:\n{}",
+                i / usize::from(cols),
+                i % usize::from(cols),
+                got[i],
+                want[i],
+                scrolled.vt.screen().contents(),
+                redrawn.vt.screen().contents()
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+    let region = format!("\x1b[2;{}r", rows - 1);
+    assert!(
+        scrolled.output()[before..]
+            .windows(region.len())
+            .any(|w| w == region.as_bytes()),
+        "the terminal never scrolled the diff's rows"
+    );
+    for term in [&mut scrolled, &mut redrawn] {
+        term.send("q");
+        assert!(term.wait_exit().success());
+    }
+}
+
+#[test]
+fn scrolling_split_in_the_frame_matches_full_redraws() {
+    scrolls_like_full_redraws(120, 30, "tree = hide\nview = split\n", "");
+}
+
+#[test]
+fn scrolling_wrapped_unified_in_the_frame_matches_full_redraws() {
+    scrolls_like_full_redraws(120, 30, "tree = hide\nview = unified\nwrap = true\n", "");
+}
+
+#[test]
+fn scrolling_wrapped_split_beside_the_tree_matches_full_redraws() {
+    scrolls_like_full_redraws(120, 30, "tree = show\nview = split\nwrap = true\n", "");
+}
+
+#[test]
+fn scrolling_with_matches_lit_matches_full_redraws() {
+    scrolls_like_full_redraws(80, 24, "tree = hide\nview = unified\n", "/line 1\r");
+}
+
+#[test]
+fn scrolling_unified_beside_the_tree_with_matches_lit_matches_full_redraws() {
+    scrolls_like_full_redraws(120, 30, "tree = show\nview = unified\n", "/line 1\r");
 }

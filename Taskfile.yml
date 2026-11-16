@@ -75,6 +75,47 @@ tasks:
     cmds:
       - cargo bench --workspace
 
+  bench:compare:
+    desc: Time dffy, built from the checkout, against other diff tools on the kernel range, for the tables in docs/benchmarks.md; results in target/perf/runs
+    requires:
+      vars: [DFFY_BENCH_REPO]
+    env:
+      DFFY_BENCH_REPO: "{{.DFFY_BENCH_REPO}}"
+      DFFY: '{{.DFFY | default "target/release/dffy"}}'
+    cmds:
+      - cargo build --release -p dffy
+      - cargo xtask compare
+
+  # The perf tasks measure the checkout against a build of a revision
+  # (default HEAD~1) and only print and save results in target/perf/runs.
+  # Arguments after `--` go to `cargo xtask perf`.
+  perf:
+    desc: "Timing, instructions and allocations of the checkout against a revision, every group unless --only narrows it, e.g. task perf -- --rev main --only frame,print"
+    requires:
+      vars: [DFFY_BENCH_REPO]
+    env:
+      DFFY_BENCH_REPO: "{{.DFFY_BENCH_REPO}}"
+    cmds:
+      - cargo xtask perf {{.CLI_ARGS}}
+
+  perf:quick:
+    desc: "Instruction and allocation counts of the checkout against a revision, every group; Linux only. e.g. task perf:quick -- --rev main"
+    requires:
+      vars: [DFFY_BENCH_REPO]
+    env:
+      DFFY_BENCH_REPO: "{{.DFFY_BENCH_REPO}}"
+    cmds:
+      - cargo xtask perf --quick {{.CLI_ARGS}}
+
+  perf:full:
+    desc: "Every group of the checkout against a revision, measuring layout bands when missing or more than 30 days old. e.g. task perf:full -- --rev main"
+    requires:
+      vars: [DFFY_BENCH_REPO]
+    env:
+      DFFY_BENCH_REPO: "{{.DFFY_BENCH_REPO}}"
+    cmds:
+      - cargo xtask perf --full {{.CLI_ARGS}}
+
   build:
     desc: Build the release binary
     cmds:
@@ -131,9 +172,10 @@ tasks:
       - cargo install --path crates/dffy --root ~/.local
 
   install:plugins:
-    desc: Install the experimental renderer plugins (dffy-render-markdown) to ~/.local/bin
+    desc: Install the experimental renderer plugins (dffy-render-markdown, dffy-render-mermaid) to ~/.local/bin
     cmds:
       - cargo install --path plugins/markdown --root ~/.local
+      - cargo install --path plugins/mermaid --root ~/.local
 
   snapshot:
     desc: Build the release artifacts locally without tagging or publishing

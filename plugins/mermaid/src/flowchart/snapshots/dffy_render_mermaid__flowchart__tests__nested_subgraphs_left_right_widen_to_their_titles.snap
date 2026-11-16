@@ -1,0 +1,16 @@
+---
+source: plugins/mermaid/src/flowchart/tests.rs
+expression: "drawn(source, 80)"
+---
+flowchart 0..8
+         ┌─ A long outer title ───────┐
+         │                            │
+         │                ┌─ Inner ─┐ │
+         │                │         │ │
+  ┌───┐  │ ┌───┐   ┌───┐  │ ┌───┐   │ │
+  │ d ├──┼▶│ c ├──▶│ a ├──┼▶│ b │   │ │
+  └───┘  │ └───┘   └───┘  │ └───┘   │ │
+         │                │         │ │
+         │                └─────────┘ │
+         │                            │
+         └────────────────────────────┘

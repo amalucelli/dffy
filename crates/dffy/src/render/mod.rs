@@ -4,7 +4,8 @@
 //! its own cell grid.
 //!
 //! Print mode (from the core's hunks) and pager mode (from a parsed patch)
-//! both describe a diff with [`FileHeader`], [`HunkHeader`] and [`DiffLine`].
+//! both describe a diff with the core's [`FileHeader`], [`HunkHeader`] and
+//! [`Line`]; this module decides only how they look.
 
 mod split;
 pub(crate) mod stat;
@@ -14,8 +15,10 @@ use std::fmt::Write as _;
 use std::io::{self, Write};
 use std::ops::{ControlFlow, Range};
 
-use dffy_core::diff::Unchanged;
-use dffy_core::highlight::Run;
+use dffy_core::view::{
+    self, Arrangement, Attributes, FileHeader, FileStatus, HunkHeader, Kind, Line, LineState,
+    Paint, Run,
+};
 use unicode_width::UnicodeWidthChar;
 
 use crate::config::Indicators;
@@ -294,7 +297,7 @@ impl Canvas {
                     Role::Plain | Role::Context => None,
                     role => Some(role.key()),
                 };
-                let syntax = ink.syntax.map(dffy_core::highlight::Syntax::key);
+                let syntax = ink.syntax.map(view::Syntax::key);
                 match (role, syntax) {
                     (None, None) => out.push_str(text),
                     (Some(r), None) => {
@@ -334,6 +337,9 @@ pub(crate) struct Layout {
     /// The file exists on one side only (added, untracked or deleted): one
     /// full-width pane with one column of line numbers, even when split.
     pub one_sided: bool,
+    /// The file is unmerged: conflict markers among its added and
+    /// unchanged lines take the warning color, over syntax colors.
+    pub unmerged: bool,
     /// Columns for line numbers across a whole file, so they line up from
     /// hunk to hunk; 0 sizes them per hunk (a piped diff's file lengths are
     /// unknown).
@@ -359,157 +365,20 @@ pub(crate) struct Layout {
 /// unified for a hunk.
 const MIN_SPLIT_TEXT: usize = 12;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Kind {
-    Context,
-    Removed,
-    Added,
-    /// The `\ No newline at end of file` marker after the line it refers to.
-    NoNewline,
-}
-
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct DiffLine<'a> {
-    pub kind: Kind,
-    /// 1-based line numbers; `None` on the side a line isn't on.
-    pub old: Option<usize>,
-    pub new: Option<usize>,
-    /// The line's content without its terminator.
-    pub text: &'a [u8],
-    /// Byte ranges of `text` to emphasize.
-    pub emphasis: &'a [Range<usize>],
-    /// Syntax runs of `text`, when the line is highlighted. Its text then
-    /// takes the syntax colors instead of the added or removed color.
-    pub syntax: Option<&'a [Run]>,
-    /// A renderer plugin's styles for `text`; empty on every other line.
-    /// Like syntax runs, they color the text instead of the change.
-    pub paint: &'a [Paint],
-    /// The syntax diff found the line's code unchanged: reformatted lines
-    /// are drawn dim with `~` for a sign, moved ones in the moved color
-    /// with `»`.
-    pub unchanged: Unchanged,
-    /// A removed or added line paired with one on the other side as its
-    /// edited version ([`dffy_core::diff::Line::paired`]).
-    pub modified: bool,
-    /// Split view starts a new block of rows here (see
-    /// [`dffy_core::diff::Line::block_start`]).
-    pub block_start: bool,
-}
-
-/// A stretch of a rendered line (from a renderer plugin) in its own
-/// style: a syntax color and attributes, bits as in
-/// [`crate::theme::Style::attributes`]. Offsets are bytes of the line.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct Paint {
-    pub start: u32,
-    pub end: u32,
-    pub syntax: Option<dffy_core::highlight::Syntax>,
-    pub attributes: u8,
-}
-
 /// What styles a line's text besides its role: emphasis ranges, syntax
 /// runs and a renderer's paint.
 type Marks<'a> = (&'a [Range<usize>], &'a [Run], &'a [Paint]);
 
 const NO_MARKS: Marks<'static> = (&[], &[], &[]);
 
-/// Numbers as git prints them in `@@ -a,b +c,d @@`.
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct HunkHeader<'a> {
-    pub old_start: usize,
-    pub old_len: usize,
-    pub new_start: usize,
-    pub new_len: usize,
-    /// The function context after the second `@@`.
-    pub heading: &'a [u8],
-    /// Unchanged lines left out before the hunk, when known: the header
-    /// then shows as a separator saying so.
-    pub hidden: usize,
-}
-
-/// A row of a hunk as laid out, before it becomes screen rows: one wraps
-/// into several. Indices are lines of the hunk body.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum HunkRow {
-    Header,
-    /// Unified: one line, including the no-newline marker.
-    Line(usize),
-    /// Split: a context line on both sides, or a removed/added pair.
-    Pair(Option<usize>, Option<usize>),
-    /// Split: the no-newline marker.
-    Marker,
-}
-
-impl HunkHeader<'_> {
-    fn number_width(&self) -> usize {
-        digits((self.old_start + self.old_len).max(self.new_start + self.new_len))
-    }
-
-    /// `@@ -a,b +c,d @@`, as git prints it.
-    pub(crate) fn numbers(&self) -> String {
-        let range = |start: usize, len: usize| {
-            if len == 1 {
-                start.to_string()
-            } else {
-                format!("{start},{len}")
-            }
-        };
-        format!(
-            "@@ -{} +{} @@",
-            range(self.old_start, self.old_len),
-            range(self.new_start, self.new_len)
-        )
-    }
+/// Columns of the largest line number `header`'s hunk shows.
+fn header_digits(header: &HunkHeader) -> usize {
+    digits((header.old_start + header.old_len).max(header.new_start + header.new_len))
 }
 
 /// Decimal digits of `n`, at least 1.
 fn digits(n: usize) -> usize {
     n.max(1).ilog10() as usize + 1
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum FileStatus {
-    Added,
-    Deleted,
-    Modified,
-    Renamed,
-    Copied,
-    TypeChange,
-    Untracked,
-    /// A merge's combined diff (`diff --cc`), passed through unpaired.
-    Combined,
-}
-
-impl FileStatus {
-    /// How a file header names it: `new file`, `modified`.
-    pub(crate) fn word(self) -> &'static str {
-        match self {
-            Self::Added => "new file",
-            Self::Deleted => "deleted file",
-            Self::Modified => "modified",
-            Self::Renamed => "renamed",
-            Self::Copied => "copied",
-            Self::TypeChange => "type changed",
-            Self::Untracked => "untracked file",
-            Self::Combined => "merged",
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct FileHeader<'a> {
-    pub status: FileStatus,
-    pub old_path: &'a [u8],
-    pub new_path: &'a [u8],
-    /// Octal modes, shown when both are known and differ.
-    pub old_mode: Option<&'a str>,
-    pub new_mode: Option<&'a str>,
-    pub similarity: Option<u8>,
-    /// A line shown instead of hunks, such as "binary files differ".
-    pub note: Option<&'a str>,
-    /// Worded after the status (`modified · staged: path`); untracked
-    /// files leave it out, since they can't be staged.
-    pub staging: Option<dffy_core::git::Staging>,
 }
 
 impl Layout {
@@ -522,9 +391,30 @@ impl Layout {
                 status,
                 FileStatus::Added | FileStatus::Untracked | FileStatus::Deleted
             ),
+            unmerged: status == FileStatus::Unmerged,
             digits: if lines == 0 { 0 } else { digits(lines) },
             ..self
         }
+    }
+
+    /// Whether `line` is a conflict marker git wrote into an unmerged file:
+    /// seven `<`, `|`, `=` or `>`, then the end of the line or a space and
+    /// a label (`=======` takes none). Removed lines never count.
+    fn conflict_marker(&self, line: &Line) -> bool {
+        if !self.unmerged || !matches!(line.state.kind(), Kind::Context | Kind::Added) {
+            return false;
+        }
+        let Some(&c @ (b'<' | b'|' | b'=' | b'>')) = line.text.first() else {
+            return false;
+        };
+        line.text
+            .get(..7)
+            .is_some_and(|run| run.iter().all(|&b| b == c))
+            && match line.text.get(7) {
+                None => true,
+                Some(b' ') => c != b'=',
+                Some(_) => false,
+            }
     }
 
     /// Columns of each line number; 0 without line numbers.
@@ -534,7 +424,7 @@ impl Layout {
         } else if self.digits > 0 {
             self.digits
         } else {
-            header.number_width()
+            header_digits(header)
         }
     }
 
@@ -610,7 +500,10 @@ impl Layout {
 
     pub(crate) fn file_header(&self, h: &FileHeader, c: &mut Canvas) {
         let status = h.status.word();
-        let label = match h.staging.filter(|_| h.status != FileStatus::Untracked) {
+        let label = match h
+            .staging
+            .filter(|_| !matches!(h.status, FileStatus::Untracked | FileStatus::Unmerged))
+        {
             Some(staging) => format!("{status} · {}: ", stat::staging_word(staging)),
             None => format!("{status}: "),
         };
@@ -670,17 +563,17 @@ impl Layout {
         &self,
         header: &HunkHeader,
         show_header: bool,
-        lines: &[DiffLine],
+        lines: &[Line],
         c: &mut Canvas,
     ) {
         if show_header {
             self.hunk_header(header, c);
         }
         let mut rows = Vec::new();
-        self.hunk_rows(
-            header,
+        view::rows(
+            self.arrangement(header),
             lines.len(),
-            |i| (lines[i].kind, lines[i].block_start),
+            |i| (lines[i].state.kind(), lines[i].block_start),
             &mut rows,
         );
         for row in rows {
@@ -688,53 +581,55 @@ impl Layout {
         }
     }
 
-    /// Whether this layout puts a hunk side by side; split falls back to
-    /// unified for hunks whose line numbers leave too little room.
-    pub(crate) fn splits(&self, header: &HunkHeader) -> bool {
+    /// How this layout arranges a hunk: side by side when split, except
+    /// for hunks whose line numbers leave too little room.
+    pub(crate) fn arrangement(&self, header: &HunkHeader) -> Arrangement {
         let half = self.width.unwrap_or(80).saturating_sub(1) / 2;
-        self.split
+        if self.split
             && !self.one_sided
             && half
                 >= self.lead_width()
                     + self.number_width(header)
                     + self.mark_width()
                     + MIN_SPLIT_TEXT
-    }
-
-    /// Appends the rows of a hunk body of `len` lines, without the header
-    /// row, given each line's kind and whether it starts a block of rows.
-    pub(crate) fn hunk_rows(
-        &self,
-        header: &HunkHeader,
-        len: usize,
-        line: impl Fn(usize) -> (Kind, bool),
-        rows: &mut Vec<HunkRow>,
-    ) {
-        if self.splits(header) {
-            split::rows(len, line, rows);
+        {
+            Arrangement::Split
         } else {
-            rows.extend((0..len).map(HunkRow::Line));
+            Arrangement::Unified
         }
     }
 
-    /// Draws one hunk row from [`Layout::hunk_rows`] (or the header), as one
-    /// screen row or several when it wraps. `line(i)` is line `i` of the body.
+    /// Draws one hunk row from [`hunk_rows`] (or the header), as one screen
+    /// row or several when it wraps. `line(i)` is line `i` of the body.
     pub(crate) fn hunk_row<'a>(
         &self,
         header: &HunkHeader,
-        row: HunkRow,
-        line: impl Fn(usize) -> DiffLine<'a>,
+        row: view::Row,
+        line: impl Fn(usize) -> Line<'a>,
         c: &mut Canvas,
     ) {
         let w = self.number_width(header);
+        let line = |i| {
+            let l = line(i);
+            if self.conflict_marker(&l) {
+                Line {
+                    emphasis: &[],
+                    syntax: None,
+                    paint: &[],
+                    ..l
+                }
+            } else {
+                l
+            }
+        };
         match row {
-            HunkRow::Header => self.hunk_header(header, c),
-            HunkRow::Line(i) => unified::line(self, w, &line(i), c),
-            HunkRow::Pair(old, new) => {
+            view::Row::Header => self.hunk_header(header, c),
+            view::Row::Line(i) => unified::line(self, w, &line(i), c),
+            view::Row::Pair(old, new) => {
                 let (old, new) = (old.map(&line), new.map(&line));
                 split::row(self, w, [old.as_ref(), new.as_ref()], c);
             }
-            HunkRow::Marker => split::marker(self, c, w),
+            view::Row::Marker => split::marker(self, c, w),
         }
     }
 
@@ -814,7 +709,7 @@ impl Layout {
     fn put_row(
         &self,
         c: &mut Canvas,
-        line: &DiffLine,
+        line: &Line,
         roles: (Role, Role),
         max: usize,
         cursor: &mut Cursor,
@@ -900,8 +795,8 @@ impl LineStyle {
     }
 
     /// Whether the line's background reaches the edge of its pane.
-    fn fills(&self, line: &DiffLine, indicators: Indicators) -> bool {
-        line.kind != Kind::Context
+    fn fills(&self, line: &Line, indicators: Indicators) -> bool {
+        line.state != LineState::Context
             && (line.syntax.is_some()
                 || !line.paint.is_empty()
                 || (indicators == Indicators::Background && self.changed))
@@ -946,12 +841,34 @@ impl LineStyle {
     }
 }
 
-/// How `line` is drawn. Under background tints a changed line's text
-/// always takes the line role, whose background carries the change. With
-/// the layout's `modified_lines`, a line paired with one on the other side
+/// How `line` is drawn. Reformatted lines are dim with `~` for a sign,
+/// moved ones in the moved color with `»`. Under background tints a
+/// changed line's text always takes the line role, whose background
+/// carries the change. With the layout's `modified_lines`, a paired line
 /// takes the modified roles, and only its changed tokens keep the removed
-/// or added color.
-fn line_style(line: &DiffLine, layout: &Layout) -> LineStyle {
+/// or added color. An unmerged file's conflict markers are in the warning
+/// color whatever else they are.
+fn line_style(line: &Line, layout: &Layout) -> LineStyle {
+    if layout.conflict_marker(line) {
+        let added = line.state.kind() == Kind::Added;
+        let role = if added {
+            Role::ConflictMarker
+        } else {
+            Role::Warn
+        };
+        return LineStyle {
+            text: role,
+            emph: role,
+            sign: role,
+            number: if added {
+                Role::AddedNumber
+            } else {
+                Role::LineNumber
+            },
+            sign_char: if added { '+' } else { ' ' },
+            changed: added,
+        };
+    }
     let indicators = layout.indicators;
     let unchanged = |role, sign_char| LineStyle {
         text: role,
@@ -961,43 +878,39 @@ fn line_style(line: &DiffLine, layout: &Layout) -> LineStyle {
         sign_char,
         changed: true,
     };
-    if line.kind != Kind::Context {
-        match line.unchanged {
-            Unchanged::No => {}
-            Unchanged::Layout => return unchanged(Role::Dim, '~'),
-            Unchanged::Moved => return unchanged(Role::Moved, '»'),
-        }
-    }
     let highlighted =
         line.syntax.is_some() || !line.paint.is_empty() || indicators == Indicators::Background;
-    if line.modified && layout.modified_lines && matches!(line.kind, Kind::Removed | Kind::Added) {
-        let removed = line.kind == Kind::Removed;
-        return LineStyle {
-            text: if highlighted {
-                Role::ModifiedLine
-            } else {
-                Role::Modified
-            },
-            emph: if removed {
-                Role::RemovedEmph
-            } else {
-                Role::AddedEmph
-            },
-            sign: Role::Modified,
-            number: Role::ModifiedNumber,
-            sign_char: if removed { '-' } else { '+' },
-            changed: true,
-        };
-    }
-    let (text, emph, sign, number, sign_char) = match line.kind {
-        Kind::Context | Kind::NoNewline => (
+    let modified = |removed: bool| LineStyle {
+        text: if highlighted {
+            Role::ModifiedLine
+        } else {
+            Role::Modified
+        },
+        emph: if removed {
+            Role::RemovedEmph
+        } else {
+            Role::AddedEmph
+        },
+        sign: Role::Modified,
+        number: Role::ModifiedNumber,
+        sign_char: if removed { '-' } else { '+' },
+        changed: true,
+    };
+    let (text, emph, sign, number, sign_char) = match line.state {
+        LineState::RemovedReformatted | LineState::AddedReformatted => {
+            return unchanged(Role::Dim, '~');
+        }
+        LineState::RemovedMoved | LineState::AddedMoved => return unchanged(Role::Moved, '»'),
+        LineState::RemovedPaired if layout.modified_lines => return modified(true),
+        LineState::AddedPaired if layout.modified_lines => return modified(false),
+        LineState::Context | LineState::NoNewline => (
             Role::Context,
             Role::Context,
             Role::Context,
             Role::LineNumber,
             ' ',
         ),
-        Kind::Removed => (
+        LineState::Removed | LineState::RemovedPaired => (
             if highlighted {
                 Role::RemovedLine
             } else {
@@ -1008,7 +921,7 @@ fn line_style(line: &DiffLine, layout: &Layout) -> LineStyle {
             Role::RemovedNumber,
             '-',
         ),
-        Kind::Added => (
+        LineState::Added | LineState::AddedPaired => (
             if highlighted {
                 Role::AddedLine
             } else {
@@ -1026,7 +939,7 @@ fn line_style(line: &DiffLine, layout: &Layout) -> LineStyle {
         sign,
         number,
         sign_char,
-        changed: matches!(line.kind, Kind::Removed | Kind::Added),
+        changed: matches!(line.state.kind(), Kind::Removed | Kind::Added),
     }
 }
 
@@ -1378,7 +1291,7 @@ fn put_glyphs(
                 c.close_span(Ink {
                     role,
                     syntax: run_syntax,
-                    attributes: 0,
+                    attributes: Attributes::NONE,
                 });
                 used += n;
                 cursor.col += n;
@@ -1405,7 +1318,7 @@ fn put_glyphs(
         let ink = Ink {
             role,
             syntax: run_syntax.or_else(|| painted.and_then(|p| p.syntax)),
-            attributes: painted.map_or(0, |p| p.attributes),
+            attributes: painted.map_or(Attributes::NONE, |p| p.attributes),
         };
         c.note_glyph(offset..offset + glyph.len(), width);
         match glyph {
@@ -1435,16 +1348,14 @@ impl Layout {
     /// scrolled sideways like code, so the viewer's commit headers and
     /// combined diffs show where they go on and let them be reached.
     pub(crate) fn text_row(&self, role: Role, text: &[u8], c: &mut Canvas) {
-        let line = DiffLine {
-            kind: Kind::Context,
+        let line = Line {
+            state: LineState::Context,
             old: None,
             new: None,
             text,
             emphasis: &[],
             syntax: None,
             paint: &[],
-            unchanged: Unchanged::No,
-            modified: false,
             block_start: false,
         };
         let layout = Self {
@@ -1524,11 +1435,6 @@ pub(crate) fn thousands(n: usize) -> String {
         out.push(c);
     }
     out
-}
-
-/// Strips one trailing `\r`, so CRLF files don't show `^M` on every line.
-pub(crate) fn display_text(line: &[u8]) -> &[u8] {
-    line.strip_suffix(b"\r").unwrap_or(line)
 }
 
 #[cfg(test)]

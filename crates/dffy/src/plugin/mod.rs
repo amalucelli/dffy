@@ -26,10 +26,8 @@ use std::time::{Duration, Instant, UNIX_EPOCH};
 use rustix::process::{Pid, WaitId, WaitIdOptions};
 
 use dffy_core::cache::{self, Cache};
-use dffy_core::highlight::Syntax;
+use dffy_core::view::{Attributes, Paint, Syntax};
 
-use crate::render::Paint;
-use crate::theme::Style;
 use json::Value;
 
 /// The protocol version: in every request and every answer. An answer of
@@ -594,7 +592,10 @@ fn line(value: &Value) -> Result<Line, String> {
         if let Some(url) = style.and_then(|s| s.get("url")).and_then(Value::as_str) {
             links.push((start..text.len(), url.to_owned()));
         }
-        if let Some((syntax, attributes)) = style.map(style_of).filter(|s| *s != (None, 0)) {
+        if let Some((syntax, attributes)) = style
+            .map(style_of)
+            .filter(|s| *s != (None, Attributes::NONE))
+        {
             let offset = |n: usize| u32::try_from(n).map_err(|_| "a line over 4GB".to_owned());
             paint.push(Paint {
                 start: offset(start)?,
@@ -609,28 +610,28 @@ fn line(value: &Value) -> Result<Line, String> {
 
 /// What a span's `style` names come to. Unknown names are ignored, so
 /// renderers can use names a later dffy understands.
-fn style_of(span: &Value) -> (Option<Syntax>, u8) {
-    let (mut syntax, mut attributes) = (None, 0);
+fn style_of(span: &Value) -> (Option<Syntax>, Attributes) {
+    let (mut syntax, mut attributes) = (None, Attributes::NONE);
     let names = span.get("style").and_then(Value::as_array).unwrap_or(&[]);
     for name in names.iter().filter_map(Value::as_str) {
         match name {
-            "bold" => attributes |= Style::BOLD,
-            "italic" => attributes |= Style::ITALIC,
-            "underline" => attributes |= Style::UNDERLINE,
-            "dim" => attributes |= Style::DIM,
+            "bold" => attributes |= Attributes::BOLD,
+            "italic" => attributes |= Attributes::ITALIC,
+            "underline" => attributes |= Attributes::UNDERLINE,
+            "dim" => attributes |= Attributes::DIM,
             "code" => syntax = Some(Syntax::String),
             "link" => {
                 syntax = syntax.or(Some(Syntax::Function));
-                attributes |= Style::UNDERLINE;
+                attributes |= Attributes::UNDERLINE;
             }
             "heading" => {
                 let level = span.get("level").and_then(Value::as_usize).unwrap_or(1);
-                attributes |= Style::BOLD;
+                attributes |= Attributes::BOLD;
                 if level <= 2 {
                     syntax = Some(Syntax::Keyword);
                 }
                 if level == 1 {
-                    attributes |= Style::UNDERLINE;
+                    attributes |= Attributes::UNDERLINE;
                 }
             }
             other => {

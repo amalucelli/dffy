@@ -254,30 +254,32 @@ impl Pair {
             scope.spawn(move || {
                 let mut seq = 0;
                 let mut batch = Vec::with_capacity(BATCH);
-                let mut sink = |found| {
-                    batch.push((seq, found));
-                    seq += 1;
-                    // Small batches first, so the first change isn't held
-                    // until a full batch is listed.
-                    let sent = batch.len() < (seq / 8).clamp(1, BATCH)
-                        || jobs
-                            .send(std::mem::replace(&mut batch, Vec::with_capacity(BATCH)))
-                            .is_ok();
-                    if sent && !stopped.load(Ordering::Relaxed) {
-                        ControlFlow::Continue(())
-                    } else {
-                        ControlFlow::Break(())
-                    }
+                // The sink borrows `seq` and `batch` until the walk is done.
+                let result = {
+                    let mut sink = |found| {
+                        batch.push((seq, found));
+                        seq += 1;
+                        // Small batches first, so the first change isn't held
+                        // until a full batch is listed.
+                        let sent = batch.len() < (seq / 8).clamp(1, BATCH)
+                            || jobs
+                                .send(std::mem::replace(&mut batch, Vec::with_capacity(BATCH)))
+                                .is_ok();
+                        if sent && !stopped.load(Ordering::Relaxed) {
+                            ControlFlow::Continue(())
+                        } else {
+                            ControlFlow::Break(())
+                        }
+                    };
+                    let mut walk = Walk {
+                        pair: self,
+                        filter,
+                        sink: &mut sink,
+                        ancestors: [Vec::new(), Vec::new()],
+                        rules: [Vec::new(), Vec::new()],
+                    };
+                    walk.run([Some(old), Some(new)])
                 };
-                let mut walk = Walk {
-                    pair: self,
-                    filter,
-                    sink: &mut sink,
-                    ancestors: [Vec::new(), Vec::new()],
-                    rules: [Vec::new(), Vec::new()],
-                };
-                let result = walk.run([Some(old), Some(new)]);
-                drop(sink);
                 if !batch.is_empty() {
                     jobs.send(batch).ok();
                 }

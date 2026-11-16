@@ -214,13 +214,14 @@ pub(crate) fn status_letter(status: super::FileStatus) -> (&'static str, Role) {
         S::TypeChange => ("T", Role::Hint),
         S::Untracked => ("?", Role::Dim),
         S::Combined => ("U", Role::Warn),
+        S::Unmerged => ("U", Role::Removed),
     }
 }
 
 /// A file's staging as the viewer words it after its status, as in
 /// `modified · partly staged`.
-pub(crate) fn staging_word(staging: dffy_core::git::Staging) -> &'static str {
-    use dffy_core::git::Staging as S;
+pub(crate) fn staging_word(staging: dffy_core::view::Staging) -> &'static str {
+    use dffy_core::view::Staging as S;
     match staging {
         S::Staged => "staged",
         S::Unstaged => "unstaged",

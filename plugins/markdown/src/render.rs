@@ -504,6 +504,43 @@ impl Renderer {
         let Some((range, language, code)) = self.code.take() else {
             return;
         };
+        // A diagram's lines start on the line after the opening fence; its
+        // first and last blocks take the fences too, as a code block would.
+        // One that can't be drawn stays a code block.
+        if language.as_deref() == Some("mermaid")
+            && let Some(blocks) = dffy_render_mermaid::render(&code, self.width)
+        {
+            let fence = self.lines(&range);
+            let count = blocks.len();
+            for (i, block) in blocks.into_iter().enumerate() {
+                let start = if i == 0 {
+                    fence.start
+                } else {
+                    fence.start + 1 + block.source.start
+                };
+                let end = if i + 1 == count {
+                    fence.end
+                } else {
+                    fence.start + 1 + block.source.end
+                };
+                self.blocks.push(Block {
+                    kind: block.kind,
+                    source: start..end.min(fence.end),
+                    lines: block
+                        .lines
+                        .into_iter()
+                        .map(|line| {
+                            line.into_iter()
+                                .map(|s| Span::styled(s.text, s.style))
+                                .collect()
+                        })
+                        .collect(),
+                    language: None,
+                });
+            }
+            self.gap();
+            return;
+        }
         let mut lines: Vec<Line> = code
             .lines()
             .map(|l| vec![Span::styled(l, &["code"])])

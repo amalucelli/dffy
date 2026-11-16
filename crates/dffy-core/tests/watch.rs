@@ -13,7 +13,8 @@ use std::process::Command;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
-use dffy_core::git::{ChangeSet, Repo, Revisions, Staging};
+use dffy_core::git::{ChangeSet, Repo, Revisions};
+use dffy_core::view::Staging;
 use dffy_core::watch::{Change, Notice, Root, Watcher};
 
 fn git(dir: &Path, args: &[&str]) -> String {

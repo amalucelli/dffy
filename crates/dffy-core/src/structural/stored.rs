@@ -1,7 +1,7 @@
 //! Structural diffs in the disk cache. A large file's diff takes tens to
 //! hundreds of milliseconds to compute and about a millisecond to read
-//! back, so it's kept by content: both blob ids, the language and its
-//! grammar, and the line hunks it was laid over.
+//! back, so it's kept by content: both blob ids, the language's identity
+//! (its grammar and query), and the line hunks it was laid over.
 
 use crate::cache::{self, Cache, Kind, get_varint, put_varint};
 use crate::diff::{Hunk, Line, LineKind, Unchanged};
@@ -18,16 +18,11 @@ pub const CACHE_MIN_BYTES: usize = 64 << 10;
 const VERSION: u8 = 4;
 
 /// What a cached structural diff depends on.
-pub(super) fn key(lang: Language, ids: [ObjectId; 2], hunks: &[Hunk]) -> Vec<u8> {
+pub(super) fn key(lang: &Language, ids: [ObjectId; 2], hunks: &[Hunk]) -> Vec<u8> {
     let mut key = vec![VERSION];
-    key.extend_from_slice(lang.name().as_bytes());
-    key.push(0);
+    key.extend_from_slice(lang.identity().as_bytes());
     for id in ids {
         key.extend_from_slice(id.as_bytes());
-    }
-    // The grammar's version, by proxy: its query ships with it.
-    for part in lang.highlights() {
-        key.extend_from_slice(cache::digest(part.as_bytes()).as_bytes());
     }
     // The hunks, which context and whitespace options shape.
     let mut shape = Vec::new();
@@ -172,7 +167,8 @@ mod tests {
         let new =
             Text::new(b"int b;\nint a(void) { return 1; }\nint c(void) { return 3; }\n".to_vec());
         let line = hunks(&old, &new, &Options::default());
-        let s = super::super::diff(b"a.c", &old, &new, &line).expect("diff");
+        let grammars = crate::highlight::Registry::builtin();
+        let s = super::super::diff(&grammars, b"a.c", &old, &new, &line).expect("diff");
         let back = decode(&encode(&s)).expect("decodes");
         assert_eq!(back.hunks, s.hunks);
         assert_eq!(back.regions, s.regions);

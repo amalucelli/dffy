@@ -2,16 +2,24 @@
 
 use std::sync::Arc;
 
+use dffy_core::cache::Cache;
 use dffy_core::diff::Options;
-use dffy_core::diff::{Whitespace, emphasize};
+use dffy_core::diff::{Emphasis, Whitespace, emphasize};
+use dffy_core::document::{self, Counts, File, Prepare};
 use dffy_core::git::{FileChange, FileDiff, Repo};
+use dffy_core::highlight::HunkSyntax;
 
 use crate::config::{Config, Indicators};
-use crate::print::FileSyntax;
 use crate::term::{Input, Key, Mods};
 use crate::theme::Theme;
 use crate::tui::worker::{Job, Pool, Settings};
-use crate::tui::{App, Counts, Done, Event, Loaded};
+use crate::tui::{App, Done, Event};
+
+/// The core's per-file work as the viewer's workers run it, without the
+/// disk cache.
+fn prepare() -> Prepare<'static> {
+    File::prepare(crate::grammars(), None)
+}
 
 /// The TUI showing one file diff, drawing frames without a terminal.
 pub struct Frame {
@@ -53,18 +61,7 @@ impl Frame {
         highlight: bool,
         config: &Config,
     ) -> Self {
-        let syntax = highlight.then(|| FileSyntax::new(&diff, None, false));
-        let hunks: Vec<_> = diff
-            .hunks
-            .iter()
-            .map(|h| match &syntax {
-                Some(s) => {
-                    let spans = s.hunk(&diff, h);
-                    (spans.emphasis(&diff, h), Some(spans))
-                }
-                None => (emphasize(&diff.old, &diff.new, h), None),
-            })
-            .collect();
+        let hunks = emphases(&diff, highlight);
         let mut app = App::new(
             config,
             Theme::default_theme(),
@@ -73,8 +70,8 @@ impl Frame {
             (width, height),
             Indicators::Bars,
         );
-        let loaded = Loaded::new(diff, Whitespace::Exact, highlight);
-        let diff = Arc::clone(&loaded.diff);
+        let loaded = prepare().file(diff, Whitespace::Exact, highlight);
+        let diff = Arc::clone(loaded.diff());
         let version = app.version(0);
         app.event(Event::Diffed(Done::Diff {
             file: 0,
@@ -92,6 +89,18 @@ impl Frame {
             }));
         }
         Self { app }
+    }
+
+    /// The work the viewer's workers do to show `diff`, all on this thread:
+    /// the file's view, then every hunk's emphasis (with `highlight`, from
+    /// a parse of both sides) and, with `structural`, the syntax diff.
+    /// Returns the number of hunks, to keep the work observable.
+    #[must_use]
+    pub fn prepare(diff: FileDiff, highlight: bool, structural: bool) -> usize {
+        let hunks = emphases(&diff, highlight);
+        std::hint::black_box(structural.then(|| prepare().structural(&diff)));
+        std::hint::black_box(prepare().file(diff, Whitespace::Exact, highlight));
+        hunks.len()
     }
 
     /// A `width` × `height` viewer of every change in `changes` with the
@@ -142,7 +151,7 @@ impl Frame {
         app.event(Event::Diffed(Done::Diff {
             file,
             version,
-            result: Ok(Box::new(Loaded::new(diff, Whitespace::Exact, false))),
+            result: Ok(Box::new(prepare().file(diff, Whitespace::Exact, false))),
         }));
         for _ in 0..file {
             app.event(Event::Input(Input::Key(Key::Char('f'), Mods::NONE)));
@@ -157,16 +166,32 @@ impl Frame {
     ///
     /// When the pool can't start or stops early.
     #[must_use]
+    pub fn count_pass(repo: &Repo, changes: Vec<FileChange>) -> Vec<(usize, usize)> {
+        Self::count_pass_cached(repo, changes, None)
+    }
+
+    /// [`Frame::count_pass`] with the counts found in and kept in `cache`,
+    /// written by the time it returns.
+    ///
+    /// # Panics
+    ///
+    /// When the pool can't start or stops early.
+    #[must_use]
     #[expect(
         clippy::expect_used,
         reason = "benchmark setup: without the pool there is nothing to measure"
     )]
-    pub fn count_pass(repo: &Repo, changes: Vec<FileChange>) -> Vec<(usize, usize)> {
+    pub fn count_pass_cached(
+        repo: &Repo,
+        changes: Vec<FileChange>,
+        cache: Option<Cache>,
+    ) -> Vec<(usize, usize)> {
         let (tx, rx) = std::sync::mpsc::channel();
         let settings = Settings {
             options: Options::default(),
             highlight: false,
-            cache: None,
+            grammars: crate::grammars(),
+            cache,
         };
         let pool = Pool::new(Some(repo), &settings, &tx).expect("the pool starts");
         let mut counts = vec![(0, 0); changes.len()];
@@ -186,6 +211,7 @@ impl Frame {
                 }
             }
         }
+        pool.flush();
         counts
     }
 
@@ -198,8 +224,8 @@ impl Frame {
     /// found the way the viewer's workers find them for the diff search.
     #[must_use]
     pub fn search(diff: &FileDiff, pattern: &str) -> usize {
-        let needle = crate::tui::view::Needle::new(pattern);
-        crate::tui::view::find(diff, None, &needle, || false).map_or(0, |m| m.list.len())
+        let needle = document::Needle::new(pattern);
+        document::find(diff, None, &needle, || false).map_or(0, |m| m.list.len())
     }
 
     /// Does the diff search's scan of the file shown on this thread, as a
@@ -216,7 +242,7 @@ impl Frame {
                 ..
             } = job
             {
-                let matches = crate::tui::view::find(&diff, Some(&hidden), &needle, || false);
+                let matches = document::find(&diff, Some(&hidden), &needle, || false);
                 self.app.event(Event::Diffed(Done::Found {
                     file,
                     version,
@@ -255,4 +281,20 @@ impl Frame {
     pub fn invalidate(&mut self) {
         self.app.invalidate();
     }
+}
+
+/// Every hunk's emphasis and, with `highlight`, its syntax spans, as the
+/// workers compute them.
+fn emphases(diff: &FileDiff, highlight: bool) -> Vec<(Vec<Emphasis>, Option<HunkSyntax>)> {
+    let syntax = highlight.then(|| prepare().syntax(diff, false));
+    diff.hunks
+        .iter()
+        .map(|h| match &syntax {
+            Some(s) => {
+                let spans = s.hunk(&diff.old, &diff.new, h);
+                (spans.emphasis(&diff.old, &diff.new, h), Some(spans))
+            }
+            None => (emphasize(&diff.old, &diff.new, h), None),
+        })
+        .collect()
 }

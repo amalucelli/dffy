@@ -96,8 +96,11 @@ Plain `dffy` compares `HEAD` with the working tree and adds untracked files, so 
 | `modified · staged` | Changed in the index, the working tree matches it |
 | `modified · partly staged` | Some of the change is staged, some isn't |
 | `untracked file` | Not in the index |
+| `conflicted` | A merge, rebase or cherry-pick stopped on it: shown as the working-tree file, conflict markers highlighted, against `HEAD` |
 
-The file tree and the picker show only the status letter.
+The file tree and the picker show only the status letter, `U` for a conflicted file.
+
+A conflicted file is listed once, as `U`, by `dffy`, `--staged`, `--unstaged` and `dffy <rev>`, even where `git diff` names it twice or by its content (`A`, `M`). With `--unstaged` it's compared with our side of the conflict, as `git diff` does.
 
 `--staged` (`git diff --cached`) and `--unstaged` (`git diff`) show one side each. `default-diff = unstaged` in the [config](config.md) makes plain `dffy` behave like plain `git diff`, and `dffy --all` brings back everything for one run. In printed output, untracked files get an `untracked file:` header.
 

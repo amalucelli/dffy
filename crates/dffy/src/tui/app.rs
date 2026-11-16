@@ -22,7 +22,12 @@ use std::time::{Duration, Instant};
 
 use dffy_core::bstr::BString;
 use dffy_core::diff::Whitespace;
+use dffy_core::document::{
+    File, Found, Match, Matches, Missing, Needle, Pos, Render, Side, Source, State,
+};
 use dffy_core::git::{FileChange, FileDiff, Revisions, Status, Update};
+use dffy_core::highlight::Language;
+use dffy_core::view::Attributes;
 use dffy_core::watch::Notice;
 use unicode_width::UnicodeWidthStr;
 
@@ -32,7 +37,7 @@ use super::help::Help;
 use super::picker::{self, Picker};
 use super::piped;
 use super::tree::{self, Item, Totals, Tree};
-use super::view::{Doc, Hit, Marks, Matches, Needle, Pos, Side, Source, State};
+use super::view::{Doc, Hit};
 use super::worker::{Counted, Done, Job, RenderJob};
 use super::{Event, view};
 use crate::config::{
@@ -269,6 +274,13 @@ pub(crate) struct App {
     pane: Pane,
     /// The count pass should be (re)started for the current list.
     count_pass: bool,
+    /// The tree's first row when the count pass last started, to start it
+    /// again with the files scrolled into view first.
+    count_scroll: Option<usize>,
+    /// Each language a listed file has, by path, in the order they first
+    /// came, and how many of them went to the pool to compile ahead.
+    languages: Vec<Language>,
+    prepared: usize,
     help: Option<Help>,
     picker: Option<Picker>,
     /// The narrow title's row and the columns of its previous-file arrow,
@@ -294,11 +306,19 @@ pub(crate) struct App {
     frame: u64,
     visible: Range<usize>,
     dirty: bool,
+    /// The diff's rows on screen still show what they showed when drawn:
+    /// nothing drew over them, and only scrolls of the diff happened since.
+    /// The next frame copies the ones still on screen instead of laying
+    /// them out again.
+    kept: bool,
+    /// The event being handled scrolled the diff.
+    scrolled: bool,
 }
 
 impl App {
     /// A viewer showing `first`, or nothing yet in watch mode. `indicators`
     /// is the config's, already resolved for color.
+    #[expect(clippy::too_many_lines, reason = "a line per field of the state")]
     pub(crate) fn new(
         config: &Config,
         theme: Theme,
@@ -315,6 +335,7 @@ impl App {
             tab_width: config.tab_width,
             indicators,
             one_sided: false,
+            unmerged: false,
             digits: 0,
             inline_signs: false,
             scroll: 0,
@@ -323,14 +344,19 @@ impl App {
             modified_lines: config.modified_lines == ModifiedLines::Changed,
         };
         let mut doc = Doc::new(placeholder, height);
-        doc.structural = config.syntax_diff;
-        doc.rendered = config.rendered;
-        doc.full = config.context == Context::Full;
+        doc.document.structural = config.syntax_diff;
+        doc.set_rendered_mode(config.rendered);
+        doc.document.full = config.context == Context::Full;
         doc.overview = true;
         let mut tree = Tree::default();
+        let languages = first
+            .iter()
+            .filter_map(|f| crate::grammars().detect(&f.path, &[]))
+            .cloned()
+            .collect();
         if let Some(first) = first {
             tree.insert(0, &first.path);
-            doc.push(first, Source::Repo);
+            doc.document.push(first, Source::Repo);
         }
         let mut app = Self {
             doc,
@@ -390,6 +416,9 @@ impl App {
                 || (config.tree == TreeMode::Auto && width >= SIDE_TREE_WIDTH),
             pane: Pane::Diff,
             count_pass: false,
+            count_scroll: None,
+            languages,
+            prepared: 0,
             help: None,
             picker: None,
             switcher: None,
@@ -405,6 +434,8 @@ impl App {
             frame: 0,
             visible: 0..1,
             dirty: true,
+            kept: false,
+            scrolled: false,
         };
         app.relayout();
         app
@@ -418,10 +449,12 @@ impl App {
 
     /// Jumps to the newest file if it's under the focus path.
     fn check_focus(&mut self) {
-        let (Some(focus), Some(file)) = (&self.focus, self.doc.files.len().checked_sub(1)) else {
+        let (Some(focus), Some(file)) =
+            (&self.focus, self.doc.document.files().len().checked_sub(1))
+        else {
             return;
         };
-        let path = &self.doc.files[file].change.path;
+        let path = &self.doc.document.files()[file].change().path;
         if focus.is_empty()
             || path == focus
             || (path.starts_with(&focus[..]) && path.get(focus.len()) == Some(&b'/'))
@@ -433,7 +466,8 @@ impl App {
 
     /// The version of the entry at `file` (see [`view::Entry::version`]).
     pub(crate) fn version(&self, file: usize) -> u64 {
-        self.doc.files.get(file).map_or(u64::MAX, |e| e.version)
+        let files = self.doc.document.files();
+        files.get(file).map_or(u64::MAX, view::Entry::version)
     }
 
     /// What the repository's diff selects, and the default it was picked
@@ -515,9 +549,9 @@ impl App {
     /// looks through every file.
     pub(crate) fn wanted(&self) -> usize {
         if self.picker.is_some() || self.tree.editing || self.search.is_some() {
-            self.doc.files.len() + piped::READ_ALL_AHEAD
+            self.doc.document.files().len() + piped::READ_ALL_AHEAD
         } else {
-            self.doc.pos.file + piped::READ_AHEAD
+            self.doc.document.pos.file + piped::READ_AHEAD
         }
     }
 
@@ -622,7 +656,7 @@ impl App {
 
     /// Whether the layout splits at this width. Split asked for still
     /// renders a hunk unified when its halves would be too thin to read
-    /// ([`Layout::splits`]); split remembered from an earlier run renders
+    /// ([`Layout::arrangement`]); split remembered from an earlier run renders
     /// unified on a phone-sized screen, without forgetting it.
     fn splits(&self) -> bool {
         match self.view {
@@ -647,6 +681,7 @@ impl App {
             tab_width: self.tab_width,
             indicators: self.indicators,
             one_sided: false,
+            unmerged: false,
             digits: 0,
             inline_signs: false,
             scroll: if self.wrap { 0 } else { self.scroll },
@@ -666,6 +701,7 @@ impl App {
         self.tree.set_height(self.tree_rows().1);
         self.doc.normalize();
         self.dirty = true;
+        self.kept = false;
     }
 
     pub(crate) fn resize(&mut self, width: usize, height: usize) {
@@ -682,6 +718,7 @@ impl App {
     pub(crate) fn invalidate(&mut self) {
         self.screen.invalidate();
         self.dirty = true;
+        self.kept = false;
     }
 
     pub(crate) fn message(&mut self, text: impl Into<String>) {
@@ -710,34 +747,48 @@ impl App {
     }
 
     pub(crate) fn event(&mut self, event: Event) -> Option<Action> {
+        let kept = std::mem::take(&mut self.kept);
+        self.scrolled = false;
+        let action = self.handle(event);
+        self.kept = kept && self.scrolled;
+        action
+    }
+
+    fn handle(&mut self, event: Event) -> Option<Action> {
         match event {
             Event::Input(input) => return self.input(input),
             Event::Enumerated(change) => {
-                self.tree.insert(self.doc.files.len(), &change.path);
-                self.doc.push(change, Source::Repo);
+                if let Some(lang) = crate::grammars().detect(&change.path, &[])
+                    && !self.languages.contains(lang)
+                {
+                    self.languages.push(lang.clone());
+                }
+                self.tree
+                    .insert(self.doc.document.files().len(), &change.path);
+                self.doc.document.push(change, Source::Repo);
                 self.check_focus();
                 self.dirty = true;
             }
             Event::Piped(item) => {
-                let file = self.doc.files.len();
+                let file = self.doc.document.files().len();
                 match item {
                     piped::Item::Commit(commit) => {
                         let change = FileChange {
-                            path: commit.label(),
+                            path: commit.label().into(),
                             status: Status::Modified,
                             old: None,
                             new: None,
                             staging: None,
                         };
                         self.tree.insert_commit(file, &change.path);
-                        self.doc.push(change, Source::Commit(commit));
+                        self.doc.document.push(change, Source::Commit(commit));
                     }
                     piped::Item::File(change, piped) => {
                         self.tree.insert(file, &change.path);
-                        self.doc.push(change, Source::Piped(piped));
+                        self.doc.document.push(change, Source::Piped(piped));
                     }
                 }
-                if self.doc.files.len() == piped::MAX_ENTRIES {
+                if self.doc.document.files().len() == piped::MAX_ENTRIES {
                     self.message(format!(
                         "stopped reading at {} entries; the rest of the input isn't read",
                         thousands(piped::MAX_ENTRIES)
@@ -755,13 +806,13 @@ impl App {
                     // void. Work asked for by position checks the version
                     // of the entry now there.
                     if let Some(search) = &mut self.search {
-                        search.counts = vec![None; self.doc.files.len()];
+                        search.counts = vec![None; self.doc.document.files().len()];
                         search.pending = None;
-                        self.doc.search = None;
+                        self.doc.document.search = None;
                     }
                     self.rebuild_tree();
                     if let Some(picker) = &mut self.picker {
-                        picker.rebuild(&self.doc.files);
+                        picker.rebuild(self.doc.document.files());
                     }
                 }
                 self.count_pass = true;
@@ -772,7 +823,7 @@ impl App {
             Event::RefreshFailed(error) => self.message(format!("refreshing failed: {error}")),
             Event::Others(others) => {
                 self.others = others;
-                self.dirty |= self.doc.files.is_empty();
+                self.dirty |= self.doc.document.files().is_empty();
             }
             Event::Watch(event) => self.watch_event(event),
             Event::Tick => {
@@ -804,22 +855,24 @@ impl App {
         // By position, to find where each file went.
         let before: Vec<(BString, u64)> = if self.search.is_some() {
             self.doc
-                .files
+                .document
+                .files()
                 .iter()
-                .map(|e| (e.change.path.clone(), e.version))
+                .map(|e| (e.change().path.clone(), e.version()))
                 .collect()
         } else {
             Vec::new()
         };
-        let marks = self.doc.search.take();
+        let marks = self.doc.document.search.take();
         self.doc.replace(update);
         if let Some(search) = &mut self.search {
             let now: HashMap<&BString, (usize, u64)> = self
                 .doc
-                .files
+                .document
+                .files()
                 .iter()
                 .enumerate()
-                .map(|(i, e)| (&e.change.path, (i, e.version)))
+                .map(|(i, e)| (&e.change().path, (i, e.version())))
                 .collect();
             // Where the file at `file` went; `None` when it's gone or, with
             // `same`, changed.
@@ -828,7 +881,7 @@ impl App {
                 let &(to, current) = now.get(path)?;
                 (!same || current == *version).then_some(to)
             };
-            let mut counts = vec![None; self.doc.files.len()];
+            let mut counts = vec![None; self.doc.document.files().len()];
             for (file, count) in search.counts.iter().enumerate() {
                 if let (Some(count), Some(to)) = (count, moved(file, true)) {
                     counts[to] = Some(*count);
@@ -839,14 +892,14 @@ impl App {
                 .pending
                 .take()
                 .and_then(|(file, land)| Some((moved(file, false)?, land)));
-            self.doc.search = marks.and_then(|mut m| {
+            self.doc.document.search = marks.and_then(|mut m| {
                 m.file = moved(m.file, true)?;
                 Some(m)
             });
         }
         self.rebuild_tree();
         if let Some(picker) = &mut self.picker {
-            picker.rebuild(&self.doc.files);
+            picker.rebuild(self.doc.document.files());
         }
         self.count_pass = true;
         self.dirty = true;
@@ -880,7 +933,7 @@ impl App {
     /// draw that followed the change, under its own key.
     fn done(&mut self, done: Done) {
         if let Some((file, version)) = done.file()
-            && !self.doc.is_current(file, version)
+            && !self.doc.document.is_current(file, version)
         {
             return;
         }
@@ -888,7 +941,12 @@ impl App {
             Done::Search {
                 file, id, count, ..
             } => {
-                let marked = self.doc.search.as_ref().is_some_and(|m| m.file == file);
+                let marked = self
+                    .doc
+                    .document
+                    .search
+                    .as_ref()
+                    .is_some_and(|m| m.file == file);
                 if let Some(search) = &mut self.search
                     && search.id == id
                     && !marked
@@ -909,11 +967,9 @@ impl App {
                 ..
             } => self.found(file, id, &diff, &hidden, matches),
             Done::Diff { file, result, .. } => {
-                if self.doc.search.as_ref().is_some_and(|m| m.file == file) {
-                    self.doc.search = None;
-                }
+                self.doc.document.search.take_if(|m| m.file == file);
                 if self.doc.load(file, result) {
-                    self.doc.evict(CACHE_BYTES, &self.visible);
+                    self.doc.document.evict(CACHE_BYTES, &self.visible);
                     self.doc.normalize();
                     self.dirty = true;
                 }
@@ -929,7 +985,9 @@ impl App {
                 syntax,
                 ..
             } => {
-                self.doc.set_emphasis(file, &diff, hunk, emphasis, syntax);
+                self.doc
+                    .document
+                    .set_emphasis(file, &diff, hunk, emphasis, syntax);
                 self.dirty |= self.visible.contains(&file);
             }
             Done::GapSyntax {
@@ -939,20 +997,20 @@ impl App {
                 spans,
                 ..
             } => {
-                self.doc.set_gap_syntax(file, &diff, gap, spans);
+                self.doc.document.set_gap_syntax(file, &diff, gap, spans);
                 self.dirty |= self.visible.contains(&file);
             }
             Done::Structural {
                 file, diff, result, ..
             } => {
-                if self.doc.set_structural(file, &diff, result) {
-                    self.doc.evict(CACHE_BYTES, &self.visible);
-                    if self.doc.structural {
+                if self.doc.document.set_structural(file, &diff, result) {
+                    self.doc.document.evict(CACHE_BYTES, &self.visible);
+                    if self.doc.document.structural {
                         self.doc.normalize();
                         self.dirty = true;
                     }
                 } else {
-                    self.dirty |= self.doc.structural && self.visible.contains(&file);
+                    self.dirty |= self.doc.document.structural && self.visible.contains(&file);
                 }
             }
             Done::Rendered {
@@ -966,8 +1024,8 @@ impl App {
             }
             Done::Counts { counts } => {
                 for (file, version, counts) in counts {
-                    if self.doc.is_current(file, version) {
-                        self.doc.set_counts(file, counts);
+                    if self.doc.document.is_current(file, version) {
+                        self.doc.document.set_counts(file, counts);
                     }
                 }
                 self.dirty |= self.tree_shown;
@@ -982,7 +1040,7 @@ impl App {
         &mut self,
         file: usize,
         diff: &Arc<FileDiff>,
-        result: Result<Box<view::Loaded>, Option<String>>,
+        result: Result<Box<File>, Option<String>>,
     ) {
         let result = match result {
             Ok(loaded) => Ok(loaded),
@@ -991,8 +1049,8 @@ impl App {
         };
         let failed = result.as_ref().err().cloned();
         if self.doc.set_rendered(file, diff, result) {
-            self.doc.evict(CACHE_BYTES, &self.visible);
-            if let Some(reason) = failed.filter(|_| self.doc.rendered) {
+            self.doc.document.evict(CACHE_BYTES, &self.visible);
+            if let Some(reason) = failed.filter(|_| self.doc.document.rendered()) {
                 self.message(format!("{reason}; showing the lines"));
             }
             self.dirty = true;
@@ -1000,25 +1058,50 @@ impl App {
     }
 
     /// The count pass to start, once per list and only while the tree
-    /// shows: the files on screen in the tree first, then the rest in
-    /// order.
+    /// shows: the files on screen in the tree first, then those near them,
+    /// then the rest in order. Started again when the tree scrolls to files
+    /// not counted yet.
     pub(crate) fn take_count_pass(&mut self) -> Option<Vec<Counted>> {
-        if !self.count_pass || !self.tree_shown || self.enumerating {
+        if !self.tree_shown || self.enumerating {
+            return None;
+        }
+        let files = self.doc.document.files();
+        let scrolled = self
+            .count_scroll
+            .is_some_and(|row| row != self.tree.scroll())
+            && self
+                .tree
+                .files_on_screen()
+                .any(|f| files.get(f).is_some_and(view::Entry::wants_counts));
+        if !self.count_pass && !scrolled {
             return None;
         }
         self.count_pass = false;
-        let files = &self.doc.files;
-        let mut first = self.tree.files_on_screen();
-        first.retain(|&f| files.get(f).is_some_and(view::Entry::wants_counts));
-        let rest = (0..files.len()).filter(|f| files[*f].wants_counts() && !first.contains(f));
+        self.count_scroll = Some(self.tree.scroll());
+        let mut first = self.tree.files_near_screen();
+        let mut wanted: Vec<bool> = files.iter().map(view::Entry::wants_counts).collect();
+        first.retain(|&f| wanted.get_mut(f).is_some_and(std::mem::take));
+        let rest = (0..files.len()).filter(|&f| wanted[f]);
         Some(
             first
                 .iter()
                 .copied()
                 .chain(rest)
-                .map(|f| (f, files[f].version, files[f].change.clone()))
+                .map(|f| (f, files[f].version(), files[f].change().clone()))
                 .collect(),
         )
+    }
+
+    /// The languages of listed files not handed out yet, whose queries the
+    /// pool compiles ahead of their first file being drawn. Nothing while
+    /// highlighting is off; those listed meanwhile come once it's on.
+    pub(crate) fn take_languages(&mut self) -> Vec<Language> {
+        if !(self.highlight && self.color) {
+            return Vec::new();
+        }
+        let new = self.languages[self.prepared..].to_vec();
+        self.prepared = self.languages.len();
+        new
     }
 
     fn show_tree(&mut self, shown: bool) {
@@ -1034,9 +1117,9 @@ impl App {
     /// Rebuilds the tree for a new file list, its selection on the file
     /// shown, which the list keeps when it can.
     fn rebuild_tree(&mut self) {
-        self.tree.rebuild(&self.doc.files);
-        if !self.doc.files.is_empty() {
-            self.tree.follow(self.doc.pos.file);
+        self.tree.rebuild(self.doc.document.files());
+        if !self.doc.document.files().is_empty() {
+            self.tree.follow(self.doc.document.pos.file);
         }
     }
 
@@ -1047,8 +1130,8 @@ impl App {
             self.show_tree(true);
         }
         self.pane = Pane::Tree;
-        if !self.doc.files.is_empty() {
-            self.tree.follow(self.doc.pos.file);
+        if !self.doc.document.files().is_empty() {
+            self.tree.follow(self.doc.document.pos.file);
         }
     }
 
@@ -1098,7 +1181,7 @@ impl App {
         if self.picker.is_some() {
             return self.picker_input(input);
         }
-        let pending = self.doc.pending_land.take();
+        let pending = self.doc.document.pending_land.take();
         let (key, mods) = match input {
             Input::Key(key, mods) => (key, mods),
             Input::Background { .. } => return None,
@@ -1107,7 +1190,7 @@ impl App {
                 if self.over_tree(usize::from(x)) {
                     self.tree.scroll_by(rows);
                 } else {
-                    self.doc.scroll(rows);
+                    self.scroll_diff(rows);
                 }
                 return None;
             }
@@ -1155,9 +1238,9 @@ impl App {
         // `n` or `N` again before the file they opened is diffed would skip
         // its changes; they wait for it instead.
         if matches!(action, Act::NextChange | Act::PrevChange)
-            && pending.is_some_and(|(at, _)| at == self.doc.pos)
+            && pending.is_some_and(|(at, _)| at == self.doc.document.pos)
         {
-            self.doc.pending_land = pending;
+            self.doc.document.pending_land = pending;
             self.message("waiting for this file's diff");
             return None;
         }
@@ -1314,8 +1397,8 @@ impl App {
             Act::CycleTheme => value(self.theme_name.clone()),
             Act::ToggleStatusBar => value(config::choice_name(&self.status_bar)),
             Act::ToggleWrap => toggle(self.wrap),
-            Act::ToggleSyntax => toggle(self.doc.structural),
-            Act::ToggleRendered => toggle(self.doc.rendered),
+            Act::ToggleSyntax => toggle(self.doc.document.structural),
+            Act::ToggleRendered => toggle(self.doc.document.rendered()),
             Act::ToggleHighlight => toggle(self.highlight),
             Act::ToggleWhitespace => toggle(self.whitespace != Whitespace::Exact),
             Act::ToggleLineNumbers => toggle(self.line_numbers),
@@ -1326,9 +1409,10 @@ impl App {
             Act::ToggleTree => toggle(self.tree_shown),
             Act::ToggleFull => toggle(
                 self.doc
-                    .files
-                    .get(self.doc.pos.file)
-                    .is_some_and(|e| self.doc.is_full(e)),
+                    .document
+                    .files()
+                    .get(self.doc.document.pos.file)
+                    .is_some_and(|e| self.doc.document.is_full(e)),
             ),
             _ => (None, title.to_owned(), None),
         }
@@ -1358,7 +1442,7 @@ impl App {
                 format!("{}: {}", label.to_lowercase(), value.unwrap_or_default())
             }
             Act::ToggleWrap => format!("{label} {}", on(self.wrap)),
-            Act::ToggleSyntax => format!("{label} {}", on(self.doc.structural)),
+            Act::ToggleSyntax => format!("{label} {}", on(self.doc.document.structural)),
             Act::ToggleHighlight => format!("{label} {}", on(self.highlight)),
             Act::ToggleWhitespace => {
                 format!("{label} {}", on(self.whitespace != Whitespace::Exact))
@@ -1379,7 +1463,7 @@ impl App {
     /// included; arrows, `ctrl+n`/`ctrl+p`, the wheel and taps move or pick.
     fn picker_input(&mut self, input: Input) -> Option<Action> {
         let top = self.picker_top();
-        let files = &self.doc.files;
+        let files = self.doc.document.files();
         let picker = self.picker.as_mut()?;
         // The rows on screen are what the keys act on; files that arrived
         // since go in first so a narrowed query sees them.
@@ -1522,7 +1606,7 @@ impl App {
             Act::ToggleTree => self.toggle_tree(),
             Act::OpenPicker => {
                 self.doc.selection = None;
-                self.picker = Some(Picker::new(&self.doc.files));
+                self.picker = Some(Picker::new(self.doc.document.files()));
             }
             Act::FilterTree => {
                 self.focus_tree();
@@ -1538,10 +1622,12 @@ impl App {
                 self.tree.select_parent();
             }
             Act::NextChange | Act::PrevChange => {
-                let before = self.doc.pos.file;
+                let before = self.doc.document.pos.file;
                 self.change(action == Act::NextChange);
                 // On past files the tree's filter hides.
-                if self.doc.pos.file != before && !self.tree.in_scope(self.doc.pos.file) {
+                if self.doc.document.pos.file != before
+                    && !self.tree.in_scope(self.doc.document.pos.file)
+                {
                     self.step_file(action == Act::NextChange);
                 }
             }
@@ -1575,10 +1661,15 @@ impl App {
             Act::Copy if self.doc.selection.is_some() => return self.copy(),
             Act::Copy => self.message("nothing selected; v selects lines"),
             Act::CopyPath => return self.copy_path(),
-            Act::HalfPageDown => self.doc.scroll(half),
-            Act::HalfPageUp => self.doc.scroll(-half),
+            Act::HalfPageDown => self.scroll_diff(half),
+            Act::HalfPageUp => self.scroll_diff(-half),
         }
         None
+    }
+
+    fn scroll_diff(&mut self, rows: isize) {
+        self.doc.scroll(rows);
+        self.scrolled = true;
     }
 
     /// `M`: takes the mouse, or leaves it to the terminal's own selection.
@@ -1619,10 +1710,10 @@ impl App {
             }
             Act::ToggleSyntax => {
                 self.doc.selection = None;
-                self.doc.structural = !self.doc.structural;
-                self.remember("syntax-diff", self.doc.structural.to_string());
+                self.doc.document.structural = !self.doc.document.structural;
+                self.remember("syntax-diff", self.doc.document.structural.to_string());
                 self.doc.normalize();
-                if self.doc.structural && self.doc.is_partial() {
+                if self.doc.document.structural && self.doc.document.is_partial() {
                     self.message(
                         "the syntax diff needs both whole files; a piped diff has only its hunks",
                     );
@@ -1680,7 +1771,7 @@ impl App {
     /// renderer, which turning them on also needs installed; elsewhere a
     /// hint says why not.
     fn toggle_rendered(&mut self) {
-        let on = !self.doc.rendered;
+        let on = !self.doc.document.rendered();
         if let Some(hint) = self.render_hint(on) {
             self.message(hint);
             return;
@@ -1694,11 +1785,11 @@ impl App {
     /// Why `r` does nothing on the file shown, if it doesn't: it has no
     /// renderer, or, with `installed`, its renderer isn't on PATH.
     fn render_hint(&mut self, installed: bool) -> Option<String> {
-        let entry = self.doc.files.get(self.doc.pos.file)?;
-        if matches!(entry.source, Source::Piped(_)) {
+        let entry = self.doc.document.files().get(self.doc.document.pos.file)?;
+        if matches!(entry.source(), Source::Piped(_)) {
             return Some("a piped diff has only its hunks; nothing to render".to_owned());
         }
-        let path = entry.change.path.clone();
+        let path = entry.change().path.clone();
         let Some(name) = self.renderers.for_path(&path).map(str::to_owned) else {
             let what = plugin::extension(&path).map_or_else(
                 || escape(path.rsplit(|&b| b == b'/').next().unwrap_or(&path)),
@@ -1755,6 +1846,7 @@ impl App {
         if width != self.render_width {
             self.render_width = width;
             self.doc.forget_renders(width);
+            self.kept = false;
         }
         let target = self.render_target(width);
         let same = match (&target, &self.render) {
@@ -1775,13 +1867,17 @@ impl App {
     }
 
     fn render_target(&mut self, width: usize) -> Option<RenderTarget> {
-        if !self.doc.rendered {
+        let document = &self.doc.document;
+        let pos = document.pos;
+        if !document.rendered() || !document.missing(pos, pos).any(|m| m == Missing::Render) {
             return None;
         }
-        let file = self.doc.pos.file;
-        let entry = self.doc.files.get(file)?;
-        let name = self.renderers.for_path(&entry.change.path)?.to_owned();
-        let diff = Arc::clone(entry.wants_render()?);
+        let file = pos.file;
+        let name = self
+            .renderers
+            .for_path(&document.files()[file].change().path)?
+            .to_owned();
+        let diff = Arc::clone(document.diff_of(file)?);
         let program = self.program(&name)?;
         Some(RenderTarget {
             file,
@@ -1795,17 +1891,17 @@ impl App {
     /// What the status bar says about the file's rendering, when rendered
     /// views are on and its type has a renderer.
     fn render_note(&self) -> Option<String> {
-        if !self.doc.rendered || self.renderers.is_empty() {
+        if !self.doc.document.rendered() || self.renderers.is_empty() {
             return None;
         }
-        let entry = self.doc.files.get(self.doc.pos.file)?;
-        let name = self.renderers.for_path(&entry.change.path)?;
-        match entry.render.as_deref() {
-            Some(view::Render::Failed(reason)) => Some(format!("lines: {reason}")),
+        let entry = self.doc.document.files().get(self.doc.document.pos.file)?;
+        let name = self.renderers.for_path(&entry.change().path)?;
+        match entry.render() {
+            Some(Render::Failed(reason)) => Some(format!("lines: {reason}")),
             None if self
                 .render
                 .as_ref()
-                .is_some_and(|t| t.file == self.doc.pos.file) =>
+                .is_some_and(|t| t.file == self.doc.document.pos.file) =>
             {
                 Some("rendering…".to_owned())
             }
@@ -1823,15 +1919,15 @@ impl App {
     /// The next file (previous, without `forward`) the tree's filter keeps;
     /// every file without one. Stays put when there's none.
     fn step_file(&mut self, forward: bool) {
-        let start = self.doc.pos;
+        let start = self.doc.document.pos;
         loop {
-            let before = self.doc.pos.file;
+            let before = self.doc.document.pos.file;
             if forward {
                 self.doc.next_file();
             } else {
                 self.doc.prev_file();
             }
-            let now = self.doc.pos.file;
+            let now = self.doc.document.pos.file;
             if now == before {
                 if !self.tree.in_scope(now) {
                     self.doc.goto_file(start.file);
@@ -1879,11 +1975,11 @@ impl App {
             needle: Arc::new(Needle::new("")),
             editing: true,
             id,
-            counts: vec![None; self.doc.files.len()],
+            counts: vec![None; self.doc.document.files().len()],
             pending: None,
         });
         self.live_search.store(id, Ordering::Relaxed);
-        self.doc.search = None;
+        self.doc.document.search = None;
     }
 
     /// Typing into the search: the workers look for the new pattern and
@@ -1913,16 +2009,16 @@ impl App {
         search.needle = Arc::new(Needle::new(&text));
         self.search_id += 1;
         search.id = self.search_id;
-        search.counts = vec![None; self.doc.files.len()];
+        search.counts = vec![None; self.doc.document.files().len()];
         search.pending = None;
         self.live_search.store(search.id, Ordering::Relaxed);
-        self.doc.search = None;
+        self.doc.document.search = None;
     }
 
     fn clear_search(&mut self) {
         self.search = None;
         self.live_search.store(u64::MAX, Ordering::Relaxed);
-        self.doc.search = None;
+        self.doc.document.search = None;
         self.message("search cleared; n/N go between changes again");
     }
 
@@ -1943,8 +2039,12 @@ impl App {
         // A scan stopped for a newer search.
         let Some(matches) = matches else { return };
         self.dirty = true;
-        let current = self.doc.diff_of(file).is_some_and(|d| Arc::ptr_eq(d, diff))
-            && self.doc.hidden_lines(file).as_deref() == Some(hidden);
+        let current = self
+            .doc
+            .document
+            .diff_of(file)
+            .is_some_and(|d| Arc::ptr_eq(d, diff))
+            && self.doc.document.hidden_lines(file).as_deref() == Some(hidden);
         let Some(search) = self.search.as_mut().filter(|_| current) else {
             return;
         };
@@ -1952,7 +2052,7 @@ impl App {
             *count = Some(matches.list.len());
         }
         let land = search.pending.take_if(|(f, _)| *f == file);
-        self.doc.search = Some(Marks {
+        self.doc.document.search = Some(Found {
             file,
             hidden: hidden.to_vec(),
             matches: Arc::new(matches),
@@ -1968,9 +2068,10 @@ impl App {
 
     /// Goes to match `i` of the file shown (its last when past the end).
     fn land_search(&mut self, i: usize) {
-        let file = self.doc.pos.file;
+        let file = self.doc.document.pos.file;
         let Some(marks) = self
             .doc
+            .document
             .search
             .as_mut()
             .filter(|m| m.file == file && !m.matches.list.is_empty())
@@ -1990,30 +2091,32 @@ impl App {
     /// top counts as the next one (`enter` after typing). Before the file's
     /// matches have arrived, it waits for them.
     fn search_step(&mut self, forward: bool, here: bool) {
-        let file = self.doc.pos.file;
+        let file = self.doc.document.pos.file;
         let top = Pos {
-            sub: 0,
-            ..self.doc.pos
+            offset: 0,
+            ..self.doc.document.pos
         };
         let marks = self
             .doc
+            .document
             .search
             .as_ref()
             .filter(|m| m.file == file)
             .map(|m| (Arc::clone(&m.matches), m.current));
         // Its diff is coming, or here to scan; not a commit, a failed diff
         // or a combined diff shown as it came, which have no matches.
-        let scanned = self.doc.diff_of(file).is_some()
+        let scanned = self.doc.document.diff_of(file).is_some()
             || self
                 .doc
-                .files
+                .document
+                .files()
                 .get(file)
                 .is_some_and(view::Entry::wants_diff);
         match marks {
             Some((matches, current)) => {
                 let n = matches.list.len();
                 // The matches are in the order the diff shows them.
-                let mut before = |m: &view::Match, or_at: bool| {
+                let mut before = |m: &Match, or_at: bool| {
                     self.doc
                         .match_pos(file, m)
                         .is_none_or(|p| p < top || (or_at && p == top))
@@ -2087,12 +2190,13 @@ impl App {
         let Some(search) = &self.search else {
             return Vec::new();
         };
-        let shown = self.doc.pos.file;
+        let shown = self.doc.document.pos.file;
         let unscanned = |f: usize, e: &view::Entry| {
-            f == shown && !e.wants_diff() && self.doc.diff_of(f).is_none()
+            f == shown && !e.wants_diff() && self.doc.document.diff_of(f).is_none()
         };
         self.doc
-            .files
+            .document
+            .files()
             .iter()
             .enumerate()
             .map(|(f, e)| {
@@ -2118,6 +2222,7 @@ impl App {
         };
         let at = self
             .doc
+            .document
             .search
             .as_ref()
             .and_then(|m| m.current.map(|i| (m.file, i)));
@@ -2221,7 +2326,7 @@ impl App {
             self.remember("ignore-all-space", all.to_string());
             self.remember("ignore-space-change", "false");
         }
-        self.doc.restale();
+        self.doc.document.restale();
         self.count_pass = true;
         Some(Action::Rediff {
             highlight: self.highlight,
@@ -2233,13 +2338,13 @@ impl App {
     /// diff doesn't have. `x` reveals some in this file for this run; `X`
     /// switches every file and is remembered.
     fn unhide(&mut self, full: bool) {
-        if self.doc.is_partial() || (full && self.piped) {
+        if self.doc.document.is_partial() || (full && self.piped) {
             self.message("a piped diff has only its hunks; the lines between them aren't in it");
         } else if full {
-            let before = self.doc.full;
+            let before = self.doc.document.full;
             self.doc.toggle_full();
-            if self.doc.full != before {
-                let context = if self.doc.full {
+            if self.doc.document.full != before {
+                let context = if self.doc.document.full {
                     "full".to_owned()
                 } else {
                     self.context_lines.to_string()
@@ -2255,11 +2360,11 @@ impl App {
     fn diff_action(&mut self, action: Act) {
         let height = isize::try_from(self.doc.height.max(1)).unwrap_or(isize::MAX);
         match action {
-            Act::ScrollDown => self.doc.scroll(1),
-            Act::ScrollUp => self.doc.scroll(-1),
-            Act::PageDown => self.doc.scroll(height),
-            Act::PageUp => self.doc.scroll(-height),
-            Act::Top => self.doc.top(),
+            Act::ScrollDown => self.scroll_diff(1),
+            Act::ScrollUp => self.scroll_diff(-1),
+            Act::PageDown => self.scroll_diff(height),
+            Act::PageUp => self.scroll_diff(-height),
+            Act::Top => self.doc.document.top(),
             Act::Bottom => self.doc.bottom(),
             // Nothing left to back out of.
             Act::Cancel => {
@@ -2275,7 +2380,7 @@ impl App {
     /// `n` (or `N`, not `next`): the next change, saying so when it's in
     /// another file.
     fn change(&mut self, next: bool) {
-        let from = self.doc.pos.file;
+        let from = self.doc.document.pos.file;
         if next {
             if let Some(file) = self.doc.next_change() {
                 self.note_file("→", "next file", from, file);
@@ -2288,16 +2393,17 @@ impl App {
     /// Says which file `n` or `N` moved to, or which commit when it moved
     /// into another.
     fn note_file(&mut self, arrow: &str, what: &str, from: usize, file: usize) {
-        let commit = self.doc.commit_of(file);
-        if commit != self.doc.commit_of(from)
+        let commit = self.doc.document.commit_of(file);
+        if commit != self.doc.document.commit_of(from)
             && let Some(c) = commit
         {
-            let label = escape(&self.doc.files[self.doc.commits[c]].change.path);
-            let total = self.doc.commits.len();
+            let document = &self.doc.document;
+            let label = escape(&document.files()[document.commits()[c]].change().path);
+            let total = self.doc.document.commits().len();
             self.message(format!("{arrow} commit {}/{total}: {label}", c + 1));
             return;
         }
-        let path = escape(&self.doc.files[file].change.path);
+        let path = escape(&self.doc.document.files()[file].change().path);
         self.message(format!("{arrow} {what}: {path}"));
     }
 
@@ -2376,10 +2482,10 @@ impl App {
 
     /// `Y`: the path of the file shown, as the repository has it.
     fn copy_path(&mut self) -> Option<Action> {
-        let entry = self.doc.files.get(self.doc.pos.file)?;
-        let path = match &entry.source {
+        let entry = self.doc.document.files().get(self.doc.document.pos.file)?;
+        let path = match &entry.source() {
             Source::Commit(commit) => commit.id.as_ref()?.as_bytes().into(),
-            _ => entry.change.path.clone(),
+            _ => entry.change().path.clone(),
         };
         Some(Action::Copy {
             note: format!("copied {}", escape(&path)),
@@ -2417,8 +2523,8 @@ impl App {
             }
             Act::MarkViewed => {
                 if let Some(Item::File(file)) = self.tree.item() {
-                    let entry = &mut self.doc.files[file];
-                    entry.viewed = !entry.viewed;
+                    let viewed = self.doc.document.files()[file].viewed();
+                    self.doc.document.set_viewed(file, !viewed);
                 }
                 None
             }
@@ -2491,7 +2597,7 @@ impl App {
             match &self.switcher {
                 Some((row, [prev, ..])) if *row == y && prev.contains(&x) => self.doc.prev_file(),
                 Some((row, [_, name, _])) if *row == y && name.contains(&x) => {
-                    self.picker = Some(Picker::new(&self.doc.files));
+                    self.picker = Some(Picker::new(self.doc.document.files()));
                 }
                 Some((row, [.., next])) if *row == y && next.contains(&x) => self.doc.next_file(),
                 _ => {}
@@ -2587,12 +2693,12 @@ impl App {
     }
 
     fn edit(&mut self) -> Option<Action> {
-        let entry = self.doc.files.get(self.doc.pos.file)?;
+        let entry = self.doc.document.files().get(self.doc.document.pos.file)?;
         if entry.is_commit() {
             self.message("a commit has no file to open");
             return None;
         }
-        let change = &entry.change;
+        let change = &entry.change();
         if change.new.is_none() {
             self.message("this file is deleted; there's nothing to open");
             return None;
@@ -2606,10 +2712,11 @@ impl App {
     /// matches are in for the lines it shows now.
     fn find_job(&self) -> Option<Job> {
         let search = self.search.as_ref().filter(|s| !s.needle.text.is_empty())?;
-        let file = self.doc.pos.file;
-        let hidden = self.doc.hidden_lines(file)?;
+        let file = self.doc.document.pos.file;
+        let hidden = self.doc.document.hidden_lines(file)?;
         if self
             .doc
+            .document
             .search
             .as_ref()
             .is_some_and(|m| m.file == file && m.hidden == hidden)
@@ -2619,7 +2726,7 @@ impl App {
         Some(Job::Find {
             file,
             version: self.version(file),
-            diff: Arc::clone(self.doc.diff_of(file)?),
+            diff: Arc::clone(self.doc.document.diff_of(file)?),
             hidden,
             needle: Arc::clone(&search.needle),
             id: search.id,
@@ -2633,13 +2740,13 @@ impl App {
     /// screen when that view is on, diffs of nearby files, then the
     /// search's counts of the other files.
     pub(crate) fn jobs(&self) -> Vec<Job> {
-        let files = &self.doc.files;
+        let files = self.doc.document.files();
         let diff = |file: usize| {
             files[file].wants_diff().then(|| Job::Diff {
                 file,
-                version: files[file].version,
-                change: files[file].change.clone(),
-                piped: match &files[file].source {
+                version: files[file].version(),
+                change: files[file].change().clone(),
+                piped: match &files[file].source() {
                     Source::Piped(piped) => Some(Arc::clone(piped)),
                     Source::Repo | Source::Commit(_) => None,
                 },
@@ -2647,37 +2754,42 @@ impl App {
         };
         let mut jobs: Vec<Job> = self.visible.clone().filter_map(diff).collect();
         jobs.extend(self.find_job());
-        jobs.extend(
-            self.doc
-                .missing_emphasis
-                .iter()
-                .filter_map(|&(file, hunk)| match &files[file].state {
-                    State::Loaded(loaded) => Some(Job::Emphasis {
-                        file,
-                        version: files[file].version,
-                        hunk,
-                        diff: Arc::clone(&loaded.diff),
-                        syntax: loaded.syntax.clone(),
-                    }),
-                    _ => None,
+        let mut structural = None;
+        for (file, missing) in self.doc.missing() {
+            let Some(loaded) = files.get(file).and_then(|e| e.file()) else {
+                continue;
+            };
+            let version = files[file].version();
+            let diff = Arc::clone(loaded.diff());
+            match missing {
+                Missing::Emphasis(hunk) => jobs.push(Job::Emphasis {
+                    file,
+                    version,
+                    hunk,
+                    diff,
+                    syntax: loaded.syntax().cloned(),
                 }),
-        );
-        jobs.extend(
-            self.doc
-                .missing_gap_syntax
-                .iter()
-                .filter_map(|&(file, gap)| match &files[file].state {
-                    State::Loaded(loaded) => Some(Job::GapSyntax {
+                Missing::GapSyntax(gap) => {
+                    jobs.extend(loaded.syntax().map(|syntax| Job::GapSyntax {
                         file,
-                        version: files[file].version,
+                        version,
                         gap,
                         lines: loaded.gap_lines(gap),
-                        diff: Arc::clone(&loaded.diff),
-                        syntax: loaded.syntax.clone()?,
-                    }),
-                    _ => None,
-                }),
-        );
+                        diff,
+                        syntax: Arc::clone(syntax),
+                    }));
+                }
+                Missing::Structural => {
+                    structural = Some(Job::Structural {
+                        file,
+                        version,
+                        diff,
+                    });
+                }
+                // The render target, settled before the frame, asks for it.
+                Missing::Render => {}
+            }
+        }
         jobs.extend(self.render.as_ref().map(|target| {
             Job::Render(RenderJob {
                 file: target.file,
@@ -2690,22 +2802,7 @@ impl App {
                 live: Arc::clone(&self.live_render),
             })
         }));
-        if self.doc.structural {
-            jobs.extend(
-                self.visible
-                    .clone()
-                    .filter_map(|file| match &files.get(file)?.state {
-                        State::Loaded(loaded) if loaded.wants_structural() => {
-                            Some(Job::Structural {
-                                file,
-                                version: files[file].version,
-                                diff: Arc::clone(&loaded.diff),
-                            })
-                        }
-                        _ => None,
-                    }),
-            );
-        }
+        jobs.extend(structural);
         let ahead = self.visible.end..(self.visible.end + PREFETCH_AHEAD).min(files.len());
         let behind = self.visible.start.saturating_sub(PREFETCH_BEHIND)..self.visible.start;
         jobs.extend(ahead.chain(behind).filter_map(diff));
@@ -2719,18 +2816,18 @@ impl App {
         let Some(search) = self.search.as_ref().filter(|s| !s.needle.text.is_empty()) else {
             return Vec::new();
         };
-        let files = &self.doc.files;
+        let files = self.doc.document.files();
         let n = files.len();
-        let start = self.doc.pos.file;
+        let start = self.doc.document.pos.file;
         (1..n)
             .map(|k| (start + k) % n)
             .filter(|&f| !files[f].is_commit() && search.counts.get(f).is_none_or(Option::is_none))
             .take(SEARCH_AHEAD)
             .map(|file| Job::Search {
                 file,
-                version: files[file].version,
-                change: files[file].change.clone(),
-                piped: match &files[file].source {
+                version: files[file].version(),
+                change: files[file].change().clone(),
+                piped: match &files[file].source() {
                     Source::Piped(piped) => Some(Arc::clone(piped)),
                     Source::Repo | Source::Commit(_) => None,
                 },
@@ -2781,18 +2878,24 @@ impl App {
         let note = note(self);
         let doc = &self.doc;
         let extra = doc
-            .files
-            .get(doc.pos.file)
-            .and_then(|e| match &e.state {
-                State::Loaded(l) if l.diff.note.is_some() => l.diff.note.clone(),
-                State::Loaded(l) if doc.structural => l.structural_note().map(str::to_owned),
+            .document
+            .files()
+            .get(doc.document.pos.file)
+            .and_then(|e| match &e.state() {
+                State::Loaded(l) if l.diff().note.is_some() => l.diff().note.clone(),
+                State::Loaded(l) if doc.document.structural => {
+                    l.structural_note().map(str::to_owned)
+                }
                 _ => None,
             })
             .or_else(|| self.render_note());
         let status = chrome::Status {
             chip: chip(self),
             position: position(self).filter(|_| !narrow),
-            hunk: doc.hunk_position().map(|(i, n)| format!("{i}/{n} hunk")),
+            hunk: doc
+                .document
+                .hunk_position()
+                .map(|(i, n)| format!("{i}/{n} hunk")),
             middle: note.clone().or_else(|| Some(modes(self))),
             note: note.is_some(),
             search: [
@@ -2833,8 +2936,8 @@ impl App {
         let tree_columns = self.tree_columns();
         let framed = self.framed();
         let search_line = self.search.as_ref().filter(|s| s.editing).map(|s| {
-            let file = self.doc.pos.file;
-            let here = match &self.doc.search {
+            let file = self.doc.document.pos.file;
+            let here = match &self.doc.document.search {
                 Some(m) if m.file == file => m.matches.list.len().to_string(),
                 _ if s.needle.text.is_empty() => "0".to_owned(),
                 _ => "…".to_owned(),
@@ -2846,19 +2949,28 @@ impl App {
         });
         let entries = self.commands.as_ref().map(|_| self.command_entries());
         let chrome = self.chrome();
-        let empty = self.doc.files.is_empty().then(|| self.empty_note());
+        let empty = self
+            .doc
+            .document
+            .files()
+            .is_empty()
+            .then(|| self.empty_note());
         let overlays = self.picker.is_some() || self.help.is_some() || self.commands.is_some();
         let (tree_top, tree_rows) = self.tree_rows();
         let picker_top = self.picker_top();
-        let grid = self.screen.frame();
+        let (grid, last) = self.screen.frame();
         chrome.outline(grid, &self.theme);
-        self.visible = self.doc.draw(grid, x, width, 1, &self.theme, self.frame);
+        let last = std::mem::take(&mut self.kept).then_some(last);
+        let (visible, scrolled) = self
+            .doc
+            .draw(grid, last, (x, width, 1), &self.theme, self.frame);
+        self.visible = visible;
         // The picker covers the tree, and refreshing it costs a pass over
         // every file while the picker reads a long input.
         if let Some(columns) = tree_columns.filter(|_| self.picker.is_none()) {
-            let files = &self.doc.files;
+            let files = self.doc.document.files();
             if self.pane == Pane::Diff && !files.is_empty() {
-                self.tree.follow(self.doc.pos.file);
+                self.tree.follow(self.doc.document.pos.file);
             }
             let totals = Totals::of(files, self.enumerating);
             if chrome.overlay {
@@ -2900,7 +3012,7 @@ impl App {
         if let Some(picker) = &mut self.picker {
             let progress = if !self.enumerating {
                 picker::Progress::Done
-            } else if self.doc.files.len() >= piped::MAX_ENTRIES {
+            } else if self.doc.document.files().len() >= piped::MAX_ENTRIES {
                 picker::Progress::Capped
             } else {
                 picker::Progress::Reading
@@ -2913,7 +3025,17 @@ impl App {
         if let Some(help) = &mut self.help {
             help.draw(grid, &self.theme, &self.keys);
         }
-        Some(self.screen.flush())
+        self.kept = !overlays && !chrome.overlay;
+        // The terminal scrolls whole rows, so the cell diff sends the tree's
+        // columns again on every row it scrolled: worth it while they're
+        // fewer than the diff's cells that moved. Tree cells count a third
+        // more, the ratio at which a full tree beside short code lines
+        // never costs more than the plain diff; a mostly blank tree would
+        // gain on larger scrolls too, which counting the cells that differ
+        // would catch.
+        Some(self.screen.flush(scrolled.filter(|(rows, by)| {
+            3 * (width - x) * (rows.len() - by.unsigned_abs()) > 4 * x * rows.len()
+        })))
     }
 }
 
@@ -2971,14 +3093,19 @@ fn draw_picker(
 ) {
     let (width, height) = (grid.width(), grid.height());
     let rows_shown = height.saturating_sub(1);
-    picker.catch_up(&doc.files);
-    let rows = picker.rows(&doc.files, &doc.commits, (width, rows_shown), progress);
+    picker.catch_up(doc.document.files());
+    let rows = picker.rows(
+        doc.document.files(),
+        doc.document.commits(),
+        (width, rows_shown),
+        progress,
+    );
     for y in top..top + rows_shown {
         grid.fill(0, y, width, Style::PLAIN);
     }
     for (i, (row, selected)) in rows.iter().enumerate() {
         if let Some(cells) = row.rows().next() {
-            view::paint(grid, 0, top + i, width, cells, theme, 0);
+            view::paint(grid, 0, top + i, width, cells, theme, Attributes::NONE);
         }
         if *selected {
             grid.map_styles(0, top + i, width, |s| theme.selected(s, true));
@@ -2991,17 +3118,26 @@ fn modes(app: &App) -> String {
     let doc = &app.doc;
     let mut modes = String::new();
     modes.push_str(if doc.layout.split { "split" } else { "unified" });
-    if doc.structural {
+    if doc.document.structural {
         modes.push_str(" syntax");
     }
     // Only on files it applies to: elsewhere it would be noise.
-    let renders = doc.files.get(doc.pos.file).is_some_and(|e| {
-        matches!(e.source, Source::Repo) && app.renderers.for_path(&e.change.path).is_some()
-    });
-    if doc.rendered && renders {
+    let renders = doc
+        .document
+        .files()
+        .get(doc.document.pos.file)
+        .is_some_and(|e| {
+            matches!(e.source(), Source::Repo) && app.renderers.for_path(&e.change().path).is_some()
+        });
+    if doc.document.rendered() && renders {
         modes.push_str(" rendered");
     }
-    if doc.files.get(doc.pos.file).is_some_and(|e| doc.is_full(e)) {
+    if doc
+        .document
+        .files()
+        .get(doc.document.pos.file)
+        .is_some_and(|e| doc.document.is_full(e))
+    {
         modes.push_str(" full");
     }
     if app.wrap {
@@ -3029,9 +3165,9 @@ fn modes(app: &App) -> String {
 fn chip(app: &App) -> String {
     let doc = &app.doc;
     let growing = if app.enumerating { "+" } else { "" };
-    match doc.commit_of(doc.pos.file) {
-        Some(c) if doc.commits.len() > 1 || app.piped => {
-            format!("commit {}/{}{growing}", c + 1, doc.commits.len())
+    match doc.document.commit_of(doc.document.pos.file) {
+        Some(c) if doc.document.commits().len() > 1 || app.piped => {
+            format!("commit {}/{}{growing}", c + 1, doc.document.commits().len())
         }
         _ => app.description.clone(),
     }
@@ -3041,18 +3177,18 @@ fn chip(app: &App) -> String {
 /// commit itself, how many it has). A `+` marks counts still growing.
 fn position(app: &App) -> Option<String> {
     let doc = &app.doc;
-    if doc.files.is_empty() {
+    if doc.document.files().is_empty() {
         return None;
     }
     let growing = if app.enumerating { "+" } else { "" };
-    let file = doc.pos.file;
-    let Some(c) = doc.commit_of(file) else {
-        let total = doc.files.len();
+    let file = doc.document.pos.file;
+    let Some(c) = doc.document.commit_of(file) else {
+        let total = doc.document.files().len();
         return Some(format!("{}/{total}{growing}", (file + 1).min(total)));
     };
-    let entry = doc.commits[c];
-    let files = doc.commit_files(entry).len();
-    let last = if c + 1 == doc.commits.len() {
+    let entry = doc.document.commits()[c];
+    let files = doc.document.commit_files(entry).len();
+    let last = if c + 1 == doc.document.commits().len() {
         growing
     } else {
         ""
@@ -3070,14 +3206,14 @@ fn position(app: &App) -> Option<String> {
 fn switcher_position(app: &App) -> String {
     let doc = &app.doc;
     let growing = if app.enumerating { "+" } else { "" };
-    let file = doc.pos.file;
-    match doc.commit_of(file) {
-        Some(c) if doc.commits[c] == file => {
-            format!("{}/{}{growing}", c + 1, doc.commits.len())
+    let file = doc.document.pos.file;
+    match doc.document.commit_of(file) {
+        Some(c) if doc.document.commits()[c] == file => {
+            format!("{}/{}{growing}", c + 1, doc.document.commits().len())
         }
         Some(_) => position(app).unwrap_or_default(),
         None => {
-            let total = doc.files.len();
+            let total = doc.document.files().len();
             format!("{}/{total}{growing}", (file + 1).min(total))
         }
     }
@@ -3088,15 +3224,17 @@ fn switcher_position(app: &App) -> String {
 /// switcher.
 fn heading(app: &App) -> Option<Heading> {
     let doc = &app.doc;
-    let entry = doc.files.get(doc.pos.file)?;
+    let entry = doc.document.files().get(doc.document.pos.file)?;
     let commit = entry.is_commit();
-    let counts = entry.counts.filter(|_| !commit);
+    let counts = entry.counts().filter(|_| !commit);
     let staging = entry
-        .change
+        .change()
         .staging
-        .filter(|_| !commit && entry.change.status != Status::Untracked)
+        .filter(|_| {
+            !commit && !matches!(entry.change().status, Status::Untracked | Status::Unmerged)
+        })
         .map(crate::render::stat::staging_word);
-    let path = escape(&entry.change.path);
+    let path = escape(&entry.change().path);
     let (dir, name) = match path.rfind('/') {
         Some(i) => (path[..=i].to_owned(), path[i + 1..].to_owned()),
         None => (String::new(), path.clone()),
@@ -3110,7 +3248,7 @@ fn heading(app: &App) -> Option<Heading> {
         }));
     }
     let dim = |text: &str| (text.to_owned(), Role::Dim);
-    if let Source::Commit(c) = &entry.source {
+    if let Source::Commit(c) = &entry.source() {
         let (head, subject) = match &c.id {
             Some(id) => (
                 vec![
@@ -3134,7 +3272,7 @@ fn heading(app: &App) -> Option<Heading> {
         head.push((format!(" · {staging}"), Role::Plain));
     }
     head.push(dim(" · "));
-    let flex = match &entry.change.status {
+    let flex = match &entry.change().status {
         Status::Renamed { from, .. } => format!("{} → {dir}", escape(from)),
         _ => dir,
     };
@@ -3213,10 +3351,15 @@ mod tests {
     use std::ops::ControlFlow;
 
     use dffy_core::diff::{Options, Text, Whitespace, hunks};
+    use dffy_core::document::{self, Counts};
     use dffy_core::git::{ChangeSet, FileDiff, Mode, Repo, Side};
 
     use super::*;
-    use crate::tui::view::Loaded;
+
+    /// `fd` prepared as a worker does without highlighting.
+    fn loaded(fd: FileDiff) -> File {
+        File::prepare(crate::grammars(), None).file(fd, Whitespace::Exact, false)
+    }
 
     fn diff(path: &str) -> FileDiff {
         let side = Some(Side::Worktree {
@@ -3267,7 +3410,7 @@ mod tests {
         );
         app.event(Event::Enumerated(diff("src/zz.rs").change));
         app.event(Event::EnumerationDone(None));
-        let loaded = Loaded::new(first, Whitespace::Exact, false);
+        let loaded = loaded(first);
         app.event(Event::Diffed(Done::Diff {
             file: 0,
             version: app.version(0),
@@ -3312,6 +3455,52 @@ mod tests {
         }
     }
 
+    /// Each language in the list goes to the pool to compile ahead once, as
+    /// its first file is listed. With highlighting off none do, until it's
+    /// turned on.
+    #[test]
+    fn each_listed_language_is_compiled_ahead_once() {
+        let names = |languages: Vec<Language>| -> Vec<String> {
+            languages.iter().map(|l| l.name().to_owned()).collect()
+        };
+        let viewer = |config: &Config, first: Option<FileChange>| {
+            App::new(
+                config,
+                Theme::default_theme(),
+                "working tree".to_owned(),
+                first,
+                (100, 20),
+                Indicators::Classic,
+            )
+        };
+        let mut app = viewer(&Config::default(), Some(diff("src/main.rs").change));
+        for path in [
+            "src/lib.rs",
+            "App.swift",
+            "README",
+            "Cargo.lock",
+            "Sources/B.swift",
+        ] {
+            app.event(Event::Enumerated(diff(path).change));
+        }
+        assert_eq!(names(app.take_languages()), ["rust", "swift", "toml"]);
+        app.event(Event::Enumerated(diff("src/c.rs").change));
+        app.event(Event::Enumerated(diff("b.kt").change));
+        app.event(Event::EnumerationDone(None));
+        assert_eq!(names(app.take_languages()), ["kotlin"]);
+        assert_eq!(names(app.take_languages()), [""; 0]);
+
+        let off = Config {
+            highlight: false,
+            ..Config::default()
+        };
+        let mut app = viewer(&off, None);
+        app.event(Event::Enumerated(diff("src/lib.rs").change));
+        assert_eq!(names(app.take_languages()), [""; 0]);
+        app.rediff(Act::ToggleHighlight);
+        assert_eq!(names(app.take_languages()), ["rust"]);
+    }
+
     /// The file is diffed again while emphasis for the diff still shown is
     /// being computed, and the new diff lands first: that emphasis was
     /// computed for the old hunk and must not be drawn with the new one.
@@ -3340,7 +3529,7 @@ mod tests {
         app.event(Event::Diffed(Done::Diff {
             file,
             version,
-            result: Ok(Box::new(Loaded::new(added(60), Whitespace::Exact, false))),
+            result: Ok(Box::new(loaded(added(60)))),
         }));
         assert!(screen(&mut app).contains("line 60"));
         app.event(Event::Diffed(Done::Emphasis {
@@ -3352,7 +3541,7 @@ mod tests {
             diff,
         }));
         assert!(app.draw().is_some());
-        let current = app.doc.diff_of(file).map(Arc::clone);
+        let current = app.doc.document.diff_of(file).map(Arc::clone);
         assert!(app.jobs().iter().any(|j| matches!(
             j,
             Job::Emphasis { diff, .. } if current.as_ref().is_some_and(|c| Arc::ptr_eq(c, diff))
@@ -3407,12 +3596,12 @@ mod tests {
         .expect("enumerate");
         app.event(Event::EnumerationDone(None));
         let diffed = |app: &App, file: usize| {
-            let change = app.doc.files[file].change.clone();
+            let change = app.doc.document.files()[file].change().clone();
             let fd = repo.file_diff(change, &Options::default()).expect("diff");
             Done::Diff {
                 file,
                 version: app.version(file),
-                result: Ok(Box::new(Loaded::new(fd, Whitespace::Exact, false))),
+                result: Ok(Box::new(loaded(fd))),
             }
         };
         for file in [0, 1] {
@@ -3420,7 +3609,12 @@ mod tests {
             app.event(Event::Diffed(done));
         }
         key(&mut app, 'f');
-        assert_eq!(app.doc.files[app.doc.pos.file].change.path, "b.txt");
+        assert_eq!(
+            app.doc.document.files()[app.doc.document.pos.file]
+                .change()
+                .path,
+            "b.txt"
+        );
         app.draw();
         let emphasis = app
             .jobs()
@@ -3460,7 +3654,7 @@ mod tests {
             "b.txt's emphasis was kept"
         );
         assert!(
-            app.doc.files[0].wants_diff(),
+            app.doc.document.files()[0].wants_diff(),
             "a.txt's diff from before the write isn't taken"
         );
     }
@@ -4138,7 +4332,7 @@ mod tests {
             app.event(Event::Diffed(Done::Diff {
                 file: i,
                 version,
-                result: Ok(Box::new(Loaded::new(fd, Whitespace::Exact, false))),
+                result: Ok(Box::new(loaded(fd))),
             }));
         }
         app
@@ -4161,7 +4355,7 @@ mod tests {
                     file,
                     version,
                     id,
-                    matches: view::find(&diff, Some(&hidden), &needle, || false),
+                    matches: document::find(&diff, Some(&hidden), &needle, || false),
                     diff,
                     hidden,
                 },
@@ -4199,10 +4393,18 @@ mod tests {
         for c in "/needle".chars() {
             key(&mut app, c);
         }
-        assert!(app.doc.search.is_none(), "typing waits for no scan");
+        assert!(
+            app.doc.document.search.is_none(),
+            "typing waits for no scan"
+        );
         assert!(screen(&mut app).contains("… in this file"));
         work(&mut app);
-        let marks = app.doc.search.as_ref().map(|m| m.matches.list.len());
+        let marks = app
+            .doc
+            .document
+            .search
+            .as_ref()
+            .map(|m| m.matches.list.len());
         assert_eq!(marks, Some(2), "marked once found");
         app.draw();
         let lit = app.theme.style(Role::SearchMatch);
@@ -4227,12 +4429,12 @@ mod tests {
         // On into src/b.rs, where smart case still finds `Needle`, once
         // its matches arrive.
         key(&mut app, 'n');
-        assert_eq!(app.doc.pos.file, 1);
+        assert_eq!(app.doc.document.pos.file, 1);
         work(&mut app);
         let shown = status(&mut app);
         assert!(shown.contains("match 3/3"), "{shown}");
         key(&mut app, 'N');
-        assert_eq!(app.doc.pos.file, 0);
+        assert_eq!(app.doc.document.pos.file, 0);
         esc(&mut app);
         assert!(app.search.is_none());
         key(&mut app, 'g');
@@ -4295,23 +4497,24 @@ mod tests {
             app.event(Event::Diffed(Done::Diff {
                 file,
                 version,
-                result: Ok(Box::new(Loaded::new(fd, Whitespace::Exact, false))),
+                result: Ok(Box::new(loaded(fd))),
             }));
         }
         app.draw();
         typed(&mut app, "/needle");
         let stale_jobs = app.jobs();
         work(&mut app);
-        assert_eq!(app.doc.search.as_ref().map(|m| m.file), Some(0));
+        assert_eq!(app.doc.document.search.as_ref().map(|m| m.file), Some(0));
 
         app.event(Event::EnumerationDone(None));
-        assert_eq!(app.doc.files[0].change.path, "src/a.rs");
-        assert_eq!(app.doc.pos.file, 1, "still on src/z.rs");
+        assert_eq!(app.doc.document.files()[0].change().path, "src/a.rs");
+        assert_eq!(app.doc.document.pos.file, 1, "still on src/z.rs");
         let marked = app
             .doc
+            .document
             .search
             .as_ref()
-            .map(|m| &app.doc.files[m.file].change.path);
+            .map(|m| &app.doc.document.files()[m.file].change().path);
         assert!(marked.is_none_or(|path| path == "src/z.rs"), "{marked:?}");
         // A scan started before the sort reports by the old positions.
         for job in stale_jobs {
@@ -4329,7 +4532,7 @@ mod tests {
                     file,
                     version,
                     id,
-                    matches: view::find(&diff, Some(&hidden), &needle, || false),
+                    matches: document::find(&diff, Some(&hidden), &needle, || false),
                     diff,
                     hidden,
                 }));
@@ -4338,6 +4541,7 @@ mod tests {
         work(&mut app);
         let marks = app
             .doc
+            .document
             .search
             .as_ref()
             .map(|m| (m.file, m.matches.list.len()));
@@ -4366,15 +4570,18 @@ mod tests {
         }));
         key(&mut app, 'f');
         key(&mut app, 'f');
-        assert_eq!(app.doc.pos.file, 2);
+        assert_eq!(app.doc.document.pos.file, 2);
         typed(&mut app, "/needle");
         app.event(Event::Input(Input::Key(Key::Enter, Mods::NONE)));
         work(&mut app);
         assert!(!status(&mut app).contains("searching this file"));
         key(&mut app, 'N');
         work(&mut app);
-        assert_eq!(app.doc.pos.file, 1, "back to src/b.rs and its match");
-        let current = app.doc.search.as_ref().and_then(|m| m.current);
+        assert_eq!(
+            app.doc.document.pos.file, 1,
+            "back to src/b.rs and its match"
+        );
+        let current = app.doc.document.search.as_ref().and_then(|m| m.current);
         assert_eq!(current, Some(0), "{}", status(&mut app));
     }
 
@@ -4399,15 +4606,8 @@ mod tests {
         let stale = || live.load(Ordering::Relaxed) != id;
         assert!(stale());
         let needle = Needle::new("ne");
-        assert_eq!(view::find(&diff, Some(&hidden), &needle, stale), None);
-        assert!(view::find(&diff, Some(&hidden), &needle, || false).is_some());
-    }
-
-    /// A capital letter makes the search match case.
-    #[test]
-    fn smart_case() {
-        assert_eq!(Needle::new("needle").find_all(b"Needle needle").len(), 2);
-        assert_eq!(Needle::new("Needle").find_all(b"Needle needle").len(), 1);
+        assert_eq!(document::find(&diff, Some(&hidden), &needle, stale), None);
+        assert!(document::find(&diff, Some(&hidden), &needle, || false).is_some());
     }
 
     /// `/` in the tree filters it fuzzily: matching files with their
@@ -4432,9 +4632,12 @@ mod tests {
             "{shown}"
         );
         app.event(Event::Input(Input::Key(Key::Tab, Mods::NONE)));
-        let at = app.doc.pos.file;
+        let at = app.doc.document.pos.file;
         key(&mut app, 'f');
-        assert_eq!(app.doc.pos.file, at, "no other file passes the filter");
+        assert_eq!(
+            app.doc.document.pos.file, at,
+            "no other file passes the filter"
+        );
         app.event(Event::Input(Input::Key(Key::Tab, Mods::NONE)));
         esc(&mut app);
         let shown = screen(&mut app);
@@ -4542,7 +4745,7 @@ mod tests {
         );
         assert_ne!(app.version(0), version, "work asked for before is void");
         assert!(
-            app.doc.files[0].wants_diff(),
+            app.doc.document.files()[0].wants_diff(),
             "the shown file is diffed again"
         );
         let done = app.event(Event::Input(Input::Key(Key::Char('W'), Mods::NONE)));
@@ -4563,7 +4766,13 @@ mod tests {
         let mut app = app(120, 18);
         app.set_context_lines(5);
         key(&mut app, 'X');
-        assert!(app.doc.files.iter().all(|e| app.doc.is_full(e)));
+        assert!(
+            app.doc
+                .document
+                .files()
+                .iter()
+                .all(|e| app.doc.document.is_full(e))
+        );
         assert_eq!(app.take_remembered(true), [("context", "full".to_owned())]);
         key(&mut app, 'X');
         assert_eq!(app.take_remembered(true), [("context", "5".to_owned())]);
@@ -4684,7 +4893,7 @@ mod tests {
         app.event(Event::Diffed(Done::Diff {
             file: 0,
             version: app.version(0),
-            result: Ok(Box::new(Loaded::new(first, Whitespace::Exact, false))),
+            result: Ok(Box::new(loaded(first))),
         }));
         // Split, a row shows its line on both halves; unified, once.
         let halves = |app: &mut App| {
@@ -4826,18 +5035,24 @@ mod tests {
         for _ in 0..3 {
             key(&mut app, 'n');
         }
-        assert_eq!((app.doc.pos.file, app.doc.pos.part), (1, 0));
+        assert_eq!(
+            (app.doc.document.pos.file, app.doc.document.pos.part),
+            (1, 0)
+        );
         key(&mut app, 'n');
-        assert_eq!((app.doc.pos.file, app.doc.pos.part), (1, 0));
+        assert_eq!(
+            (app.doc.document.pos.file, app.doc.document.pos.part),
+            (1, 0)
+        );
         assert!(screen(&mut app).contains("waiting for this file's diff"));
-        let loaded = Loaded::new(diff("src/zz.rs"), Whitespace::Exact, false);
+        let loaded = loaded(diff("src/zz.rs"));
         app.event(Event::Diffed(Done::Diff {
             file: 1,
             version: app.version(1),
             result: Ok(Box::new(loaded)),
         }));
-        assert_eq!(app.doc.pos.file, 1);
-        assert!(app.doc.pos.part > 0, "{:?}", app.doc.pos);
+        assert_eq!(app.doc.document.pos.file, 1);
+        assert!(app.doc.document.pos.part > 0, "{:?}", app.doc.document.pos);
         let shown = screen(&mut app);
         let top = shown.lines().nth(1).unwrap_or_default();
         assert!(top.contains("@@ -1,7"), "{shown}");
@@ -4881,7 +5096,7 @@ mod tests {
                 app.event(Event::Diffed(Done::Diff {
                     file: 1,
                     version: app.version(1),
-                    result: Ok(Box::new(Loaded::new(late(), Whitespace::Exact, false))),
+                    result: Ok(Box::new(loaded(late()))),
                 }));
             };
             if diff_first {
@@ -4923,7 +5138,7 @@ mod tests {
         app.event(Event::Enumerated(diff("b.rs").change));
         app.event(Event::EnumerationDone(None));
         key(&mut app, 'n');
-        assert_eq!(app.doc.pos.file, 1, "n moves to the next file now");
+        assert_eq!(app.doc.document.pos.file, 1, "n moves to the next file now");
         assert_eq!(
             app.event(Event::Input(Input::Key(Key::Char('q'), Mods::NONE))),
             None
@@ -4974,7 +5189,7 @@ mod tests {
         let counts = files
             .iter()
             .enumerate()
-            .map(|(i, &(_, added, removed))| (i, app.version(i), view::Counts { added, removed }))
+            .map(|(i, &(_, added, removed))| (i, app.version(i), Counts { added, removed }))
             .collect();
         app.event(Event::Diffed(Done::Counts { counts }));
         if width < SIDE_TREE_WIDTH {
@@ -5094,11 +5309,11 @@ mod tests {
                 piped: Some(piped),
             } = job
             {
-                let (fd, headings) = piped.diff(change).expect("in memory");
+                let loaded = piped::read(&piped, change).expect("in memory");
                 app.event(Event::Diffed(Done::Diff {
                     file,
                     version,
-                    result: Ok(Box::new(Loaded::piped(fd, headings))),
+                    result: Ok(Box::new(loaded)),
                 }));
             }
         }
@@ -5161,11 +5376,16 @@ mod tests {
             (100, 20),
             Indicators::Classic,
         );
-        app.event(Event::Piped(piped::Item::Commit(Arc::new(piped::Commit {
-            id: Some("0123abc".repeat(5) + "01234"),
-            subject: "Change two files".to_owned(),
-            lines: vec![(Role::Plain, "    Change two files".into())],
-        }))));
+        app.event(Event::Piped(piped::Item::Commit(Arc::new(
+            dffy_core::patch::Commit {
+                id: Some("0123abc".repeat(5) + "01234"),
+                subject: "Change two files".to_owned(),
+                lines: vec![(
+                    dffy_core::patch::TextKind::CommitMessage,
+                    "    Change two files".into(),
+                )],
+            },
+        ))));
         for path in ["a.rs", "b.rs"] {
             app.event(Event::Enumerated(diff(path).change));
         }
@@ -5175,7 +5395,7 @@ mod tests {
             assert!(shown.contains(summary), "{shown}");
         };
         shows(&mut app, "2 files …");
-        let count = |added, removed| view::Counts { added, removed };
+        let count = |added, removed| Counts { added, removed };
         app.event(Event::Diffed(Done::Counts {
             counts: vec![(1, app.version(1), count(3, 1))],
         }));
@@ -5262,10 +5482,57 @@ mod tests {
         let counts = FILES
             .iter()
             .enumerate()
-            .map(|(i, &(_, added, removed))| (i, app.version(i), view::Counts { added, removed }))
+            .map(|(i, &(_, added, removed))| (i, app.version(i), Counts { added, removed }))
             .collect();
         app.event(Event::Diffed(Done::Counts { counts }));
         app
+    }
+
+    /// The count pass starts with the files on the tree's screen, then a
+    /// screen's worth below and above them, and starts again with what's on
+    /// screen when the tree scrolls to files not counted yet.
+    #[test]
+    fn the_count_pass_starts_where_the_tree_shows() {
+        let mut app = App::new(
+            &Config::default(),
+            Theme::default_theme(),
+            "range".to_owned(),
+            None,
+            (200, 12),
+            Indicators::Classic,
+        );
+        for i in 0..80 {
+            app.event(Event::Enumerated(diff(&format!("f{i:02}")).change));
+        }
+        app.event(Event::EnumerationDone(None));
+        screen(&mut app);
+        app.tree.scroll_by(20);
+        screen(&mut app);
+        let shown: Vec<usize> = app.tree.files_on_screen().collect();
+        let (top, height) = (shown[0], shown.len());
+        let pass = |app: &mut App| -> Option<Vec<usize>> {
+            Some(app.take_count_pass()?.iter().map(|f| f.0).collect())
+        };
+        let first = pass(&mut app).expect("a pass once the list is complete");
+        let near: Vec<usize> = (top..top + 2 * height).chain(top - height..top).collect();
+        assert_eq!(first[..near.len()], near[..]);
+        assert_eq!(first.len(), 80);
+        assert_eq!(pass(&mut app), None, "started again unasked");
+
+        let counts = near
+            .iter()
+            .map(|&f| (f, app.version(f), Counts::default()))
+            .collect();
+        app.event(Event::Diffed(Done::Counts { counts }));
+        app.tree.scroll_by(height.cast_signed());
+        screen(&mut app);
+        assert_eq!(pass(&mut app), None, "scrolled to files already counted");
+        app.tree.scroll_by((2 * height).cast_signed());
+        screen(&mut app);
+        let shown: Vec<usize> = app.tree.files_on_screen().collect();
+        let again = pass(&mut app).expect("scrolled to files not counted");
+        assert_eq!(again[..shown.len()], shown[..]);
+        assert_eq!(again.len(), 80 - near.len());
     }
 
     fn typed(app: &mut App, text: &str) {
@@ -5280,8 +5547,8 @@ mod tests {
         let picker = app.picker.as_mut().expect("the picker is open");
         picker
             .rows(
-                &app.doc.files,
-                &app.doc.commits,
+                app.doc.document.files(),
+                app.doc.document.commits(),
                 (width, height - 1),
                 picker::Progress::Done,
             )
@@ -5325,13 +5592,13 @@ mod tests {
         app.event(Event::Input(Input::Key(Key::Backspace, Mods::NONE)));
         app.event(Event::Input(Input::Key(Key::Enter, Mods::NONE)));
         assert!(app.picker.is_none());
-        assert_eq!(app.doc.pos.file, 3, "kernel/sched/fair.c");
+        assert_eq!(app.doc.document.pos.file, 3, "kernel/sched/fair.c");
         // A tap on a row opens that file.
         key(&mut app, 'o');
         app.draw();
         app.event(Event::Input(Input::Click { x: 10, y: 1 }));
         assert!(app.picker.is_none());
-        assert_eq!(app.doc.pos.file, 0);
+        assert_eq!(app.doc.document.pos.file, 0);
     }
 
     /// Under 100 columns the title is `‹ i/N name ›`: taps on the arrows
@@ -5354,13 +5621,13 @@ mod tests {
         // Both cells beside an arrow are its padding: still the arrow.
         let [_, _, next] = hits(&app);
         tap(&mut app, next.start);
-        assert_eq!(app.doc.pos.file, 1);
+        assert_eq!(app.doc.document.pos.file, 1);
         let [_, _, next] = hits(&app);
         tap(&mut app, next.end - 1);
-        assert_eq!(app.doc.pos.file, 2);
+        assert_eq!(app.doc.document.pos.file, 2);
         let [prev, _, _] = hits(&app);
         tap(&mut app, prev.start);
-        assert_eq!(app.doc.pos.file, 1);
+        assert_eq!(app.doc.document.pos.file, 1);
         insta::assert_snapshot!(title(&mut app), @" ‹ 2/4 kernel-parameters.txt › +1234 -56");
         let [_, name, next] = hits(&app);
         tap(&mut app, next.end);
@@ -5388,14 +5655,14 @@ mod tests {
         );
         // The panel shows 3 rows of 7; the wheel scrolls it alone, 3 rows
         // a notch.
-        let pos = app.doc.pos;
+        let pos = app.doc.document.pos;
         app.event(Event::Input(Input::Scroll {
             delta: 1,
             x: 10,
             y: 3,
         }));
         let scrolled = screen(&mut app);
-        assert_eq!(app.doc.pos, pos);
+        assert_eq!(app.doc.document.pos, pos);
         assert!(
             scrolled
                 .lines()
@@ -5420,7 +5687,7 @@ mod tests {
         // The first row: `.clang-format`, a file.
         app.event(Event::Input(Input::Click { x: 3, y: 2 }));
         assert!(!app.tree_shown, "a picked file closes the tree");
-        assert_eq!(app.doc.pos.file, 0);
+        assert_eq!(app.doc.document.pos.file, 0);
     }
 
     #[test]
@@ -5503,9 +5770,15 @@ mod tests {
                 ],
             },
         ];
-        let diff = Arc::clone(app.doc.diff_of(0).expect("diffed"));
-        let rendered = view::rendered::build(Arc::clone(&diff), sides, 3, 60);
-        assert_eq!((rendered.added, rendered.removed), (1, 3));
+        let diff = Arc::clone(app.doc.document.diff_of(0).expect("diffed"));
+        let rendered = view::rendered::build(Arc::clone(&diff), sides, crate::grammars(), 3, 60);
+        assert_eq!(
+            rendered.counts(),
+            Counts {
+                added: 1,
+                removed: 3
+            }
+        );
         app.event(Event::Diffed(Done::Rendered {
             file: 0,
             version: app.version(0),
@@ -5542,6 +5815,192 @@ mod tests {
         assert!(!app.jobs().iter().any(|j| matches!(j, Job::Render(_))));
         key(&mut app, 'r');
         assert_eq!(app.programs.len(), 1, "looked up once r asked");
-        assert!(!app.doc.rendered, "not on without the program");
+        assert!(!app.doc.document.rendered(), "not on without the program");
+    }
+
+    /// Wrapped, a file left part way down a long row comes back at that
+    /// same screen row of it, not at the row's first.
+    #[test]
+    fn a_place_inside_a_wrapped_row_is_kept_across_files() {
+        let old = (1..=60)
+            .map(|i| format!("line {i}\n"))
+            .collect::<Vec<_>>()
+            .concat();
+        let long = "a line long enough to wrap ".repeat(10);
+        let new = old.replace("line 4\n", &format!("line 4 {long}\n"));
+        let (old, new) = (Text::new(old.into()), Text::new(new.into()));
+        let fd = FileDiff {
+            hunks: hunks(&old, &new, &Options::default()),
+            old,
+            new,
+            ..diff("src/a.rs")
+        };
+        let mut config = Config::default();
+        config.apply_source("wrap = true\n", &mut Vec::new());
+        let mut app = app_of(&config, "working tree", fd, (60, 10));
+        for _ in 0..20 {
+            if app.doc.document.pos.offset > 0 {
+                break;
+            }
+            key(&mut app, 'j');
+        }
+        assert!(
+            app.doc.document.pos.offset > 0,
+            "{:?}",
+            app.doc.document.pos
+        );
+        let (pos, before) = (app.doc.document.pos, screen(&mut app));
+        key(&mut app, 'j');
+        assert_ne!(app.doc.document.pos, pos, "not at the bottom");
+        key(&mut app, 'k');
+        key(&mut app, 'f');
+        assert_eq!(app.doc.document.pos.file, 1);
+        key(&mut app, 'F');
+        assert_eq!(app.doc.document.pos, pos);
+        let after = screen(&mut app);
+        assert_eq!(after, before);
+        insta::assert_snapshot!("wrapped_place_kept", after);
+    }
+
+    /// Thirty C functions, the 15th and 16th swapped: lines removed and
+    /// added to the line diff, code moved to the syntax diff.
+    fn moved_diff() -> FileDiff {
+        let f = |i: usize| format!("int f{i}(void) {{ return {i}; }}\n");
+        let old: String = (1..=30).map(f).collect();
+        let new: String = (1..=30)
+            .map(|i| match i {
+                15 => f(16),
+                16 => f(15),
+                _ => f(i),
+            })
+            .collect();
+        let (old, new) = (Text::new(old.into()), Text::new(new.into()));
+        FileDiff {
+            hunks: hunks(&old, &new, &Options::default()),
+            old,
+            new,
+            ..diff("src/f.c")
+        }
+    }
+
+    /// `d` between the line diff and the syntax diff keeps the view where
+    /// it was in the file's rows.
+    #[test]
+    fn the_syntax_diff_toggle_keeps_the_place() {
+        let mut app = app_of(&Config::default(), "working tree", moved_diff(), (100, 10));
+        for _ in 0..4 {
+            key(&mut app, 'j');
+        }
+        let lines = screen(&mut app);
+        key(&mut app, 'd');
+        assert!(app.doc.document.structural);
+        app.draw();
+        for job in app.jobs() {
+            if let Job::Structural {
+                file,
+                version,
+                diff,
+            } = job
+            {
+                app.event(Event::Diffed(Done::Structural {
+                    file,
+                    version,
+                    result: File::prepare(crate::grammars(), None).structural(&diff),
+                    diff,
+                }));
+            }
+        }
+        let syntax = screen(&mut app);
+        assert!(syntax.contains("»│"), "the syntax diff shows:\n{syntax}");
+        insta::assert_snapshot!("syntax_diff_on", syntax);
+        key(&mut app, 'd');
+        let off = screen(&mut app);
+        assert_eq!(off, lines);
+        insta::assert_snapshot!("syntax_diff_off", off);
+    }
+
+    /// The screen with each run of cells in one of `roles`' styles in
+    /// `<role>…</>`.
+    fn role_markup(app: &mut App, roles: &[Role]) -> String {
+        app.draw();
+        let styles: Vec<_> = roles.iter().map(|&r| (app.theme.style(r), r)).collect();
+        let grid = app.screen.shown_grid();
+        (0..grid.height())
+            .map(|y| {
+                let mut line = String::new();
+                let mut current = None;
+                for cell in grid.row(y) {
+                    let role = styles
+                        .iter()
+                        .find(|(style, _)| *style == cell.style())
+                        .map(|&(_, r)| r);
+                    if role != current {
+                        if current.is_some() {
+                            line.push_str("</>");
+                        }
+                        if let Some(r) = role {
+                            line.extend(["<", r.key(), ">"]);
+                        }
+                        current = role;
+                    }
+                    line.push_str(cell.text());
+                }
+                if current.is_some() {
+                    line.push_str("</>");
+                }
+                line.trim_end().to_owned()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// `git show` of a merge in the viewer: the commit's header, metadata
+    /// and message in their colors, then the combined diff's lines colored
+    /// by their prefix columns.
+    #[test]
+    fn a_piped_merge_shows_its_commit_and_combined_diff_in_their_colors() {
+        let merge = include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/git-show-merge.diff"
+        ));
+        let roles = [
+            Role::CommitHeader,
+            Role::Dim,
+            Role::HunkHeader,
+            Role::Added,
+            Role::Removed,
+        ];
+        let mut app = piped_app(merge, 100, 14);
+        // The default theme shares colors between these roles and others
+        // (`warn` is yellow too): underlined, each is told apart.
+        app.theme = Theme::parse(
+            "roles",
+            "commit-header = yellow underline\ndim = dim underline\n\
+             hunk-header = cyan underline\nadded = green underline\nremoved = red underline\n",
+            &mut Vec::new(),
+        );
+        key(&mut app, 't');
+        read_back(&mut app);
+        insta::assert_snapshot!("piped_merge_commit", role_markup(&mut app, &roles));
+        key(&mut app, 'f');
+        read_back(&mut app);
+        insta::assert_snapshot!("piped_merge_combined", role_markup(&mut app, &roles));
+    }
+
+    /// `view = auto` splits from `split-min-width` columns of screen, 140
+    /// by default, and is unified a column short of it.
+    #[test]
+    fn auto_splits_from_the_split_min_width() {
+        let mut app = app(140, 12);
+        assert!(app.doc.layout.split);
+        let split = screen(&mut app);
+        assert!(
+            split.lines().any(|l| l.matches("line 4").count() == 2),
+            "side by side:\n{split}"
+        );
+        insta::assert_snapshot!("auto_at_split_min_width", split);
+        app.resize(139, 12);
+        assert!(!app.doc.layout.split);
+        insta::assert_snapshot!("auto_below_split_min_width", screen(&mut app));
     }
 }

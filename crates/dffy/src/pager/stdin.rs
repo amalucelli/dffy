@@ -8,8 +8,8 @@ use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use super::parse::{Event, Parser, strip_ansi};
-use crate::render::Kind;
+use dffy_core::patch::{Event, Parser, strip_ansi};
+use dffy_core::view::Kind;
 
 /// Bytes per read from stdin.
 const CHUNK: usize = 64 << 10;

@@ -3,8 +3,9 @@
 //! keeps them current; and a small pool that diffs files, computes
 //! emphasis and syntax spans for the hunks on screen, and syntax-diffs the
 //! files on screen when that view is on. When it has nothing else to do,
-//! the pool counts every file's lines for the file tree. Results come back
-//! as [`Event`]s.
+//! the pool compiles the highlight queries of the languages in the list,
+//! so a language's first file doesn't wait for its query, then counts
+//! every file's lines for the file tree. Results come back as [`Event`]s.
 
 use std::collections::VecDeque;
 use std::io;
@@ -19,7 +20,7 @@ use dffy_core::cache::Cache;
 use dffy_core::diff::{Emphasis, Options};
 use dffy_core::document::{self, Counts, File, Matches, Needle, Prepare, SyntaxSlot};
 use dffy_core::git::{ChangeSet, FileChange, FileDiff, Repo, Revisions};
-use dffy_core::highlight::{HunkSyntax, Registry};
+use dffy_core::highlight::{HunkSyntax, Language, Registry};
 use dffy_core::structural::{Structural, Unavailable};
 use dffy_core::view::Spans;
 use dffy_core::watch::MAX_BATCH;
@@ -366,8 +367,16 @@ struct Queue {
     /// unwanted, so asking for it again would run it twice; from then on
     /// the viewer's next ask is the one that counts.
     running: Vec<Key>,
-    /// The count pass, taken only when nothing is waiting. It's set once per
-    /// list rather than with every frame's jobs, since it covers every file.
+    /// Languages whose highlight queries to compile ahead of their first
+    /// file being highlighted, taken only when nothing is waiting, one at a
+    /// time: a compile can take 140ms (Swift), and three at once would
+    /// leave no worker for what comes on screen meanwhile.
+    preparing: VecDeque<Language>,
+    /// A worker is compiling one of `preparing`.
+    compiling: bool,
+    /// The count pass, taken only when nothing is waiting or to compile.
+    /// It's set once per list rather than with every frame's jobs, since it
+    /// covers every file.
     counting: VecDeque<Counted>,
     /// What jobs are done with; set before any job is.
     settings: Settings,
@@ -407,6 +416,8 @@ impl Pool {
         let queue = Queue {
             waiting: VecDeque::new(),
             running: Vec::new(),
+            preparing: VecDeque::new(),
+            compiling: false,
             counting: VecDeque::new(),
             settings: settings.clone(),
         };
@@ -458,6 +469,15 @@ impl Pool {
         }
     }
 
+    /// Compiles the highlight queries of `languages` once nothing else is
+    /// waiting, in order.
+    pub(crate) fn prepare(&self, languages: Vec<Language>) {
+        let (queue, ready) = &*self.shared;
+        let mut queue = queue.lock().unwrap_or_else(PoisonError::into_inner);
+        queue.preparing.extend(languages);
+        ready.notify_all();
+    }
+
     /// Replaces the count pass with `files`, in the order to count them;
     /// an empty list cancels it.
     pub(crate) fn count(&self, files: Vec<Counted>) {
@@ -468,14 +488,16 @@ impl Pool {
     }
 }
 
-/// What a worker takes next, a job or a chunk of the count pass, with the
-/// settings to do it with.
+/// What a worker takes next, a job, a query to compile or a chunk of the
+/// count pass, with the settings to do it with.
 enum Work {
     Job(Job, Settings),
+    Prepare(Language),
     Count(Vec<Counted>, Settings),
 }
 
-/// Waits for the next job, or with none waiting a chunk of the count pass.
+/// Waits for the next job, or with none waiting a query to compile, then a
+/// chunk of the count pass.
 fn next(shared: &(Mutex<Queue>, Condvar)) -> Work {
     let (queue, ready) = shared;
     let mut q = queue.lock().unwrap_or_else(PoisonError::into_inner);
@@ -483,6 +505,12 @@ fn next(shared: &(Mutex<Queue>, Condvar)) -> Work {
         if let Some(job) = q.waiting.pop_front() {
             q.running.push(job.key());
             return Work::Job(job, q.settings.clone());
+        }
+        if !q.compiling
+            && let Some(language) = q.preparing.pop_front()
+        {
+            q.compiling = true;
+            return Work::Prepare(language);
         }
         if !q.counting.is_empty() {
             let n = q.counting.len().min(COUNT_CHUNK);
@@ -550,6 +578,16 @@ fn work(shared: &(Mutex<Queue>, Condvar), repo: Option<&Repo>, tx: &Sender<Event
     loop {
         let done = match next(shared) {
             Work::Job(job, settings) => run(job, repo, &settings),
+            Work::Prepare(language) => {
+                language.prepare();
+                let (queue, ready) = shared;
+                queue
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .compiling = false;
+                ready.notify_all();
+                continue;
+            }
             Work::Count(files, settings) => Done::Counts {
                 counts: count(repo, &settings, files),
             },
@@ -740,6 +778,45 @@ mod tests {
             too_large: false,
             note: None,
         })
+    }
+
+    /// Compiling queries ahead waits for every job asked for, takes one
+    /// worker at a time, and comes before the count pass.
+    #[test]
+    fn queries_compile_after_the_jobs_one_at_a_time_before_the_count_pass() {
+        let diff = modified();
+        let grammars = crate::grammars();
+        let lang = |name| grammars.named(name).expect("bundled").clone();
+        let queue = Queue {
+            waiting: VecDeque::from([Job::Emphasis {
+                file: 0,
+                version: 0,
+                hunk: 0,
+                diff: Arc::clone(&diff),
+                syntax: None,
+            }]),
+            running: Vec::new(),
+            preparing: VecDeque::from([lang("swift"), lang("kotlin")]),
+            compiling: false,
+            counting: VecDeque::from([(0, 0, diff.change.clone())]),
+            settings: Settings {
+                options: Options::default(),
+                highlight: true,
+                grammars,
+                cache: None,
+            },
+        };
+        let shared = (Mutex::new(queue), Condvar::new());
+        let taken = |work: Work| match work {
+            Work::Job(..) => "job".to_owned(),
+            Work::Prepare(language) => language.name().to_owned(),
+            Work::Count(..) => "count".to_owned(),
+        };
+        assert_eq!(taken(next(&shared)), "job");
+        assert_eq!(taken(next(&shared)), "swift");
+        assert_eq!(taken(next(&shared)), "count", "a second compile at once");
+        shared.0.lock().expect("queue").compiling = false;
+        assert_eq!(taken(next(&shared)), "kotlin");
     }
 
     /// A job's result either makes the job unwanted (it's stored) or wanted

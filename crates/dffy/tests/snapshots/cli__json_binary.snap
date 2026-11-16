@@ -1,0 +1,7 @@
+---
+source: crates/dffy/tests/cli.rs
+expression: "json(d, &[], &[\"logo.bin\"])"
+---
+{"type":"header","version":1,"old":{"kind":"tree","id":"bfad37707764a70cf0a0cf8a9a549dd83f87b626"},"new":{"kind":"tree","id":"44c4ea573a9b62ac060b6c55d29a0367ea962239"},"untracked":false,"revisions":["main~1","main"],"paths":["logo.bin"],"options":{"context":3,"whitespace":"exact","syntax":false,"renames":true,"highlights":false,"summary":false}}
+{"type":"file","path":"logo.bin","old_path":"logo.bin","status":"modified","similarity":null,"old_mode":"100644","new_mode":"100644","binary":true,"too_large":false,"language":null,"added":null,"removed":null,"syntax":null,"classification":null,"note":null,"hunks":[]}
+{"type":"end","files":1,"added":0,"removed":0}

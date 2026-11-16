@@ -1,9 +1,12 @@
 //! The screen as a grid of styled cells, double-buffered: each flush sends
 //! the terminal only the cells that changed since the previous frame, inside
-//! one synchronized update.
+//! one synchronized update. Rows a frame scrolled are moved by the terminal
+//! within a scroll region first, so only the rows that came into view are
+//! sent.
 
 use std::fmt::Write as _;
 use std::io::Write as _;
+use std::ops::Range;
 
 use dffy_core::view::Attributes;
 use unicode_width::UnicodeWidthChar;
@@ -230,6 +233,37 @@ impl Grid {
         self.cells[i] = cell;
     }
 
+    /// Copies columns `columns` of rows `rows` of `source`, a grid as wide,
+    /// to the rows from `to` down.
+    pub(crate) fn copy_rows(
+        &mut self,
+        source: &Self,
+        rows: Range<usize>,
+        to: usize,
+        columns: Range<usize>,
+    ) {
+        for (i, y) in rows.enumerate() {
+            let (from, at) = (y * self.width, (to + i) * self.width);
+            self.cells[at + columns.start..at + columns.end]
+                .copy_from_slice(&source.cells[from + columns.start..from + columns.end]);
+        }
+    }
+
+    /// Moves rows `rows` up by `by` rows (down when negative), as a
+    /// terminal scrolls them: the rows coming in are blank.
+    fn scroll(&mut self, rows: Range<usize>, by: isize) {
+        let shift = by.unsigned_abs().min(rows.len()) * self.width;
+        let cells = &mut self.cells[rows.start * self.width..rows.end * self.width];
+        let len = cells.len();
+        if by > 0 {
+            cells.copy_within(shift.., 0);
+            cells[len - shift..].fill(Cell::BLANK);
+        } else {
+            cells.copy_within(..len - shift, shift);
+            cells[..shift].fill(Cell::BLANK);
+        }
+    }
+
     /// Row `y` as plain text, for tests.
     #[cfg(test)]
     pub(crate) fn row_text(&self, y: usize) -> String {
@@ -297,22 +331,46 @@ impl Screen {
             .join("\n")
     }
 
-    /// A blank grid to draw the next frame into.
-    pub(crate) fn frame(&mut self) -> &mut Grid {
+    /// A blank grid to draw the next frame into, and the last frame's.
+    pub(crate) fn frame(&mut self) -> (&mut Grid, &Grid) {
         self.next.clear();
-        &mut self.next
+        (&mut self.next, &self.shown)
     }
 
     /// The bytes that bring the terminal to the frame drawn since
     /// [`Screen::frame`]; empty when nothing changed.
-    pub(crate) fn flush(&mut self) -> &[u8] {
+    ///
+    /// `scroll` says that some rows of the frame hold the last frame's rows
+    /// moved up by a number of rows, or down when it's negative: the
+    /// terminal scrolls them before the cells that differ are sent. It
+    /// scrolls every column of those rows, and the cells of columns that
+    /// didn't move are then sent again with the rest that differ.
+    pub(crate) fn flush(&mut self, scroll: Option<(Range<usize>, isize)>) -> &[u8] {
         self.out.clear();
         self.out.extend_from_slice(SYNC_BEGIN);
+        let before = self.out.len();
         if self.stale {
             self.shown.clear();
             self.out.extend_from_slice(b"\x1b[0m\x1b[H\x1b[2J");
+        } else if let Some((rows, by)) = scroll
+            && (1..rows.len()).contains(&by.unsigned_abs())
+        {
+            // Deleting lines at the region's top, or inserting them there,
+            // scrolls the region. That's VT102, which every terminal and
+            // multiplexer has, the Linux console included; it lacks SU and
+            // SD. Lines come in blank in the default colors, the SGR state
+            // between frames.
+            write!(
+                self.out,
+                "\x1b[{top};{}r\x1b[{top}H\x1b[{}{}\x1b[r",
+                rows.end,
+                by.unsigned_abs(),
+                if by > 0 { 'M' } else { 'L' },
+                top = rows.start + 1,
+            )
+            .ok();
+            self.shown.scroll(rows, by);
         }
-        let before = self.out.len();
         diff(&self.shown, &self.next, &mut self.out);
         if !self.stale && self.out.len() == before {
             self.out.clear();
@@ -472,15 +530,96 @@ mod tests {
     #[test]
     fn unchanged_frames_emit_nothing_and_changes_are_synchronized() {
         let mut screen = Screen::new(5, 2);
-        screen.frame().put_str(0, 0, 5, "hi", Style::PLAIN);
+        screen.frame().0.put_str(0, 0, 5, "hi", Style::PLAIN);
         assert_eq!(
-            screen.flush(),
+            screen.flush(None),
             b"\x1b[?2026h\x1b[0m\x1b[H\x1b[2J\x1b[1Hhi\x1b[?2026l"
         );
-        screen.frame().put_str(0, 0, 5, "hi", Style::PLAIN);
-        assert_eq!(screen.flush(), b"");
-        screen.frame().put_str(0, 1, 5, "yo", Style::PLAIN);
-        assert_eq!(screen.flush(), b"\x1b[?2026h\x1b[1H\x1b[K\r\nyo\x1b[?2026l");
+        screen.frame().0.put_str(0, 0, 5, "hi", Style::PLAIN);
+        assert_eq!(screen.flush(None), b"");
+        screen.frame().0.put_str(0, 1, 5, "yo", Style::PLAIN);
+        assert_eq!(
+            screen.flush(None),
+            b"\x1b[?2026h\x1b[1H\x1b[K\r\nyo\x1b[?2026l"
+        );
+    }
+
+    /// Rows scrolled within a region move on the terminal, and only the
+    /// rows that came in, plus whatever else changed, are sent.
+    #[test]
+    fn scrolled_rows_move_on_the_terminal_and_only_new_rows_are_sent() {
+        let (w, h) = (8u16, 6u16);
+        let size = |n| std::num::NonZero::new(n).expect("non-zero");
+        let mut vt = vt100::Parser::new(size(h), size(w), 0);
+        let mut screen = Screen::new(w.into(), h.into());
+        let text = |y: usize, top: usize| match y {
+            0 => format!("top {top}"),
+            5 => "bottom".to_owned(),
+            _ => format!("line {}", top + y),
+        };
+        let mut sent = Vec::new();
+        for (top, scroll) in [(0, None), (1, Some(1)), (3, Some(2)), (1, Some(-2))] {
+            let (grid, _) = screen.frame();
+            for y in 0..usize::from(h) {
+                grid.put_str(0, y, w.into(), &text(y, top), GREEN);
+            }
+            let expected = grid.clone();
+            let out = screen.flush(scroll.map(|by| (1..5, by)));
+            vt.process(out);
+            sent.push(String::from_utf8(out.to_vec()).expect("utf-8"));
+            for y in 0..h {
+                assert_eq!(
+                    vt.screen().contents_between(y, 0, y, w).trim_end(),
+                    expected.row_text(y.into()).trim_end(),
+                    "row {y} at {top}"
+                );
+            }
+        }
+        assert!(
+            sent[1].contains("\x1b[2;5r\x1b[2H\x1b[1M\x1b[r"),
+            "{:?}",
+            sent[1]
+        );
+        assert!(sent[1].contains("line 5") && !sent[1].contains("line 4"));
+        assert!(
+            sent[3].contains("\x1b[2;5r\x1b[2H\x1b[2L\x1b[r"),
+            "{:?}",
+            sent[3]
+        );
+        assert!(sent[3].contains("line 3") && !sent[3].contains("line 4"));
+    }
+
+    /// A scroll moves every column of its rows, so a column beside the
+    /// scrolled ones that stayed put is sent again, and only it.
+    #[test]
+    fn columns_that_stayed_put_are_sent_again_after_a_scroll() {
+        let (w, h) = (9u16, 5u16);
+        let size = |n| std::num::NonZero::new(n).expect("non-zero");
+        let mut vt = vt100::Parser::new(size(h), size(w), 0);
+        let mut screen = Screen::new(w.into(), h.into());
+        let mut sent = String::new();
+        for (top, scroll) in [(0, None), (2, Some(2)), (1, Some(-1))] {
+            let (grid, _) = screen.frame();
+            for y in 0..usize::from(h) {
+                grid.put_str(0, y, w.into(), &format!("{y}│line {}", top + y), GREEN);
+            }
+            let expected = grid.clone();
+            let out = screen.flush(scroll.map(|by| (0..5, by)));
+            vt.process(out);
+            sent = String::from_utf8(out.to_vec()).expect("utf-8");
+            for y in 0..h {
+                assert_eq!(
+                    vt.screen().contents_between(y, 0, y, w),
+                    expected.row_text(y.into()).trim_end(),
+                    "row {y} at {top}"
+                );
+            }
+        }
+        assert!(sent.contains("\x1b[1;5r\x1b[1H\x1b[1L\x1b[r"), "{sent:?}");
+        assert!(
+            sent.contains("line 1") && !sent.contains("line 2"),
+            "{sent:?}"
+        );
     }
 
     #[test]
@@ -579,7 +718,7 @@ mod tests {
             &[("", Style::PLAIN)],
         ];
         for frame in frames {
-            let grid = screen.frame();
+            let (grid, _) = screen.frame();
             for (y, (text, style)) in frame.iter().enumerate() {
                 let end = grid.put_str(0, y, w, text, *style);
                 if y == 1 {
@@ -587,7 +726,7 @@ mod tests {
                 }
             }
             let expected = grid.clone();
-            vt.process(screen.flush());
+            vt.process(screen.flush(None));
             for y in 0..h {
                 let mut x = 0;
                 while x < w {

@@ -1,0 +1,7 @@
+---
+source: crates/dffy/tests/cli.rs
+expression: "json(d, &[], &[\"new.txt\"])"
+---
+{"type":"header","version":1,"old":{"kind":"tree","id":"bfad37707764a70cf0a0cf8a9a549dd83f87b626"},"new":{"kind":"tree","id":"44c4ea573a9b62ac060b6c55d29a0367ea962239"},"untracked":false,"revisions":["main~1","main"],"paths":["new.txt"],"options":{"context":3,"whitespace":"exact","syntax":false,"renames":true,"highlights":false,"summary":false}}
+{"type":"file","path":"new.txt","old_path":"new.txt","status":"added","similarity":null,"old_mode":null,"new_mode":"100644","binary":false,"too_large":false,"language":null,"added":2,"removed":0,"syntax":null,"classification":null,"note":null,"hunks":[{"old_start":0,"old_lines":0,"new_start":1,"new_lines":2,"heading":null,"lines":[{"kind":"added","old":null,"new":1,"text":"brand new"},{"kind":"added","old":null,"new":2,"text":"no newline","no_newline":true}]}]}
+{"type":"end","files":1,"added":2,"removed":0}

@@ -63,18 +63,18 @@ That directory must be on your `PATH`.
 
 ## Plugins
 
-The experimental Markdown renderer is a separate binary, `dffy-render-markdown`. Each dffy release ships it under the same version, outside dffy's archive and cask. Install it with one of these:
+The experimental renderers are separate binaries: `dffy-render-markdown` and `dffy-render-mermaid`. Each dffy release ships them under the same version, outside dffy's archive and cask. Install them with one of these (drop the one you don't want):
 
 ```sh
-brew install --cask amalucelli/tap/dffy-render-markdown
-curl -fsSL https://raw.githubusercontent.com/amalucelli/dffy/main/install.sh | sh -s -- --plugin markdown
-cargo install --locked --git https://github.com/amalucelli/dffy dffy-render-markdown
+brew install --cask amalucelli/tap/dffy-render-markdown amalucelli/tap/dffy-render-mermaid
+curl -fsSL https://raw.githubusercontent.com/amalucelli/dffy/main/install.sh | sh -s -- --plugin markdown --plugin mermaid
+cargo install --locked --git https://github.com/amalucelli/dffy dffy-render-markdown dffy-render-mermaid
 ```
 
-- The script installs dffy and the plugin side by side, both checked against the release's `checksums.txt`. `DFFY_PLUGINS=markdown` does the same as the flag.
-- dffy finds the plugin on your `PATH`.
+- The script installs dffy and the plugins side by side, all checked against the release's `checksums.txt`. `DFFY_PLUGINS=markdown,mermaid` does the same as the flags.
+- dffy finds the plugins on your `PATH`.
 
-[plugins.md](plugins.md) covers turning it on.
+[plugins.md](plugins.md) covers turning them on.
 
 ## Shell completions
 

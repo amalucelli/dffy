@@ -1,0 +1,17 @@
+---
+source: plugins/mermaid/src/sequence/tests.rs
+expression: text
+---
+participants 0..1
+  ┌───┐           ┌───┐ ┌───┐
+  │ A │           │ B │ │ C │
+  └─┬─┘           └─┬─┘ └─┬─┘
+message 1..2
+    │ a message     │     │
+    │ with many     │     │
+    │ words in it   │     │
+    │ that goes on  │     │
+    ├──────────────▶│     │
+message 2..3
+    │               │ ok  │
+    │               ├────▶│

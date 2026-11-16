@@ -3,8 +3,10 @@
 ```
 dffy [options] [<rev>...] [-- <path>...]
 dffy [options] [--no-index] <path> <path>
+dffy --json [options] [<rev>...] [-- <path>...]
 dffy show [<rev>] [-- <path>...]
 dffy config [--default]
+dffy mcp
 dffy themes | doctor | daemon status|stop | completions <shell>
 ```
 
@@ -14,7 +16,7 @@ Without a subcommand dffy runs `diff`, so `dffy main..HEAD` is `dffy diff main..
 
 dffy opens the full-screen viewer when stdout is a terminal, unless one of these applies:
 
-- `--stat`, `--name-only`, `--name-status` or `--exit-code` is given;
+- `--stat`, `--name-only`, `--name-status`, `--exit-code` or `--json` is given;
 - `--paging=never` is given (or `paging = never` is set);
 - there's nothing to show and the viewer wouldn't be watching. dffy then prints `no changes` and exits. For `--staged` and `--unstaged` it prints what the other side holds instead: `no staged changes (2 unstaged, 1 untracked; run dffy to see them)`. With `--watch`, the viewer opens and waits for changes.
 
@@ -34,6 +36,7 @@ Otherwise dffy prints.
 | `config` | The effective settings, each marked with where its value comes from. `--default` prints every key with its documentation and default instead. See [config.md](config.md). |
 | `themes` | The available themes, with a preview. `--dump <name>` prints a built-in theme as a theme file to copy and edit. See [themes.md](themes.md). |
 | `doctor` | Checks git, the repository, the watches it needs, the terminal, the config, the cache and `dffyd`, and times dffy on the repository; `--json` prints it all as one object. See [troubleshooting.md](troubleshooting.md#dffy-doctor). |
+| `mcp` | A Model Context Protocol server on stdin and stdout, for coding agents: tools that list changed files and return diffs as the objects of `--json`, a page at a time. Register it with `claude mcp add dffy -- dffy mcp`. See [mcp.md](mcp.md). |
 | `daemon status`, `daemon stop` | Inspect or stop the watch broker. See [watch.md](watch.md#dffyd). |
 | `completions <shell>` | A completion script for `bash`, `zsh`, `fish`, `elvish` or `powershell`. See [install.md](install.md#shell-completions). |
 
@@ -177,6 +180,15 @@ The three summaries exclude each other. `--exit-code` is for `diff` only and com
 ```sh
 dffy --exit-code --stat main..   # prints the stat, exits 1 if main.. has changes
 ```
+
+## JSON output
+
+```sh
+dffy --json main..
+dffy --json --syntax --staged -- src/
+```
+
+`--json` writes the diff as JSON Lines for scripts, CI and agents: a header, an object per file with its hunks and lines, then an end object. It takes the same revisions, paths and diff options as printed output, and is never colored or paged. `--syntax` adds moved and reformatted marks and classifies files whose changes are only formatting or moves. `--highlight-spans` adds each line's syntax highlighting. With `--stat`, `--name-only` or `--name-status`, file objects come without hunks: paths, status, counts and flags. [json.md](json.md) is the schema. `dffy mcp` serves the same objects to coding agents, paged ([mcp.md](mcp.md)).
 
 ## `--color-only`
 

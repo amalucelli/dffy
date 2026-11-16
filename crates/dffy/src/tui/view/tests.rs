@@ -97,7 +97,7 @@ fn print_rows(layout: Layout) -> Vec<String> {
 
 fn grid_rows(doc: &mut Doc, theme: &Theme) -> (Grid, Vec<String>) {
     let mut grid = Grid::new(60, doc.height);
-    doc.draw(&mut grid, 0, 60, 0, theme, 1);
+    doc.draw(&mut grid, None, (0, 60, 0), theme, 1);
     let rows = (0..doc.height)
         .map(|y| grid.row_text(y).trim_end().to_owned())
         .collect();
@@ -317,8 +317,8 @@ fn an_empty_document_ignores_moves_and_draws_nothing() {
     assert_eq!(doc.line_at_top(), 1);
     let mut grid = Grid::new(60, 5);
     assert_eq!(
-        doc.draw(&mut grid, 0, 60, 0, &Theme::default_theme(), 1),
-        0..0
+        doc.draw(&mut grid, None, (0, 60, 0), &Theme::default_theme(), 1),
+        (0..0, None)
     );
     assert_eq!(doc.document.pos, Pos::default());
 }
@@ -735,7 +735,7 @@ fn the_overview_marks_changes_and_the_lines_on_screen() {
     doc.overview = true;
     doc.toggle_full();
     let mut grid = Grid::new(60, 20);
-    doc.draw(&mut grid, 0, 60, 0, &Theme::default_theme(), 1);
+    doc.draw(&mut grid, None, (0, 60, 0), &Theme::default_theme(), 1);
     let column: String = (0..20).map(|y| grid.row(y)[59].text().to_owned()).collect();
     insta::assert_snapshot!("overview", column);
     // A click on the mark near the bottom brings that change to the top.
@@ -788,7 +788,7 @@ fn background_tints_fill_changed_lines_with_a_stronger_gutter() {
         theme.tint(bg);
         let mut doc = doc(layout, 9);
         let mut grid = Grid::new(60, 9);
-        doc.draw(&mut grid, 0, 60, 0, &theme, 1);
+        doc.draw(&mut grid, None, (0, 60, 0), &theme, 1);
         insta::assert_snapshot!(name, backgrounds(&grid, 1..7));
     }
 }
@@ -812,7 +812,7 @@ fn background_tints_give_moved_code_its_own_hue() {
     assert!(doc.document.set_structural(0, &diff, Some(structural)));
     doc.document.structural = true;
     let mut grid = Grid::new(60, 6);
-    doc.draw(&mut grid, 0, 60, 0, &theme, 1);
+    doc.draw(&mut grid, None, (0, 60, 0), &theme, 1);
     insta::assert_snapshot!("tints_moved", backgrounds(&grid, 1..4));
 }
 
@@ -861,11 +861,11 @@ fn a_selection_shows_reversed_on_its_side_and_copies_that_sides_code() {
     let theme = plain_theme();
     let mut doc = doc(layout(true, false), 7);
     let mut grid = Grid::new(60, 7);
-    doc.draw(&mut grid, 0, 60, 0, &theme, 1);
+    doc.draw(&mut grid, None, (0, 60, 0), &theme, 1);
     assert!(doc.select(None));
     doc.select_by(2);
     let mut grid = Grid::new(60, 7);
-    doc.draw(&mut grid, 0, 60, 0, &theme, 1);
+    doc.draw(&mut grid, None, (0, 60, 0), &theme, 1);
     insta::assert_snapshot!(marked(&grid, Attributes::REVERSE), @r#"
     @@ -1,5 +1,6 @@
     1  │ fn main() {             │[1  │ fn main() {              ]
@@ -889,7 +889,7 @@ fn a_selection_shows_reversed_on_its_side_and_copies_that_sides_code() {
     assert!(decorated.decorated);
     assert!(doc.select_other_side());
     let mut grid = Grid::new(60, 7);
-    doc.draw(&mut grid, 0, 60, 0, &theme, 1);
+    doc.draw(&mut grid, None, (0, 60, 0), &theme, 1);
     insta::assert_snapshot!(marked(&grid, Attributes::REVERSE), @r#"
     @@ -1,5 +1,6 @@
     [1  │ fn main() {             ]│1  │ fn main() {
@@ -913,12 +913,12 @@ fn a_unified_selection_skips_the_other_sides_lines_and_counts_hidden_ones() {
     let theme = plain_theme();
     let mut doc = doc_of(long_diff(), layout(false, false), 40);
     let mut grid = Grid::new(60, 40);
-    doc.draw(&mut grid, 0, 60, 0, &theme, 1);
+    doc.draw(&mut grid, None, (0, 60, 0), &theme, 1);
     assert!(doc.select(None));
     // Lines 1 and 2, then "line three": the removed "line 3" is passed over.
     doc.select_by(2);
     let mut grid = Grid::new(60, 40);
-    doc.draw(&mut grid, 0, 60, 0, &theme, 1);
+    doc.draw(&mut grid, None, (0, 60, 0), &theme, 1);
     let rows: Vec<String> = marked(&grid, Attributes::REVERSE)
         .lines()
         .take(6)
@@ -995,7 +995,7 @@ fn each_scroll_step_moves_the_code_one_row() {
     let theme = plain_theme();
     let frame = |doc: &mut Doc| {
         let mut grid = Grid::new(60, HEIGHT);
-        doc.draw(&mut grid, 0, 60, 0, &theme, 1);
+        doc.draw(&mut grid, None, (0, 60, 0), &theme, 1);
         let rows: Vec<String> = (0..HEIGHT).map(|y| grid.row_text(y)).collect();
         (rows, doc.document.pos)
     };

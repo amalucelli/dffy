@@ -1,0 +1,8 @@
+---
+source: plugins/mermaid/src/flowchart/tests.rs
+expression: "drawn(\"graph RL\\n  A -->|left| B\\n\", 80)"
+---
+flowchart 0..2
+  ┌───┐           ┌───┐
+  │ B │◀─ left ───┤ A │
+  └───┘           └───┘

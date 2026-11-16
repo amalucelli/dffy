@@ -6,7 +6,9 @@ mod config;
 mod daemon;
 mod docs;
 mod doctor;
+mod json;
 mod keys;
+mod mcp;
 mod no_index;
 mod output;
 mod pager;
@@ -558,6 +560,10 @@ fn run(cli: Cli, ctx: &Ctx) -> Result<ExitCode, Error> {
             }
             write_stdout(ctx, &c)
         }
+        Some(Command::Mcp) => {
+            mcp::serve(dir, ctx)?;
+            Ok(ExitCode::SUCCESS)
+        }
         Some(Command::Completions { shell }) => {
             let mut buf = Vec::new();
             clap_complete::generate(shell, &mut Cli::command(), "dffy", &mut buf);
@@ -597,6 +603,12 @@ fn diff(dir: Option<&Path>, args: &DiffArgs, ctx: &Ctx) -> Result<ExitCode, Erro
         });
     }
     let reads_stdin = match args.revs.as_slice() {
+        [dash] if dash == "-" && args.json => {
+            return Err(Error::Fatal {
+                message: "--json reads the repository; it can't read a diff from stdin".into(),
+                hint: None,
+            });
+        }
         [dash] if dash == "-" => true,
         revs if revs.iter().any(|r| r == "-") => {
             return Err(Error::Fatal {
@@ -623,6 +635,15 @@ fn diff(dir: Option<&Path>, args: &DiffArgs, ctx: &Ctx) -> Result<ExitCode, Erro
     };
     let target = print::Target::Diff(&revisions);
     let c = &args.common;
+    if args.json {
+        let paths = printed_paths(c);
+        let plan = print::prepare(dir, &target, paths, print::Summary::Diff, c.view.reverse)?;
+        let compared = json::Compared {
+            revisions: &args.revs,
+            operands: None,
+        };
+        return json_diff(&plan, &compared, args, ctx);
+    }
     let viewer = ctx.term.stdout_tty
         && ctx.config.paging != Paging::Never
         && !(args.exit_code || c.stat || c.name_only || c.name_status);
@@ -648,6 +669,17 @@ fn compare(
     let c = &args.common;
     let difftool = no_index::Difftool::from_env();
     let (repo, description) = no_index::open(base, operands, args, &difftool)?;
+    if args.json {
+        let mut plan = print::Plan::compare(repo, base, print::Summary::Diff, c.view.reverse);
+        if let Some(focus) = &c.focus {
+            plan.paths = vec![plan.relative(focus)?];
+        }
+        let compared = json::Compared {
+            revisions: &[],
+            operands: Some(operands),
+        };
+        return json_diff(&plan, &compared, args, ctx);
+    }
     let viewer = ctx.term.stdout_tty
         && ctx.config.paging != Paging::Never
         && !(args.exit_code || c.stat || c.name_only || c.name_status);
@@ -830,14 +862,45 @@ fn run_print(
     exit_code: bool,
     ctx: &Ctx,
 ) -> Result<ExitCode, Error> {
-    // In print mode --focus narrows the output to one path; the viewer uses
-    // it to pick the starting file instead.
-    let paths: &[PathBuf] = match &common.focus {
-        Some(focus) => std::slice::from_ref(focus),
-        None => &common.paths,
-    };
+    let paths = printed_paths(common);
     let plan = print::prepare(dir, target, paths, summary(common), common.view.reverse)?;
     print_plan(&plan, exit_code, ctx)
+}
+
+/// The paths printed output is limited to. In print mode --focus narrows
+/// the output to one path; the viewer uses it to pick the starting file
+/// instead.
+fn printed_paths(common: &CommonArgs) -> &[PathBuf] {
+    match &common.focus {
+        Some(focus) => std::slice::from_ref(focus),
+        None => &common.paths,
+    }
+}
+
+/// `--json`: straight to stdout, never paged.
+fn json_diff(
+    plan: &print::Plan,
+    compared: &json::Compared,
+    args: &DiffArgs,
+    ctx: &Ctx,
+) -> Result<ExitCode, Error> {
+    let detail = if summary(&args.common) != print::Summary::Diff {
+        json::Detail::Summary
+    } else if args.highlight_spans {
+        json::Detail::Highlights
+    } else {
+        json::Detail::Hunks
+    };
+    let mut out = Output::stdout();
+    let result = json::write(plan, compared, detail, ctx, &mut out);
+    let finished = out.finish();
+    let changed = result?;
+    finished?;
+    Ok(if args.exit_code && changed {
+        ExitCode::FAILURE
+    } else {
+        ExitCode::SUCCESS
+    })
 }
 
 fn summary(common: &CommonArgs) -> print::Summary {
@@ -874,6 +937,7 @@ fn selects_from_repo(args: &DiffArgs) -> bool {
         || args.all
         || args.merge_base
         || args.exit_code
+        || args.json
         || c.stat
         || c.name_only
         || c.name_status

@@ -483,6 +483,10 @@ impl Session<'_> {
             if let Some(files) = app.take_count_pass() {
                 self.pool.count(files);
             }
+            let languages = app.take_languages();
+            if !languages.is_empty() {
+                self.pool.prepare(languages);
+            }
             let remembered = app.take_remembered(false);
             if !remembered.is_empty() {
                 state::write(&remembered);

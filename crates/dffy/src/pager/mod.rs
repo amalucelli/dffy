@@ -231,8 +231,9 @@ impl<F: FnMut(Sink) -> io::Result<()>> Renderer<F> {
                 },
                 emphasis,
                 // Not highlighted: compiling one language's query alone
-                // costs up to 35ms, over the 20ms budget for first output,
-                // and hunk fragments parse poorly without their file.
+                // costs up to about 140ms (Swift's), over the 20ms budget
+                // for first output, and hunk fragments parse poorly
+                // without their file.
                 syntax: None,
                 paint: &[],
                 block_start: false,

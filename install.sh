@@ -6,7 +6,7 @@
 #
 # Options:
 #   --plugin NAME     also install the renderer plugin dffy-render-NAME next to dffy;
-#                     repeatable. Plugins: markdown
+#                     repeatable. Plugins: markdown, mermaid
 #
 # Environment:
 #   DFFY_PLUGINS      plugins to install, separated by spaces or commas; adds to --plugin
@@ -87,8 +87,8 @@ sha256() {
 # add_plugin NAME
 add_plugin() {
 	case "$1" in
-	markdown) ;;
-	*) die "unknown plugin '$1'; available: markdown" ;;
+	markdown | mermaid) ;;
+	*) die "unknown plugin '$1'; available: markdown, mermaid" ;;
 	esac
 	case " $plugins " in
 	*" $1 "*) ;;

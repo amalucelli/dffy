@@ -39,22 +39,43 @@ fn highlight(name: &str, source: &str) -> String {
     markup(&text, &parsed.spans(&text, 0..text.len()))
 }
 
+fn detect(path: &str, content: &str) -> Option<&'static str> {
+    GRAMMARS
+        .detect(path.as_bytes(), content.as_bytes())
+        .map(Language::name)
+}
+
 #[test]
 fn every_bundled_query_compiles() {
     let grammars = Registry::builtin();
-    assert_eq!(grammars.languages().len(), 18);
+    assert_eq!(grammars.languages().len(), 30);
     for lang in grammars.languages() {
         assert!(lang.compiled().is_some(), "{}", lang.name());
     }
 }
 
 #[test]
+fn prepare_compiles_a_query_once_however_many_threads_ask() {
+    let grammars = Registry::builtin();
+    let swift = grammars.named("swift").expect("swift");
+    let start = std::sync::Barrier::new(4);
+    std::thread::scope(|s| {
+        for _ in 0..4 {
+            s.spawn(|| {
+                start.wait();
+                swift.prepare();
+            });
+        }
+    });
+    swift.prepare();
+    assert_eq!(swift.compiles(), 1);
+    assert!(swift.is_compiled());
+    parse(swift, b"let x = 1\n").expect("parses");
+    assert_eq!(swift.compiles(), 1, "the first parse compiled it again");
+}
+
+#[test]
 fn detects_by_name_extension_and_shebang() {
-    let detect = |path: &str, content: &str| {
-        GRAMMARS
-            .detect(path.as_bytes(), content.as_bytes())
-            .map(Language::name)
-    };
     assert_eq!(detect("kernel/sched/fair.c", ""), Some("c"));
     assert_eq!(detect("include/linux/sched.h", ""), Some("c"));
     assert_eq!(detect("src/lib.rs", ""), Some("rust"));
@@ -67,8 +88,195 @@ fn detects_by_name_extension_and_shebang() {
         Some("python")
     );
     assert_eq!(detect("tools/build", "#!/bin/sh\n"), Some("bash"));
-    assert_eq!(detect("Makefile", "all:\n"), None);
     assert_eq!(detect("README", "text"), None);
+}
+
+#[test]
+fn csharp_roles() {
+    assert_eq!(detect("src/App.cs", ""), Some("csharp"));
+    insta::assert_snapshot!(highlight(
+        "csharp",
+        "// note\nclass A { string F() { return \"x\"; } }\n"
+    ), @r#"
+    <comment>// note</>
+    <keyword>class</> <type>A</> <punctuation>{</> <type>string</> <function>F</><punctuation>()</> <punctuation>{</> <keyword>return</> <string>"x"</><punctuation>;</> <punctuation>}</> <punctuation>}</>
+    "#);
+}
+
+#[test]
+fn dockerfile_roles() {
+    assert_eq!(detect("Dockerfile", ""), Some("dockerfile"));
+    assert_eq!(detect("build/Containerfile", ""), Some("dockerfile"));
+    assert_eq!(detect("ci/web.dockerfile", ""), Some("dockerfile"));
+    insta::assert_snapshot!(highlight(
+        "dockerfile",
+        "# note\nFROM alpine AS build\nENV MODE=\"fast\"\nRUN make\n"
+    ), @r#"
+    <comment># note</>
+    <keyword>FROM</> alpine <keyword>AS</> build
+    <keyword>ENV</> <property>MODE</>=<string>"fast"</>
+    <keyword>RUN</> make
+    "#);
+}
+
+#[test]
+fn elixir_roles() {
+    assert_eq!(detect("lib/app.ex", ""), Some("elixir"));
+    assert_eq!(detect("bin/run", "#!/usr/bin/env elixir\n"), Some("elixir"));
+    insta::assert_snapshot!(highlight("elixir", "# note\ndef f(x), do: \"x\"\n"), @r#"
+    <comment># note</>
+    <keyword>def</> <function>f</><punctuation>(</>x<punctuation>),</> <string>do: "x"</>
+    "#);
+}
+
+/// Only Terraform's named values (`var`, `local`, …) are builtins: a
+/// resource reference like `aws_s3_bucket.a` keeps its first name plain.
+#[test]
+fn hcl_roles() {
+    assert_eq!(detect("infra/main.tf", ""), Some("hcl"));
+    assert_eq!(detect("prod.tfvars", ""), Some("hcl"));
+    insta::assert_snapshot!(highlight(
+        "hcl",
+        r#"# note
+resource "aws_s3_bucket" "b" {
+  bucket = "${var.prefix}-logs"
+  count  = 2
+  tags   = merge(local.tags, { Name = aws_s3_bucket.a.id })
+  policy = <<-EOT
+    %{ if true }on%{ endif }
+  EOT
+  lifecycle {
+    prevent_destroy = false
+  }
+}
+"#
+    ), @r#"
+    <comment># note</>
+    <keyword>resource</> <string>"aws_s3_bucket"</> <string>"b"</> <punctuation>{</>
+      <property>bucket</> = <string>"</><punctuation>${</><variable-builtin>var</><punctuation>.</><property>prefix</><punctuation>}</><string>-logs"</>
+      <property>count</>  = <number>2</>
+      <property>tags</>   = <function>merge</><punctuation>(</><variable-builtin>local</><punctuation>.</><property>tags</><punctuation>,</> <punctuation>{</> <property>Name</> = aws_s3_bucket<punctuation>.</><property>a</><punctuation>.</><property>id</> <punctuation>})</>
+      <property>policy</> = <string><<-EOT</>
+        <punctuation>%{</> <keyword>if</> <constant>true</> <punctuation>}</><string>on</><punctuation>%{</> <keyword>endif</> <punctuation>}</>
+      <string>EOT</>
+      <type>lifecycle</> <punctuation>{</>
+        <property>prevent_destroy</> = <constant>false</>
+      <punctuation>}</>
+    <punctuation>}</>
+    "#);
+}
+
+/// The jump patterns after the crate's query leave the returned value's
+/// identifiers plain.
+#[test]
+fn kotlin_roles() {
+    assert_eq!(detect("src/Main.kt", ""), Some("kotlin"));
+    assert_eq!(detect("build.gradle.kts", ""), Some("kotlin"));
+    insta::assert_snapshot!(highlight(
+        "kotlin",
+        "// note\nfun f(s: String): String {\n    return if (s > \"a\") s else \"b\"\n}\n"
+    ), @r#"
+    <comment>// note</>
+    <keyword>fun</> <function>f</><punctuation>(</>s<punctuation>:</> <type>String</><punctuation>):</> <type>String</> <punctuation>{</>
+        <keyword>return</> <keyword>if</> <punctuation>(</>s <operator>></> <string>"a"</><punctuation>)</> s <keyword>else</> <string>"b"</>
+    <punctuation>}</>
+    "#);
+}
+
+#[test]
+fn make_roles() {
+    assert_eq!(detect("Makefile", "all:\n"), Some("make"));
+    assert_eq!(detect("GNUmakefile", ""), Some("make"));
+    assert_eq!(detect("scripts/rules.mk", ""), Some("make"));
+    insta::assert_snapshot!(highlight(
+        "make",
+        "# note\nCC := cc\nall: main.o\n\t$(CC) -o $@ $^\ninclude deps.mk\n"
+    ), @"
+    <comment># note</>
+    CC <operator>:=</> <string>cc</>
+    <constant>all</><punctuation>:</> main.o
+    	<punctuation>$(</>CC<punctuation>)</> -o <punctuation>$</><operator>@</> <punctuation>$^</>
+    <keyword>include</> deps.mk
+    ");
+}
+
+#[test]
+fn php_roles() {
+    assert_eq!(detect("web/index.php", ""), Some("php"));
+    assert_eq!(detect("bin/console", "#!/usr/bin/env php\n"), Some("php"));
+    insta::assert_snapshot!(highlight(
+        "php",
+        "<?php\n// note\nfunction f($x) { return \"x\"; }\n"
+    ), @r#"
+    <tag><?php</>
+    <comment>// note</>
+    <keyword>function</> <function>f</>(<operator>$</>x) { <keyword>return</> <string>"x"</>; }
+    "#);
+}
+
+/// The query captures comments as `@spell @comment`, in that order.
+#[test]
+fn scala_roles() {
+    assert_eq!(detect("src/A.scala", ""), Some("scala"));
+    assert_eq!(detect("build.sbt", ""), Some("scala"));
+    insta::assert_snapshot!(highlight(
+        "scala",
+        "// note\nobject A { def f: String = \"x\" }\n"
+    ), @r#"
+    <comment>// note</>
+    <keyword>object</> <type>A</> <punctuation>{</> <keyword>def</> <function>f</>: <type>String</> = <string>"x"</> <punctuation>}</>
+    "#);
+}
+
+#[test]
+fn sql_roles() {
+    assert_eq!(detect("db/schema.sql", ""), Some("sql"));
+    insta::assert_snapshot!(highlight(
+        "sql",
+        "-- note\nSELECT a FROM t WHERE b = 'x';\n"
+    ), @"
+    <comment>-- note</>
+    <keyword>SELECT</> <property>a</> <keyword>FROM</> <type>t</> <keyword>WHERE</> <property>b</> <operator>=</> <string>'x'</><punctuation>;</>
+    ");
+}
+
+#[test]
+fn swift_roles() {
+    assert_eq!(detect("Sources/App.swift", ""), Some("swift"));
+    insta::assert_snapshot!(highlight(
+        "swift",
+        "// note\nfunc f() -> String { return \"x\" }\n"
+    ), @r#"
+    <comment>// note</>
+    <keyword>func</> <function>f</><punctuation>()</> <operator>-></> <type>String</> <punctuation>{</> <keyword>return</> <string>"x"</> <punctuation>}</>
+    "#);
+}
+
+#[test]
+fn xml_roles() {
+    assert_eq!(detect("pom.xml", ""), Some("xml"));
+    assert_eq!(detect("icons/a.svg", ""), Some("xml"));
+    assert_eq!(detect("Info.plist", ""), Some("xml"));
+    insta::assert_snapshot!(highlight("xml", "<!-- note -->\n<a b=\"c\">text</a>\n"), @r#"
+    <comment><!-- note --></>
+    <punctuation><</><tag>a</> <property>b</><operator>=</><punctuation>"</><string>c</><punctuation>"></>text<punctuation></</><tag>a</><punctuation>></>
+    "#);
+}
+
+/// Identifiers stay plain: the query's `#lua-match?` patterns for
+/// constants and types are read as `#match?`.
+#[test]
+fn zig_roles() {
+    assert_eq!(detect("src/main.zig", ""), Some("zig"));
+    assert_eq!(detect("build.zig.zon", ""), Some("zig"));
+    insta::assert_snapshot!(highlight(
+        "zig",
+        "// note\nconst std = @import(\"std\");\npub fn f(x: u32) u32 { return x; }\n"
+    ), @r#"
+    <comment>// note</>
+    <keyword>const</> std <operator>=</> <keyword>@import</><punctuation>(</><string>"std"</><punctuation>);</>
+    <keyword>pub</> <keyword>fn</> <function>f</><punctuation>(</>x<punctuation>:</> <type>u32</><punctuation>)</> <type>u32</> <punctuation>{</> <keyword>return</> x<punctuation>;</> <punctuation>}</>
+    "#);
 }
 
 /// Cache keys carry a language's identity: stable for one grammar, apart

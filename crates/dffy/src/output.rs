@@ -98,6 +98,16 @@ impl Output {
         }
     }
 
+    /// Writes to `writer`, for tests.
+    #[cfg(test)]
+    pub(crate) fn to(writer: impl Write + 'static) -> Self {
+        Self {
+            writer: BufWriter::new(Box::new(writer)),
+            pager: None,
+            interrupted: None,
+        }
+    }
+
     /// Starts `command` through `sh -c`, as git does, and writes to it. Falls
     /// back to stdout when the pager can't start.
     pub(crate) fn paged(command: &str) -> Self {

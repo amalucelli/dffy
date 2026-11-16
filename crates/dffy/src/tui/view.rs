@@ -149,6 +149,9 @@ pub(crate) struct Doc {
     /// The logical row drawn on each screen row of the pane in the last
     /// frame; `None` for empty rows.
     drawn: Vec<Option<Pos>>,
+    /// Where the last frame's pane was drawn; the next frame reuses its
+    /// rows only when drawn there again.
+    painted: Option<(usize, usize, usize)>,
     pub selection: Option<Selection>,
 }
 
@@ -166,6 +169,7 @@ impl Doc {
             separators: Vec::new(),
             target: None,
             drawn: Vec::new(),
+            painted: None,
             selection: None,
         }
     }
@@ -883,39 +887,59 @@ impl Doc {
     }
 
     /// Draws from the position down into rows `top..top + self.height` of
-    /// `grid`, columns `x..end`. Returns the files drawn. The first
-    /// separator on screen is drawn highlighted, as what `x` reveals.
+    /// `grid`, columns `x..end`. The first separator on screen is drawn
+    /// highlighted, as what `x` reveals.
+    ///
+    /// `previous` is the last frame's grid, given when nothing but the
+    /// position changed since. When the position is still within a screen
+    /// of the last frame's, the rows still on screen are copied from it
+    /// and only the rows that came into view are laid out.
+    ///
+    /// Returns the files drawn, and when rows were copied, the pane's rows
+    /// of the grid and how many rows the view scrolled down by (up when
+    /// negative).
     pub(crate) fn draw(
         &mut self,
         grid: &mut Grid,
-        x: usize,
-        end: usize,
-        top: usize,
+        previous: Option<&Grid>,
+        (x, end, top): (usize, usize, usize),
         theme: &Theme,
         frame: u64,
-    ) -> Range<usize> {
-        self.separators.clear();
-        self.target = None;
+    ) -> (Range<usize>, Option<(Range<usize>, isize)>) {
+        let target = self.target.take();
+        let painted = self.painted.take();
         if self.document.files().is_empty() {
-            return 0..0;
+            self.separators.clear();
+            return (0..0, None);
         }
         let overview = (self.overview && end > x + 1).then_some(end - 1);
         let end = overview.unwrap_or(end);
         let mut c = Canvas::default();
-        let mut pos = self.document.pos;
-        let file = pos.file;
+        let file = self.document.pos.file;
         let layout = self.file_layout(file);
-        self.drawn.clear();
-        self.drawn.resize(self.height, None);
-        let mut y = 0;
+        let area = (x, end, top);
+        self.painted = Some(area);
+        let reused = previous
+            .filter(|_| painted == self.painted)
+            .and_then(|previous| self.reuse(grid, previous, area, &layout));
+        let (scrolled, rows, mut pos) = if let Some((by, rows, from)) = reused {
+            (Some(by), rows, from)
+        } else {
+            self.separators.clear();
+            self.drawn.clear();
+            self.drawn.resize(self.height, None);
+            (None, 0..self.height, self.document.pos)
+        };
+        let kept = self.separators.len();
+        let mut y = rows.start;
         let mut last = pos;
-        while y < self.height {
+        while y < rows.end {
             c.clear();
             if self.render(pos, &layout, &mut c) && pos.offset == 0 {
                 self.separators.push((y, pos));
             }
             for (i, row) in c.rows().enumerate().skip(pos.offset) {
-                if y == self.height {
+                if y == rows.end {
                     break;
                 }
                 let after = paint(grid, x, top + y, end, row, theme, Attributes::NONE);
@@ -930,8 +954,19 @@ impl Doc {
                 break;
             }
         }
-        self.draw_selection(grid, x, end, top, &layout);
-        self.draw_search(grid, x, end, top, theme, &layout);
+        // Rows drawn above the copied ones: their separators come first.
+        if rows.start == 0 {
+            let new = self.separators.len() - kept;
+            self.separators.rotate_right(new);
+        }
+        let last = self
+            .drawn
+            .last()
+            .copied()
+            .flatten()
+            .map_or(last, |p| Pos { offset: 0, ..p });
+        self.draw_selection(grid, area, &layout);
+        self.draw_search(grid, area, theme, &layout, rows);
         self.document.touch(file, frame);
         if let Some(note) = self.note(file) {
             let text_width = unicode_width::UnicodeWidthStr::width(note);
@@ -948,16 +983,124 @@ impl Doc {
             );
             self.draw_overview(grid, column, top, lines, theme);
         }
+        let copied = target.filter(|_| scrolled.is_some());
+        self.draw_target(grid, &mut c, copied, area, &layout, theme);
+        (
+            file..file + 1,
+            scrolled.map(|by| (top..top + self.height, by)),
+        )
+    }
+
+    /// Draws the first separator on screen again, highlighted as what `x`
+    /// reveals. `copied` is the separator highlighted in the rows copied
+    /// from the last frame: when one scrolled in above it, it's drawn
+    /// plain again.
+    fn draw_target(
+        &mut self,
+        grid: &mut Grid,
+        c: &mut Canvas,
+        copied: Option<Pos>,
+        (x, end, top): (usize, usize, usize),
+        layout: &Layout,
+        theme: &Theme,
+    ) {
+        if let Some(old) = copied
+            && let Some(&(y, _)) = self.separators.iter().skip(1).find(|(_, p)| *p == old)
+        {
+            c.clear();
+            self.render(old, layout, c);
+            if let Some(row) = c.rows().next() {
+                grid.fill(x, top + y, end, Style::PLAIN);
+                let after = paint(grid, x, top + y, end, row, theme, Attributes::NONE);
+                if let Some(fill) = c.fill(0) {
+                    grid.fill(after, top + y, end, theme.ink_style(fill));
+                }
+            }
+        }
         if let Some(&(y, pos)) = self.separators.first() {
             self.target = Some(pos);
             c.clear();
-            self.render(pos, &layout, &mut c);
+            self.render(pos, layout, c);
             if let Some(row) = c.rows().next() {
                 grid.fill(x, top + y, end, Style::PLAIN);
                 paint(grid, x, top + y, end, row, theme, Attributes::NONE);
             }
         }
-        file..file + 1
+    }
+
+    /// Copies the rows of `previous`, the last frame, that are still on
+    /// screen to where they go now, and moves what's kept about them to
+    /// match. Returns how many rows the view scrolled down by (up when
+    /// negative), the rows left to draw, and the position the first of
+    /// them shows. `None`, having changed nothing, when the last frame
+    /// showed another file, no row of this frame, or rows other than the
+    /// document's (the note), or while lines are selected: scrolling with
+    /// a selection held is rare, and those frames are drawn whole.
+    fn reuse(
+        &mut self,
+        grid: &mut Grid,
+        previous: &Grid,
+        (x, end, top): (usize, usize, usize),
+        layout: &Layout,
+    ) -> Option<(isize, Range<usize>, Pos)> {
+        let (height, pos) = (self.height, self.document.pos);
+        let (first, bottom) = (self.drawn.first().copied()??, self.drawn.last().copied()??);
+        if self.drawn.len() != height
+            || first.file != pos.file
+            || self.note(pos.file).is_some()
+            || self.selection.is_some()
+            || (previous.width(), previous.height()) != (grid.width(), grid.height())
+        {
+            return None;
+        }
+        if let Some(k) = self.drawn.iter().position(|d| *d == Some(pos)) {
+            let by = isize::try_from(k).ok()?;
+            grid.copy_rows(previous, top + k..top + height, top, x..end);
+            self.drawn.copy_within(k.., 0);
+            self.drawn[height - k..].fill(None);
+            self.separators.retain(|(y, _)| *y >= k);
+            for (y, _) in &mut self.separators {
+                *y -= k;
+            }
+            let next = Pos {
+                offset: bottom.offset + 1,
+                ..bottom
+            };
+            return Some((by, height - k..height, next));
+        }
+        if pos > first {
+            return None;
+        }
+        let k = self.rows_between(pos, first, layout, height)?;
+        let by = -isize::try_from(k).ok()?;
+        grid.copy_rows(previous, top..top + height - k, top + k, x..end);
+        self.drawn.copy_within(..height - k, k);
+        self.drawn[..k].fill(None);
+        self.separators.retain_mut(|(y, _)| {
+            *y += k;
+            *y < height
+        });
+        Some((by, 0..k, pos))
+    }
+
+    /// Screen rows from `from` down to `to`, a later row of the same file
+    /// (offsets counted), when fewer than `limit`.
+    fn rows_between(&mut self, from: Pos, to: Pos, layout: &Layout, limit: usize) -> Option<usize> {
+        let logical = |p: Pos| Pos { offset: 0, ..p };
+        let mut pos = from;
+        let mut rows = 0;
+        while logical(pos) < logical(to) {
+            rows += self.height(pos, layout) - pos.offset;
+            if rows >= limit || !self.next_row(&mut pos, layout) {
+                return None;
+            }
+        }
+        if logical(pos) != logical(to) {
+            return None;
+        }
+        (rows + to.offset)
+            .checked_sub(pos.offset)
+            .filter(|&rows| rows < limit)
     }
 
     /// Shows the selected lines in reverse video, on their side's half of
@@ -965,9 +1108,7 @@ impl Doc {
     fn draw_selection(
         &mut self,
         grid: &mut Grid,
-        x: usize,
-        end: usize,
-        top: usize,
+        (x, end, top): (usize, usize, usize),
         layout: &Layout,
     ) {
         let Some(selection) = self.selection.clone() else {
@@ -1029,24 +1170,23 @@ impl Doc {
         self.mapped = mapped;
     }
 
-    /// Paints the search's matches on the rows drawn, the current one in
-    /// its own color. Only the rows on screen are looked up, however many
+    /// Paints the search's matches on screen rows `rows`, the current one
+    /// in its own color. Only those rows are looked up, however many
     /// matches the file has. `layout` is the drawn file's.
     fn draw_search(
         &mut self,
         grid: &mut Grid,
-        x: usize,
-        end: usize,
-        top: usize,
+        (x, end, top): (usize, usize, usize),
         theme: &Theme,
         layout: &Layout,
+        rows: Range<usize>,
     ) {
         let Some(marks) = self.document.search.take() else {
             return;
         };
         let mut mapped = std::mem::take(&mut self.mapped);
         let mut previous = None;
-        for y in 0..self.drawn.len() {
+        for y in rows {
             let Some(pos) = self.drawn[y] else { continue };
             let logical = Pos { offset: 0, ..pos };
             if pos.file != marks.file {

@@ -16,7 +16,7 @@ use dffy_core::document::{
     self, File, NO_NEWLINE_LINE, diff_line, file_header, hunk_header, structural_note,
 };
 use dffy_core::git::{CommitInfo, DiffSpec, FileChange, FileDiff, Repo, Revisions, Status};
-use dffy_core::highlight::{HunkSyntax, PARALLEL_PARSE_BYTES, Registry};
+use dffy_core::highlight::{HunkSyntax, Language, PARALLEL_PARSE_BYTES, Registry};
 use dffy_core::patch::TextKind;
 use dffy_core::structural::{Structural, Unavailable};
 use dffy_core::view::{self, Arrangement, Heading, LineState, Row, Staging, no_newline};
@@ -69,29 +69,42 @@ pub(crate) fn prepare(
         None => cwd,
     };
     let repo = Repo::discover(&base)?;
-    let (spec, commit) = match target {
-        Target::Diff(revisions) => (repo.resolve_revisions(revisions)?, None),
-        Target::Show(rev) => {
-            let (id, spec) = repo.resolve_show(rev)?;
-            (spec, Some(repo.commit_info(id)?))
-        }
-    };
-    let paths = paths
-        .iter()
-        .map(|p| repo_relative(repo.workdir(), &base, p))
-        .collect::<Result<_, _>>()?;
-    Ok(Plan {
-        repo,
-        spec,
-        commit,
-        paths,
-        summary,
-        reverse,
-        base,
-    })
+    Plan::resolve(repo, base, target, paths, summary, reverse)
 }
 
 impl Plan {
+    /// Resolves what to diff in an open repository; `paths` are relative to
+    /// `base`.
+    pub(crate) fn resolve(
+        repo: Repo,
+        base: PathBuf,
+        target: &Target,
+        paths: &[PathBuf],
+        summary: Summary,
+        reverse: bool,
+    ) -> Result<Self, Error> {
+        let (spec, commit) = match target {
+            Target::Diff(revisions) => (repo.resolve_revisions(revisions)?, None),
+            Target::Show(rev) => {
+                let (id, spec) = repo.resolve_show(rev)?;
+                (spec, Some(repo.commit_info(id)?))
+            }
+        };
+        let paths = paths
+            .iter()
+            .map(|p| repo_relative(repo.workdir(), &base, p))
+            .collect::<Result<_, _>>()?;
+        Ok(Self {
+            repo,
+            spec,
+            commit,
+            paths,
+            summary,
+            reverse,
+            base,
+        })
+    }
+
     /// Two files or folders compared outside git; `base` is where `--focus`
     /// paths start.
     pub(crate) fn compare(repo: Repo, base: &Path, summary: Summary, reverse: bool) -> Self {
@@ -378,6 +391,29 @@ enum Done {
     End(Result<bool, Error>),
 }
 
+/// The per-file step of the print writer ([`Plan::stream`]): diffs a file
+/// and encodes its output. The writer runs it on its threads, writes the
+/// outputs in order and bounds what they hold.
+pub(crate) trait FileOutput: Sync {
+    /// Written between the outputs of two files.
+    const SEPARATOR: &'static [u8];
+
+    /// Diffs `change` (with its sides' sizes, when they could be read) and
+    /// hands its encoded output to `emit` in parts. `false` when the file is
+    /// left out, before anything is emitted.
+    fn file(
+        &self,
+        repo: &Repo,
+        change: FileChange,
+        sizes: Option<[u64; 2]>,
+        emit: &mut dyn FnMut(Vec<u8>) -> Result<(), Error>,
+    ) -> Result<bool, Error>;
+
+    /// `change` is queued for [`FileOutput::file`], which a worker may not
+    /// take up for a while. Called on the writer's thread, in file order.
+    fn queued(&self, _change: &FileChange) {}
+}
+
 /// How print mode diffs, lays out and encodes each file.
 struct Renderer<'a> {
     layout: crate::render::Layout,
@@ -391,6 +427,9 @@ struct Renderer<'a> {
     cores: usize,
     /// Files whose sides are being parsed for highlighting now.
     parsing: std::sync::atomic::AtomicUsize,
+    /// Languages whose query compile has been started ahead of their first
+    /// file.
+    prepared: std::sync::Mutex<Vec<Language>>,
 }
 
 impl Renderer<'_> {
@@ -419,9 +458,11 @@ impl Renderer<'_> {
             other => other.map_err(Error::from),
         }
     }
+}
 
-    /// Diffs and lays out a file, handing its encoded output to `emit` in
-    /// parts. `false` when the file is left out, before anything is emitted.
+impl FileOutput for Renderer<'_> {
+    const SEPARATOR: &'static [u8] = b"\n";
+
     fn file(
         &self,
         repo: &Repo,
@@ -503,6 +544,39 @@ impl Renderer<'_> {
         })
     }
 
+    /// Starts compiling the query of a language not seen yet, so it runs
+    /// while the files queued ahead of this one are diffed instead of
+    /// beside its first parse. Only while a core isn't parsing; otherwise a
+    /// later file of the language tries again, and its first parse compiles
+    /// it at the latest. By path only: a file known by its `#!` line alone
+    /// compiles beside its parse.
+    fn queued(&self, change: &FileChange) {
+        if !self.highlight || self.parsing.load(std::sync::atomic::Ordering::Relaxed) >= self.cores
+        {
+            return;
+        }
+        let Some(lang) = self.grammars.detect(&change.path, &[]) else {
+            return;
+        };
+        let mut prepared = self
+            .prepared
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if prepared.contains(lang) {
+            return;
+        }
+        let lang = lang.clone();
+        prepared.push(lang.clone());
+        // Detached, as nothing joins it: the language's first parse waits on
+        // the same compile. Out of threads, that parse compiles it instead.
+        std::thread::Builder::new()
+            .name("dffy-query".into())
+            .spawn(move || lang.prepare())
+            .ok();
+    }
+}
+
+impl Renderer<'_> {
     /// Lays out and encodes `fd`, handing the output to `emit` in parts.
     fn lay_out(
         &self,
@@ -539,81 +613,85 @@ impl Renderer<'_> {
         flush(&mut c);
         emitted
     }
+}
 
-    /// A worker: diffs, lays out and encodes files from `queue` until it
-    /// closes, sending each whole to the writer.
-    fn files(
-        &self,
-        repo: &Repo,
-        queue: &std::sync::Mutex<std::sync::mpsc::Receiver<Job>>,
-        done: &std::sync::mpsc::SyncSender<Done>,
-        stop: &std::sync::atomic::AtomicBool,
-    ) {
-        loop {
-            let job = queue
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .recv();
-            let Ok((i, change, sizes, held)) = job else {
-                break;
-            };
-            if stop.load(std::sync::atomic::Ordering::Relaxed) {
-                break;
-            }
-            let mut parts = Vec::new();
-            let shown = self.file(repo, change, sizes, &mut |part| {
-                parts.push(part);
-                Ok(())
-            });
-            let rendered = shown.map(|shown| shown.then_some(parts));
-            if done.send(Done::File(i, held, rendered)).is_err() {
-                break;
-            }
+/// A worker: diffs and encodes files from `queue` until it closes, sending
+/// each whole to the writer.
+fn files(
+    output: &impl FileOutput,
+    repo: &Repo,
+    queue: &std::sync::Mutex<std::sync::mpsc::Receiver<Job>>,
+    done: &std::sync::mpsc::SyncSender<Done>,
+    stop: &std::sync::atomic::AtomicBool,
+) {
+    loop {
+        let job = queue
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .recv();
+        let Ok((i, change, sizes, held)) = job else {
+            break;
+        };
+        if stop.load(std::sync::atomic::Ordering::Relaxed) {
+            break;
+        }
+        let mut parts = Vec::new();
+        let shown = output.file(repo, change, sizes, &mut |part| {
+            parts.push(part);
+            Ok(())
+        });
+        let rendered = shown.map(|shown| shown.then_some(parts));
+        if done.send(Done::File(i, held, rendered)).is_err() {
+            break;
         }
     }
+}
 
-    /// Lays out the files larger than the whole budget from `queue`, one at
-    /// a time, while the workers carry on with the files after it. Each is
-    /// diffed right away, but its parts go to the writer only once a token
-    /// on `turns` says every file before it is out, so none are held.
-    fn large_files(
-        &self,
-        repo: &Repo,
-        queue: std::sync::mpsc::Receiver<(FileChange, Option<[u64; 2]>)>,
-        turns: &std::sync::mpsc::Receiver<()>,
-        done: &std::sync::mpsc::SyncSender<Done>,
-        stop: &std::sync::atomic::AtomicBool,
-    ) {
-        let stopped = || Error::fatal("the print writer stopped");
-        for (change, sizes) in queue {
-            if stop.load(std::sync::atomic::Ordering::Relaxed) {
-                break;
+/// Threads the machine runs at once.
+fn cores() -> usize {
+    std::thread::available_parallelism().map_or(1, std::num::NonZero::get)
+}
+
+/// Diffs and encodes the files larger than the whole budget from `queue`,
+/// one at a time, while the workers carry on with the files after it. Each
+/// is diffed right away, but its parts go to the writer only once a token
+/// on `turns` says every file before it is out, so none are held.
+fn large_files(
+    output: &impl FileOutput,
+    repo: &Repo,
+    queue: std::sync::mpsc::Receiver<(FileChange, Option<[u64; 2]>)>,
+    turns: &std::sync::mpsc::Receiver<()>,
+    done: &std::sync::mpsc::SyncSender<Done>,
+    stop: &std::sync::atomic::AtomicBool,
+) {
+    let stopped = || Error::fatal("the print writer stopped");
+    for (change, sizes) in queue {
+        if stop.load(std::sync::atomic::Ordering::Relaxed) {
+            break;
+        }
+        let mut turn = false;
+        let shown = output.file(repo, change, sizes, &mut |part| {
+            if !turn {
+                turns.recv().map_err(|_| stopped())?;
+                turn = true;
             }
-            let mut turn = false;
-            let shown = self.file(repo, change, sizes, &mut |part| {
-                if !turn {
-                    turns.recv().map_err(|_| stopped())?;
-                    turn = true;
-                }
-                done.send(Done::Part(part)).map_err(|_| stopped())
-            });
-            // A file left out, or failing, still waits for its turn.
-            let shown = if turn {
-                shown
-            } else {
-                turns.recv().map_err(|_| stopped()).and(shown)
-            };
-            if done.send(Done::End(shown)).is_err() {
-                break;
-            }
+            done.send(Done::Part(part)).map_err(|_| stopped())
+        });
+        // A file left out, or failing, still waits for its turn.
+        let shown = if turn {
+            shown
+        } else {
+            turns.recv().map_err(|_| stopped()).and(shown)
+        };
+        if done.send(Done::End(shown)).is_err() {
+            break;
         }
     }
 }
 
 impl Plan {
     /// Writes each file's diff in order while worker threads diff,
-    /// highlight, lay out and encode the files after it, as many as
-    /// [`BUDGET`] allows. Returns whether any file was written.
+    /// highlight, lay out and encode the files after it.
     fn write_diffs(&self, ctx: &Ctx, out: &mut Output, options: Options) -> Result<bool, Error> {
         let render = Renderer {
             layout: ctx.layout(),
@@ -623,38 +701,47 @@ impl Plan {
             syntax_diff: ctx.config.syntax_diff,
             grammars: crate::grammars(),
             cache: ctx.cache.as_ref(),
-            cores: std::thread::available_parallelism().map_or(1, std::num::NonZero::get),
+            cores: cores(),
             parsing: std::sync::atomic::AtomicUsize::new(0),
+            prepared: std::sync::Mutex::new(Vec::new()),
         };
+        self.stream(ctx, out, &render)
+    }
+
+    /// Writes each file's output from `output` in order, separated by its
+    /// [`FileOutput::SEPARATOR`], while worker threads diff and encode the
+    /// files after it, as many as [`BUDGET`] allows. Returns whether any
+    /// file was written.
+    pub(crate) fn stream<O: FileOutput>(
+        &self,
+        ctx: &Ctx,
+        out: &mut Output,
+        output: &O,
+    ) -> Result<bool, Error> {
+        let cores = cores();
         let (jobs, queue) = std::sync::mpsc::channel::<Job>();
         let queue = std::sync::Mutex::new(queue);
         // Bounded, so a large file's parts stop being laid out while the
         // output is stalled, as when a pager stops reading.
-        let (done, results) = std::sync::mpsc::sync_channel::<Done>(render.cores * 2);
+        let (done, results) = std::sync::mpsc::sync_channel::<Done>(cores * 2);
         let (large, large_queue) = std::sync::mpsc::channel();
         let (turns, turn) = std::sync::mpsc::channel();
         // Set when output fails (the reader went away), so workers drop the
         // files still queued instead of rendering them.
         let stop = std::sync::atomic::AtomicBool::new(false);
         std::thread::scope(|scope| {
-            let (repo, lane, render_ref, stop_ref) = (
-                self.repo.without_object_cache(),
-                done.clone(),
-                &render,
-                &stop,
-            );
+            let (repo, lane, stop_ref) = (self.repo.without_object_cache(), done.clone(), &stop);
             scope.spawn(move || {
-                render_ref.large_files(&repo, large_queue, &turn, &lane, stop_ref);
+                large_files(output, &repo, large_queue, &turn, &lane, stop_ref);
             });
-            for _ in 0..render.cores {
-                let (repo, done, queue, render, stop) = (
+            for _ in 0..cores {
+                let (repo, done, queue, stop) = (
                     self.repo.without_object_cache(),
                     done.clone(),
                     &queue,
-                    &render,
                     &stop,
                 );
-                scope.spawn(move || render.files(&repo, queue, &done, stop));
+                scope.spawn(move || files(output, &repo, queue, &done, stop));
             }
             drop(done);
             let mut writer = InOrder {
@@ -666,6 +753,7 @@ impl Plan {
                     limit: BUDGET,
                     held: 0,
                 },
+                separator: O::SEPARATOR,
                 started: false,
                 turns,
                 large: std::collections::VecDeque::new(),
@@ -677,6 +765,7 @@ impl Plan {
                     let Some(change) = change else {
                         return writer.wait_for(sent, out);
                     };
+                    output.queued(&change);
                     let sizes = self.repo.sizes(&change).ok();
                     let held = sizes.map_or(0, held_bytes);
                     // A thread hung up only if it panicked; waiting for its
@@ -724,7 +813,7 @@ impl Plan {
     /// and the rest wait for the rename pass. `emit(None)` comes when that
     /// wait starts and before the pass runs, so whatever is pending can go
     /// out first.
-    fn for_each_change(
+    pub(crate) fn for_each_change(
         &self,
         ctx: &Ctx,
         emit: &mut dyn FnMut(Option<FileChange>) -> Result<(), Error>,
@@ -778,6 +867,8 @@ struct InOrder {
     next: usize,
     any: bool,
     budget: Budget,
+    /// Written between two files.
+    separator: &'static [u8],
     /// Part of the next file is out.
     started: bool,
     /// Tells the large-file thread that its next file is next to write.
@@ -853,11 +944,11 @@ impl InOrder {
         }
     }
 
-    /// Writes part of the next file, after the blank line between files
-    /// when it's the first part.
+    /// Writes part of the next file, after the separator between files when
+    /// it's the first part.
     fn write_part(&mut self, part: &[u8], out: &mut Output) -> Result<(), Error> {
-        if !self.started && self.any {
-            out.write_raw(b"\n")?;
+        if !self.started && self.any && !self.separator.is_empty() {
+            out.write_raw(self.separator)?;
         }
         self.started = true;
         Ok(out.write_raw(part)?)

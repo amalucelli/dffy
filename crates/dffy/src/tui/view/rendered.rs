@@ -1250,9 +1250,8 @@ mod tests {
         doc.height = 8;
         doc.draw(
             &mut grid,
-            0,
-            60,
-            0,
+            None,
+            (0, 60, 0),
             &crate::theme::Theme::default_theme(),
             1,
         );

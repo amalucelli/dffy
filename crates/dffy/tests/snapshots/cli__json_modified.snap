@@ -1,0 +1,7 @@
+---
+source: crates/dffy/tests/cli.rs
+expression: "json(d, &[], &[\"lib.rs\"])"
+---
+{"type":"header","version":1,"old":{"kind":"tree","id":"bfad37707764a70cf0a0cf8a9a549dd83f87b626"},"new":{"kind":"tree","id":"44c4ea573a9b62ac060b6c55d29a0367ea962239"},"untracked":false,"revisions":["main~1","main"],"paths":["lib.rs"],"options":{"context":3,"whitespace":"exact","syntax":false,"renames":true,"highlights":false,"summary":false}}
+{"type":"file","path":"lib.rs","old_path":"lib.rs","status":"modified","similarity":null,"old_mode":"100644","new_mode":"100644","binary":false,"too_large":false,"language":"rust","added":1,"removed":1,"syntax":null,"classification":null,"note":null,"hunks":[{"old_start":1,"old_lines":3,"new_start":1,"new_lines":3,"heading":null,"lines":[{"kind":"removed","mark":"modified","old":1,"new":null,"text":"pub fn add(a: i32, b: i32) -> i32 {","emphasis":[[14,17],[22,25],[30,33]]},{"kind":"added","mark":"modified","old":null,"new":1,"text":"pub fn add(a: i64, b: i64) -> i64 {","emphasis":[[14,17],[22,25],[30,33]]},{"kind":"context","old":2,"new":2,"text":"    a + b"},{"kind":"context","old":3,"new":3,"text":"}"}]}]}
+{"type":"end","files":1,"added":1,"removed":1}

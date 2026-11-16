@@ -37,7 +37,7 @@ Layer 1 is the exception: `highlight` and `structural` store results through `ca
 | `diff::intraline` | Token-level emphasis inside changed lines, and the pairing of a change block's removed and added lines, for hunks and for a patch's lines alike. |
 | `view` | What a frontend draws, short of how it looks: a hunk's lines and their states (modified, moved, reformatted), headers, rows in the split or unified arrangement, syntax runs, paint and attributes, hunk headings. No widths, colors or cells. |
 | `patch` | Unified diffs read as text (`git diff`, `git log -p`, `diff -u`): the line-at-a-time parser and its events, what text lines and combined-diff lines are, and the builder that collects events into commits and files. No I/O: the host reads the input and stores what it keeps. |
-| `highlight` | tree-sitter highlighting of the requested lines, and a file's two sides prepared for it. The grammar registry (`Registry`) is a value the host builds and passes in, with the 18 bundled grammars as `Registry::builtin`; each grammar has an identity that goes into cache keys. |
+| `highlight` | tree-sitter highlighting of the requested lines, and a file's two sides prepared for it. The grammar registry (`Registry`) is a value the host builds and passes in, with the 30 bundled grammars as `Registry::builtin`; each grammar has an identity that goes into cache keys. |
 | `structural` | The syntax-aware diff: anchoring, per-region matching, the result cache. |
 | `git` | Revision resolution (through gix), streaming change enumeration, content loading. |
 | `git::spec` | `git diff`-style arguments resolved to the two sides of a diff. |
@@ -53,7 +53,7 @@ Layer 1 is the exception: `highlight` and `structural` store results through `ca
 
 ### `dffy`
 
-The `dffy` binary: CLI, printed output, pager mode, the viewer and the watch broker. It's also a library so the benchmarks can reach it.
+The `dffy` binary: CLI, printed output, pager mode, the viewer, the MCP server and the watch broker. It's also a library so the benchmarks can reach it.
 
 | Module | What it owns |
 |---|---|
@@ -65,6 +65,8 @@ The `dffy` binary: CLI, printed output, pager mode, the viewer and the watch bro
 | `theme` | Roles, themes and tints. |
 | `output` | Terminal facts, color decisions, stdout or a pager process. |
 | `print` | Printed output from the repository, streamed file by file: the threads and output budget around the core's per-file steps, and laying each file out. |
+| `json` | `--json`: the header, file and end objects of [json.md](json.md), written by hand from the core's per-file steps and streamed through `print`'s writer. A file object can also hold a window of its hunks, for hosts that page. |
+| `mcp` | `dffy mcp`: the Model Context Protocol server ([mcp.md](mcp.md)). Hand-written JSON-RPC over stdio on the `plugin` module's JSON, both protocol eras, the three tools, cursors and the text rendering. |
 | `no_index` | When two arguments are paths to compare rather than revisions, and what the comparison is called (`git difftool`'s temporary copies included). |
 | `pager` | Pager mode: the stdin reader and line splitting, streaming the core's `patch` events into rendered rows, and `--color-only`. |
 | `plugin` | Renderer plugins: the `render` setting, finding `dffy-render-<name>` on `PATH`, running one with a timeout, the protocol's JSON. |
@@ -89,7 +91,20 @@ The viewer's submodules, under `tui`:
 
 ### `plugins/markdown`
 
-`dffy-render-markdown`, the Markdown renderer plugin. It turns pulldown-cmark events into blocks of styled lines and writes the protocol's JSON with serde_json. [plugins.md](plugins.md) has the protocol.
+`dffy-render-markdown`, the Markdown renderer plugin. It turns pulldown-cmark events into blocks of styled lines and writes the protocol's JSON with serde_json. [plugins.md](plugins.md) has the protocol. ```` ```mermaid ```` fences go through `plugins/mermaid`'s library; one it can't draw stays a code block.
+
+### `plugins/mermaid`
+
+`dffy-render-mermaid`, the Mermaid renderer plugin. It's a library, which the Markdown plugin uses, and a binary that answers the protocol. The binary falls back to the source lines when the library returns nothing.
+
+| Module | What it owns |
+|---|---|
+| `canvas` | A grid of cells. Lines are kept as the directions each cell joins, so meeting and crossing lines become the right junction whatever order they're drawn in. |
+| `flowchart` | The flowchart parser. |
+| `flowchart::layout` | The layered layout, in the manner of Sugiyama: back edges turned around, longest-path layers, placeholders for long edges, barycenter ordering with subgraphs kept together, least-squares placement, one track per bending edge between layers, and frames. It works in layer/along-layer coordinates, so top-down and left-right charts share it, and bottom-up and right-left are flips. |
+| `sequence` | Sequence diagrams: parser, column spacing, and a block per statement. |
+
+Each module draws once, at the narrowest label wrap that fits the width; sizes are measured before drawing. Past the size limits in [plugins.md](plugins.md#the-mermaid-plugin), the library returns nothing: layout cost grows with edges times layers, and drawing cost with the drawing's area.
 
 ### `xtask`
 
@@ -101,7 +116,7 @@ The viewer never waits for the whole diff.
 
 1. A change-set thread lists changed files in git's path order and sends them as they're found. For a range that's a tree merge-join; for the working tree, a parallel stat scan of the index, then the untracked walk. The first files paint before the scan finishes.
 2. Once the list is complete, the rename pass pairs deletions with additions and updates the list in place.
-3. A worker pool diffs a file when it's about to be drawn, then computes emphasis and highlighting for the hunks on screen only, as the core's `Document::missing` names them for the rows drawn and through the same `File::prepare` steps printed output uses. The syntax diff, when on, runs on the files on screen after the line diff has painted. When idle, the pool counts every file's lines for the tree.
+3. A worker pool diffs a file when it's about to be drawn, then computes emphasis and highlighting for the hunks on screen only, as the core's `Document::missing` names them for the rows drawn and through the same `File::prepare` steps printed output uses. The syntax diff, when on, runs on the files on screen after the line diff has painted. When idle, the pool compiles the highlight queries of the languages in the list, then counts every file's lines for the tree.
 4. Rendering touches only the rows drawn. A view's position is anchored to a row of a hunk instead of a screen row, so loading a diff, resizing or switching layout never measures a whole file.
 5. Renderer plugins run last, and only when asked. With the rendered view on, a worker sends the file shown to its renderer once its line diff is loaded. The answer's blocks are diffed as units (`diff::unit_hunks`) into an ordinary `document::File` (built by `view::rendered`) that takes the line diff's place. Without a `render` setting, nothing about renderers happens.
 
@@ -110,6 +125,10 @@ The viewer never waits for the whole diff.
 - Revisions are resolved before anything is written, so errors never land inside a pager.
 - Files then stream one by one, each prepared whole by the core's `File::prepare`.
 - With renames on, files from the first addition or deletion on are held until the rename pass has paired them.
+
+### MCP server
+
+- The repository handle, the grammars and the disk cache stay open across calls; each call resolves its revisions and lists the whole change set again (renames paired), then diffs only the page it returns, a file per core.
 
 ### Pager mode
 
@@ -151,8 +170,9 @@ dffy's own pass, following git 2.43's diffcore-rename:
 
 ### Highlighting and grammars
 
-- **Highlighting:** a file side is parsed once, and the highlight query runs only over the lines asked for. Queries compile on first use per language (3–35ms each), beside that first parse. When both sides are 32KB or more they parse on two threads at once, in print mode only while cores are free. Sides over 512KB, or whose parse takes over 200ms, stay plain.
-- **Grammars:** Bash, C, C++, CSS, Go, HTML, Java, JavaScript, JSON, Lua, Markdown, Python, Ruby, Rust, TOML, TSX, TypeScript and YAML (tree-sitter, bundled). They're about 15MB of the 20MB binary.
+- **Highlighting:** a file side is parsed once, and the highlight query runs only over the lines asked for. Queries compile once per language (under 0.1ms to 140ms, Swift's; about 430ms for all), in the background once a file of the language appears in the change list: in the viewer when the pool is idle, one at a time; in print mode when the file is queued, while a core isn't parsing. A parse that comes first compiles the query beside it, as does one of a file known by its `#!` line alone. When both sides are 32KB or more they parse on two threads at once, in print mode only while cores are free. Sides over 512KB, or whose parse takes over 200ms, stay plain.
+- **Grammars:** Bash, C, C++, C#, CSS, Dockerfile, Elixir, Go, HCL (Terraform), HTML, Java, JavaScript, JSON, Kotlin, Lua, Make, Markdown, PHP, Python, Ruby, Rust, Scala, SQL, Swift, TOML, TSX, TypeScript, XML, YAML and Zig (tree-sitter, bundled). They're about 52MB of the 57MB binary; SQL's alone is about 13MB.
+- **Queries:** each grammar's own highlight query, except HCL's, which dffy writes itself (`crates/dffy-core/src/highlight/queries/hcl/`) as the grammar crate ships none, and Kotlin's, which gets a few patterns appended. Queries written for Neovim compile as they are: `#lua-match?` is read as `#match?`, and `@spell` is ignored.
 
 ### git access
 
@@ -183,6 +203,7 @@ dffy's own pass, following git 2.43's diffcore-rename:
 dffy has its own terminal layer (`term`); it uses no TUI library.
 
 - **Cell grid:** the screen is a double-buffered grid of styled cells. Each flush sends only the cells that changed since the last frame.
+- **Scrolling:** when only the diff's position changed since the last frame, the rows still on screen are copied from it and only the rows that came into view are laid out. The terminal moves the copied rows itself (a scroll region, `CSI t;b r`, and deleted or inserted lines, `CSI n M` / `CSI n L`), so only the new rows and what else changed are sent. A scroll region spans whole rows, so with the tree beside the diff its columns move too and are sent again; the terminal scrolls only while those cells, counted a third more, are fewer than the diff's cells that moved.
 - **Synchronized output:** every flush is wrapped in `CSI ? 2026 h` / `l`, so terminals that support it never show half a frame.
 - **Input:** raw termios and dffy's own parser. It uses no extended keyboard protocols, only input that every terminal and multiplexer passes through.
 - **The one query:** the background color (OSC 11), with a 200ms timeout and a dark fallback.
@@ -291,13 +312,14 @@ A dependency must be an established crate, added only when a few lines can't do 
 
 | Crate | Direct dependencies |
 |---|---|
-| dffy-core | gix, tree-sitter with 18 grammars, ignore, memchr, rustc-hash, thiserror, objc2 (macOS), rustix (Linux) |
+| dffy-core | gix, tree-sitter with 30 grammars, ignore, memchr, rustc-hash, thiserror, objc2 (macOS), rustix (Linux) |
 | dffy | dffy-core, clap (with clap_complete and clap_mangen), rustix, signal-hook, unicode-width |
-| `plugins/markdown` | pulldown-cmark, serde_json, unicode-width |
+| `plugins/markdown` | dffy-render-mermaid, pulldown-cmark, serde_json, unicode-width |
+| `plugins/mermaid` | serde_json, unicode-width |
 | `xtask` | serde_json, portable-pty, vt100 |
 
 - **gix** is built without `max-performance`, which pulls in an MPL-2.0 crate.
-- **JSON:** dffy has no JSON crate; the renderer protocol's JSON is hand-written.
+- **JSON:** dffy has no JSON crate; the renderer protocol's, `--json`'s and the MCP server's JSON is hand-written.
 - **Checks:** `task deny` checks advisories, licenses, bans and sources; `task machete` finds unused dependencies.
 
 ## Releases

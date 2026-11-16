@@ -1,0 +1,22 @@
+[package]
+name = "dffy-render-mermaid"
+description = "An experimental dffy renderer plugin that shows Mermaid diagram diffs drawn as text"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+readme.workspace = true
+keywords = ["diff", "mermaid", "terminal", "dffy"]
+categories = ["command-line-utilities", "development-tools"]
+
+[lints]
+workspace = true
+
+[dependencies]
+serde_json = "1.0.154"
+unicode-width = "0.2.3"
+
+[dev-dependencies]
+insta = "1.49.0"

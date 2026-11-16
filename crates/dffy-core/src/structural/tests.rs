@@ -162,6 +162,21 @@ fn hunks_reproduce_new_in_every_fixture_language() {
             "{\"a\": [1, 2, 3], \"b\": {\"c\": true}}\n",
             "{\n  \"b\": {\"c\": false},\n  \"a\": [1, 2, 3, 4]\n}\n",
         ),
+        (
+            "a.kt",
+            "fun f(a: Int): Int {\n    return a + 1\n}\nval x = f(3)\n",
+            "val x = f(3)\nfun f(a: Int, b: Int): Int {\n    return a + b\n}\n",
+        ),
+        (
+            "main.tf",
+            "variable \"a\" {\n  default = 1\n}\nresource \"r\" \"b\" { count = var.a }\n",
+            "resource \"r\" \"b\" {\n  count = var.a\n}\nvariable \"a\" {\n  default = 2\n}\n",
+        ),
+        (
+            "a.sql",
+            "SELECT a, b FROM t WHERE c = 1;\nDELETE FROM u;\n",
+            "DELETE FROM u;\nSELECT\n  b,\n  a\nFROM t\nWHERE c = 2;\n",
+        ),
         // Syntax errors on both sides.
         (
             "broken.c",
@@ -313,6 +328,15 @@ fn reindenting_is_a_change_where_indentation_is_syntax() {
     insta::assert_snapshot!(show(&o, &n, &s.hunks), @r"
     -        b(2)
     +    b(2)
+    ");
+    // Scala 3's braceless syntax: the same move out of the `if`.
+    let old = "def f(x: Int) =\n  if x > 0 then\n    a(1)\n    b(2)\n";
+    let new = "def f(x: Int) =\n  if x > 0 then\n    a(1)\n  b(2)\n";
+    let s = check("a.scala", old, new);
+    let (o, n) = texts(old, new);
+    insta::assert_snapshot!(show(&o, &n, &s.hunks), @r"
+    -    b(2)
+    +  b(2)
     ");
 }
 

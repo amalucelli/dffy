@@ -5,8 +5,12 @@
 //! intra-line emphasis uses as tokens.
 //!
 //! Which grammar a file gets comes from the host's [`Registry`]. Queries are
-//! compiled on first use per language and kept as long as its registry
-//! entry: compiling all of them costs about 80ms, one costs 3–35ms.
+//! compiled on first use per language, or ahead of it when the host calls
+//! [`Language::prepare`], and kept as long as its registry entry: compiling all of them costs about 430ms, one costs under 0.1ms
+//! (JSON) to 140ms (Swift). The cost is tree-sitter checking each pattern
+//! that nests a child under a named node against the grammar's parse
+//! table, plus a per-grammar floor (12ms for SQL with an empty query), so
+//! dropping patterns dffy doesn't draw saves little.
 
 mod lang;
 
@@ -46,7 +50,7 @@ fn role(name: &str) -> Option<Syntax> {
     let specific = match name {
         "variable.builtin" => Some(Syntax::VariableBuiltin),
         "string.escape" | "escape" => Some(Syntax::Escape),
-        "string.special.key" => Some(Syntax::Property),
+        "string.special.key" | "variable.member" => Some(Syntax::Property),
         "constructor" => Some(Syntax::Type),
         "text.title" | "markup.heading" => Some(Syntax::Keyword),
         "text.literal" | "markup.raw" => Some(Syntax::String),
@@ -84,8 +88,18 @@ struct Compiled {
 
 impl Compiled {
     /// `None` if `source` doesn't compile against `grammar`.
+    ///
+    /// Queries written for Neovim get two adjustments. tree-sitter skips
+    /// predicates it doesn't know, so a pattern guarded by `#lua-match?`
+    /// would match every node: it's read as `#match?`, which agrees with
+    /// it on the patterns the bundled queries use (Lua's `%` classes and
+    /// `-` don't carry over). And `@spell` marks text to spell-check,
+    /// often on the same node as a real capture; listed first, it would
+    /// claim a comment and leave it plain.
     fn new(grammar: &tree_sitter::Language, source: &str) -> Option<Self> {
-        let query = Query::new(grammar, source).ok()?;
+        let mut query = Query::new(grammar, &source.replace("lua-match?", "match?")).ok()?;
+        query.disable_capture("spell");
+        query.disable_capture("nospell");
         let roles = query
             .capture_names()
             .iter()
@@ -449,9 +463,10 @@ impl Highlighter {
 }
 
 /// The version of what cached spans mean: bump it when [`role`] maps
-/// names differently or [`Spans`] change shape. Renumbering [`Syntax`]
-/// changes the key by itself.
-const SPANS_VERSION: u8 = 1;
+/// names differently, [`Compiled::new`] reads queries differently or
+/// [`Spans`] change shape. Renumbering [`Syntax`] changes the key by
+/// itself.
+const SPANS_VERSION: u8 = 2;
 
 /// What a cached whole-file highlight depends on: the content, the
 /// language's [`Language::identity`], and how captures become [`Syntax`]

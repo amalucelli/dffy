@@ -26,6 +26,7 @@ use dffy_core::document::{
     File, Found, Match, Matches, Missing, Needle, Pos, Render, Side, Source, State,
 };
 use dffy_core::git::{FileChange, FileDiff, Revisions, Status, Update};
+use dffy_core::highlight::Language;
 use dffy_core::view::Attributes;
 use dffy_core::watch::Notice;
 use unicode_width::UnicodeWidthStr;
@@ -273,6 +274,10 @@ pub(crate) struct App {
     pane: Pane,
     /// The count pass should be (re)started for the current list.
     count_pass: bool,
+    /// Each language a listed file has, by path, in the order they first
+    /// came, and how many of them went to the pool to compile ahead.
+    languages: Vec<Language>,
+    prepared: usize,
     help: Option<Help>,
     picker: Option<Picker>,
     /// The narrow title's row and the columns of its previous-file arrow,
@@ -298,11 +303,19 @@ pub(crate) struct App {
     frame: u64,
     visible: Range<usize>,
     dirty: bool,
+    /// The diff's rows on screen still show what they showed when drawn:
+    /// nothing drew over them, and only scrolls of the diff happened since.
+    /// The next frame copies the ones still on screen instead of laying
+    /// them out again.
+    kept: bool,
+    /// The event being handled scrolled the diff.
+    scrolled: bool,
 }
 
 impl App {
     /// A viewer showing `first`, or nothing yet in watch mode. `indicators`
     /// is the config's, already resolved for color.
+    #[expect(clippy::too_many_lines, reason = "a line per field of the state")]
     pub(crate) fn new(
         config: &Config,
         theme: Theme,
@@ -332,6 +345,11 @@ impl App {
         doc.document.full = config.context == Context::Full;
         doc.overview = true;
         let mut tree = Tree::default();
+        let languages = first
+            .iter()
+            .filter_map(|f| crate::grammars().detect(&f.path, &[]))
+            .cloned()
+            .collect();
         if let Some(first) = first {
             tree.insert(0, &first.path);
             doc.document.push(first, Source::Repo);
@@ -394,6 +412,8 @@ impl App {
                 || (config.tree == TreeMode::Auto && width >= SIDE_TREE_WIDTH),
             pane: Pane::Diff,
             count_pass: false,
+            languages,
+            prepared: 0,
             help: None,
             picker: None,
             switcher: None,
@@ -409,6 +429,8 @@ impl App {
             frame: 0,
             visible: 0..1,
             dirty: true,
+            kept: false,
+            scrolled: false,
         };
         app.relayout();
         app
@@ -673,6 +695,7 @@ impl App {
         self.tree.set_height(self.tree_rows().1);
         self.doc.normalize();
         self.dirty = true;
+        self.kept = false;
     }
 
     pub(crate) fn resize(&mut self, width: usize, height: usize) {
@@ -689,6 +712,7 @@ impl App {
     pub(crate) fn invalidate(&mut self) {
         self.screen.invalidate();
         self.dirty = true;
+        self.kept = false;
     }
 
     pub(crate) fn message(&mut self, text: impl Into<String>) {
@@ -717,9 +741,22 @@ impl App {
     }
 
     pub(crate) fn event(&mut self, event: Event) -> Option<Action> {
+        let kept = std::mem::take(&mut self.kept);
+        self.scrolled = false;
+        let action = self.handle(event);
+        self.kept = kept && self.scrolled;
+        action
+    }
+
+    fn handle(&mut self, event: Event) -> Option<Action> {
         match event {
             Event::Input(input) => return self.input(input),
             Event::Enumerated(change) => {
+                if let Some(lang) = crate::grammars().detect(&change.path, &[])
+                    && !self.languages.contains(lang)
+                {
+                    self.languages.push(lang.clone());
+                }
                 self.tree
                     .insert(self.doc.document.files().len(), &change.path);
                 self.doc.document.push(change, Source::Repo);
@@ -1036,6 +1073,18 @@ impl App {
         )
     }
 
+    /// The languages of listed files not handed out yet, whose queries the
+    /// pool compiles ahead of their first file being drawn. Nothing while
+    /// highlighting is off; those listed meanwhile come once it's on.
+    pub(crate) fn take_languages(&mut self) -> Vec<Language> {
+        if !(self.highlight && self.color) {
+            return Vec::new();
+        }
+        let new = self.languages[self.prepared..].to_vec();
+        self.prepared = self.languages.len();
+        new
+    }
+
     fn show_tree(&mut self, shown: bool) {
         self.tree_shown = shown;
         if shown {
@@ -1122,7 +1171,7 @@ impl App {
                 if self.over_tree(usize::from(x)) {
                     self.tree.scroll_by(rows);
                 } else {
-                    self.doc.scroll(rows);
+                    self.scroll_diff(rows);
                 }
                 return None;
             }
@@ -1593,10 +1642,15 @@ impl App {
             Act::Copy if self.doc.selection.is_some() => return self.copy(),
             Act::Copy => self.message("nothing selected; v selects lines"),
             Act::CopyPath => return self.copy_path(),
-            Act::HalfPageDown => self.doc.scroll(half),
-            Act::HalfPageUp => self.doc.scroll(-half),
+            Act::HalfPageDown => self.scroll_diff(half),
+            Act::HalfPageUp => self.scroll_diff(-half),
         }
         None
+    }
+
+    fn scroll_diff(&mut self, rows: isize) {
+        self.doc.scroll(rows);
+        self.scrolled = true;
     }
 
     /// `M`: takes the mouse, or leaves it to the terminal's own selection.
@@ -1773,6 +1827,7 @@ impl App {
         if width != self.render_width {
             self.render_width = width;
             self.doc.forget_renders(width);
+            self.kept = false;
         }
         let target = self.render_target(width);
         let same = match (&target, &self.render) {
@@ -2286,10 +2341,10 @@ impl App {
     fn diff_action(&mut self, action: Act) {
         let height = isize::try_from(self.doc.height.max(1)).unwrap_or(isize::MAX);
         match action {
-            Act::ScrollDown => self.doc.scroll(1),
-            Act::ScrollUp => self.doc.scroll(-1),
-            Act::PageDown => self.doc.scroll(height),
-            Act::PageUp => self.doc.scroll(-height),
+            Act::ScrollDown => self.scroll_diff(1),
+            Act::ScrollUp => self.scroll_diff(-1),
+            Act::PageDown => self.scroll_diff(height),
+            Act::PageUp => self.scroll_diff(-height),
             Act::Top => self.doc.document.top(),
             Act::Bottom => self.doc.bottom(),
             // Nothing left to back out of.
@@ -2884,9 +2939,13 @@ impl App {
         let overlays = self.picker.is_some() || self.help.is_some() || self.commands.is_some();
         let (tree_top, tree_rows) = self.tree_rows();
         let picker_top = self.picker_top();
-        let grid = self.screen.frame();
+        let (grid, last) = self.screen.frame();
         chrome.outline(grid, &self.theme);
-        self.visible = self.doc.draw(grid, x, width, 1, &self.theme, self.frame);
+        let last = std::mem::take(&mut self.kept).then_some(last);
+        let (visible, scrolled) = self
+            .doc
+            .draw(grid, last, (x, width, 1), &self.theme, self.frame);
+        self.visible = visible;
         // The picker covers the tree, and refreshing it costs a pass over
         // every file while the picker reads a long input.
         if let Some(columns) = tree_columns.filter(|_| self.picker.is_none()) {
@@ -2947,7 +3006,17 @@ impl App {
         if let Some(help) = &mut self.help {
             help.draw(grid, &self.theme, &self.keys);
         }
-        Some(self.screen.flush())
+        self.kept = !overlays && !chrome.overlay;
+        // The terminal scrolls whole rows, so the cell diff sends the tree's
+        // columns again on every row it scrolled: worth it while they're
+        // fewer than the diff's cells that moved. Tree cells count a third
+        // more, the ratio at which a full tree beside short code lines
+        // never costs more than the plain diff; a mostly blank tree would
+        // gain on larger scrolls too, which counting the cells that differ
+        // would catch.
+        Some(self.screen.flush(scrolled.filter(|(rows, by)| {
+            3 * (width - x) * (rows.len() - by.unsigned_abs()) > 4 * x * rows.len()
+        })))
     }
 }
 
@@ -3363,6 +3432,52 @@ mod tests {
             too_large: false,
             note: None,
         }
+    }
+
+    /// Each language in the list goes to the pool to compile ahead once, as
+    /// its first file is listed. With highlighting off none do, until it's
+    /// turned on.
+    #[test]
+    fn each_listed_language_is_compiled_ahead_once() {
+        let names = |languages: Vec<Language>| -> Vec<String> {
+            languages.iter().map(|l| l.name().to_owned()).collect()
+        };
+        let viewer = |config: &Config, first: Option<FileChange>| {
+            App::new(
+                config,
+                Theme::default_theme(),
+                "working tree".to_owned(),
+                first,
+                (100, 20),
+                Indicators::Classic,
+            )
+        };
+        let mut app = viewer(&Config::default(), Some(diff("src/main.rs").change));
+        for path in [
+            "src/lib.rs",
+            "App.swift",
+            "README",
+            "Cargo.lock",
+            "Sources/B.swift",
+        ] {
+            app.event(Event::Enumerated(diff(path).change));
+        }
+        assert_eq!(names(app.take_languages()), ["rust", "swift", "toml"]);
+        app.event(Event::Enumerated(diff("src/c.rs").change));
+        app.event(Event::Enumerated(diff("b.kt").change));
+        app.event(Event::EnumerationDone(None));
+        assert_eq!(names(app.take_languages()), ["kotlin"]);
+        assert_eq!(names(app.take_languages()), [""; 0]);
+
+        let off = Config {
+            highlight: false,
+            ..Config::default()
+        };
+        let mut app = viewer(&off, None);
+        app.event(Event::Enumerated(diff("src/lib.rs").change));
+        assert_eq!(names(app.take_languages()), [""; 0]);
+        app.rediff(Act::ToggleHighlight);
+        assert_eq!(names(app.take_languages()), ["rust"]);
     }
 
     /// The file is diffed again while emphasis for the diff still shown is

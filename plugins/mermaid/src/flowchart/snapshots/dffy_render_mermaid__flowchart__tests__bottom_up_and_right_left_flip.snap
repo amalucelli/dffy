@@ -1,0 +1,14 @@
+---
+source: plugins/mermaid/src/flowchart/tests.rs
+expression: "drawn(\"graph BT\\n  A -->|up| B\\n\", 80)"
+---
+flowchart 0..2
+  ┌───┐
+  │ B │
+  └───┘
+    ▲
+   up
+    │
+  ┌─┴─┐
+  │ A │
+  └───┘

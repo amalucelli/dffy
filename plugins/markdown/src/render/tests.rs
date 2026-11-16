@@ -101,6 +101,22 @@ fn quotes_have_a_bar_and_code_keeps_its_text_and_language() {
 }
 
 #[test]
+fn mermaid_fences_are_drawn_and_broken_ones_stay_code() {
+    let source = "```mermaid\nsequenceDiagram\n  A->>B: hi\n```\n\n```mermaid\npie\n```\n";
+    assert_eq!(
+        shown(source, 80),
+        "participants 0..2 | <dim>┌───┐</> <dim>┌───┐</> | <dim>│</> <bold>A</> <dim>│</> <dim>│</> <bold>B</> <dim>│</> | <dim>└─┬─┘</> <dim>└─┬─┘</>\n\
+         message 2..4 |   <dim>│</> hi  <dim>│</> |   <syntax-operator>├────▶</><dim>│</>\n\
+         gap 4..4 | \n\
+         code 5..8 | <code>pie</>\n\
+         gap 8..8 | "
+    );
+    let blocks = render(source, 80);
+    assert_eq!(blocks[0].language, None);
+    assert_eq!(blocks[3].language.as_deref(), Some("mermaid"));
+}
+
+#[test]
 fn links_images_html_and_rules() {
     let source = "See [docs](https://x.dev) ![a cat](cat.png)\n\n<div>\nraw\n</div>\n\n---\n";
     let blocks = render(source, 10);

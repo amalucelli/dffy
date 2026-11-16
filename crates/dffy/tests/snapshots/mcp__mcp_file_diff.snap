@@ -1,0 +1,24 @@
+---
+source: crates/dffy/tests/mcp.rs
+expression: "snapshot(&[parts[0].raw_structured(), parts[0].text().to_owned(),\nparts[1].text().to_owned(),])"
+---
+{"header":{"type":"header","version":1,"old":{"kind":"tree","id":"3c7dcae4d2474c9ab3cca259da3f74f76e7cc041"},"new":{"kind":"tree","id":"999d2ed097b841160702f909a1516b735d182f99"},"untracked":false,"revisions":["main~1","main"],"paths":[],"options":{"context":3,"whitespace":"exact","syntax":false,"renames":true,"highlights":false,"summary":false}},"file":{"type":"file","path":"long.txt","old_path":"long.txt","status":"modified","similarity":null,"old_mode":"100644","new_mode":"100644","binary":false,"too_large":false,"language":null,"added":12,"removed":12,"syntax":null,"classification":null,"note":null,"hunks":[{"old_start":1,"old_lines":5,"new_start":1,"new_lines":2,"heading":null,"lines":[{"kind":"context","old":1,"new":1,"text":"line 1"},{"kind":"context","old":2,"new":2,"text":"line 2"},{"kind":"removed","old":3,"new":null,"text":"line 3"},{"kind":"removed","old":4,"new":null,"text":"line 4"},{"kind":"removed","old":5,"new":null,"text":"line 5"}]}]},"truncated":true,"remaining_lines":30,"next_cursor":"<cursor>"}
+--
+M long.txt +12 -12
+@@ -1,5 +1,2 @@
+  line 1
+  line 2
+- line 3
+- line 4
+- line 5
+[truncated: 30 more lines; next_cursor: <cursor> (pass it as cursor, with the same arguments)]
+
+--
+M long.txt +12 -12
+@@ -6,3 +3,2 @@ line 5
+- line 6
+- line 7
+- line 8
++ changed 3
++ changed 4
+[truncated: 25 more lines; next_cursor: <cursor> (pass it as cursor, with the same arguments)]

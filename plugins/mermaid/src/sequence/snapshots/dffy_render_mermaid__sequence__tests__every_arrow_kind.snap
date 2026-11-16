@@ -1,0 +1,39 @@
+---
+source: plugins/mermaid/src/sequence/tests.rs
+expression: "drawn(source, 80)"
+---
+participants 0..3
+  ┌───────┐        ╭─────╮
+  │ Alice │        │ Bob │
+  └───┬───┘        ╰──┬──╯
+message 3..4
+      │     solid     │
+      ├───────────────┤
+message 4..5
+      │    dotted     │
+      ├┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┤
+message 5..6
+      │     arrow     │
+      ├──────────────▶│
+message 6..7
+      │ dotted arrow  │
+      │◀┄┄┄┄┄┄┄┄┄┄┄┄┄┄┤
+message 7..8
+      │     cross     │
+      ├──────────────×│
+message 8..9
+      │ dotted cross  │
+      │×┄┄┄┄┄┄┄┄┄┄┄┄┄┄┤
+message 9..10
+      │     async     │
+      ├──────────────▷│
+message 10..11
+      │ dotted async  │
+      │◁┄┄┄┄┄┄┄┄┄┄┄┄┄┄┤
+message 11..12
+      │   both ways   │
+      │◀─────────────▶│
+message 12..13
+      │               │
+      ├──┐ self       │
+      │◀─┘            │

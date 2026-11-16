@@ -44,7 +44,7 @@ It fits into how you already work. Every action is a single key, the layout adap
 
 **Reading diffs**
 - 🪟 [Split or unified](docs/config.md#settings), picked by terminal width.
-- 🌈 Syntax highlighting for 18 languages, with [changed words emphasized](docs/viewer.md#modified-lines).
+- 🌈 Syntax highlighting for 30 languages, with [changed words emphasized](docs/viewer.md#modified-lines).
 - 🌳 [A syntax-aware diff](docs/architecture.md#the-engine) (`d`) that marks reformatted (`~`) and moved (`»`) code.
 - 🔁 Renames detected the way git detects them.
 

@@ -1,0 +1,11 @@
+---
+source: crates/dffy/tests/cli.rs
+expression: "[json(d, &[\"--syntax\"], &[\"spacing.c\"]),\njson(d, &[\"-w\"], &[\"spacing.c\"]),].join(\"--\\n\")"
+---
+{"type":"header","version":1,"old":{"kind":"tree","id":"bfad37707764a70cf0a0cf8a9a549dd83f87b626"},"new":{"kind":"tree","id":"44c4ea573a9b62ac060b6c55d29a0367ea962239"},"untracked":false,"revisions":["main~1","main"],"paths":["spacing.c"],"options":{"context":3,"whitespace":"exact","syntax":true,"renames":true,"highlights":false,"summary":false}}
+{"type":"file","path":"spacing.c","old_path":"spacing.c","status":"modified","similarity":null,"old_mode":"100644","new_mode":"100644","binary":false,"too_large":false,"language":"c","added":1,"removed":1,"syntax":"complete","classification":"formatting_only","note":null,"hunks":[{"old_start":1,"old_lines":3,"new_start":1,"new_lines":3,"heading":null,"lines":[{"kind":"context","old":1,"new":1,"text":"int x = 1;"},{"kind":"removed","mark":"reformatted","old":2,"new":null,"text":"int y = 2;"},{"kind":"added","mark":"reformatted","old":null,"new":2,"text":"int  y=2;"},{"kind":"context","old":3,"new":3,"text":"int z = 3;"}]}]}
+{"type":"end","files":1,"added":1,"removed":1}
+--
+{"type":"header","version":1,"old":{"kind":"tree","id":"bfad37707764a70cf0a0cf8a9a549dd83f87b626"},"new":{"kind":"tree","id":"44c4ea573a9b62ac060b6c55d29a0367ea962239"},"untracked":false,"revisions":["main~1","main"],"paths":["spacing.c"],"options":{"context":3,"whitespace":"ignore_all_space","syntax":false,"renames":true,"highlights":false,"summary":false}}
+{"type":"file","path":"spacing.c","old_path":"spacing.c","status":"modified","similarity":null,"old_mode":"100644","new_mode":"100644","binary":false,"too_large":false,"language":"c","added":0,"removed":0,"syntax":null,"classification":"formatting_only","note":null,"hunks":[]}
+{"type":"end","files":1,"added":0,"removed":0}

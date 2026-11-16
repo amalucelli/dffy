@@ -1,0 +1,25 @@
+---
+source: plugins/mermaid/src/flowchart/tests.rs
+expression: "drawn(source, 80)"
+---
+flowchart 0..5
+     ┌───┐
+     │ A │
+     └┬──┘
+      │ ▲
+    ┌─┘ └┐
+    ▼    │
+  ┌───┐  │
+  │ B │  │
+  └─┬─┘  │
+    │    │
+    └┐ ┌─┘
+     ▼ │
+    ┌──┴┐
+    │ C │
+    └─┬─┘
+      │
+      ▼
+    ┌───┐
+    │ D │
+    └───┘

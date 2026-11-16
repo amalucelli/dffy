@@ -25,7 +25,7 @@ builds:
       - aarch64-unknown-linux-gnu
       - x86_64-unknown-linux-gnu
 
-  # The Markdown renderer plugin ships in the same release as its own opt-in archive.
+  # Each renderer plugin ships in the same release as its own opt-in archive.
   - id: render-markdown-darwin
     builder: rust
     binary: dffy-render-markdown
@@ -44,6 +44,24 @@ builds:
       - aarch64-unknown-linux-gnu
       - x86_64-unknown-linux-gnu
 
+  - id: render-mermaid-darwin
+    builder: rust
+    binary: dffy-render-mermaid
+    tool: cargo
+    command: build
+    flags: [--release, --package=dffy-render-mermaid]
+    targets:
+      - aarch64-apple-darwin
+      - x86_64-apple-darwin
+
+  - id: render-mermaid-linux
+    builder: rust
+    binary: dffy-render-mermaid
+    flags: [--release, --package=dffy-render-mermaid]
+    targets:
+      - aarch64-unknown-linux-gnu
+      - x86_64-unknown-linux-gnu
+
 archives:
   - id: dffy
     ids: [darwin, linux]
@@ -55,6 +73,11 @@ archives:
   - id: dffy-render-markdown
     ids: [render-markdown-darwin, render-markdown-linux]
     name_template: "dffy-render-markdown_{{ .Os }}_{{ .Arch }}"
+    formats: [tar.gz]
+
+  - id: dffy-render-mermaid
+    ids: [render-mermaid-darwin, render-mermaid-linux]
+    name_template: "dffy-render-mermaid_{{ .Os }}_{{ .Arch }}"
     formats: [tar.gz]
 
 checksum:
@@ -88,6 +111,20 @@ homebrew_casks:
         install_steps: |
           on_macos do
             run "/usr/bin/xattr", args: ["-dr", "com.apple.quarantine", "{{ .StagedPath }}/dffy-render-markdown"]
+          end
+
+  - name: dffy-render-mermaid
+    ids: [dffy-render-mermaid]
+    description: "Experimental Mermaid renderer plugin for dffy"
+    homepage: https://github.com/amalucelli/dffy
+    repository:
+      owner: amalucelli
+      name: homebrew-tap
+    hooks:
+      post:
+        install_steps: |
+          on_macos do
+            run "/usr/bin/xattr", args: ["-dr", "com.apple.quarantine", "{{ .StagedPath }}/dffy-render-mermaid"]
           end
 
 changelog:

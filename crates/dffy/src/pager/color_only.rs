@@ -11,7 +11,8 @@
 //! file or commit starts. A wrong guess costs a color, never text.
 //!
 //! Code isn't syntax-highlighted: hunk fragments parse poorly without
-//! their file, and compiling one language's query costs up to 35ms.
+//! their file, and compiling one language's query costs up to about
+//! 140ms (Swift's).
 
 use std::io::{self, BufRead, BufReader, Read, Write};
 

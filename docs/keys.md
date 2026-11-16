@@ -50,8 +50,8 @@ keybind = leader:z=toggle_wrap
 
 | Action | Keys | Command panel | Description |
 |---|---|---|---|
-| `next_file` | `f` `]` | `n` | Next file |
-| `prev_file` | `F` `[` | `p` | Previous file |
+| `next_file` | `f` `]` `alt+f` `alt+right` | `n` | Next file |
+| `prev_file` | `F` `[` `alt+b` `alt+left` | `p` | Previous file |
 | `switch_pane` | `tab` `shift+tab` |  | Switch between the file tree and the diff |
 | `toggle_tree` | `T` `t` | `t` | Show or hide the file tree |
 | `open_picker` | `o` | `o` | Find a file: type part of its path, enter opens it |

@@ -7,8 +7,10 @@
 //! - `compare` times dffy against other diff tools on the kernel range and
 //!   prints the tables in `docs/benchmarks.md`.
 //! - `report` prints a run's tables from its `results.json`.
+//! - `bump` sets the release version in every manifest and `Cargo.lock`.
 
 mod ab;
+mod bump;
 mod compare;
 mod harness;
 mod perf;
@@ -24,6 +26,7 @@ const USAGE: &str = "\
 usage: cargo xtask perf [--quick | --full] [--rev REV] [--rounds N] [--only GROUP,...]
        cargo xtask compare [--scenarios S,...] [--runs N] [--slow-runs N] [--mem-runs N]
        cargo xtask report <run-dir>
+       cargo xtask bump <version>
 advanced:
        cargo xtask bench-baseline <dir>
        cargo xtask bench-ab <base-dir> [--quick] [--rounds N] [--only GROUP,...] [--instructions METRIC,...]
@@ -52,6 +55,7 @@ fn main() -> ExitCode {
         Some((cmd, rest)) if cmd.starts_with("bench-") => ab::main(cmd, rest),
         Some((cmd, rest)) if cmd == "compare" => compare::main(rest).map(|()| true),
         Some((cmd, rest)) if cmd == "report" => results::main(rest).map(|()| true),
+        Some((cmd, rest)) if cmd == "bump" => bump::main(rest).map(|()| true),
         _ => Err(USAGE.to_owned()),
     };
     match result {

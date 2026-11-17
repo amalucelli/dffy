@@ -182,10 +182,24 @@ tasks:
     cmds:
       - goreleaser release --snapshot --clean --skip=publish
 
+  bump:
+    desc: Set the release version in every Cargo.toml and Cargo.lock, e.g. task bump VERSION=0.3.0
+    requires:
+      vars: [VERSION]
+    cmds:
+      - cargo xtask bump {{.VERSION}}
+
   release:
     desc: Tag and publish a release, e.g. task release TAG=v0.1.0
     requires:
       vars: [TAG]
+    preconditions:
+      # `dffy --version` comes from dffy's Cargo version and the disk cache
+      # keys from dffy-core's, so both must match the tag.
+      - sh: test "v$(cargo pkgid -p dffy | sed 's/.*[#@]//')" = "{{.TAG}}"
+        msg: "{{.TAG}} doesn't match dffy's version in Cargo.toml; bump it first"
+      - sh: test "v$(cargo pkgid -p dffy-core | sed 's/.*[#@]//')" = "{{.TAG}}"
+        msg: "{{.TAG}} doesn't match dffy-core's version in crates/dffy-core/Cargo.toml; bump it first"
     env:
       GITHUB_TOKEN:
         sh: gh auth token

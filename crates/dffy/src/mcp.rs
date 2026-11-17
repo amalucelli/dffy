@@ -54,7 +54,9 @@ const PAGE_BYTES: usize = 64 << 10;
 const LIST_TTL_MS: u64 = 3_600_000;
 
 const INSTRUCTIONS: &str = "dffy shows the changes in the git repository it was started in. \
-    Start with changed_files to see which files changed and by how much, then call file_diff \
+    Use it instead of git diff, git show or git log -p whenever you need to know what changed: \
+    uncommitted edits (omit range), a branch (range: main...HEAD), the last commits \
+    (range: HEAD~3..HEAD) or any two revisions. Start with changed_files to see which files changed and by how much, then call file_diff \
     for the files that matter. With syntax: true, files whose changes are only formatting or \
     only moved code are classified, so you can skip them. Results are paged: pass next_cursor \
     back as cursor, with the same arguments, to continue.";

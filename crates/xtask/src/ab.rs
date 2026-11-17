@@ -36,7 +36,6 @@ use std::fs::{self, File, OpenOptions};
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::time::Instant;
 
 use crate::results::{Entry, Header, Results};
 use crate::{
@@ -65,8 +64,8 @@ const SIDES: [&str; 2] = ["A", "B"];
 /// whose instructions are counted.
 const DIVAN_ITERATIONS: [u32; 2] = [50, 250];
 
-/// The iterations of the first of `--quick`'s two runs of a divan
-/// benchmark; the second adds [`added_iterations`].
+/// The iterations per sample of the first of `--quick`'s two runs of a
+/// divan benchmark, in [`quick_runs`].
 const FIRST_ITERATIONS: u32 = 2;
 
 /// `count_pass`'s files whose count differs from their diff: any in B fails,
@@ -514,8 +513,8 @@ struct Runner {
 }
 
 /// A divan benchmark that `--quick` counts, every round, by running it alone
-/// at [`FIRST_ITERATIONS`] and at `added` more: the difference in
-/// instructions over `added` is its instructions per iteration.
+/// as [`quick_runs`] plans: the difference in instructions over `added` is
+/// its instructions per iteration.
 struct DivanBench {
     metric: String,
     added: u32,
@@ -564,8 +563,7 @@ impl Runner {
     }
 
     /// Lists the divan benchmarks of the suites in `groups` in both sets,
-    /// with the [`added_iterations`] of each from its time and the
-    /// fixture's in A.
+    /// with the [`added_iterations`] of each from its time in A.
     fn plan_divan(&mut self, sets: [&Path; 2], groups: &[&str]) -> Result<()> {
         for suite in ["frame", "engine"]
             .into_iter()
@@ -597,18 +595,11 @@ impl Runner {
                     times[i].1[side] = ns;
                 }
             }
-            // The fixture's time: the suite run with a filter that matches
-            // no benchmark still loads it.
-            let mut cmd = self.command(sets[0].join(suite))?;
-            cmd.args(["--bench", "--exact", &format!("{suite}::no benchmark")]);
-            let start = Instant::now();
-            self.run(&mut cmd, "fixture-A", suite)?;
-            let fixture = start.elapsed().as_secs_f64() * 1e9;
             for (metric, ns) in times {
                 let iteration = ns[0].or(ns[1]).unwrap_or_default();
                 self.divan.push(DivanBench {
                     metric,
-                    added: added_iterations(iteration, fixture),
+                    added: added_iterations(iteration),
                     sides: ns.map(|t| t.is_some()),
                 });
             }
@@ -671,7 +662,7 @@ impl Runner {
                 let mut counts = [0.0; 2];
                 for (count, iters) in counts.iter_mut().zip(DIVAN_ITERATIONS) {
                     let tag = format!("instructions-{round}-{}", SIDES[side]);
-                    *count = self.divan_run(metric, sets[side], iters, &tag)?.0;
+                    *count = self.divan_run(metric, sets[side], [iters, 1], &tag)?.0;
                 }
                 let iters = f64::from(DIVAN_ITERATIONS[1] - DIVAN_ITERATIONS[0]);
                 values[side].push((counts[1] - counts[0]) / iters);
@@ -696,10 +687,11 @@ impl Runner {
             if !bench.sides[side] {
                 continue;
             }
-            let (first, _) = self.divan_run(&bench.metric, set, FIRST_ITERATIONS, tag)?;
-            let iterations = FIRST_ITERATIONS + bench.added;
-            let (n, runs) = self.divan_run(&bench.metric, set, iterations, tag)?;
-            let per_iteration = (n - first) / f64::from(bench.added);
+            let [short, long] = quick_runs(bench.added);
+            let (first, _) = self.divan_run(&bench.metric, set, short, tag)?;
+            let (n, runs) = self.divan_run(&bench.metric, set, long, tag)?;
+            let added = long[0] * (long[1] - short[1]);
+            let per_iteration = (n - first) / f64::from(added);
             let name = format!("{} instructions", bench.metric);
             rows.push((name, Unit::Instructions, Some(per_iteration)));
             rows.extend(runs);
@@ -707,13 +699,13 @@ impl Runner {
         Ok(rows)
     }
 
-    /// The divan benchmark `metric` of `set` run alone for `iterations`,
-    /// one per sample: the run's instructions, and the benchmark's rows.
+    /// The divan benchmark `metric` of `set` run alone for `count` samples of
+    /// `size` iterations: the run's instructions, and the benchmark's rows.
     fn divan_run(
         &self,
         metric: &str,
         set: &Path,
-        iterations: u32,
+        [count, size]: [u32; 2],
         tag: &str,
     ) -> Result<(f64, Vec<Row>)> {
         let (suite, _) = metric.split_once('/').unwrap_or_default();
@@ -721,14 +713,10 @@ impl Runner {
         let exact = metric.replace('/', "::");
         let mut cmd = self.command(set.join(suite))?;
         cmd.args(["--bench", "--exact", &exact, "--threads", "1"])
-            .args([
-                "--sample-size",
-                "1",
-                "--sample-count",
-                &iterations.to_string(),
-            ])
+            .args(["--sample-count", &count.to_string()])
+            .args(["--sample-size", &size.to_string()])
             .args(["--color", "never", "--bytes-format", "decimal"]);
-        let (out, n) = self.run_counted(&mut cmd, tag, &format!("{metric} {iterations}"))?;
+        let (out, n) = self.run_counted(&mut cmd, tag, &format!("{metric} {count}x{size}"))?;
         let rows = parse_divan(suite, &out)?;
         if !rows.iter().any(|(name, ..)| name == metric) {
             return Err(format!("{}: ran no {exact}", describe(&cmd)));
@@ -1091,28 +1079,47 @@ fn counts_only(mut rows: Vec<Row>) -> Vec<Row> {
     rows
 }
 
+/// The `--sample-count` and `--sample-size` of `--quick`'s two runs of a
+/// divan benchmark, the second `added` iterations longer: the same number
+/// of samples, so divan's work per sample (timer reads, its sample and
+/// allocation records, sorting the samples) is the same in both and cancels
+/// in the difference, and [`ADDED_PER_SAMPLE`] more iterations in each.
+fn quick_runs(added: u32) -> [[u32; 2]; 2] {
+    let count = (added / ADDED_PER_SAMPLE).max(1);
+    [
+        [count, FIRST_ITERATIONS],
+        [count, FIRST_ITERATIONS + added.div_ceil(count)],
+    ]
+}
+
+/// The iterations `--quick`'s longer run adds to each sample, at most. A
+/// sample holds every iteration's input and output until it ends, and
+/// `frame/prepare_file/table` holds about 3.5 MB an iteration, so a sample
+/// of 10 holds about 35 MB.
+const ADDED_PER_SAMPLE: u32 = 8;
+
 /// Iterations the second counted run of a divan benchmark adds to the
-/// first: enough to take a quarter of the time its suite's fixture takes to
-/// load, and at least 50ms, which covers a benchmark's own setup where that
-/// outweighs the fixture. So the variation in each run's instructions,
-/// mostly the fixture's and the setup's, stays small against the
-/// difference. A power of two from 2: even, so a benchmark alternating two
-/// inputs counts both alike, and unchanged by small differences in timing
-/// from one invocation to the next.
-fn added_iterations(iteration_ns: f64, fixture_ns: f64) -> u32 {
-    const MOST: u32 = 1 << 16;
-    let wanted = (f64::max(fixture_ns / 4.0, 50e6) / iteration_ns.max(1.0)).ceil();
-    if wanted >= f64::from(MOST) {
-        return MOST;
-    }
+/// first: the power of two nearest to [`ADDED_NS`] of them, from 2 to 2^18,
+/// so the variation in each run's instructions, mostly its setup's, stays
+/// small against the difference. A power of two: even, so a benchmark
+/// alternating two inputs counts both alike, and unchanged by small
+/// differences in timing from one invocation to the next. The cap holds
+/// divan's per-sample records to 2^15 samples for a benchmark of a few
+/// nanoseconds.
+fn added_iterations(iteration_ns: f64) -> u32 {
+    let exponent = (ADDED_NS / iteration_ns.max(1.0)).log2().round();
     #[expect(
         clippy::cast_possible_truncation,
         clippy::cast_sign_loss,
-        reason = "below 2^16, and negative only for a nonsensical time, which then gets 2"
+        reason = "clamped to 1..=18"
     )]
-    let wanted = wanted as u32;
-    wanted.next_power_of_two().max(2)
+    let exponent = exponent.clamp(1.0, 18.0) as u32;
+    1 << exponent
 }
+
+/// The time, in nanoseconds, of the iterations `--quick`'s longer run of a
+/// divan benchmark adds.
+const ADDED_NS: f64 = 200e6;
 
 /// The instruction count whose values on one side are furthest apart,
 /// relative to their median, and that distance.
@@ -1703,15 +1710,28 @@ frame                       fastest       │ slowest       │ median        �
     }
 
     #[test]
-    fn added_iterations_cover_a_quarter_of_the_fixture_or_50ms() {
-        // 100µs per iteration, a 400ms fixture: 1000 wanted, 1024 given.
-        assert_eq!(added_iterations(100e3, 400e6), 1024);
-        // A fast fixture: 50ms of iterations, 500 wanted.
-        assert_eq!(added_iterations(100e3, 30e6), 512);
-        // Slower than the fixture's quarter: the fewest, still even.
-        assert_eq!(added_iterations(150e6, 1.2e9), 2);
-        // A few nanoseconds against a slow fixture: capped.
-        assert_eq!(added_iterations(5.0, 1.2e9), 1 << 16);
+    fn added_iterations_take_about_200ms() {
+        // 100µs per iteration: 2000 wanted, 2048 the nearest power of two.
+        assert_eq!(added_iterations(100e3), 2048);
+        // 150µs: 1333 wanted, nearer 1024 than 2048.
+        assert_eq!(added_iterations(150e3), 1024);
+        // Slower than 200ms: the fewest, still even.
+        assert_eq!(added_iterations(150e6), 2);
+        // A few nanoseconds: capped.
+        assert_eq!(added_iterations(5.0), 1 << 18);
+    }
+
+    #[test]
+    fn quick_runs_differ_only_in_iterations_per_sample() {
+        for iteration_ns in [1.6e3, 100e3, 150e6] {
+            let added = added_iterations(iteration_ns);
+            let [[short_count, short_size], [long_count, long_size]] = quick_runs(added);
+            assert_eq!(short_count, long_count);
+            assert_eq!(long_count * (long_size - short_size), added);
+            assert!(long_size - short_size <= ADDED_PER_SAMPLE);
+            // Even, so a benchmark alternating two inputs runs both alike.
+            assert!(short_size % 2 == 0 && long_size % 2 == 0);
+        }
     }
 
     #[cfg(not(target_os = "linux"))]

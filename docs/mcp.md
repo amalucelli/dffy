@@ -34,6 +34,16 @@ claude mcp add dffy -- dffy mcp
 
 A client that starts servers outside the repository needs `-C`: `"args": ["-C", "/path/to/repo", "mcp"]`.
 
+## Recommended agent prompt
+
+The server tells agents to use its tools instead of `git diff`, but agents often reach for git in a shell anyway, especially when a request mentions commits. Put this in the project's `CLAUDE.md`, `AGENTS.md` or equivalent:
+
+```
+To see what changed in the current git repository, use dffy tools instead of git diff, git show or git log -p.
+```
+
+In Claude Code, MCP tools can be deferred until the agent searches for them. That makes git in a shell the easier path, so this prompt matters there most.
+
 ## Tools
 
 | Tool | What it returns | When to use it |

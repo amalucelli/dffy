@@ -39,7 +39,7 @@ It fits into how you already work. Every action is a single key, the layout adap
 ## Features
 
 **Fast**
-- ⚡ [Opens the Linux v6.0..v6.1 diff in 9.5ms](docs/benchmarks.md) and loads the rest in the background.
+- ⚡ [Opens the Linux v6.0..v6.1 diff in less than 10ms](docs/benchmarks.md) and loads the rest in the background.
 - 👀 [`--watch`](docs/watch.md) repaints as you edit, stage and commit.
 
 **Reading diffs**
@@ -122,19 +122,19 @@ Opening Linux v6.0..v6.1 (13,168 changed files, a 48MB patch) in a viewer, time 
 
 | | `dffy` | `lumen` 2.32.0 | `hunk` 0.25.0 |
 |---|--:|--:|--:|
-| The v6.0..v6.1 range | 9.5ms | 12.4s | 17.7s |
-| The working tree (5 files changed) | 63ms | 1.12s | 790ms |
-| As a pager, `git diff v6.0 v6.1 \| …` | 217ms | n/a | 15.3s |
-| Memory, opening the range | 90MB | 676MB | 4.26GB |
+| The v6.0..v6.1 range | 8.1ms | 12.5s | 18.1s |
+| The working tree (5 files changed) | 77ms | 1.11s | 733ms |
+| As a pager, `git diff v6.0 v6.1 \| …` | 210ms | n/a | 15.2s |
+| Memory, opening the range | 99MB | 676MB | 4.39GB |
 
-As git's pager, `dffy` streams the whole 48MB patch in 3.0MB of its own memory, about as fast as plain `git diff`.
+As git's pager, `dffy` streams the whole 48MB patch in 3.1MB of its own memory, about as fast as plain `git diff`.
 ## Architecture
 
 `dffy` is written in Rust.
 
 - 📚 [A library at its core](docs/architecture.md#crates), `dffy-core`: the diff model the viewer, printed output, JSON and the MCP server all share.
 - 🧮 [Its own diff engine](docs/architecture.md#the-engine): histogram and syntax-aware diffs, renames matching git's.
-- 🖼️ [Its own terminal renderer](docs/architecture.md#the-renderer), with no TUI framework. A full frame takes about 200µs.
+- 🖼️ [Its own terminal renderer](docs/architecture.md#the-renderer), with no TUI framework. A full frame takes about 150µs.
 - 🌊 [Streamed input and output](docs/architecture.md#data-flow), so the first screen doesn't wait for the whole diff.
 - 🛰️ [One shared watcher per repository](docs/architecture.md#watcher-and-broker), however many views are open.
 

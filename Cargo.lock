@@ -423,7 +423,7 @@ dependencies = [
 
 [[package]]
 name = "dffy"
-version = "0.1.0"
+version = "0.2.1"
 dependencies = [
  "clap",
  "clap_complete",
@@ -442,7 +442,7 @@ dependencies = [
 
 [[package]]
 name = "dffy-core"
-version = "0.1.0"
+version = "0.2.1"
 dependencies = [
  "divan",
  "gix",
@@ -491,7 +491,7 @@ dependencies = [
 
 [[package]]
 name = "dffy-render-markdown"
-version = "0.1.0"
+version = "0.2.1"
 dependencies = [
  "dffy-render-mermaid",
  "pulldown-cmark",
@@ -501,7 +501,7 @@ dependencies = [
 
 [[package]]
 name = "dffy-render-mermaid"
-version = "0.1.0"
+version = "0.2.1"
 dependencies = [
  "insta",
  "serde_json",
@@ -2744,7 +2744,7 @@ dependencies = [
 
 [[package]]
 name = "xtask"
-version = "0.1.0"
+version = "0.2.1"
 dependencies = [
  "perf-event2",
  "portable-pty",

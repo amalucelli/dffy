@@ -1282,6 +1282,26 @@ fn a_short_piped_diff_prints_without_the_viewer() {
     assert!(term.contains("new 0"), "{out:?}");
 }
 
+/// With `paging = always`, even a diff that fits one screen opens the
+/// viewer.
+#[test]
+fn paging_always_opens_a_short_piped_diff_in_the_viewer() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    std::fs::write(dir.path().join("short.diff"), many_files_diff(1)).expect("write");
+    let mut term = Term::spawn_sh(
+        dir.path(),
+        100,
+        24,
+        "cat short.diff | \"$DFFY\" --paging=always",
+    );
+    term.wait_for("the viewer", |t| {
+        t.vt.screen().alternate_screen() && t.contains("new 0")
+    });
+    term.send("q");
+    assert!(term.wait_exit().success());
+    assert!(!term.vt.screen().alternate_screen());
+}
+
 /// A diff longer than the screen opens the viewer, on the keys from the
 /// terminal while the diff comes from the pipe; quitting restores the
 /// terminal. Piped files have only their hunks: `x` says so.
@@ -1324,7 +1344,7 @@ fn a_long_piped_diff_opens_the_viewer() {
 
 /// Input that isn't a diff goes through untouched, byte for byte: with
 /// paging off, and through a pager (`cat -` here; plain `cat` means no
-/// pager).
+/// pager) with paging auto or always.
 #[test]
 fn piped_input_that_isnt_a_diff_passes_through_unchanged() {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -1336,6 +1356,7 @@ fn piped_input_that_isnt_a_diff_passes_through_unchanged() {
     for script in [
         "cat in.txt | \"$DFFY\" --paging=never",
         "cat in.txt | DFFY_PAGER='cat -' \"$DFFY\"",
+        "cat in.txt | DFFY_PAGER='cat -' \"$DFFY\" --paging=always",
     ] {
         let mut term = Term::spawn_sh(dir.path(), 80, 24, script);
         assert!(term.wait_exit().success(), "{script}");

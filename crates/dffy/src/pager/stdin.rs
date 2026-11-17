@@ -200,15 +200,25 @@ pub(crate) enum Decision {
     Print,
     /// A diff that ended and fits one screen: print it, no pager.
     Fits,
-    /// A diff longer than a screen, or still arriving: open the viewer.
+    /// A diff longer than a screen, still arriving, or with
+    /// [`Screen::Viewer`]: open the viewer.
     Viewer,
 }
 
-/// Reads as much of `stdin` as it takes to decide. With `screen`, the
-/// screen's rows and whether the layout is split, a diff that ends within
-/// one screen is told apart from a longer one; without it, every diff is
-/// printed.
-pub(crate) fn decide(stdin: &mut Stdin, screen: Option<(usize, bool)>) -> io::Result<Decision> {
+/// Where a diff would be shown.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum Screen {
+    /// No terminal: every diff is printed.
+    Absent,
+    /// A terminal of this many rows, the layout split or not: a diff that
+    /// ends within one screen is told apart from a longer one.
+    Fit(usize, bool),
+    /// A terminal, and every diff opens the viewer whatever its length.
+    Viewer,
+}
+
+/// Reads as much of `stdin` as it takes to decide.
+pub(crate) fn decide(stdin: &mut Stdin, screen: Screen) -> io::Result<Decision> {
     let mut deadline = None;
     loop {
         match sniff(stdin.buffered(), stdin.ended) {
@@ -223,8 +233,10 @@ pub(crate) fn decide(stdin: &mut Stdin, screen: Option<(usize, bool)>) -> io::Re
             return Ok(Decision::NotDiff);
         }
     }
-    let Some((height, split)) = screen else {
-        return Ok(Decision::Print);
+    let (height, split) = match screen {
+        Screen::Absent => return Ok(Decision::Print),
+        Screen::Viewer => return Ok(Decision::Viewer),
+        Screen::Fit(height, split) => (height, split),
     };
     let deadline = Instant::now() + FIT_WAIT;
     let mut rows = Rows::new(split);
@@ -370,14 +382,23 @@ mod tests {
     fn short_diffs_fit_and_long_ones_open_the_viewer() {
         let decide_on = |input: &'static [u8], height| {
             let mut stdin = Stdin::spawn_from(input).expect("thread");
-            decide(&mut stdin, Some((height, false))).expect("decide")
+            decide(&mut stdin, Screen::Fit(height, false)).expect("decide")
         };
         let diff = b"diff --git a/x b/x\n--- a/x\n+++ b/x\n@@ -1,3 +1,3 @@\n a\n-b\n+c\n d\n";
         assert_eq!(decide_on(diff, 24), Decision::Fits);
         assert_eq!(decide_on(diff, 4), Decision::Viewer);
         assert_eq!(decide_on(b"plain text\n", 24), Decision::NotDiff);
+        let always = |input: &'static [u8]| {
+            let mut stdin = Stdin::spawn_from(input).expect("thread");
+            decide(&mut stdin, Screen::Viewer).expect("decide")
+        };
+        assert_eq!(always(diff), Decision::Viewer, "paging always");
+        assert_eq!(always(b"plain text\n"), Decision::NotDiff, "paging always");
         let mut stdin = Stdin::spawn_from(&diff[..]).expect("thread");
-        assert_eq!(decide(&mut stdin, None).expect("decide"), Decision::Print);
+        assert_eq!(
+            decide(&mut stdin, Screen::Absent).expect("decide"),
+            Decision::Print
+        );
         let mut all = Vec::new();
         stdin.read_to_end(&mut all).expect("read");
         assert_eq!(all, diff, "nothing read for the decision is lost");

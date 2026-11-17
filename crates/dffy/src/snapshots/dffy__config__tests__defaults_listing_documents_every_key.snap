@@ -5,7 +5,7 @@ expression: text
 <dim># Color output: auto, always or never. With auto, NO_COLOR and CLICOLOR_FORCE apply.</>
 <hint>color</><dim> = </>auto
 
-<dim># Page output on a terminal: auto or never.</>
+<dim># Page output on a terminal: auto, always or never. Auto prints a piped diff that fits one screen; always opens the viewer for it.</>
 <hint>paging</><dim> = </>auto
 
 <dim># Pager command, run through sh. Empty uses $PAGER, then less -RFX. DFFY_PAGER overrides it.</>

@@ -74,7 +74,8 @@ pub(crate) struct Global {
     /// When to use colors; auto follows the terminal and the environment
     #[arg(long, value_name = "when", global = true)]
     pub color: Option<ColorWhen>,
-    /// Whether to page output on a terminal
+    /// Whether to page output on a terminal; always opens the viewer even
+    /// for a piped diff that fits one screen
     #[arg(long, value_name = "when", global = true)]
     pub paging: Option<Paging>,
     /// Theme: a built-in or a file in the config's themes directory

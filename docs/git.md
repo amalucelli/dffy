@@ -68,13 +68,13 @@ dffy                       # dffy reads the repository itself and ignores diff.e
 When stdin is a pipe and stdout is a terminal (git's pager setup, or `git log -p | dffy`), dffy first looks at the start of the input:
 
 - **Not a diff** (`git log`, `git blame`, `git branch`): passed through to the pager byte for byte, so it looks as it would without dffy.
-- **A diff that fits one screen:** printed, the way `less -F` does, and dffy exits.
+- **A diff that fits one screen:** printed, the way `less -F` does, and dffy exits. With `--paging=always` (or `paging = always`), the viewer opens instead.
 - **Anything longer:** the viewer opens, reading keys from the terminal.
 
 Timing:
 
 - **Slow writers:** input still undecided after half a second (`git log -S`) is passed through.
-- **A diff still trickling in** after a quarter second opens the viewer without waiting to see whether it would fit.
+- **A diff still trickling in** after a quarter second opens the viewer without waiting to see whether it would fit. With `paging = always` there is no such wait: the viewer opens as soon as the input is recognized as a diff.
 
 In the viewer:
 

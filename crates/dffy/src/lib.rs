@@ -741,11 +741,12 @@ fn print_diff(input: impl io::Read, mut out: Output, ctx: &Ctx) -> Result<ExitCo
 }
 
 /// Piped input with a terminal for output. A diff opens the viewer, unless
-/// it fits one screen (printed, as `less -F` would) or paging is off
-/// (printed); anything else passes through to the pager unchanged, so
-/// `git log`, `git branch` and `git blame` look as they would without dffy.
+/// it fits one screen (printed, as `less -F` would, except with paging
+/// always) or paging is off (printed); anything else passes through to the
+/// pager unchanged, so `git log`, `git branch` and `git blame` look as they
+/// would without dffy.
 fn piped(ctx: &Ctx) -> Result<ExitCode, Error> {
-    use pager::stdin::{Decision, Stdin, decide};
+    use pager::stdin::{Decision, Screen, Stdin, decide};
     let mut stdin = Stdin::spawn()?;
     let tty = if ctx.config.paging == Paging::Never {
         None
@@ -754,7 +755,12 @@ fn piped(ctx: &Ctx) -> Result<ExitCode, Error> {
     };
     let layout = ctx.layout();
     let height = tty.as_ref().map(|t| t.size().1);
-    match decide(&mut stdin, height.map(|h| (h, layout.split)))? {
+    let screen = match height {
+        None => Screen::Absent,
+        Some(_) if ctx.config.paging == Paging::Always => Screen::Viewer,
+        Some(h) => Screen::Fit(h, layout.split),
+    };
+    match decide(&mut stdin, screen)? {
         Decision::NotDiff => {
             let mut out = ctx.output();
             let mut buf = vec![0; 64 << 10];

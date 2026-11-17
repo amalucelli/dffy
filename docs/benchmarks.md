@@ -15,7 +15,7 @@
   | `print` | dffy printing the range, highlighted and not, one file, and the file list |
   | `pager` | dffy reading the range's patch as a pager |
 
-  dffy's own budgets, measured inside the process with the divan benchmarks and the kernel tests, are in [architecture.md](architecture.md#performance).
+  dffy's own budgets are in [architecture.md](architecture.md#performance).
 
 Both need `DFFY_BENCH_REPO` naming a clone of the Linux kernel with tags `v6.0` and `v6.1`. A shallow clone is enough (about 600MB of history):
 
@@ -66,7 +66,7 @@ task perf -- --rev main
 - Allocation counts and bytes per iteration, from divan's allocation profiler, fail on any increase of the median.
 - `count_pass` finding files whose count differs from their diff fails. A metric the baseline has and the candidate lacks fails; one only the candidate has is listed.
 
-**The quick tier** keeps only the deterministic metrics, so 3 rounds are enough. Each round runs each divan benchmark alone twice, at 2 iterations and at 2 plus a power of two chosen so that the added iterations take at least a quarter of the time its fixture takes to load, and divides the difference in instructions by the added iterations. Print and pager run on a fixed subset of the range: 421 changed files under ten directories, with C sources and headers, Makefiles and Kconfig, Rust, docs, YAML, JSON, renames and the largest file, in rows named `print/subset` and `pager/subset`. There are no timings, peak memory or `pty` group. The summary ends with the largest spread of an instruction count over one side's rounds.
+**The quick tier** keeps only the deterministic metrics, so 3 rounds are enough. Each round runs each divan benchmark alone twice, with the same number of samples, and divides the difference in instructions by the iterations the second run adds: the power of two nearest to 200ms of the benchmark's time per iteration, at most 8 more per sample. With equal sample counts, divan's per-sample work cancels in the difference, and a sample holds at most 10 iterations' inputs and outputs. Print and pager run on a fixed subset of the range: 421 changed files under ten directories, with C sources and headers, Makefiles and Kconfig, Rust, docs, YAML, JSON, renames and the largest file, in rows named `print/subset` and `pager/subset`. There are no timings, peak memory or `pty` group. The summary ends with the largest spread of an instruction count over one side's rounds.
 
 Every command runs in the kernel clone with only `PATH` from the environment, an empty home and XDG directories, git with no global or system config, and `TERM=xterm-256color`. Peak memory needs `/usr/bin/time` (GNU time on Linux). Layout bands hold only for the machine that measured them. Advanced: `cargo xtask bench-baseline`, `bench-ab`, `bench-noise` and `bench-layouts` run the steps above on a directory of executables, and `bench-noise` writes a `noise.tsv` beside them that lets an allocation metric pass within its band; `cargo xtask` prints their usage.
 
@@ -100,16 +100,13 @@ The tables below are pasted from a run; no task writes them.
 2. Run `cargo xtask report target/perf/runs/<time>` with the directory it printed.
 3. Paste the tables under their headings below, and update [Setup](#setup) with the run's date, machine and versions from the top of its `summary.md`.
 
-dffy's budget table in [architecture.md](architecture.md#performance) is updated the same way, from the divan benchmarks and the kernel tests.
+dffy's budget table in [architecture.md](architecture.md#performance) is updated the same way, from a `task perf:full` run's report and this comparison.
 
 ## Setup
 
-- **Date:** every table was measured on 2026-11-15 on a release build (`cargo build --release`).
-  - The `delta` row without highlighting is from a second run of that section the same hour, because its total spread over 0.8s in the first.
-  - The range table's first three rows (git, dffy as git's pager, dffy without highlighting) are from a later run of that section the same day, after a change that sped up dffy's printed output. So is dffy's row in the viewer table for the range: the faster line diff moved its settled time, and its first frame stayed the same.
-  - dffy's other rows were measured again after that change. They stayed within their spread, or within 5% when timed run for run against the previous build, so they keep their first measurement.
-- **Machine:** a VM with 4 vCPUs of an AMD EPYC 9554P, 15.6GiB of RAM, Ubuntu 24.04.5 LTS, Linux 6.12.115, with nothing else running. Each measurement started once the one-minute load average was under 1.
-- **Versions:** dffy 0.1.0 (release build), `delta` 0.20.1, `difftastic` 0.72.0, `diff-so-fancy` 1.4.14 on Perl 5.38.2, `hunk` 0.25.0, `lumen` 2.32.0, git 2.43.0, GNU diffutils 3.10, hyperfine 2.0.0, pyte 0.8.2 on Python 3.12.3.
+- **Date:** every table is from one run of `cargo xtask compare`, started on 2026-11-17 at 01:56 UTC, on a release build (`cargo build --release`).
+- **Machine:** a VM with 4 vCPUs of an AMD EPYC 9554P, 15.6GiB of RAM, Ubuntu 24.04.5 LTS, Linux 6.12.115, with nothing else running. The load average was 0.11 when the run started, and each measurement started once the one-minute load average was under 1.
+- **Versions:** dffy 0.2.0 (commit `126c8cf`, built with rustc 1.100.0), `delta` 0.20.1, `difftastic` 0.72.0, `diff-so-fancy` 1.4.14 on Perl 5.38.2, `hunk` 0.25.0, `lumen` 2.32.0, git 2.43.0, GNU diffutils 3.10, hyperfine 2.0.0.
 - **Runs:** 10 per measurement after a warmup run, 3 without warmup for commands over about ten seconds, and one for `difftastic` on the whole range. Memory comes from 3 more runs of each command (one for `difftastic` on the range); the viewer tables sample memory during their timed runs.
 - **Memory:** "own memory" is what the program allocated itself. "Mapped files" is the part of the repository's pack files (and the program's executable) it has mapped: OS file cache, shared with git and every other reader of the same packs. `git diff` maps the same packs.
 
@@ -119,17 +116,17 @@ The pagers read what git writes for a terminal. Totals are measured with output 
 
 | Tool | Command | First byte, median (min–max) | Total, median ± σ (min–max) | Own memory | Mapped files | git beside it, own / mapped |
 |---|---|---|---|---|---|---|
-| git diff (baseline) | `git diff --no-ext-diff --color=always v6.0 v6.1` | 200.9ms (186.8–233.3) | 4.17s ± 0.05s (4.12s–4.26s) | 125.9MB | 277.3MB | — |
-| dffy, as git's pager | `git diff --no-ext-diff --color=always v6.0 v6.1 \| dffy --paging=never --color=always` | 197.4ms (185.4–235.4) | 4.39s ± 0.05s (4.35s–4.50s) | 3.0MB | 5.5MB | 125.9MB / 276.7MB |
-| dffy, on the repository, no highlighting | `dffy v6.0..v6.1 --paging=never --color=always --no-highlight` | 6.1ms (4.0–12.8) | 785.0ms ± 13.5ms (756.2ms–795.5ms) | 48.3MB | 279.2MB | — |
-| dffy, on the repository, highlighted | `dffy v6.0..v6.1 --paging=never --color=always` | 7.1ms (7.0–7.3) | 17.07s ± 0.12s (17.01s–17.23s) | 74.7MB | 283.8MB | — |
-| `delta`, no highlighting | `git diff --no-ext-diff --color=always v6.0 v6.1 \| delta --paging=never --syntax-theme=none` | 210.8ms (207.1–211.5) | 8.56s ± 0.06s (8.45s–8.57s) | 21.7MB | 7.4MB | 125.9MB / 276.4MB |
-| `delta`, highlighted | `git diff --no-ext-diff --color=always v6.0 v6.1 \| delta --paging=never` | 218.0ms (214.0–235.1) | 38.99s ± 0.53s (38.56s–39.62s) | 29.7MB | 7.9MB | 125.9MB / 276.3MB |
-| `diff-so-fancy` | `git diff --no-ext-diff --color=always v6.0 v6.1 \| diff-so-fancy` | 216.2ms (199.3–217.0) | 14.78s ± 0.06s (14.75s–14.87s) | 33.4MB | 5.6MB | 125.9MB / 277.2MB |
-| `difftastic`, as git's external diff | `DFT_COLOR=always GIT_EXTERNAL_DIFF=difft git diff v6.0 v6.1` | 235.4ms, one run | 956.07s, one run | 916.5MB | 11.5MB | 117.7MB / 277.4MB |
+| git diff (baseline) | `git diff --no-ext-diff --color=always v6.0 v6.1` | 207.5ms (184.5–218.5) | 4.20s ± 0.05s (4.09s–4.24s) | 125.8MB | 276.4MB | — |
+| dffy, as git's pager | `git diff --no-ext-diff --color=always v6.0 v6.1 \| dffy --paging=never --color=always` | 209.1ms (187.3–217.5) | 4.40s ± 0.04s (4.34s–4.48s) | 3.1MB | 5.8MB | 125.8MB / 277.0MB |
+| dffy, on the repository, no highlighting | `dffy v6.0..v6.1 --paging=never --color=always --no-highlight` | 6.4ms (4.0–7.7) | 777.7ms ± 16.0ms (755.5ms–805.6ms) | 46.5MB | 279.9MB | — |
+| dffy, on the repository, highlighted | `dffy v6.0..v6.1 --paging=never --color=always` | 7.2ms (6.6–7.5) | 16.14s ± 0.30s (16.01s–16.58s) | 79.1MB | 285.4MB | — |
+| `delta`, no highlighting | `git diff --no-ext-diff --color=always v6.0 v6.1 \| delta --paging=never --syntax-theme=none` | 201.8ms (189.5–211.0) | 8.58s ± 0.10s (8.42s–8.60s) | 21.6MB | 7.7MB | 125.8MB / 276.7MB |
+| `delta`, highlighted | `git diff --no-ext-diff --color=always v6.0 v6.1 \| delta --paging=never` | 190.6ms (188.8–214.2) | 38.94s ± 0.16s (38.76s–39.08s) | 29.6MB | 7.9MB | 125.8MB / 276.5MB |
+| `diff-so-fancy` | `git diff --no-ext-diff --color=always v6.0 v6.1 \| diff-so-fancy` | 211.0ms (209.0–221.7) | 14.81s ± 0.09s (14.75s–14.93s) | 33.4MB | 5.4MB | 125.8MB / 276.4MB |
+| `difftastic`, as git's external diff | `DFT_COLOR=always GIT_EXTERNAL_DIFF=difft git diff v6.0 v6.1` | 245.4ms, one run | 935.15s, one run | 917.1MB | 11.5MB | 117.7MB / 276.5MB |
 
 - A pager's first byte follows git's, which comes after git's rename detection: with `--no-renames`, git's first byte comes at 33ms (median of 10).
-- dffy as a pager doesn't highlight code; dffy on the repository highlights every file it prints, which is most of its 17.1s.
+- dffy as a pager doesn't highlight code; dffy on the repository highlights every file it prints, which is most of its 16.1s.
 - git and dffy on the repository each map about 280MB of the repository's 576MB of packs, the same pages of the same files. Of its own memory, dffy holds at most 4MB of file contents and output ahead of what it has written. A file larger than that is diffed on a thread of its own, one at a time, while the others go on, and its output streams once its turn comes. Highlighting adds the syntax trees of the files being highlighted.
 - `difftastic` starts one process per file; its memory is the peak of the largest one.
 
@@ -137,8 +134,8 @@ The pagers read what git writes for a terminal. Totals are measured with output 
 
 | Tool | Command | First byte, median (min–max) | Total, median ± σ (min–max) | Own memory | Mapped files | git beside it, own / mapped |
 |---|---|---|---|---|---|---|
-| git diff --name-status | `git diff --no-ext-diff --name-status v6.0 v6.1` | 193.3ms (188.5–241.2) | 212.0ms ± 19.0ms (190.6ms–249.5ms) | 19.1MB | 63.6MB | — |
-| dffy --name-status | `dffy --name-status --color=never v6.0..v6.1` | 3.4ms (2.5–6.2) | 82.5ms ± 3.8ms (75.2ms–87.0ms) | 19.1MB | 65.7MB | — |
+| git diff --name-status | `git diff --no-ext-diff --name-status v6.0 v6.1` | 197.3ms (187.5–213.0) | 211.0ms ± 9.1ms (192.2ms–221.9ms) | 19.0MB | 63.2MB | — |
+| dffy --name-status | `dffy --name-status --color=never v6.0..v6.1` | 2.4ms (2.1–2.7) | 78.5ms ± 3.8ms (72.9ms–84.9ms) | 19.3MB | 66.9MB | — |
 
 Both lists are identical: 12,914 entries, 254 of them renames, with the same similarity scores.
 
@@ -148,17 +145,17 @@ Both lists are identical: 12,914 entries, 254 of them renames, with the same sim
 
 | Tool | Command | First byte, median (min–max) | Total, median ± σ (min–max) | Own memory | Mapped files | git beside it, own / mapped |
 |---|---|---|---|---|---|---|
-| GNU diff | `diff -u old/kernel/sched/fair.c new/kernel/sched/fair.c` | 7.9ms (5.0–8.5) | 7.0ms ± 0.6ms (6.8ms–8.4ms) | 1.7MB | 2.1MB | — |
-| git diff --no-index | `git diff --no-index --color=always old/kernel/sched/fair.c new/kernel/sched/fair.c` | 13.1ms (6.6–16.2) | 16.6ms ± 2.5ms (10.2ms–18.8ms) | 2.5MB | 5.4MB | — |
-| dffy | `dffy --paging=never --color=always old/kernel/sched/fair.c new/kernel/sched/fair.c` | 56.0ms (42.8–64.9) | 59.7ms ± 11.6ms (38.2ms–72.5ms) | 13.5MB | 8.4MB | — |
-| `delta` | `delta --paging=never old/kernel/sched/fair.c new/kernel/sched/fair.c` | 27.0ms (23.2–29.0) | 60.7ms ± 12.2ms (48.2ms–84.6ms) | 3.7MB | 8.0MB | 2.4MB / 5.3MB |
-| `diff-so-fancy` | `git diff --no-index --color=always old/kernel/sched/fair.c new/kernel/sched/fair.c \| diff-so-fancy` | 32.6ms (26.0–53.6) | 44.1ms ± 16.5ms (37.8ms–77.6ms) | 4.5MB | 5.6MB | 2.5MB / 5.4MB |
-| dffy --syntax | `dffy --syntax --paging=never --color=always old/kernel/sched/fair.c new/kernel/sched/fair.c` | 55.5ms (53.6–60.4) | 67.5ms ± 10.4ms (54.3ms–82.1ms) | 34.4MB | 8.5MB | — |
-| `difftastic` | `DFT_COLOR=always difft old/kernel/sched/fair.c new/kernel/sched/fair.c` | 254.7ms (230.8–273.6) | 260.6ms ± 10.0ms (244.3ms–271.2ms) | 45.1MB | 7.3MB | 17.1MB / 14.2MB |
+| GNU diff | `diff -u old/kernel/sched/fair.c new/kernel/sched/fair.c` | 5.7ms (3.7–8.2) | 4.2ms ± 1.1ms (3.4ms–7.0ms) | 1.7MB | 2.0MB | — |
+| git diff --no-index | `git diff --no-index --color=always old/kernel/sched/fair.c new/kernel/sched/fair.c` | 9.5ms (5.8–11.9) | 7.9ms ± 2.6ms (6.0ms–13.2ms) | 2.6MB | 5.4MB | — |
+| dffy | `dffy --paging=never --color=always old/kernel/sched/fair.c new/kernel/sched/fair.c` | 52.5ms (40.2–58.9) | 43.4ms ± 6.7ms (39.4ms–60.3ms) | 13.5MB | 9.2MB | — |
+| `delta` | `delta --paging=never old/kernel/sched/fair.c new/kernel/sched/fair.c` | 16.2ms (11.5–23.8) | 55.1ms ± 11.2ms (43.8ms–71.4ms) | 3.7MB | 8.0MB | 2.6MB / 5.3MB |
+| `diff-so-fancy` | `git diff --no-index --color=always old/kernel/sched/fair.c new/kernel/sched/fair.c \| diff-so-fancy` | 31.3ms (28.3–43.3) | 43.9ms ± 8.1ms (36.7ms–58.2ms) | 4.5MB | 5.4MB | 2.6MB / 5.3MB |
+| dffy --syntax | `dffy --syntax --paging=never --color=always old/kernel/sched/fair.c new/kernel/sched/fair.c` | 66.9ms (58.5–77.3) | 76.4ms ± 8.8ms (58.7ms–85.5ms) | 34.4MB | 9.4MB | — |
+| `difftastic` | `DFT_COLOR=always difft old/kernel/sched/fair.c new/kernel/sched/fair.c` | 258.3ms (239.5–281.4) | 264.4ms ± 11.9ms (248.3ms–290.9ms) | 45.0MB | 7.2MB | 17.1MB / 14.2MB |
 
 `delta` runs `git diff --no-index` itself to compare two files, and `difftastic` runs git as well; their git is in the last column.
 
-dffy parses both sides of the file for highlighting before it prints the first line, so its first byte comes after `delta`'s and `diff-so-fancy`'s; its total is level with `delta`'s. In the viewer, the plain diff paints first and highlighting follows.
+dffy parses both sides of the file for highlighting before it prints the first line, so its first byte comes after `delta`'s and `diff-so-fancy`'s; its total is level with `diff-so-fancy`'s, and its median is under `delta`'s. In the viewer, the plain diff paints first and highlighting follows.
 
 ## Syntax-aware diffs of five large files
 
@@ -166,16 +163,16 @@ dffy parses both sides of the file for highlighting before it prints the first l
 
 | File (old → new) | Tool | Time, median ± σ (min–max) | Own memory | Mapped files | What it showed |
 |---|---|---|---|---|---|
-| kernel/sched/fair.c (316KB → 321KB) | dffy --syntax | 71.1ms ± 9.8ms (57.2ms–93.4ms) | 22.8MB | 7.8MB | syntax diff, nothing fell back |
-| kernel/sched/fair.c (316KB → 321KB) | `difftastic` | 253.0ms ± 13.3ms (241.6ms–286.8ms) | 45.8MB | 7.2MB | Text (78 C parse errors, exceeded DFT_PARSE_ERROR_LIMIT, first at 127:21) |
-| kernel/exit.c (44KB → 45KB) | dffy --syntax | 20.8ms ± 4.3ms (17.5ms–29.0ms) | 4.4MB | 7.9MB | syntax diff, nothing fell back |
-| kernel/exit.c (44KB → 45KB) | `difftastic` | 67.5ms ± 8.2ms (53.6ms–80.1ms) | 9.0MB | 7.3MB | Text (49 C parse errors, exceeded DFT_PARSE_ERROR_LIMIT, first at 172:45) |
-| mm/mmap.c (100KB → 100KB) | dffy --syntax | 41.1ms ± 10.3ms (26.7ms–55.3ms) | 8.8MB | 7.7MB | syntax diff, nothing fell back |
-| mm/mmap.c (100KB → 100KB) | `difftastic` | 122.1ms ± 10.6ms (114.1ms–145.4ms) | 21.3MB | 7.4MB | Text (55 C parse errors, exceeded DFT_PARSE_ERROR_LIMIT, first at 170:30) |
-| mm/vmscan.c (139KB → 212KB) | dffy --syntax | 43.8ms ± 8.9ms (39.7ms–60.7ms) | 12.6MB | 8.0MB | syntax diff, nothing fell back |
-| mm/vmscan.c (139KB → 212KB) | `difftastic` | 149.5ms ± 8.6ms (145.6ms–173.1ms) | 27.1MB | 7.2MB | Text (11 C parse errors, exceeded DFT_PARSE_ERROR_LIMIT, first at 2145:23) |
-| drivers/net/wireless/realtek/rtw89/rtw8852c_table.c (517KB → 1076KB) | dffy --syntax | 334.8ms ± 18.5ms (314.6ms–364.2ms) | 108.4MB | 7.9MB | syntax diff, nothing fell back |
-| drivers/net/wireless/realtek/rtw89/rtw8852c_table.c (517KB → 1076KB) | `difftastic` | 242.3ms ± 9.5ms (234.3ms–268.6ms) | 141.2MB | 7.2MB | Text (1.1 MiB exceeded DFT_BYTE_LIMIT) |
+| kernel/sched/fair.c (316KB → 321KB) | dffy --syntax | 66.7ms ± 9.8ms (55.5ms–83.3ms) | 22.9MB | 8.5MB | syntax diff, nothing fell back |
+| kernel/sched/fair.c (316KB → 321KB) | `difftastic` | 271.7ms ± 14.9ms (241.2ms–299.6ms) | 45.9MB | 7.2MB | Text (78 C parse errors, exceeded DFT_PARSE_ERROR_LIMIT, first at 127:21) |
+| kernel/exit.c (44KB → 45KB) | dffy --syntax | 22.8ms ± 3.7ms (15.8ms–27.3ms) | 4.4MB | 8.6MB | syntax diff, nothing fell back |
+| kernel/exit.c (44KB → 45KB) | `difftastic` | 66.3ms ± 9.7ms (55.9ms–82.4ms) | 9.1MB | 7.3MB | Text (49 C parse errors, exceeded DFT_PARSE_ERROR_LIMIT, first at 172:45) |
+| mm/mmap.c (100KB → 100KB) | dffy --syntax | 32.8ms ± 5.3ms (27.4ms–40.8ms) | 8.9MB | 8.5MB | syntax diff, nothing fell back |
+| mm/mmap.c (100KB → 100KB) | `difftastic` | 121.3ms ± 12.9ms (102.0ms–141.2ms) | 21.3MB | 7.4MB | Text (55 C parse errors, exceeded DFT_PARSE_ERROR_LIMIT, first at 170:30) |
+| mm/vmscan.c (139KB → 212KB) | dffy --syntax | 42.3ms ± 2.1ms (40.0ms–46.3ms) | 12.8MB | 8.6MB | syntax diff, nothing fell back |
+| mm/vmscan.c (139KB → 212KB) | `difftastic` | 150.4ms ± 8.0ms (136.2ms–164.3ms) | 26.9MB | 7.2MB | Text (11 C parse errors, exceeded DFT_PARSE_ERROR_LIMIT, first at 2145:23) |
+| drivers/net/wireless/realtek/rtw89/rtw8852c_table.c (517KB → 1076KB) | dffy --syntax | 327.1ms ± 15.9ms (308.7ms–360.5ms) | 108.8MB | 8.5MB | syntax diff, nothing fell back |
+| drivers/net/wireless/realtek/rtw89/rtw8852c_table.c (517KB → 1076KB) | `difftastic` | 233.4ms ± 10.5ms (221.2ms–254.9ms) | 141.5MB | 7.2MB | Text (1.1 MiB exceeded DFT_BYTE_LIMIT) |
 
 `difftastic`'s times here are for its text fallback, not a structural diff; its header names the limit each file went over. dffy's syntax diff matches parse-error subtrees as opaque pieces, so the same files get a syntax diff.
 
@@ -189,10 +186,10 @@ The first changed line is in the first file, `.clang-format`.
 
 | Viewer | Command | First byte | First frame | Settled | Own memory | Mapped files | git beside it, own / mapped |
 |---|---|---|---|---|---|---|---|
-| harness floor | `echo ping_portaddr_for_each_entry_rcu; sleep 1.5` | 4.0ms (3.6–4.6) | 4.0ms (3.6–4.6) | 4.0ms (3.6–4.6) | 0.1MB | 2.0MB | — |
-| dffy | `dffy v6.0..v6.1` | 9.0ms (5.4–14.5) | 9.5ms (7.5–14.5) | 725.2ms (711.7–750.1) | 90.5MB | 279.6MB | — |
-| `lumen` | `lumen diff v6.0..v6.1` | 5196.2ms (5158.2–5220.8) | 12434.8ms (12428.3–12450.7) | 12435.0ms (12428.5–12451.0) | 676.2MB | 314.4MB | — |
-| `hunk` | `hunk diff v6.0 v6.1` | 10252.5ms (10191.4–10260.7) | 17742.4ms (17692.6–17884.6) | 17746.4ms (17693.4–17887.5) | 4.26GB | 95.8MB | 0.4MB / 5.4MB |
+| harness floor | `echo ping_portaddr_for_each_entry_rcu; sleep 1.5` | 2.5ms (1.5–2.9) | 2.5ms (1.5–2.9) | 2.5ms (1.5–2.9) | 0.1MB | 1.9MB | — |
+| dffy | `dffy v6.0..v6.1` | 6.8ms (5.1–8.1) | 8.1ms (6.4–10.0) | 559.5ms (541.3–589.1) | 99.2MB | 285.1MB | — |
+| `lumen` | `lumen diff v6.0..v6.1` | 5246.7ms (5192.6–5300.6) | 12474.4ms (12458.1–12545.4) | 12474.6ms (12458.4–12545.7) | 676.2MB | 314.1MB | — |
+| `hunk` | `hunk diff v6.0 v6.1` | 10261.6ms (10171.8–10269.2) | 18111.1ms (17731.8–18298.9) | 18111.3ms (17731.9–18300.1) | 4.39GB | 95.7MB | 0.5MB / 5.4MB |
 
 dffy keeps updating the screen after its first frame while it finishes the file list, pairs renames and counts every file's lines for the tree; that work ends at "settled". Its own pty benchmark, which stops at the end of the first complete frame, is in [architecture.md](architecture.md#performance).
 
@@ -202,9 +199,9 @@ The clone has a one-line comment appended to five files. Each viewer opens on ev
 
 | Viewer | Command | First byte | First frame | Settled | Own memory | Mapped files | git beside it, own / mapped |
 |---|---|---|---|---|---|---|---|
-| dffy | `dffy` | 58.6ms (53.8–72.6) | 63.1ms (54.6–72.8) | 174.2ms (150.6–179.4) | 22.8MB | 18.3MB | — |
-| `lumen` | `lumen diff` | 495.8ms (486.1–515.7) | 1122.4ms (1106.8–1220.1) | 7097.1ms (7086.5–7208.7) | 39.3MB | 170.4MB | — |
-| `hunk` | `hunk diff` | 660.4ms (618.7–684.5) | 790.0ms (726.4–814.9) | 1361.9ms (1277.8–1485.6) | 166.1MB | 97.1MB | 17.7MB / 14.4MB |
+| dffy | `dffy` | 74.6ms (62.6–91.3) | 77.0ms (68.3–92.3) | 171.3ms (159.0–184.9) | 22.3MB | 19.0MB | — |
+| `lumen` | `lumen diff` | 485.2ms (479.6–551.7) | 1113.6ms (1095.6–1166.1) | still drawing 5s later | 39.6MB | 170.6MB | — |
+| `hunk` | `hunk diff` | 624.4ms (610.7–646.4) | 732.6ms (712.1–757.3) | 1267.9ms (1240.8–1287.7) | 172.3MB | 97.2MB | 17.7MB / 14.4MB |
 
 The clone tracks 97,371 files; dffy's default diff covers untracked files as well.
 
@@ -214,12 +211,12 @@ Each viewer reads the file from the repository with a path filter, and from the 
 
 | Viewer | Command | First byte | First frame | Settled | Own memory | Mapped files | git beside it, own / mapped |
 |---|---|---|---|---|---|---|---|
-| dffy | `dffy v6.0..v6.1 -- kernel/sched/fair.c` | 8.1ms (7.2–9.8) | 14.1ms (12.6–20.6) | 88.6ms (87.0–103.1) | 22.2MB | 10.9MB | — |
-| dffy, two files | `dffy old/kernel/sched/fair.c new/kernel/sched/fair.c` | 6.8ms (4.3–8.3) | 10.9ms (6.2–13.6) | 60.2ms (39.9–68.1) | 13.9MB | 8.9MB | — |
-| `lumen` | `lumen diff v6.0..v6.1 --file kernel/sched/fair.c` | 102.9ms (89.9–124.8) | 864.5ms (828.8–890.6) | 5993.7ms (5948.2–6023.4) | 39.5MB | 56.0MB | — |
+| dffy | `dffy v6.0..v6.1 -- kernel/sched/fair.c` | 7.3ms (5.7–11.1) | 21.0ms (17.4–24.0) | 97.1ms (85.0–119.9) | 23.0MB | 11.6MB | — |
+| dffy, two files | `dffy old/kernel/sched/fair.c new/kernel/sched/fair.c` | 6.3ms (5.8–9.6) | 14.4ms (10.0–20.9) | 72.3ms (61.2–83.5) | 13.9MB | 9.5MB | — |
+| `lumen` | `lumen diff v6.0..v6.1 --file kernel/sched/fair.c` | 98.1ms (84.5–109.4) | 851.3ms (835.0–898.1) | still drawing 5s later | 39.5MB | 56.0MB | — |
 | `lumen`, two files | | n/a | n/a (no two-file mode) | n/a | | | |
-| `hunk` | `hunk diff v6.0 v6.1 -- kernel/sched/fair.c` | 278.0ms (259.6–300.7) | 438.9ms (405.6–461.7) | 609.4ms (575.1–649.5) | 144.0MB | 96.8MB | 1.3MB / 5.9MB |
-| `hunk`, two files | `hunk diff --files old/kernel/sched/fair.c new/kernel/sched/fair.c` | 304.5ms (295.1–322.7) | 470.7ms (459.6–494.0) | 552.1ms (541.4–577.8) | 140.6MB | 97.1MB | — |
+| `hunk` | `hunk diff v6.0 v6.1 -- kernel/sched/fair.c` | 275.0ms (247.8–311.9) | 427.3ms (387.4–451.5) | 601.1ms (571.6–631.7) | 145.9MB | 96.8MB | 1.3MB / 5.9MB |
+| `hunk`, two files | `hunk diff --files old/kernel/sched/fair.c new/kernel/sched/fair.c` | 310.1ms (299.5–336.7) | 470.9ms (443.8–487.9) | 554.9ms (527.5–571.7) | 140.3MB | 97.0MB | — |
 
 ### One large file: rtw8852c_table.c
 
@@ -227,12 +224,12 @@ Each viewer reads the file from the repository with a path filter, and from the 
 
 | Viewer | Command | First byte | First frame | Settled | Own memory | Mapped files | git beside it, own / mapped |
 |---|---|---|---|---|---|---|---|
-| dffy | `dffy v6.0..v6.1 -- drivers/net/wireless/realtek/rtw89/rtw8852c_table.c` | 8.7ms (7.5–11.8) | 35.5ms (27.2–50.5) | 36.8ms (28.5–51.3) | 12.7MB | 9.9MB | — |
-| dffy, two files | `dffy old/…/rtw8852c_table.c new/…/rtw8852c_table.c` | 7.0ms (3.6–8.5) | 28.4ms (21.3–40.2) | 28.9ms (21.9–40.5) | 8.0MB | 7.5MB | — |
-| `lumen` | `lumen diff v6.0..v6.1 --file drivers/net/wireless/realtek/rtw89/rtw8852c_table.c` | 107.5ms (92.9–115.6) | 7211.5ms (7124.4–7518.4) | 12731.9ms (12650.3–12979.6) | 151.6MB | 56.0MB | — |
+| dffy | `dffy v6.0..v6.1 -- drivers/net/wireless/realtek/rtw89/rtw8852c_table.c` | 7.1ms (6.6–8.0) | 49.2ms (41.6–56.4) | 49.8ms (42.0–57.1) | 13.2MB | 11.7MB | — |
+| dffy, two files | `dffy old/…/rtw8852c_table.c new/…/rtw8852c_table.c` | 5.9ms (4.3–8.0) | 40.4ms (38.2–49.5) | 41.1ms (38.7–49.9) | 9.4MB | 9.1MB | — |
+| `lumen` | `lumen diff v6.0..v6.1 --file drivers/net/wireless/realtek/rtw89/rtw8852c_table.c` | 108.7ms (90.9–129.4) | 7132.8ms (7079.2–7168.7) | still drawing 5s later | 151.6MB | 56.0MB | — |
 | `lumen`, two files | | n/a | n/a (no two-file mode) | n/a | | | |
-| `hunk` | `hunk diff v6.0 v6.1 -- drivers/net/wireless/realtek/rtw89/rtw8852c_table.c` | n/a | n/a (shows "File too large to render automatically.") | n/a | 69.6MB | 92.9MB | — |
-| `hunk`, two files | `hunk diff --files old/…/rtw8852c_table.c new/…/rtw8852c_table.c` | >60s | >60s | >60s | 113.7MB | 44.0MB | — |
+| `hunk` | `hunk diff v6.0 v6.1 -- drivers/net/wireless/realtek/rtw89/rtw8852c_table.c` | n/a | n/a (shows "File too large to render automatically.") | n/a | 69.0MB | 92.7MB | — |
+| `hunk`, two files | `hunk diff --files old/…/rtw8852c_table.c new/…/rtw8852c_table.c` | >60s | >60s | >60s | 113.6MB | 44.1MB | — |
 
 With two files, `hunk` wrote nothing to the terminal in 60 seconds, with one core busy.
 
@@ -242,11 +239,11 @@ The viewer reads the range's patch from `git diff --no-ext-diff v6.0 v6.1` on st
 
 | Viewer | Command | First byte | First frame | Settled | Own memory | Mapped files | git beside it, own / mapped |
 |---|---|---|---|---|---|---|---|
-| dffy | `git diff --no-ext-diff v6.0 v6.1 \| dffy` | 214.9ms (193.5–230.4) | 216.7ms (198.1–231.0) | 234.8ms (214.0–251.1) | 2.0MB | 6.5MB | 21.3MB / 65.2MB |
-| `hunk` pager | `git diff --no-ext-diff v6.0 v6.1 \| hunk pager` | 7476.5ms (7468.2–7805.2) | 15267.4ms (15044.2–15397.0) | 15268.1ms (15044.7–15397.7) | 4.18GB | 95.6MB | 125.8MB / 276.4MB |
+| dffy | `git diff --no-ext-diff v6.0 v6.1 \| dffy` | 208.6ms (203.4–234.6) | 209.7ms (204.4–234.8) | 226.6ms (222.2–256.5) | 2.1MB | 6.6MB | 21.5MB / 65.2MB |
+| `hunk` pager | `git diff --no-ext-diff v6.0 v6.1 \| hunk pager` | 7504.7ms (7446.7–7633.5) | 15178.9ms (15175.8–15583.1) | 15179.0ms (15175.9–15583.2) | 4.19GB | 95.8MB | 125.8MB / 276.4MB |
 | `lumen` | | n/a | n/a (not a pager: reads revisions, not a patch) | n/a | | | |
 
-Both first frames wait for git's first byte, which comes after git's rename detection. dffy reads the patch only as far as the screen and its look-ahead need, so git waits on the pipe with 21MB of its own. Beside `hunk`, git runs to the end of the patch, with the same 126MB as on its own.
+Both first frames wait for git's first byte, which comes after git's rename detection. dffy reads the patch only as far as the screen and its look-ahead need, so git waits on the pipe with 21.5MB of its own. Beside `hunk`, git runs to the end of the patch, with the same 126MB as on its own.
 
 ## Method
 

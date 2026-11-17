@@ -9,7 +9,7 @@ For contributors and coding agents.
 
 The workspace has four kinds of crate:
 
-- `dffy-core`, the library that decides what a diff means. It's versioned on its own (0.1.0) and not published to crates.io; its API is 0.x and unstable.
+- `dffy-core`, the library that decides what a diff means. It's versioned on its own and not published to crates.io; its API is 0.x and unstable.
 - `dffy`, the binary, which shows it in a terminal. It has no supported API.
 - `xtask`, the benchmark tooling.
 - The experimental renderer plugins under `plugins/`, programs of their own that are never linked into dffy.
@@ -237,25 +237,25 @@ Budgets, measured on the kernel clone with a warm page cache. Cold runs (180–6
 
 | Budget | Target | Measured |
 |---|---|---|
-| First paint, range | 50ms | First 50 paths of `v6.0..v6.1` in 1.8ms, all 13,168 in 29ms; first viewer frame in a pty in 5–7ms |
-| First paint, working tree | 50ms | First modified file in 24ms, all tracked files in 51ms, with untracked files 111ms |
-| Pager, first output | 20ms | 3.6ms on a 53MB diff; 6.4MB peak memory for the whole diff |
-| Print, first output | — | 4.1ms for the range, 30ms for the working tree |
-| Frame render | 8ms | 160–244µs for a full 200×60 frame, including the 13,000-file tree |
+| First paint, range | 50ms | First 50 paths of `v6.0..v6.1` in 0.8ms, all 13,168 in 24ms; first viewer frame in a pty in 2.6ms |
+| First paint, working tree | 50ms | First modified file in 27ms, all tracked files in 54ms, with untracked files 109ms |
+| Pager, first output | 20ms | 3.6ms on a 53MB diff; 9.6MB peak RSS for the whole diff |
+| Print, first output | — | 7.2ms for the range (6.4ms without highlighting), 30ms for the working tree |
+| Frame render | 8ms | 140–235µs for a full 200×60 frame, including the 13,000-file tree |
 | Watch refresh | 16ms | About 11ms from the write to the repaint, 8ms of it the debounce |
 | Renames on the range | — | 254 of 254 pairs match git, in 33–35ms (git: 194–201ms) |
-| Line diff, worst file (1.1MB) | 1.5× imara-diff | 2.4ms, 1.16× imara-diff |
-| Syntax diff, five large kernel files | 500ms, 256MB each | 8–267ms in process, at most 100MB per process; `difftastic` fell back to a line diff on all five |
+| Line diff, worst file (1.1MB) | 1.5× imara-diff | 1.9ms, 0.89× imara-diff |
+| Syntax diff, five large kernel files | 500ms, 256MB each | 23–327ms for each `dffy --syntax` run, at most 109MB of its own memory; `difftastic` fell back to a line diff on all five |
 
-Measured on a 4-vCPU, 15GB Linux VM.
+Measured on a VM with 4 vCPUs of an AMD EPYC 9554P, 15.6GiB of RAM, Ubuntu 24.04.5 and Linux 6.12.115.
 
 To reproduce:
 
 1. Point `DFFY_BENCH_REPO` at a kernel clone with tags `v6.0` and `v6.1`.
-2. Run `task bench`: the divan benchmarks in `crates/dffy-core/benches/engine.rs` and `crates/dffy/benches/frame.rs`.
-3. Run `task test:kernel`.
+2. Run `task perf:full` for the divan benchmarks in `crates/dffy-core/benches/engine.rs` and `crates/dffy/benches/frame.rs` and the end-to-end timings, and `task bench:compare` for the whole-command rows.
+3. Turn each run into tables with `cargo xtask report <run-dir>`.
 
-Both skip without `DFFY_BENCH_REPO`.
+All of them need `DFFY_BENCH_REPO`.
 
 ### Checking a change
 
@@ -338,8 +338,9 @@ goreleaser builds the release from `.goreleaser.yaml`:
 - a Homebrew cask pushed to `amalucelli/homebrew-tap`.
 
 ```sh
+task bump VERSION=0.3.0    # set the version in every Cargo.toml and Cargo.lock, then commit
 task snapshot              # build the artifacts locally, no tag, no publish
-task release TAG=v0.1.0    # sign and push the tag, then publish with goreleaser
+task release TAG=v0.3.0    # sign and push the tag, then publish with goreleaser
 ```
 
-`task release` reads a GitHub token from `gh auth token`. goreleaser reads the tag from the remote, so the tag is pushed before it runs.
+`task bump` only edits files. `task release` refuses a tag that doesn't match dffy's and dffy-core's Cargo versions, and reads a GitHub token from `gh auth token`. goreleaser reads the tag from the remote, so the tag is pushed before it runs.

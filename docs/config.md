@@ -37,7 +37,7 @@ keybind = q=unbind
 | Key | Default | Values | Remembered | Description |
 |---|---|---|---|---|
 | `color` | `auto` | `auto`, `always`, `never` |  | Color output: auto, always or never. With auto, NO_COLOR and CLICOLOR_FORCE apply. |
-| `paging` | `auto` | `auto`, `never` |  | Page output on a terminal: auto or never. |
+| `paging` | `auto` | `auto`, `always`, `never` |  | Page output on a terminal: auto, always or never. Auto prints a piped diff that fits one screen; always opens the viewer for it. |
 | `pager` | empty | a shell command |  | Pager command, run through sh. Empty uses $PAGER, then less -RFX. DFFY_PAGER overrides it. |
 | `theme` | `default` | a theme name | yes | Theme name: a built-in or a file in the themes directory next to this file. |
 | `view` | `auto` | `auto`, `split`, `unified` | yes | Diff layout: auto, split or unified. Auto splits on terminals at least split-min-width wide. |

@@ -23,6 +23,7 @@ pub(crate) enum ColorWhen {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub(crate) enum Paging {
     Auto,
+    Always,
     Never,
 }
 
@@ -206,7 +207,7 @@ pub(crate) const KEYS: &[Key] = &[
     },
     Key {
         name: "paging",
-        doc: "Page output on a terminal: auto or never.",
+        doc: "Page output on a terminal: auto, always or never. Auto prints a piped diff that fits one screen; always opens the viewer for it.",
         default: "auto",
     },
     Key {

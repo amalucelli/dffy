@@ -6,6 +6,27 @@ mod config;
 mod daemon;
 mod docs;
 mod doctor;
+
+/// `dffy doctor`: fails when a check does.
+fn doctor(ctx: &Ctx, dir: Option<&Path>, json: bool) -> Result<ExitCode, Error> {
+    let facts = doctor::Facts::gather(ctx, dir);
+    let failed = if json {
+        let (text, failed) = facts.json();
+        io::stdout().lock().write_all(text.as_bytes())?;
+        failed
+    } else {
+        let mut c = Canvas::default();
+        let failed = facts.render(&mut c);
+        // Its exit code is always success; the checks decide doctor's.
+        let _ = write_stdout(ctx, &c)?;
+        failed
+    };
+    Ok(if failed {
+        ExitCode::FAILURE
+    } else {
+        ExitCode::SUCCESS
+    })
+}
 mod json;
 mod keys;
 mod mcp;
@@ -494,27 +515,6 @@ fn print_err(ctx: &Ctx, canvas: &Canvas) {
     let mut buf = Vec::new();
     canvas.write_to(&mut buf, ctx.err_theme()).ok();
     io::stderr().lock().write_all(&buf).ok();
-}
-
-/// `dffy doctor`: fails when a check does.
-fn doctor(ctx: &Ctx, dir: Option<&Path>, json: bool) -> Result<ExitCode, Error> {
-    let facts = doctor::Facts::gather(ctx, dir);
-    let failed = if json {
-        let (text, failed) = facts.json();
-        io::stdout().lock().write_all(text.as_bytes())?;
-        failed
-    } else {
-        let mut c = Canvas::default();
-        let failed = facts.render(&mut c);
-        // Its exit code is always success; the checks decide doctor's.
-        let _ = write_stdout(ctx, &c)?;
-        failed
-    };
-    Ok(if failed {
-        ExitCode::FAILURE
-    } else {
-        ExitCode::SUCCESS
-    })
 }
 
 /// The comments file: `file` (`--comments`) relative to where dffy runs
@@ -1063,11 +1063,12 @@ fn print_diff(input: impl io::Read, mut out: Output, ctx: &Ctx) -> Result<ExitCo
 }
 
 /// Piped input with a terminal for output. A diff opens the viewer, unless
-/// it fits one screen (printed, as `less -F` would) or paging is off
-/// (printed); anything else passes through to the pager unchanged, so
-/// `git log`, `git branch` and `git blame` look as they would without dffy.
+/// it fits one screen (printed, as `less -F` would, except with paging
+/// always) or paging is off (printed); anything else passes through to the
+/// pager unchanged, so `git log`, `git branch` and `git blame` look as they
+/// would without dffy.
 fn piped(ctx: &Ctx) -> Result<ExitCode, Error> {
-    use pager::stdin::{Decision, Stdin, decide};
+    use pager::stdin::{Decision, Screen, Stdin, decide};
     let mut stdin = Stdin::spawn()?;
     let tty = if ctx.config.paging == Paging::Never {
         None
@@ -1076,7 +1077,12 @@ fn piped(ctx: &Ctx) -> Result<ExitCode, Error> {
     };
     let layout = ctx.layout();
     let height = tty.as_ref().map(|t| t.size().1);
-    match decide(&mut stdin, height.map(|h| (h, layout.split)))? {
+    let screen = match height {
+        None => Screen::Absent,
+        Some(_) if ctx.config.paging == Paging::Always => Screen::Viewer,
+        Some(h) => Screen::Fit(h, layout.split),
+    };
+    match decide(&mut stdin, screen)? {
         Decision::NotDiff => {
             let mut out = ctx.output();
             let mut buf = vec![0; 64 << 10];

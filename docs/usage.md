@@ -212,7 +212,7 @@ These can go before or after the subcommand.
 |---|---|
 | `-C <path>` | Run as if dffy started in `<path>`. |
 | `--color auto\|always\|never` | When to color output. `auto` colors terminals, and follows `NO_COLOR` and `CLICOLOR_FORCE`. |
-| `--paging auto\|never` | `never` writes straight to the terminal and also keeps the viewer from opening. |
+| `--paging auto\|always\|never` | `never` writes straight to the terminal and also keeps the viewer from opening. `always` opens the viewer for a piped diff that fits one screen, which `auto` prints; see [git.md](git.md#piped-input). |
 | `--theme <name>` | A built-in theme or a file in the config's `themes/` directory. See [themes.md](themes.md). |
 | `--comments <file>` | The review comments file, relative to `-C`'s directory; the default is `dffy/comments.json` in the repository's git directory. See [comments.md](comments.md#where-the-file-is). |
 | `--review <name>` | The review plugin, `dffy-review-<name>`, over the `review` setting; it adds the plugin's command (`dffy pr`) for the run. See [plugins.md](plugins.md#review-plugins). |

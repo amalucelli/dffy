@@ -8,7 +8,7 @@ expression: "all_rows(layout(false, true)).join(\"\\n\")"
      │  └┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┘
 1 1  │ fn main() {
 2  ○-│     let total = count + 1;
-     │  ╶ ▸ ana · 3h ago · resolved · Was count right? ───╴
+     │  │ ▸ ana · 3h ago · resolved · Was count right?    │
   2◆+│     let total = items.len() + 1;
      │  ┌ ▾ octocat · 2h ago · outdated ┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┐
      │  ┆ Why len() here and not a running count, kept as ┆
@@ -28,4 +28,4 @@ expression: "all_rows(layout(false, true)).join(\"\\n\")"
   6 +│ // a comment long enough to wrap in a narrow split co
      │ lumn, and then some more!
      │\ No newline at end of file
-     │  ╶ ▸ ana · 4h ago · outdated · lines not…  1 reply ╴
+     │  │ ▸ ana · 4h ago · outdated · lines not…  1 reply │

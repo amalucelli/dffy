@@ -9,11 +9,13 @@
 mod git;
 mod github;
 
+use std::cell::OnceCell;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, Stdio};
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
@@ -21,14 +23,45 @@ use serde_json::{Value, json};
 use crate::git::{Remote, Source};
 use crate::github::{Error, Page};
 
-const USAGE: &str = "usage: dffy-review-github list | detect | prepare <pr> | check <pr> | pull <pr> \
+const USAGE: &str = "usage: dffy-review-github describe | doctor | list | detect | prepare <pr> \
+                     | check <pr> | pull <pr> \
                      | post <pr> --event pending|comment|approve|request_changes [--summary-file <file>] \
                      | post <pr> --dry-run \
-                     | post <pr> --submit-only --event comment|approve|request_changes [--summary-file <file>] \
+                     | post <pr> --apply-event --event comment|approve|request_changes [--summary-file <file>] \
                      | prefetch";
 
-const VERBS: [&str; 7] = [
-    "list", "detect", "prepare", "check", "pull", "post", "prefetch",
+/// What `describe` says: the command, the words for a PR, and the events
+/// the post dialog offers, `pending` leaving the review open on GitHub.
+fn description() -> Value {
+    let event = |id: &str, key: &str, label: &str, done: &str| json!({"id": id, "key": key, "label": label, "done": done});
+    let mut pending = event(
+        "pending",
+        "p",
+        "pending: on GitHub, for you only",
+        "review pending",
+    );
+    pending["submits"] = json!(false);
+    json!({
+        "command": "pr",
+        "noun": "pull request",
+        "nouns": "pull requests",
+        "short": "PR",
+        "id_prefix": "#",
+        "events": [
+            pending,
+            event("comment", "c", "comment", "commented"),
+            event("approve", "a", "approve", "approved"),
+            event("request_changes", "r", "request changes", "changes requested"),
+        ],
+        "outdated_reply_warning": "GitHub collapses this thread, so a reply there is easy to miss",
+    })
+}
+
+/// What dffy shows when refused drafts held the event back.
+const HELD: &str = "review still pending";
+
+const VERBS: [&str; 9] = [
+    "describe", "doctor", "list", "detect", "prepare", "check", "pull", "post", "prefetch",
 ];
 
 /// The review plugin protocol this speaks. dffy names the one it wants in
@@ -59,6 +92,14 @@ fn main() -> ExitCode {
         .get(1)
         .and_then(|n| n.trim_start_matches('#').parse().ok());
     let result = match (args.as_slice(), pr) {
+        (["describe"], _) => {
+            emit(description());
+            Ok(())
+        }
+        (["doctor"], _) => {
+            doctor();
+            Ok(())
+        }
         (["list"], _) => list(),
         (["detect"], _) => detect(),
         (["prefetch"], _) => prefetch(),
@@ -68,7 +109,7 @@ fn main() -> ExitCode {
         (["post", _, flags @ ..], Some(pr)) => match post_args(flags) {
             Ok((PostMode::Post(event), summary)) => post(pr, event, summary),
             Ok((PostMode::DryRun, _)) => dry_run(pr),
-            Ok((PostMode::SubmitOnly(event), summary)) => submit_only(pr, event, summary),
+            Ok((PostMode::ApplyEvent(event), summary)) => apply_event(pr, event, summary),
             Err(e) => return fail(2, &e),
         },
         ([verb, ..], _) if !VERBS.contains(verb) => {
@@ -158,7 +199,8 @@ fn toggled(comment: &Value) -> bool {
 }
 
 /// A PR under review, and what's kept for it: the comments file, drafts
-/// included, and the session dffy was last given. It's in the data
+/// included, the session dffy was last given, and GitHub's hunks of a
+/// head for `post` to plan with. It's in the data
 /// directory, not the state or cache one, because the drafts are your
 /// writing.
 struct Review {
@@ -200,13 +242,15 @@ impl Review {
         serde_json::from_slice(&fs::read(self.dir.join("session.json")).ok()?).ok()
     }
 
-    /// `session` as dffy reads it: with the comments file, without the
-    /// branch.
+    /// `session` as dffy reads it: the PR's number as its id, with the
+    /// comments file, without the branch.
     fn printed(&self, session: &Value) -> Value {
         let mut session = session.clone();
         if let Some(fields) = session.as_object_mut() {
             fields.remove("head_ref");
+            fields.remove("number");
         }
+        session["id"] = json!(self.pr.to_string());
         session["comments"] = json!(self.file().to_string_lossy());
         session
     }
@@ -216,12 +260,60 @@ impl Review {
     }
 
     fn save(&self, session: &Value) -> Result<(), String> {
-        let path = self.dir.join("session.json");
-        let tmp = self.dir.join("session.json.tmp");
+        self.write("session.json", session)
+    }
+
+    fn write(&self, name: &str, value: &Value) -> Result<(), String> {
+        let path = self.dir.join(name);
+        let tmp = self.dir.join(format!("{name}.tmp"));
         fs::create_dir_all(&self.dir)
-            .and_then(|()| fs::write(&tmp, session.to_string()))
+            .and_then(|()| fs::write(&tmp, value.to_string()))
             .and_then(|()| fs::rename(&tmp, &path))
             .map_err(|e| format!("can't write {}: {e}", path.display()))
+    }
+
+    /// Keeps GitHub's hunks of the PR at `head`, for `post` to plan with,
+    /// in place of any kept before.
+    fn keep_hunks(
+        &self,
+        head: &str,
+        files: &HashMap<String, Vec<git::Hunk>>,
+    ) -> Result<(), String> {
+        let files: serde_json::Map<String, Value> = files
+            .iter()
+            .map(|(path, hunks)| {
+                let hunks: Vec<Value> = hunks
+                    .iter()
+                    .map(|h| json!([h.old.start, h.old.end, h.new.start, h.new.end]))
+                    .collect();
+                (path.clone(), json!(hunks))
+            })
+            .collect();
+        self.write("hunks.json", &json!({"head": head, "files": files}))
+    }
+
+    /// GitHub's hunks by path, when they were kept for `head`.
+    fn hunks(&self, head: &str) -> Option<HashMap<String, Vec<git::Hunk>>> {
+        let kept: Value =
+            serde_json::from_slice(&fs::read(self.dir.join("hunks.json")).ok()?).ok()?;
+        if kept["head"] != head {
+            return None;
+        }
+        let hunk = |h: &Value| {
+            let n = |i: usize| h[i].as_u64();
+            Some(git::Hunk {
+                old: n(0)?..n(1)?,
+                new: n(2)?..n(3)?,
+            })
+        };
+        kept["files"]
+            .as_object()?
+            .iter()
+            .map(|(path, hunks)| {
+                let hunks = hunks.as_array()?.iter().map(hunk).collect::<Option<_>>()?;
+                Some((path.clone(), hunks))
+            })
+            .collect()
     }
 
     /// Records the session's head, the one drafts are posted against, as
@@ -255,28 +347,76 @@ impl Review {
 }
 
 /// Writes `page`, and the pages after it as they arrive, into the comments
-/// file, with a progress line for each.
+/// file, with a progress line for each. Then fetches the original commits
+/// git didn't have, which a force-push left off the PR's head, and places
+/// the threads written on them. The fetched commits get no ref: once
+/// placed, a thread's lines are in the file, and a re-import that can't
+/// read them leaves them.
 fn import(review: &Review, mut page: Page) -> Result<(), String> {
     let file = review.file();
-    let toggled: HashSet<String> = comments(&read(&file)?)
-        .iter()
-        .filter(|c| toggled(c))
-        .filter_map(|c| c["ref"].as_str().map(str::to_owned))
-        .collect();
+    let mut known = github::Known::default();
+    for c in comments(&read(&file)?) {
+        let Some(reference) = c["ref"].as_str() else {
+            continue;
+        };
+        for (set, has) in [
+            (&mut known.toggled, toggled(c)),
+            (&mut known.anchored, c["anchor"].is_object()),
+            (&mut known.unplaced, c["github_unplaced"].is_string()),
+        ] {
+            if has {
+                set.insert(reference.to_owned());
+            }
+        }
+    }
     let mut source = Source::default();
-    let mut written = 0;
+    let (mut written, mut waiting) = (0, Vec::new());
     loop {
-        let ops = github::upserts(&page.threads, &page.base, &mut source, &toggled);
+        let (ops, missing) = github::upserts(&page.threads, &page.base, &mut source, &mut known);
         if !ops.is_empty() {
             apply(&file, &ops)?;
         }
+        waiting.extend(missing);
         written += page.threads.len();
         emit(json!({"progress": format!("{written}/{}", page.total)}));
-        let Some(after) = page.next else {
-            return Ok(());
+        let Some(after) = page.next.take() else {
+            break;
         };
         page = github::page(&review.remote, review.pr, Some(&after))?;
     }
+    let mut commits: Vec<&str> = waiting.iter().filter_map(github::original_commit).collect();
+    commits.sort_unstable();
+    commits.dedup();
+    // Threads on a commit that didn't arrive stay as they were written.
+    if commits.is_empty() || !git::fetch_commits(&commits) {
+        return Ok(());
+    }
+    // A fresh source: the first one keeps its misses.
+    let (ops, _) = github::upserts(&waiting, &page.base, &mut Source::default(), &mut known);
+    apply(&file, &ops)
+}
+
+/// GitHub's hunks of the PR, asked for in the background.
+fn fetch_files(review: &Review) -> JoinHandle<Option<HashMap<String, Vec<git::Hunk>>>> {
+    let (remote, pr) = (review.remote.clone(), review.pr);
+    std::thread::spawn(move || github::files(&remote, pr))
+}
+
+/// Writes the threads from `page` on, then keeps the hunks `files` gets
+/// when they're of the session's head. GitHub doesn't say which head its
+/// files are of; they're taken as `page`'s, asked for at the same time.
+fn import_with_files(
+    review: &Review,
+    page: Page,
+    files: JoinHandle<Option<HashMap<String, Vec<git::Hunk>>>>,
+    session_head: &str,
+) -> Result<(), String> {
+    let head = page.head.clone();
+    let imported = import(review, page);
+    if let (true, Ok(Some(hunks))) = (head == session_head, files.join()) {
+        review.keep_hunks(&head, &hunks)?;
+    }
+    imported
 }
 
 /// A PR prepared before, with its commits still here, answers from the
@@ -293,19 +433,23 @@ fn prepare(pr: u64) -> Result<(), String> {
         return pull(&review);
     };
     review.emit_session(&session);
+    let files = fetch_files(&review);
     let page = github::page(&review.remote, pr, None)?;
     // Threads on a newer head read their anchors from it.
     if !git::has_commit(&page.head) {
         git::fetch_pulls(&[pr])?;
     }
-    import(&review, page)
+    let head = session["head"].as_str().unwrap_or_default();
+    import_with_files(&review, page, files, head)
 }
 
-/// Fetches the head and the first page of threads together, prints the
-/// session once both commits are here, then writes every page.
+/// Fetches the head, the first page of threads and the PR's files
+/// together, prints the session once both commits are here, then writes
+/// every page.
 fn pull(review: &Review) -> Result<(), String> {
     let pr = review.pr;
     let saved = review.session();
+    let files = fetch_files(review);
     let (fetched, first) = std::thread::scope(|s| {
         let fetch = s.spawn(|| git::fetch_pulls(&[pr]));
         let first = github::page(&review.remote, pr, None);
@@ -319,6 +463,7 @@ fn pull(review: &Review) -> Result<(), String> {
     let fetched = fetched.and_then(|()| git::git(&["rev-parse", &git::pull_ref(pr)]));
     let page = match first {
         Ok(page) => page,
+        Err(Error::Setup(e)) => return Err(e),
         Err(e) => {
             // The code still opens, on the base it had or the default branch's.
             let head = fetched?;
@@ -354,7 +499,8 @@ fn pull(review: &Review) -> Result<(), String> {
         &page.url,
         &page.head_ref,
     )?;
-    import(review, page)
+    let head = page.head.clone();
+    import_with_files(review, page, files, &head)
 }
 
 /// Whether origin's head for the PR is still the session's, from git alone.
@@ -375,11 +521,11 @@ fn check(pr: u64) -> Result<(), String> {
 
 /// The open PR of the branch checked out, for plain `dffy`: from a session
 /// kept for that branch when there's one, which needs nothing from GitHub,
-/// else from one query by the branch's name. `{"pr": null}` without one,
-/// or on a detached HEAD.
+/// else from one query by the branch's name. `{"review": null}` without
+/// one, or on a detached HEAD.
 fn detect() -> Result<(), String> {
     let Ok(branch) = git::git(&["symbolic-ref", "--quiet", "--short", "HEAD"]) else {
-        emit(json!({ "pr": null }));
+        emit(json!({ "review": null }));
         return Ok(());
     };
     let remote = Remote::origin()?;
@@ -397,12 +543,12 @@ fn detect() -> Result<(), String> {
             .session()
             .filter(|s| s["head_ref"] == branch.as_str())
         {
-            emit(json!({ "pr": review.printed(&session) }));
+            emit(json!({ "review": review.printed(&session) }));
             return Ok(());
         }
     }
     let Some(mut found) = github::detect(&remote, &branch)? else {
-        emit(json!({ "pr": null }));
+        emit(json!({ "review": null }));
         return Ok(());
     };
     let pr = found["number"].as_u64().unwrap_or_default();
@@ -410,8 +556,7 @@ fn detect() -> Result<(), String> {
     found["last_reviewed_head"] = review
         .session()
         .map_or(Value::Null, |s| s["last_reviewed_head"].clone());
-    found["comments"] = json!(review.file().to_string_lossy());
-    emit(json!({ "pr": found }));
+    emit(json!({ "review": review.printed(&found) }));
     Ok(())
 }
 
@@ -422,7 +567,7 @@ fn open_prs() -> Result<Vec<Value>, String> {
 }
 
 fn list() -> Result<(), String> {
-    emit(json!({"prs": open_prs()?}));
+    emit(json!({"reviews": open_prs()?}));
     Ok(())
 }
 
@@ -431,13 +576,68 @@ fn list() -> Result<(), String> {
 fn prefetch() -> Result<(), String> {
     let prs: Vec<u64> = open_prs()?
         .iter()
-        .filter_map(|pr| pr["number"].as_u64())
+        .filter_map(|pr| pr["id"].as_str()?.parse().ok())
         .collect();
     if !prs.is_empty() {
         git::fetch_pulls(&prs)?;
     }
     emit(json!({ "fetched": prs }));
     Ok(())
+}
+
+/// For `dffy doctor`: whether gh is installed, and logged in to the host
+/// the API calls go to. `gh auth status` asks that host, so it isn't free;
+/// no other verb runs it, they read the same from their first call.
+fn doctor() {
+    let check =
+        |name: &str, ok: bool, detail: &str| json!({"name": name, "ok": ok, "detail": detail});
+    let first_line = |bytes: &[u8]| {
+        String::from_utf8_lossy(bytes)
+            .lines()
+            .map(|l| l.trim().trim_start_matches('✓').trim().to_owned())
+            .find(|l| !l.is_empty())
+            .unwrap_or_default()
+    };
+    let gh = |args: &[&str]| {
+        Command::new("gh")
+            .args(args)
+            .env("GH_PROMPT_DISABLED", "1")
+            .stdin(Stdio::null())
+            .output()
+    };
+    let checks = match gh(&["--version"]) {
+        Err(e) => {
+            let detail = if e.kind() == std::io::ErrorKind::NotFound {
+                github::NO_GH.to_owned()
+            } else {
+                format!("can't run gh: {e}")
+            };
+            [
+                check("gh", false, &detail),
+                check("auth", false, "needs gh"),
+            ]
+        }
+        Ok(version) => {
+            let host = github::host();
+            let auth = match gh(&["auth", "status", "--hostname", &host]) {
+                Ok(out) if out.status.success() => {
+                    let said = String::from_utf8_lossy(&out.stdout);
+                    let line = said
+                        .lines()
+                        .find(|l| l.contains("Logged in to"))
+                        .map_or_else(|| first_line(&out.stdout), |l| first_line(l.as_bytes()));
+                    check("auth", true, &line)
+                }
+                Ok(_) => check("auth", false, &github::logged_out()),
+                Err(e) => check("auth", false, &format!("can't run gh: {e}")),
+            };
+            [
+                check("gh", version.status.success(), &first_line(&version.stdout)),
+                auth,
+            ]
+        }
+    };
+    emit(json!({ "checks": checks }));
 }
 
 /// GitHub allows 80 content-creating requests a minute; this stays under
@@ -470,23 +670,23 @@ enum Event {
 /// What a `post` run does.
 enum PostMode {
     Post(Event),
-    /// Says what `post` would do with each draft, from git alone.
+    /// Says what `post` would do with each draft, without asking GitHub.
     DryRun,
     /// Submits your pending review, posting no drafts.
-    SubmitOnly(Event),
+    ApplyEvent(Event),
 }
 
-/// `--dry-run` alone, or `--event`, `--summary-file` and `--submit-only`
+/// `--dry-run` alone, or `--event`, `--summary-file` and `--apply-event`
 /// in any order.
 fn post_args<'a>(flags: &[&'a str]) -> Result<(PostMode, Option<&'a str>), String> {
     if flags == ["--dry-run"] {
         return Ok((PostMode::DryRun, None));
     }
-    let (mut event, mut summary, mut submit_only) = (None, None, false);
+    let (mut event, mut summary, mut apply_only) = (None, None, false);
     let mut flags = flags.iter();
     while let Some(flag) = flags.next() {
-        if *flag == "--submit-only" {
-            submit_only = true;
+        if *flag == "--apply-event" {
+            apply_only = true;
             continue;
         }
         match (*flag, flags.next()) {
@@ -507,14 +707,14 @@ fn post_args<'a>(flags: &[&'a str]) -> Result<(PostMode, Option<&'a str>), Strin
             _ => return Err(USAGE.to_owned()),
         }
     }
-    let mode = match (event, submit_only) {
+    let mode = match (event, apply_only) {
         (None, _) => return Err(USAGE.to_owned()),
         (Some(Event::Pending), true) => {
             return Err(
-                "--submit-only submits the review: comment, approve or request_changes".to_owned(),
+                "--apply-event submits the review: comment, approve or request_changes".to_owned(),
             );
         }
-        (Some(event), true) => PostMode::SubmitOnly(event),
+        (Some(event), true) => PostMode::ApplyEvent(event),
         (Some(event), false) => PostMode::Post(event),
     };
     Ok((mode, summary))
@@ -624,13 +824,14 @@ fn at_head(
     Ok(placed)
 }
 
-/// What `post` does with a draft, decided from git alone before anything
-/// is sent; `--dry-run` prints it.
+/// What `post` does with a draft, decided before anything is sent from git
+/// and the hunks `prepare` or `pull` kept; `--dry-run` prints it. `unsure`
+/// says line or file was decided by git's diff of the PR, not GitHub's.
 enum Plan {
     /// On its lines at the PR's head, or a reply in its thread.
-    Line(Value),
+    Line { placed: Value, unsure: bool },
     /// On the whole file, quoting the lines it has.
-    File(Value),
+    File { placed: Value, unsure: bool },
     /// Left a draft, with why.
     Skip(String),
 }
@@ -640,8 +841,8 @@ impl Plan {
     fn line(&self, draft: &Value) -> Value {
         let mut out = json!({"id": draft["id"], "path": draft["path"]});
         match self {
-            Self::Line(placed) | Self::File(placed) => {
-                let kind = if matches!(self, Self::Line(_)) {
+            Self::Line { placed, unsure } | Self::File { placed, unsure } => {
+                let kind = if matches!(self, Self::Line { .. }) {
                     "line"
                 } else {
                     "file"
@@ -651,6 +852,9 @@ impl Plan {
                 if let Some(line) = placed["end"][side].as_u64() {
                     out["line"] = json!(line);
                     out["side"] = json!(side);
+                    if *unsure {
+                        out["unsure"] = json!(true);
+                    }
                 }
             }
             Self::Skip(why) => {
@@ -669,6 +873,11 @@ struct Planner {
     commits: Option<(String, String)>,
     /// The paths the PR changes, when git could list them.
     changed: Option<HashSet<String>>,
+    /// GitHub's hunks of the session's head by path, when they were kept.
+    github: HashMap<String, Vec<git::Hunk>>,
+    /// git's hunks of the PR by path, for files GitHub's don't cover: read
+    /// on the first such file, `None` when git couldn't diff it.
+    local: OnceCell<Option<HashMap<String, Vec<git::Hunk>>>>,
     /// Roots with a thread on GitHub, or planned to get one.
     threads: HashSet<String>,
     source: Source,
@@ -693,6 +902,10 @@ impl Planner {
                     .collect(),
             )
         });
+        let github = commits
+            .as_ref()
+            .and_then(|(_, head)| review.hunks(head))
+            .unwrap_or_default();
         let threads = comments(file)
             .iter()
             .filter(|c| c["github_thread"].is_string())
@@ -701,6 +914,8 @@ impl Planner {
         Self {
             commits,
             changed,
+            github,
+            local: OnceCell::new(),
             threads,
             source: Source::default(),
         }
@@ -709,7 +924,10 @@ impl Planner {
     fn plan(&mut self, draft: &Value) -> Plan {
         if let Some(root) = draft["in_reply_to"].as_str() {
             return if self.threads.contains(root) {
-                Plan::Line(draft.clone())
+                Plan::Line {
+                    placed: draft.clone(),
+                    unsure: false,
+                }
             } else {
                 Plan::Skip("its thread isn't posted".to_owned())
             };
@@ -728,23 +946,38 @@ impl Planner {
         if let Some(id) = draft["id"].as_str() {
             self.threads.insert(id.to_owned());
         }
-        if github::fits_its_lines(&placed) {
-            Plan::Line(placed)
+        let (hunks, unsure) = if let Some(hunks) = self.github.get(path) {
+            (Some(hunks.as_slice()), false)
         } else {
-            Plan::File(placed)
+            let local = self.local.get_or_init(|| {
+                let (base, head) = self.commits.as_ref()?;
+                git::hunks(base, head, github::CONTEXT).ok()
+            });
+            let hunks = local.as_ref();
+            (
+                hunks.map(|h| h.get(path).map_or(&[][..], Vec::as_slice)),
+                true,
+            )
+        };
+        if github::fits_its_lines(&placed, hunks) {
+            Plan::Line { placed, unsure }
+        } else {
+            Plan::File { placed, unsure }
         }
     }
 }
 
+/// What `post` posts: your comments not posted yet. One with an author is
+/// someone else's, an agent's, and would go out under your name.
 fn drafts(file: &Value) -> Vec<&Value> {
     comments(file)
         .iter()
-        .filter(|c| c["ref"].is_null())
+        .filter(|c| c["ref"].is_null() && c["author"].as_str().unwrap_or_default().is_empty())
         .collect()
 }
 
-/// Prints each draft's plan, then how many go each way. It reads git and
-/// the comments file, and writes nothing.
+/// Prints each draft's plan, then how many go each way. It reads git, the
+/// comments file and the kept hunks, and writes nothing.
 fn dry_run(pr: u64) -> Result<(), String> {
     let review = Review::new(pr)?;
     if review.session().is_none() {
@@ -756,8 +989,8 @@ fn dry_run(pr: u64) -> Result<(), String> {
     for draft in drafts(&current) {
         let plan = planner.plan(draft);
         *match plan {
-            Plan::Line(_) => &mut line,
-            Plan::File(_) => &mut file,
+            Plan::Line { .. } => &mut line,
+            Plan::File { .. } => &mut file,
             Plan::Skip(_) => &mut skip,
         } += 1;
         emit(plan.line(draft));
@@ -831,8 +1064,10 @@ fn post(pr: u64, event: Event, summary: Option<&str>) -> Result<(), String> {
         "failed": drafts.len() - post.posted,
         "url": post.url(),
     });
-    if post.review.is_some() && !submitted {
-        done["pending_review"] = json!(true);
+    // `pending` leaves the review pending as asked; only a submit is held.
+    if matches!(event, Event::Submit(_)) && !submitted {
+        done["held"] = json!(true);
+        done["held_message"] = json!(HELD);
     }
     emit(done);
     failure.map_or(Ok(()), Err)
@@ -841,7 +1076,7 @@ fn post(pr: u64, event: Event, summary: Option<&str>) -> Result<(), String> {
 /// Submits your pending review, after a `post` left it pending, without
 /// posting the drafts still left. With no review pending, the event goes
 /// on a new one, as an approval alone does.
-fn submit_only(pr: u64, event: Event, summary: Option<&str>) -> Result<(), String> {
+fn apply_event(pr: u64, event: Event, summary: Option<&str>) -> Result<(), String> {
     let summary = read_summary(summary)?;
     let review = Review::new(pr)?;
     let file = review.file();
@@ -945,8 +1180,8 @@ impl<'a> Post<'a> {
                 break;
             }
             match planner.plan(draft) {
-                Plan::Line(placed) => self.draft(&placed, false)?,
-                Plan::File(placed) => self.draft(&placed, true)?,
+                Plan::Line { placed, .. } => self.draft(&placed, false)?,
+                Plan::File { placed, .. } => self.draft(&placed, true)?,
                 Plan::Skip(why) => self.leave(draft, why, false),
             }
             emit(json!({"progress": format!("{}/{}", i + 1, drafts.len())}));
@@ -1009,7 +1244,7 @@ impl<'a> Post<'a> {
                 self.posted += 1;
             }
             Err(Error::Rejected(m)) => self.leave(comment, m, true),
-            Err(Error::Failed(m)) => self.stopped = Some(m),
+            Err(Error::Failed(m) | Error::Setup(m)) => self.stopped = Some(m),
         }
         Ok(())
     }
@@ -1031,7 +1266,7 @@ impl<'a> Post<'a> {
                     self.resolves_refused
                         .push(format!("{}: {m}", location(comment)));
                 }
-                Err(Error::Failed(m)) => {
+                Err(Error::Failed(m) | Error::Setup(m)) => {
                     self.stopped = Some(m);
                     break;
                 }

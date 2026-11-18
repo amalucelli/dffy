@@ -1,6 +1,7 @@
 //! A multi-line text input drawn inside the diff, for writing comments:
-//! typing, pasting, backspace and delete, and the cursor moving by
-//! character, by wrapped row and to a row's ends. Rows wrap at spaces to
+//! typing, pasting, deleting a character, a word or back to the line's
+//! start, and the cursor moving by character, by word, by wrapped row and
+//! to a row's ends. Rows wrap at spaces to
 //! the width they were last drawn at, which is what up and down move by.
 
 use std::ops::Range;
@@ -31,12 +32,38 @@ impl TextBox {
     }
 
     /// Edits for `key`: characters, `enter` (a new line), `tab` (four
-    /// spaces), backspace, delete, the arrows, home and end. Keys with
+    /// spaces), backspace, delete, the arrows, home and end. By word,
+    /// alt+backspace or ctrl+w deletes back, alt+delete or alt+d ahead, and
+    /// alt with the arrows, `b` or `f` moves; ctrl+u deletes back to the
+    /// line's start, ctrl+a is home and ctrl+e end. These are the readline
+    /// keys macOS terminals send for option and command. Other keys with
     /// ctrl or alt do nothing.
     pub(crate) fn key(&mut self, key: Key, mods: Mods) {
-        if mods != Mods::NONE {
-            return;
+        match (key, mods) {
+            (Key::Backspace, Mods::ALT) | (Key::Char('w'), Mods::CTRL) => {
+                self.cut(word_start(&self.text, self.cursor)..self.cursor);
+            }
+            (Key::Delete | Key::Char('d'), Mods::ALT) => {
+                self.cut(self.cursor..word_end(&self.text, self.cursor));
+            }
+            (Key::Left | Key::Char('b'), Mods::ALT) => {
+                self.cursor = word_start(&self.text, self.cursor);
+            }
+            (Key::Right | Key::Char('f'), Mods::ALT) => {
+                self.cursor = word_end(&self.text, self.cursor);
+            }
+            (Key::Char('u'), Mods::CTRL) => {
+                let start = self.text[..self.cursor].rfind('\n').map_or(0, |i| i + 1);
+                self.cut(start..self.cursor);
+            }
+            (Key::Char('a'), Mods::CTRL) => self.plain(Key::Home),
+            (Key::Char('e'), Mods::CTRL) => self.plain(Key::End),
+            (key, Mods::NONE) => self.plain(key),
+            _ => {}
         }
+    }
+
+    fn plain(&mut self, key: Key) {
         match key {
             Key::Char(c) if !c.is_control() => self.insert(c.encode_utf8(&mut [0; 4])),
             Key::Enter => self.insert("\n"),
@@ -106,6 +133,12 @@ impl TextBox {
     fn insert(&mut self, s: &str) {
         self.text.insert_str(self.cursor, s);
         self.cursor += s.len();
+    }
+
+    /// Deletes `range`, which holds the cursor at one end.
+    fn cut(&mut self, range: Range<usize>) {
+        self.cursor = range.start;
+        self.text.replace_range(range, "");
     }
 
     /// Moves the cursor a row up or down, to the column nearest the one it
@@ -208,6 +241,36 @@ fn trailing(text: &str, range: &Range<usize>) -> usize {
     }
 }
 
+/// Words are runs of letters and digits, as in readline. Going back or
+/// ahead by one passes the spaces and punctuation next to the cursor, then
+/// a word, never into another line; a line break next to the cursor is a
+/// step of its own.
+fn word(c: char) -> bool {
+    c.is_alphanumeric()
+}
+
+fn word_start(text: &str, cursor: usize) -> usize {
+    let before = &text[..cursor];
+    if before.ends_with('\n') {
+        return cursor - 1;
+    }
+    let line = &before[before.rfind('\n').map_or(0, |i| i + 1)..];
+    let rest = line.trim_end_matches(|c| !word(c)).trim_end_matches(word);
+    cursor - line.len() + rest.len()
+}
+
+fn word_end(text: &str, cursor: usize) -> usize {
+    let after = &text[cursor..];
+    if after.starts_with('\n') {
+        return cursor + 1;
+    }
+    let line = &after[..after.find('\n').unwrap_or(after.len())];
+    let rest = line
+        .trim_start_matches(|c| !word(c))
+        .trim_start_matches(word);
+    cursor + line.len() - rest.len()
+}
+
 /// The row holding byte `cursor` and its column there. A cursor where one
 /// wrapped row ends and the next starts is on the next.
 fn locate(text: &str, rows: &[Range<usize>], cursor: usize) -> (usize, usize) {
@@ -256,8 +319,80 @@ mod tests {
         assert_eq!(b.text(), "one two thre\nx");
         b.key(Key::Delete, Mods::NONE);
         assert_eq!(shown(&mut b, 8), ["one two ", "thre|x"]);
+        b.key(Key::Char('x'), Mods::CTRL);
+        b.key(Key::Char('x'), Mods::ALT);
+        assert_eq!(b.text(), "one two threx", "ctrl and alt keys don't type");
+    }
+
+    fn at(text: &str, cursor: usize) -> TextBox {
+        let mut b = TextBox::new(text);
+        b.cursor = cursor;
+        b
+    }
+
+    fn marked(b: &TextBox) -> String {
+        format!("{}|{}", &b.text[..b.cursor], &b.text[b.cursor..])
+    }
+
+    /// Alt+backspace and ctrl+w take the word before the cursor, or its
+    /// part before the cursor, with the spaces and punctuation after it;
+    /// at a line's start they take only the line break.
+    #[test]
+    fn a_word_goes_back_to_its_start() {
+        let mut b = at("one, twofold", 9);
+        b.key(Key::Backspace, Mods::ALT);
+        assert_eq!(marked(&b), "one, |old");
+        b.key(Key::Char('w'), Mods::CTRL);
+        assert_eq!(marked(&b), "|old");
+        let mut b = at("one two\nthree", 8);
+        b.key(Key::Backspace, Mods::ALT);
+        assert_eq!(marked(&b), "one two|three");
+        let mut b = at("x\n  ", 4);
+        b.key(Key::Backspace, Mods::ALT);
+        assert_eq!(marked(&b), "x\n|", "stops at the line's start");
+        let mut b = TextBox::new("naïve café");
+        b.key(Key::Backspace, Mods::ALT);
+        assert_eq!(marked(&b), "naïve |");
+    }
+
+    /// Alt+d and alt+delete take the word after the cursor; alt with the
+    /// arrows, `b` or `f` moves past one, a line break a step of its own.
+    #[test]
+    fn words_ahead_and_moving_by_word() {
+        let mut b = at("one, two three", 3);
+        b.key(Key::Char('d'), Mods::ALT);
+        assert_eq!(marked(&b), "one| three");
+        b.key(Key::Delete, Mods::ALT);
+        assert_eq!(marked(&b), "one|");
+        let mut b = at("ab cd\nef", 0);
+        for (key, want) in [
+            (Key::Right, "ab| cd\nef"),
+            (Key::Char('f'), "ab cd|\nef"),
+            (Key::Right, "ab cd\n|ef"),
+            (Key::Left, "ab cd|\nef"),
+            (Key::Char('b'), "ab |cd\nef"),
+        ] {
+            b.key(key, Mods::ALT);
+            assert_eq!(marked(&b), want);
+        }
+    }
+
+    /// Ctrl+u takes the line back to its start, past the rows it wraps
+    /// into; ctrl+a goes to the row's start, like home, and ctrl+e to its
+    /// end, like end.
+    #[test]
+    fn ctrl_u_clears_back_to_the_line_start() {
+        let mut b = TextBox::new("top\none two three four");
+        assert_eq!(shown(&mut b, 8), ["top", "one two ", "three ", "four|"]);
+        b.key(Key::Char('a'), Mods::CTRL);
+        assert_eq!(shown(&mut b, 8), ["top", "one two ", "three ", "|four"]);
+        b.key(Key::Right, Mods::NONE);
+        b.key(Key::Char('u'), Mods::CTRL);
+        assert_eq!(shown(&mut b, 8), ["top", "|our"]);
+        b.key(Key::Char('u'), Mods::CTRL);
+        assert_eq!(b.text(), "top\nour", "nothing before it on its line");
         b.key(Key::Char('e'), Mods::CTRL);
-        assert_eq!(b.text(), "one two threx", "ctrl keys don't type");
+        assert_eq!(shown(&mut b, 8), ["top", "our|"]);
     }
 
     /// Up and down go by wrapped rows, keeping the column; home and end go

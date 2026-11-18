@@ -1107,14 +1107,14 @@ fn doctor_finds_the_review_plugin_on_path() {
     let plugin = bin.path().join("dffy-review-test");
     assert!(
         found.contains(&format!(
-            "\"review\":{{\"name\":\"test\",\"path\":\"{}\"}}",
+            "\"review\":{{\"name\":\"test\",\"path\":\"{}\",",
             plugin.display()
         )),
         "{found}"
     );
     let missing = doctor(format!("rel:{}:{system}", renderers.path().display()), true);
     assert!(
-        missing.contains("\"review\":{\"name\":\"test\",\"path\":null}"),
+        missing.contains("\"review\":{\"name\":\"test\",\"path\":null,"),
         "{missing}"
     );
     let text = doctor(format!("{}:{system}", renderers.path().display()), false);
@@ -1124,31 +1124,138 @@ fn doctor_finds_the_review_plugin_on_path() {
     );
 }
 
-/// `dffy pr` says what it lacks, with a usage error's status: a review
-/// plugin set, the plugin on PATH, a terminal.
-#[test]
-fn dffy_pr_says_what_it_needs() {
-    let repo = repo();
+/// `dffy-review-test` in its own directory: `describe` prints
+/// `describe.json` from beside it and adds a line to `described`, so a
+/// test counts the runs; `doctor` reports one check.
+fn describing_plugin(answer: &str) -> tempfile::TempDir {
+    use std::os::unix::fs::PermissionsExt as _;
     let bin = tempfile::tempdir().expect("tempdir");
+    let plugin = bin.path().join("dffy-review-test");
+    std::fs::write(
+        &plugin,
+        "#!/bin/sh\n\
+         d=$(dirname \"$0\")\n\
+         case \"$1\" in\n\
+         describe) echo run >> \"$d/described\"; cat \"$d/describe.json\" ;;\n\
+         doctor) echo '{\"version\":1,\"checks\":[{\"name\":\"thing\",\"ok\":false,\"detail\":\"not set up\"}]}' ;;\n\
+         *) exit 2 ;;\n\
+         esac\n",
+    )
+    .expect("write");
+    std::fs::set_permissions(&plugin, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    std::fs::write(bin.path().join("describe.json"), answer).expect("write");
+    bin
+}
+
+const MERGE_REQUEST: &str =
+    r#"{"version":1,"command":"mr","noun":"merge request","nouns":"merge requests"}"#;
+
+/// The review command is the one the plugin describes, in help and in
+/// completions: `dffy mr` reaches the review code (which then wants a
+/// terminal), and `pr` is a revision like any other.
+#[test]
+fn the_review_command_is_the_one_the_plugin_describes() {
+    let repo = repo();
+    let bin = describing_plugin(MERGE_REQUEST);
     let path = format!("{}:/usr/bin:/bin", bin.path().display());
-    for (args, said) in [
-        (
-            &["pr", "7"][..],
-            "dffy pr needs a review plugin, and none is set",
-        ),
-        (
-            &["--review", "test", "pr"],
-            "dffy-review-test isn't on PATH",
-        ),
-    ] {
-        let out = dffy_cmd(repo.path(), args)
+    let run = |args: &[&str]| {
+        let mut full = vec!["--review", "test"];
+        full.extend(args);
+        dffy_cmd(repo.path(), &full)
+            .env("PATH", &path)
+            .output()
+            .expect("spawn dffy")
+    };
+    let help = stdout(&run(&["--help"]));
+    assert!(
+        help.contains("mr           Review a merge request in the viewer"),
+        "{help}"
+    );
+    assert!(!help.contains("  pr "), "{help}");
+    let mr = run(&["mr", "7"]);
+    assert_eq!(mr.status.code(), Some(128));
+    assert!(
+        stderr(&mr).contains("dffy mr opens the viewer, which needs a terminal"),
+        "{}",
+        stderr(&mr)
+    );
+    let pr = run(&["pr"]);
+    assert_eq!(pr.status.code(), Some(128));
+    assert!(stderr(&pr).contains("'pr'"), "{}", stderr(&pr));
+    let zsh = stdout(&run(&["completions", "zsh"]));
+    assert!(zsh.contains("'mr:Review a merge request"), "{zsh}");
+    let doctor = stdout(&run(&["--color=never", "doctor"]));
+    assert!(doctor.contains(", adds dffy mr\n"), "{doctor}");
+    assert!(doctor.contains("! review thing not set up"), "{doctor}");
+}
+
+/// `describe` runs once for the program as installed: its answer is
+/// cached until the program changes.
+#[test]
+fn describe_is_cached_until_the_plugin_changes() {
+    let repo = repo();
+    let bin = describing_plugin(MERGE_REQUEST);
+    let path = format!("{}:/usr/bin:/bin", bin.path().display());
+    let runs = || {
+        std::fs::read_to_string(bin.path().join("described"))
+            .unwrap_or_default()
+            .lines()
+            .count()
+    };
+    let help = || {
+        let out = dffy_cmd(repo.path(), &["--review", "test", "--help"])
             .env("PATH", &path)
             .output()
             .expect("spawn dffy");
-        assert_eq!(out.status.code(), Some(128), "{args:?}");
-        let err = String::from_utf8_lossy(&out.stderr);
-        assert!(err.contains(said), "{args:?}: {err}");
-    }
+        assert!(stdout(&out).contains("Review a merge request"), "{out:?}");
+    };
+    help();
+    help();
+    assert_eq!(runs(), 1);
+    let plugin = bin.path().join("dffy-review-test");
+    let mut script = std::fs::read_to_string(&plugin).expect("read");
+    script.push_str("# changed\n");
+    std::fs::write(&plugin, script).expect("write");
+    help();
+    assert_eq!(runs(), 2);
+}
+
+/// Without a review plugin, or with one whose command is dffy's own,
+/// there's no review command: `pr` is a revision, help lists none, and
+/// doctor says why.
+#[test]
+fn without_a_described_plugin_there_is_no_review_command() {
+    let repo = repo();
+    let pr = dffy(repo.path(), &["pr", "7"]);
+    assert_eq!(pr.status.code(), Some(128));
+    assert!(stderr(&pr).contains("'pr'"), "{}", stderr(&pr));
+    let help = stdout(&dffy(repo.path(), &["--help"]));
+    assert!(!help.contains("Review a"), "{help}");
+
+    let bin = describing_plugin(&MERGE_REQUEST.replace("\"mr\"", "\"diff\""));
+    let path = format!("{}:/usr/bin:/bin", bin.path().display());
+    let run = |args: &[&str]| {
+        dffy_cmd(repo.path(), args)
+            .env("PATH", &path)
+            .output()
+            .expect("spawn dffy")
+    };
+    let help = stdout(&run(&["--review", "test", "--help"]));
+    assert!(!help.contains("Review a"), "{help}");
+    let diff = run(&[
+        "--review",
+        "test",
+        "--color=never",
+        "main~1..main",
+        "--stat",
+    ]);
+    assert!(diff.status.success(), "{}", stderr(&diff));
+    let doctor = stdout(&run(&["--review", "test", "--color=never", "doctor"]));
+    assert!(doctor.contains(", adds no command\n"), "{doctor}");
+    assert!(
+        doctor.contains("its command 'diff' is one of dffy's own"),
+        "{doctor}"
+    );
 }
 
 #[test]

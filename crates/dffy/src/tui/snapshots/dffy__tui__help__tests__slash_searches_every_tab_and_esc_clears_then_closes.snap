@@ -13,8 +13,8 @@ expression: "shown(&mut help, &keys, 100, 20)"
        │ o                 find file             Files                                    ┃│
        │ G end             bottom of file        Move                                     ┃│
        │ c                 files with comments   Files                                    ┃│
-       │ enter l           open file or folder   Files                                    ┃│
-       │ X                 toggle whole file     View                                     ││
+       │ C                 comment on file       Other                                    ││
+       │ enter l           open file or folder   Files                                    ││
        │                                                                                   │
        │ more settings: space · all keys: docs/keys.md                                     │
        │ /file▏ · esc clear                                                                │

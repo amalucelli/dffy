@@ -154,6 +154,8 @@ homebrew_casks:
     ids: [dffy-review-github]
     description: "Experimental GitHub pull request review plugin for dffy"
     homepage: https://github.com/amalucelli/dffy
+    dependencies:
+      - formula: gh
     repository:
       owner: amalucelli
       name: homebrew-tap

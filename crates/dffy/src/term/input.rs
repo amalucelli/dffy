@@ -64,6 +64,11 @@ pub(crate) enum Input {
         x: u16,
         y: u16,
     },
+    /// A right-button press, with or without modifiers.
+    RightClick {
+        x: u16,
+        y: u16,
+    },
     /// The left button was let go.
     Release {
         x: u16,
@@ -438,12 +443,14 @@ fn x10_mouse(b: &[u8]) -> Parsed {
 }
 
 fn mouse(button: u16, x: u16, y: u16, press: bool) -> Option<Input> {
-    // Bit 6 marks wheel buttons, bit 5 motion; the low bits pick the button.
-    // The legacy encoding reports any release as button 3.
+    // Bit 6 marks wheel buttons, bit 5 motion; the low bits pick the button,
+    // and the bits between them, masked off, the modifiers. The legacy
+    // encoding reports any release as button 3.
     match (button & 0b1110_0011, press) {
         (64, true) => Some(Input::Scroll { delta: -1, x, y }),
         (65, true) => Some(Input::Scroll { delta: 1, x, y }),
         (0, true) => Some(Input::Click { x, y }),
+        (2, true) => Some(Input::RightClick { x, y }),
         (32, true) => Some(Input::Drag { x, y }),
         (0, false) | (3, true) => Some(Input::Release { x, y }),
         _ => None,
@@ -544,12 +551,33 @@ mod tests {
         );
     }
 
+    /// What macOS terminals send for the text box's word and line keys:
+    /// option as ESC before the key (or an xterm modifier), and command as
+    /// the readline controls it's mapped to.
+    #[test]
+    fn macos_word_and_line_editing_keys() {
+        assert_eq!(
+            keys(&[b"\x1b\x7f\x1b\x08\x1b[3;3~\x1bd\x1bb\x1bf\x1b[1;3D\x1b[1;3C\x15\x17\x01"]),
+            [
+                (Key::Backspace, Mods::ALT),
+                (Key::Backspace, Mods::ALT),
+                (Key::Delete, Mods::ALT),
+                (Key::Char('d'), Mods::ALT),
+                (Key::Char('b'), Mods::ALT),
+                (Key::Char('f'), Mods::ALT),
+                (Key::Left, Mods::ALT),
+                (Key::Right, Mods::ALT),
+                (Key::Char('u'), Mods::CTRL),
+                (Key::Char('w'), Mods::CTRL),
+                (Key::Char('a'), Mods::CTRL),
+            ]
+        );
+    }
+
     #[test]
     fn mouse_wheel_and_click() {
         assert_eq!(
-            parse_all(&[
-                b"\x1b[<64;10;5M\x1b[<65;1;1M\x1b[<0;3;4M\x1b[<32;3;6M\x1b[<0;3;6m\x1b[<2;3;4M"
-            ]),
+            parse_all(&[b"\x1b[<64;10;5M\x1b[<65;1;1M\x1b[<0;3;4M\x1b[<32;3;6M\x1b[<0;3;6m"]),
             [
                 Input::Scroll {
                     delta: -1,
@@ -573,6 +601,27 @@ mod tests {
                 x: 0,
                 y: 0
             }]
+        );
+    }
+
+    /// A right-button press is its own input whatever modifiers it came
+    /// with; its drags and its release mean nothing.
+    #[test]
+    fn right_button_presses() {
+        assert_eq!(
+            parse_all(&[b"\x1b[<2;3;4M\x1b[<34;3;5M\x1b[<2;3;5m\x1b[<18;7;8M\x1b[<10;1;1M"]),
+            [
+                Input::RightClick { x: 2, y: 3 },
+                Input::RightClick { x: 6, y: 7 },
+                Input::RightClick { x: 0, y: 0 },
+            ]
+        );
+        assert_eq!(
+            parse_all(&[b"\x1b[M\"!!\x1b[M#!!"]),
+            [
+                Input::RightClick { x: 0, y: 0 },
+                Input::Release { x: 0, y: 0 }
+            ]
         );
     }
 

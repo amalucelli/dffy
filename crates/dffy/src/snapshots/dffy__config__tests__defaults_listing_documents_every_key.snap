@@ -62,7 +62,7 @@ expression: text
 <dim># Show files that have a renderer (see render) rendered in the viewer, diffed block by block, instead of as lines; `r` toggles it.</>
 <hint>rendered</><dim> = </>false
 
-<dim># Experimental: the review plugin, the program dffy-review-<name> on PATH, that `dffy pr` runs to review a pull request in the viewer, and that plain `dffy` asks for the branch's pull request; empty for none. --review <name> sets it for one run. See docs/plugins.md.</>
+<dim># Experimental: the review plugin, the program dffy-review-<name> on PATH. It adds the command it names to open one of the code host's reviews in the viewer, and plain `dffy` asks it for the branch's; empty for none, and no such command. --review <name> sets it for one run. See docs/plugins.md.</>
 <hint>review</><dim> = </>
 
 <dim># Start the viewer in watch mode, refreshing as files, the index or refs change; `w` toggles it. With nothing to show, a watching viewer opens and waits for changes instead of printing that there are none.</>
@@ -194,6 +194,9 @@ expression: text
 <hint>keybind</><dim> = </>Y=copy_path
 <hint>keybind</><dim> = </>leader:Y=copy_path
 
+<dim># copy_absolute_path: copy where the file is on disk, from the filesystem's root</>
+<dim># (no key by default)</>
+
 <dim># cancel: end the selection; in the tree, clear the filter</>
 <hint>keybind</><dim> = </>esc=cancel
 
@@ -289,11 +292,14 @@ expression: text
 <dim># toggle_copy_decorations: copies include line numbers and +/- signs, or only the code</>
 <hint>keybind</><dim> = </>leader:D=toggle_copy_decorations
 
-<dim># edit: open the file in $EDITOR at the top line</>
+<dim># edit: open the file in $EDITOR at the line last tapped, else the top line</>
 <hint>keybind</><dim> = </>e=edit
 
 <dim># comment: comment on the selected lines, or the line v would start on, in a text box under them; esc saves it</>
 <hint>keybind</><dim> = </>c=comment
+
+<dim># comment_file: comment on the whole file shown, in a text box under its first row; esc saves it</>
+<hint>keybind</><dim> = </>C=comment_file
 
 <dim># comments: list every comment thread, files not in the diff included; enter goes to one</>
 <hint>keybind</><dim> = </>i=comments
@@ -310,24 +316,27 @@ expression: text
 <dim># toggle_threads: fold every comment thread to one row, or unfold them all</>
 <hint>keybind</><dim> = </>Z=toggle_threads
 
-<dim># comment_in_editor: write in $EDITOR: your draft in the focused thread, else a reply to it, else a comment on the line; ctrl+e does it from the text box</>
+<dim># comment_in_editor: write in $EDITOR: your draft in the focused thread, else a reply to it, else a comment on the line; ctrl+g does it from the text box</>
 <hint>keybind</><dim> = </>leader:E=comment_in_editor
 
 <dim># commented_files: the tree shows only the files with comments, or every file; f/F and n/N keep to them</>
 <hint>keybind</><dim> = </>tree:c=commented_files
 <hint>keybind</><dim> = </>leader:C=commented_files
 
-<dim># review_pull: on a pull request (dffy pr), fetch its new commits and threads and show them in place (experimental, see review)</>
+<dim># review_pull: on a review a review plugin opened, fetch its new commits and threads and show them in place (experimental, see review)</>
 <hint>keybind</><dim> = </>p=review_pull
 
-<dim># review_post: on a pull request (dffy pr), open the dialog that posts your drafts, replies and resolves as a review (experimental, see review)</>
+<dim># review_post: on a review a review plugin opened, open the dialog that posts your drafts, replies and resolves as a review (experimental, see review)</>
 <hint>keybind</><dim> = </>P=review_post
 
-<dim># open_pull_request: list the pull requests on this branch, yours and those waiting on your review, to open one (experimental, see review)</>
-<hint>keybind</><dim> = </>leader:P=open_pull_request
+<dim># open_review: list the reviews the review plugin offers, such as this branch's, yours and those waiting on you, to open one (experimental, see review)</>
+<hint>keybind</><dim> = </>leader:P=open_review
 
-<dim># since_last_review: on a pull request, show only what changed since the head of your last review posted from dffy, or the whole PR again</>
+<dim># since_last_review: on a review a review plugin opened, show only what changed since the head of your last review posted from dffy, or the whole review again</>
 <hint>keybind</><dim> = </>leader:R=since_last_review
+
+<dim># whole_review: on the branch's review that plain dffy found, show the whole review against the working tree, or the working tree's changes again</>
+<hint>keybind</><dim> = </>leader:A=whole_review
 
 <dim># help: show or hide this help</>
 <hint>keybind</><dim> = </>?=help

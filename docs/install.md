@@ -73,7 +73,7 @@ cargo install --locked --git https://github.com/amalucelli/dffy dffy-render-mark
 
 - The script installs dffy and the plugins side by side, all checked against the release's `checksums.txt`. `DFFY_PLUGINS=markdown,mermaid,review-github` does the same as the flags.
 - dffy finds the plugins on your `PATH`.
-- `dffy-review-github` also needs [`gh`](https://cli.github.com), logged in.
+- `dffy-review-github` also needs the GitHub CLI, [`gh`](https://cli.github.com) (`brew install gh`, or your system's package), logged in with `gh auth login`. `dffy doctor` checks both once `review = github` is set.
 
 [plugins.md](plugins.md) covers turning them on.
 
@@ -87,7 +87,7 @@ cargo install --locked --git https://github.com/amalucelli/dffy dffy-render-mark
 | zsh | `dffy completions zsh > ~/.zfunc/_dffy`, with `fpath=(~/.zfunc $fpath)` before `compinit` in `~/.zshrc` |
 | bash | `dffy completions bash > ~/.local/share/bash-completion/completions/dffy` (needs the bash-completion package) |
 
-Regenerate the script after upgrading to pick up new or changed flags.
+Regenerate the script after upgrading to pick up new or changed flags, and after setting a review plugin: the script includes the plugin's command (`dffy pr`) only when one is set. The man page leaves it out.
 
 ## Man page
 

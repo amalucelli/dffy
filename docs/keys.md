@@ -95,6 +95,7 @@ keybind = leader:z=toggle_wrap
 | `select` | `v` |  | Select lines, from the top line or the one tapped |
 | `copy` | `y` | `y` | Copy the selected lines' code |
 | `copy_path` | `Y` | `Y` | Copy the file's path |
+| `copy_absolute_path` |  |  | Copy where the file is on disk, from the filesystem's root |
 | `cancel` | `esc` |  | End the selection; in the tree, clear the filter |
 | `toggle_copy_decorations` |  | `D` | Copies include line numbers and +/- signs, or only the code |
 
@@ -110,14 +111,16 @@ keybind = leader:z=toggle_wrap
 | Action | Keys | Command panel | Description |
 |---|---|---|---|
 | `leader` | `space` |  | Open the command panel; its next key runs a command |
-| `edit` | `e` |  | Open the file in $EDITOR at the top line |
+| `edit` | `e` |  | Open the file in $EDITOR at the line last tapped, else the top line |
 | `comment` | `c` |  | Comment on the selected lines, or the line v would start on, in a text box under them; esc saves it |
+| `comment_file` | `C` |  | Comment on the whole file shown, in a text box under its first row; esc saves it |
 | `comments` | `i` |  | List every comment thread, files not in the diff included; enter goes to one |
-| `comment_in_editor` |  | `E` | Write in $EDITOR: your draft in the focused thread, else a reply to it, else a comment on the line; ctrl+e does it from the text box |
-| `review_pull` | `p` |  | On a pull request (dffy pr), fetch its new commits and threads and show them in place (experimental, see review) |
-| `review_post` | `P` |  | On a pull request (dffy pr), open the dialog that posts your drafts, replies and resolves as a review (experimental, see review) |
-| `open_pull_request` |  | `P` | List the pull requests on this branch, yours and those waiting on your review, to open one (experimental, see review) |
-| `since_last_review` |  | `R` | On a pull request, show only what changed since the head of your last review posted from dffy, or the whole PR again |
+| `comment_in_editor` |  | `E` | Write in $EDITOR: your draft in the focused thread, else a reply to it, else a comment on the line; ctrl+g does it from the text box |
+| `review_pull` | `p` |  | On a review a review plugin opened, fetch its new commits and threads and show them in place (experimental, see review) |
+| `review_post` | `P` |  | On a review a review plugin opened, open the dialog that posts your drafts, replies and resolves as a review (experimental, see review) |
+| `open_review` |  | `P` | List the reviews the review plugin offers, such as this branch's, yours and those waiting on you, to open one (experimental, see review) |
+| `since_last_review` |  | `R` | On a review a review plugin opened, show only what changed since the head of your last review posted from dffy, or the whole review again |
+| `whole_review` |  | `A` | On the branch's review that plain dffy found, show the whole review against the working tree, or the working tree's changes again |
 | `help` | `?` | `?` | Show or hide this help |
 | `quit` | `q` `ctrl+c` |  | Quit |
 
@@ -168,6 +171,7 @@ While the file tree has focus, these keys come first; every other key does what 
 | `a` | Watch for changes | `toggle_watch` |
 | `c` | Theme | `cycle_theme` |
 | `E` | Continue in editor | `comment_in_editor` |
-| `P` | Open pull request… | `open_pull_request` |
+| `P` | Open review… | `open_review` |
 | `R` | Since last review | `since_last_review` |
+| `A` | Show whole review | `whole_review` |
 | `?` | All keys | `help` |

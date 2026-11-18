@@ -1,9 +1,10 @@
-//! Pull request mode: the viewer on a PR that a review plugin prepared,
-//! showing `<base>...<head>` with the PR's comments file. The plugin runs
-//! in the background (see [`crate::plugin::review`]): what it says comes
-//! back as [`Event::Review`] for the run's id, and runs that are no longer
-//! wanted are ignored. Here are the state of the PR, the run going on, the
-//! picker of PRs and the dialog that posts the review.
+//! Review mode: the viewer on a review that a review plugin prepared,
+//! showing `<base>...<head>` with the review's comments file. The plugin
+//! runs in the background (see [`crate::plugin::review`]): what it says
+//! comes back as [`Event::Review`] for the run's id, and runs that are no
+//! longer wanted are ignored. Here are the state of the review, the run
+//! going on, the picker of reviews and the dialog that posts the review.
+//! Every word naming the host's kind of review is the plugin's.
 
 use std::collections::HashMap;
 use std::ops::ControlFlow;
@@ -17,26 +18,31 @@ use unicode_width::UnicodeWidthStr;
 use std::fmt::Write as _;
 
 use super::{Action, App, Comments, escape, is_web};
-use crate::plugin::review::{Draft, Plan, Pr, Reason, Said, Session};
+use crate::plugin::review::{self, Draft, Listed, Plan, Reason, ReviewEvent, Said, Session};
 use crate::term::{Grid, Input, Key, Mods};
 use crate::theme::{Role, Style, Theme};
 use crate::tui::help;
 use crate::tui::textbox::TextBox;
 
-/// How often the plugin is asked whether the PR's head moved.
+/// How often the plugin is asked whether the review's head moved.
 pub(super) const CHECK_EVERY: Duration = Duration::from_secs(60);
 
-/// The PR shown.
+/// The review shown.
 pub(super) struct Mode {
     pub plugin: String,
     pub session: Session,
-    /// The range is `<last_reviewed_head>..<head>`, not the whole PR.
+    /// The session as titles and messages name it: `PR #7`.
+    pub label: String,
+    /// The range is `<last_reviewed_head>..<head>`, not the whole review.
     pub since_last: bool,
-    /// Found as the branch checked out: the PR's base against the working
-    /// tree, so changes not pushed yet show with the PR's comments.
-    pub local: bool,
-    /// The event of the last post, as an index into [`EVENTS`].
-    pub event: usize,
+    /// Found as the branch checked out by plain `dffy`: the range and title
+    /// it showed, which stay, the review adding its comments and status.
+    pub plain: Option<(Revisions, String)>,
+    /// With `plain`: the review's base against the working tree instead,
+    /// so changes not pushed yet show with the review's.
+    pub whole: bool,
+    /// The event of the last post.
+    pub event: Option<ReviewEvent>,
     /// How the last post ended, which the status bar keeps saying.
     pub outcome: Option<String>,
     /// The head on the host, when the last check found it moved.
@@ -53,13 +59,15 @@ pub(super) struct Mode {
 }
 
 impl Mode {
-    fn new(plugin: String, session: Session) -> Self {
+    fn new(plugin: String, session: Session, label: String) -> Self {
         Self {
             plugin,
             session,
+            label,
             since_last: false,
-            local: false,
-            event: 0,
+            plain: None,
+            whole: false,
+            event: None,
             outcome: None,
             moved: None,
             check: None,
@@ -69,12 +77,14 @@ impl Mode {
         }
     }
 
-    /// The revisions shown: the PR, or what changed since the last review.
+    /// The revisions shown: the review, or what changed since the last one
+    /// you posted.
     fn revisions(&self) -> Revisions {
         let s = &self.session;
-        let range = match (&s.last_reviewed_head, self.since_last) {
-            (Some(last), true) => format!("{last}..{}", s.head),
-            _ if self.local => {
+        let range = match (&s.last_reviewed_head, self.since_last, &self.plain) {
+            (Some(last), true, _) => format!("{last}..{}", s.head),
+            (.., Some((plain, _))) if !self.whole => return plain.clone(),
+            (.., Some(_)) => {
                 return Revisions {
                     revs: vec![s.base.clone()],
                     merge_base: true,
@@ -90,13 +100,12 @@ impl Mode {
     }
 
     fn description(&self) -> String {
-        let n = self.session.number;
-        if self.since_last {
-            format!("PR #{n} since your review")
-        } else if self.local {
-            format!("PR #{n} + working tree")
-        } else {
-            format!("PR #{n}")
+        let label = &self.label;
+        match &self.plain {
+            _ if self.since_last => format!("{label} since your review"),
+            Some((_, plain)) if !self.whole => plain.clone(),
+            Some(_) => format!("{label} + working tree"),
+            None => label.clone(),
         }
     }
 }
@@ -105,41 +114,47 @@ impl Mode {
 /// time.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum Job {
-    Prepare(u64),
+    Prepare,
     Pull,
     Post,
-    /// `post --submit-only`, after a post that left this many drafts out.
-    SubmitOnly(usize),
+    /// `post --apply-event`, after a post that left this many drafts out.
+    ApplyEvent(usize),
 }
 
 impl Job {
     /// Sends to the host, so nothing may stop it halfway.
     fn posts(self) -> bool {
-        matches!(self, Self::Post | Self::SubmitOnly(_))
+        matches!(self, Self::Post | Self::ApplyEvent(_))
     }
 }
 
 pub(super) struct Running {
     pub id: u64,
     pub job: Job,
+    /// The review it's of, as messages name it.
+    pub label: String,
     pub progress: Option<String>,
-    /// A `prepare` of the PR `detect` found for the branch checked out.
+    /// A `prepare` of the review `detect` found for the branch checked out.
     pub local: bool,
     /// A post's drafts not posted, and its last line: comments posted,
-    /// comments not, and whether the review is still pending.
+    /// comments not, and whether the event wasn't applied, with the
+    /// plugin's words for that.
     pub unposted: Vec<Unposted>,
     pub posted: Option<(usize, usize, bool)>,
+    pub held_message: Option<String>,
 }
 
 impl Running {
-    fn new(id: u64, job: Job) -> Self {
+    fn new(id: u64, job: Job, label: String) -> Self {
         Self {
             id,
             job,
+            label,
             progress: None,
             local: false,
             unposted: Vec::new(),
             posted: None,
+            held_message: None,
         }
     }
 }
@@ -166,38 +181,32 @@ impl Unposted {
     }
 }
 
-/// A review's event, as the dialog lists them.
-const EVENTS: [(char, &str, &str); 4] = [
-    ('p', "pending", "pending: on the host, for you only"),
-    ('c', "comment", "comment"),
-    ('a', "approve", "approve"),
-    ('r', "request_changes", "request changes"),
-];
-
-/// What a past event reads as, for the status bar.
-fn done_as(event: &str) -> &'static str {
-    match event {
-        "approve" => "approved",
-        "request_changes" => "changes requested",
-        _ => "commented",
+/// How a post of `event` ended, in the words the status bar keeps:
+/// `review sent`, `approved · 2 comments not posted`, the plugin's words
+/// for an event `held` back (`review still pending · 2 not posted`), or
+/// `nothing posted`.
+fn outcome(event: &ReviewEvent, (posted, failed): (usize, usize), held: Option<&str>) -> String {
+    let not_posted = |text: &str| match failed {
+        0 => text.to_owned(),
+        n => format!("{text} · {} not posted", plural(n, "comment")),
+    };
+    match held {
+        Some(held) if failed > 0 => format!("{held} · {failed} not posted"),
+        Some(held) => held.to_owned(),
+        None if !event.submits && posted + failed == 0 => "nothing posted".to_owned(),
+        None if event.submits && failed == 0 => "review sent".to_owned(),
+        None => not_posted(&event.done),
     }
 }
 
-/// How a post ended, in the words the status bar keeps: `review sent`,
-/// `approved · 2 comments not posted`, `review still pending · 2 not
-/// posted`.
-fn outcome(event: &str, failed: usize, pending_review: bool) -> String {
-    match (event, pending_review, failed) {
-        ("pending", false, 0) => "nothing posted".to_owned(),
-        ("pending", _, 0) | (_, true, 0) => "review pending".to_owned(),
-        ("pending", ..) | (_, true, _) => format!("review still pending · {failed} not posted"),
-        (_, false, 0) => "review sent".to_owned(),
-        (event, false, n) => format!("{} · {} not posted", done_as(event), plural(n, "comment")),
-    }
-}
+/// What the status bar says of an event held back when the plugin doesn't
+/// say.
+const HELD: &str = "review not sent";
 
 /// The dialog `P` opens.
 pub(super) struct Dialog {
+    /// The plugin's events, and the one picked.
+    events: Vec<ReviewEvent>,
     event: usize,
     summary: TextBox,
     /// Keys go to the summary.
@@ -215,37 +224,73 @@ struct Preflight {
     failed: Option<String>,
 }
 
-/// The prompt after a post that left drafts out and so didn't submit the
+/// The prompt after a post that left drafts out and so didn't apply the
 /// event picked.
 pub(super) struct Held {
     failed: usize,
     unposted: Vec<Unposted>,
+    event: ReviewEvent,
+    /// The plugin's words for where that leaves the review.
+    message: Option<String>,
 }
 
-/// The PRs `list` gave, grouped by why, to open one.
+/// The reviews `list` gave, grouped, to open one: the reasons dffy knows
+/// first, then the plugin's groups in the order they came.
 pub(super) struct Picker {
-    prs: Vec<Pr>,
+    reviews: Vec<Listed>,
+    /// Each review's group, as an index into `groups`.
+    group: Vec<usize>,
+    groups: Vec<String>,
+    /// Each review's id as shown, with the plugin's prefix, and the widest.
+    tags: Vec<String>,
+    tag_width: usize,
     cursor: usize,
     scroll: usize,
+    /// The plugin's plural noun, for the frame.
+    title: String,
 }
 
 impl Picker {
-    fn new(mut prs: Vec<Pr>) -> Self {
-        prs.sort_by_key(|p| p.reason);
+    fn new(mut reviews: Vec<Listed>, nouns: &str, prefix: &str) -> Self {
+        let mut groups: Vec<String> = Vec::new();
+        let mut title_of = |listed: &Listed| {
+            let title = match listed.reason {
+                Reason::CurrentBranch => "This branch",
+                Reason::ReviewRequested => "Waiting on your review",
+                Reason::Mine => "Yours",
+                Reason::Other => listed.group.as_deref().unwrap_or("Other"),
+            };
+            groups.iter().position(|g| g == title).unwrap_or_else(|| {
+                groups.push(title.to_owned());
+                groups.len() - 1
+            })
+        };
+        // Sorted stably, so the plugin's groups keep the order they came.
+        let mut keyed: Vec<(Reason, usize, Listed)> = (reviews.drain(..))
+            .map(|listed| (listed.reason, title_of(&listed), listed))
+            .collect();
+        keyed.sort_by_key(|&(reason, group, _)| (reason, group));
+        let (group, reviews): (Vec<usize>, Vec<Listed>) =
+            keyed.into_iter().map(|(_, g, p)| (g, p)).unzip();
+        let tags: Vec<String> = (reviews.iter())
+            .map(|p| format!("{prefix}{}", escape(p.shown().as_bytes())))
+            .collect();
+        let tag_width = tags
+            .iter()
+            .map(|t| t.width())
+            .max()
+            .unwrap_or(0)
+            .clamp(7, 16);
         Self {
-            prs,
+            reviews,
+            group,
+            groups,
+            tags,
+            tag_width,
             cursor: 0,
             scroll: 0,
+            title: format!(" {nouns} "),
         }
-    }
-}
-
-fn group_title(reason: Reason) -> &'static str {
-    match reason {
-        Reason::CurrentBranch => "This branch",
-        Reason::ReviewRequested => "Waiting on your review",
-        Reason::Mine => "Yours",
-        Reason::Other => "Other",
     }
 }
 
@@ -269,45 +314,86 @@ impl App {
 
     /// Starts on `session`, whose `prepare` goes on in the background and
     /// says the rest under the returned run id.
-    pub(crate) fn start_pr(&mut self, plugin: String, session: Session) -> u64 {
+    pub(crate) fn start_review(&mut self, plugin: String, session: Session) -> u64 {
         let id = self.next_run();
-        self.job = Some(Running::new(id, Job::Prepare(session.number)));
+        let label = self.review_label(session.shown());
+        self.job = Some(Running::new(id, Job::Prepare, label.clone()));
         self.review = Some(plugin.clone());
-        let mode = Mode::new(plugin, session);
+        let mode = Mode::new(plugin, session, label);
         self.description = mode.description();
-        self.pr = Some(mode);
+        self.reviewing = Some(mode);
+        // The comments file shown is the session's: your comments in it
+        // not posted yet are drafts.
+        let changed = (self.comments.as_mut()).map_or_else(Vec::new, |c| c.set_session(true));
+        if !changed.is_empty() {
+            self.placed_again(&changed);
+        }
         id
     }
 
-    /// Opens the picker on `prs`, for `dffy pr` on a branch without one.
-    pub(crate) fn pick_pr(&mut self, plugin: String, prs: Vec<Pr>) {
+    /// Opens the picker on `reviews`, for the review command (`dffy pr`) on a
+    /// branch without one.
+    pub(crate) fn pick_review(&mut self, plugin: String, reviews: Vec<Listed>) {
         self.review = Some(plugin);
-        self.open_picker_of(prs);
+        self.open_picker_of(reviews);
     }
 
-    fn open_picker_of(&mut self, prs: Vec<Pr>) {
-        if prs.is_empty() {
-            self.message(
-                "no open pull requests for you here: none on this branch, yours or waiting on you",
-            );
+    fn open_picker_of(&mut self, reviews: Vec<Listed>) {
+        if reviews.is_empty() {
+            self.message(format!("no {} listed for you here", self.noun(true)));
             return;
         }
-        self.prs = Some(Picker::new(prs));
+        let prefix = self.naming.as_ref().map_or("", |n| n.id_prefix.as_str());
+        self.reviews = Some(Picker::new(reviews, self.noun(true), prefix));
     }
 
-    /// The run of `job` with `args`, unless a post is still running: a
-    /// post can't be stopped halfway, and anything else would stop it.
-    fn run(&mut self, plugin: String, job: Job, args: Vec<String>) -> Option<Action> {
+    /// The review plugin's word for what it reviews, or the plural;
+    /// `review` until a plugin describes itself.
+    pub(super) fn noun(&self, plural: bool) -> &str {
+        match (&self.naming, plural) {
+            (Some(naming), false) => &naming.noun,
+            (Some(naming), true) => &naming.nouns,
+            (None, false) => "review",
+            (None, true) => "reviews",
+        }
+    }
+
+    /// How the review whose id shows as `shown` reads in titles and
+    /// messages: `PR #7` in the plugin's words.
+    pub(super) fn review_label(&self, shown: &str) -> String {
+        match &self.naming {
+            Some(naming) => naming.label(shown),
+            None => format!("review {shown}"),
+        }
+    }
+
+    fn say_not_on_review(&mut self) {
+        let said = match &self.naming {
+            Some(n) => format!("not on a {}; dffy {} <id> opens one", n.noun, n.command),
+            None => "not on a review".to_owned(),
+        };
+        self.message(said);
+    }
+
+    /// The run of `job` on the review `label` names, with `args`, unless a
+    /// post is still running: a post can't be stopped halfway, and
+    /// anything else would stop it.
+    fn run(
+        &mut self,
+        plugin: String,
+        (job, label): (Job, String),
+        args: Vec<String>,
+    ) -> Option<Action> {
         if self.job.as_ref().is_some_and(|r| r.job.posts()) {
             self.message("the review is still being posted; wait for it to finish");
             return None;
         }
         let id = self.next_run();
-        self.job = Some(Running::new(id, job));
+        self.job = Some(Running::new(id, job, label));
         let comments = match job {
-            Job::Prepare(_) => None,
-            Job::Pull | Job::Post | Job::SubmitOnly(_) => {
-                self.pr.as_ref().map(|p| p.session.comments.clone())
+            Job::Prepare => None,
+            Job::Pull | Job::Post | Job::ApplyEvent(_) => {
+                self.reviewing.as_ref().map(|p| p.session.comments.clone())
             }
         };
         Some(Action::Plugin {
@@ -319,11 +405,12 @@ impl App {
         })
     }
 
-    /// The command panel's "Open pull request…": lists them to pick from,
-    /// beside the run going on, which a look at the list shouldn't stop.
-    pub(super) fn open_pr_picker(&mut self) -> Option<Action> {
+    /// The command panel's "Open review…", in the plugin's words: lists
+    /// them to pick from, beside the run going on, which a look at the
+    /// list shouldn't stop.
+    pub(super) fn open_review_picker(&mut self) -> Option<Action> {
         let plugin = self.review_plugin()?;
-        self.message("listing pull requests…");
+        self.message(format!("listing {}…", self.noun(true)));
         let id = self.next_run();
         self.listing = Some(id);
         Some(Action::Plugin {
@@ -335,9 +422,9 @@ impl App {
         })
     }
 
-    /// Asks `plugin` whether the branch checked out has a PR, for plain
-    /// `dffy`; the viewer goes on meanwhile (see [`App::detected`]).
-    pub(crate) fn detect_pr(&mut self, plugin: String) -> Action {
+    /// Asks `plugin` whether the branch checked out has a review, for
+    /// plain `dffy`; the viewer goes on meanwhile (see [`App::detected`]).
+    pub(crate) fn detect_review(&mut self, plugin: String) -> Action {
         let id = self.next_run();
         self.detecting = Some(id);
         self.review = Some(plugin.clone());
@@ -350,17 +437,18 @@ impl App {
         }
     }
 
-    /// What `detect` said: a PR for the branch is prepared, then shown
-    /// against the working tree, unless another PR was opened meanwhile.
+    /// What `detect` said: a review for the branch is prepared, then its
+    /// comments join plain `dffy`'s range, unless another review was opened
+    /// meanwhile.
     fn detected(&mut self, said: Said) -> Option<Action> {
         match said {
-            Said::Detected(Some(found)) if self.pr.is_none() && self.job.is_none() => {
+            Said::Detected(Some(found)) if self.reviewing.is_none() && self.job.is_none() => {
                 let plugin = self.review.clone()?;
-                let n = found.number;
+                let label = self.review_label(found.shown());
                 let action = self.run(
                     plugin,
-                    Job::Prepare(n),
-                    vec!["prepare".to_owned(), n.to_string()],
+                    (Job::Prepare, label),
+                    vec!["prepare".to_owned(), found.id],
                 );
                 if let Some(running) = &mut self.job {
                     running.local = true;
@@ -371,7 +459,8 @@ impl App {
                 self.detecting = None;
                 if let Err(e) = result {
                     let e = escape(e.as_bytes());
-                    self.message(format!("looking for this branch's PR failed: {e}"));
+                    let noun = self.noun(false);
+                    self.message(format!("looking for this branch's {noun} failed: {e}"));
                 }
                 None
             }
@@ -392,27 +481,31 @@ impl App {
         plugin
     }
 
-    /// `p`: fetches the PR's head and threads, and shows the new head in
-    /// place.
-    pub(super) fn update_pr(&mut self) -> Option<Action> {
-        let Some(pr) = &self.pr else {
-            self.message("not on a pull request; dffy pr <number> opens one");
+    /// `p`: fetches the review's head and threads, and shows the new head
+    /// in place.
+    pub(super) fn update_review(&mut self) -> Option<Action> {
+        let Some(mode) = &self.reviewing else {
+            self.say_not_on_review();
             return None;
         };
-        let (plugin, n) = (pr.plugin.clone(), pr.session.number);
+        let (plugin, id, label) = (
+            mode.plugin.clone(),
+            mode.session.id.clone(),
+            mode.label.clone(),
+        );
         if self.job.as_ref().is_some_and(|r| r.job == Job::Pull) {
-            self.message(format!("already updating PR #{n}"));
+            self.message(format!("already updating {label}"));
             return None;
         }
-        self.message(format!("updating PR #{n}…"));
-        self.run(plugin, Job::Pull, vec!["pull".to_owned(), n.to_string()])
+        self.message(format!("updating {label}…"));
+        self.run(plugin, (Job::Pull, label), vec!["pull".to_owned(), id])
     }
 
     /// `P`: the dialog that posts the review, and the dry run that says
     /// what posting would do, beside whatever else runs.
     pub(super) fn open_post(&mut self) -> Option<Action> {
-        let Some(pr) = &self.pr else {
-            self.message("not on a pull request; dffy pr <number> opens one");
+        let Some(mode) = &self.reviewing else {
+            self.say_not_on_review();
             return None;
         };
         if let Some(running) = self.job.as_ref().filter(|r| r.job.posts()) {
@@ -424,14 +517,17 @@ impl App {
             self.message(format!("posting{at}…"));
             return None;
         }
-        let summary = TextBox::new(&pr.summary);
-        let (plugin, n, comments) = (
-            pr.plugin.clone(),
-            pr.session.number,
-            pr.session.comments.clone(),
+        let summary = TextBox::new(&mode.summary);
+        let (plugin, review, comments) = (
+            mode.plugin.clone(),
+            mode.session.id.clone(),
+            mode.session.comments.clone(),
         );
+        let events =
+            (self.naming.as_ref()).map_or_else(review::default_events, |n| n.events.clone());
         let id = self.next_run();
         self.posting = Some(Dialog {
+            events,
             event: 0,
             summary,
             writing: false,
@@ -446,7 +542,7 @@ impl App {
         Some(Action::Plugin {
             id,
             plugin,
-            args: vec!["post".to_owned(), n.to_string(), "--dry-run".to_owned()],
+            args: vec!["post".to_owned(), review, "--dry-run".to_owned()],
             comments: Some(comments),
             summary: None,
         })
@@ -495,35 +591,39 @@ impl App {
     }
 
     /// "Since last review": the range from the head your last review was
-    /// on to the head, or back to the whole PR.
+    /// on to the head, or back to what showed before.
     pub(super) fn toggle_since_review(&mut self) -> Option<Action> {
-        let Some(pr) = &mut self.pr else {
-            self.message("not on a pull request; dffy pr <number> opens one");
+        let whole = format!("the whole {}", self.noun(false));
+        let Some(mode) = &mut self.reviewing else {
+            self.say_not_on_review();
             return None;
         };
-        let Some(last) = pr.session.last_reviewed_head.clone() else {
-            self.message("no review of yours posted from dffy on this PR yet");
+        let Some(last) = mode.session.last_reviewed_head.clone() else {
+            let note = format!("no review of yours posted from dffy on {} yet", mode.label);
+            self.message(note);
             return None;
         };
-        if last == pr.session.head && !pr.since_last {
+        if last == mode.session.head && !mode.since_last {
             self.message("nothing new since your last review");
             return None;
         }
-        pr.since_last = !pr.since_last;
-        let note = if pr.since_last {
+        mode.since_last = !mode.since_last;
+        let note = if mode.since_last {
             format!(
                 "since your last review: {}..{}",
                 short(&last),
-                short(&pr.session.head)
+                short(&mode.session.head)
             )
+        } else if mode.plain.is_some() && !mode.whole {
+            "the working tree's changes".to_owned()
         } else {
-            "the whole PR".to_owned()
+            whole
         };
         self.message(note);
         self.retarget(None, None)
     }
 
-    /// Shows the PR's range, as it stands now, and its comments when
+    /// Shows the review's range, as it stands now, and its comments when
     /// `comments` names another file.
     fn retarget(
         &mut self,
@@ -531,18 +631,50 @@ impl App {
         moved: Option<(String, String)>,
     ) -> Option<Action> {
         Some(Action::Retarget {
-            revisions: self.pr_range()?,
+            revisions: Some(self.review_range()?),
             comments,
             moved,
         })
     }
 
-    /// The PR's range as it stands now, which the title and the list of
-    /// files take.
-    fn pr_range(&mut self) -> Option<Revisions> {
-        let pr = self.pr.as_ref()?;
-        let revisions = pr.revisions();
-        self.description = pr.description();
+    /// "Show whole review": on the review plain `dffy` found, the review's
+    /// base against the working tree, or plain `dffy`'s range again.
+    pub(super) fn toggle_whole_review(&mut self) -> Option<Action> {
+        let Some(mode) = &mut self.reviewing else {
+            self.say_not_on_review();
+            return None;
+        };
+        if mode.plain.is_none() {
+            let note = format!("{} is shown whole already", mode.label);
+            self.message(note);
+            return None;
+        }
+        mode.whole = !mode.whole;
+        mode.since_last = false;
+        let note = if mode.whole {
+            format!("{} + working tree", mode.label)
+        } else {
+            "the working tree's changes".to_owned()
+        };
+        self.message(note);
+        self.retarget(None, None)
+    }
+
+    /// The command panel's words for [`App::toggle_whole_review`].
+    pub(super) fn whole_review_title(&self) -> String {
+        if self.reviewing.as_ref().is_some_and(|p| p.whole) {
+            "Show working tree changes".to_owned()
+        } else {
+            format!("Show whole {}", self.noun(false))
+        }
+    }
+
+    /// The review's range as it stands now, which the title and the list
+    /// of files take.
+    fn review_range(&mut self) -> Option<Revisions> {
+        let mode = self.reviewing.as_ref()?;
+        let revisions = mode.revisions();
+        self.description = mode.description();
         if let Some((selected, _)) = &mut self.selected {
             selected.clone_from(&revisions);
         }
@@ -552,72 +684,74 @@ impl App {
     /// The head of your last review, while "Since last review" shows from
     /// it.
     pub(crate) fn reviewed_from(&self) -> Option<&str> {
-        let pr = self.pr.as_ref().filter(|p| p.since_last)?;
-        pr.session.last_reviewed_head.as_deref()
+        let mode = self.reviewing.as_ref().filter(|p| p.since_last)?;
+        mode.session.last_reviewed_head.as_deref()
     }
 
     /// The head of your last review isn't in the clone, so the range from
-    /// it can't be listed: back to the whole PR, whose range is returned.
+    /// it can't be listed: back to the whole review, whose range is
+    /// returned.
     pub(crate) fn reviewed_head_missing(&mut self) -> Option<Revisions> {
-        let pr = self.pr.as_mut()?;
-        pr.since_last = false;
-        let last = pr.session.last_reviewed_head.clone().unwrap_or_default();
+        let mode = self.reviewing.as_mut()?;
+        mode.since_last = false;
+        let last = mode.session.last_reviewed_head.clone().unwrap_or_default();
         self.message(format!(
             "last reviewed commit {} isn't in this clone (force-pushed away?)",
             short(&last)
         ));
-        self.pr_range()
+        self.review_range()
     }
 
     /// Whether "Since last review" is on, for the command panel.
     pub(super) fn since_review(&self) -> bool {
-        self.pr.as_ref().is_some_and(|p| p.since_last)
+        self.reviewing.as_ref().is_some_and(|p| p.since_last)
     }
 
-    /// The check, when it's due: none while the PR's head is being fetched.
+    /// The check, when it's due: none while the review's head is being
+    /// fetched.
     pub(super) fn due_check(&mut self) -> Option<Action> {
         let busy = matches!(
             self.job.as_ref().map(|r| r.job),
-            Some(Job::Pull | Job::Prepare(_))
+            Some(Job::Pull | Job::Prepare)
         );
         let id = self.run_id + 1;
-        let pr = self.pr.as_mut()?;
-        if pr.check.is_some() || Instant::now() < pr.next_check {
+        let mode = self.reviewing.as_mut()?;
+        if mode.check.is_some() || Instant::now() < mode.next_check {
             return None;
         }
         if busy {
-            pr.next_check = Instant::now() + CHECK_EVERY;
+            mode.next_check = Instant::now() + CHECK_EVERY;
             return None;
         }
-        pr.check = Some(id);
+        mode.check = Some(id);
         self.run_id = id;
         Some(Action::Plugin {
             id,
-            plugin: pr.plugin.clone(),
-            args: vec!["check".to_owned(), pr.session.number.to_string()],
-            comments: Some(pr.session.comments.clone()),
+            plugin: mode.plugin.clone(),
+            args: vec!["check".to_owned(), mode.session.id.clone()],
+            comments: Some(mode.session.comments.clone()),
             summary: None,
         })
     }
 
     /// When the next check is due, while none runs.
     pub(super) fn check_deadline(&self) -> Option<Instant> {
-        self.pr
+        self.reviewing
             .as_ref()
             .filter(|p| p.check.is_none())
             .map(|p| p.next_check)
     }
 
-    /// `x` on a thread in PR mode, for the post dialog's count.
+    /// `x` on a thread in review mode, for the post dialog's count.
     pub(super) fn note_resolve(&mut self, root: &str, was: bool) {
-        if let Some(pr) = &mut self.pr {
-            match pr.resolves.get(root) {
+        if let Some(mode) = &mut self.reviewing {
+            match mode.resolves.get(root) {
                 Some(&before) if before != was => {
-                    pr.resolves.remove(root);
+                    mode.resolves.remove(root);
                 }
                 Some(_) => {}
                 None => {
-                    pr.resolves.insert(root.to_owned(), was);
+                    mode.resolves.insert(root.to_owned(), was);
                 }
             }
         }
@@ -625,7 +759,7 @@ impl App {
 
     /// What a run said. Runs no longer wanted say nothing.
     pub(super) fn review_said(&mut self, id: u64, said: Said) -> Option<Action> {
-        if self.pr.as_ref().is_some_and(|p| p.check == Some(id)) {
+        if self.reviewing.as_ref().is_some_and(|p| p.check == Some(id)) {
             self.checked(said);
             return None;
         }
@@ -650,81 +784,99 @@ impl App {
             Said::Posted {
                 posted,
                 failed,
-                pending_review,
+                held,
+                held_message,
                 url,
             } => {
-                running.posted = Some((posted, failed, pending_review));
+                running.posted = Some((posted, failed, held));
+                running.held_message = held_message;
                 self.link = url.filter(|u| is_web(u));
             }
             Said::Done(result) => {
                 let running = self.job.take()?;
                 match (job, result) {
-                    (Job::Post, Ok(())) => self.posted(running),
-                    (Job::SubmitOnly(failed), Ok(())) => self.submitted(failed),
+                    (Job::Post | Job::ApplyEvent(_), Ok(())) => {
+                        if let Job::ApplyEvent(failed) = job {
+                            self.applied(failed);
+                        } else {
+                            self.posted(running);
+                        }
+                        // The plugin's notice, read as the run ended, says
+                        // more than the outcome, which the status bar keeps.
+                        if let Some(notice) = self.comments.as_ref().and_then(Comments::notice) {
+                            self.message(escape(notice.as_bytes()));
+                        }
+                    }
                     (_, Ok(())) => {}
                     (job, Err(e)) => {
                         let e = escape(e.as_bytes());
+                        let label = &running.label;
                         self.message(match job {
-                            Job::Prepare(n) => format!("PR #{n}: {e}"),
-                            Job::Pull => format!("updating the PR failed: {e}"),
+                            Job::Prepare => format!("{label}: {e}"),
+                            Job::Pull => format!("updating {label} failed: {e}"),
                             Job::Post => format!("posting failed: {e}"),
-                            Job::SubmitOnly(_) => {
-                                format!("submitting the review failed, it's still pending: {e}")
-                            }
+                            Job::ApplyEvent(_) => format!("sending the review failed: {e}"),
                         });
                     }
                 }
             }
-            Said::Prs(_) | Said::Head { .. } | Said::Detected(_) | Said::Planned { .. } => {}
+            Said::Listed(_) | Said::Head { .. } | Said::Detected(_) | Said::Planned { .. } => {}
         }
         None
     }
 
     /// A post that finished: what it did goes in the status bar, unless the
-    /// host refused drafts and so the event picked wasn't submitted, which
-    /// asks first. Drafts the dialog showed couldn't be posted don't hold
-    /// the event back.
+    /// host refused drafts and so the submitting event picked was held
+    /// back, which asks first. Drafts the dialog showed couldn't be posted
+    /// don't hold the event back.
     fn posted(&mut self, running: Running) {
-        let Some(pr) = &mut self.pr else {
+        let Some(mode) = &mut self.reviewing else {
             return;
         };
-        let (posted, failed, pending_review) = running.posted.unwrap_or_default();
-        let event = EVENTS[pr.event].1;
-        // As the plugin records it: a pending review with nothing in it
-        // reviewed nothing.
-        if posted > 0 || (event != "pending" && !pending_review) {
-            pr.session.last_reviewed_head = Some(pr.session.head.clone());
+        let Some(event) = mode.event.clone() else {
+            return;
+        };
+        let (posted, failed, held) = running.posted.unwrap_or_default();
+        // As the plugin records it: an event that leaves the review open,
+        // with nothing in it, reviewed nothing.
+        if posted > 0 || (event.submits && !held) {
+            mode.session.last_reviewed_head = Some(mode.session.head.clone());
         }
-        pr.resolves.clear();
-        let text = outcome(event, failed, pending_review);
-        if event != "pending" && pending_review && failed > 0 {
-            pr.outcome = Some(text);
+        mode.resolves.clear();
+        let message = held.then(|| running.held_message.unwrap_or_else(|| HELD.to_owned()));
+        let text = outcome(&event, (posted, failed), message.as_deref());
+        if event.submits && held && failed > 0 {
+            mode.outcome = Some(text);
             self.held = Some(Held {
                 failed,
                 unposted: running.unposted,
+                event,
+                message,
             });
             self.message = None;
             return;
         }
-        pr.summary.clear();
-        pr.outcome = Some(text.clone());
+        mode.summary.clear();
+        mode.outcome = Some(text.clone());
         // The link goes in the note only: it would crowd the status bar
-        // out of room for the PR's part.
+        // out of room for the review's part.
         match self.link.as_deref().filter(|_| failed == 0) {
             Some(url) => self.message(format!("{text} · {url}")),
             None => self.message = None,
         }
     }
 
-    /// `post --submit-only` finished: the review went without the drafts
+    /// `post --apply-event` finished: the event went without the drafts
     /// left out.
-    fn submitted(&mut self, failed: usize) {
-        let Some(pr) = &mut self.pr else {
+    fn applied(&mut self, failed: usize) {
+        let Some(mode) = &mut self.reviewing else {
             return;
         };
-        pr.session.last_reviewed_head = Some(pr.session.head.clone());
-        pr.summary.clear();
-        pr.outcome = Some(outcome(EVENTS[pr.event].1, failed, false));
+        mode.session.last_reviewed_head = Some(mode.session.head.clone());
+        mode.summary.clear();
+        if let Some(event) = &mode.event {
+            mode.outcome = Some(outcome(event, (0, failed), None));
+        }
         self.message = None;
     }
 
@@ -748,24 +900,28 @@ impl App {
         if key == Key::Char('c') && mods.contains(Mods::CTRL) {
             return Some(Action::Quit);
         }
-        let failed = self.held.as_ref()?.failed;
+        let held = self.held.as_ref()?;
+        let (failed, event) = (held.failed, held.event.id.clone());
         match key {
             Key::Char('s') => {
                 self.held = None;
-                let pr = self.pr.as_ref()?;
-                let (plugin, n, summary) =
-                    (pr.plugin.clone(), pr.session.number, pr.summary.clone());
-                let event = EVENTS[pr.event].1;
-                self.message("submitting the review without them…");
+                let current = self.reviewing.as_ref()?;
+                let (plugin, id, label, summary) = (
+                    current.plugin.clone(),
+                    current.session.id.clone(),
+                    current.label.clone(),
+                    current.summary.clone(),
+                );
+                self.message("sending the review without them…");
                 let mut action = self.run(
                     plugin,
-                    Job::SubmitOnly(failed),
+                    (Job::ApplyEvent(failed), label),
                     vec![
                         "post".to_owned(),
-                        n.to_string(),
-                        "--submit-only".to_owned(),
+                        id,
+                        "--apply-event".to_owned(),
                         "--event".to_owned(),
-                        event.to_owned(),
+                        event,
                     ],
                 );
                 if let Some(Action::Plugin { summary: s, .. }) = &mut action {
@@ -787,15 +943,15 @@ impl App {
     /// What `list` said, for the picker.
     fn listed(&mut self, said: Said) {
         match said {
-            Said::Prs(prs) => {
+            Said::Listed(reviews) => {
                 self.message = None;
-                self.open_picker_of(prs);
+                self.open_picker_of(reviews);
             }
             Said::Done(result) => {
                 self.listing = None;
                 if let Err(e) = result {
                     let e = escape(e.as_bytes());
-                    self.message(format!("listing pull requests failed: {e}"));
+                    self.message(format!("listing {} failed: {e}", self.noun(true)));
                 }
             }
             _ => {}
@@ -803,93 +959,107 @@ impl App {
         self.dirty = true;
     }
 
-    /// A session line: a PR opened from the picker or found for the
-    /// branch (`local`), or the PR updated.
+    /// A session line: a review opened from the picker or found for the
+    /// branch (`local`), or the review updated.
     fn prepared(&mut self, job: Job, local: bool, session: Session) -> Option<Action> {
         let plugin = self.review.clone().unwrap_or_default();
+        let label = self.review_label(session.shown());
         match job {
-            Job::Prepare(_) => {
+            Job::Prepare => {
                 let comments = session.comments.clone();
                 let title = session.title.clone().unwrap_or_default();
-                let n = session.number;
-                let mut mode = Mode::new(plugin, session);
-                mode.local = local;
-                self.pr = Some(mode);
+                let mut mode = Mode::new(plugin, session, label.clone());
+                if local {
+                    let revisions = self.selected.as_ref().map(|(r, _)| r.clone());
+                    mode.plain = Some((revisions.unwrap_or_default(), self.description.clone()));
+                }
+                // The retarget takes the session's comments file, read as
+                // a session's from here on.
+                self.reviewing = Some(mode);
                 let on = if local { " · this branch's" } else { "" };
-                self.message(format!("PR #{n}{on} · {}", escape(title.as_bytes())));
+                self.message(format!("{label}{on} · {}", escape(title.as_bytes())));
+                if local {
+                    // The range stays plain dffy's: only the comments change.
+                    return Some(Action::Retarget {
+                        revisions: None,
+                        comments: Some(comments),
+                        moved: None,
+                    });
+                }
                 self.retarget(Some(comments), None)
             }
             Job::Pull => {
-                let pr = self.pr.as_mut()?;
-                pr.moved = None;
-                let old = std::mem::replace(&mut pr.session, session);
-                let s = &pr.session;
-                let n = s.number;
+                let mode = self.reviewing.as_mut()?;
+                mode.moved = None;
+                let old = std::mem::replace(&mut mode.session, session);
+                mode.label.clone_from(&label);
+                let s = &mode.session;
                 let comments = (s.comments != old.comments).then(|| s.comments.clone());
                 if (&s.base, &s.head) == (&old.base, &old.head) && comments.is_none() {
-                    self.message(format!("PR #{n} is up to date"));
+                    self.message(format!("{label} is up to date"));
                     return None;
                 }
                 let moved = (s.head != old.head).then(|| (old.head.clone(), s.head.clone()));
-                self.message(format!("PR #{n} updated"));
+                self.message(format!("{label} updated"));
                 self.retarget(comments, moved)
             }
-            Job::Post | Job::SubmitOnly(_) => None,
+            Job::Post | Job::ApplyEvent(_) => None,
         }
     }
 
     /// After an update moved the head from `old` to `new`, how many
     /// commits that is, when git could tell.
-    pub(crate) fn pr_updated(&mut self, count: Option<usize>) {
-        let (Some(pr), Some(count)) = (&self.pr, count) else {
+    pub(crate) fn review_updated(&mut self, count: Option<usize>) {
+        let (Some(mode), Some(count)) = (&self.reviewing, count) else {
             return;
         };
-        let n = pr.session.number;
         let s = if count == 1 { "" } else { "s" };
-        self.message(format!("PR #{n} updated · {count} new commit{s}"));
+        let note = format!("{} updated · {count} new commit{s}", mode.label);
+        self.message(note);
     }
 
     fn checked(&mut self, said: Said) {
-        let Some(pr) = &mut self.pr else {
+        let Some(mode) = &mut self.reviewing else {
             return;
         };
         match said {
             Said::Head { head, moved } => {
-                pr.moved = (moved && head != pr.session.head).then_some(head);
+                mode.moved = (moved && head != mode.session.head).then_some(head);
                 self.dirty = true;
             }
             Said::Done(result) => {
-                pr.check = None;
-                pr.next_check = Instant::now() + CHECK_EVERY;
+                mode.check = None;
+                mode.next_check = Instant::now() + CHECK_EVERY;
                 if let Err(e) = result {
                     let e = escape(e.as_bytes());
-                    self.message(format!("checking the PR failed: {e}"));
+                    let note = format!("checking {} failed: {e}", mode.label);
+                    self.message(note);
                 }
             }
             _ => {}
         }
     }
 
-    /// The PR's part of the status bar: `PR #7`, what's running, and
+    /// The review's part of the status bar: `PR #7`, what's running, and
     /// whether the head moved.
-    pub(super) fn pr_status(&self) -> Option<String> {
-        let pr = self.pr.as_ref()?;
-        let mut text = format!("PR #{}", pr.session.number);
+    pub(super) fn review_part(&self) -> Option<String> {
+        let mode = self.reviewing.as_ref()?;
+        let mut text = mode.label.clone();
         if let Some(running) = &self.job {
             let doing = match running.job {
-                Job::Prepare(_) => "fetching threads",
+                Job::Prepare => "fetching threads",
                 Job::Pull => "updating",
                 Job::Post => "posting",
-                Job::SubmitOnly(_) => "submitting",
+                Job::ApplyEvent(_) => "sending",
             };
             let _ = write!(text, " · {doing}");
             if let Some(progress) = &running.progress {
                 let _ = write!(text, " {progress}");
             }
-        } else if pr.moved.is_some() {
+        } else if mode.moved.is_some() {
             text.push_str(" updated · new commits · p to update");
         }
-        if let Some(outcome) = &pr.outcome {
+        if let Some(outcome) = &mode.outcome {
             let _ = write!(text, " · {outcome}");
         }
         if self.link.is_some() {
@@ -898,17 +1068,17 @@ impl App {
         Some(text)
     }
 
-    /// Input that PR mode's overlays take, or `o` while a posted review's
+    /// Input that review mode's overlays take, or `o` while a posted review's
     /// note shows; `Continue` when it's for the rest of the viewer.
-    pub(super) fn pr_input(&mut self, input: &Input) -> ControlFlow<Option<Action>> {
+    pub(super) fn review_input(&mut self, input: &Input) -> ControlFlow<Option<Action>> {
         if self.posting.is_some() {
             return ControlFlow::Break(self.post_input(input));
         }
         if self.held.is_some() && !self.keys_elsewhere() {
             return ControlFlow::Break(self.held_input(input));
         }
-        if self.prs.is_some() {
-            return ControlFlow::Break(self.pr_picker_input(input));
+        if self.reviews.is_some() {
+            return ControlFlow::Break(self.review_picker_input(input));
         }
         match (&self.link, input) {
             (Some(url), Input::Key(Key::Char('o'), Mods::NONE)) => {
@@ -947,15 +1117,17 @@ impl App {
         }
         match key {
             Key::Esc => {
-                if let (Some(pr), Some(dialog)) = (&mut self.pr, self.posting.take()) {
-                    dialog.summary.text().clone_into(&mut pr.summary);
+                if let (Some(mode), Some(dialog)) = (&mut self.reviewing, self.posting.take()) {
+                    dialog.summary.text().clone_into(&mut mode.summary);
                 }
             }
             Key::Tab | Key::Char('s') => dialog.writing = true,
             Key::Up | Key::Char('k') => dialog.event = dialog.event.saturating_sub(1),
-            Key::Down | Key::Char('j') => dialog.event = (dialog.event + 1).min(EVENTS.len() - 1),
-            Key::Char(c) if EVENTS.iter().any(|e| e.0 == c) => {
-                dialog.event = EVENTS.iter().position(|e| e.0 == c).unwrap_or(0);
+            Key::Down | Key::Char('j') => {
+                dialog.event = (dialog.event + 1).min(dialog.events.len().saturating_sub(1));
+            }
+            Key::Char(c) if dialog.events.iter().any(|e| e.key == c) => {
+                dialog.event = dialog.events.iter().position(|e| e.key == c).unwrap_or(0);
             }
             Key::Char('v') if dialog.preflight.skipped.is_empty() => {
                 let p = &dialog.preflight;
@@ -968,8 +1140,8 @@ impl App {
             }
             Key::Char('v') => {
                 let skipped = std::mem::take(&mut dialog.preflight.skipped);
-                if let (Some(pr), Some(dialog)) = (&mut self.pr, self.posting.take()) {
-                    dialog.summary.text().clone_into(&mut pr.summary);
+                if let (Some(mode), Some(dialog)) = (&mut self.reviewing, self.posting.take()) {
+                    dialog.summary.text().clone_into(&mut mode.summary);
                 }
                 self.go_to_unposted(&skipped);
             }
@@ -979,26 +1151,43 @@ impl App {
         None
     }
 
-    /// Posts the review as the dialog has it.
+    /// Posts the review as the dialog has it, once the local drafts in view
+    /// are in the review's comments file, where `post` reads them. When
+    /// they can't be moved, nothing is posted and the dialog stays.
     fn send_review(&mut self) -> Option<Action> {
-        let dialog = self.posting.take()?;
-        let pr = self.pr.as_mut()?;
+        let moved = (self.comments.as_mut())
+            .filter(|c| c.local_drafts() > 0)
+            .map(Comments::move_local);
+        match moved {
+            Some(Ok(changed)) => self.placed_again(&changed),
+            Some(Err(e)) => {
+                let e = escape(e.as_bytes());
+                let noun = self.noun(false);
+                self.message(format!(
+                    "nothing posted: local drafts not moved to the {noun}: {e}"
+                ));
+                return None;
+            }
+            None => {}
+        }
+        let mut dialog = self.posting.take()?;
+        let mode = self.reviewing.as_mut()?;
         let summary = dialog.summary.text().trim_end().to_owned();
-        pr.summary.clone_from(&summary);
-        let (plugin, n) = (pr.plugin.clone(), pr.session.number);
-        pr.event = dialog.event;
-        pr.outcome = None;
-        let event = EVENTS[dialog.event].1;
-        self.message(format!("posting the review on PR #{n}…"));
+        mode.summary.clone_from(&summary);
+        let (plugin, id, label) = (
+            mode.plugin.clone(),
+            mode.session.id.clone(),
+            mode.label.clone(),
+        );
+        let event = dialog.events.swap_remove(dialog.event);
+        let event_id = event.id.clone();
+        mode.event = Some(event);
+        mode.outcome = None;
+        self.message(format!("posting the review on {label}…"));
         let mut action = self.run(
             plugin,
-            Job::Post,
-            vec![
-                "post".to_owned(),
-                n.to_string(),
-                "--event".to_owned(),
-                event.to_owned(),
-            ],
+            (Job::Post, label),
+            vec!["post".to_owned(), id, "--event".to_owned(), event_id],
         );
         if let Some(Action::Plugin { summary: s, .. }) = &mut action {
             *s = (!summary.is_empty()).then_some(summary);
@@ -1006,23 +1195,55 @@ impl App {
         action
     }
 
-    /// What `P` would send: new comments, replies and resolve changes.
-    pub(super) fn unsent(&self) -> (usize, usize, usize) {
+    /// What `P` would send: new comments, replies and resolve changes, and
+    /// how many of the comments and replies are local drafts.
+    pub(super) fn unsent(&self) -> Unsent {
         let (comments, replies) = self.comments.as_ref().map_or((0, 0), Comments::unsent);
-        let resolves = self.pr.as_ref().map_or(0, |p| p.resolves.len());
-        (comments, replies, resolves)
+        Unsent {
+            comments,
+            replies,
+            resolves: self.reviewing.as_ref().map_or(0, |p| p.resolves.len()),
+            local: self.comments.as_ref().map_or(0, Comments::local_drafts),
+        }
     }
+}
+
+/// What `P` would send (see [`App::unsent`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct Unsent {
+    pub comments: usize,
+    pub replies: usize,
+    pub resolves: usize,
+    /// Comments and replies among them from the local review's file, which
+    /// the plugin's dry run doesn't see: they move to the review's file only
+    /// as the review is sent.
+    pub local: usize,
 }
 
 impl Preflight {
     /// What goes: the plugin's count of drafts once its dry run is in, in
-    /// which replies are comments, else dffy's own of `unsent`.
-    fn what(&self, (comments, replies, resolves): (usize, usize, usize)) -> String {
+    /// which replies are comments, plus the local drafts it doesn't see;
+    /// else dffy's own count.
+    fn what(&self, unsent: Unsent) -> String {
+        let Unsent {
+            comments,
+            replies,
+            resolves,
+            local,
+        } = unsent;
         let mut parts = Vec::new();
-        if let Some((line, file, skip)) = self.planned {
-            if line + file + skip > 0 {
-                parts.push(plural(line + file + skip, "comment"));
+        let of_which = |parts: &mut Vec<String>| {
+            if local > 0
+                && let Some(last) = parts.last_mut()
+            {
+                let _ = write!(last, " ({local} local)");
             }
+        };
+        if let Some((line, file, skip)) = self.planned {
+            if line + file + skip + local > 0 {
+                parts.push(plural(line + file + skip + local, "comment"));
+            }
+            of_which(&mut parts);
             if file > 0 {
                 parts.push(format!("{file} as a file comment"));
             }
@@ -1033,6 +1254,7 @@ impl Preflight {
             if replies > 0 {
                 parts.push(plural(replies, "reply").replace("replys", "replies"));
             }
+            of_which(&mut parts);
         }
         if resolves > 0 {
             parts.push(plural(resolves, "resolve change"));
@@ -1074,15 +1296,9 @@ impl Preflight {
 }
 
 impl Dialog {
-    /// Draws the dialog for `pr`, which would send `unsent` (see
+    /// Draws the dialog for `mode`, which would send `unsent` (see
     /// [`App::unsent`]).
-    pub(super) fn draw(
-        &mut self,
-        grid: &mut Grid,
-        theme: &Theme,
-        pr: &Mode,
-        (comments, replies, resolves): (usize, usize, usize),
-    ) {
+    pub(super) fn draw(&mut self, grid: &mut Grid, theme: &Theme, mode: &Mode, unsent: Unsent) {
         let dialog = self;
         let (gw, gh) = (grid.width(), grid.height());
         if gw < 20 || gh < 8 {
@@ -1096,27 +1312,30 @@ impl Dialog {
         let inner = width - 4;
         let mut lines: Vec<(String, Style)> = Vec::new();
         let dim = theme.style(Role::Dim);
-        lines.push((
-            dialog.preflight.what((comments, replies, resolves)),
-            Style::PLAIN,
-        ));
+        lines.push((dialog.preflight.what(unsent), Style::PLAIN));
         lines.extend(
             dialog
                 .preflight
                 .note()
                 .map(|(text, warn)| (text, if warn { theme.style(Role::Warn) } else { dim })),
         );
-        if pr.moved.is_some() {
+        if mode.moved.is_some() {
             lines.push((
-                "! the PR has new commits; this review goes on the head shown".to_owned(),
+                format!(
+                    "! {} has new commits; this review goes on the head shown",
+                    mode.label
+                ),
                 theme.style(Role::Warn),
             ));
         }
         lines.push((String::new(), Style::PLAIN));
         let first_event = lines.len();
-        for (i, (key, _, label)) in EVENTS.iter().enumerate() {
+        for (i, event) in dialog.events.iter().enumerate() {
             let dot = if i == dialog.event { "(•)" } else { "( )" };
-            lines.push((format!("{dot} {key}  {label}"), Style::PLAIN));
+            lines.push((
+                format!("{dot} {}  {}", event.key, event.label),
+                Style::PLAIN,
+            ));
         }
         lines.push((String::new(), Style::PLAIN));
         let hint = if dialog.writing {
@@ -1139,7 +1358,7 @@ impl Dialog {
         };
         let height = (lines.len() + shown + 4).min(gh);
         let (x0, y0) = ((gw - width) / 2, (gh - height) / 2);
-        let title = format!(" post review · PR #{} ", pr.session.number);
+        let title = format!(" post review · {} ", mode.label);
         help::frame(grid, (x0, y0, width, height), &title, theme);
         let (x, right) = (x0 + 2, x0 + width - 2);
         for (i, (text, style)) in lines.iter().enumerate() {
@@ -1148,7 +1367,7 @@ impl Dialog {
                 break;
             }
             grid.put_str(x, y, right, text, *style);
-            let event = i.checked_sub(first_event).filter(|&e| e < EVENTS.len());
+            let event = (i.checked_sub(first_event)).filter(|&e| e < dialog.events.len());
             if event == Some(dialog.event) {
                 let mut bold = theme.selected(Style::PLAIN, !dialog.writing);
                 bold.attributes |= Attributes::BOLD;
@@ -1176,7 +1395,7 @@ impl Dialog {
 }
 
 impl Held {
-    pub(super) fn draw(&self, grid: &mut Grid, theme: &Theme, pr: &Mode) {
+    pub(super) fn draw(&self, grid: &mut Grid, theme: &Theme, mode: &Mode) {
         let (gw, gh) = (grid.width(), grid.height());
         if gw < 20 || gh < 8 {
             return;
@@ -1210,23 +1429,27 @@ impl Held {
         if self.unposted.len() > room {
             lines.push((format!("· {} more", self.unposted.len() - room), dim));
         }
+        let label = &self.event.label;
+        lines.push((String::new(), Style::PLAIN));
+        lines.push((
+            format!("so “{label}” wasn't applied"),
+            theme.style(Role::Warn),
+        ));
+        if let Some(message) = &self.message {
+            lines.push((escape(message.as_bytes()), dim));
+        }
         lines.extend([
             (String::new(), Style::PLAIN),
+            (format!("s  {label} without them"), Style::PLAIN),
             (
-                "so the review wasn't submitted, and is still pending".to_owned(),
-                theme.style(Role::Warn),
-            ),
-            (String::new(), Style::PLAIN),
-            ("s  submit it without them".to_owned(), Style::PLAIN),
-            (
-                "f  fix them: go to the first, the review stays pending".to_owned(),
+                "f  fix them: go to the first, the review stays as it is".to_owned(),
                 Style::PLAIN,
             ),
-            ("k  keep the review pending".to_owned(), Style::PLAIN),
+            ("k  leave the review as it is".to_owned(), Style::PLAIN),
         ]);
         let height = (lines.len() + 4).min(gh);
         let (x0, y0) = ((gw - width) / 2, (gh - height) / 2);
-        let title = format!(" review not sent · PR #{} ", pr.session.number);
+        let title = format!(" review not sent · {} ", mode.label);
         help::frame(grid, (x0, y0, width, height), &title, theme);
         let (x, right) = (x0 + 2, x0 + width - 2);
         for (i, (text, style)) in lines.iter().enumerate() {
@@ -1236,27 +1459,21 @@ impl Held {
             }
             grid.put_str(x, y, right, text, *style);
         }
-        grid.put_str(
-            x,
-            y0 + height - 2,
-            right,
-            "s, f or k · esc keeps it pending",
-            dim,
-        );
+        grid.put_str(x, y0 + height - 2, right, "s, f or k · esc leaves it", dim);
     }
 }
 
 impl App {
-    /// Input while the PR picker is open: `j`/`k` or the arrows move,
+    /// Input while the review picker is open: `j`/`k` or the arrows move,
     /// `enter` opens, `esc` closes.
-    pub(super) fn pr_picker_input(&mut self, input: &Input) -> Option<Action> {
-        let picker = self.prs.as_mut()?;
-        let last = picker.prs.len().saturating_sub(1);
+    pub(super) fn review_picker_input(&mut self, input: &Input) -> Option<Action> {
+        let picker = self.reviews.as_mut()?;
+        let last = picker.reviews.len().saturating_sub(1);
         match *input {
             Input::Key(Key::Char('c'), mods) if mods.contains(Mods::CTRL) => {
                 return Some(Action::Quit);
             }
-            Input::Key(Key::Esc | Key::Char('q'), _) => self.prs = None,
+            Input::Key(Key::Esc | Key::Char('q'), _) => self.reviews = None,
             Input::Key(Key::Up | Key::Char('k'), _) => {
                 picker.cursor = picker.cursor.saturating_sub(1);
             }
@@ -1270,26 +1487,28 @@ impl App {
                     .min(last);
             }
             Input::Key(Key::Enter, _) => {
-                let n = picker.prs.get(picker.cursor)?.number;
-                self.prs = None;
-                return self.open_pr(n);
+                let listed = picker.reviews.get(picker.cursor)?;
+                let (id, shown) = (listed.id.clone(), listed.shown().to_owned());
+                self.reviews = None;
+                let label = self.review_label(&shown);
+                return self.open_review(id, label);
             }
             _ => {}
         }
         None
     }
 
-    fn open_pr(&mut self, n: u64) -> Option<Action> {
-        if self.pr.as_ref().is_some_and(|p| p.session.number == n) {
-            self.message(format!("PR #{n} is open"));
+    fn open_review(&mut self, id: String, label: String) -> Option<Action> {
+        if self.reviewing.as_ref().is_some_and(|p| p.session.id == id) {
+            self.message(format!("{label} is open"));
             return None;
         }
         let plugin = self.review_plugin()?;
-        self.message(format!("fetching #{n}…"));
+        self.message(format!("fetching {label}…"));
         self.run(
             plugin,
-            Job::Prepare(n),
-            vec!["prepare".to_owned(), n.to_string()],
+            (Job::Prepare, label),
+            vec!["prepare".to_owned(), id],
         )
     }
 }
@@ -1301,19 +1520,19 @@ impl Picker {
         if gw < 20 || gh < 6 {
             return;
         }
-        // Group titles, then each PR under its group's.
+        // Group titles, then each review under its group's.
         let mut lines: Vec<Option<usize>> = Vec::new();
-        let mut titles: Vec<&'static str> = Vec::new();
+        let mut titles: Vec<&str> = Vec::new();
         let mut last = None;
-        for (i, pr) in picker.prs.iter().enumerate() {
-            if last != Some(pr.reason) {
+        for (i, &group) in picker.group.iter().enumerate() {
+            if last != Some(group) {
                 if last.is_some() {
                     lines.push(None);
                     titles.push("");
                 }
                 lines.push(None);
-                titles.push(group_title(pr.reason));
-                last = Some(pr.reason);
+                titles.push(&picker.groups[group]);
+                last = Some(group);
             }
             lines.push(Some(i));
             titles.push("");
@@ -1326,7 +1545,7 @@ impl Picker {
             (lines.len() + 4).min(gh - 2)
         };
         let (x0, y0) = ((gw - width) / 2, (gh - height) / 2);
-        help::frame(grid, (x0, y0, width, height), " pull requests ", theme);
+        help::frame(grid, (x0, y0, width, height), &picker.title, theme);
         let rows = height.saturating_sub(3);
         let at = lines
             .iter()
@@ -1353,7 +1572,7 @@ impl Picker {
                 grid.put_str(x, y, right, title, bold);
                 continue;
             };
-            let pr = &picker.prs[i];
+            let listed = &picker.reviews[i];
             let selected = i == picker.cursor;
             let mark = |s: Style| if selected { theme.selected(s, true) } else { s };
             if selected {
@@ -1363,16 +1582,16 @@ impl Picker {
                 x,
                 y,
                 right,
-                &format!("#{:<6}", pr.number),
+                &format!("{:<w$}", picker.tags[i], w = picker.tag_width),
                 mark(theme.style(Role::Hint)),
             );
-            let author = format!("  {}", escape(pr.author.as_bytes()));
+            let author = format!("  {}", escape(listed.author.as_bytes()));
             let title_end = right.saturating_sub(author.width());
             grid.put_str(
                 after + 1,
                 y,
                 title_end,
-                &escape(pr.title.as_bytes()),
+                &escape(listed.title.as_bytes()),
                 mark(Style::PLAIN),
             );
             grid.put_str(title_end, y, right, &author, mark(dim));

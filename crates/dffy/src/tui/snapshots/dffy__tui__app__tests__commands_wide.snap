@@ -34,7 +34,7 @@ expression: panel_markup(&mut app)
 <dim>│</>                                     <dim>│</>  <dim>│</>     Copy file path                               Y   <dim>┃│</>                                         <dim>┃</>
 <dim>│</>                                     <dim>│</>  <dim>│</> [ ] Copy with line numbers and signs             D   <dim>┃│</>                                         <dim>┃</>
 <dim>│</>                                     <dim>│</>  <dim>│</>                                                      <dim>┃│</>                                         <dim>┃</>
-<dim>│</>                                     <dim>│</>  <dim>│</> Modes                                                <dim>┃│</>                                         █
+<dim>│</>                                     <dim>│</>  <dim>│</> Modes                                                <dim>││</>                                         █
 <dim>│</>                                     <dim>│</>  <dim>│</> [x] Mouse selection                              M   <dim>││</>                                         <dim>┃</>
 <dim>│</>                                     <dim>│</>  <dim>│</> [ ] Watch for changes                            a <dim>w</> <dim>││</>                                         <dim>┃</>
 <dim>│</>                                     <dim>│</>  <dim>│</>                                                      <dim>││</>                                         <dim>┃</>

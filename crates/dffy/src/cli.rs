@@ -2,14 +2,19 @@
 //! `dffy main..HEAD` means `dffy diff main..HEAD`; a revision named like a
 //! subcommand needs the explicit form (`dffy diff config`). Diff flags mirror
 //! `git diff`.
+//!
+//! The review plugin's command (`dffy pr`) is a subcommand only when a
+//! review plugin is set and describes it, so it's added at run time by
+//! [`command`]; without one, `pr` is a revision like any other.
 
 use std::ffi::OsString;
 use std::path::PathBuf;
 
 use clap::builder::styling::{AnsiColor, Effects, Styles};
-use clap::{Args, CommandFactory, Parser, Subcommand};
+use clap::{Args, CommandFactory, FromArgMatches, Parser, Subcommand};
 
 use crate::config::{ColorWhen, Context, Paging};
+use crate::plugin::review::Naming;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -40,18 +45,100 @@ const GLOBAL_WITH_VALUE: [&str; 6] = [
     "--review",
 ];
 
-/// Inserts `diff` before the first argument that is neither a global option
-/// nor a subcommand, so `dffy -C repo main..HEAD --stat` parses as
-/// `dffy -C repo diff main..HEAD --stat`. clap's own way to have arguments
-/// without a subcommand turns global options off for the subcommands.
-pub(crate) fn with_default_subcommand(mut args: Vec<OsString>) -> Vec<OsString> {
+/// dffy's command line, with the review plugin's command when `review`
+/// describes one.
+pub(crate) fn command(review: Option<&Naming>) -> clap::Command {
     let command = Cli::command();
-    let is_subcommand = |name: &str| {
-        name == "help"
-            || command
-                .get_subcommands()
-                .any(|s| s.get_name() == name || s.get_all_aliases().any(|a| a == name))
+    let Some(Naming {
+        command: name,
+        noun,
+        nouns,
+        ..
+    }) = review
+    else {
+        return command;
     };
+    command.subcommand(
+        clap::Command::new(name.clone())
+            .about(format!(
+                "Review a {noun} in the viewer, through the review plugin"
+            ))
+            .long_about(format!(
+                "Review a {noun} in the viewer, through the review plugin (review = <name> \
+                 in the config, or --review <name>), which names this command.\n\n\
+                 With an id, it opens that {noun}: its diff from base to head, with its \
+                 review threads, as soon as the head is in the clone. Without one, it opens \
+                 the current branch's {noun}, or lists the {nouns} to pick from. \
+                 Experimental; see docs/plugins.md."
+            ))
+            .arg(clap::Arg::new("id").help(format!("The {noun}'s id"))),
+    )
+}
+
+/// Whether `name` is one of dffy's own subcommands or their aliases, which
+/// a review plugin's command can't be.
+pub(crate) fn is_builtin(name: &str) -> bool {
+    is_subcommand(&Cli::command(), name)
+}
+
+fn is_subcommand(command: &clap::Command, name: &str) -> bool {
+    name == "help"
+        || command
+            .get_subcommands()
+            .any(|s| s.get_name() == name || s.get_all_aliases().any(|a| a == name))
+}
+
+/// Parses `args` with `command`, from [`command`]: its review command, if
+/// any, comes out as [`Command::Review`].
+pub(crate) fn parse(command: clap::Command, args: &[OsString]) -> Result<Cli, clap::Error> {
+    let mut matches = command.try_get_matches_from(args)?;
+    let review = match matches.subcommand_name() {
+        Some(name) if !is_builtin(name) => matches
+            .remove_subcommand()
+            .map(|(_, sub)| sub.get_one::<String>("id").cloned()),
+        _ => None,
+    };
+    let mut cli = Cli::from_arg_matches(&matches)?;
+    if let Some(id) = review {
+        cli.command = Some(Command::Review { id });
+    }
+    Ok(cli)
+}
+
+/// `--review` and `--no-cache`, read before parsing: whether there's a
+/// review command to parse depends on them. A `--review` name that isn't
+/// a plugin name is left for clap to refuse.
+pub(crate) fn early_flags(args: &[OsString]) -> (Option<String>, bool) {
+    let (mut review, mut no_cache) = (None, false);
+    let mut iter = args.iter().skip(1).filter_map(|a| a.to_str());
+    while let Some(arg) = iter.next() {
+        match arg {
+            "--" => break,
+            "--no-cache" => no_cache = true,
+            "--review" => review = iter.next().map(str::to_owned),
+            _ => {
+                if let Some(name) = arg.strip_prefix("--review=") {
+                    review = Some(name.to_owned());
+                }
+            }
+        }
+    }
+    (
+        review.filter(|name| crate::plugin::check_name(name).is_ok()),
+        no_cache,
+    )
+}
+
+/// Inserts `diff` before the first argument that is neither a global option
+/// nor one of `command`'s subcommands, so `dffy -C repo main..HEAD --stat`
+/// parses as `dffy -C repo diff main..HEAD --stat`. clap's own way to have
+/// arguments without a subcommand turns global options off for the
+/// subcommands.
+pub(crate) fn with_default_subcommand(
+    command: &clap::Command,
+    mut args: Vec<OsString>,
+) -> Vec<OsString> {
+    let is_subcommand = |name: &str| is_subcommand(command, name);
     let mut i = 1;
     while i < args.len() {
         let arg = args[i].to_str().unwrap_or_default();
@@ -91,8 +178,8 @@ pub(crate) struct Global {
     /// repository's git directory
     #[arg(long, value_name = "file", global = true)]
     pub comments: Option<PathBuf>,
-    /// Review plugin dffy pr runs, dffy-review-<name>, over the config's
-    /// review for this run
+    /// Review plugin, dffy-review-<name>, over the config's review for this
+    /// run
     #[arg(long, value_name = "name", global = true, value_parser = review_name)]
     pub review: Option<String>,
     /// Neither read nor write the disk cache, for debugging
@@ -123,19 +210,10 @@ pub(crate) enum Command {
         #[command(subcommand)]
         action: Option<CommentsAction>,
     },
-    /// Review a pull request in the viewer, through the review plugin
-    #[command(
-        long_about = "Review a pull request in the viewer, through the review \
-        plugin (review = <name> in the config, or --review <name>).\n\n\
-        With a number, it opens that PR: its diff from base to head, with its review \
-        threads, as soon as the head is in the clone. Without one, it opens the \
-        current branch's PR, or lists the PRs to pick from. Experimental; see \
-        docs/plugins.md."
-    )]
-    Pr {
-        /// The pull request's number
-        number: Option<u64>,
-    },
+    /// The review plugin's command, which [`command`] adds and [`parse`]
+    /// reads.
+    #[command(skip)]
+    Review { id: Option<String> },
     /// Print the effective configuration
     Config {
         /// Print every key with its documentation and default value instead
@@ -394,15 +472,92 @@ fn styles() -> Styles {
 
 #[cfg(test)]
 mod tests {
-    use clap::Parser;
-
     use super::*;
 
     fn parse(args: &[&str]) -> Cli {
+        parse_with(None, args).unwrap_or_else(|e| panic!("{args:?}: {e}"))
+    }
+
+    fn parse_with(review: Option<&Naming>, args: &[&str]) -> Result<Cli, clap::Error> {
         let mut full = vec![OsString::from("dffy")];
         full.extend(args.iter().map(OsString::from));
-        Cli::try_parse_from(with_default_subcommand(full))
-            .unwrap_or_else(|e| panic!("{args:?}: {e}"))
+        let command = command(review);
+        super::parse(command.clone(), &with_default_subcommand(&command, full))
+    }
+
+    fn merge_request() -> Naming {
+        Naming::decode(
+            br#"{"version":1,"command":"mr","noun":"merge request","nouns":"merge requests"}"#,
+        )
+        .expect("a describe answer")
+    }
+
+    /// With a review plugin that describes `mr`, `mr` is a subcommand that
+    /// takes an optional id, whatever the plugin's ids look like, and the
+    /// global options, and `pr` a revision; without one, neither is a
+    /// subcommand.
+    #[test]
+    fn the_review_command_is_a_subcommand_only_when_described() {
+        let mr = merge_request();
+        command(Some(&mr)).debug_assert();
+        let review = |args: &[&str]| match parse_with(Some(&mr), args) {
+            Ok(Cli {
+                command: Some(Command::Review { id }),
+                global,
+            }) => (id, global),
+            other => panic!("{args:?}: {other:?}"),
+        };
+        assert_eq!(review(&["mr", "7"]).0.as_deref(), Some("7"));
+        assert_eq!(review(&["mr", "I8f2c"]).0.as_deref(), Some("I8f2c"));
+        assert_eq!(review(&["mr"]).0, None);
+        let (id, global) = review(&["-C", "repo", "mr", "7", "--color=never"]);
+        assert_eq!(id.as_deref(), Some("7"));
+        assert_eq!(global.dir, Some(PathBuf::from("repo")));
+        assert_eq!(global.color, Some(ColorWhen::Never));
+        let revision = |review: Option<&Naming>, args: &[&str]| {
+            diff_args(parse_with(review, args).unwrap_or_else(|e| panic!("{args:?}: {e}"))).revs
+        };
+        assert_eq!(revision(Some(&mr), &["pr", "7"]), ["pr", "7"]);
+        assert_eq!(revision(None, &["pr", "7"]), ["pr", "7"]);
+        assert_eq!(revision(None, &["mr"]), ["mr"]);
+        assert_eq!(revision(Some(&mr), &["diff", "mr"]), ["mr"]);
+
+        let help = |review| command(review).render_long_help().to_string();
+        let described = help(Some(&mr));
+        assert!(
+            described.contains("mr           Review a merge request in the viewer"),
+            "{described}"
+        );
+        assert!(!help(None).contains("Review a"), "{}", help(None));
+    }
+
+    #[test]
+    fn a_review_command_cant_be_a_builtin_subcommand_or_alias() {
+        for name in ["diff", "show", "config", "doctor", "mcp", "man", "help"] {
+            assert!(is_builtin(name), "{name}");
+        }
+        assert!(!is_builtin("mr"));
+        assert!(!is_builtin("pr"));
+    }
+
+    #[test]
+    fn early_flags_are_read_before_parsing() {
+        let early = |args: &[&str]| {
+            let mut full = vec![OsString::from("dffy")];
+            full.extend(args.iter().map(OsString::from));
+            early_flags(&full)
+        };
+        assert_eq!(
+            early(&["--review", "gitlab", "mr"]),
+            (Some("gitlab".to_owned()), false)
+        );
+        assert_eq!(
+            early(&["mr", "--review=gitlab"]),
+            (Some("gitlab".to_owned()), false)
+        );
+        assert_eq!(early(&["--no-cache", "mr"]), (None, true));
+        assert_eq!(early(&["--review", "../evil", "mr"]), (None, false));
+        assert_eq!(early(&["--", "--review", "gitlab"]), (None, false));
     }
 
     fn diff_args(cli: Cli) -> DiffArgs {
@@ -454,12 +609,7 @@ mod tests {
             &["--all", "--merge-base"],
             &["--all", "--color-only"],
         ] {
-            let mut full = vec![OsString::from("dffy")];
-            full.extend(args.iter().map(OsString::from));
-            assert!(
-                Cli::try_parse_from(with_default_subcommand(full)).is_err(),
-                "{args:?}"
-            );
+            assert!(parse_with(None, args).is_err(), "{args:?}");
         }
     }
 
@@ -497,8 +647,7 @@ mod tests {
         let cli = parse(&["--review", "github", "--comments", "pr.json", "a...b"]);
         assert_eq!(cli.global.review.as_deref(), Some("github"));
         assert_eq!(diff_args(cli).revs, ["a...b"]);
-        let full = ["dffy", "--review", "../evil", "HEAD"].map(OsString::from);
-        assert!(Cli::try_parse_from(with_default_subcommand(full.to_vec())).is_err());
+        assert!(parse_with(None, &["--review", "../evil", "HEAD"]).is_err());
     }
 
     #[test]
@@ -530,9 +679,6 @@ mod tests {
 
     #[test]
     fn summary_flags_are_exclusive() {
-        let args = ["dffy", "--stat", "--name-only"]
-            .map(OsString::from)
-            .to_vec();
-        assert!(Cli::try_parse_from(with_default_subcommand(args)).is_err());
+        assert!(parse_with(None, &["--stat", "--name-only"]).is_err());
     }
 }

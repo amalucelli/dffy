@@ -29,7 +29,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::{Arc, LazyLock, Mutex, PoisonError};
 
-use clap::{ColorChoice, CommandFactory, FromArgMatches};
+use clap::{ColorChoice, CommandFactory};
 use dffy_core::cache::Cache;
 use dffy_core::git;
 use dffy_core::highlight::Registry;
@@ -149,6 +149,9 @@ pub(crate) struct Ctx {
     pub color_err: bool,
     /// `None` when the cache is off or there's nowhere to put it.
     pub cache: Option<Cache>,
+    /// The review plugin set, described: `None` without one, `Err` with
+    /// why it adds no command.
+    pub review: Option<Result<plugin::review::Described, String>>,
     /// `--comments`, resolved; the viewer defaults to the repository's.
     pub comments: Option<PathBuf>,
 }
@@ -166,6 +169,11 @@ impl Ctx {
 
     fn err_theme(&self) -> Option<&Theme> {
         self.color_err.then_some(&self.theme)
+    }
+
+    /// The review plugin, when it describes its command.
+    pub(crate) fn described(&self) -> Option<&plugin::review::Described> {
+        self.review.as_ref()?.as_ref().ok()
     }
 
     /// The diff layout for this terminal. Off a terminal, unified lines are
@@ -275,15 +283,29 @@ pub fn main() -> ExitCode {
     if raw.nth(1).is_some_and(|a| a == plugin::review::DETACH) {
         return plugin::review::exec_detached(raw);
     }
-    let args = cli::with_default_subcommand(std::env::args_os().collect());
-    let mut command = Cli::command();
+    let raw: Vec<std::ffi::OsString> = std::env::args_os().collect();
+    // Read before parsing: the review plugin they name adds a subcommand.
+    let loaded = config::load();
+    let (review_flag, no_cache) = cli::early_flags(&raw);
+    let cache = (loaded.config.cache && !no_cache)
+        .then(Cache::default_dir)
+        .flatten()
+        .map(|dir| Cache::new(dir, loaded.config.cache_size));
+    let review = review_flag
+        .or_else(|| loaded.config.review.clone())
+        .map(|name| {
+            let program = plugin::find(plugin::REVIEW_PREFIX, &name)
+                .ok_or_else(|| format!("{}{name} isn't on PATH", plugin::REVIEW_PREFIX))?;
+            let naming = plugin::review::describe(&program, cache.as_ref(), cli::is_builtin)?;
+            Ok(plugin::review::Described { program, naming })
+        });
+    let described = review.as_ref().and_then(|r| r.as_ref().ok());
+    let mut command = cli::command(described.map(|d| &d.naming));
+    let args = cli::with_default_subcommand(&command, raw);
     if let Some(choice) = color_flag(&args) {
         command = command.color(choice);
     }
-    let cli = match command
-        .try_get_matches_from(&args)
-        .and_then(|m| Cli::from_arg_matches(&m))
-    {
+    let cli = match cli::parse(command, &args) {
         Ok(cli) => cli,
         Err(e) => {
             e.print().ok();
@@ -295,7 +317,6 @@ pub fn main() -> ExitCode {
         }
     };
 
-    let loaded = config::load();
     let mut config = loaded.config;
     let mut sources = loaded.sources;
     let mut warnings = loaded.warnings;
@@ -314,15 +335,11 @@ pub fn main() -> ExitCode {
     let color_only = matches!(&cli.command, Some(Command::Diff(d)) if d.color_only);
     let color_out = output::use_color(config.color, term.stdout_tty || color_only);
     let theme = load_theme(&config, color_out, &mut warnings);
-    let cache = config
-        .cache
-        .then(Cache::default_dir)
-        .flatten()
-        .map(|dir| Cache::new(dir, config.cache_size));
     let ctx = Ctx {
         color_out,
         color_err: output::use_color(config.color, term.stderr_tty),
         cache,
+        review,
         context_lines: config.context.hunk_lines(true),
         config,
         sources,
@@ -636,7 +653,7 @@ fn run(cli: Cli, ctx: &Ctx) -> Result<ExitCode, Error> {
             Ok(ExitCode::SUCCESS)
         }
         Some(Command::Doctor { json }) => doctor(ctx, dir, json),
-        Some(Command::Pr { number }) => pr(dir, number, ctx),
+        Some(Command::Review { id }) => review_command(dir, id, ctx),
         Some(Command::Daemon { action }) => {
             let mut c = Canvas::default();
             match action {
@@ -663,7 +680,8 @@ fn run(cli: Cli, ctx: &Ctx) -> Result<ExitCode, Error> {
         }
         Some(Command::Completions { shell }) => {
             let mut buf = Vec::new();
-            clap_complete::generate(shell, &mut Cli::command(), "dffy", &mut buf);
+            let mut command = cli::command(ctx.described().map(|d| &d.naming));
+            clap_complete::generate(shell, &mut command, "dffy", &mut buf);
             io::stdout().lock().write_all(&buf)?;
             Ok(ExitCode::SUCCESS)
         }
@@ -748,7 +766,7 @@ fn diff(dir: Option<&Path>, args: &DiffArgs, ctx: &Ctx) -> Result<ExitCode, Erro
         let plan = print::prepare(dir, &target, &c.paths, print::Summary::Diff, c.view.reverse)?;
         let focus = c.focus.as_deref().map(|f| plan.relative(f)).transpose()?;
         let description = describe(&revisions, c.view.reverse);
-        let detect = detect_pr(args, &plan, ctx);
+        let detect = detect_review(args, &plan, ctx);
         return tui::run(
             &tty,
             plan,
@@ -765,11 +783,15 @@ fn diff(dir: Option<&Path>, args: &DiffArgs, ctx: &Ctx) -> Result<ExitCode, Erro
     run_print(dir, &target, &args.common, args.exit_code, ctx)
 }
 
-/// `dffy pr`: the viewer on PR `number`, or the current branch's, or the
-/// picker of PRs on the diff `dffy` shows. It opens once the plugin's
-/// `prepare` names the PR's commits, and the plugin goes on downloading
-/// threads behind it.
-fn pr(dir: Option<&Path>, number: Option<u64>, ctx: &Ctx) -> Result<ExitCode, Error> {
+/// The review plugin's command (`dffy pr`): the viewer on review `id`, or
+/// the current branch's, or the picker of reviews on the diff `dffy`
+/// shows. It opens once the plugin's `prepare` names the review's commits,
+/// and the plugin goes on downloading threads behind it.
+fn review_command(dir: Option<&Path>, id: Option<String>, ctx: &Ctx) -> Result<ExitCode, Error> {
+    // Only a described plugin adds the command that runs this.
+    let Some(described) = ctx.described() else {
+        return Err(Error::fatal("no review plugin describes this command"));
+    };
     // The plugin runs in a session of its own, which the terminal's Ctrl-C
     // doesn't reach: until the viewer handles signals, they kill it here.
     let phase = Arc::new(Mutex::new(Phase::Waiting));
@@ -782,7 +804,7 @@ fn pr(dir: Option<&Path>, number: Option<u64>, ctx: &Ctx) -> Result<ExitCode, Er
         }
         *phase == Phase::Waiting
     })?;
-    let result = open_pr(dir, number, ctx, &phase);
+    let result = open_review(dir, id, described, ctx, &phase);
     // A `prepare` started before an error is stopped too, not only one the
     // viewer ran.
     plugin::stop_all();
@@ -800,25 +822,30 @@ enum Phase {
     Viewing,
 }
 
-fn open_pr(
+fn open_review(
     dir: Option<&Path>,
-    number: Option<u64>,
+    id: Option<String>,
+    plugin::review::Described { program, naming }: &plugin::review::Described,
     ctx: &Ctx,
     phase: &Mutex<Phase>,
 ) -> Result<ExitCode, Error> {
     use plugin::review::{self, Reason, Said};
-    let (name, program) = review_plugin(ctx)?;
+    let plugin = program.name.clone();
+    let terminal = format!(
+        "dffy {} opens the viewer, which needs a terminal",
+        naming.command
+    );
     let tty = ctx
         .term
         .stdout_tty
         .then(term::Tty::open)
         .and_then(Result::ok)
-        .ok_or_else(|| Error::fatal("dffy pr opens the viewer, which needs a terminal"))?;
+        .ok_or_else(|| Error::fatal(terminal))?;
     let cwd = std::env::current_dir()
         .map_err(|e| Error::fatal(format!("can't read the current directory: {e}")))?;
     let repo = git::Repo::discover(&dir.map_or_else(|| cwd.clone(), |dir| cwd.join(dir)))?;
     let root = repo.workdir().ok_or(git::Error::NoWorktree)?;
-    let program_name = format!("{}{name}", plugin::REVIEW_PREFIX);
+    let program_name = format!("{}{plugin}", plugin::REVIEW_PREFIX);
     let start = |args: &[String]| -> Result<_, Error> {
         let (tx, rx) = std::sync::mpsc::channel();
         let command = review::command(&program.path, args, root, None)?;
@@ -854,33 +881,33 @@ fn open_pr(
             viewer,
         )
     };
-    let number = if let Some(number) = number {
-        number
+    let (label, id) = if let Some(id) = id {
+        (naming.label(&id), id)
     } else {
-        say("listing pull requests…");
+        say(&format!("listing {}…", naming.nouns));
         let (_, rx) = start(&["list".to_owned()])?;
-        let prs = first_said(&rx, |said| match said {
-            Said::Prs(prs) => Some(prs),
+        let reviews = first_said(&rx, |said| match said {
+            Said::Listed(reviews) => Some(reviews),
             _ => None,
         });
         say("");
-        let prs = prs.map_err(|e| {
+        let reviews = reviews.map_err(|e| {
             Error::fatal(e.unwrap_or_else(|| format!("{program_name} listed nothing")))
         })?;
-        if let Some(pr) = prs.iter().find(|p| p.reason == Reason::CurrentBranch) {
-            pr.number
+        if let Some(found) = reviews.iter().find(|p| p.reason == Reason::CurrentBranch) {
+            (naming.label(found.shown()), found.id.clone())
         } else {
             let revisions = git::Revisions {
                 unstaged: ctx.config.default_diff == DefaultDiff::Unstaged,
                 ..git::Revisions::default()
             };
             let description = describe(&revisions, false);
-            let pick = tui::PrStart::Pick { plugin: name, prs };
+            let pick = tui::ReviewStart::Pick { plugin, reviews };
             return viewer(revisions, description, pick, &ctx.viewer());
         }
     };
-    say(&format!("fetching #{number}…"));
-    let (run, rx) = start(&["prepare".to_owned(), number.to_string()])?;
+    say(&format!("fetching {label}…"));
+    let (run, rx) = start(&["prepare".to_owned(), id])?;
     let session = first_said(&rx, |said| match said {
         Said::Session(session) => Some(session),
         _ => None,
@@ -888,7 +915,7 @@ fn open_pr(
     say("");
     let session = session.map_err(|e| {
         let e = e.unwrap_or_else(|| format!("{program_name} prepare named no commits"));
-        Error::fatal(format!("PR #{number}: {e}"))
+        Error::fatal(format!("{label}: {e}"))
     })?;
     let revisions = git::Revisions {
         revs: vec![format!("{}...{}", session.base, session.head)],
@@ -896,18 +923,19 @@ fn open_pr(
     };
     let mut ctx = ctx.viewer();
     ctx.comments = Some(session.comments.clone());
-    let open = tui::PrStart::Open {
-        plugin: name,
+    let open = tui::ReviewStart::Open {
+        plugin,
         session,
         run,
         rest: rx,
     };
-    viewer(revisions, format!("PR #{number}"), open, &ctx)
+    viewer(revisions, label, open, &ctx)
 }
 
 /// Plain `dffy` (no revisions or paths) on a branch, with a review plugin
-/// set: the viewer asks the plugin for the branch's PR as it starts.
-fn detect_pr(args: &DiffArgs, plan: &print::Plan, ctx: &Ctx) -> Option<tui::PrStart> {
+/// that describes itself: the viewer asks the plugin for the branch's
+/// review as it starts.
+fn detect_review(args: &DiffArgs, plan: &print::Plan, ctx: &Ctx) -> Option<tui::ReviewStart> {
     let unnamed = args.revs.is_empty()
         && !(args.staged || args.unstaged || args.merge_base || args.common.view.reverse)
         && args.common.paths.is_empty();
@@ -918,29 +946,12 @@ fn detect_pr(args: &DiffArgs, plan: &print::Plan, ctx: &Ctx) -> Option<tui::PrSt
             .is_some_and(|head| head.starts_with(b"ref: refs/heads/"))
     };
     let plugin = ctx
-        .config
-        .review
-        .clone()
-        .filter(|_| unnamed && on_branch())?;
-    Some(tui::PrStart::Detect { plugin })
-}
-
-/// The review plugin set, and its program.
-fn review_plugin(ctx: &Ctx) -> Result<(String, plugin::Program), Error> {
-    let Some(name) = ctx.config.review.clone() else {
-        return Err(Error::Fatal {
-            message: "dffy pr needs a review plugin, and none is set".into(),
-            hint: Some(
-                "set review = <name> in the config, or pass --review <name>; see docs/plugins.md"
-                    .into(),
-            ),
-        });
-    };
-    let program = plugin::find(plugin::REVIEW_PREFIX, &name).ok_or_else(|| Error::Fatal {
-        message: format!("{}{name} isn't on PATH", plugin::REVIEW_PREFIX),
-        hint: Some("docs/install.md says how to install it".into()),
-    })?;
-    Ok((name, program))
+        .described()
+        .filter(|_| unnamed && on_branch())?
+        .program
+        .name
+        .clone();
+    Some(tui::ReviewStart::Detect { plugin })
 }
 
 /// The first line on `said` that `pick` takes; `Err` with the run's
@@ -1293,9 +1304,9 @@ mod tests {
 
     #[test]
     fn a_whitespace_flag_beats_the_other_remembered_whitespace_key() {
-        let args = cli::with_default_subcommand(vec!["dffy".into(), "-b".into()]);
-        let matches = Cli::command().try_get_matches_from(args).expect("parses");
-        let cli = Cli::from_arg_matches(&matches).expect("arguments");
+        let command = cli::command(None);
+        let args = cli::with_default_subcommand(&command, vec!["dffy".into(), "-b".into()]);
+        let cli = cli::parse(command, &args).expect("parses");
         let mut config = Config::default();
         let mut sources = config::Sources::default();
         for key in apply_flags(&mut config, &cli) {
@@ -1314,11 +1325,12 @@ mod tests {
             &["dffy", "--review", "flag", "HEAD"][..],
             &["dffy", "--review=flag", "doctor"],
         ] {
+            let command = cli::command(None);
             let args = cli::with_default_subcommand(
+                &command,
                 args.iter().map(|a| std::ffi::OsString::from(*a)).collect(),
             );
-            let matches = Cli::command().try_get_matches_from(args).expect("parses");
-            let cli = Cli::from_arg_matches(&matches).expect("arguments");
+            let cli = cli::parse(command, &args).expect("parses");
             let mut config = Config::default();
             let mut sources = config::Sources::default();
             for key in config.apply_source("review = configured\n", &mut Vec::new()) {

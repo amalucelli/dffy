@@ -475,6 +475,20 @@ pub(super) fn frame(
     title: &str,
     theme: &Theme,
 ) {
+    border(grid, (x0, y0, width, height), theme);
+    let end = x0 + width;
+    grid.put_str(x0 + 2, y0, end - 1, title, theme.style(Role::FileHeader));
+    let close = end.saturating_sub(CLOSE.width() + 2);
+    grid.put_str(close, y0, end - 1, CLOSE, theme.style(Role::Dim));
+}
+
+/// A box over the screen at `x0`, `y0`, `width` by `height`: cleared, in a
+/// border.
+pub(super) fn border(
+    grid: &mut Grid,
+    (x0, y0, width, height): (usize, usize, usize, usize),
+    theme: &Theme,
+) {
     let end = x0 + width;
     let border = theme.style(Role::Dim);
     for y in y0..y0 + height {
@@ -493,9 +507,6 @@ pub(super) fn frame(
         }
         grid.put_str(end - 1, y, end, right, border);
     }
-    grid.put_str(x0 + 2, y0, end - 1, title, theme.style(Role::FileHeader));
-    let close = end.saturating_sub(CLOSE.width() + 2);
-    grid.put_str(close, y0, end - 1, CLOSE, border);
 }
 
 /// A scrollbar down column `x` from row `top`, `rows` tall, for a list of

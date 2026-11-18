@@ -21,4 +21,4 @@ expression: screen(&mut app)
 │                          │ 47 47  │ line 47                                                      │
 │                          │ 48 48  │ line 48                                                      │
 │                          │ 49 49  │ line 49                                                      │
-└«─  working tree  ────────┴─ 1/2 · 1/2 hunk  esc saves · ctrl+e continues in $EDITOR ─────────────┘
+└«─  working tree  ────────┴─ 1/2 · 1/2 hunk  esc saves · ctrl+g continues in $EDITOR ─────────────┘

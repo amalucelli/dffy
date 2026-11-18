@@ -2,17 +2,27 @@
 
 **Experimental.** The file format and the operations may change.
 
-dffy keeps review comments in a JSON file: comments on lines of a diff, replies to them, and whether a thread is resolved. The viewer draws them, and integrations such as `dffy-review-github` keep the file in step with a code host.
+dffy keeps review comments in a JSON file: comments on lines of a diff, replies to them, and whether a thread is resolved. The viewer draws them, and integrations such as a [review plugin](plugins.md#review-plugins) keep the file in step with a code host.
 
-- dffy reads the file whenever it changes, so a comment written by another program shows up in a running viewer.
+- A running viewer reads the file again whenever another program writes it, so a comment written elsewhere shows up in it:
+  - It watches the file's directory with the OS's file watcher (FSEvents on macOS, inotify on Linux), so a write that renames a new file over the old one, as `dffy comments apply` does, counts. Nothing is polled while the file is unchanged; on Linux, when the inotify watch limit is reached, the file is checked once a second instead.
+  - It also reads the file when a review plugin it runs reports progress, hands over a review, or exits: plugins write as they go.
+  - A burst of writes is read once, and a file that stat says hasn't changed since the last read, as after the viewer's own writes, isn't read again.
 - Only dffy writes it: the viewer, and `dffy comments apply` for everyone else. An integration sends [operations](#writing-dffy-comments-apply) and dffy applies them under a lock, so two writers never lose each other's changes.
 - dffy never talks to the network. Posting comments to a host and pulling them back is the integration's job.
 
 ## Where the file is
 
-- `--comments <file>` picks the file, for every subcommand. An integration keeps one per pull request in its own storage and passes it when it starts dffy. A relative path is relative to the directory dffy runs in, which `-C` sets.
+- `--comments <file>` picks the file, for every subcommand. An integration keeps one per review in its own storage and passes it when it starts dffy. A relative path is relative to the directory dffy runs in, which `-C` sets.
 - Without it, the file is `dffy/comments.json` in the repository's git directory (`.git/dffy/comments.json`, or the worktree's own git directory in a linked worktree), for reviewing your own changes. Outside a repository there's no default, and `dffy comments` fails until `--comments` names a file.
-- A file that doesn't exist reads as no comments. The first write creates it, and its directory.
+- On a code host's review ([viewer.md](viewer.md#code-host-reviews)), the viewer shows the integration's file and, beside it, your drafts in the file plain `dffy` uses (your comments without a `ref`, with their replies) that place on the review's diff. Changes to those drafts go to their own file. Posting moves them into the integration's file first: each is added there as a new comment, with a new `id`, its replies after it, and removed from its own file once the other has it.
+
+### Drafts
+
+A **draft** is a comment of yours (an empty `author`) without a `ref`, in a review session's file, the one a review plugin keeps for a review; `P` posts it. Elsewhere nothing is posted, so the viewer shows no drafts there and doesn't count any.
+
+A comment without a `ref` whose `author` isn't empty, such as one an agent wrote, is never a draft: posting it would put it out under your name. In a review session it shows `not posted`, stays out of the counts and of what `P` sends, and a review plugin's `post` leaves it alone. You can still edit or delete it.
+- A file that doesn't exist reads as no comments. The first write creates it, and its directory. The viewer creates the directory when it starts, to watch it.
 - A diff piped to dffy has no comments.
 
 ## The file, version 1
@@ -44,15 +54,15 @@ A comment:
 | `start`, `end` | The first and last commented lines, each `{"old": <n>, "new": <n>}`: the line's number on each side, 1-based, or `null` on a side it isn't on, as a line in [json.md](json.md#lines). A context line has both numbers, an added line only `new`, a removed line only `old`. Left out for a comment on the whole file. |
 | `text` | The comment, as Markdown. |
 | `suggestion` | Optional replacement text for the commented lines, without a final newline. |
-| `author` | Who wrote it, a free string. Empty means you. |
+| `author` | Who wrote it, a free string. Empty means you; only your comments are [drafts](#drafts). |
 | `created` | When it was written, RFC 3339 (`2026-11-17T10:42:00Z`). dffy writes UTC; integrations give their host's timestamp. |
 | `in_reply_to` | For a reply, the `id` of its thread's first comment. |
 | `resolved` | Whether the thread is resolved. It's read from the thread's first comment. |
-| `ref` | Opaque, owned by an integration: the comment's identity on a host, such as `github:<node id>`. A comment with a `ref` has been posted. Each `ref` is on one comment at most. |
+| `ref` | Opaque, owned by an integration: the comment's identity on a host, such as dffy-review-github's `github:<node id>`. A comment with a `ref` has been posted. Each `ref` is on one comment at most. |
 | `anchor` | The text of the commented lines, with up to 2 lines of context on each side. See [Anchors](#anchors). |
-| `distance` | How many lines the commented lines are from the nearest change on their side, 0 when they include one. Hosts accept comments only within their hunks' context (3 lines on GitHub), so an integration compares it with that. Left out when it isn't known. See [Distance](#distance). |
+| `distance` | How many lines the commented lines are from the nearest change on their side, 0 when they include one, in the diff the comment was written on. A hint for hosts that accept a comment on lines only near a change, whose diff may not be that one. Left out when it isn't known. See [Distance](#distance). |
 | `url` | The comment on its host, set by an integration. `o` on a focused thread in the viewer opens it; only `http` and `https` links open. |
-| `outdated` | `true` when the host marks the thread outdated (its lines changed since). Read from the thread's first comment; left out when false. The viewer shows it, and warns that GitHub collapses such threads before you reply to one. |
+| `outdated` | `true` when the host marks the thread outdated (its lines changed since). Read from the thread's first comment; left out when false. The viewer shows it, and before you reply to one says the review plugin's warning about such threads, when it has one. |
 
 - `id`, `path`, `text`, `author`, `created` and `resolved` are always present. dffy leaves out the other fields when they don't apply; a reader treats a field that's `null` as left out.
 - **Kinds of comment:**
@@ -76,7 +86,7 @@ Line numbers alone go stale: a host moves a thread to a newer commit, and a loca
 
 1. **Exact:** the lines at `start` to `end` are the anchor's `lines`. The comment stays there.
 2. **Moved:** the anchor's `before`, `lines` and `after`, in a row, appear exactly once within 1000 lines of `start`. The comment goes to that copy of `lines`.
-3. **Unplaced:** otherwise. The viewer lists the comment apart from the diff, with its file.
+3. **Unplaced:** otherwise. The viewer shows the comment under its file's last row, headed with the lines `start` and `end` name on `side`, over the anchor's lines and context as they were; a commented line shows as unchanged when the comment numbers it on both sides. `i`'s list has it apart, with its file.
 
 A range whose first line is on the other side (`start_side` isn't `side`, as when it runs from removed lines to added ones) is anchored and placed by its lines on `side`: from `start`'s number on `side` when it has one, else `end` alone.
 
@@ -89,7 +99,7 @@ The viewer fills in anchors for the comments you make in it. An integration fill
 - A changed line on that side (added on `new`, removed on `old`) is as far as its number is from the nearest commented line, and 0 when it's one of them.
 - A change on the other side sits between two lines of this side. Both of those lines are 1 from it, as when lines were only removed and the comment is on the `new` side next to where they were.
 
-The viewer writes it when you add a comment, from the diff on screen. An integration posting a comment with a `distance` over its host's context posts it as a file comment instead, quoting the lines.
+The viewer writes it when you add a comment, from the diff on screen, which may be your uncommitted changes rather than the review's. So it's a hint, for hosts that accept a comment on lines only near a change: an integration that can diff what the host shows measures the lines against that instead, and uses `distance` only when it can't. What it does with a comment too far from a change is up to it; dffy-review-github posts it as a file comment, quoting the lines.
 
 ### Versions
 

@@ -194,6 +194,54 @@ pub(crate) fn read(path: &Path) -> Result<Review, String> {
 /// id each one touched (`None` for a notice). Waits while another writer
 /// holds the lock. Creates the file and its directory on first use.
 pub(crate) fn apply(path: &Path, ops: Vec<Op>) -> Result<Vec<Option<String>>, String> {
+    update(path, |comments| comments.apply(ops, SystemTime::now()))
+}
+
+/// Moves the threads whose first comments are `roots` from the file at
+/// `from` to the one at `to`, each comment added there as [`Op::Add`]
+/// adds one, with a new id, its replies after it; roots no longer in
+/// `from` are skipped. `from` loses them only once `to` holds them: when
+/// anything before writing `to` fails, neither file changes, and when
+/// writing `from` after fails, they're in both. Locks `from`, then `to`.
+/// Returns how many comments moved.
+pub(crate) fn move_threads(from: &Path, to: &Path, roots: &[String]) -> Result<usize, String> {
+    update(from, |source| {
+        let now = SystemTime::now();
+        let moving = |c: &Comment| roots.contains(c.in_reply_to.as_ref().unwrap_or(&c.id));
+        let moved: Vec<Comment> = source
+            .comments
+            .iter()
+            .filter(|c| moving(c))
+            .cloned()
+            .collect();
+        if moved.is_empty() {
+            return Ok(0);
+        }
+        update(to, |target| {
+            for root in moved.iter().filter(|c| c.in_reply_to.is_none()) {
+                let id = target.insert(root.clone(), None, now)?;
+                let reply_to = Target::Id(id);
+                for reply in moved
+                    .iter()
+                    .filter(|c| c.in_reply_to == Some(root.id.clone()))
+                {
+                    target.insert(reply.clone(), Some(&reply_to), now)?;
+                }
+            }
+            Ok(())
+        })?;
+        source.comments.retain(|c| !moving(c));
+        Ok(moved.len())
+    })
+}
+
+/// Reads the file under its lock, lets `change` change it, and writes it
+/// back unless `change` fails. Waits while another writer holds the lock.
+/// Creates the file and its directory on first use.
+fn update<T>(
+    path: &Path,
+    change: impl FnOnce(&mut Review) -> Result<T, String>,
+) -> Result<T, String> {
     let failed =
         |what: &str, at: &Path, e: io::Error| format!("can't {what} {}: {e}", at.display());
     if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
@@ -210,7 +258,7 @@ pub(crate) fn apply(path: &Path, ops: Vec<Op>) -> Result<Vec<Option<String>>, St
         .map_err(|e| failed("open", &lock_path, e))?;
     lock.lock().map_err(|e| failed("lock", &lock_path, e))?;
     let mut comments = read(path)?;
-    let ids = comments.apply(ops, SystemTime::now())?;
+    let out = change(&mut comments)?;
     // One fixed name is enough: only the lock's holder writes it.
     let tmp = sibling(path, ".tmp");
     let mut file = File::create(&tmp).map_err(|e| failed("create", &tmp, e))?;
@@ -219,7 +267,7 @@ pub(crate) fn apply(path: &Path, ops: Vec<Op>) -> Result<Vec<Option<String>>, St
         .map_err(|e| failed("write", &tmp, e))?;
     fs::rename(&tmp, path).map_err(|e| failed("replace", path, e))?;
     drop(lock);
-    Ok(ids)
+    Ok(out)
 }
 
 /// `dffy comments apply`: the operations' JSON in, the answer's out.

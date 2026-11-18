@@ -309,13 +309,15 @@ pub(crate) fn render(
     {
         return Ok(sides);
     }
-    let (answer, failed) = run(program, request.encode().into_bytes(), cancelled)?;
-    match (decode(&answer, lines), failed) {
+    let mut command = Command::new(&program.path);
+    command.process_group(0);
+    let (answer, status) = run(command, request.encode().into_bytes(), TIMEOUT, cancelled)?;
+    match (decode(&answer, lines), status.success()) {
         // The renderer's own message says more than how it exited.
         (Err(said @ Failure::Said(_)), _) => Err(said),
-        (Err(_) | Ok(_), Some(status)) => Err(Failure::Exited(status)),
-        (Err(failure), None) => Err(failure),
-        (Ok(sides), None) => {
+        (Err(_) | Ok(_), false) => Err(Failure::Exited(exited(status))),
+        (Err(failure), true) => Err(failure),
+        (Ok(sides), true) => {
             if let (Some(cache), Some(key)) = (cache, &key) {
                 cache.put(cache::Kind::Rendered, key, &answer);
             }
@@ -396,20 +398,23 @@ fn reap(child: &mut Child) -> std::io::Result<Option<ExitStatus>> {
     Ok(status)
 }
 
-/// Runs the renderer on `input` and returns what it printed, and how it
-/// exited when that wasn't a success.
+/// Runs `command`, a plugin, on `input` within `timeout`, and returns what
+/// it printed and how it exited. `command` puts the plugin in a process
+/// group of its own, which is killed with it: a renderer through
+/// `process_group`, a review plugin through `setsid`, which a process
+/// already leading a group can't call.
 fn run(
-    program: &Program,
+    mut command: Command,
     input: Vec<u8>,
+    timeout: Duration,
     cancelled: impl Fn() -> bool,
-) -> Result<(Vec<u8>, Option<String>), Failure> {
-    let deadline = Instant::now() + TIMEOUT;
-    let mut child = Command::new(&program.path)
+) -> Result<(Vec<u8>, ExitStatus), Failure> {
+    let deadline = Instant::now() + timeout;
+    let mut child = command
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         // Its messages would land on the viewer's screen.
         .stderr(Stdio::null())
-        .process_group(0)
         .spawn()
         .map_err(|e| Failure::Spawn(e.to_string()))?;
     {
@@ -495,11 +500,15 @@ fn run(
             "its exit status went missing".to_owned(),
         ));
     };
-    let failed = (!status.success()).then(|| match status.code() {
+    Ok((out, status))
+}
+
+/// How a plugin that failed exited, as words.
+fn exited(status: ExitStatus) -> String {
+    match status.code() {
         Some(code) => format!("exited with status {code}"),
         None => "was killed by a signal".to_owned(),
-    });
-    Ok((out, failed))
+    }
 }
 
 /// Reads an answer, checking it against the request, whose sides had

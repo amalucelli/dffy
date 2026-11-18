@@ -3,22 +3,22 @@ source: crates/dffy/src/tui/app.rs
 expression: screen(&mut app)
 ---
 ┌ Files · 12 +2 -2 ────────┬─ modified · src/some/deeply/nested/module/file.rs · +2 -2 ────────────┐
-│ ▼ src/                   │        │  ┆ On the whole file                                       ┆ ┃
-│   ▼ …eply/nested/module/ │        │  └┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┘ █
+│ ▼ src/                   │        │  │ On the whole file                                       │ ┃
+│   ▼ …eply/nested/module/ │        │  └─────────────────────────────────────────────────────────┘ █
 │     M …le.rs 5   +2   -2 │  1  1  │ line 1                                                       │
-│   M zz.rs                │  2  2◆ │ line 2                                                       │
-│   M zz0.rs               │        │  ┏ ▾ you · 2h ago · draft ┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┓ │
-│   M zz1.rs               │        │  ┇ Why two?                                                ┇ │
-│   M zz2.rs               │        │  ┇                                                         ┇ │
-│   M zz3.rs               │        │  ┇ you · 1h ago · draft                                    ┇ │
-│   M zz4.rs               │        │  ┇ Because.                                                ┇ │
-│   M zz5.rs               │        │  ┇                                                         ┇ │
-│   M zz6.rs               │        │  ┇ you · reply · esc saves · ctrl+e editor                 ┇ │
-│   M zz7.rs               │        │  ┇ Sure▏                                                   ┇ │
-│   M zz8.rs               │        │  ┗┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┛ │
+│   M zz.rs                │  2  2● │ line 2                                                       │
+│   M zz0.rs               │        │  ┏ ▾ you · 2h ago ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓ │
+│   M zz1.rs               │        │  ┃ Why two?                                                ┃ │
+│   M zz2.rs               │        │  ┃                                                         ┃ │
+│   M zz3.rs               │        │  ┃ you · 1h ago                                            ┃ │
+│   M zz4.rs               │        │  ┃ Because.                                                ┃ │
+│   M zz5.rs               │        │  ┃                                                         ┃ │
+│   M zz6.rs               │        │  ┃ you · reply · esc saves · ctrl+g editor                 ┃ │
+│   M zz7.rs               │        │  ┃ Sure▏                                                   ┃ │
+│   M zz8.rs               │        │  ┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛ │
 │   M zz9.rs   1           │  3  3  │ line 3                                                       │
 │                          │  4   ○-│ line 4                                                       ▐
-│                          │        │  ╶ ▸ you · 2h ago · resolved · Old four ───────────────────╴ │
+│                          │        │  │ ▸ you · 2h ago · resolved · Old four                    │ │
 │                          │     4 +│ line four                                                    │
 │                          │  5  5  │ line 5                                                       │
-└«─  working tree  ────────┴─ 1/12 · 1/2 hunk  thread reopened  6 threads · 5 drafts ──────────────┘
+└«─  working tree  ────────┴─ 1/12 · 1/2 hunk  thread reopened  6 threads ──────── space commands ─┘

@@ -7,6 +7,7 @@ use dffy_core::git::{FileChange, FileDiff, Mode, Side, Status};
 use super::*;
 use crate::config::Indicators;
 use crate::print;
+use crate::review;
 use crate::theme::Role;
 use crate::tui::textbox::TextBox;
 
@@ -763,8 +764,14 @@ fn backgrounds(grid: &Grid, rows: Range<usize>) -> String {
                 if current.is_some() {
                     out.push(']');
                 }
-                if let Some(crate::theme::Color::Rgb(r, g, b)) = bg {
-                    let _ = write!(out, "[{r:02x}{g:02x}{b:02x} ");
+                match bg {
+                    Some(crate::theme::Color::Rgb(r, g, b)) => {
+                        let _ = write!(out, "[{r:02x}{g:02x}{b:02x} ");
+                    }
+                    Some(crate::theme::Color::Ansi(n)) => {
+                        let _ = write!(out, "[ansi{n} ");
+                    }
+                    None => {}
                 }
                 current = bg;
             }
@@ -811,6 +818,8 @@ fn comment_marks_go_after_the_line_numbers_of_their_side() {
         url: None,
         notes: vec![note("x", "", "11:00", "Hm", true)],
         lines: Vec::new(),
+        snippet: None,
+        local: false,
     };
     let markers: Arc<[_]> = Arc::new([
         marker(document::Side::New, 1, Look::Draft),
@@ -823,9 +832,9 @@ fn comment_marks_go_after_the_line_numbers_of_their_side() {
     insta::assert_snapshot!(rows.join("\n"), @r#"
     @@ -1,5 +1,6 @@
     1○ │ fn main() {             │1  │ fn main() {
-       │  ╶ ▸ you · just now … ╴ │
+       │  │ ▸ you · just now … │ │
     2 -│     let total = count +…│2◆+│     let total = items.le…
-                                 │   │  ╶ ▸ you · just now ·… ╴
+                                 │   │  ┆ ▸ you · just now ·… ┆
     3  │     println!("{total}");│3  │     println!("{total}");
     "#);
 
@@ -842,10 +851,10 @@ fn comment_marks_go_after_the_line_numbers_of_their_side() {
     let tints: Vec<&str> = tints.lines().map(str::trim_end).collect();
     insta::assert_snapshot!(tints.join("\n"), @"
      1 1○│ fn main() {
-         │  ╶ ▸ you · just now · draft · Hm ──────────────────╴
+         │  │[ansi8  ▸ you · just now · draft · Hm                   ]│
     [2c385b  2   │][262d49      let total = ][603740 count][262d49  + 1;                           ]
     [2c385b    2◆│][262d49      let total = ][2d4d3d items.len()][262d49  + 1;                     ]
-         │  ╶ ▸ you · just now · draft · Hm ┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄╴
+         │  ┆[ansi8  ▸ you · just now · draft · Hm                   ]┆
     ");
 }
 
@@ -1194,7 +1203,11 @@ fn note(id: &str, author: &str, at: &str, text: &str, draft: bool) -> comments::
         created: format!("2026-11-17T{at}:00Z"),
         text: text.to_owned(),
         suggestion: None,
-        draft,
+        standing: if draft {
+            comments::Standing::Draft
+        } else {
+            comments::Standing::Posted
+        },
     }
 }
 
@@ -1212,6 +1225,8 @@ fn threads() -> Arc<[Thread]> {
         url: None,
         notes,
         lines: Vec::new(),
+        snippet: None,
+        local: false,
     };
     let mut asked = note(
         "n",
@@ -1255,7 +1270,7 @@ fn threads() -> Arc<[Thread]> {
             ..thread(
                 "l",
                 At::Lost,
-                Look::Posted,
+                Look::Open,
                 vec![
                     note("l", "ana", "08:00", "Moved away", false),
                     note("l2", "octocat", "08:30", "It did", false),
@@ -1314,6 +1329,156 @@ fn threads_hang_under_their_lines() {
     insta::assert_snapshot!("threads_narrow", all_rows(narrow).join("\n"));
 }
 
+/// Threads whose lines weren't found, with the code they were on: one by
+/// dffy on added new line 145, between its context, a tab and a line long
+/// enough to cut in it; one from a host on old lines 140–141, outdated,
+/// with no context after.
+fn lost() -> Arc<[Thread]> {
+    let lines = |l: &[&str]| l.iter().map(|&s| s.to_owned()).collect::<Vec<_>>();
+    let thread = |root: &str, comment: review::Comment, text: &str| Thread {
+        root: root.to_owned(),
+        at: At::Lost,
+        look: Look::Open,
+        resolved: false,
+        outdated: comment.side == review::Side::Old,
+        url: None,
+        notes: vec![note(root, "ana", "09:00", text, false)],
+        lines: Vec::new(),
+        snippet: comments::snippet(&comment, true),
+        local: false,
+    };
+    let added = review::Comment {
+        path: "src/main.rs".to_owned(),
+        start: Some(review::LineNumbers {
+            old: None,
+            new: Some(144),
+        }),
+        end: Some(review::LineNumbers {
+            old: None,
+            new: Some(144),
+        }),
+        anchor: Some(review::Anchor {
+            before: lines(&["let request = Request {", "\turl,"]),
+            lines: lines(&[
+                "    headers: vec![(\"accept\", \"application/json\"), (\"x-trace\", id)],",
+            ]),
+            after: lines(&["    retries: 3,", "};"]),
+        }),
+        ..review::Comment::default()
+    };
+    let removed = review::Comment {
+        path: "src/main.rs".to_owned(),
+        side: review::Side::Old,
+        start: Some(review::LineNumbers {
+            old: Some(139),
+            new: None,
+        }),
+        end: Some(review::LineNumbers {
+            old: Some(140),
+            new: None,
+        }),
+        anchor: Some(review::Anchor {
+            before: lines(&["fn count(items: &[u8]) -> usize {"]),
+            lines: lines(&["    let n = items.len();", "    n"]),
+            after: Vec::new(),
+        }),
+        ..review::Comment::default()
+    };
+    vec![
+        thread("a", added, "Accept anything here?"),
+        thread("b", removed, "Why inline it?"),
+    ]
+    .into()
+}
+
+/// A thread whose lines weren't found shows the line it was on in its
+/// heading, folded too, and the code at the top of its box: the commented
+/// lines with their numbers and the side's sign, their context dimmed
+/// around them, each line cut to the box like a suggestion's.
+#[test]
+fn lost_threads_show_the_code_they_were_on() {
+    let rows = |width: usize| {
+        let mut doc = doc(
+            Layout {
+                width: Some(width),
+                ..layout(false, false)
+            },
+            200,
+        );
+        doc.now = NOW;
+        doc.set_threads(0, lost());
+        let folded = tall_rows(&mut doc);
+        doc.fold.toggle("b");
+        doc.refit();
+        let rows = tall_rows(&mut doc);
+        let from = rows
+            .iter()
+            .position(|r| r.contains("▾ ana"))
+            .expect("a box");
+        (folded, rows[from..].join("\n"))
+    };
+    let (folded, unified) = rows(60);
+    insta::assert_snapshot!("lost_snippets", unified);
+    insta::assert_snapshot!("lost_snippets_narrow", rows(34).1);
+    let card = folded
+        .iter()
+        .find(|r| r.contains("▸ ana"))
+        .expect("a folded row");
+    assert!(card.contains("outdated · old lines 140–141"), "{card}");
+}
+
+/// Every row's height is the screen rows it draws, its threads' boxes
+/// with their code included, at any width and wrapped or not.
+#[test]
+fn heights_count_the_rows_of_snippets() {
+    for (width, wrap) in [(60, false), (34, false), (60, true)] {
+        let layout = Layout {
+            width: Some(width),
+            ..layout(false, wrap)
+        };
+        let mut doc = doc(layout, 200);
+        doc.set_threads(0, lost());
+        doc.fold.toggle("b");
+        doc.scroll(-1000);
+        let mut pos = Pos {
+            offset: 0,
+            ..doc.document.pos
+        };
+        let layout = doc.file_layout(0);
+        loop {
+            let mut c = Canvas::default();
+            doc.render(pos, &layout, &mut c);
+            assert_eq!(c.len(), doc.height(pos, &layout), "{pos:?} at {width}");
+            if !doc.next_row(&mut pos, &layout) {
+                break;
+            }
+        }
+    }
+}
+
+/// A snippet is highlighted once, when its thread is placed: drawing and
+/// scrolling through it don't parse its code again.
+#[test]
+fn snippets_are_highlighted_once() {
+    let before = comments::painted_count();
+    let threads = lost();
+    assert_eq!(comments::painted_count(), before + 2);
+    let code = &threads[0].snippet.as_ref().expect("a snippet").rows[2];
+    assert!(
+        code.pieces.iter().any(|(ink, _)| ink.syntax.is_some()),
+        "{code:?}"
+    );
+    let theme = Theme::default_theme();
+    let mut doc = doc(layout(false, false), 6);
+    doc.set_threads(0, threads);
+    doc.fold.toggle("b");
+    for _ in 0..40 {
+        grid_rows(&mut doc, &theme);
+        doc.scroll(1);
+    }
+    assert_eq!(comments::painted_count(), before + 2);
+}
+
 /// A posted thread on new line 2 with two replies, then another on the
 /// same line.
 fn conversation() -> Arc<[Thread]> {
@@ -1323,12 +1488,14 @@ fn conversation() -> Arc<[Thread]> {
             side: document::Side::New,
             lines: 1..2,
         },
-        look: Look::Posted,
+        look: Look::Open,
         resolved: false,
         outdated: false,
         url: None,
         notes,
         lines: Vec::new(),
+        snippet: None,
+        local: false,
     };
     vec![
         on_line_2(
@@ -1504,7 +1671,7 @@ fn folded_threads_take_one_row() {
         .iter()
         .find(|r| r.contains("▸ octocat"))
         .expect("a folded row");
-    insta::assert_snapshot!(summary, @"     │  ╶ ▸ octocat · 2h ago · outdated · Why l…  1 reply ╴");
+    insta::assert_snapshot!(summary, @"     │  ┆ ▸ octocat · 2h ago · outdated · Why l…  1 reply ┆");
     assert_eq!(
         folded.iter().filter(|r| !r.is_empty()).count() + 9,
         full.iter().filter(|r| !r.is_empty()).count()
@@ -1543,7 +1710,7 @@ fn folds_outlive_reloads_of_the_comments_file() {
         .map(|t| Thread {
             resolved: false,
             outdated: false,
-            look: t.look.max(Look::Posted),
+            look: t.look.max(Look::Open),
             ..t.clone()
         })
         .collect();
@@ -1604,7 +1771,133 @@ fn a_focused_threads_border_is_heavy() {
     assert_eq!(grid.row(at)[8].style(), theme.style(Role::Warn));
     doc.set_focus(Some("l".to_owned()));
     let rows = grid_rows(&mut doc, &theme).1;
-    assert!(rows.iter().any(|r| r.contains("╺ ▸ ana")), "{rows:#?}");
+    assert!(rows.iter().any(|r| r.contains("┃ ▸ ana")), "{rows:#?}");
+}
+
+/// A folded thread is one row drawn as a closed card: the open box's sides
+/// at its columns, dashed for a draft, heavy while it has the focus, its
+/// text cut to fit and the reply count at its right end while there's
+/// room for it.
+#[test]
+fn a_folded_thread_is_a_card_of_one_row() {
+    let cards = |layout: Layout, focus: Option<&str>| {
+        let mut doc = commented(layout, 200);
+        doc.fold.toggle_all();
+        doc.refit();
+        doc.set_focus(focus.map(str::to_owned));
+        let rows = tall_rows(&mut doc);
+        rows.into_iter()
+            .filter(|r| r.contains('▸'))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    insta::assert_snapshot!(cards(layout(false, false), None), @"
+    │  ┆ ▸ you · 1m ago · draft · on the file · On the … ┆
+    │  │ ▸ ana · 3h ago · resolved · Was count right?    │
+    │  ┆ ▸ octocat · 2h ago · outdated · Why l…  1 reply ┆
+    │  │ ▸ ana · 4h ago · outdated · lines not…  1 reply │
+    ");
+    insta::assert_snapshot!(cards(layout(false, false), Some("l")), @"
+    │  ┆ ▸ you · 1m ago · draft · on the file · On the … ┆
+    │  │ ▸ ana · 3h ago · resolved · Was count right?    │
+    │  ┆ ▸ octocat · 2h ago · outdated · Why l…  1 reply ┆
+    │  ┃ ▸ ana · 4h ago · outdated · lines not…  1 reply ┃
+    ");
+    insta::assert_snapshot!(cards(layout(false, false), Some("n")), @"
+    │  ┆ ▸ you · 1m ago · draft · on the file · On the … ┆
+    │  │ ▸ ana · 3h ago · resolved · Was count right?    │
+    │  ┇ ▸ octocat · 2h ago · outdated · Why l…  1 reply ┇
+    │  │ ▸ ana · 4h ago · outdated · lines not…  1 reply │
+    ");
+    insta::assert_snapshot!(cards(layout(true, false), None), @"
+    │  ┆ ▸ you · 1m ago · draft · on the file · On the wh… ┆
+    │  │ ▸ ana · 3h ago · … │ │
+                              │   │  ┆ ▸ octocat · 2h ago… ┆
+    │  │ ▸ ana · 4h ago · outdated · lines not f…  1 reply │
+    ");
+    let narrow = Layout {
+        width: Some(34),
+        ..layout(false, false)
+    };
+    insta::assert_snapshot!(cards(narrow, None), @"
+    │  ┆ ▸ you · 1m ago · dra… ┆
+    │  │ ▸ ana · 3h ago · res… │
+    │  ┆ ▸ octocat ·…  1 reply ┆
+    │  │ ▸ ana · 4h …  1 reply │
+    ");
+}
+
+/// Inside its sides a folded thread takes the inactive selection's
+/// background, the selection's while it has the focus, so it stands out
+/// from the code; code rows and open boxes keep none. A theme whose
+/// selection has no background (mono) tints nothing.
+#[test]
+fn a_folded_thread_is_tinted_inside_its_sides() {
+    let theme = Theme::parse(
+        "tinted",
+        "selection = on #404040\nselection-inactive = on #202020",
+        &mut Vec::new(),
+    );
+    let mut unified = commented(layout(false, false), 26);
+    unified.set_focus(Some("l".to_owned()));
+    let mut grid = Grid::new(60, 26);
+    unified.draw(&mut grid, None, (0, 60, 0), &theme, 1);
+    let tints = backgrounds(&grid, 0..26);
+    let tints: Vec<&str> = tints.lines().map(str::trim_end).collect();
+    insta::assert_snapshot!(tints.join("\n"), @r#"
+    @@ -1,5 +1,6 @@
+         │  ┌ ▾ you · 1m ago · draft · on the file ┄┄┄┄┄┄┄┄┄┄┄┐
+         │  ┆ On the whole file                               ┆
+         │  └┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┘
+    1 1  │ fn main() {
+    2  ○-│     let total = count + 1;
+         │  │[202020  ▸ ana · 3h ago · resolved · Was count right?    ]│
+      2◆+│     let total = items.len() + 1;
+         │  ┌ ▾ octocat · 2h ago · outdated ┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┐
+         │  ┆ Why len() here and not a running count, kept as ┆
+         │  ┆ the items arrive?                               ┆
+         │  ┆ suggested change:                               ┆
+         │  ┆ -     let total = items.len() + 1;              ┆
+         │  ┆ +     let total = items.len();                  ┆
+         │  ┆                                                 ┆
+         │  ┆ you · 30m ago · draft                           ┆
+         │  ┆ Simpler.                                        ┆
+         │  └┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┘
+    3 3  │     println!("{total}");
+      4 +│     eprintln!("done");
+    4 5  │ }
+    5   -│ // a comment long enough to wrap in a narrow split c…
+      6 +│ // a comment long enough to wrap in a narrow split c…
+         │\ No newline at end of file
+         │  ┃[404040  ▸ ana · 4h ago · outdated · lines not…  1 reply ]┃
+    "#);
+
+    // Split, in a pane right of the tree: a second card under the same
+    // line, past the blank row parting it from the first.
+    let mut split = doc(layout(true, false), 8);
+    split.now = NOW;
+    split.set_threads(0, conversation());
+    split.fold.toggle_all();
+    split.refit();
+    let mut grid = Grid::new(65, 8);
+    split.draw(&mut grid, None, (5, 65, 0), &theme, 1);
+    let tints = backgrounds(&grid, 2..6);
+    let tints: Vec<&str> = tints.lines().map(str::trim_end).collect();
+    insta::assert_snapshot!(tints.join("\n"), @"
+    2 -│     let total = count +…│2●+│     let total = items.le…
+                                 │   │  │[202020  ▸ ana · 3h ago · S… ]│
+                                 │   │
+                                 │   │  │[202020  ▸ octocat · 1h ago… ]│
+    ");
+
+    let mono = Theme::parse("m", "inherit = mono", &mut Vec::new());
+    let mut grid = Grid::new(60, 26);
+    unified.draw(&mut grid, None, (0, 60, 0), &mono, 1);
+    assert!(
+        (0..26).all(|y| grid.row(y).iter().all(|c| c.style().bg.is_none())),
+        "{}",
+        backgrounds(&grid, 0..26)
+    );
 }
 
 /// The text box is drawn as a box too: a reply in its thread's box under a
@@ -1633,7 +1926,7 @@ fn the_text_box_is_boxed_where_the_thread_sits() {
     insta::assert_snapshot!(rows[at..at + 6].join("\n"), @"
          │  ┇ Simpler.                                        ┇
          │  ┇                                                 ┇
-         │  ┇ you · reply · esc saves · ctrl+e editor         ┇
+         │  ┇ you · reply · esc saves · ctrl+g editor         ┇
          │  ┇ Sure, and a reply long enough to wrap in its    ┇
          │  ┇ box▏                                            ┇
          │  ┗┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┛
@@ -1716,7 +2009,7 @@ fn threads_are_stepped_through_in_order() {
     while doc.step_thread(true) {
         let focused = doc.focused().expect("focused").root.clone();
         let shown = screen(&mut doc);
-        assert!(shown.contains(['┏', '╺']), "{focused} on screen:\n{shown}");
+        assert!(shown.contains(['┏', '┃']), "{focused} on screen:\n{shown}");
         seen.push(focused);
     }
     assert_eq!(seen, ["f", "o", "n", "l"]);

@@ -95,8 +95,9 @@ impl Matches {
 /// Every match of `needle` on the lines a file's diff shows: removed
 /// lines' old text, added and unchanged lines' new text (an unchanged line
 /// counts once), in the order the diff shows them. `hidden` has the new
-/// lines each gap of unchanged lines hides under its separator, by gap (see
-/// [`super::Document::hidden_lines`]); without it, only the hunks' lines count.
+/// lines the gaps of unchanged lines hide under their separators, in order
+/// (see [`super::Document::hidden_lines`]); without it, only the hunks'
+/// lines count.
 /// `None` once `cancelled` says so: it's asked every 4096 lines, so a
 /// search that's been typed past stops.
 pub fn find(
@@ -130,13 +131,20 @@ pub fn find(
         }
         true
     };
+    let mut runs = hidden.map(|h| h.iter().peekable());
     for (g, gap) in gaps(diff).iter().enumerate() {
-        if let Some(hidden) = hidden {
-            let skip = hidden.get(g).cloned().unwrap_or(gap.new..gap.new + gap.len);
-            for line in (gap.new..skip.start).chain(skip.end..gap.new + gap.len) {
+        if let Some(runs) = &mut runs {
+            let (mut line, end) = (gap.new, gap.new + gap.len);
+            while line < end {
+                while runs.next_if(|r| r.end <= line).is_some() {}
+                if let Some(run) = runs.peek().filter(|r| r.start <= line) {
+                    line = run.end;
+                    continue;
+                }
                 if !scan(Side::New, line) {
                     return None;
                 }
+                line += 1;
             }
         }
         let Some(hunk) = diff.hunks.get(g) else {

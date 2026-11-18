@@ -14,6 +14,7 @@ mod comments;
 mod editor;
 mod fuzzy;
 mod help;
+mod menu;
 mod picker;
 pub(crate) mod piped;
 mod textbox;
@@ -22,10 +23,12 @@ pub(crate) mod view;
 pub(crate) mod worker;
 
 use std::io::{self, Write};
+use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, ExitStatus};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, mpsc};
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use dffy_core::bstr::{BString, ByteSlice};
@@ -38,9 +41,9 @@ pub(crate) use worker::Done;
 
 use crate::daemon::client::{self, Subscription};
 use crate::pager::stdin::Stdin;
-use crate::plugin::review::{self, Pr, Said};
+use crate::plugin::review::{self, Listed, Said};
 use crate::print::{self, Plan};
-use crate::render::Canvas;
+use crate::render::{Canvas, escape};
 use crate::state;
 use crate::term::{self, Input, Reader, Signal, Tty};
 use crate::theme::{BUILTIN, Role, Theme};
@@ -67,7 +70,7 @@ pub(crate) enum Event {
     /// The list is empty, and this is what the view leaves out of the
     /// uncommitted changes, if it shows only part of them.
     Others(Option<print::Others>),
-    /// The comments file changed on disk.
+    /// A comments file may have changed on disk.
     Comments,
     /// A review plugin's run `id` said this.
     Review {
@@ -96,6 +99,7 @@ pub(crate) fn theme(ctx: &Ctx) -> Theme {
 /// away so a second viewer started meanwhile doesn't show it too.
 fn prepare(app: &mut App, ctx: &Ctx) {
     app.set_color(ctx.color_out);
+    app.set_naming(ctx.described().map(|d| d.naming.clone()));
     app.set_view_remembered(ctx.sources.get("view") == crate::config::Source::LastUsed);
     app.start_tree(ctx.sources.get("tree") == crate::config::Source::LastUsed);
     app.set_context_lines(ctx.context_lines);
@@ -105,27 +109,30 @@ fn prepare(app: &mut App, ctx: &Ctx) {
     }
 }
 
-/// How `dffy pr` starts the viewer.
-pub(crate) enum PrStart {
-    /// On the PR whose `prepare` printed `session` and goes on as `run`,
-    /// saying the rest on `rest`.
+/// How the review plugin's command (`dffy pr`) starts the viewer.
+pub(crate) enum ReviewStart {
+    /// On the review whose `prepare` printed `session` and goes on as
+    /// `run`, saying the rest on `rest`.
     Open {
         plugin: String,
         session: review::Session,
         run: review::Run,
         rest: mpsc::Receiver<Said>,
     },
-    /// With the picker of `prs` open, for a branch without a PR.
-    Pick { plugin: String, prs: Vec<Pr> },
-    /// Plain `dffy` on a branch: `plugin` looks for its PR, and the viewer
-    /// switches to it, against the working tree, if there's one.
+    /// With the picker of `reviews` open, for a branch without a review.
+    Pick {
+        plugin: String,
+        reviews: Vec<Listed>,
+    },
+    /// Plain `dffy` on a branch: `plugin` looks for its review, whose
+    /// comments and status join what the viewer shows, if there's one.
     Detect { plugin: String },
 }
 
 /// Runs the viewer on `tty` for `plan` until the user quits. An empty diff
 /// prints [`print::empty_message`] instead, without taking over the screen,
-/// unless watching or opening a PR: then the viewer waits for changes.
-/// Looking for the branch's PR doesn't hold an empty diff open.
+/// unless watching or opening a review: then the viewer waits for changes.
+/// Looking for the branch's review doesn't hold an empty diff open.
 #[expect(
     clippy::too_many_lines,
     reason = "the viewer's startup in order: workers, change set, first file, session"
@@ -136,7 +143,7 @@ pub(crate) fn run(
     revisions: Revisions,
     focus: Option<BString>,
     description: String,
-    pr: Option<PrStart>,
+    start: Option<ReviewStart>,
     ctx: &Ctx,
 ) -> Result<ExitCode, Error> {
     let (tx, rx) = mpsc::channel();
@@ -179,9 +186,9 @@ pub(crate) fn run(
             Ok(Event::EnumerationDone(Some(error))) => return Err(Error::fatal(error)),
             Ok(Event::EnumerationDone(None)) | Err(_) => {
                 // A commit without changes still has its header to show.
-                let opened = pr
+                let opened = start
                     .as_ref()
-                    .is_some_and(|p| !matches!(p, PrStart::Detect { .. }));
+                    .is_some_and(|p| !matches!(p, ReviewStart::Detect { .. }));
                 if watch || commit.is_some() || opened {
                     break None;
                 }
@@ -220,29 +227,36 @@ pub(crate) fn run(
     if let Some(focus) = focus {
         app.focus(focus);
     }
-    // Watched from before the first read, so no change falls between.
     // Absolute: review plugins get it, and run from the working tree's root.
+    let absolute = |path: PathBuf| std::path::absolute(&path).unwrap_or(path);
+    let default = repo.git_dir().map(crate::review::default_path);
     let comments = ctx
         .comments
         .clone()
-        .or_else(|| repo.git_dir().map(crate::review::default_path))
-        .map(|path| std::path::absolute(&path).unwrap_or(path));
+        .or_else(|| default.clone())
+        .map(absolute);
+    // `dffy pr` reads the review's file; plain `dffy`'s is the local review's.
+    let local = match &start {
+        Some(ReviewStart::Open { .. }) => default.map(absolute),
+        _ => comments.clone(),
+    };
+    app.set_local_comments(local);
     let watching = comments.and_then(|path| {
-        let stop = watch_comments(path.clone(), tx.clone());
+        let files = app.comment_files(path.clone());
         app.set_comments(path);
-        stop
+        watch_comments(files, tx.clone())
     });
     let mut review_run = None;
     let mut detect = None;
-    match pr {
-        Some(PrStart::Detect { plugin }) => detect = Some(app.detect_pr(plugin)),
-        Some(PrStart::Open {
+    match start {
+        Some(ReviewStart::Detect { plugin }) => detect = Some(app.detect_review(plugin)),
+        Some(ReviewStart::Open {
             plugin,
             session,
             run,
             rest,
         }) => {
-            let id = app.start_pr(plugin, session);
+            let id = app.start_review(plugin, session);
             let events = tx.clone();
             std::thread::Builder::new()
                 .name("dffy-review-rest".into())
@@ -255,7 +269,7 @@ pub(crate) fn run(
                 })?;
             review_run = Some(run);
         }
-        Some(PrStart::Pick { plugin, prs }) => app.pick_pr(plugin, prs),
+        Some(ReviewStart::Pick { plugin, reviews }) => app.pick_review(plugin, reviews),
         None => {}
     }
 
@@ -357,38 +371,43 @@ pub(crate) fn run_piped(tty: &Tty, stdin: Stdin, ctx: &Ctx) -> Result<ExitCode, 
     Ok(ExitCode::SUCCESS)
 }
 
-/// How often the comments file is looked at. The loop has no tick of its
-/// own, and watch mode covers only the repository, not a file elsewhere;
-/// a watcher on this one file is the upgrade if idle wakeups ever matter.
-const COMMENTS_POLL: Duration = Duration::from_millis(250);
-
-/// Sends [`Event::Comments`] whenever `path`'s modification time or size
-/// changes, looking every [`COMMENTS_POLL`], until the returned sender is
-/// dropped or the loop is gone. The first look happens before this
-/// returns. `None` when the thread couldn't start.
-fn watch_comments(path: PathBuf, events: mpsc::Sender<Event>) -> Option<mpsc::Sender<()>> {
-    let stamp = |path: &Path| {
-        std::fs::metadata(path)
-            .ok()
-            .map(|m| (m.modified().ok(), m.len()))
-    };
-    let mut last = stamp(&path);
-    let (stop, stopped) = mpsc::channel::<()>();
-    std::thread::Builder::new()
-        .name("dffy-comments".to_owned())
-        .spawn(move || {
-            while let Err(mpsc::RecvTimeoutError::Timeout) = stopped.recv_timeout(COMMENTS_POLL) {
-                let now = stamp(&path);
-                if now != last {
-                    last = now;
-                    if events.send(Event::Comments).is_err() {
-                        return;
-                    }
+/// Sends [`Event::Comments`] when one of `paths` is written, created or
+/// replaced, dffy's own writes included, until the returned handle is
+/// dropped or the loop is gone. Each file's directory is watched, created first if
+/// missing as writing the file would, so a write through a temporary file
+/// and a rename shows; the watcher's debounce makes a burst of writes one
+/// event. A file that can't be watched goes without: its reloads then come
+/// from dffy's own writes and review plugin runs only.
+///
+/// The watches start on a thread of their own, as starting one waits on
+/// the OS, and an [`Event::Comments`] follows once they're in place: read
+/// the files before calling this, and a write in between isn't missed.
+fn watch_comments(
+    paths: Vec<PathBuf>,
+    events: mpsc::Sender<Event>,
+) -> Option<JoinHandle<Vec<Watcher>>> {
+    let start = move || {
+        let watchers = paths
+            .iter()
+            .filter_map(|path| {
+                if let Some(dir) = path.parent() {
+                    std::fs::create_dir_all(dir).ok();
                 }
-            }
-        })
-        .ok()?;
-    Some(stop)
+                let events = events.clone();
+                Watcher::start(Root::file(path).ok()?, move |notice| match notice {
+                    Notice::Changed(_) | Notice::Rescan => events.send(Event::Comments).is_ok(),
+                    Notice::Polling(_) => true,
+                })
+                .ok()
+            })
+            .collect();
+        events.send(Event::Comments).ok();
+        watchers
+    };
+    std::thread::Builder::new()
+        .name("dffy-comments-watch".into())
+        .spawn(start)
+        .ok()
 }
 
 /// Opens `url` with the platform's opener, detached from the terminal;
@@ -505,8 +524,10 @@ fn route_compared(
 }
 
 struct Session<'a> {
-    /// Stops the comments file's watch once dropped.
-    watching: Option<mpsc::Sender<()>>,
+    /// The comments files' watches, one per file, as the thread starting
+    /// them returns them; see [`watch_comments`]. Never joined: dropping the
+    /// handle drops the watches once the thread ends, which stops them.
+    watching: Option<JoinHandle<Vec<Watcher>>>,
     /// The review plugin's run other than a check, the last one started.
     review_run: Option<review::Run>,
     tty: &'a Tty,
@@ -704,14 +725,8 @@ impl Session<'_> {
                             highlight,
                             whitespace,
                         }) => self.pool.set(highlight, whitespace),
-                        Some(Action::Copy { text, mut note }) => {
-                            self.tty.write(&term::clipboard(&text))?;
-                            let tmux = self.tmux_clipboard.get_or_init(term::tmux_clipboard);
-                            if tmux.as_ref().is_some_and(|value| value != "on") {
-                                note.push_str("; tmux needs set-clipboard on");
-                            }
-                            app.message(note);
-                        }
+                        Some(Action::Copy { text, note }) => self.copy(app, &text, note)?,
+                        Some(Action::CopyFullPath(path)) => self.copy_full_path(app, &path)?,
                         None => {}
                     },
                 }
@@ -722,6 +737,34 @@ impl Session<'_> {
                 };
             }
         }
+    }
+
+    /// Puts `text` on the clipboard, then says `note`.
+    fn copy(&self, app: &mut App, text: &[u8], mut note: String) -> io::Result<()> {
+        self.tty.write(&term::clipboard(text))?;
+        let tmux = self.tmux_clipboard.get_or_init(term::tmux_clipboard);
+        if tmux.as_ref().is_some_and(|value| value != "on") {
+            note.push_str("; tmux needs set-clipboard on");
+        }
+        app.message(note);
+        Ok(())
+    }
+
+    /// Puts where the repository-relative `path` is on disk on the
+    /// clipboard.
+    fn copy_full_path(&self, app: &mut App, path: &BString) -> io::Result<()> {
+        let Some(full) = self.files.as_ref().and_then(|f| f.on_disk(path.as_bstr())) else {
+            app.message(if self.files.is_some() {
+                "this file isn't on disk"
+            } else {
+                "there's no working tree for this file to be in"
+            });
+            return Ok(());
+        };
+        // The working tree is as dffy was pointed at it, maybe relative.
+        let full = std::path::absolute(&full).unwrap_or(full);
+        let bytes = full.as_os_str().as_bytes();
+        self.copy(app, bytes, format!("copied {}", escape(bytes)))
     }
 
     /// Hands the terminal to the editor and takes it back.
@@ -850,28 +893,31 @@ impl Session<'_> {
         }
     }
 
-    /// Lists `revisions` from now on, with the comments in `comments` when
-    /// that's another file. `moved` is a PR's head before and after an
-    /// update, whose commits are counted for the note.
+    /// Lists `revisions` from now on, when given, with the comments in
+    /// `comments` when that's another file. `moved` is a review's head before
+    /// and after an update, whose commits are counted for the note.
     fn retarget(
         &mut self,
         app: &mut App,
-        mut revisions: Revisions,
+        revisions: Option<Revisions>,
         comments: Option<PathBuf>,
         moved: Option<(String, String)>,
     ) {
-        // Checked first: once the list has a range that doesn't resolve,
-        // every refresh after fails too.
-        if let (Some(last), Some(repo)) = (app.reviewed_from(), &self.files)
-            && !repo.is_revision(last)
-            && let Some(whole) = app.reviewed_head_missing()
-        {
-            revisions = whole;
+        if let Some(mut revisions) = revisions {
+            // Checked first: once the list has a range that doesn't
+            // resolve, every refresh after fails too.
+            if let (Some(last), Some(repo)) = (app.reviewed_from(), &self.files)
+                && !repo.is_revision(last)
+                && let Some(whole) = app.reviewed_head_missing()
+            {
+                revisions = whole;
+            }
+            self.requests.send(Request::Retarget(revisions)).ok();
         }
-        self.requests.send(Request::Retarget(revisions)).ok();
         if let Some(path) = comments {
-            self.watching = watch_comments(path.clone(), self.events.clone());
+            let files = app.comment_files(path.clone());
             app.set_comments(path);
+            self.watching = watch_comments(files, self.events.clone());
         }
         if let (Some((old, new)), Some(root)) = (moved, self.files.as_ref().and_then(Repo::workdir))
         {
@@ -884,7 +930,7 @@ impl Session<'_> {
                 .ok()
                 .filter(|out| out.status.success())
                 .and_then(|out| String::from_utf8(out.stdout).ok()?.trim().parse().ok());
-            app.pr_updated(count);
+            app.review_updated(count);
         }
     }
 
@@ -924,28 +970,43 @@ impl Session<'_> {
 mod tests {
     use super::*;
 
-    /// The comments file is looked at from the start: writing it, even
-    /// creating it, sends one event, and stopping the watch ends the thread.
+    /// The comments files are watched, even one whose directory doesn't
+    /// exist yet, and an event says the watches are in place: creating one,
+    /// replacing it through a rename, or writing the other then sends an
+    /// event, and dropping the handle, never joined, ends the watches. How
+    /// many events a write makes is the backend's; the app's reload skips
+    /// those that changed nothing.
     #[test]
     fn a_change_to_the_comments_file_sends_an_event() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("comments.json");
+        let path = dir.path().join("dffy").join("comments.json");
+        let local = dir.path().join("local.json");
         let (tx, rx) = mpsc::channel();
-        let stop = watch_comments(path.clone(), tx).expect("starts");
-        let wait = Duration::from_secs(2);
-        assert!(rx.recv_timeout(COMMENTS_POLL * 2).is_err(), "nothing yet");
-        std::fs::write(&path, "{\"version\":1,\"comments\":[]}").expect("write");
-        assert!(matches!(rx.recv_timeout(wait), Ok(Event::Comments)));
+        let watching = watch_comments(vec![path.clone(), local.clone()], tx).expect("spawned");
+        let wait = Duration::from_secs(10);
         assert!(
-            rx.recv_timeout(COMMENTS_POLL * 2).is_err(),
-            "once per change"
+            matches!(rx.recv_timeout(wait), Ok(Event::Comments)),
+            "in place"
         );
-        std::fs::write(&path, "{\"version\":1,\"notice\":\"x\",\"comments\":[]}").expect("write");
+        let empty = "{\"version\":1,\"comments\":[]}";
+        std::fs::write(&path, empty).expect("write");
         assert!(matches!(rx.recv_timeout(wait), Ok(Event::Comments)));
-        drop(stop);
-        assert!(matches!(
-            rx.recv_timeout(wait),
-            Err(mpsc::RecvTimeoutError::Disconnected)
-        ));
+        let tmp = path.with_extension("tmp");
+        std::fs::write(&tmp, "{\"version\":1,\"notice\":\"x\",\"comments\":[]}").expect("write");
+        std::fs::rename(&tmp, &path).expect("rename");
+        assert!(matches!(rx.recv_timeout(wait), Ok(Event::Comments)));
+        std::fs::write(&local, empty).expect("write");
+        assert!(matches!(rx.recv_timeout(wait), Ok(Event::Comments)));
+        drop(watching);
+        loop {
+            match rx.recv_timeout(wait) {
+                Ok(Event::Comments) => {}
+                Ok(_) => panic!("not a comments event"),
+                Err(e) => {
+                    assert_eq!(e, mpsc::RecvTimeoutError::Disconnected, "the watches end");
+                    break;
+                }
+            }
+        }
     }
 }

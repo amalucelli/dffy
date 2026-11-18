@@ -14,11 +14,13 @@ use std::io::{self, BufRead as _, BufReader, Read};
 use std::os::unix::process::CommandExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, ExitStatus, Stdio};
+use std::time::Duration;
 
+use dffy_core::cache::{self, Cache};
 use rustix::process::{Pid, WaitId, WaitIdOptions};
 
 use super::json::{self, Value};
-use super::{kill_group, running};
+use super::{Program, kill_group, running};
 
 /// The protocol version, in `DFFY_REVIEW_PROTOCOL` and in every line a
 /// plugin prints; a line of another version stops the run.
@@ -41,10 +43,302 @@ pub(crate) fn exec_detached(mut args: impl Iterator<Item = OsString>) -> ExitCod
     ExitCode::from(127)
 }
 
-/// A PR under review, from a session line.
+/// How long `describe` may take. It runs before dffy parses its arguments,
+/// until its answer is cached, so a hung plugin can't hold every start.
+const DESCRIBE_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// How long the plugin's `doctor` may take: its checks may ask the host.
+const DOCTOR_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// What a plugin's `describe` says: the subcommand dffy adds for it, the
+/// words for what it reviews, which dffy's screens use, and the events the
+/// post dialog offers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Naming {
+    /// `pr`, for `dffy pr [<id>]`.
+    pub command: String,
+    /// `pull request`.
+    pub noun: String,
+    /// `pull requests`.
+    pub nouns: String,
+    /// `PR`, before a review's id: `PR #7`. The noun when not described.
+    pub short: String,
+    /// `#`, right before the id; may be empty.
+    pub id_prefix: String,
+    /// The post dialog's choices, in order; never empty.
+    pub events: Vec<ReviewEvent>,
+    /// Said the first time you reply to an outdated thread; none, nothing.
+    pub outdated_reply_warning: Option<String>,
+}
+
+/// One way `post` can end a review, as the plugin names it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ReviewEvent {
+    /// Passed as `--event <id>`.
+    pub id: String,
+    /// Picks it in the dialog.
+    pub key: char,
+    pub label: String,
+    /// The status bar's words once it went: `approved`.
+    pub done: String,
+    /// Sending it ends the review on the host, so drafts the host refused
+    /// hold it back (see [`Said::Posted`]); a `false` event leaves the
+    /// review open there.
+    pub submits: bool,
+}
+
+/// The dialog's own keys, which an event's key can't be.
+const DIALOG_KEYS: [char; 4] = ['j', 'k', 's', 'v'];
+
+impl Naming {
+    /// Reads a `describe` answer. A command is lowercase letters, digits
+    /// and `-`, starting with a letter. Words are one line of printable
+    /// text, since help and the viewer print them as they are.
+    pub(crate) fn decode(bytes: &[u8]) -> Result<Self, String> {
+        let value = answer(bytes)?;
+        let field =
+            |key: &str| text(&value, key).ok_or_else(|| format!("its describe has no {key}"));
+        let command = field("command")?;
+        if !command.starts_with(|c: char| c.is_ascii_lowercase())
+            || !command
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+        {
+            return Err(format!(
+                "its command '{}' isn't lowercase letters, digits and -, starting with a letter",
+                command.escape_debug()
+            ));
+        }
+        let noun = noun("noun", field("noun")?, 40)?;
+        let short = match text(&value, "short") {
+            Some(short) => self::noun("short", short, 40)?,
+            None => noun.clone(),
+        };
+        let id_prefix = text(&value, "id_prefix").unwrap_or_default();
+        if id_prefix.chars().count() > 8 || id_prefix.contains(char::is_control) {
+            return Err(format!(
+                "its id_prefix '{}' isn't up to 8 printable characters",
+                id_prefix.escape_debug()
+            ));
+        }
+        let events = match value.get("events") {
+            None | Some(Value::Null) => default_events(),
+            Some(events) => review_events(events)?,
+        };
+        let outdated_reply_warning = text(&value, "outdated_reply_warning")
+            .map(|w| self::noun("outdated_reply_warning", w, 200))
+            .transpose()?;
+        Ok(Self {
+            nouns: self::noun("nouns", field("nouns")?, 40)?,
+            noun,
+            command,
+            short,
+            id_prefix,
+            events,
+            outdated_reply_warning,
+        })
+    }
+
+    /// How a review reads in titles and messages: `PR #7`.
+    pub(crate) fn label(&self, shown: &str) -> String {
+        format!("{} {}{shown}", self.short, self.id_prefix)
+    }
+}
+
+/// The events of a plugin that names none: `post`.
+pub(crate) fn default_events() -> Vec<ReviewEvent> {
+    vec![ReviewEvent {
+        id: "post".to_owned(),
+        key: 'p',
+        label: "post".to_owned(),
+        done: "posted".to_owned(),
+        submits: true,
+    }]
+}
+
+/// `text`, when it's 1 to `most` printable characters.
+fn noun(key: &str, text: String, most: usize) -> Result<String, String> {
+    if text.trim().is_empty() || text.chars().count() > most || text.contains(char::is_control) {
+        return Err(format!(
+            "its {key} '{}' isn't 1 to {most} printable characters",
+            text.escape_debug()
+        ));
+    }
+    Ok(text)
+}
+
+/// The `events` of a describe answer: 1 to 9, each id a word and each key
+/// one letter or digit the dialog doesn't take, neither repeated.
+fn review_events(events: &Value) -> Result<Vec<ReviewEvent>, String> {
+    let events = events.as_array().ok_or("its events isn't a list")?;
+    if events.is_empty() || events.len() > 9 {
+        return Err("its events aren't 1 to 9".to_owned());
+    }
+    let mut out: Vec<ReviewEvent> = Vec::with_capacity(events.len());
+    for event in events {
+        let id = text(event, "id").unwrap_or_default();
+        if !id.starts_with(|c: char| c.is_ascii_lowercase())
+            || id.len() > 40
+            || !id
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_' || b == b'-')
+        {
+            return Err(format!(
+                "its event '{}' isn't lowercase letters, digits, _ and -, starting with a letter",
+                id.escape_debug()
+            ));
+        }
+        let key = text(event, "key").unwrap_or_default();
+        let key = match key.chars().collect::<Vec<_>>()[..] {
+            [k] if (k.is_ascii_lowercase() || k.is_ascii_digit()) && !DIALOG_KEYS.contains(&k) => k,
+            _ => {
+                return Err(format!(
+                    "its event {id}'s key '{}' isn't one letter or digit other than j, k, s and v",
+                    key.escape_debug()
+                ));
+            }
+        };
+        if out.iter().any(|e| e.id == id || e.key == key) {
+            return Err(format!("its event {id} repeats an id or a key"));
+        }
+        let words = |field: &str| {
+            let said = text(event, field).ok_or_else(|| format!("its event {id} has no {field}"));
+            noun(&format!("event {id}'s {field}"), said?, 40)
+        };
+        out.push(ReviewEvent {
+            label: words("label")?,
+            done: words("done")?,
+            submits: event.get("submits") != Some(&Value::Bool(false)),
+            key,
+            id,
+        });
+    }
+    Ok(out)
+}
+
+/// A review plugin that describes itself.
+#[derive(Debug, Clone)]
+pub(crate) struct Described {
+    pub program: Program,
+    pub naming: Naming,
+}
+
+/// `program`'s naming. Its `describe` answer is kept in the disk cache
+/// while the program is the same file (path, modification time and size),
+/// so dffy doesn't run the plugin on every start; only an answer that
+/// reads as one is kept. A command `reserved` says is dffy's own is
+/// refused, cached or not. A failure isn't kept: the next start asks again.
+pub(crate) fn describe(
+    program: &Program,
+    cache: Option<&Cache>,
+    reserved: impl Fn(&str) -> bool,
+) -> Result<Naming, String> {
+    let mut key = Vec::with_capacity(64);
+    key.extend_from_slice(&PROTOCOL.to_le_bytes());
+    key.extend_from_slice(program.path.as_os_str().as_encoded_bytes());
+    key.push(0);
+    key.extend_from_slice(&program.stamp.0.to_le_bytes());
+    key.extend_from_slice(&program.stamp.1.to_le_bytes());
+    let cached = cache.and_then(|c| c.get(cache::Kind::Described, &key));
+    let naming = if let Some(Ok(naming)) = cached.map(|answer| Naming::decode(&answer)) {
+        naming
+    } else {
+        let answer = ask(program, "describe", DESCRIBE_TIMEOUT)?;
+        let naming = Naming::decode(&answer)?;
+        if let Some(cache) = cache {
+            cache.put(cache::Kind::Described, &key, &answer);
+        }
+        naming
+    };
+    if reserved(&naming.command) {
+        return Err(format!(
+            "its command '{}' is one of dffy's own",
+            naming.command
+        ));
+    }
+    Ok(naming)
+}
+
+/// One of the plugin's own checks, from its `doctor`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Check {
+    pub name: String,
+    pub ok: bool,
+    pub detail: String,
+}
+
+/// The plugin's checks of what it needs, for `dffy doctor`; never cached.
+pub(crate) fn doctor(program: &Program) -> Result<Vec<Check>, String> {
+    let value = answer(&ask(program, "doctor", DOCTOR_TIMEOUT)?)?;
+    value
+        .get("checks")
+        .and_then(Value::as_array)
+        .ok_or("its doctor has no checks")?
+        .iter()
+        .map(|check| {
+            Ok(Check {
+                name: text(check, "name").ok_or("a check without a name")?,
+                ok: check.get("ok") == Some(&Value::Bool(true)),
+                detail: text(check, "detail").unwrap_or_default(),
+            })
+        })
+        .collect()
+}
+
+/// Runs `verb`, which answers with one line and needs no repository, the
+/// way the other verbs run: detached from the terminal, with stdin closed.
+/// Returns what it printed.
+fn ask(program: &Program, verb: &str, timeout: Duration) -> Result<Vec<u8>, String> {
+    let mut command = Command::new(std::env::current_exe().map_err(|e| e.to_string())?);
+    command
+        .arg(DETACH)
+        .arg(&program.path)
+        .arg(verb)
+        .env("DFFY_REVIEW_PROTOCOL", PROTOCOL.to_string())
+        .env_remove("DFFY_COMMENTS");
+    let (out, status) =
+        super::run(command, Vec::new(), timeout, || false).map_err(|failure| match failure {
+            super::Failure::Timeout => format!("its {verb} took over {}s", timeout.as_secs()),
+            failure => format!("its {verb} {failure}"),
+        })?;
+    let first = out
+        .split(|&b| b == b'\n')
+        .find(|l| !l.trim_ascii().is_empty());
+    // Its own message says more than how it exited.
+    if let Some(Ok(Some(Line::Error(message)))) = first.map(decode) {
+        return Err(message);
+    }
+    match status.code() {
+        Some(0) => answer(&out)
+            .map(|_| out)
+            .map_err(|e| format!("its {verb}: {e}")),
+        Some(2) => Err(format!(
+            "it doesn't know {verb}; it may be older than this dffy"
+        )),
+        _ => Err(format!("its {verb} {}", super::exited(status))),
+    }
+}
+
+/// The first line of a one-line answer, checked: an object of this
+/// protocol's version, without an error.
+fn answer(bytes: &[u8]) -> Result<Value, String> {
+    let line = bytes
+        .split(|&b| b == b'\n')
+        .find(|l| !l.trim_ascii().is_empty())
+        .ok_or("it printed nothing")?;
+    match decode(line)? {
+        Some(Line::Error(message)) => Err(message),
+        _ => json::parse(line),
+    }
+}
+
+/// A review, from a session line.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Session {
-    pub number: u64,
+    /// The plugin's id, which its verbs take.
+    pub id: String,
+    /// What to show for the id, when the plugin gives one.
+    pub label: Option<String>,
     pub title: Option<String>,
     pub url: Option<String>,
     /// Commits in the clone: dffy shows `<base>...<head>`.
@@ -56,23 +350,40 @@ pub(crate) struct Session {
     pub comments: PathBuf,
 }
 
-/// Why `list` lists a PR.
+impl Session {
+    /// The id as shown.
+    pub(crate) fn shown(&self) -> &str {
+        self.label.as_deref().unwrap_or(&self.id)
+    }
+}
+
+/// Why `list` lists a review; the picker groups by it, these first.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum Reason {
     CurrentBranch,
     ReviewRequested,
     Mine,
-    /// A reason this dffy doesn't know.
+    /// A reason this dffy doesn't know: grouped by the entry's `group`.
     Other,
 }
 
-/// A PR from `list`.
+/// A review from `list`.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct Pr {
-    pub number: u64,
+pub(crate) struct Listed {
+    pub id: String,
+    pub label: Option<String>,
     pub title: String,
     pub author: String,
     pub reason: Reason,
+    /// The plugin's title for its group, for a reason dffy doesn't know.
+    pub group: Option<String>,
+}
+
+impl Listed {
+    /// The id as shown.
+    pub(crate) fn shown(&self) -> &str {
+        self.label.as_deref().unwrap_or(&self.id)
+    }
 }
 
 /// What `post` does, or did, with a draft.
@@ -99,11 +410,12 @@ pub(crate) struct Draft {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Said {
     Session(Session),
-    /// `detect`: the branch checked out's PR, as a session, if it has one.
+    /// `detect`: the branch checked out's review, as a session, if it has
+    /// one.
     Detected(Option<Session>),
     Progress(String),
-    Prs(Vec<Pr>),
-    /// `check`: the PR's head on the host, and whether it isn't the
+    Listed(Vec<Listed>),
+    /// `check`: the review's head on the host, and whether it isn't the
     /// session's.
     Head {
         head: String,
@@ -117,12 +429,14 @@ pub(crate) enum Said {
         file: usize,
         skip: usize,
     },
-    /// `post` finished: comments posted and not, whether your review is
-    /// still pending on the host, and the review's link.
+    /// `post` finished: comments posted and not, whether the event wasn't
+    /// applied, with the plugin's words for where that leaves the review,
+    /// and the review's link.
     Posted {
         posted: usize,
         failed: usize,
-        pending_review: bool,
+        held: bool,
+        held_message: Option<String>,
         url: Option<String>,
     },
     /// The run is over; `Err` says why it failed: the plugin's own error
@@ -159,16 +473,16 @@ fn decode(bytes: &[u8]) -> Result<Option<Line>, String> {
     }
     let said = if let Some(s) = value.get("session") {
         Said::Session(session(s)?)
-    } else if let Some(pr) = value.get("pr") {
-        Said::Detected(match pr {
+    } else if let Some(review) = value.get("review") {
+        Said::Detected(match review {
             Value::Null => None,
-            pr => Some(session(pr)?),
+            review => Some(session(review)?),
         })
     } else if let Some(p) = value.get("progress") {
         Said::Progress(p.as_str().ok_or("progress isn't text")?.to_owned())
-    } else if let Some(prs) = value.get("prs") {
-        let prs = prs.as_array().ok_or("prs isn't a list")?;
-        Said::Prs(prs.iter().map(pr).collect::<Result<_, _>>()?)
+    } else if let Some(reviews) = value.get("reviews") {
+        let reviews = reviews.as_array().ok_or("reviews isn't a list")?;
+        Said::Listed(reviews.iter().map(listed).collect::<Result<_, _>>()?)
     } else if let Some(head) = value.get("head") {
         Said::Head {
             head: commit(head).ok_or("head isn't a commit")?,
@@ -196,7 +510,9 @@ fn decode(bytes: &[u8]) -> Result<Option<Line>, String> {
         Said::Posted {
             posted: count(Some(posted)),
             failed: count(value.get("failed")),
-            pending_review: value.get("pending_review") == Some(&Value::Bool(true)),
+            held: value.get("held") == Some(&Value::Bool(true)),
+            held_message: text(&value, "held_message")
+                .and_then(|m| noun("held_message", m, 200).ok()),
             url: text(&value, "url"),
         }
     } else {
@@ -222,12 +538,25 @@ fn commit(value: &Value) -> Option<String> {
         .map(str::to_owned)
 }
 
-fn number(value: &Value) -> Result<u64, String> {
-    value
-        .get("number")
-        .and_then(Value::as_usize)
-        .and_then(|n| u64::try_from(n).ok())
-        .ok_or_else(|| "no PR number".to_owned())
+/// A review's `id` and optional `label`. The id goes on the plugin's
+/// command line, so it can't pass for a flag; both show, so they're one
+/// printable line.
+fn review_id(value: &Value) -> Result<(String, Option<String>), String> {
+    let printable = |s: &str| !s.is_empty() && s.len() <= 200 && !s.contains(char::is_control);
+    let id = text(value, "id")
+        .filter(|id| printable(id) && !id.starts_with('-'))
+        .ok_or("no review id, or one that isn't printable text")?;
+    let label = match value.get("label") {
+        None | Some(Value::Null) => None,
+        Some(label) => Some(
+            label
+                .as_str()
+                .filter(|l| printable(l))
+                .ok_or("a review label that isn't printable text")?
+                .to_owned(),
+        ),
+    };
+    Ok((id, label))
 }
 
 fn session(value: &Value) -> Result<Session, String> {
@@ -242,8 +571,10 @@ fn session(value: &Value) -> Result<Session, String> {
             .and_then(commit)
             .ok_or_else(|| format!("the session's {key} isn't a commit"))
     };
+    let (id, label) = review_id(value)?;
     Ok(Session {
-        number: number(value)?,
+        id,
+        label,
         title: text(value, "title"),
         url: text(value, "url"),
         base: side("base")?,
@@ -256,9 +587,11 @@ fn session(value: &Value) -> Result<Session, String> {
     })
 }
 
-fn pr(value: &Value) -> Result<Pr, String> {
-    Ok(Pr {
-        number: number(value)?,
+fn listed(value: &Value) -> Result<Listed, String> {
+    let (id, label) = review_id(value)?;
+    Ok(Listed {
+        id,
+        label,
         title: text(value, "title").unwrap_or_default(),
         author: text(value, "author").unwrap_or_default(),
         reason: match value.get("reason").and_then(Value::as_str) {
@@ -267,12 +600,14 @@ fn pr(value: &Value) -> Result<Pr, String> {
             Some("mine") => Reason::Mine,
             _ => Reason::Other,
         },
+        // Words dffy draws as they are, so one printable line or none.
+        group: text(value, "group").and_then(|g| noun("group", g, 40).ok()),
     })
 }
 
 /// The command for `program`'s `args`, detached from the terminal, in the
 /// working tree's `root`, told the comments file for the verbs that take
-/// a PR.
+/// a review.
 pub(crate) fn command(
     program: &Path,
     args: &[String],

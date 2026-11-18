@@ -8,7 +8,7 @@ expression: "all_rows(narrow).join(\"\\n\")"
      │  └┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┘
 1 1  │ fn main() {
 2  ○-│     let total = count + 1;
-     │  ╶ ▸ ana · 3h ago · res… ╴
+     │  │ ▸ ana · 3h ago · res… │
   2◆+│     let total = items.len(…
      │  ┌ ▾ octocat · 2h ago ·… ┐
      │  ┆ Why len() here and    ┆
@@ -28,4 +28,4 @@ expression: "all_rows(narrow).join(\"\\n\")"
 5   -│ // a comment long enough t…
   6 +│ // a comment long enough t…
      │\ No newline at end of file
-     │  ╶ ▸ ana · 4h …  1 reply ╴
+     │  │ ▸ ana · 4h …  1 reply │

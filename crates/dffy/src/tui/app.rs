@@ -13,7 +13,7 @@
 //! instead of the view, `s` picks the side copied, and any other action
 //! ends the selection first.
 
-mod pr;
+mod review;
 
 use std::collections::HashMap;
 use std::fmt::Write as _;
@@ -38,6 +38,7 @@ use super::chrome::{self, Chrome, Cut, Heading, Switcher, Title};
 use super::commands::{self, Commands, Outcome};
 use super::comments::{self, Comments, Compose, Panel, Writes, Writing};
 use super::help::Help;
+use super::menu::{self, Menu, Run};
 use super::picker::{self, Picker};
 use super::piped;
 use super::textbox::TextBox;
@@ -51,10 +52,11 @@ use crate::config::{
 };
 use crate::daemon::client;
 use crate::keys::{Action as Act, Keys};
+use crate::plugin::review::{Naming, Said};
 use crate::plugin::{self, Program, Renderers};
 use crate::print;
 use crate::render::{Layout, escape, thousands};
-use crate::review::{self, Op, Target};
+use crate::review::{Change, Op, Target};
 use crate::term::{self, Input, Key, Mods, Screen};
 use crate::theme::{self, Role, Style, Theme};
 
@@ -68,6 +70,9 @@ const TIP_TIME: Duration = Duration::from_secs(8);
 /// Choices are written to the state file once they've settled this long.
 const REMEMBER_DELAY: Duration = Duration::from_millis(500);
 const WHEEL_ROWS: isize = 3;
+/// Unchanged lines revealed above and below a thread's lines that a gap
+/// hid.
+const THREAD_CONTEXT: usize = 2;
 /// Terminals at least this wide show the tree as a panel beside the diff,
 /// shown from the start; narrower ones show it over the diff when asked.
 const SIDE_TREE_WIDTH: usize = 100;
@@ -96,6 +101,9 @@ pub(crate) enum Action {
         text: Vec<u8>,
         note: String,
     },
+    /// Put where this repository-relative path is on disk on the
+    /// clipboard, from the filesystem's root.
+    CopyFullPath(BString),
     /// Turn the terminal's mouse reports on or off.
     Mouse(bool),
     /// Diff again with these settings: the files were marked stale.
@@ -119,10 +127,11 @@ pub(crate) enum Action {
         comments: Option<PathBuf>,
         summary: Option<String>,
     },
-    /// List `revisions` from now on, reading `comments` when it's another
-    /// file. `moved` is the PR's head before and after, to count commits.
+    /// List `revisions` from now on, when given, reading `comments` when
+    /// it's another file. `moved` is the review's head before and after, to
+    /// count commits.
     Retarget {
-        revisions: Revisions,
+        revisions: Option<Revisions>,
         comments: Option<PathBuf>,
         moved: Option<(String, String)>,
     },
@@ -269,6 +278,8 @@ pub(crate) struct App {
     remembered: Vec<(&'static str, String)>,
     remembered_at: Option<Instant>,
     commands: Option<Commands>,
+    /// The menu a right click opened.
+    menu: Option<Menu>,
     search: Option<Search>,
     /// The last search id handed out. Kept across cleared searches, so a
     /// scan for one that's gone never reports as the next one's.
@@ -324,6 +335,9 @@ pub(crate) struct App {
     /// The review comments; `None` without a comments file (a piped diff,
     /// paths compared outside git without `--comments`).
     comments: Option<Comments>,
+    /// The local review's file, plain `dffy`'s: a review session's
+    /// comments file shows its drafts too.
+    local_comments: Option<PathBuf>,
     panel: Option<Panel>,
     /// What the text box's or the editor's text becomes, while either is
     /// open.
@@ -333,30 +347,32 @@ pub(crate) struct App {
     handed: Option<(String, Writes)>,
     /// `d` was pressed once on the focused thread; another deletes.
     deleting: bool,
-    /// Replying to an outdated thread said once what GitHub does with it.
+    /// Replying to an outdated thread said once the plugin's warning.
     warned_outdated: bool,
     /// A file gone to for a thread before its threads were placed, and
     /// which of them to focus once they are.
     thread_pending: Option<(usize, Seek)>,
     /// The review plugin's name, from the config or `--review`.
     review: Option<String>,
-    /// The pull request shown, in PR mode.
-    pr: Option<pr::Mode>,
+    /// The review plugin's words, when it describes itself.
+    naming: Option<Naming>,
+    /// The review shown, in review mode.
+    reviewing: Option<review::Mode>,
     /// The review plugin's run other than a check, while it runs.
-    job: Option<pr::Running>,
+    job: Option<review::Running>,
     /// The last run id handed out.
     run_id: u64,
-    /// The pull requests to pick from.
-    prs: Option<pr::Picker>,
+    /// The reviews to pick from.
+    reviews: Option<review::Picker>,
     /// The dialog that posts the review.
-    posting: Option<pr::Dialog>,
+    posting: Option<review::Dialog>,
     /// The prompt after a post that left drafts out of the review.
-    held: Option<pr::Held>,
+    held: Option<review::Held>,
     /// The review just posted, which `o` opens until another key.
     link: Option<String>,
-    /// The `list` run for the PR picker, beside any other run.
+    /// The `list` run for the review picker, beside any other run.
     listing: Option<u64>,
-    /// The `detect` run looking for the branch's PR at startup.
+    /// The `detect` run looking for the branch's review at startup.
     detecting: Option<u64>,
     /// The text box opened again after its save failed: `esc` now
     /// discards it.
@@ -469,6 +485,7 @@ impl App {
             remembered: Vec::new(),
             remembered_at: None,
             commands: None,
+            menu: None,
             search: None,
             search_id: 0,
             live_search: Arc::new(AtomicU64::new(u64::MAX)),
@@ -500,6 +517,7 @@ impl App {
             help: None,
             picker: None,
             comments: None,
+            local_comments: None,
             panel: None,
             composing: None,
             handed: None,
@@ -507,10 +525,11 @@ impl App {
             warned_outdated: false,
             thread_pending: None,
             review: config.review.clone(),
-            pr: None,
+            naming: None,
+            reviewing: None,
             job: None,
             run_id: 0,
-            prs: None,
+            reviews: None,
             posting: None,
             held: None,
             link: None,
@@ -580,6 +599,10 @@ impl App {
     /// With color off the theme is attributes only, and stays so.
     pub(crate) fn set_color(&mut self, color: bool) {
         self.color = color;
+    }
+
+    pub(crate) fn set_naming(&mut self, naming: Option<Naming>) {
+        self.naming = naming;
     }
 
     /// Shows the first-run tip until a key or about 8 seconds pass.
@@ -958,7 +981,15 @@ impl App {
                 }
                 return self.due_check();
             }
-            Event::Review { id, said } => return self.review_said(id, said),
+            Event::Review { id, said } => {
+                // Plugins write the comments file as they go: a page of
+                // threads at a time, refs once posted. Read before the
+                // handler, which may look the threads up.
+                if matches!(said, Said::Progress(_) | Said::Session(_) | Said::Done(_)) {
+                    self.reload_comments();
+                }
+                return self.review_said(id, said);
+            }
             // The loop handles these; they need the terminal.
             Event::Resize | Event::Interrupt => {}
         }
@@ -1266,10 +1297,6 @@ impl App {
         self.asked = Some(Instant::now());
     }
 
-    #[expect(
-        clippy::too_many_lines,
-        reason = "a dispatch: each overlay in turn, then the pane's keys"
-    )]
     fn input(&mut self, input: Input) -> Option<Action> {
         if let Input::Background { rgb } = input {
             // A late reply is ignored: switching tints well after the
@@ -1293,7 +1320,10 @@ impl App {
         if self.doc.writing.is_some() {
             return self.writing_input(input);
         }
-        if let std::ops::ControlFlow::Break(done) = self.pr_input(&input) {
+        if self.menu.is_some() {
+            return self.menu_input(&input);
+        }
+        if let std::ops::ControlFlow::Break(done) = self.review_input(&input) {
             return done;
         }
         if self.commands.is_some() {
@@ -1376,6 +1406,12 @@ impl App {
             self.message("waiting for this file's diff");
             return None;
         }
+        self.dispatch(action)
+    }
+
+    /// Runs `action` as its key does in the pane with the keys: lines
+    /// selected in the diff take it first.
+    fn dispatch(&mut self, action: Act) -> Option<Action> {
         if self.doc.selection.is_some() && self.pane == Pane::Diff {
             match self.selecting(action) {
                 Ok(done) => return done,
@@ -1412,9 +1448,234 @@ impl App {
             Input::Click { x, y } => self.click(usize::from(x), usize::from(y)),
             Input::Drag { x, y } => self.drag(usize::from(x), usize::from(y)),
             Input::Release { .. } => return self.release(),
+            Input::RightClick { x, y } => self.open_menu(usize::from(x), usize::from(y)),
             Input::Key(..) | Input::Background { .. } | Input::Paste(_) => {}
         }
         None
+    }
+
+    /// Input while the menu is open; see [`Menu`]. A right click elsewhere
+    /// opens the menu there instead.
+    fn menu_input(&mut self, input: &Input) -> Option<Action> {
+        // An armed `d` is kept for the key right after it, never a later one.
+        self.deleting = false;
+        let size = (self.screen.width(), self.screen.height());
+        let menu = self.menu.as_mut()?;
+        let outcome = match *input {
+            Input::Key(key, mods) => menu.key(key, mods),
+            Input::Click { x, y } => menu.tap((usize::from(x), usize::from(y)), size),
+            Input::RightClick { x, y } => {
+                self.menu = None;
+                self.open_menu(usize::from(x), usize::from(y));
+                return None;
+            }
+            _ => menu::Outcome::Stay,
+        };
+        match outcome {
+            menu::Outcome::Stay => None,
+            menu::Outcome::Close => {
+                self.menu = None;
+                None
+            }
+            menu::Outcome::Run(run) => {
+                self.menu = None;
+                match run {
+                    Run::Action(action) => self.dispatch(action),
+                    Run::CopyLine => {
+                        self.dispatch(Act::Select);
+                        self.dispatch(Act::Copy)
+                    }
+                    Run::Thread(c) => self
+                        .thread_key(Key::Char(c), Mods::NONE, false)
+                        .ok()
+                        .flatten(),
+                    Run::Reveal(separator) => {
+                        self.doc.aim(separator);
+                        self.dispatch(Act::Expand)
+                    }
+                }
+            }
+        }
+    }
+
+    /// A right click: aims at what's under it as a left click does, without
+    /// opening, folding or revealing anything, then lists what the keys do
+    /// to it there. With nothing to act on, no menu opens.
+    fn open_menu(&mut self, x: usize, y: usize) {
+        self.press = None;
+        self.drag_edge = None;
+        self.deleting = false;
+        let (tree_top, tree_rows) = self.tree_rows();
+        let entries = if self.over_tree(x) && (tree_top..tree_top + tree_rows).contains(&y) {
+            // Under the panel's top border.
+            y.checked_sub(tree_top + 1)
+                .map(|line| self.aim_tree(line))
+                .unwrap_or_default()
+        } else if y == 0 || y + 1 >= self.screen.height() || x + 1 == self.screen.width() {
+            Vec::new()
+        } else {
+            self.aim_diff(x, y)
+        };
+        if !entries.is_empty() {
+            self.menu = Some(Menu::new((x, y), entries));
+        }
+    }
+
+    /// Selects the tree's row at `line`, the keys on the tree; for a file,
+    /// shows it, as moving onto it does, and lists the tree's keys for it.
+    fn aim_tree(&mut self, line: usize) -> Vec<menu::Entry> {
+        let Some(item) = self.tree.click(line) else {
+            return Vec::new();
+        };
+        self.pane = Pane::Tree;
+        let Item::File(file) = item else {
+            return Vec::new();
+        };
+        // `e` would open a line tapped before, maybe in another file.
+        self.tapped = None;
+        self.doc.goto_file(file);
+        let entry = &self.doc.document.files()[file];
+        let on_disk = !entry.is_commit() && !self.piped;
+        let editable = on_disk && entry.change().new.is_some();
+        let viewed = entry.viewed();
+        let commented = self.tree.commented();
+        let mut entries = vec![self.menu_entry(true, "Copy path", Act::CopyPath)];
+        if on_disk {
+            entries.push(self.menu_entry(true, "Copy absolute path", Act::CopyAbsolutePath));
+        }
+        if editable {
+            entries.push(self.menu_entry(true, "Open in editor", Act::Edit));
+        }
+        let mark = if viewed {
+            "Mark unviewed"
+        } else {
+            "Mark viewed"
+        };
+        entries.push(self.menu_entry(true, mark, Act::MarkViewed));
+        if self.comments.is_some() {
+            if on_disk {
+                entries.push(self.menu_entry(true, "Comment on file", Act::CommentFile));
+            }
+            let filter = if commented {
+                "Show every file"
+            } else {
+                "Show only files with comments"
+            };
+            entries.push(self.menu_entry(true, filter, Act::CommentedFiles));
+        }
+        entries
+    }
+
+    /// Aims at the diff's screen cell `x`, `y`: a thread takes the focus, a
+    /// separator is the one `x` reveals, and a line of code is where `v`
+    /// starts, the selection kept only when it holds the line. Lists the
+    /// keys for it.
+    fn aim_diff(&mut self, x: usize, y: usize) -> Vec<menu::Entry> {
+        self.pane = Pane::Diff;
+        match self.doc.block_row_at(y - 1) {
+            Some((Block::Thread(i), _)) => {
+                let thread = self.doc.threads()[i].clone();
+                self.doc.selection = None;
+                self.doc.set_focus(Some(thread.root.clone()));
+                return self.thread_entries(&thread);
+            }
+            Some((Block::New, _)) => return Vec::new(),
+            None => self.doc.set_focus(None),
+        }
+        if let Some(separator) = self.doc.separator_at(y - 1) {
+            self.doc.selection = None;
+            return vec![menu::Entry {
+                run: Run::Reveal(separator),
+                ..self.menu_entry(false, "Reveal hidden lines", Act::Expand)
+            }];
+        }
+        let Some((pos, side)) = self.code_at(x, y) else {
+            self.doc.selection = None;
+            return Vec::new();
+        };
+        let selected = self.doc.selection_holds(pos, side);
+        if !selected {
+            self.doc.selection = None;
+        }
+        self.tapped = Some((pos, side));
+        let entry = &self.doc.document.files()[pos.file];
+        let editable = !entry.is_commit() && !self.piped && entry.change().new.is_some();
+        let commentable = self.comments.is_some() && !entry.is_commit();
+        let mut entries = Vec::new();
+        if commentable {
+            let label = if selected {
+                "Comment on selection"
+            } else {
+                "Comment on line"
+            };
+            entries.push(self.menu_entry(false, label, Act::Comment));
+        }
+        if selected {
+            entries.push(self.menu_entry(false, "Copy selection", Act::Copy));
+        } else {
+            let key = match (
+                self.key_for(false, Act::Select),
+                self.key_for(false, Act::Copy),
+            ) {
+                (Some(v), Some(y)) => format!("{v} {y}"),
+                _ => String::new(),
+            };
+            entries.push(menu::Entry {
+                label: "Copy line".to_owned(),
+                key,
+                run: Run::CopyLine,
+            });
+        }
+        if editable {
+            entries.push(self.menu_entry(false, "Open in editor", Act::Edit));
+        }
+        entries
+    }
+
+    /// The focused thread's keys, as far as they'd act on `thread`.
+    fn thread_entries(&self, thread: &comments::Thread) -> Vec<menu::Entry> {
+        let key = |label: &str, c: char| menu::Entry {
+            label: label.to_owned(),
+            key: c.to_string(),
+            run: Run::Thread(c),
+        };
+        let mut entries = vec![key("Reply", 'r')];
+        if thread.notes.iter().any(|n| !n.posted()) {
+            entries.push(key("Edit draft", 'e'));
+            entries.push(key("Delete draft", 'd'));
+        }
+        entries.push(key(if thread.resolved { "Reopen" } else { "Resolve" }, 'x'));
+        let fold = if self.doc.fold.collapsed(&thread.root) {
+            "Unfold"
+        } else {
+            "Fold"
+        };
+        entries.push(self.menu_entry(false, fold, Act::ToggleThread));
+        if thread.url.as_deref().is_some_and(is_web) {
+            entries.push(key("Open on host", 'o'));
+        }
+        entries
+    }
+
+    /// An entry running `action` as its key does, in the tree (`tree`) or
+    /// the diff.
+    fn menu_entry(&self, tree: bool, label: &str, action: Act) -> menu::Entry {
+        menu::Entry {
+            label: label.to_owned(),
+            key: self.key_for(tree, action).unwrap_or_default(),
+            run: Run::Action(action),
+        }
+    }
+
+    /// The first key bound to `action` in the tree (`tree`) or the diff,
+    /// skipping keys the tree's own table takes for something else.
+    fn key_for(&self, tree: bool, action: Act) -> Option<String> {
+        self.keys
+            .chords(true, action)
+            .filter(|_| tree)
+            .chain(self.keys.chords(false, action))
+            .find(|c| self.keys.action(tree, c.key, c.mods) == Some(action))
+            .map(crate::keys::Chord::name)
     }
 
     /// Input while the command panel is open: a row's key or `enter` runs
@@ -1577,6 +1838,8 @@ impl App {
             Act::ToggleTree => toggle(self.tree_shown),
             Act::CommentedFiles => toggle(self.tree.commented()),
             Act::SinceLastReview => toggle(self.since_review()),
+            Act::WholeReview => (None, self.whole_review_title(), None),
+            Act::OpenReview => (None, format!("Open {}…", self.noun(false)), None),
             Act::ToggleFull => toggle(
                 self.doc
                     .document
@@ -1744,6 +2007,7 @@ impl App {
             | Act::ScrollRight
             | Act::ScrollReset
             | Act::CopyPath
+            | Act::CopyAbsolutePath
             | Act::Help
             | Act::Leader
             | Act::Quit => return Ok(self.act(action)),
@@ -1844,6 +2108,7 @@ impl App {
             Act::ToggleMouse => return Some(self.toggle_mouse()),
             Act::Edit => return self.edit(),
             Act::Comment
+            | Act::CommentFile
             | Act::Comments
             | Act::NextThread
             | Act::PrevThread
@@ -1851,16 +2116,18 @@ impl App {
             | Act::ToggleThreads
             | Act::CommentInEditor
             | Act::CommentedFiles => return self.comment_action(action),
-            Act::ReviewPull => return self.update_pr(),
+            Act::ReviewPull => return self.update_review(),
             Act::ReviewPost => return self.open_post(),
-            Act::OpenPullRequest => return self.open_pr_picker(),
+            Act::OpenReview => return self.open_review_picker(),
             Act::SinceLastReview => return self.toggle_since_review(),
+            Act::WholeReview => return self.toggle_whole_review(),
             Act::Help => self.help = Some(Help::default()),
             Act::ScrollRight | Act::ScrollLeft | Act::ScrollReset => self.scroll_code(action),
             Act::Select => self.start_selection(),
             Act::Copy if self.doc.selection.is_some() => return self.copy(),
             Act::Copy => self.message("nothing selected; v selects lines"),
             Act::CopyPath => return self.copy_path(),
+            Act::CopyAbsolutePath => return self.copy_full_path(),
             Act::HalfPageDown => self.scroll_diff(half),
             Act::HalfPageUp => self.scroll_diff(-half),
         }
@@ -2698,6 +2965,16 @@ impl App {
         })
     }
 
+    /// Where the file shown is on disk, which the loop knows.
+    fn copy_full_path(&mut self) -> Option<Action> {
+        let entry = self.doc.document.files().get(self.doc.document.pos.file)?;
+        if entry.is_commit() {
+            self.message("a commit has no file on disk");
+            return None;
+        }
+        Some(Action::CopyFullPath(entry.change().path.clone()))
+    }
+
     /// An action while the tree has the keys.
     fn tree_action(&mut self, action: Act) {
         let moved = match action {
@@ -2913,8 +3190,12 @@ impl App {
         None
     }
 
+    /// `e`: the file in the editor at the line last tapped, as `v` starts
+    /// there, else at the top line.
     fn edit(&mut self) -> Option<Action> {
-        let entry = self.doc.document.files().get(self.doc.document.pos.file)?;
+        let tapped = self.take_tapped().map(|(pos, _)| pos);
+        let file = tapped.map_or(self.doc.document.pos.file, |pos| pos.file);
+        let entry = self.doc.document.files().get(file)?;
         if entry.is_commit() {
             self.message("a commit has no file to open");
             return None;
@@ -2925,24 +3206,40 @@ impl App {
             return None;
         }
         let path = change.path.clone();
-        let line = self.doc.line_at_top();
+        let line = match tapped {
+            Some(pos) => self.doc.line_at(pos),
+            None => self.doc.line_at_top(),
+        };
         Some(Action::Edit { path, line })
     }
 
     /// Takes the comments in `path`, reloaded whenever [`Event::Comments`]
     /// says it changed.
     pub(crate) fn set_comments(&mut self, path: PathBuf) {
-        self.comments = Some(Comments::new(path));
+        let session = self.reviewing.is_some();
+        self.comments = Some(Comments::new(path, self.local_comments.clone(), session));
         self.reload_comments();
     }
 
-    /// Reads the comments file again and places the threads that changed
-    /// on the files already diffed. Says the file's notice, if it has one.
+    /// Takes the local review's file, whose drafts show on a review
+    /// session's diff.
+    pub(crate) fn set_local_comments(&mut self, path: Option<PathBuf>) {
+        self.local_comments = path;
+    }
+
+    /// The files [`App::set_comments`] with `path` reads, to watch.
+    pub(crate) fn comment_files(&self, path: PathBuf) -> Vec<PathBuf> {
+        Comments::new(path, self.local_comments.clone(), false).sources()
+    }
+
+    /// Reads the comments file again, if it changed since the last read,
+    /// and places the threads that changed on the files already diffed.
+    /// Says the file's notice, if it has one.
     fn reload_comments(&mut self) {
         let Some(comments) = &mut self.comments else {
             return;
         };
-        match comments.reload() {
+        match comments.refresh() {
             Ok(None) => {}
             Ok(Some(changed)) => {
                 self.placed_again(&changed);
@@ -2972,8 +3269,11 @@ impl App {
         self.dirty = true;
     }
 
-    /// Places the threads of `file`, diffed or failed to be, if it has any.
+    /// Places the threads of `file`, diffed or failed to be, if it has any,
+    /// and reveals the lines of each, folded or not, that a gap hid, so it
+    /// hangs under its own line; positions stay on their lines.
     fn place(&mut self, file: usize) {
+        let highlight = self.highlight;
         let (Some(comments), Some(entry)) =
             (&mut self.comments, self.doc.document.files().get(file))
         else {
@@ -2983,13 +3283,30 @@ impl App {
         if !comments.has(path) {
             return;
         }
-        match entry.state() {
+        let threads = match entry.state() {
             State::Loaded(loaded) => {
                 let diff = comments::line_diff(loaded);
-                comments.place(path, entry.version(), Some([&diff.old, &diff.new]));
+                let texts = Some([&diff.old, &diff.new]);
+                comments.place(path, entry.version(), texts, highlight);
+                comments.threads(path)
             }
-            State::Failed(_) => comments.place(path, entry.version(), None),
+            State::Failed(_) => {
+                comments.place(path, entry.version(), None, highlight);
+                None
+            }
             State::Pending => return,
+        };
+        let mut revealed = false;
+        for thread in threads.iter().flat_map(|t| t.iter()) {
+            if let comments::At::Line { side, lines } = &thread.at {
+                let document = &mut self.doc.document;
+                revealed |= document.reveal_lines(file, *side, lines.clone(), THREAD_CONTEXT);
+            }
+        }
+        if revealed {
+            self.doc.normalize();
+            self.dirty = true;
+            self.kept = false;
         }
         // `m`, `M` or the panel went here before its threads were.
         if let Some((pending, _)) = &self.thread_pending
@@ -3064,7 +3381,7 @@ impl App {
                 let root = root.or_else(|| ids.into_iter().next().flatten());
                 self.sync_threads();
                 if let Some(root) = root {
-                    self.doc.go_to_thread(&root);
+                    self.doc.focus_thread(&root);
                 }
             }
             None => {
@@ -3105,7 +3422,7 @@ impl App {
 
     /// Input while the text box is open: every key edits it but `esc`,
     /// which saves it (an empty text discards it, and so does a second
-    /// `esc` after a save failed), `ctrl+e`, which hands it to the editor,
+    /// `esc` after a save failed), `ctrl+g`, which hands it to the editor,
     /// and `ctrl+c`, which saves it and quits. The wheel still scrolls.
     fn writing_input(&mut self, input: Input) -> Option<Action> {
         let ctrl = |mods: Mods| mods.contains(Mods::CTRL);
@@ -3122,7 +3439,9 @@ impl App {
                 self.close_box();
                 return Some(Action::Quit);
             }
-            Input::Key(Key::Char('e'), mods) if ctrl(mods) => {
+            // Not ctrl+e: Ghostty sends it for cmd+right, which the box
+            // takes as the end of the row.
+            Input::Key(Key::Char('g'), mods) if ctrl(mods) => {
                 let writing = self.doc.writing.take()?;
                 let text = writing.text.text().to_owned();
                 self.handed = Some((text.clone(), writing.at));
@@ -3218,6 +3537,35 @@ impl App {
         }
     }
 
+    /// `C`: the text box for a comment on the whole file shown, under its
+    /// first row.
+    fn comment_file(&mut self) {
+        if !self.can_comment() {
+            return;
+        }
+        let Some(entry) = self.doc.document.files().get(self.doc.document.pos.file) else {
+            return;
+        };
+        if entry.is_commit() {
+            self.message("a commit has no file to comment on");
+            return;
+        }
+        match comments::file_draft(entry.change()) {
+            Ok(comment) => {
+                // The box is in the diff, which a tree over it would hide.
+                if self.pane == Pane::Tree {
+                    self.pane = Pane::Diff;
+                    if !self.side_tree() {
+                        self.show_tree(false);
+                    }
+                }
+                self.doc.set_focus(None);
+                self.open_box(Compose::New(Box::new(comment)), Writes::File, "");
+            }
+            Err(why) => self.message(why),
+        }
+    }
+
     /// The command panel's "Continue in editor": your last draft in the
     /// focused thread, else a reply to it, else a new comment on the line,
     /// written in the editor. The text box is the way in from a phone:
@@ -3227,7 +3575,7 @@ impl App {
             return None;
         }
         let focused = self.doc.focused().map(|t| {
-            let draft = t.notes.iter().rev().find(|n| n.draft);
+            let draft = t.notes.iter().rev().find(|n| !n.posted());
             (
                 t.root.clone(),
                 draft.map(|n| (n.id.clone(), n.text.clone())),
@@ -3260,14 +3608,17 @@ impl App {
             .filter(|_| mods == Mods::NONE)
             .ok_or(())?
             .clone();
-        let draft = thread.notes.iter().rev().find(|n| n.draft);
+        let draft = thread.notes.iter().rev().find(|n| !n.posted());
         match key {
             Key::Esc => self.doc.set_focus(None),
             Key::Char('r') => {
-                if thread.outdated && !std::mem::replace(&mut self.warned_outdated, true) {
-                    self.message(
-                        "outdated: GitHub collapses this thread, so a reply there is easy to miss",
-                    );
+                let warning = (self.naming.as_ref())
+                    .and_then(|n| n.outdated_reply_warning.as_deref())
+                    .filter(|_| thread.outdated && !self.warned_outdated);
+                if let Some(warning) = warning {
+                    let note = format!("outdated: {}", escape(warning.as_bytes()));
+                    self.warned_outdated = true;
+                    self.message(note);
                 }
                 let root = thread.root.clone();
                 self.open_box(Compose::Reply(root.clone()), Writes::Reply(root), "");
@@ -3287,9 +3638,9 @@ impl App {
                 None => self.message("no draft here to edit; posted comments are the host's"),
             },
             Key::Char('x') => {
-                let change = review::Change {
+                let change = Change {
                     resolved: Some(!thread.resolved),
-                    ..review::Change::default()
+                    ..Change::default()
                 };
                 let note = if thread.resolved {
                     "thread reopened"
@@ -3337,6 +3688,7 @@ impl App {
     fn comment_action(&mut self, action: Act) -> Option<Action> {
         match action {
             Act::Comment => self.comment(),
+            Act::CommentFile => self.comment_file(),
             Act::Comments => self.open_panel(),
             Act::NextThread | Act::PrevThread => {
                 self.doc.selection = None;
@@ -3764,9 +4116,10 @@ impl App {
             || self.help.is_some()
             || self.commands.is_some()
             || self.panel.is_some()
-            || self.prs.is_some()
+            || self.reviews.is_some()
             || self.posting.is_some()
-            || self.held.is_some();
+            || self.held.is_some()
+            || self.menu.is_some();
         self.sync_threads();
         self.doc.now = now();
         let unsent = self.unsent();
@@ -3844,14 +4197,17 @@ impl App {
         if let Some(help) = &mut self.help {
             help.draw(grid, &self.theme, &self.keys);
         }
-        if let Some(picker) = &mut self.prs {
+        if let Some(picker) = &mut self.reviews {
             picker.draw(grid, &self.theme);
         }
-        if let (Some(dialog), Some(pr)) = (&mut self.posting, &self.pr) {
-            dialog.draw(grid, &self.theme, pr, unsent);
+        if let (Some(dialog), Some(mode)) = (&mut self.posting, &self.reviewing) {
+            dialog.draw(grid, &self.theme, mode, unsent);
         }
-        if let (Some(held), Some(pr), false) = (&self.held, &self.pr, held_waits) {
-            held.draw(grid, &self.theme, pr);
+        if let (Some(held), Some(mode), false) = (&self.held, &self.reviewing, held_waits) {
+            held.draw(grid, &self.theme, mode);
+        }
+        if let Some(menu) = &self.menu {
+            menu.draw(grid, &self.theme);
         }
         self.kept = !overlays && !chrome.overlay;
         // The terminal scrolls whole rows, so the cell diff sends the tree's
@@ -4138,11 +4494,11 @@ fn note(app: &App) -> Option<String> {
         .map(|(text, _)| text.clone())
         .or_else(|| {
             if app.doc.writing.is_some() {
-                return Some("esc saves · ctrl+e continues in $EDITOR".to_owned());
+                return Some("esc saves · ctrl+g continues in $EDITOR".to_owned());
             }
             let thread = app.doc.focused().filter(|_| app.doc.selection.is_none())?;
             let mut keys = vec!["r reply"];
-            if thread.notes.iter().any(|n| n.draft) {
+            if thread.notes.iter().any(|n| !n.posted()) {
                 keys.extend(["e edit", "d delete"]);
             }
             keys.push(if thread.resolved {
@@ -4175,7 +4531,8 @@ fn note(app: &App) -> Option<String> {
 }
 
 /// The review's part of the status bar: `PR #7 · 18 threads · 2 drafts`,
-/// the PR in PR mode and the counts when the comments file has threads.
+/// the review in review mode and the counts when the comments file has
+/// threads.
 fn review_status(app: &App) -> Option<String> {
     let (threads, drafts) = app.comments.as_ref().map_or((0, 0), Comments::counts);
     let s = |n: usize| if n == 1 { "" } else { "s" };
@@ -4186,9 +4543,9 @@ fn review_status(app: &App) -> Option<String> {
         }
         text
     });
-    match (app.pr_status(), counts) {
-        (Some(pr), Some(counts)) => Some(format!("{pr} · {counts}")),
-        (pr, counts) => pr.or(counts),
+    match (app.review_part(), counts) {
+        (Some(review), Some(counts)) => Some(format!("{review} · {counts}")),
+        (review, counts) => review.or(counts),
     }
 }
 
@@ -4257,7 +4614,8 @@ mod tests {
     use dffy_core::git::{ChangeSet, FileDiff, Mode, Repo, Side};
 
     use super::*;
-    use crate::plugin::review::{Draft, Plan, Pr, Reason, Said, Session};
+    use crate::plugin::review::{Draft, Listed, Plan, Reason, Said, Session};
+    use crate::review;
 
     /// `fd` prepared as a worker does without highlighting.
     fn loaded(fd: FileDiff) -> File {
@@ -7021,7 +7379,8 @@ mod tests {
         assert_eq!(anchor.after, ["line 3", "line four"]);
         assert_eq!(comment.distance, Some(2));
         let shown = screen(&mut app);
-        let rows: Vec<&str> = shown.lines().filter(|l| l.contains('◆')).collect();
+        // Outside a review session nothing is posted, so nothing's a draft.
+        let rows: Vec<&str> = shown.lines().filter(|l| l.contains('●')).collect();
         assert_eq!(rows.len(), 2, "{shown}");
         assert!(rows[0].contains("line 1") && rows[1].contains("line 2"));
         let below = shown
@@ -7029,7 +7388,7 @@ mod tests {
             .skip_while(|l| !l.contains("line 2"))
             .nth(1)
             .unwrap_or_default();
-        assert!(below.contains("▾ you · just now · draft"), "{shown}");
+        assert!(below.contains("▾ you · just now ━"), "{shown}");
         assert_eq!(
             app.doc.focused().map(|t| t.root.as_str()),
             Some(comment.id.as_str())
@@ -7054,11 +7413,12 @@ mod tests {
         assert_eq!(read_comments(&path).comments.len(), 0);
     }
 
-    /// `ctrl+e` hands the box's text to the editor through the compose
+    /// `ctrl+g` hands the box's text to the editor through the compose
     /// path; what's written there is saved. When the editor fails, the box
-    /// opens again with the text.
+    /// opens again with the text. `ctrl+e`, which Ghostty sends for
+    /// cmd+right, stays in the box.
     #[test]
-    fn ctrl_e_continues_the_box_in_the_editor() {
+    fn ctrl_g_continues_the_box_in_the_editor() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("comments.json");
         let mut app = app(100, 20);
@@ -7066,14 +7426,18 @@ mod tests {
         screen(&mut app);
         key(&mut app, 'c');
         typed(&mut app, "Draft");
-        let ctrl_e = Event::Input(Input::Key(Key::Char('e'), Mods::CTRL));
-        assert_eq!(app.event(ctrl_e), Some(Action::Compose("Draft".to_owned())));
+        let ctrl = |c| Event::Input(Input::Key(Key::Char(c), Mods::CTRL));
+        assert_eq!(app.event(ctrl('e')), None);
+        assert!(app.doc.writing.is_some());
+        assert_eq!(
+            app.event(ctrl('g')),
+            Some(Action::Compose("Draft".to_owned()))
+        );
         assert!(app.doc.writing.is_none());
         app.composed(None);
         let reopened = app.doc.writing.as_ref().map(|w| w.text.text().to_owned());
         assert_eq!(reopened.as_deref(), Some("Draft"));
-        let ctrl_e = Event::Input(Input::Key(Key::Char('e'), Mods::CTRL));
-        assert!(app.event(ctrl_e).is_some());
+        assert!(app.event(ctrl('g')).is_some());
         app.composed(Some("Written in vim\n".to_owned()));
         let saved = read_comments(&path);
         assert_eq!(saved.comments.len(), 1);
@@ -7111,9 +7475,18 @@ mod tests {
     const BASE: &str = "aaaa111";
     const HEAD: &str = "bbbb222";
 
+    /// A plugin that calls a review `PR #7` and posts it with four events,
+    /// the first of which leaves it open on the host.
+    const DESCRIBED: &str = r##"{"version":1,"command":"pr","noun":"pull request","nouns":"pull requests","short":"PR","id_prefix":"#","events":[{"id":"pending","key":"p","label":"pending: on the host, for you only","done":"review pending","submits":false},{"id":"comment","key":"c","label":"comment","done":"commented"},{"id":"approve","key":"a","label":"approve","done":"approved"},{"id":"request_changes","key":"r","label":"request changes","done":"changes requested"}]}"##;
+
+    fn described(app: &mut App, answer: &str) {
+        app.set_naming(Some(Naming::decode(answer.as_bytes()).expect("decodes")));
+    }
+
     fn session(dir: &tempfile::TempDir, head: &str, last: Option<&str>) -> Session {
         Session {
-            number: 7,
+            id: "7".to_owned(),
+            label: None,
             title: Some("Spell out five".to_owned()),
             url: Some("https://github.com/acme/widgets/pull/7".to_owned()),
             base: BASE.to_owned(),
@@ -7143,19 +7516,105 @@ mod tests {
                 revisions,
                 comments,
                 moved,
-            }) => (revisions.revs.join(" "), comments, moved),
+            }) => (revisions.expect("a range").revs.join(" "), comments, moved),
             other => panic!("not a retarget: {other:?}"),
         }
     }
 
-    /// "Open pull request…" lists the PRs, grouped by why they're listed;
-    /// `enter` prepares one, whose session line switches the viewer to its
-    /// range and comments in place. Its threads keep downloading, which
-    /// the status bar shows. Runs replaced since say nothing.
+    /// The command panel, the picker, the notes and the titles say what
+    /// the review plugin reviews in its own words, and name a review by
+    /// its short form, its id prefix and its label, else its id; the id
+    /// is what the plugin's verbs take.
+    #[test]
+    fn review_labels_use_the_plugins_words() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut app = app(160, 20);
+        app.review = Some("test".to_owned());
+        described(
+            &mut app,
+            r#"{"version":1,"command":"mr","noun":"merge request","nouns":"merge requests","short":"MR","id_prefix":"!"}"#,
+        );
+        let entry = app
+            .command_entries()
+            .into_iter()
+            .find(|e| e.action == Act::OpenReview)
+            .expect("the panel's entry");
+        assert_eq!(entry.label, "Open merge request…");
+        press(&mut app, Key::Char('p'));
+        assert!(
+            status(&mut app).contains("not on a merge request; dffy mr <id> opens one"),
+            "{}",
+            status(&mut app)
+        );
+        key(&mut app, ' ');
+        let (list, _, _) = plugin_run(press(&mut app, Key::Char('P')));
+        assert!(status(&mut app).contains("listing merge requests…"));
+        said(
+            &mut app,
+            list,
+            Said::Listed(vec![Listed {
+                id: "I8f2c".to_owned(),
+                label: Some("12".to_owned()),
+                title: "Cache it".to_owned(),
+                author: "hubot".to_owned(),
+                reason: Reason::Mine,
+                group: None,
+            }]),
+        );
+        let picker = screen(&mut app);
+        assert!(
+            picker.contains(" merge requests ") && picker.contains("!12 ") && !picker.contains('#'),
+            "{picker}"
+        );
+        let (prepare, args, _) = plugin_run(press(&mut app, Key::Enter));
+        assert_eq!(args, ["prepare", "I8f2c"]);
+        assert!(status(&mut app).contains("fetching MR !12…"));
+        let session = Session {
+            id: "I8f2c".to_owned(),
+            label: Some("12".to_owned()),
+            ..session(&dir, HEAD, None)
+        };
+        said(&mut app, prepare, Said::Session(session));
+        assert!(status(&mut app).contains("MR !12 · Spell out five"));
+        app.message = None;
+        assert!(status(&mut app).contains("MR !12 · fetching threads"));
+        assert_eq!(app.description, "MR !12");
+        app.job = None;
+        let (_, args, _) = plugin_run(press(&mut app, Key::Char('p')));
+        assert_eq!(args, ["pull", "I8f2c"]);
+    }
+
+    /// Without a description, a review reads as one by its id, in words
+    /// any host's would fit.
+    #[test]
+    fn an_undescribed_plugin_reviews_reviews() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut app = app(160, 20);
+        app.review = Some("test".to_owned());
+        press(&mut app, Key::Char('p'));
+        assert!(status(&mut app).contains("not on a review"));
+        let entry = (app.command_entries().into_iter())
+            .find(|e| e.action == Act::OpenReview)
+            .expect("the panel's entry");
+        assert_eq!(entry.label, "Open review…");
+        let prepare = app.start_review("test".to_owned(), session(&dir, HEAD, None));
+        said(&mut app, prepare, Said::Progress("1/2".to_owned()));
+        app.message = None;
+        let shown = status(&mut app);
+        assert!(shown.contains("review 7 · fetching threads 1/2"), "{shown}");
+    }
+
+    /// "Open pull request…" lists the PRs, grouped by why they're listed:
+    /// the reasons dffy knows first, then the plugin's own groups in the
+    /// order they came, by its titles. `enter` prepares one, whose session
+    /// line switches the viewer to its range and comments in place. Its
+    /// threads keep downloading, which the status bar shows. Runs replaced
+    /// since say nothing.
     #[test]
     fn the_pr_picker_opens_a_pr_in_place() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let mut app = app(160, 20);
+        let mut app = app(160, 30);
+        described(&mut app, DESCRIBED);
         screen(&mut app);
         key(&mut app, ' ');
         assert_eq!(press(&mut app, Key::Char('P')), None);
@@ -7164,19 +7623,24 @@ mod tests {
         key(&mut app, ' ');
         let (list, args, _) = plugin_run(press(&mut app, Key::Char('P')));
         assert_eq!(args, ["list"]);
-        let pr = |number, reason| Pr {
-            number,
-            title: format!("Change {number}"),
+        let listed = |id: usize, reason, group: Option<&str>| Listed {
+            id: id.to_string(),
+            label: None,
+            title: format!("Change {id}"),
             author: "hubot".to_owned(),
             reason,
+            group: group.map(str::to_owned),
         };
         said(
             &mut app,
             list,
-            Said::Prs(vec![
-                pr(11, Reason::Mine),
-                pr(9, Reason::ReviewRequested),
-                pr(7, Reason::CurrentBranch),
+            Said::Listed(vec![
+                listed(3, Reason::Other, Some("Starred")),
+                listed(11, Reason::Mine, None),
+                listed(5, Reason::Other, Some("Mentions you")),
+                listed(9, Reason::ReviewRequested, None),
+                listed(4, Reason::Other, Some("Starred")),
+                listed(7, Reason::CurrentBranch, None),
             ]),
         );
         let shown = screen(&mut app);
@@ -7187,17 +7651,20 @@ mod tests {
         };
         assert!(at("This branch") < at("#7") && at("#7") < at("Waiting on your review"));
         assert!(at("#9") < at("Yours") && at("Yours") < at("#11"));
+        assert!(at("#11") < at("Starred") && at("Starred") < at("#3"));
+        assert!(at("#3") < at("#4") && at("#4") < at("Mentions you"));
+        assert!(at("Mentions you") < at("#5"));
         press(&mut app, Key::Down);
         let (prepare, args, _) = plugin_run(press(&mut app, Key::Enter));
         assert_eq!(args, ["prepare", "9"]);
-        assert!(app.prs.is_none());
-        assert!(status(&mut app).contains("fetching #9…"));
+        assert!(app.reviews.is_none());
+        assert!(status(&mut app).contains("fetching PR #9…"));
         assert_eq!(
             said(&mut app, list, Said::Progress("late".to_owned())),
             None
         );
         let nine = Session {
-            number: 9,
+            id: "9".to_owned(),
             ..session(&dir, HEAD, None)
         };
         let (revisions, comments, _) = range(said(&mut app, prepare, Said::Session(nine)));
@@ -7228,13 +7695,14 @@ mod tests {
     fn a_due_check_finds_the_pr_moved_and_p_updates_it_in_place() {
         let dir = tempfile::tempdir().expect("tempdir");
         let mut app = app(160, 20);
-        let prepare = app.start_pr("test".to_owned(), session(&dir, HEAD, None));
+        described(&mut app, DESCRIBED);
+        let prepare = app.start_review("test".to_owned(), session(&dir, HEAD, None));
         said(&mut app, prepare, Said::Done(Ok(())));
         let deadline = app.deadline().expect("a check is due later");
-        assert!(deadline + Duration::from_secs(5) > Instant::now() + pr::CHECK_EVERY);
+        assert!(deadline + Duration::from_secs(5) > Instant::now() + super::review::CHECK_EVERY);
         assert_eq!(app.event(Event::Tick), None);
 
-        app.pr.as_mut().expect("a PR").next_check = Instant::now();
+        app.reviewing.as_mut().expect("a PR").next_check = Instant::now();
         let (check, args, _) = plugin_run(app.event(Event::Tick));
         assert_eq!(args, ["check", "7"]);
         assert_eq!(app.event(Event::Tick), None, "one check at a time");
@@ -7264,7 +7732,7 @@ mod tests {
         assert_eq!(revisions, format!("{BASE}...cccc333"));
         assert_eq!(comments, None, "the same comments");
         assert_eq!(moved, Some((HEAD.to_owned(), "cccc333".to_owned())));
-        app.pr_updated(Some(3));
+        app.review_updated(Some(3));
         let shown = status(&mut app);
         assert!(shown.contains("PR #7 updated · 3 new commits"), "{shown}");
         said(&mut app, pull, Said::Done(Ok(())));
@@ -7283,19 +7751,20 @@ mod tests {
         assert!(status(&mut app).contains("PR #7 is up to date"));
     }
 
-    /// `P` shows what goes, a warning when the PR moved, and the events;
-    /// a letter picks one, `s` writes the summary, `enter` posts. The
-    /// status bar follows the post, and `o` opens the review it made.
+    /// `P` shows what goes, a warning when the PR moved, and the plugin's
+    /// events; a letter picks one, `s` writes the summary, `enter` posts.
+    /// The status bar follows the post, and `o` opens the review it made.
     #[test]
     fn the_post_dialog_sends_the_event_and_summary_picked() {
         let dir = tempfile::tempdir().expect("tempdir");
         let (mut app, path) = commented(&dir);
         app.resize(160, 30);
-        app.start_pr("test".to_owned(), session(&dir, HEAD, None));
+        described(&mut app, DESCRIBED);
+        app.start_review("test".to_owned(), session(&dir, HEAD, None));
         app.job = None;
         assert_eq!(path, dir.path().join("comments.json"), "the session's");
         app.note_resolve("p1", false);
-        app.pr.as_mut().expect("a PR").moved = Some("cccc333".to_owned());
+        app.reviewing.as_mut().expect("a PR").moved = Some("cccc333".to_owned());
         let (_, args, _) = plugin_run(press(&mut app, Key::Char('P')));
         assert_eq!(args, ["post", "7", "--dry-run"]);
         let shown = screen(&mut app);
@@ -7304,7 +7773,11 @@ mod tests {
             shown.contains("4 comments · 1 reply · 1 resolve change"),
             "{shown}"
         );
-        assert!(shown.contains("the PR has new commits"), "{shown}");
+        assert!(shown.contains("PR #7 has new commits"), "{shown}");
+        assert!(
+            shown.contains("( ) r  request changes"),
+            "the plugin's events: {shown}"
+        );
         key(&mut app, 'a');
         key(&mut app, 's');
         typed(&mut app, "Ship it");
@@ -7324,7 +7797,8 @@ mod tests {
             Said::Posted {
                 posted: 5,
                 failed: 0,
-                pending_review: false,
+                held: false,
+                held_message: None,
                 url: Some(url.to_owned()),
             },
         );
@@ -7335,9 +7809,161 @@ mod tests {
             press(&mut app, Key::Char('o')),
             Some(Action::Browse(url.to_owned()))
         );
-        let pr = app.pr.as_ref().expect("a PR");
-        assert_eq!(pr.session.last_reviewed_head.as_deref(), Some(HEAD));
-        assert!(pr.resolves.is_empty() && pr.summary.is_empty());
+        let mode = app.reviewing.as_ref().expect("a PR");
+        assert_eq!(mode.session.last_reviewed_head.as_deref(), Some(HEAD));
+        assert!(mode.resolves.is_empty() && mode.summary.is_empty());
+    }
+
+    /// The local review's file: a draft thread on new line 2 with a reply,
+    /// a draft whose line isn't in the PR's diff, and a posted comment.
+    const LOCAL: &str = r#"{"version":1,"comments":[
+{"id":"l1","path":"src/some/deeply/nested/module/file.rs","side":"new","start":{"old":2,"new":2},"end":{"old":2,"new":2},"text":"Local one","author":"","created":"2026-11-17T10:00:00Z","anchor":{"before":["line 1"],"lines":["line 2"],"after":["line 3"]}},
+{"id":"l2","path":"src/some/deeply/nested/module/file.rs","text":"Local reply","author":"","created":"2026-11-17T10:05:00Z","in_reply_to":"l1"},
+{"id":"l9","path":"src/some/deeply/nested/module/file.rs","side":"new","start":{"old":null,"new":30},"end":{"old":null,"new":30},"text":"Not on this diff","author":"","created":"2026-11-17T10:00:00Z","anchor":{"before":[],"lines":["only in the working tree"],"after":[]}},
+{"id":"lp","path":"src/some/deeply/nested/module/file.rs","text":"Posted from here","author":"","created":"2026-11-17T10:00:00Z","ref":"github:9"}
+]}"#;
+
+    /// The PR's file: your draft on new line 4, and a posted comment on
+    /// new line 50.
+    const PR_FILE: &str = r#"{"version":1,"comments":[
+{"id":"pd","path":"src/some/deeply/nested/module/file.rs","side":"new","start":{"old":null,"new":4},"end":{"old":null,"new":4},"text":"PR draft","author":"","created":"2026-11-17T10:00:00Z","anchor":{"before":[],"lines":["line four"],"after":[]}},
+{"id":"pp","path":"src/some/deeply/nested/module/file.rs","side":"new","start":{"old":null,"new":50},"end":{"old":null,"new":50},"text":"Fifty?","author":"octocat","created":"2026-11-17T10:00:00Z","ref":"github:1","anchor":{"before":[],"lines":["line fifty"],"after":[]}}
+]}"#;
+
+    /// A viewer on PR #7 with [`PR_FILE`], plain dffy's [`LOCAL`] beside it.
+    /// Returns the PR's file and the local one.
+    fn pr_with_local(dir: &tempfile::TempDir) -> (App, PathBuf, PathBuf) {
+        let (pr, local) = (
+            dir.path().join("comments.json"),
+            dir.path().join("local.json"),
+        );
+        std::fs::write(&pr, PR_FILE).expect("write");
+        std::fs::write(&local, LOCAL).expect("write");
+        let mut app = app(100, 30);
+        described(&mut app, DESCRIBED);
+        app.set_local_comments(Some(local.clone()));
+        app.start_review("test".to_owned(), session(dir, HEAD, None));
+        app.job = None;
+        app.set_comments(pr.clone());
+        (app, pr, local)
+    }
+
+    /// On a PR, the local review's drafts that place on its diff show with
+    /// a `local` chip and count as drafts; one that doesn't place stays out
+    /// of view and of the `i` list, and a posted one isn't brought. Edits
+    /// and replies in a local thread go to the local file, a new comment to
+    /// the PR's.
+    #[test]
+    fn local_drafts_show_on_a_pr_and_are_written_where_they_live() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (mut app, pr, local) = pr_with_local(&dir);
+        let shown = screen(&mut app);
+        assert!(shown.contains("draft · local"), "{shown}");
+        assert!(shown.contains("Local reply"), "{shown}");
+        assert!(!shown.contains("Not on this diff") && !shown.contains("Posted from here"));
+        assert_eq!(
+            app.unsent(),
+            super::review::Unsent {
+                comments: 2,
+                replies: 1,
+                resolves: 0,
+                local: 2
+            }
+        );
+        key(&mut app, 'i');
+        let list = screen(&mut app);
+        assert!(
+            list.contains("Local one") && !list.contains("Not on this diff"),
+            "{list}"
+        );
+        press(&mut app, Key::Esc);
+
+        let pr_before = std::fs::read(&pr).expect("read");
+        app.open_thread("l1");
+        // `e` takes the thread's last draft: the reply.
+        key(&mut app, 'e');
+        typed(&mut app, " more");
+        press(&mut app, Key::Esc);
+        key(&mut app, 'r');
+        typed(&mut app, "Again");
+        press(&mut app, Key::Esc);
+        let replies: Vec<_> = (read_comments(&local).comments.into_iter())
+            .filter(|c| c.in_reply_to.as_deref() == Some("l1"))
+            .map(|c| c.text)
+            .collect();
+        assert_eq!(replies, ["Local reply more", "Again"]);
+        assert_eq!(std::fs::read(&pr).expect("read"), pr_before, "not the PR's");
+        press(&mut app, Key::Esc);
+        key(&mut app, 'c');
+        typed(&mut app, "New here");
+        press(&mut app, Key::Esc);
+        let texts: Vec<String> = read_comments(&pr)
+            .comments
+            .into_iter()
+            .map(|c| c.text)
+            .collect();
+        assert_eq!(texts, ["PR draft", "Fifty?", "New here"]);
+        assert_eq!(read_comments(&local).comments.len(), 5);
+    }
+
+    /// The post dialog counts the local drafts in view with the plugin's
+    /// dry run, which doesn't see them. Sending moves them into the PR's
+    /// file, with new ids, before `post` runs, and out of the local file
+    /// after; when the PR's file can't take them, nothing is posted, the
+    /// dialog stays and both files are as they were.
+    #[test]
+    fn posting_moves_the_local_drafts_into_the_prs_file_first() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (mut app, pr, local) = pr_with_local(&dir);
+        let (check, args, _) = plugin_run(press(&mut app, Key::Char('P')));
+        assert_eq!(args, ["post", "7", "--dry-run"]);
+        let shown = screen(&mut app);
+        assert!(shown.contains("2 comments · 1 reply (2 local)"), "{shown}");
+        said(
+            &mut app,
+            check,
+            Said::Planned {
+                line: 0,
+                file: 1,
+                skip: 0,
+            },
+        );
+        let shown = screen(&mut app);
+        assert!(
+            shown.contains("3 comments (2 local) · 1 as a file comment"),
+            "{shown}"
+        );
+
+        std::fs::write(&pr, r#"{"version":2,"comments":[]}"#).expect("write");
+        let local_before = std::fs::read(&local).expect("read");
+        assert_eq!(press(&mut app, Key::Enter), None);
+        assert!(app.posting.is_some(), "the dialog stays");
+        assert!(status(&mut app).contains("nothing posted"));
+        assert_eq!(std::fs::read(&local).expect("read"), local_before);
+        assert_eq!(
+            std::fs::read_to_string(&pr).expect("read"),
+            r#"{"version":2,"comments":[]}"#
+        );
+
+        std::fs::write(&pr, PR_FILE).expect("write");
+        let (_, args, _) = plugin_run(press(&mut app, Key::Enter));
+        assert_eq!(args, ["post", "7", "--event", "pending"]);
+        let left: Vec<String> = read_comments(&local)
+            .comments
+            .into_iter()
+            .map(|c| c.id)
+            .collect();
+        assert_eq!(left, ["l9", "lp"]);
+        let moved = read_comments(&pr).comments;
+        let texts: Vec<&str> = moved.iter().map(|c| c.text.as_str()).collect();
+        assert_eq!(texts, ["PR draft", "Fifty?", "Local one", "Local reply"]);
+        assert!(moved[2].id != "l1" && moved[2].reference.is_none());
+        assert_eq!(moved[3].in_reply_to.as_ref(), Some(&moved[2].id));
+        let shown = screen(&mut app);
+        assert!(
+            shown.contains("Local one") && !shown.contains("· local"),
+            "{shown}"
+        );
     }
 
     fn draft(id: &str, plan: Plan) -> Said {
@@ -7365,7 +7991,8 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let (mut app, _) = commented(&dir);
         app.resize(160, 30);
-        let prepare = app.start_pr("test".to_owned(), session(&dir, HEAD, None));
+        described(&mut app, DESCRIBED);
+        let prepare = app.start_review("test".to_owned(), session(&dir, HEAD, None));
         screen(&mut app);
         let (check, args, _) = plugin_run(press(&mut app, Key::Char('P')));
         assert_eq!(args, ["post", "7", "--dry-run"]);
@@ -7407,7 +8034,10 @@ mod tests {
 
         key(&mut app, 'v');
         assert!(app.posting.is_none());
-        assert_eq!(app.pr.as_ref().map(|p| p.summary.as_str()), Some("Later"));
+        assert_eq!(
+            app.reviewing.as_ref().map(|p| p.summary.as_str()),
+            Some("Later")
+        );
         assert_eq!(focused(&app), Some("d1"), "the reply's thread");
         let shown = status(&mut app);
         assert!(
@@ -7423,7 +8053,8 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let (mut app, _) = commented(&dir);
         app.resize(160, 30);
-        app.start_pr("test".to_owned(), session(&dir, HEAD, None));
+        described(&mut app, DESCRIBED);
+        app.start_review("test".to_owned(), session(&dir, HEAD, None));
         app.job = None;
         let (check, ..) = plugin_run(press(&mut app, Key::Char('P')));
         said(&mut app, check, Said::Done(Ok(())));
@@ -7437,7 +8068,8 @@ mod tests {
             Said::Posted {
                 posted: 3,
                 failed: 2,
-                pending_review: false,
+                held: false,
+                held_message: None,
                 url: None,
             },
         );
@@ -7450,11 +8082,11 @@ mod tests {
         );
     }
 
-    /// A post the host refused comments in, with an event other than
-    /// pending, leaves the review pending and asks what to do: `s` submits
-    /// it without them, `f` goes to the first of them, `k` keeps it
-    /// pending. The prompt waits while another overlay has the keys. The
-    /// status bar says how it ended, even after the plugin's notice.
+    /// A post the host refused comments in, with an event that submits,
+    /// is held back, in the plugin's words, and asks what to do: `s`
+    /// applies the event without them, `f` goes to the first of them, `k`
+    /// leaves it. The prompt waits while another overlay has the keys.
+    /// The status bar says how it ended, even after the plugin's notice.
     #[test]
     fn a_post_with_comments_refused_asks_what_to_do() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -7462,7 +8094,8 @@ mod tests {
         let held = || {
             let (mut app, path) = commented(&dir);
             app.resize(160, 30);
-            app.start_pr("test".to_owned(), session(&dir, HEAD, None));
+            described(&mut app, DESCRIBED);
+            app.start_review("test".to_owned(), session(&dir, HEAD, None));
             app.job = None;
             screen(&mut app);
             let (check, ..) = plugin_run(press(&mut app, Key::Char('P')));
@@ -7484,7 +8117,8 @@ mod tests {
                 Said::Posted {
                     posted: 1,
                     failed: 2,
-                    pending_review: true,
+                    held: true,
+                    held_message: Some("review still pending".to_owned()),
                     url: Some(url.to_owned()),
                 },
             );
@@ -7492,6 +8126,11 @@ mod tests {
             let shown = screen(&mut app);
             assert!(shown.contains("2 comments weren't posted"), "{shown}");
             assert!(shown.contains("Line could not be resolved"), "{shown}");
+            assert!(
+                shown.contains("so “approve” wasn't applied")
+                    && shown.contains("s  approve without them"),
+                "{shown}"
+            );
             (app, path)
         };
         let notice = |app: &mut App, path: &PathBuf| {
@@ -7506,7 +8145,7 @@ mod tests {
 
         let (mut app, path) = held();
         let (submit, args, summary) = plugin_run(press(&mut app, Key::Char('s')));
-        assert_eq!(args, ["post", "7", "--submit-only", "--event", "approve"]);
+        assert_eq!(args, ["post", "7", "--apply-event", "--event", "approve"]);
         assert_eq!(summary.as_deref(), Some("Ship it"));
         said(
             &mut app,
@@ -7514,7 +8153,8 @@ mod tests {
             Said::Posted {
                 posted: 0,
                 failed: 0,
-                pending_review: false,
+                held: false,
+                held_message: None,
                 url: Some(url.to_owned()),
             },
         );
@@ -7524,7 +8164,7 @@ mod tests {
             shown.contains("approved · 2 comments not posted"),
             "{shown}"
         );
-        assert!(app.pr.as_ref().is_some_and(|p| p.summary.is_empty()));
+        assert!(app.reviewing.as_ref().is_some_and(|p| p.summary.is_empty()));
 
         let (mut app, path) = held();
         assert_eq!(press(&mut app, Key::Char('f')), None);
@@ -7550,8 +8190,131 @@ mod tests {
             shown.contains("review still pending · 2 not posted"),
             "{shown}"
         );
-        let pr = app.pr.as_ref().expect("a PR");
-        assert_eq!(pr.summary, "Ship it", "kept for the next post");
+        let mode = app.reviewing.as_ref().expect("a PR");
+        assert_eq!(mode.summary, "Ship it", "kept for the next post");
+    }
+
+    /// An event that leaves the review open on the host isn't held back by
+    /// refused drafts, so nothing asks; with nothing posted, it says so.
+    #[test]
+    fn an_event_that_doesnt_submit_isnt_held() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (mut app, _) = commented(&dir);
+        app.resize(160, 30);
+        described(&mut app, DESCRIBED);
+        app.start_review("test".to_owned(), session(&dir, HEAD, None));
+        app.job = None;
+        for (posted, failed, said_after) in [
+            (2, 1, "review pending · 1 comment not posted"),
+            (0, 0, "nothing posted"),
+        ] {
+            let (check, ..) = plugin_run(press(&mut app, Key::Char('P')));
+            said(&mut app, check, Said::Done(Ok(())));
+            key(&mut app, 'p');
+            let (post, args, _) = plugin_run(press(&mut app, Key::Enter));
+            assert_eq!(args, ["post", "7", "--event", "pending"]);
+            said(
+                &mut app,
+                post,
+                Said::Posted {
+                    posted,
+                    failed,
+                    held: false,
+                    held_message: None,
+                    url: None,
+                },
+            );
+            said(&mut app, post, Said::Done(Ok(())));
+            assert!(app.held.is_none());
+            let shown = status(&mut app);
+            assert!(shown.contains(said_after), "{shown}");
+        }
+    }
+
+    /// A plugin that names no events posts with one, `post`, and the
+    /// review it held back reads as not sent.
+    #[test]
+    fn without_events_a_review_is_posted() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (mut app, _) = commented(&dir);
+        app.resize(160, 30);
+        described(
+            &mut app,
+            r#"{"version":1,"command":"cr","noun":"change","nouns":"changes"}"#,
+        );
+        app.start_review("test".to_owned(), session(&dir, HEAD, None));
+        app.job = None;
+        let (check, ..) = plugin_run(press(&mut app, Key::Char('P')));
+        said(&mut app, check, Said::Done(Ok(())));
+        let shown = screen(&mut app);
+        assert!(shown.contains("(•) p  post"), "{shown}");
+        let (post, args, _) = plugin_run(press(&mut app, Key::Enter));
+        assert_eq!(args, ["post", "7", "--event", "post"]);
+        said(&mut app, post, draft("d1", skip("Refused")));
+        said(
+            &mut app,
+            post,
+            Said::Posted {
+                posted: 0,
+                failed: 1,
+                held: true,
+                held_message: None,
+                url: None,
+            },
+        );
+        said(&mut app, post, Said::Done(Ok(())));
+        let shown = screen(&mut app);
+        assert!(shown.contains("review not sent · change 7"), "{shown}");
+        assert!(shown.contains("s  post without them"), "{shown}");
+        press(&mut app, Key::Char('k'));
+        assert!(status(&mut app).contains("change 7 · review not sent · 1 not posted"));
+    }
+
+    /// The plugin's notice, written as its post ends, is what the status
+    /// bar says after it, over dffy's own words for how it went, which the
+    /// review's part keeps; whether the watcher read it first or the
+    /// run's end did.
+    #[test]
+    fn the_plugins_notice_outlasts_the_post() {
+        let url = "https://example.com/review/7";
+        for watched in [false, true] {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let (mut app, path) = commented(&dir);
+            app.resize(160, 30);
+            described(&mut app, DESCRIBED);
+            app.start_review("test".to_owned(), session(&dir, HEAD, None));
+            app.job = None;
+            let (check, ..) = plugin_run(press(&mut app, Key::Char('P')));
+            said(&mut app, check, Said::Done(Ok(())));
+            key(&mut app, 'c');
+            let (post, ..) = plugin_run(press(&mut app, Key::Enter));
+            said(
+                &mut app,
+                post,
+                Said::Posted {
+                    posted: 3,
+                    failed: 0,
+                    held: false,
+                    held_message: None,
+                    url: Some(url.to_owned()),
+                },
+            );
+            review::apply(
+                &path,
+                vec![Op::Notice(Some("a resolve was refused".to_owned()))],
+            )
+            .expect("applies");
+            if watched {
+                app.event(Event::Comments);
+            }
+            said(&mut app, post, Said::Done(Ok(())));
+            let shown = status(&mut app);
+            assert!(
+                shown.contains("a resolve was refused"),
+                "{watched}: {shown}"
+            );
+            assert!(shown.contains("PR #7 · review sent"), "{watched}: {shown}");
+        }
     }
 
     /// "Since last review" switches to the range from the head last
@@ -7560,11 +8323,16 @@ mod tests {
     fn since_last_review_toggles_the_range() {
         let dir = tempfile::tempdir().expect("tempdir");
         let mut app = app(160, 20);
-        app.start_pr("test".to_owned(), session(&dir, HEAD, None));
+        described(&mut app, DESCRIBED);
+        app.start_review("test".to_owned(), session(&dir, HEAD, None));
         key(&mut app, ' ');
         assert_eq!(press(&mut app, Key::Char('R')), None);
         assert!(status(&mut app).contains("no review of yours posted"));
-        app.pr.as_mut().expect("a PR").session.last_reviewed_head = Some("9999aaa".to_owned());
+        app.reviewing
+            .as_mut()
+            .expect("a PR")
+            .session
+            .last_reviewed_head = Some("9999aaa".to_owned());
         key(&mut app, ' ');
         let (revisions, ..) = range(press(&mut app, Key::Char('R')));
         assert_eq!(revisions, format!("9999aaa..{HEAD}"));
@@ -7575,13 +8343,22 @@ mod tests {
         assert_eq!(revisions, format!("{BASE}...{HEAD}"));
     }
 
-    /// The branch's PR, found by `detect`, is prepared and shown from its
-    /// base against the working tree; with none, nothing changes.
+    /// The branch's PR, found by `detect`, is prepared and brings its
+    /// comments to plain dffy's range, which stays; "Show whole pull
+    /// request" shows its base against the working tree, and goes back.
+    /// With no PR, nothing changes.
     #[test]
-    fn a_detected_pr_shows_against_the_working_tree() {
+    fn a_detected_pr_keeps_the_range_and_adds_its_comments() {
         let dir = tempfile::tempdir().expect("tempdir");
         let mut app = app(160, 20);
-        let Action::Plugin { id, args, .. } = app.detect_pr("test".to_owned()) else {
+        described(&mut app, DESCRIBED);
+        let plain = Revisions {
+            unstaged: true,
+            ..Revisions::default()
+        };
+        app.set_selected(plain.clone(), DefaultDiff::Unstaged);
+        let title = app.description.clone();
+        let Action::Plugin { id, args, .. } = app.detect_review("test".to_owned()) else {
             panic!("a run");
         };
         assert_eq!(args, ["detect"]);
@@ -7598,21 +8375,39 @@ mod tests {
                 comments,
                 ..
             }) => {
-                assert_eq!(revisions.revs, [BASE]);
-                assert!(revisions.merge_base && !revisions.staged);
+                assert_eq!(revisions, None, "the range stays");
                 assert_eq!(comments, Some(dir.path().join("comments.json")));
             }
             other => panic!("not a retarget: {other:?}"),
         }
+        assert_eq!(app.description, title);
+        let whole = |app: &mut App| {
+            key(app, ' ');
+            match press(app, Key::Char('A')) {
+                Some(Action::Retarget {
+                    revisions: Some(revisions),
+                    comments: None,
+                    ..
+                }) => revisions,
+                other => panic!("not a retarget: {other:?}"),
+            }
+        };
+        let revisions = whole(&mut app);
+        assert_eq!(revisions.revs, [BASE]);
+        assert!(revisions.merge_base && !revisions.staged);
         assert_eq!(app.description, "PR #7 + working tree");
+        assert_eq!(app.whole_review_title(), "Show working tree changes");
+        assert_eq!(whole(&mut app), plain);
+        assert_eq!(app.description, title);
+        assert_eq!(app.whole_review_title(), "Show whole pull request");
 
         let mut app = self::app(160, 20);
-        let Action::Plugin { id, .. } = app.detect_pr("test".to_owned()) else {
+        let Action::Plugin { id, .. } = app.detect_review("test".to_owned()) else {
             panic!("a run");
         };
         assert_eq!(said(&mut app, id, Said::Detected(None)), None);
         said(&mut app, id, Said::Done(Ok(())));
-        assert!(app.pr.is_none() && app.job.is_none());
+        assert!(app.reviewing.is_none() && app.job.is_none());
     }
 
     /// Listing PRs runs beside a `prepare`, which keeps saying how far it
@@ -7621,7 +8416,8 @@ mod tests {
     fn listing_prs_leaves_the_run_going_on() {
         let dir = tempfile::tempdir().expect("tempdir");
         let mut app = app(160, 20);
-        let prepare = app.start_pr("test".to_owned(), session(&dir, HEAD, None));
+        described(&mut app, DESCRIBED);
+        let prepare = app.start_review("test".to_owned(), session(&dir, HEAD, None));
         key(&mut app, ' ');
         let (list, args, _) = plugin_run(press(&mut app, Key::Char('P')));
         assert_eq!(args, ["list"]);
@@ -7636,7 +8432,7 @@ mod tests {
     fn review_keys_refuse_a_piped_diff_and_need_a_pr() {
         let mut app = app(100, 20);
         assert_eq!(press(&mut app, Key::Char('p')), None);
-        assert!(screen(&mut app).contains("not on a pull request"));
+        assert!(screen(&mut app).contains("not on a review"));
         app.set_piped();
         app.review = Some("test".to_owned());
         key(&mut app, ' ');
@@ -7648,13 +8444,17 @@ mod tests {
     /// author, age and state, replies indented; the comment on the whole
     /// file under its first row. The gutter keeps a mark per thread, the
     /// tree counts each file's comments, and the status bar counts the
-    /// threads and drafts.
+    /// threads, and in a review session the drafts.
     #[test]
     fn threads_show_inline_under_their_lines() {
         let dir = tempfile::tempdir().expect("tempdir");
         let (mut app, _) = commented(&dir);
         insta::assert_snapshot!("comment_marks", screen(&mut app));
         app.resize(160, 30);
+        let wide = screen(&mut app);
+        assert!(wide.contains("6 threads ─"), "{wide}");
+        let prepare = app.start_review("test".to_owned(), session(&dir, HEAD, None));
+        said(&mut app, prepare, Said::Done(Ok(())));
         let wide = screen(&mut app);
         assert!(wide.contains("6 threads · 5 drafts"), "{wide}");
     }
@@ -7705,7 +8505,7 @@ mod tests {
         assert_eq!(app.doc.focused().map(|t| t.root.as_str()), Some("m1"));
         let shown = screen(&mut app);
         assert!(
-            shown.contains("lines not found") && shown.contains("Moved away"),
+            shown.contains("line 10 not found") && shown.contains("Moved away"),
             "{shown}"
         );
     }
@@ -7828,10 +8628,12 @@ mod tests {
         assert!(find("d1").is_some_and(|c| !c.resolved));
     }
 
-    /// A thread on lines a `⋯` separator hides shows under the separator,
-    /// where `m` finds it; revealing the lines puts it under its own.
+    /// A thread placed on lines a `⋯` separator hides reveals them, two
+    /// lines around them and no more: it hangs under its own line, between
+    /// a separator for the hidden lines above and one for those below, and
+    /// the view stays on the row it showed. `X` and back keeps them.
     #[test]
-    fn a_thread_on_hidden_lines_hangs_under_the_separator() {
+    fn a_thread_on_hidden_lines_reveals_them() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("comments.json");
         std::fs::write(
@@ -7839,20 +8641,31 @@ mod tests {
             r#"{"version":1,"comments":[{"id":"h1","path":"src/some/deeply/nested/module/file.rs","side":"new","start":{"old":20,"new":20},"end":{"old":20,"new":20},"text":"Hidden here","author":"","created":"2026-11-17T10:00:00Z","anchor":{"before":[],"lines":["line 20"],"after":[]}}]}"#,
         )
         .expect("write");
-        let mut app = app(100, 20);
+        let mut app = app(100, 12);
+        // The `@@` row and the first hunk's eight, then the separator.
+        app.doc.scroll(9);
+        let top = |app: &mut App| screen(app).lines().nth(1).unwrap_or_default().to_owned();
+        assert!(top(&mut app).contains("⋯ 39 unchanged lines"));
+        let line = app.doc.line_at_top();
         app.set_comments(path);
-        screen(&mut app);
-        key(&mut app, 'm');
-        assert_eq!(app.doc.focused().map(|t| t.root.as_str()), Some("h1"));
+        assert_eq!(app.doc.line_at_top(), line, "the view stays");
         let shown = screen(&mut app);
+        assert!(top(&mut app).contains("⋯ 10 unchanged lines"), "{shown}");
+        assert!(shown.contains("⋯ 24 unchanged lines"), "{shown}");
+        let has_line = |n: usize| shown.contains(&format!("│ line {n}"));
+        assert!(
+            (18..=22).all(has_line) && !has_line(17) && !has_line(23),
+            "{shown}"
+        );
         let under = shown
             .lines()
-            .skip_while(|l| !l.contains("unchanged lines"))
+            .skip_while(|l| !l.contains("│ line 20"))
             .nth(1)
             .unwrap_or_default();
-        assert!(under.contains("▾ you · 2h ago · draft"), "{shown}");
-        press(&mut app, Key::Esc);
+        assert!(under.contains("▾ you · 2h ago ─"), "{shown}");
         key(&mut app, 'X');
+        key(&mut app, 'X');
+        assert!(screen(&mut app).contains("⋯ 10 unchanged lines"));
         key(&mut app, 'm');
         let shown = screen(&mut app);
         let under = shown
@@ -7860,16 +8673,29 @@ mod tests {
             .skip_while(|l| !l.contains("│ line 20"))
             .nth(1)
             .unwrap_or_default();
-        assert!(under.contains("▾ you · 2h ago · draft"), "{shown}");
+        assert!(under.contains("▾ you · 2h ago ━"), "{shown}");
     }
 
     /// `o` opens a posted thread on its host. Its comments are the host's:
-    /// `e` and `d` say so. Replying to an outdated thread says once that
-    /// GitHub collapses it.
+    /// `e` and `d` say so. Replying to an outdated thread says the review
+    /// plugin's warning once, when it has one.
     #[test]
     fn posted_threads_open_on_their_host_and_outdated_ones_warn() {
+        let quiet = tempfile::tempdir().expect("tempdir");
+        let (mut app, _) = commented(&quiet);
+        screen(&mut app);
+        for _ in 0..4 {
+            key(&mut app, 'm');
+        }
+        key(&mut app, 'r');
+        assert!(!screen(&mut app).contains("outdated:"), "no warning to say");
+
         let dir = tempfile::tempdir().expect("tempdir");
         let (mut app, path) = commented(&dir);
+        described(
+            &mut app,
+            r#"{"version":1,"command":"pr","noun":"pull request","nouns":"pull requests","outdated_reply_warning":"the host folds this thread, so a reply there is easy to miss"}"#,
+        );
         screen(&mut app);
         for _ in 0..4 {
             key(&mut app, 'm');
@@ -7886,16 +8712,379 @@ mod tests {
         key(&mut app, 'd');
         assert!(screen(&mut app).contains("no draft here to delete"));
         key(&mut app, 'r');
-        assert!(screen(&mut app).contains("GitHub collapses this thread"));
+        assert!(screen(&mut app).contains("outdated: the host folds this thread"));
         press(&mut app, Key::Esc);
         key(&mut app, 'r');
-        assert!(!screen(&mut app).contains("GitHub collapses"), "once");
+        assert!(!screen(&mut app).contains("the host folds"), "once");
         press(&mut app, Key::Esc);
         assert_eq!(
             read_comments(&path).comments.len(),
             7,
             "empty replies discarded"
         );
+    }
+
+    /// The cell where `text` first shows on screen under the title row,
+    /// which names the file shown.
+    fn cell_of(app: &mut App, text: &str) -> (u16, u16) {
+        let shown = screen(app);
+        let (x, y) = shown
+            .lines()
+            .enumerate()
+            .skip(1)
+            .find_map(|(y, l)| Some((l[..l.find(text)?].chars().count(), y)))
+            .unwrap_or_else(|| panic!("{text}:\n{shown}"));
+        (
+            u16::try_from(x).expect("column"),
+            u16::try_from(y).expect("row"),
+        )
+    }
+
+    fn right_click(app: &mut App, text: &str) {
+        let (x, y) = cell_of(app, text);
+        app.event(Event::Input(Input::RightClick { x, y }));
+    }
+
+    /// The open menu's entries, each its label and its key.
+    fn menu_rows(app: &App) -> Vec<String> {
+        app.menu
+            .as_ref()
+            .expect("a menu")
+            .entries()
+            .iter()
+            .map(|e| format!("{} {}", e.label, e.key).trim_end().to_owned())
+            .collect()
+    }
+
+    /// Moves the menu's cursor to the entry starting `label`, `j` and
+    /// `down` alike, and runs it with `enter`.
+    fn choose(app: &mut App, label: &str) -> Option<Action> {
+        let i = menu_rows(app)
+            .iter()
+            .position(|r| r.starts_with(label))
+            .unwrap_or_else(|| panic!("{label}: {:?}", menu_rows(app)));
+        for step in 0..i {
+            if step % 2 == 0 {
+                key(app, 'j');
+            } else {
+                press(app, Key::Down);
+            }
+        }
+        let done = press(app, Key::Enter);
+        assert!(app.menu.is_none(), "running an entry closes the menu");
+        done
+    }
+
+    /// A right click on a file in the tree selects it as `j`/`k` would
+    /// and lists what the tree's keys do to it; each entry does what its
+    /// key does there.
+    #[test]
+    fn the_menu_of_a_tree_file_runs_the_trees_keys() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (mut app, _) = commented(&dir);
+        right_click(&mut app, "zz3.rs");
+        let file = app.doc.document.pos.file;
+        assert_eq!(app.doc.document.files()[file].change().path, "src/zz3.rs");
+        assert_eq!(app.pane, Pane::Tree);
+        assert_eq!(app.tree.item(), Some(Item::File(file)));
+        assert_eq!(
+            menu_rows(&app),
+            [
+                "Copy path Y",
+                "Copy absolute path",
+                "Open in editor e",
+                "Mark viewed v",
+                "Comment on file C",
+                "Show only files with comments c",
+            ]
+        );
+        let copied = choose(&mut app, "Copy path");
+        assert_eq!(copied, press(&mut app, Key::Char('Y')));
+        assert_eq!(
+            choose_again(&mut app, "zz3.rs", "Copy absolute path"),
+            Some(Action::CopyFullPath("src/zz3.rs".into()))
+        );
+        assert!(choose_again(&mut app, "zz3.rs", "Mark viewed").is_none());
+        assert!(app.doc.document.files()[file].viewed());
+        right_click(&mut app, "zz3.rs");
+        assert!(menu_rows(&app).contains(&"Mark unviewed v".to_owned()));
+        esc(&mut app);
+        assert!(app.menu.is_none());
+        key(&mut app, 'v');
+        assert!(!app.doc.document.files()[file].viewed(), "the same as v");
+        choose_again(&mut app, "zz3.rs", "Show only files");
+        assert!(app.tree.commented());
+        // A tap on an entry runs it; a tap outside closes the menu.
+        right_click(&mut app, "zz9.rs");
+        let (x, y) = cell_of(&mut app, "Show every file");
+        app.event(Event::Input(Input::Click { x, y }));
+        assert!(app.menu.is_none() && !app.tree.commented());
+        right_click(&mut app, "zz3.rs");
+        app.event(Event::Input(Input::Click { x: 99, y: 0 }));
+        assert!(app.menu.is_none() && !app.tree.commented());
+    }
+
+    fn choose_again(app: &mut App, text: &str, label: &str) -> Option<Action> {
+        right_click(app, text);
+        choose(app, label)
+    }
+
+    /// On a line of code: a comment on it, its copy and the editor at it,
+    /// each the same as tapping the line and pressing the keys shown.
+    #[test]
+    fn the_menu_of_a_code_line_runs_its_keys_on_that_line() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (mut app, _) = commented(&dir);
+        right_click(&mut app, "line 3");
+        assert_eq!(app.pane, Pane::Diff);
+        assert_eq!(
+            menu_rows(&app),
+            ["Comment on line c", "Copy line v y", "Open in editor e"]
+        );
+        let copied = choose(&mut app, "Copy line");
+        assert!(app.doc.selection.is_none());
+        let tap = |app: &mut App, text: &str| {
+            let (x, y) = cell_of(app, text);
+            app.event(Event::Input(Input::Click { x, y }));
+            app.event(Event::Input(Input::Release { x, y }));
+        };
+        tap(&mut app, "line 3");
+        key(&mut app, 'v');
+        assert_eq!(copied, press(&mut app, Key::Char('y')));
+        assert!(matches!(&copied, Some(Action::Copy { text, .. }) if text == b"line 3"));
+
+        let edit = choose_again(&mut app, "line 3", "Open in editor");
+        assert_eq!(
+            edit,
+            Some(Action::Edit {
+                path: FILE.into(),
+                line: 3
+            })
+        );
+        tap(&mut app, "line 3");
+        assert_eq!(edit, press(&mut app, Key::Char('e')));
+
+        choose_again(&mut app, "line 3", "Comment on line");
+        let writes = |app: &App| app.doc.writing.as_ref().map(|w| w.at.clone());
+        let on_line = Some(Writes::New {
+            side: document::Side::New,
+            lines: 2..3,
+        });
+        assert_eq!(writes(&app), on_line);
+        esc(&mut app);
+        tap(&mut app, "line 3");
+        key(&mut app, 'c');
+        assert_eq!(writes(&app), on_line);
+    }
+
+    /// Inside the selection the entries act on it; outside, on the line
+    /// clicked, the selection gone.
+    #[test]
+    fn the_menu_inside_a_selection_acts_on_the_selection() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (mut app, _) = commented(&dir);
+        screen(&mut app);
+        key(&mut app, 'v');
+        key(&mut app, 'j');
+        let selection = app.doc.selection.clone();
+        right_click(&mut app, "line 2");
+        assert_eq!(app.doc.selection, selection, "kept");
+        assert_eq!(
+            menu_rows(&app),
+            [
+                "Comment on selection c",
+                "Copy selection y",
+                "Open in editor e"
+            ]
+        );
+        let copied = choose(&mut app, "Copy selection");
+        assert!(matches!(&copied, Some(Action::Copy { text, .. }) if text == b"line 1\nline 2"));
+        assert!(app.doc.selection.is_none(), "as y ends it");
+        // From the line right-clicked, as after a tap.
+        key(&mut app, 'v');
+        key(&mut app, 'j');
+        right_click(&mut app, "line 5");
+        assert!(app.doc.selection.is_none());
+        assert_eq!(menu_rows(&app)[0], "Comment on line c");
+    }
+
+    /// On a `⋯` separator, `x` for that one, though `x` alone reveals the
+    /// first on screen: the same as tapping it.
+    #[test]
+    fn the_menu_of_a_separator_reveals_its_gap() {
+        let tapped = |menu: bool| {
+            let mut app = app(100, 40);
+            let shown = screen(&mut app);
+            let lines: Vec<&str> = shown.lines().collect();
+            let separators: Vec<usize> = (0..lines.len())
+                .filter(|&y| lines[y].contains('⋯'))
+                .collect();
+            let [.., _, y] = separators[..] else {
+                panic!("two separators:\n{shown}");
+            };
+            let x = lines[y].chars().position(|c| c == '⋯').expect("⋯");
+            let (x, y) = (
+                u16::try_from(x).expect("column"),
+                u16::try_from(y).expect("row"),
+            );
+            if menu {
+                app.event(Event::Input(Input::RightClick { x, y }));
+                assert_eq!(menu_rows(&app), ["Reveal hidden lines x"]);
+                choose(&mut app, "Reveal");
+            } else {
+                app.event(Event::Input(Input::Click { x, y }));
+            }
+            screen(&mut app)
+        };
+        assert_eq!(tapped(true), tapped(false));
+    }
+
+    /// On a thread: what its keys do once it has the focus, as far as they
+    /// apply. Edit and delete only with a draft in it, opening on the host
+    /// only with a link.
+    #[test]
+    fn the_menu_of_a_thread_runs_its_focused_keys() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (mut app, path) = commented(&dir);
+        right_click(&mut app, "Why two?");
+        assert_eq!(app.doc.focused().map(|t| t.root.as_str()), Some("d1"));
+        assert_eq!(
+            menu_rows(&app),
+            [
+                "Reply r",
+                "Edit draft e",
+                "Delete draft d",
+                "Resolve x",
+                "Fold z",
+            ]
+        );
+        choose(&mut app, "Edit draft");
+        assert_eq!(
+            app.doc.writing.as_ref().map(|w| w.text.text().to_owned()),
+            Some("Because.".to_owned())
+        );
+        esc(&mut app);
+        choose_again(&mut app, "Why two?", "Delete draft");
+        assert!(status(&mut app).contains("d again deletes your draft reply"));
+        key(&mut app, 'd');
+        assert_eq!(read_comments(&path).comments.len(), 6);
+        choose_again(&mut app, "Why two?", "Fold");
+        assert!(app.doc.fold.collapsed("d1"));
+        choose_again(&mut app, "Why two?", "Unfold");
+        assert!(!app.doc.fold.collapsed("d1"));
+
+        esc(&mut app);
+        key(&mut app, 'g');
+        for _ in 0..4 {
+            key(&mut app, 'm');
+        }
+        esc(&mut app);
+        assert!(app.doc.focused().is_none());
+        right_click(&mut app, "Fifty?");
+        assert_eq!(
+            menu_rows(&app),
+            ["Reply r", "Resolve x", "Unfold z", "Open on host o"]
+        );
+        let opened = choose(&mut app, "Open on host");
+        assert_eq!(opened, press(&mut app, Key::Char('o')));
+        assert!(matches!(opened, Some(Action::Browse(_))));
+        choose_again(&mut app, "Fifty?", "Resolve");
+        assert!(
+            read_comments(&path)
+                .comments
+                .iter()
+                .any(|c| c.id == "p1" && c.resolved)
+        );
+    }
+
+    /// `C`, or the tree menu's entry, writes a comment on the whole file in
+    /// a box under its first row.
+    #[test]
+    fn c_on_a_file_comments_on_the_whole_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("comments.json");
+        let mut app = app(100, 20);
+        app.set_comments(path.clone());
+        choose_again(&mut app, "file.rs", "Comment on file");
+        assert_eq!(app.pane, Pane::Diff, "the box is in the diff");
+        typed(&mut app, "Whole");
+        let shown = screen(&mut app);
+        let at = |text: &str| {
+            shown
+                .find(text)
+                .unwrap_or_else(|| panic!("{text}:\n{shown}"))
+        };
+        assert!(at("Whole▏") < at("line 1"), "{shown}");
+        esc(&mut app);
+        let saved = read_comments(&path);
+        let [comment] = saved.comments.as_slice() else {
+            panic!("one comment: {saved:?}");
+        };
+        assert_eq!(
+            (comment.path.as_str(), comment.text.as_str()),
+            (FILE, "Whole")
+        );
+        assert!(comment.start.is_none() && comment.anchor.is_none());
+        assert_eq!(app.doc.focused().map(|t| &t.at), Some(&comments::At::File));
+        key(&mut app, 'C');
+        assert_eq!(app.doc.writing.as_ref().map(|w| &w.at), Some(&Writes::File));
+        esc(&mut app);
+        // A file not diffed yet takes one too: it needs no lines.
+        choose_again(&mut app, "zz.rs", "Comment on file");
+        typed(&mut app, "Later");
+        assert!(screen(&mut app).contains("Later▏"));
+        esc(&mut app);
+        assert!(
+            read_comments(&path)
+                .comments
+                .iter()
+                .any(|c| c.path == "src/zz.rs")
+        );
+    }
+
+    /// The menu opens at the cell right-clicked, or as close as the screen
+    /// allows.
+    #[test]
+    fn the_menu_opens_at_the_click_within_the_screen() {
+        let mut app = app(80, 14);
+        screen(&mut app);
+        app.event(Event::Input(Input::RightClick { x: 10, y: 4 }));
+        let shown = screen(&mut app);
+        assert_eq!(
+            shown.lines().nth(4).and_then(|l| l.chars().nth(10)),
+            Some('┌'),
+            "{shown}"
+        );
+        esc(&mut app);
+        app.event(Event::Input(Input::RightClick { x: 77, y: 12 }));
+        insta::assert_snapshot!("menu_at_the_corner", screen(&mut app));
+        // A right click elsewhere opens it there instead.
+        app.event(Event::Input(Input::RightClick { x: 10, y: 4 }));
+        let shown = screen(&mut app);
+        assert_eq!(
+            shown.lines().nth(4).and_then(|l| l.chars().nth(10)),
+            Some('┌'),
+            "{shown}"
+        );
+        assert_eq!(shown.matches('┌').count(), 1, "{shown}");
+    }
+
+    /// A closed menu costs nothing: the screen is as before it opened, and
+    /// the next frame reuses the diff's rows again.
+    #[test]
+    fn a_closed_menu_draws_nothing() {
+        let mut app = app(80, 14);
+        let before = screen(&mut app);
+        app.event(Event::Input(Input::RightClick { x: 10, y: 4 }));
+        assert_ne!(screen(&mut app), before);
+        assert!(!app.kept, "an overlay over the rows");
+        esc(&mut app);
+        assert!(app.menu.is_none());
+        assert_eq!(screen(&mut app), before);
+        assert!(app.kept);
+        // Nothing to act on, no menu: the status bar.
+        app.event(Event::Input(Input::RightClick { x: 10, y: 13 }));
+        assert!(app.menu.is_none());
     }
 
     /// `z` folds the focused thread to one row and back; `Z` folds all.
@@ -7909,7 +9098,7 @@ mod tests {
         key(&mut app, 'z');
         let shown = screen(&mut app);
         assert!(
-            shown.contains("▸ you · 2h ago · draft · Why two?") && shown.contains("1 reply"),
+            shown.contains("▸ you · 2h ago · Why two?") && shown.contains("1 reply"),
             "{shown}"
         );
         assert!(!shown.contains("Because."));
@@ -7932,7 +9121,7 @@ mod tests {
         let shown = screen(&mut app);
         let header = shown
             .lines()
-            .position(|l| l.contains("▾ you · 2h ago · draft"))
+            .position(|l| l.contains("▾ you · 2h ago ─"))
             .expect("an open thread's header");
         let row = |shown: &str| shown.lines().nth(header).unwrap_or_default().to_owned();
         let click = |app: &mut App, y: usize| {
@@ -7993,11 +9182,21 @@ mod tests {
 
     /// When another program changes the file, its threads are placed again
     /// and its notice shows.
+    /// Whether `root`'s thread is placed on [`FILE`].
+    fn placed(app: &App, root: &str) -> bool {
+        (app.comments.as_ref())
+            .and_then(|c| c.threads(FILE.as_bytes()))
+            .is_some_and(|threads| threads.iter().any(|t| t.root == root))
+    }
+
+    /// When another program changes the file, its threads are placed again
+    /// and its notice shows.
     #[test]
     fn a_changed_comments_file_is_read_again_with_its_notice() {
         let dir = tempfile::tempdir().expect("tempdir");
         let (mut app, path) = commented(&dir);
         screen(&mut app);
+        assert!(placed(&app, "p1"));
         review::apply(
             &path,
             vec![
@@ -8009,6 +9208,68 @@ mod tests {
         app.event(Event::Comments);
         let shown = screen(&mut app);
         assert!(shown.contains("comments as of 10:42"), "{shown}");
-        assert!(!shown.contains('●'), "{shown}");
+        assert!(!placed(&app, "p1") && placed(&app, "d1"));
+    }
+
+    /// A review plugin's progress reads the comments file again, without
+    /// waiting on the file watcher: it writes as it goes.
+    #[test]
+    fn a_review_runs_progress_reads_the_comments_file_again() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (mut app, path) = commented(&dir);
+        screen(&mut app);
+        assert!(placed(&app, "p1"));
+        review::apply(&path, vec![Op::Rm(Target::Id("p1".to_owned()))]).expect("applies");
+        let progress = Said::Progress("page 2".to_owned());
+        app.event(Event::Review {
+            id: 1,
+            said: progress,
+        });
+        assert!(!placed(&app, "p1") && placed(&app, "d1"));
+    }
+
+    /// Only a review session's file has drafts: your comments not posted
+    /// in it. In a local review nothing is posted, so nothing is a draft,
+    /// and an agent's comment in a session is left for you, marked, rather
+    /// than posted under your name.
+    #[test]
+    fn drafts_are_yours_in_a_review_session() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (mut app, path) = commented(&dir);
+        review::apply(
+            &path,
+            vec![Op::Add {
+                comment: Box::new(review::Comment {
+                    path: FILE.to_owned(),
+                    text: "From the agent".to_owned(),
+                    author: "claude".to_owned(),
+                    ..review::Comment::default()
+                }),
+                reply_to: Some(Target::Id("d1".to_owned())),
+            }],
+        )
+        .expect("applies");
+        app.event(Event::Comments);
+        let shown = screen(&mut app);
+        assert!(!shown.contains("draft") && !shown.contains('◆'), "{shown}");
+        assert!(!shown.contains("not posted"), "{shown}");
+        assert_eq!(app.comments.as_ref().map(Comments::counts), Some((6, 0)));
+
+        let prepare = app.start_review("test".to_owned(), session(&dir, HEAD, None));
+        said(&mut app, prepare, Said::Done(Ok(())));
+        let shown = screen(&mut app);
+        assert!(shown.contains("▾ you · 2h ago · draft"), "{shown}");
+        assert!(shown.contains("claude · just now · not posted"), "{shown}");
+        assert_eq!(app.comments.as_ref().map(Comments::counts), Some((6, 5)));
+        assert_eq!(
+            app.unsent(),
+            super::review::Unsent {
+                comments: 4,
+                replies: 1,
+                resolves: 0,
+                local: 0
+            },
+            "the agent's reply isn't sent"
+        );
     }
 }

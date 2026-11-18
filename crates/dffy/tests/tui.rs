@@ -435,8 +435,9 @@ fn a_comment_is_written_in_a_box_and_saved() {
     term.send("\x1b[200~ q,\r\nreally\x1b[201~");
     assert!(term.contains("really▏"), "{}", term.vt.screen().contents());
     term.send("\x1b");
-    term.wait_for("the thread", |t| t.contains("▾ you · just now · draft"));
-    assert!(term.contains("◆"));
+    // Outside a review session nothing is posted, so it isn't a draft.
+    term.wait_for("the thread", |t| t.contains("▾ you · just now ━"));
+    assert!(term.contains("●"));
     let saved = std::fs::read_to_string(repo.path().join(".git/dffy/comments.json"))
         .expect("the comments file");
     assert!(
@@ -447,10 +448,10 @@ fn a_comment_is_written_in_a_box_and_saved() {
     assert!(term.wait_exit().success());
 }
 
-/// `ctrl+e` hands the box's text to the editor, on a file of its own, and
+/// `ctrl+g` hands the box's text to the editor, on a file of its own, and
 /// saves what's written there.
 #[test]
-fn ctrl_e_continues_a_comment_in_the_editor() {
+fn ctrl_g_continues_a_comment_in_the_editor() {
     let repo = repo();
     let bin = tempfile::tempdir().expect("tempdir");
     let editor = bin.path().join("vim");
@@ -465,11 +466,62 @@ fn ctrl_e_continues_a_comment_in_the_editor() {
     term.wait_for("the diffs", |t| t.contains(" +3 -3"));
     term.send("c");
     term.send("Begun");
-    term.send("\x05");
-    term.wait_for("the mark", |t| t.contains("◆"));
+    term.send("\x07");
+    term.wait_for("the mark", |t| t.contains("●"));
     let saved = std::fs::read_to_string(repo.path().join(".git/dffy/comments.json"))
         .expect("the comments file");
     assert!(saved.contains("\"text\":\"Begun in vim\""), "{saved}");
+    term.send("q");
+    assert!(term.wait_exit().success());
+}
+
+/// A trip to the editor keeps the place: the diff stays where it was
+/// scrolled, a failed editor opens the box again with the text and the
+/// cursor at its end, and the saved thread takes the focus.
+#[test]
+fn the_editor_round_trip_keeps_the_place() {
+    let repo = repo();
+    let bin = tempfile::tempdir().expect("tempdir");
+    let editor = bin.path().join("vim");
+    let ran = bin.path().join("ran");
+    std::fs::write(
+        &editor,
+        format!(
+            "#!/bin/sh\n[ -e '{0}' ] || {{ touch '{0}'; exit 1; }}\nprintf ' in vim\\n' >> \"$2\"\n",
+            ran.display()
+        ),
+    )
+    .expect("write editor");
+    Command::new("chmod")
+        .arg("+x")
+        .arg(&editor)
+        .status()
+        .expect("chmod");
+    let editor = editor.to_str().expect("utf-8 path").to_owned();
+    let mut term = Term::spawn(repo.path(), 100, 12, &[("EDITOR", &editor)]);
+    term.wait_for("the diffs", |t| t.contains(" +3 -3"));
+    term.send("nnn");
+    let top = term.row(1);
+    assert!(top.contains("▌ line 100"), "{top}");
+    term.send("c");
+    term.wait_for("the box", |t| t.contains("new comment"));
+    term.send("Begun\x07");
+    term.wait_for("the box again", |t| ran.exists() && t.contains("Begun▏"));
+    term.send("X");
+    term.wait_for("the cursor at the end", |t| t.contains("BegunX▏"));
+    assert_eq!(term.row(1), top);
+    term.send("\x07");
+    // A focused thread has a heavy border.
+    term.wait_for("the focused thread", |t| {
+        t.contains("BegunX in vim") && t.contains("┏")
+    });
+    // The same row, with the new thread's mark in its gutter.
+    assert_eq!(
+        term.row(1).replacen('●', " ", 1),
+        top,
+        "{}",
+        term.vt.screen().contents()
+    );
     term.send("q");
     assert!(term.wait_exit().success());
 }
@@ -481,10 +533,16 @@ fn rev_parse(dir: &Path, rev: &str) -> String {
         .to_owned()
 }
 
+/// What `dffy-review-test` describes until a test writes another
+/// `describe.sh`: `dffy pr`, a review read as `PR #7`, and four events.
+const DESCRIBE: &str = r##"{"version":1,"command":"pr","noun":"pull request","nouns":"pull requests","short":"PR","id_prefix":"#","events":[{"id":"pending","key":"p","label":"pending","done":"review pending","submits":false},{"id":"comment","key":"c","label":"comment","done":"commented"},{"id":"approve","key":"a","label":"approve","done":"approved"},{"id":"request_changes","key":"r","label":"request changes","done":"changes requested"}]}"##;
+
 /// A pull request for `dffy pr`: a repository whose last commit, the PR's
 /// head, changes README.md over its base, the commit before; and
-/// `dffy-review-test` on PATH, which records each call and how it was run,
-/// then runs `<verb>.sh` from its directory, which tests write.
+/// `dffy-review-test` on PATH, which records each call but `describe` and
+/// how it was run, then runs `<verb>.sh` from its directory, which tests
+/// write. It describes [`DESCRIBE`] until a test writes another
+/// `describe.sh`, before its first run: the answer is cached.
 struct Pull {
     repo: tempfile::TempDir,
     stub: tempfile::TempDir,
@@ -508,11 +566,17 @@ impl Pull {
             &plugin,
             "#!/bin/sh\n\
              d=$(dirname \"$0\")\n\
+             [ \"$1\" = describe ] || \
              { echo \"$*\"; pwd -P; ( : < /dev/tty ) 2>/dev/null && echo tty || echo notty; \
                echo \"protocol=$DFFY_REVIEW_PROTOCOL comments=$DFFY_COMMENTS\"; } >> \"$d/calls\"\n\
              . \"$d/$1.sh\"\n",
         )
         .expect("write plugin");
+        std::fs::write(
+            stub.path().join("describe.sh"),
+            format!("echo '{DESCRIBE}'"),
+        )
+        .expect("write describe");
         Command::new("chmod")
             .arg("+x")
             .arg(&plugin)
@@ -534,7 +598,7 @@ impl Pull {
 
     fn session(&self, number: u64, head: &str) -> String {
         format!(
-            r#"{{"version":1,"session":{{"number":{number},"title":"Spell out five","url":"https://example.com/pull/{number}","base":"{}","head":"{head}","last_reviewed_head":null,"comments":"{}"}}}}"#,
+            r#"{{"version":1,"session":{{"id":"{number}","title":"Spell out five","url":"https://example.com/pull/{number}","base":"{}","head":"{head}","last_reviewed_head":null,"comments":"{}"}}}}"#,
             self.base,
             self.comments().display()
         )
@@ -584,7 +648,7 @@ fn dffy_pr_opens_the_pr_once_prepare_names_its_commits() {
         ),
     );
     let mut term = pull.spawn(&["pr", "7"]);
-    term.wait_for("the fetching note", |t| t.contains("fetching #7…"));
+    term.wait_for("the fetching note", |t| t.contains("fetching PR #7…"));
     std::fs::write(&gate, "").expect("open the gate");
     term.wait_for("the PR's diff", |t| t.contains("From the PR."));
     term.wait_for("its thread", |t| t.contains("Nice README"));
@@ -603,11 +667,49 @@ fn dffy_pr_opens_the_pr_once_prepare_names_its_commits() {
     assert!(term.wait_exit().success());
 }
 
-/// Plain `dffy` on a branch asks the plugin for the branch's PR without
-/// waiting for it, then shows the PR's base against the working tree, so
-/// a fix not pushed yet shows with the PR's changes and comments.
+/// A plugin that describes `mr` gets `dffy mr <id>`, in its words, and the
+/// same review mode, its reviews named its way: `MR !7` for the review
+/// whose id is `I8f2c` and label `7`. `pr` is then a revision. `describe`
+/// runs without the terminal too.
 #[test]
-fn plain_dffy_switches_to_the_branchs_pr() {
+fn the_review_command_is_the_plugins() {
+    let pull = Pull::new();
+    pull.verb(
+        "describe",
+        r#"( : < /dev/tty ) 2>/dev/null && echo tty > "$d/describe-tty" || echo notty > "$d/describe-tty"
+echo '{"version":1,"command":"mr","noun":"merge request","nouns":"merge requests","short":"MR","id_prefix":"!"}'"#,
+    );
+    let session = pull
+        .session(7, &pull.head)
+        .replace(r#""id":"7""#, r#""id":"I8f2c","label":"7""#);
+    pull.verb("prepare", &format!("echo '{session}'"));
+    let mut term = pull.spawn(&["mr", "I8f2c"]);
+    term.wait_for("the merge request's diff", |t| t.contains("From the PR."));
+    term.wait_for("review mode", |t| t.status().contains("MR !7"));
+    assert!(
+        pull.calls().starts_with("prepare I8f2c\n"),
+        "{}",
+        pull.calls()
+    );
+    assert_eq!(
+        std::fs::read_to_string(pull.stub.path().join("describe-tty")).expect("described"),
+        "notty\n"
+    );
+    term.send("q");
+    assert!(term.wait_exit().success());
+    let mut term = pull.spawn(&["pr", "7"]);
+    let status = term.wait_exit();
+    assert!(!status.success());
+    let screen = term.vt.screen().contents();
+    assert!(screen.contains("unknown revision 'pr'"), "{screen}");
+}
+
+/// Plain `dffy` on a branch asks the plugin for the branch's PR without
+/// waiting for it, then keeps its own range with the PR's comments and
+/// status; the command panel's "Show whole pull request" shows the PR's
+/// base against the working tree, and goes back.
+#[test]
+fn plain_dffy_attaches_the_branchs_pr() {
     let pull = Pull::new();
     std::fs::write(
         pull.repo.path().join("README.md"),
@@ -621,7 +723,7 @@ fn plain_dffy_switches_to_the_branchs_pr() {
     .expect("write");
     let gate = pull.stub.path().join("go");
     let session = pull.session(7, &pull.head);
-    let pr = session.replacen("\"session\"", "\"pr\"", 1);
+    let pr = session.replacen("\"session\"", "\"review\"", 1);
     pull.verb(
         "detect",
         &format!(
@@ -636,6 +738,9 @@ fn plain_dffy_switches_to_the_branchs_pr() {
     assert!(!term.status().contains("PR #7"), "{}", term.status());
     std::fs::write(&gate, "").expect("open the gate");
     term.wait_for("the PR", |t| t.status().contains("PR #7"));
+    term.wait_for("its thread", |t| t.contains("Nice README"));
+    assert!(term.contains("+2 -0"), "{}", term.vt.screen().contents());
+    term.send(" A");
     // Against the PR's base: its commit's lines and the fix.
     term.wait_for("the PR's change and the fix", |t| t.contains("+4 -0"));
     assert!(
@@ -643,10 +748,27 @@ fn plain_dffy_switches_to_the_branchs_pr() {
         "{}",
         term.vt.screen().contents()
     );
-    term.wait_for("its thread", |t| t.contains("Nice README"));
+    term.send(" A");
+    term.wait_for("the working tree's diff again", |t| t.contains("+2 -0"));
     assert!(pull.calls().starts_with("detect\n"), "{}", pull.calls());
     term.send("q");
     assert!(term.wait_exit().success());
+}
+
+/// A review plugin that doesn't describe itself isn't asked for the
+/// branch's review either.
+#[test]
+fn plain_dffy_asks_only_a_described_plugin_for_the_branchs_review() {
+    let pull = Pull::new();
+    pull.verb("describe", "exit 1");
+    pull.verb("detect", r#"echo '{"version":1,"review":null}'"#);
+    std::fs::write(pull.repo.path().join("README.md"), "# demo\n\nLocal.\n").expect("write");
+    let mut term = pull.spawn(&[]);
+    term.wait_for("the working tree's diff", |t| t.contains("Local."));
+    std::thread::sleep(Duration::from_millis(300));
+    term.send("q");
+    assert!(term.wait_exit().success());
+    assert_eq!(pull.calls(), "", "no verb ran");
 }
 
 /// What the plugin says went wrong before the PR's commits are here ends
@@ -724,7 +846,7 @@ fn ctrl_c_while_fetching_kills_the_plugin() {
         &format!("sleep 30 & echo $! > '{}'\nwait\n", pid.display()),
     );
     let mut term = pull.spawn(&["pr", "7"]);
-    term.wait_for("the fetching note", |t| t.contains("fetching #7…"));
+    term.wait_for("the fetching note", |t| t.contains("fetching PR #7…"));
     term.wait_for("the sleep", |_| {
         std::fs::read_to_string(&pid).is_ok_and(|p| p.ends_with('\n'))
     });
@@ -797,7 +919,7 @@ fn a_picked_pr_updates_in_place_and_posts() {
     git(d, &["update-ref", "refs/pull/11/head", &second]);
     pull.verb(
         "list",
-        r#"echo '{"version":1,"prs":[{"number":11,"title":"Document the cache","author":"ada","url":"u","head_ref":"docs","reason":"mine"}]}'"#,
+        r#"echo '{"version":1,"reviews":[{"id":"11","title":"Document the cache","author":"ada","url":"u","head_ref":"docs","reason":"mine"}]}'"#,
     );
     pull.verb("prepare", &format!("echo '{}'", pull.session(11, &first)));
     pull.verb("pull", &format!("echo '{}'", pull.session(11, &second)));
@@ -862,7 +984,7 @@ fn a_picked_pr_updates_in_place_and_posts() {
 
 /// `P` runs `post --dry-run` beside the `prepare` still going, and the
 /// dialog counts what it says. A post the host refused a comment in asks
-/// what to do; `s` submits the approval without the comments left out.
+/// what to do; `s` applies the approval without the comments left out.
 #[test]
 fn posting_checks_first_and_asks_when_a_comment_is_refused() {
     let pull = Pull::new();
@@ -884,8 +1006,8 @@ fn posting_checks_first_and_asks_when_a_comment_is_refused() {
             "case \"$*\" in\n\
              *--dry-run*) echo '{skipped}'; echo '{{\"version\":1,\"draft\":{{\"id\":\"c2\",\"path\":\"README.md\",\"plan\":\"file\"}}}}'; \
                echo '{{\"version\":1,\"planned\":{{\"line\":0,\"file\":1,\"skip\":1}}}}' ;;\n\
-             *--submit-only*) echo \"$*\" > '{}'; echo '{{\"version\":1,\"posted\":0,\"failed\":0,\"url\":\"https://example.com/pull/7#review\"}}' ;;\n\
-             *) echo '{skipped}'; echo '{refused}'; echo '{{\"version\":1,\"posted\":0,\"failed\":2,\"pending_review\":true,\"url\":\"https://example.com/pull/7#review\"}}' ;;\n\
+             *--apply-event*) echo \"$*\" > '{}'; echo '{{\"version\":1,\"posted\":0,\"failed\":0,\"url\":\"https://example.com/pull/7#review\"}}' ;;\n\
+             *) echo '{skipped}'; echo '{refused}'; echo '{{\"version\":1,\"posted\":0,\"failed\":2,\"held\":true,\"held_message\":\"review still pending\",\"url\":\"https://example.com/pull/7#review\"}}' ;;\n\
              esac\n",
             args.display()
         ),
@@ -915,7 +1037,7 @@ fn posting_checks_first_and_asks_when_a_comment_is_refused() {
         t.status().contains("approved · 2 comments not posted")
     });
     let sent = std::fs::read_to_string(&args).expect("args");
-    assert_eq!(sent.trim(), "post 7 --submit-only --event approve");
+    assert_eq!(sent.trim(), "post 7 --apply-event --event approve");
     term.send("q");
     assert!(term.wait_exit().success());
 }
@@ -1713,6 +1835,37 @@ fn a_remapped_key_runs_its_action() {
         "q no longer quits"
     );
     term.send("Q");
+    assert!(term.wait_exit().success());
+}
+
+/// `copy_absolute_path`, bound to a key, copies where the file shown is
+/// on disk, from the root, though dffy runs in the repository.
+#[test]
+fn the_absolute_path_is_copied_from_the_root() {
+    let repo = repo();
+    let config = config("keybind = K=copy_absolute_path\n");
+    let mut term = Term::spawn(repo.path(), 200, 12, &[("XDG_CONFIG_HOME", &path(&config))]);
+    term.wait_for("the diffs", |t| t.contains(" +3 -3"));
+    term.send("f");
+    term.wait_for("src/lib.rs", |t| t.row(0).contains("src/lib.rs"));
+    let before = term.output().len();
+    term.send("K");
+    let status = term.status();
+    let copied = status
+        .split("copied ")
+        .nth(1)
+        .and_then(|s| s.split_whitespace().next())
+        .unwrap_or_else(|| panic!("{status}"));
+    assert!(
+        copied.starts_with('/') && copied.ends_with("/src/lib.rs"),
+        "{status}"
+    );
+    assert!(
+        sent(&term, before, b"\x1b]52;c;"),
+        "{:?}",
+        String::from_utf8_lossy(&term.output()[before..])
+    );
+    term.send("q");
     assert!(term.wait_exit().success());
 }
 

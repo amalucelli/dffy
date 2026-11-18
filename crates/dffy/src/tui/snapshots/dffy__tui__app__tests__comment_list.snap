@@ -4,12 +4,12 @@ expression: screen(&mut app)
 ---
 ┌ Files · 12 +4 -4 ────────┬─ modified · src/some/deeply/nested/module/file.rs · +2 -2 ────────────┐
 │ ┌─ comments ─────────────────────────────────────────────────────────────────────── esc close ─┐ ┃
-│ │ gone.rs:1 · draft · file not in this diff · Gone                                             │ █
-│ │ src/some/deeply/nested/module/file.rs · draft · on the file · On the whole file              │ │
-│ │ src/some/deeply/nested/module/file.rs:2 · draft · Why two?                                   │ │
+│ │ gone.rs:1 · file not in this diff · Gone                                                     │ █
+│ │ src/some/deeply/nested/module/file.rs · on the file · On the whole file                      │ │
+│ │ src/some/deeply/nested/module/file.rs:2 · Why two?                                           │ │
 │ │ src/some/deeply/nested/module/file.rs:4 (old) · resolved · Old four                          │ │
 │ │ src/some/deeply/nested/module/file.rs:50 · posted · Fifty?                                   │ │
-│ │ src/zz9.rs:10 · draft · lines not found · Moved away                                         │ │
+│ │ src/zz9.rs:10 · lines not found · Moved away                                                 │ │
 │ │                                                                                              │ │
 │ │                                                                                              │ │
 │ │                                                                                              │ │
@@ -21,4 +21,4 @@ expression: screen(&mut app)
 │ │                                                                                              │ │
 │ │ enter goes to it · esc close                                                                 │ │
 │ └──────────────────────────────────────────────────────────────────────────────────────────────┘ │
-└──  working tree  ────────┴─ 1/12 · 1/2 hunk  unified  6 threads · 5 drafts ───── space commands ─┘
+└──  working tree  ────────┴─ 1/12 · 1/2 hunk  unified  6 threads ───── / search · space commands ─┘

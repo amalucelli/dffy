@@ -625,3 +625,80 @@ fn listing_heads_every_thread() {
         Orphan.
     ");
 }
+
+/// Moving threads to another file adds each comment there with a new id,
+/// replies under their moved root and the rest as they were, and takes
+/// them out of the first file; a thread not asked for stays. When the
+/// other file can't take them, neither file changes.
+#[test]
+fn moved_threads_leave_their_file_only_once_the_other_has_them() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (from, to) = (dir.path().join("local.json"), dir.path().join("pr.json"));
+    let ids = apply(
+        &from,
+        parse_ops(format!("[{LINE_COMMENT},{LINE_COMMENT}]").as_bytes()).expect("ops"),
+    )
+    .expect("applies");
+    let (moving, staying) = (ids[0].clone().expect("id"), ids[1].clone().expect("id"));
+    apply(
+        &from,
+        vec![Op::Add {
+            comment: Box::new(Comment {
+                text: "And this.".to_owned(),
+                ..Comment::default()
+            }),
+            reply_to: Some(Target::Id(moving.clone())),
+        }],
+    )
+    .expect("replies");
+    let before = read(&from).expect("reads");
+
+    fs::write(&to, r#"{"version":2,"comments":[]}"#).expect("write");
+    let refused = fs::read(&to).expect("read");
+    assert!(move_threads(&from, &to, std::slice::from_ref(&moving)).is_err());
+    assert_eq!(
+        read(&from).expect("reads"),
+        before,
+        "the first file kept them"
+    );
+    assert_eq!(
+        fs::read(&to).expect("read"),
+        refused,
+        "the other is as it was"
+    );
+
+    fs::write(
+        &to,
+        r#"{"version":1,"comments":[{"id":"pr1","path":"a.rs","text":"Posted","ref":"github:1"}]}"#,
+    )
+    .expect("write");
+    assert_eq!(
+        move_threads(&from, &to, std::slice::from_ref(&moving)),
+        Ok(2)
+    );
+    let left = read(&from).expect("reads");
+    assert_eq!(
+        left.comments
+            .iter()
+            .map(|c| c.id.as_str())
+            .collect::<Vec<_>>(),
+        [staying.as_str()]
+    );
+    let got = read(&to).expect("reads").comments;
+    let root = &got[1];
+    let old = &before.comments[0];
+    assert_ne!(root.id, moving, "a new id");
+    assert_eq!(
+        (
+            &root.text,
+            &root.anchor,
+            root.start,
+            root.end,
+            &root.created
+        ),
+        (&old.text, &old.anchor, old.start, old.end, &old.created)
+    );
+    assert_eq!(got[2].text, "And this.");
+    assert_eq!(got[2].in_reply_to.as_ref(), Some(&root.id));
+    assert_eq!(got[0].id, "pr1", "what was there stays");
+}

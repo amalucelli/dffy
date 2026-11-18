@@ -13,8 +13,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use gix::bstr::BString;
 
 use super::{
-    Content, Context, Counts, File, Headings, Mark, Match, Matches, Pos, Segment, Shape, Shown,
-    file_status,
+    Content, Context, Counts, File, Headings, Mark, Match, Matches, Pos, Reveal, Segment, Shape,
+    Shown, Side, file_status,
 };
 use crate::diff::Emphasis;
 use crate::git::{FileChange, FileDiff, Status, Update};
@@ -106,7 +106,7 @@ pub struct Entry<P> {
     recount: bool,
     viewed: bool,
     /// Lines revealed from the top and bottom edge of each gap.
-    reveal: Vec<(usize, usize)>,
+    reveal: Vec<Reveal>,
     /// Where the file was left when another was shown.
     saved: Option<Pos>,
     /// Shown with a diff since it arrived: opened at its first change, or
@@ -298,7 +298,7 @@ impl<P> Entry<P> {
             (render, _) => render,
         }));
         if let State::Loaded(file) = &self.state {
-            self.reveal = vec![(0, 0); file.gaps().len()];
+            self.reveal = vec![Reveal::default(); file.gaps().len()];
         }
         self.saved = None;
         self.placed = false;
@@ -659,7 +659,11 @@ impl<P> Document<P> {
             Ok(loaded) => {
                 self.loaded_bytes += loaded.bytes();
                 entry.counts = Some(loaded.counts());
-                entry.reveal.resize(loaded.gaps().len(), (0, 0));
+                entry.reveal.resize(loaded.gaps().len(), Reveal::default());
+                // A diff of the same file may cut its gaps differently.
+                for (reveal, gap) in entry.reveal.iter_mut().zip(loaded.gaps()) {
+                    reveal.settle(gap.len);
+                }
                 State::Loaded(loaded)
             }
             Err(e) => {
@@ -1379,13 +1383,13 @@ impl<P> Document<P> {
 
     /// How much of gap `gap` of `file` shows.
     #[must_use]
-    pub fn shown(&self, file: usize, gap: usize) -> Option<Shown> {
+    pub fn shown(&self, file: usize, gap: usize) -> Option<Shown<'_>> {
         let (loaded, shape) = self.view(file)?;
         Some(loaded.shown(&shape, gap))
     }
 
-    /// The new lines each gap of `file` hides under its separator, by gap,
-    /// for [`super::find`]; `None` until it's diffed.
+    /// The new lines the gaps of `file` hide under their separators, in
+    /// order, for [`super::find`]; `None` until it's diffed.
     #[must_use]
     pub fn hidden_lines(&self, file: usize) -> Option<Vec<Range<usize>>> {
         let (loaded, shape) = self.view(file)?;
@@ -1402,24 +1406,44 @@ impl<P> Document<P> {
         self.with_file(file, arrange, |f, shape| f.match_pos(shape, file, m))?
     }
 
-    /// The line of gap `gap` the position is on, when it's in that gap (the
-    /// separator counts as its first hidden line).
-    fn gap_anchor(&self, file: usize, gap: usize) -> Option<usize> {
-        if self.pos.file != file {
+    /// The line of gap `gap` of `file` that `pos` is on, when it's in that
+    /// gap (a separator counts as the first line it hides).
+    fn gap_anchor(&self, file: usize, gap: usize, pos: Pos) -> Option<usize> {
+        if pos.file != file {
             return None;
         }
         let (loaded, shape) = self.view(file)?;
-        let (at, line) = loaded.gap_anchor(&shape, self.pos)?;
+        let (at, line) = loaded.gap_anchor(&shape, pos)?;
         (at == gap).then_some(line)
     }
 
-    /// Puts the position back on gap line `line` after the gap changed.
-    fn reanchor(&mut self, file: usize, gap: usize, line: Option<usize>) {
+    /// Puts `pos` back on gap line `line` after the gap changed.
+    fn reanchor(&self, gap: usize, line: Option<usize>, pos: &mut Pos) {
         if let Some(line) = line
-            && let Some((loaded, shape)) = self.view(file)
+            && let Some((loaded, shape)) = self.view(pos.file)
         {
-            self.pos.row = loaded.shown(&shape, gap).row(line);
-            self.pos.offset = 0;
+            pos.row = loaded.shown(&shape, gap).row(line);
+            pos.offset = 0;
+        }
+    }
+
+    /// Stores `reveal` for gap `gap` of `file`, keeping the position, and
+    /// the place the file was left at, on their lines of the gap.
+    fn set_reveal(&mut self, file: usize, gap: usize, gaps: usize, reveal: Reveal) {
+        let saved = self.files[file].saved;
+        let anchors = (
+            self.gap_anchor(file, gap, self.pos),
+            saved.and_then(|p| self.gap_anchor(file, gap, p)),
+        );
+        let entry = &mut self.files[file];
+        entry.reveal.resize(gaps, Reveal::default());
+        entry.reveal[gap] = reveal;
+        let mut pos = self.pos;
+        self.reanchor(gap, anchors.0, &mut pos);
+        self.pos = pos;
+        if let Some(mut saved) = saved {
+            self.reanchor(gap, anchors.1, &mut saved);
+            self.files[file].saved = Some(saved);
         }
     }
 
@@ -1430,17 +1454,49 @@ impl<P> Document<P> {
     /// gaps never open. Returns whether any line was hidden; the host then
     /// normalizes the position.
     pub fn expand(&mut self, file: usize, gap: usize) -> bool {
-        let Some((gaps, edges)) = self.view(file).and_then(|(loaded, shape)| {
+        let Some((gaps, reveal)) = self.view(file).and_then(|(loaded, shape)| {
             Some((loaded.gaps().len(), loaded.reveal_more(&shape, gap)?))
         }) else {
             return false;
         };
-        let anchor = self.gap_anchor(file, gap);
-        let entry = &mut self.files[file];
-        entry.reveal.resize(gaps, (0, 0));
-        entry.reveal[gap] = edges;
-        self.reanchor(file, gap, anchor);
+        self.set_reveal(file, gap, gaps, reveal);
         true
+    }
+
+    /// Reveals the lines of `side` in `lines` (0-based) of `file` that its
+    /// gaps hide, with `context` lines around them within each gap, the
+    /// rest of the gap staying hidden; for lines the host wants seen, such
+    /// as a comment's. Positions in the gaps stay on their lines, as with
+    /// [`Document::expand`]. Lines of a hunk, a piped file and a rendered
+    /// view are left as they are. Returns whether any line was hidden; the
+    /// host then normalizes the position.
+    pub fn reveal_lines(
+        &mut self,
+        file: usize,
+        side: Side,
+        lines: Range<usize>,
+        context: usize,
+    ) -> bool {
+        let Some(entry) = (self.files.get(file))
+            .filter(|e| !matches!(e.render.as_deref(), Some(Render::Shown(_))))
+        else {
+            return false;
+        };
+        let State::Loaded(loaded) = &entry.state else {
+            return false;
+        };
+        let gaps = loaded.gaps().len();
+        let revealed: Vec<(usize, Reveal)> = (0..gaps)
+            .filter_map(|g| {
+                let reveal = loaded.reveal_lines(entry.reveal.get(g), g, (side, &lines), context);
+                Some((g, reveal?))
+            })
+            .collect();
+        let any = !revealed.is_empty();
+        for (gap, reveal) in revealed {
+            self.set_reveal(file, gap, gaps, reveal);
+        }
+        any
     }
 
     /// Switches every file between its changes and its full text, keeping a
@@ -1452,12 +1508,14 @@ impl<P> Document<P> {
             return false;
         }
         let gap = match self.segment(file, self.pos.part) {
-            Some(Segment::Gap(g)) => Some((g, self.gap_anchor(file, g))),
+            Some(Segment::Gap(g)) => Some((g, self.gap_anchor(file, g, self.pos))),
             _ => None,
         };
         self.full = !self.full;
         if let Some((g, line)) = gap {
-            self.reanchor(file, g, line);
+            let mut pos = self.pos;
+            self.reanchor(g, line, &mut pos);
+            self.pos = pos;
         }
         true
     }
@@ -1526,7 +1584,7 @@ impl<P> Document<P> {
             } else {
                 shown.rows().saturating_sub(1)
             };
-            let separator = shown.hidden() > 0 && from == shown.top && to == shown.top;
+            let separator = from == to && shown.line(from).is_none();
             (from <= to && !separator).then_some(Missing::GapSyntax(g))
         });
         let structural = (self.structural && loaded.is_some_and(File::wants_structural))

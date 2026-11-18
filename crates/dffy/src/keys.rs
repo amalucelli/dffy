@@ -69,6 +69,7 @@ actions! {
     Select "select" "select lines" "select lines, from the top line or the one tapped",
     Copy "copy" "copy selection" "copy the selected lines' code",
     CopyPath "copy_path" "copy path" "copy the file's path",
+    CopyAbsolutePath "copy_absolute_path" "copy absolute path" "copy where the file is on disk, from the filesystem's root",
     Cancel "cancel" "cancel selection" "end the selection; in the tree, clear the filter",
     SwitchPane "switch_pane" "switch tree/diff" "switch between the file tree and the diff",
     ToggleTree "toggle_tree" "toggle tree" "show or hide the file tree",
@@ -96,19 +97,21 @@ actions! {
     ToggleWatch "toggle_watch" "toggle watch" "watch for changes",
     ToggleMouse "toggle_mouse" "toggle mouse" "take mouse input, or leave it to the terminal's own selection (many terminals select natively with shift held while dragging)",
     ToggleCopyDecorations "toggle_copy_decorations" "copy decorations" "copies include line numbers and +/- signs, or only the code",
-    Edit "edit" "open in editor" "open the file in $EDITOR at the top line",
+    Edit "edit" "open in editor" "open the file in $EDITOR at the line last tapped, else the top line",
     Comment "comment" "comment on lines" "comment on the selected lines, or the line v would start on, in a text box under them; esc saves it",
+    CommentFile "comment_file" "comment on file" "comment on the whole file shown, in a text box under its first row; esc saves it",
     Comments "comments" "list comments" "list every comment thread, files not in the diff included; enter goes to one",
     NextThread "next_thread" "next thread" "next comment thread, on into the next file with comments; it takes the focus, where r replies, e edits, x resolves, d deletes and o opens it on its host",
     PrevThread "prev_thread" "prev thread" "previous comment thread, back into the previous file with comments",
     ToggleThread "toggle_thread" "fold thread" "fold or unfold the focused comment thread, or the first on screen",
     ToggleThreads "toggle_threads" "fold all threads" "fold every comment thread to one row, or unfold them all",
-    CommentInEditor "comment_in_editor" "comment in $EDITOR" "write in $EDITOR: your draft in the focused thread, else a reply to it, else a comment on the line; ctrl+e does it from the text box",
+    CommentInEditor "comment_in_editor" "comment in $EDITOR" "write in $EDITOR: your draft in the focused thread, else a reply to it, else a comment on the line; ctrl+g does it from the text box",
     CommentedFiles "commented_files" "files with comments" "the tree shows only the files with comments, or every file; f/F and n/N keep to them",
-    ReviewPull "review_pull" "update the PR" "on a pull request (dffy pr), fetch its new commits and threads and show them in place (experimental, see review)",
-    ReviewPost "review_post" "post the review" "on a pull request (dffy pr), open the dialog that posts your drafts, replies and resolves as a review (experimental, see review)",
-    OpenPullRequest "open_pull_request" "open a PR" "list the pull requests on this branch, yours and those waiting on your review, to open one (experimental, see review)",
-    SinceLastReview "since_last_review" "since last review" "on a pull request, show only what changed since the head of your last review posted from dffy, or the whole PR again",
+    ReviewPull "review_pull" "update the review" "on a review a review plugin opened, fetch its new commits and threads and show them in place (experimental, see review)",
+    ReviewPost "review_post" "post the review" "on a review a review plugin opened, open the dialog that posts your drafts, replies and resolves as a review (experimental, see review)",
+    OpenReview "open_review" "open a review…" "list the reviews the review plugin offers, such as this branch's, yours and those waiting on you, to open one (experimental, see review)",
+    SinceLastReview "since_last_review" "since last review" "on a review a review plugin opened, show only what changed since the head of your last review posted from dffy, or the whole review again",
+    WholeReview "whole_review" "show the whole review" "on the branch's review that plain dffy found, show the whole review against the working tree, or the working tree's changes again",
     Help "help" "show this help" "show or hide this help",
     Quit "quit" "quit" "quit",
 }
@@ -208,6 +211,7 @@ const DEFAULTS: &[(Table, &str, Action)] = &[
     (M, "w", Action::ToggleWatch),
     (M, "e", Action::Edit),
     (M, "c", Action::Comment),
+    (M, "C", Action::CommentFile),
     (M, "i", Action::Comments),
     (M, "m", Action::NextThread),
     (M, "M", Action::PrevThread),
@@ -248,8 +252,9 @@ const DEFAULTS: &[(Table, &str, Action)] = &[
     (L, "a", Action::ToggleWatch),
     (L, "c", Action::CycleTheme),
     (L, "E", Action::CommentInEditor),
-    (L, "P", Action::OpenPullRequest),
+    (L, "P", Action::OpenReview),
     (L, "R", Action::SinceLastReview),
+    (L, "A", Action::WholeReview),
     (L, "?", Action::Help),
 ];
 
@@ -337,18 +342,21 @@ impl Action {
             Self::Select
             | Self::Copy
             | Self::CopyPath
+            | Self::CopyAbsolutePath
             | Self::Cancel
             | Self::ToggleCopyDecorations => Group::Copy,
             Self::ToggleWatch | Self::ToggleMouse => Group::Modes,
             Self::Leader
             | Self::Edit
             | Self::Comment
+            | Self::CommentFile
             | Self::Comments
             | Self::CommentInEditor
             | Self::ReviewPull
             | Self::ReviewPost
-            | Self::OpenPullRequest
+            | Self::OpenReview
             | Self::SinceLastReview
+            | Self::WholeReview
             | Self::Help
             | Self::Quit => Group::Other,
         }
@@ -380,13 +388,15 @@ impl Action {
             Self::CycleTheme => "Theme",
             Self::Copy => "Copy selection",
             Self::CopyPath => "Copy file path",
+            Self::CopyAbsolutePath => "Copy absolute path",
             Self::ToggleCopyDecorations => "Copy with line numbers and signs",
             Self::ToggleMouse => "Mouse selection",
             Self::ToggleWatch => "Watch for changes",
             Self::CommentInEditor => "Continue in editor",
             Self::CommentedFiles => "Files with comments",
-            Self::OpenPullRequest => "Open pull request…",
+            Self::OpenReview => "Open review…",
             Self::SinceLastReview => "Since last review",
+            Self::WholeReview => "Show whole review",
             Self::Help => "All keys",
             other => other.label(),
         }
@@ -416,6 +426,7 @@ impl Action {
             Self::Select => "select lines",
             Self::Copy => "copy selection",
             Self::CopyPath => "copy path",
+            Self::CopyAbsolutePath => "copy absolute path",
             Self::Cancel => "cancel",
             Self::SwitchPane => "switch pane",
             Self::ToggleTree => "tree",
@@ -445,6 +456,7 @@ impl Action {
             Self::ToggleCopyDecorations => "copy decorations",
             Self::Edit => "edit",
             Self::Comment => "comment",
+            Self::CommentFile => "comment on file",
             Self::Comments => "comments",
             Self::NextThread => "next thread",
             Self::PrevThread => "previous thread",
@@ -452,10 +464,11 @@ impl Action {
             Self::ToggleThreads => "fold threads",
             Self::CommentInEditor => "comment in editor",
             Self::CommentedFiles => "files with comments",
-            Self::ReviewPull => "update PR",
+            Self::ReviewPull => "update review",
             Self::ReviewPost => "post review",
-            Self::OpenPullRequest => "open pull request",
+            Self::OpenReview => "open review",
             Self::SinceLastReview => "since last review",
+            Self::WholeReview => "whole review",
             Self::Help => "all keys",
             Self::Quit => "quit",
         }

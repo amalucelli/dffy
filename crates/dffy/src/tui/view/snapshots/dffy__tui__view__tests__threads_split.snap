@@ -8,7 +8,7 @@ expression: "all_rows(layout(true, false)).join(\"\\n\")"
    │  └┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┘
 1  │ fn main() {             │1  │ fn main() {
 2○-│     let total = count +…│2◆+│     let total = items.le…
-   │  ╶ ▸ ana · 3h ago · … ╴ │
+   │  │ ▸ ana · 3h ago · … │ │
                              │   │
                              │   │  ┌ ▾ octocat · 2h ago… ┐
                              │   │  ┆ Why len() here and  ┆
@@ -27,4 +27,4 @@ expression: "all_rows(layout(true, false)).join(\"\\n\")"
 4  │ }                       │5  │ }
 5 -│ // a comment long enoug…│6 +│ // a comment long enough…
    │\ No newline at end of file
-   │  ╶ ▸ ana · 4h ago · outdated · lines not f…  1 reply ╴
+   │  │ ▸ ana · 4h ago · outdated · lines not f…  1 reply │

@@ -154,12 +154,45 @@ pub(crate) enum Block {
 struct Rows {
     separator: bool,
     code: usize,
+    /// Its folded threads, to tint when painted.
+    cards: Vec<Card>,
+}
+
+/// A folded thread's row: which of its row's screen rows it is, the
+/// columns inside its sides, and whether it has the focus.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Card {
+    row: usize,
+    columns: Range<usize>,
+    focused: bool,
+}
+
+impl Card {
+    /// Gives its cells on screen row `y`, its row drawn from column `x`
+    /// of a pane ending at `end`, the background of the selection, or of
+    /// the inactive one when it hasn't the focus.
+    fn tint(&self, grid: &mut Grid, (x, end, y): (usize, usize, usize), theme: &Theme) {
+        // The background alone: mono's selection is reverse video, which
+        // would turn the card inside out.
+        let bg = theme
+            .style(if self.focused {
+                Role::Selection
+            } else {
+                Role::SelectionInactive
+            })
+            .bg;
+        if bg.is_some() {
+            let end = (x + self.columns.end).min(end);
+            grid.map_styles(x + self.columns.start, y, end, |s| Style { bg, ..s });
+        }
+    }
 }
 
 /// Which threads are folded to one row. Resolved threads start folded, and
-/// outdated ones unless a draft is in them: on a reviewed PR they outnumber
-/// the open ones, and an unsent reply shouldn't hide. In a local review
-/// every comment is a draft, so resolving is what folds there. `Z` then sets every thread, and `z` one. Choices are
+/// outdated ones unless a comment not posted is in them: on a reviewed
+/// change they outnumber the open ones, and an unsent reply shouldn't
+/// hide. In a local review nothing is posted, so resolving is what folds
+/// there. `Z` then sets every thread, and `z` one. Choices are
 /// kept by root, as folded or not rather than as a flip of the default, so
 /// they outlive reloads of the comments file and a thread resolved or
 /// reopened under them.
@@ -205,7 +238,8 @@ impl Fold {
         self.defaults = threads
             .iter()
             .map(|t| {
-                let quiet = t.resolved || (t.outdated && !t.notes.iter().any(|n| n.draft));
+                let quiet =
+                    t.resolved || (t.outdated && t.notes.iter().all(comments::Note::posted));
                 (t.root.clone(), quiet)
             })
             .collect();
@@ -632,10 +666,19 @@ impl Doc {
         let start = c.len();
         let separator = self.render_code(pos, layout, c);
         let code = c.len() - start;
+        let mut cards = Vec::new();
         for (i, block) in self.blocks(pos, layout).into_iter().enumerate() {
-            self.render_block(block, pos, layout, i > 0, c);
+            let card = self.render_block(block, pos, layout, i > 0, c);
+            cards.extend(card.map(|card| Card {
+                row: card.row - start,
+                ..card
+            }));
         }
-        Rows { separator, code }
+        Rows {
+            separator,
+            code,
+            cards,
+        }
     }
 
     /// [`Doc::render`]'s code rows. Returns whether it's a gap's separator.
@@ -772,20 +815,18 @@ impl Doc {
     }
 
     /// The blocks hung under the row at `pos`, in the order they're drawn:
-    /// under the file's first row the comments on the whole file; under
-    /// a line the threads on it, old side first, then the text box when it
-    /// writes a new one there; under a separator the threads on the lines
-    /// it hides; under the file's last row the threads whose lines are
-    /// gone.
+    /// under the file's first row the comments on the whole file, then the
+    /// text box when it writes a new one; under a line the threads on it,
+    /// old side first, then the text box when it writes a new one there;
+    /// under a separator the threads on the lines it hides; under the
+    /// file's last row the threads whose lines are gone.
     fn blocks(&mut self, pos: Pos, layout: &Layout) -> Vec<Block> {
-        let new = match &self.writing {
-            Some(Writing {
-                at: Writes::New { side, lines },
-                ..
-            }) => Some((*side, lines.end - 1)),
-            _ => None,
+        let (new, on_file) = match self.writing.as_ref().map(|w| &w.at) {
+            Some(Writes::New { side, lines }) => (Some((*side, lines.end - 1)), false),
+            Some(Writes::File) => (None, true),
+            _ => (None, false),
         };
-        if pos.file != self.threads_file || (self.threads.is_empty() && new.is_none()) {
+        if pos.file != self.threads_file || (self.threads.is_empty() && new.is_none() && !on_file) {
             return Vec::new();
         }
         let threads = Arc::clone(&self.threads);
@@ -798,6 +839,9 @@ impl Doc {
                     .filter(|&i| threads[i].at == At::File)
                     .map(Block::Thread),
             );
+            if on_file {
+                out.push(Block::New);
+            }
         }
         let lines = self.document.row_lines(logical, arrange(layout));
         let rendered = self.document.file(pos.file).and_then(File::rendered);
@@ -850,31 +894,41 @@ impl Doc {
         let Some(Segment::Gap(g)) = self.document.segment(pos.file, pos.part) else {
             return None;
         };
-        let shown = self.document.shown(pos.file, g)?;
-        if shown.hidden() == 0 || shown.line(pos.row).is_some() {
-            return None;
-        }
+        let hides = self.document.shown(pos.file, g)?.hides(pos.row)?;
         let span = *self.document.file(pos.file)?.gaps().get(g)?;
         let first = match side {
             Side::Old => span.old,
             Side::New => span.new,
-        } + shown.top;
-        Some(first..first + shown.hidden())
+        };
+        Some(first + hides.start..first + hides.end)
     }
 
     /// Appends `block`'s rows, hung under the row at `pos`: blank under
     /// the gutter but for its rule, then the block's box from a cell into
     /// the code's column to a cell before the pane's edge. In a split row a
     /// thread on a line takes its side's half. `gap` puts a blank row over
-    /// it, to part it from the block above.
-    fn render_block(&mut self, block: Block, pos: Pos, layout: &Layout, gap: bool, c: &mut Canvas) {
+    /// it, to part it from the block above. Returns the row of a folded
+    /// thread, counted in `c`.
+    fn render_block(
+        &mut self,
+        block: Block,
+        pos: Pos,
+        layout: &Layout,
+        gap: bool,
+        c: &mut Canvas,
+    ) -> Option<Card> {
         let (start, gutter, boxed, old_half) = self.block_columns(block, pos, layout);
         let mut rows = Canvas::default();
         if gap {
             rows.spaces(Role::Plain, boxed);
             rows.end_line();
         }
-        self.block_box(block, boxed, &mut rows);
+        let left = start + gutter.saturating_sub(2) + 3;
+        let card = self.block_box(block, boxed, &mut rows).map(|focused| Card {
+            row: c.len() + usize::from(gap),
+            columns: left + 1..(left + boxed).saturating_sub(1),
+            focused,
+        });
         for row in rows.rows() {
             if start > 0 {
                 c.spaces(Role::Plain, start - 1);
@@ -892,6 +946,7 @@ impl Doc {
             }
             c.end_line();
         }
+        card
     }
 
     /// Screen rows of `block` hung under the row at `pos`.
@@ -920,7 +975,7 @@ impl Doc {
     fn writes_in(&self, i: usize) -> bool {
         self.writing.as_ref().is_some_and(|w| match &w.at {
             Writes::Reply(root) | Writes::Edit { root, .. } => *root == self.threads[i].root,
-            Writes::New { .. } => false,
+            Writes::New { .. } | Writes::File => false,
         })
     }
 
@@ -983,8 +1038,9 @@ impl Doc {
         (start, gutter, boxed, split && side == Some(Side::Old))
     }
 
-    /// Writes `block`'s box, `boxed` columns wide, into `c`.
-    fn block_box(&mut self, block: Block, boxed: usize, c: &mut Canvas) {
+    /// Writes `block`'s box, `boxed` columns wide, into `c`. Returns
+    /// whether it has the focus when it's a folded thread's one row.
+    fn block_box(&mut self, block: Block, boxed: usize, c: &mut Canvas) -> Option<bool> {
         match block {
             Block::Thread(i) => {
                 let threads = Arc::clone(&self.threads);
@@ -993,12 +1049,14 @@ impl Doc {
                 let writing = self.writing.as_mut().filter(|_| writes);
                 let focused = writes || self.focus.as_deref() == Some(thread.root.as_str());
                 let collapsed = self.fold.collapsed(&thread.root);
-                comments::thread_rows(thread, (collapsed, focused), writing, (boxed, self.now), c);
+                comments::thread_rows(thread, (collapsed, focused), writing, (boxed, self.now), c)
+                    .then_some(focused)
             }
             Block::New => {
                 if let Some(writing) = &mut self.writing {
                     comments::new_rows(&mut writing.text, boxed, c);
                 }
+                None
             }
         }
     }
@@ -1225,10 +1283,25 @@ impl Doc {
         }
     }
 
+    /// The separator drawn on screen row `y` of the document in the last
+    /// frame.
+    pub(crate) fn separator_at(&self, y: usize) -> Option<Pos> {
+        self.separators
+            .iter()
+            .find(|(row, _)| *row == y)
+            .map(|&(_, p)| p)
+    }
+
+    /// Makes `separator` the one `x` reveals, until the next frame aims
+    /// at the first on screen again.
+    pub(crate) fn aim(&mut self, separator: Pos) {
+        self.target = Some(separator);
+    }
+
     /// A click on screen row `y` of the document: reveals more of the gap
     /// when it's a separator.
     pub(crate) fn click(&mut self, y: usize) {
-        if let Some(&(_, p)) = self.separators.iter().find(|(row, _)| *row == y)
+        if let Some(p) = self.separator_at(y)
             && let Some(Segment::Gap(g)) = self.document.segment(p.file, p.part)
         {
             self.expand(p.file, g);
@@ -1245,8 +1318,14 @@ impl Doc {
 
     /// The new-side line number at the top of the screen, for the editor.
     pub(crate) fn line_at_top(&mut self) -> usize {
-        let line = self.line_of(self.document.pos);
-        let file = self.document.file(self.document.pos.file);
+        self.line_at(self.document.pos)
+    }
+
+    /// The new-side line number of the row at `pos`, or the first after
+    /// it, for the editor.
+    pub(crate) fn line_at(&mut self, pos: Pos) -> usize {
+        let line = self.line_of(pos);
+        let file = self.document.file(pos.file);
         match file.and_then(File::rendered) {
             Some(rendered) => rendered.source_lines(Side::New, line - 1, line - 1).start + 1,
             None => line,
@@ -1404,6 +1483,9 @@ impl Doc {
                 let after = paint(grid, x, top + y, end, row, theme, Attributes::NONE);
                 if let Some(fill) = c.fill(i) {
                     grid.fill(after, top + y, end, theme.ink_style(fill));
+                }
+                for card in drawn.cards.iter().filter(|card| card.row == i) {
+                    card.tint(grid, (x, end, top + y), theme);
                 }
                 if i >= drawn.code {
                     self.blocks_drawn = true;
@@ -2011,6 +2093,23 @@ impl Doc {
         });
     }
 
+    /// Whether the selection holds the row at `pos`, on `side` when the
+    /// row is split.
+    pub(crate) fn selection_holds(&mut self, pos: Pos, side: Side) -> bool {
+        let Some(s) = &self.selection else {
+            return false;
+        };
+        let (selected, file, (lo, hi)) = (s.side, s.anchor.file, s.range());
+        if pos.file != file {
+            return false;
+        }
+        let layout = self.file_layout(file);
+        if side != selected && self.split_row(pos, &layout) {
+            return false;
+        }
+        self.row_lines(pos)[selected.index()].is_some_and(|line| (lo..=hi).contains(&line))
+    }
+
     /// Starts a selection on the row at `pos` and `side`, or with none, on
     /// the first row on screen holding code, on its new side when it has
     /// one. Returns whether there was a line to start on.
@@ -2306,6 +2405,17 @@ impl Doc {
         true
     }
 
+    /// Focuses the thread with root `root` on the file shown, scrolling
+    /// only as far as it takes to show it: after a save, the place stays.
+    pub(crate) fn focus_thread(&mut self, root: &str) -> bool {
+        let Some(i) = self.threads.iter().position(|t| t.root == root) else {
+            return false;
+        };
+        self.focus = Some(root.to_owned());
+        self.reveal_block(Block::Thread(i), false);
+        true
+    }
+
     /// Focuses thread `i`, hung under the row at `pos`, and shows it a few
     /// rows of code below the top.
     fn show_thread(&mut self, pos: Pos, i: usize) {
@@ -2321,7 +2431,7 @@ impl Doc {
     /// The block the text box is drawn in.
     pub(crate) fn writing_block(&self) -> Option<Block> {
         match &self.writing.as_ref()?.at {
-            Writes::New { .. } => Some(Block::New),
+            Writes::New { .. } | Writes::File => Some(Block::New),
             Writes::Reply(root) | Writes::Edit { root, .. } => self
                 .threads()
                 .iter()
@@ -2458,15 +2568,16 @@ impl Doc {
         // A piped file's hidden lines aren't known, so they're left out.
         let mut unknown = Vec::new();
         for (g, &span) in loaded.gaps().iter().enumerate() {
-            let shown = document.shown(file, g)?;
             let start = match selection.side {
                 Side::Old => span.old,
                 Side::New => span.new,
-            } + shown.top;
-            let (from, to) = (start.max(lo), (start + shown.hidden()).min(hi + 1));
-            hidden += to.saturating_sub(from);
-            if partial && to > from {
-                unknown.push(from..to);
+            };
+            for run in document.shown(file, g)?.hidden_lines() {
+                let (from, to) = ((start + run.start).max(lo), (start + run.end).min(hi + 1));
+                hidden += to.saturating_sub(from);
+                if partial && to > from {
+                    unknown.push(from..to);
+                }
             }
         }
         let diff = loaded.diff();

@@ -202,6 +202,13 @@ main() {
 	*":$install_dir:"*) ;;
 	*) say "$install_dir is not on your PATH; add it in your shell profile, e.g. export PATH=\"$install_dir:\$PATH\"" ;;
 	esac
+
+	case " $plugins " in
+	*" review-github "*)
+		command -v gh >/dev/null 2>&1 ||
+			say "dffy-review-github needs the GitHub CLI (gh): https://cli.github.com"
+		;;
+	esac
 }
 
 # Called last, so a download cut short by the pipe runs nothing.

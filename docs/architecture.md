@@ -81,7 +81,7 @@ The viewer's submodules, under `tui`:
 
 | Submodule | What it owns |
 |---|---|
-| `app` | State and event handling. `app::pr` is pull request mode: the PR shown, the review plugin's run, the PR picker and the post dialog. A PR's update or another PR goes through the change-set thread as a new range, the way watch mode's refreshes do. |
+| `app` | State and event handling. `app::pr` is review mode: the code host's review shown, the review plugin's run, the review picker and the post dialog, every word naming the host's kind of review the plugin's. A review's update or another review goes through the change-set thread as a new range, the way watch mode's refreshes do. |
 | `view` | The screen layer over the core's `Document`: rows' heights when wrapping, scrolling and keeping the screen full, opening a file a few rows above its first change, drawing, the overview column, selections and the mouse. It reports what `Document::missing` names for the rows drawn in the last frame. `view::rendered` turns a renderer's blocks into a rendered `File`. |
 | `worker` | The change-set thread, and the pool that runs diffs, renderings and the core's `File::prepare` steps off the UI thread. `app` turns the screen's `missing()` into the pool's jobs. |
 | `tree`, `picker`, `commands`, `help` | The file tree, the file picker, the command panel, the key list. |

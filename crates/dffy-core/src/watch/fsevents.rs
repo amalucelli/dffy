@@ -9,14 +9,17 @@
 use std::ffi::{CStr, OsStr, c_char, c_void};
 use std::os::unix::ffi::OsStrExt;
 use std::path::PathBuf;
-use std::ptr::NonNull;
+use std::ptr::{self, NonNull};
 use std::slice;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Sender};
 use std::thread::{self, JoinHandle};
 
-use objc2_core_foundation::{CFArray, CFRunLoop, CFString, kCFRunLoopDefaultMode};
+use objc2_core_foundation::{
+    CFArray, CFRetained, CFRunLoop, CFRunLoopSource, CFRunLoopSourceContext, CFString,
+    kCFRunLoopDefaultMode,
+};
 #[expect(deprecated, reason = "see the call in `run`")]
 use objc2_core_services::FSEventStreamScheduleWithRunLoop;
 use objc2_core_services::{
@@ -32,14 +35,29 @@ use super::{Raw, Root, Shared, SharedExcludes};
 
 pub(super) const NAME: &str = "fsevents";
 
-/// How often the stream's run loop checks whether to stop.
-const STOP_CHECK_SECONDS: f64 = 0.25;
-
 /// The stream's thread; dropping it stops the stream.
 pub(super) struct Handle {
     stop: Arc<AtomicBool>,
+    waker: Waker,
     thread: Option<JoinHandle<()>>,
 }
+
+/// Wakes the stream's run loop, which otherwise sleeps until an event.
+/// A signaled source stays signaled until the loop runs it, so a stop
+/// asked before the loop starts waiting isn't lost, as `CFRunLoopStop`'s
+/// would be.
+struct Waker {
+    run_loop: CFRetained<CFRunLoop>,
+    source: CFRetained<CFRunLoopSource>,
+}
+
+// SAFETY: other threads only signal the source, wake the run loop and
+// release both, which Core Foundation allows from any thread.
+unsafe impl Send for Waker {}
+
+/// The stop source's work: none, as handling it ends the run that
+/// [`run`] checks the stop flag after.
+unsafe extern "C-unwind" fn woken(_info: *mut c_void) {}
 
 impl Handle {
     /// Nothing to do: the stream covers the whole tree whatever git ignores,
@@ -51,6 +69,8 @@ impl Handle {
 impl Drop for Handle {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
+        self.waker.source.signal();
+        self.waker.run_loop.wake_up();
         if let Some(thread) = self.thread.take() {
             thread.join().ok();
         }
@@ -80,10 +100,11 @@ pub(super) fn start(
         .spawn(move || run(&paths, tx, &ready_tx, &stopped))
         .map_err(|e| e.to_string())?;
     match ready.recv() {
-        Ok(Ok(())) => {
+        Ok(Ok(waker)) => {
             shared.watches.store(count, Ordering::Relaxed);
             Ok(Handle {
                 stop,
+                waker,
                 thread: Some(thread),
             })
         }
@@ -92,7 +113,12 @@ pub(super) fn start(
     }
 }
 
-fn run(paths: &[PathBuf], tx: Sender<Raw>, ready: &Sender<Result<(), String>>, stop: &AtomicBool) {
+fn run(
+    paths: &[PathBuf],
+    tx: Sender<Raw>,
+    ready: &Sender<Result<Waker, String>>,
+    stop: &AtomicBool,
+) {
     let strings: Vec<_> = paths
         .iter()
         .map(|p| CFString::from_str(&p.to_string_lossy()))
@@ -135,20 +161,37 @@ fn run(paths: &[PathBuf], tx: Sender<Raw>, ready: &Sender<Result<(), String>>, s
     // SAFETY: Core Foundation initializes this constant before any of our
     // code runs and never writes it again.
     let mode = unsafe { kCFRunLoopDefaultMode };
-    let (Some(run_loop), Some(mode)) = (CFRunLoop::current(), mode) else {
+    let mut stopper = CFRunLoopSourceContext {
+        version: 0,
+        info: ptr::null_mut(),
+        retain: None,
+        release: None,
+        copyDescription: None,
+        equal: None,
+        hash: None,
+        schedule: None,
+        cancel: None,
+        perform: Some(woken),
+    };
+    // SAFETY: `stopper` is a valid version 0 context, copied by the call;
+    // its `info` is never read.
+    let source = unsafe { CFRunLoopSource::new(None, 0, &raw mut stopper) };
+    let (Some(run_loop), Some(mode), Some(source)) = (CFRunLoop::current(), mode, source) else {
         // SAFETY: `stream` is valid and was never scheduled or started.
         unsafe { FSEventStreamRelease(stream) };
         free_info();
         ready.send(Err("no run loop for FSEvents".to_owned())).ok();
         return;
     };
+    run_loop.add_source(Some(&source), Some(mode));
     #[expect(
         deprecated,
         reason = "the replacement schedules on a dispatch queue, which needs another dependency for the same behavior"
     )]
     // SAFETY: `stream` is valid and not yet scheduled. It's scheduled on
     // this thread's run loop, which runs below until the handle asks to
-    // stop, and it's invalidated before `run_loop` goes out of scope.
+    // stop, and it's invalidated before the thread, which keeps its run
+    // loop alive, ends.
     unsafe {
         FSEventStreamScheduleWithRunLoop(stream, &run_loop, mode);
     }
@@ -156,9 +199,14 @@ fn run(paths: &[PathBuf], tx: Sender<Raw>, ready: &Sender<Result<(), String>>, s
     // requires.
     let started = unsafe { FSEventStreamStart(stream) };
     if started {
-        ready.send(Ok(())).ok();
+        let waker = Waker {
+            run_loop,
+            source: source.clone(),
+        };
+        ready.send(Ok(waker)).ok();
         while !stop.load(Ordering::Relaxed) {
-            CFRunLoop::run_in_mode(Some(mode), STOP_CHECK_SECONDS, false);
+            // No timeout: the loop sleeps until an event or the stop source.
+            CFRunLoop::run_in_mode(Some(mode), f64::MAX, true);
         }
         // SAFETY: `stream` was started on this thread.
         unsafe { FSEventStreamStop(stream) };
@@ -173,6 +221,7 @@ fn run(paths: &[PathBuf], tx: Sender<Raw>, ready: &Sender<Result<(), String>>, s
     // SAFETY: `stream` is invalidated and this is its only reference.
     unsafe { FSEventStreamRelease(stream) };
     free_info();
+    source.invalidate();
 }
 
 /// Forwards each event's path, or an overflow when `FSEvents` says events
@@ -209,5 +258,35 @@ unsafe extern "C-unwind" fn callback(
             Raw::Overflow
         };
         tx.send(raw).ok();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Mutex;
+    use std::time::Duration;
+
+    use super::super::excludes::Excludes;
+    use super::*;
+
+    /// A stop asked right as the stream starts, before its loop waits,
+    /// still ends the thread: dropping the handle joins it.
+    #[test]
+    fn dropping_the_handle_right_after_start_ends_the_stream() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = Root::plain(dir.path()).expect("root");
+        let excludes = Arc::new(Mutex::new(Excludes::load(&root, None)));
+        let (done, finished) = mpsc::channel();
+        thread::spawn(move || {
+            for _ in 0..200 {
+                let (tx, _rx) = mpsc::channel();
+                drop(start(&root, tx, &Arc::default(), &excludes).expect("starts"));
+            }
+            done.send(()).ok();
+        });
+        assert!(
+            finished.recv_timeout(Duration::from_secs(60)).is_ok(),
+            "a stop was lost"
+        );
     }
 }

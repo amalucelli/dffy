@@ -301,7 +301,7 @@ pub(crate) const KEYS: &[Key] = &[
     },
     Key {
         name: "review",
-        doc: "Experimental: the review plugin, the program dffy-review-<name> on PATH, that `dffy pr` runs to review a pull request in the viewer, and that plain `dffy` asks for the branch's pull request; empty for none. --review <name> sets it for one run. See docs/plugins.md.",
+        doc: "Experimental: the review plugin, the program dffy-review-<name> on PATH. It adds the command it names to open one of the code host's reviews in the viewer, and plain `dffy` asks it for the branch's; empty for none, and no such command. --review <name> sets it for one run. See docs/plugins.md.",
         default: "",
     },
     Key {

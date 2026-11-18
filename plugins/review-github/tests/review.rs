@@ -23,8 +23,39 @@ const URL: &str = "https://github.com/acme/widgets/pull/7";
 
 /// Each `gh` event records how many lines the plugin had printed by then,
 /// which orders the plugin's output against its requests without sleeps.
+/// GraphQL requests go to `requests` and `events`, REST ones to `rest`.
 const GH: &str = r#"#!/bin/sh
+case "$1" in
+  --version) echo 'gh version 2.0.0 (stub)'; exit 0 ;;
+  auth)
+    printf '%s\n' "$*" >> "$STUB/auth"
+    if [ -f "$STUB/gh/logged-out" ]; then
+      echo 'You are not logged into any GitHub hosts. To log in, run: gh auth login' >&2; exit 1
+    fi
+    printf 'github.com\n  ✓ Logged in to github.com account octocat (keyring)\n'; exit 0 ;;
+esac
 body=$(cat)
+if [ -f "$STUB/gh/logged-out" ]; then
+  echo 'To get started with GitHub CLI, please run:  gh auth login' >&2; exit 4
+fi
+if [ -f "$STUB/gh/bad-token" ]; then echo 'gh: Bad credentials (HTTP 401)' >&2; exit 1; fi
+if [ "$2" != graphql ]; then
+  # REST, named by the path's last segment. A `.hold` makes the answer wait
+  # for the plugin's first line; the log says how many lines it had then.
+  op=$(printf '%s' "$2" | sed 's/?.*//; s|.*/||')
+  n=$(($(cat "$STUB/rest" 2>/dev/null | grep -c "/$op?") + 1))
+  if [ -f "$STUB/gh/$op.hold" ]; then
+    i=0
+    while [ "$(wc -l < "$STUB/out")" -lt 1 ] && [ $i -lt 30 ]; do sleep 0.1; i=$((i + 1)); done
+  fi
+  printf '%s after %s\n' "$*" "$(wc -l < "$STUB/out" | tr -d ' ')" >> "$STUB/rest"
+  for f in "$STUB/gh/$op.$n" "$STUB/gh/$op"; do
+    if [ -f "$f.json" ]; then cat "$f.json"; exit 0; fi
+    if [ -f "$f.down" ]; then echo 'error connecting to api.github.com' >&2; exit 1; fi
+  done
+  echo "gh stub: no fixture for $op call $n" >&2
+  exit 1
+fi
 op=$(printf '%s' "$body" | sed -n 's/.*"operationName":"\([A-Za-z]*\)".*/\1/p')
 printf '%s\n' "$body" >> "$STUB/requests"
 printf 'gh %s after %s\n' "$op" "$(wc -l < "$STUB/out" | tr -d ' ')" >> "$STUB/events"
@@ -152,9 +183,38 @@ impl Fixture {
         let base_lib = numbered((1..=12).map(|n| format!("line {n}")));
         fs::write(author.join("src/lib.rs"), &base_lib).expect("write");
         fs::write(author.join("notes.txt"), "notes\n").expect("write");
+        let long = |n: usize, changed: &str| {
+            numbered((1..=40).map(|i| {
+                if i == n {
+                    changed.to_owned()
+                } else {
+                    format!("long {i}")
+                }
+            }))
+        };
+        let moved = |changed: &str| {
+            numbered((1..=20).map(|i| {
+                if i == 10 {
+                    changed.to_owned()
+                } else {
+                    format!("moved {i}")
+                }
+            }))
+        };
+        fs::write(author.join("src/long.rs"), long(0, "")).expect("write");
+        fs::create_dir_all(author.join("docs")).expect("docs dir");
+        fs::write(author.join("docs/old name.txt"), moved("moved 10")).expect("write");
         git(&author, &["add", "."]);
         git(&author, &["commit", "-q", "-m", "base"]);
         let base = git(&author, &["rev-parse", "HEAD"]);
+        // Two lines on top, so its old and new line numbers differ.
+        fs::write(
+            author.join("src/long.rs"),
+            format!("zero\nzero\n{}", long(30, "thirty")),
+        )
+        .expect("write");
+        git(&author, &["mv", "docs/old name.txt", "docs/new name.txt"]);
+        fs::write(author.join("docs/new name.txt"), moved("ten")).expect("write");
         let head_lib = numbered(
             (1..=12)
                 .map(|n| {
@@ -257,19 +317,42 @@ impl Fixture {
         );
     }
 
+    /// Makes `gh` answer as it does without a token.
+    fn log_out(&self) {
+        fs::write(self.path("stub/gh/logged-out"), "").expect("write");
+    }
+
     /// A verb as dffy runs it, with stdout written to a file the `gh` stub
     /// counts lines in.
     fn run(&self, args: &[&str]) -> Run {
+        let path = std::env::var("PATH").unwrap_or_default();
+        self.run_on(args, &format!("{}:{path}", self.path("stub/bin").display()))
+    }
+
+    /// A verb run with nothing on PATH but git and dffy: a `gh` installed
+    /// beside git, as on CI, would otherwise be found.
+    fn run_without_gh(&self, args: &[&str]) -> Run {
+        let bin = self.path("nogh");
+        if !bin.exists() {
+            fs::create_dir(&bin).expect("dir");
+            let git = std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
+                .map(|dir| dir.join("git"))
+                .find(|git| git.is_file())
+                .expect("git on PATH");
+            std::os::unix::fs::symlink(git, bin.join("git")).expect("git");
+            std::os::unix::fs::symlink(&self.real_dffy, bin.join("dffy")).expect("dffy");
+        }
+        self.run_on(args, &bin.display().to_string())
+    }
+
+    fn run_on(&self, args: &[&str], path: &str) -> Run {
         let out = self.path("stub/out");
         let file = fs::File::create(&out).expect("stdout file");
-        let path = std::env::var("PATH").unwrap_or_default();
         let status = Command::new(env!("CARGO_BIN_EXE_dffy-review-github"))
             .current_dir(self.work())
             .args(args)
-            .env(
-                "PATH",
-                format!("{}:{path}", self.path("stub/bin").display()),
-            )
+            .env("PATH", path)
+            .env_remove("GH_HOST")
             .env("STUB", self.path("stub"))
             .env("DFFY_REVIEW_PROTOCOL", "1")
             .env("XDG_DATA_HOME", self.path("data"))
@@ -381,6 +464,16 @@ impl Fixture {
             .collect()
     }
 
+    /// Every REST request, `<gh's arguments> after <lines printed>`, as
+    /// answered.
+    fn rest(&self) -> Vec<String> {
+        fs::read_to_string(self.path("stub/rest"))
+            .unwrap_or_default()
+            .lines()
+            .map(str::to_owned)
+            .collect()
+    }
+
     fn operations(&self) -> Vec<String> {
         self.requests()
             .iter()
@@ -388,10 +481,13 @@ impl Fixture {
             .collect()
     }
 
-    /// A cold `prepare` of the PR with the two pages of threads.
+    /// A cold `prepare` of the PR with the two pages of threads, and
+    /// GitHub's files with the hunks git has too, unless a test answered
+    /// the files otherwise.
     fn prepare(&self) -> Run {
         self.reply("PullRequest", Some(1), "pull_request_page_1.json");
         self.reply("PullRequest", Some(2), "pull_request_page_2.json");
+        self.reply("files", None, "files.json");
         let run = self.run(&["prepare", PR]);
         run.ok();
         run
@@ -466,6 +562,89 @@ impl Fixture {
         ids
     }
 
+    /// Puts a `git` on the stub's PATH that logs each call, `<args> after
+    /// <lines printed>`, for `git_calls`.
+    fn log_git(&self) {
+        let real = std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
+            .map(|dir| dir.join("git"))
+            .find(|git| git.is_file())
+            .expect("git on PATH");
+        let wrapper = self.path("stub/bin/git");
+        fs::write(
+            &wrapper,
+            format!(
+                "#!/bin/sh\necho \"$* after $(wc -l < \"$STUB/out\" | tr -d ' ')\" >> \"$STUB/git\"\n\
+                 exec '{}' \"$@\"\n",
+                real.display()
+            ),
+        )
+        .expect("wrapper");
+        fs::set_permissions(&wrapper, fs::Permissions::from_mode(0o755)).expect("chmod");
+    }
+
+    /// The git calls logged since the last `reset_git_calls`.
+    fn git_calls(&self) -> Vec<String> {
+        fs::read_to_string(self.path("stub/git"))
+            .unwrap_or_default()
+            .lines()
+            .map(str::to_owned)
+            .collect()
+    }
+
+    fn reset_git_calls(&self) {
+        fs::remove_file(self.path("stub/git")).ok();
+    }
+
+    /// A commit on the PR's head that only the author has: `src/lib.rs`
+    /// with its fifth line `5ive`.
+    fn unpushed_commit(&self) -> String {
+        let author = self.path("author");
+        git(&author, &["checkout", "-q", "-b", "rewritten", &self.head]);
+        let lib = fs::read_to_string(author.join("src/lib.rs")).expect("read");
+        fs::write(author.join("src/lib.rs"), lib.replace("five\n", "5ive\n")).expect("write");
+        git(&author, &["commit", "-q", "-am", "rewritten"]);
+        git(&author, &["rev-parse", "HEAD"])
+    }
+
+    /// Pushes `commit` to the remote and drops the ref again, as a
+    /// force-push leaves a PR's earlier head: there, but on no ref.
+    fn orphan_on_remote(&self, commit: &str) {
+        let url = self.path("github/acme/widgets.git");
+        git(
+            &self.path("author"),
+            &[
+                "push",
+                "-q",
+                url.to_str().expect("utf-8 path"),
+                &format!("{commit}:refs/hidden/orphan"),
+            ],
+        );
+        git(&url, &["update-ref", "-d", "refs/hidden/orphan"]);
+        // As GitHub serves them, whatever protocol this git speaks.
+        git(&url, &["config", "uploadpack.allowAnySHA1InWant", "true"]);
+    }
+
+    /// Answers every `PullRequest` with one page: a thread written on
+    /// `rewritten`'s fifth line, and one on a commit GitHub no longer has.
+    fn reply_force_pushed(&self, rewritten: &str) {
+        let thread = |n: u64, commit: &str, line: u64| {
+            json!({"id": format!("PRRT_{n}"), "isResolved": false, "isOutdated": true,
+                "path": "src/lib.rs", "diffSide": "RIGHT", "startDiffSide": null,
+                "originalLine": line, "originalStartLine": null, "subjectType": "LINE",
+                "comments": {"nodes": [{"id": format!("PRRC_{n}"), "url": URL,
+                    "body": "Hm.", "createdAt": "2026-11-16T09:30:00Z",
+                    "viewerDidAuthor": false, "author": {"login": "octocat"},
+                    "originalCommit": {"oid": commit}}]}})
+        };
+        let page = json!({"data": {"repository": {"pullRequest": {
+            "title": "Spell out five", "url": URL, "baseRefOid": self.base,
+            "headRefOid": self.head, "headRefName": "five",
+            "reviewThreads": {"totalCount": 2,
+                "pageInfo": {"hasNextPage": false, "endCursor": null},
+                "nodes": [thread(1, rewritten, 5), thread(2, GONE, 3)]}}}}});
+        fs::write(self.path("stub/gh/PullRequest.json"), page.to_string()).expect("fixture");
+    }
+
     fn draft(&self, id: &str) -> Value {
         self.comments()["comments"]
             .as_array()
@@ -477,6 +656,121 @@ impl Fixture {
     }
 }
 
+/// `describe` names the command dffy adds, the words its screens use, a
+/// PR as `PR #7`, and the events the post dialog offers: `pending` leaves
+/// the review open, the others submit it. dffy runs it from anywhere, so
+/// it needs no repository, git or gh.
+#[test]
+fn describe_names_the_command_from_nothing_but_itself() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let out = Command::new(env!("CARGO_BIN_EXE_dffy-review-github"))
+        .current_dir(dir.path())
+        .arg("describe")
+        .env("PATH", "")
+        .env("DFFY_REVIEW_PROTOCOL", "1")
+        .stdin(Stdio::null())
+        .output()
+        .expect("runs");
+    assert!(out.status.success(), "{out:?}");
+    let [described] = &lines(&out.stdout)[..] else {
+        panic!("one line: {out:?}");
+    };
+    assert_eq!(
+        [
+            &described["command"],
+            &described["noun"],
+            &described["nouns"],
+            &described["short"],
+            &described["id_prefix"]
+        ],
+        ["pr", "pull request", "pull requests", "PR", "#"]
+    );
+    let events: Vec<(&str, &str, bool)> = described["events"]
+        .as_array()
+        .expect("events")
+        .iter()
+        .map(|e| {
+            (
+                e["id"].as_str().expect("an id"),
+                e["key"].as_str().expect("a key"),
+                e["submits"] != false,
+            )
+        })
+        .collect();
+    assert_eq!(
+        events,
+        [
+            ("pending", "p", false),
+            ("comment", "c", true),
+            ("approve", "a", true),
+            ("request_changes", "r", true)
+        ]
+    );
+    assert!(described["outdated_reply_warning"].is_string());
+}
+
+const NO_GH: &str = "dffy-review-github needs the GitHub CLI (gh): https://cli.github.com";
+
+const LOGGED_OUT: &str = "gh isn't logged in to github.com; run `gh auth login`";
+
+/// A verb that asks GitHub says what's missing when gh isn't installed or
+/// isn't logged in, and `prepare` prints no session then.
+#[test]
+fn gh_missing_or_logged_out_is_said_plainly() {
+    let f = Fixture::new();
+    for args in [&["list"][..], &["prepare", PR]] {
+        let run = f.run_without_gh(args);
+        assert_eq!(run.code, Some(1), "{args:?}");
+        assert_eq!(run.lines, [json!({"error": NO_GH})], "{args:?}");
+    }
+    // A token GitHub refuses reads as logged out too.
+    fs::write(f.path("stub/gh/bad-token"), "").expect("write");
+    let run = f.run(&["list"]);
+    assert_eq!(run.lines, [json!({"error": LOGGED_OUT})]);
+    f.log_out();
+    for args in [&["list"][..], &["prepare", PR]] {
+        let run = f.run(args);
+        assert_eq!(run.code, Some(1), "{args:?}");
+        assert_eq!(run.lines, [json!({"error": LOGGED_OUT})], "{args:?}");
+    }
+}
+
+/// `doctor` checks gh and its login to the host the API calls go to, and
+/// exits 0 whatever they find: the checks carry it.
+#[test]
+fn doctor_checks_gh_and_its_login() {
+    let f = Fixture::new();
+    let run = f.run(&["doctor"]);
+    run.ok();
+    assert_eq!(
+        run.lines,
+        [json!({"checks": [
+            {"name": "gh", "ok": true, "detail": "gh version 2.0.0 (stub)"},
+            {"name": "auth", "ok": true, "detail": "Logged in to github.com account octocat (keyring)"},
+        ]})]
+    );
+    assert_eq!(
+        fs::read_to_string(f.path("stub/auth")).expect("auth asked"),
+        "auth status --hostname github.com\n"
+    );
+    f.log_out();
+    let run = f.run(&["doctor"]);
+    run.ok();
+    assert_eq!(
+        run.lines[0]["checks"][1],
+        json!({"name": "auth", "ok": false, "detail": LOGGED_OUT})
+    );
+    let run = f.run_without_gh(&["doctor"]);
+    run.ok();
+    assert_eq!(
+        run.lines,
+        [json!({"checks": [
+            {"name": "gh", "ok": false, "detail": NO_GH},
+            {"name": "auth", "ok": false, "detail": "needs gh"},
+        ]})]
+    );
+}
+
 #[test]
 fn prepare_prints_the_session_once_the_head_is_local_then_imports_the_rest() {
     let f = Fixture::new();
@@ -485,7 +779,7 @@ fn prepare_prints_the_session_once_the_head_is_local_then_imports_the_rest() {
     assert_eq!(
         run.lines,
         [
-            json!({"session": {"number": 7, "title": "Spell out five", "url": URL,
+            json!({"session": {"id": "7", "title": "Spell out five", "url": URL,
                 "base": f.base, "head": f.head, "last_reviewed_head": null,
                 "comments": f.comments_file()}}),
             json!({"progress": "1/4"}),
@@ -503,6 +797,8 @@ fn prepare_prints_the_session_once_the_head_is_local_then_imports_the_rest() {
         f.head
     );
 
+    // GitHub moved this thread to lines 5-6 of a later head; its lines and
+    // anchor are those it was written on.
     let root = f.comment("github:PRRC_kwDOAAAAB84AAAB1");
     assert_eq!(root["path"], "src/lib.rs");
     assert_eq!(root["side"], "new");
@@ -595,7 +891,7 @@ fn pull_moves_the_session_to_the_new_head_and_leaves_the_last_reviewed_one() {
     assert_eq!(
         run.lines,
         [
-            json!({"session": {"number": 7, "title": "Spell out five", "url": URL,
+            json!({"session": {"id": "7", "title": "Spell out five", "url": URL,
                 "base": f.base, "head": f.head2, "last_reviewed_head": null,
                 "comments": f.comments_file()}}),
             json!({"progress": "0/0"}),
@@ -748,7 +1044,7 @@ fn a_rejected_comment_stays_a_draft_and_a_retry_posts_only_it_in_the_pending_rev
         [
             json!({"draft": {"id": ids[0], "path": "src/lib.rs", "plan": "skip",
                 "reason": "Line could not be resolved"}}),
-            json!({"posted": 2, "failed": 1, "pending_review": true,
+            json!({"posted": 2, "failed": 1, "held": true, "held_message": "review still pending",
                 "url": format!("{URL}#pullrequestreview-2001")}),
         ]
     );
@@ -808,7 +1104,7 @@ fn a_post_stopped_midway_fails_and_a_retry_resumes_without_posting_twice() {
     assert_eq!(run.code, Some(1));
     assert_eq!(
         run.lines[run.lines.len() - 2],
-        json!({"posted": 2, "failed": 1, "pending_review": true,
+        json!({"posted": 2, "failed": 1, "held": true, "held_message": "review still pending",
             "url": format!("{URL}#pullrequestreview-2001")})
     );
     assert!(run.error().contains("api.github.com"), "{}", run.error());
@@ -958,15 +1254,16 @@ fn post_places_drafts_by_their_anchor_at_the_pr_head() {
     );
 }
 
-/// `--dry-run` says what `post` would do with each draft, from git alone:
-/// on its line at the PR's head, as a file comment, or not at all and why,
-/// then the counts. Nothing is asked of GitHub and nothing is written.
+/// `--dry-run` says what `post` would do with each draft, from git and
+/// what `prepare` kept: on its line at the PR's head, as a file comment, or
+/// not at all and why, then the counts. Nothing is asked of GitHub and
+/// nothing is written.
 #[test]
-fn a_dry_run_plans_each_draft_from_git_alone() {
+fn a_dry_run_plans_each_draft_without_asking_github() {
     let f = Fixture::new();
     f.prepare();
     let ids = f.add_planned_drafts();
-    let before = (f.requests().len(), f.comments());
+    let before = (f.requests().len(), f.rest().len(), f.comments());
 
     let run = f.run(&["post", PR, "--dry-run"]);
     run.ok();
@@ -1000,7 +1297,7 @@ fn a_dry_run_plans_each_draft_from_git_alone() {
             json!({"planned": {"line": 2, "file": 2, "skip": 3}}),
         ]
     );
-    assert_eq!((f.requests().len(), f.comments()), before);
+    assert_eq!((f.requests().len(), f.rest().len(), f.comments()), before);
 }
 
 /// `post` does what `--dry-run` said, draft by draft: the same drafts are
@@ -1072,10 +1369,382 @@ fn post_follows_the_dry_runs_plan() {
     );
 }
 
-/// After a post that left the review pending, `--submit-only` submits it
-/// with the event and summary, without posting the drafts still left.
+/// Drafts whose stored `distance` was measured against another diff: each
+/// is planned, on either side, by where its lines are in the PR's own
+/// hunks, and in a renamed file by its hunks under the new name. Each one
+/// is `(draft, plan, line)`.
+fn add_mismeasured_drafts(f: &Fixture) -> Vec<(String, &'static str, u64)> {
+    let draft = |path: &str, side: &str, (start, end): (u64, u64), lines: &[&str], distance| {
+        let at = |line| {
+            let mut both = json!({"old": null, "new": null});
+            both[side] = json!(line);
+            both
+        };
+        let mut draft = json!({"path": path, "side": side, "start": at(start), "end": at(end),
+            "anchor": {"before": [], "lines": lines, "after": []},
+            "text": "Hm.", "distance": distance});
+        if path == "docs/new name.txt" {
+            draft["old_path"] = json!("docs/old name.txt");
+        }
+        json!({"op": "add", "comment": draft})
+    };
+    let planned = [
+        (
+            draft("src/long.rs", "new", (17, 17), &["long 15"], 0),
+            "file",
+            17,
+        ),
+        (
+            draft("src/long.rs", "new", (32, 32), &["thirty"], 50),
+            "line",
+            32,
+        ),
+        // In the hunk on the old side (27 to 33), not on the new (29 to 35).
+        (
+            draft("src/long.rs", "old", (28, 28), &["long 28"], 50),
+            "line",
+            28,
+        ),
+        (
+            draft("src/long.rs", "old", (12, 12), &["long 12"], 0),
+            "file",
+            12,
+        ),
+        // Its last line is in the hunk, its first isn't.
+        (
+            draft("src/long.rs", "new", (28, 29), &["long 26", "long 27"], 0),
+            "file",
+            29,
+        ),
+        (
+            draft("docs/new name.txt", "old", (10, 10), &["moved 10"], 50),
+            "line",
+            10,
+        ),
+        (
+            draft("docs/new name.txt", "new", (10, 10), &["ten"], 50),
+            "line",
+            10,
+        ),
+        (
+            draft("docs/new name.txt", "new", (2, 2), &["moved 2"], 0),
+            "file",
+            2,
+        ),
+    ];
+    let ops: Vec<Value> = planned.iter().map(|(op, ..)| op.clone()).collect();
+    let answer = f.apply(&json!(ops));
+    planned
+        .iter()
+        .zip(answer["ids"].as_array().expect("ids"))
+        .map(|((_, plan, line), id)| (id.as_str().expect("an id").to_owned(), *plan, *line))
+        .collect()
+}
+
+/// A draft's stored `distance` is a hint from the diff it was written on;
+/// both `--dry-run` and `post` measure it against the PR's diff instead.
 #[test]
-fn submit_only_submits_the_pending_review_without_posting_drafts() {
+fn drafts_go_on_their_lines_by_the_pr_diff_not_their_stored_distance() {
+    let f = Fixture::new();
+    f.prepare();
+    let drafts = add_mismeasured_drafts(&f);
+
+    let planned = f.run(&["post", PR, "--dry-run"]);
+    planned.ok();
+    let plans: Vec<(String, &str, u64)> = planned
+        .lines
+        .iter()
+        .filter_map(|l| l.get("draft"))
+        .map(|d| {
+            (
+                d["id"].as_str().expect("an id").to_owned(),
+                d["plan"].as_str().expect("a plan"),
+                d["line"].as_u64().expect("a line"),
+            )
+        })
+        .collect();
+    assert_eq!(plans, drafts);
+
+    f.reply("PostState", None, "post_state.json");
+    f.reply("AddReview", None, "add_review.json");
+    f.reply("SubmitPullRequestReview", None, "submit.json");
+    for n in 1..=drafts.len() {
+        fs::write(
+            f.path("stub/gh")
+                .join(format!("AddPullRequestReviewThread.{n}.json")),
+            json!({"data": {"addPullRequestReviewThread": {"thread": {
+                "id": format!("PRRT_{n}"),
+                "comments": {"nodes": [{"id": format!("PRRC_{n}"), "url": URL}]}}}}})
+            .to_string(),
+        )
+        .expect("fixture written");
+    }
+    f.post("comment", "").ok();
+    let sent: Vec<(&str, u64)> = f
+        .requests()
+        .iter()
+        .filter(|r| r["operationName"] == "AddPullRequestReviewThread")
+        .map(|r| {
+            let vars = &r["variables"];
+            if vars["subjectType"] == "FILE" {
+                ("file", 0)
+            } else {
+                ("line", vars["line"].as_u64().expect("a line"))
+            }
+        })
+        .collect();
+    let expected: Vec<(&str, u64)> = drafts
+        .iter()
+        .map(|(_, plan, line)| (*plan, if *plan == "line" { *line } else { 0 }))
+        .collect();
+    assert_eq!(sent, expected);
+}
+
+/// Planning reads the PR's diff once a run, however many drafts there are.
+#[test]
+fn a_dry_runs_git_calls_dont_grow_with_its_drafts() {
+    let f = Fixture::new();
+    f.prepare();
+    f.log_git();
+    add_mismeasured_drafts(&f);
+    f.run(&["post", PR, "--dry-run"]).ok();
+    let once = f.git_calls().len();
+    assert!(once > 0, "git was run");
+    f.reset_git_calls();
+    for _ in 0..3 {
+        add_mismeasured_drafts(&f);
+    }
+    f.run(&["post", PR, "--dry-run"]).ok();
+    assert_eq!(f.git_calls().len(), once);
+}
+
+/// An original commit GitHub never had, or has dropped.
+const GONE: &str = "0123456789abcdef0123456789abcdef01234567";
+
+/// A thread is anchored on its original commit, which a force-push can
+/// leave on no ref, so fetching the PR's head doesn't bring it. Those
+/// commits are fetched by oid, all in one fetch after the session line;
+/// one GitHub doesn't have leaves its thread a file comment that says why.
+/// Once placed, a thread keeps its lines without the commit.
+#[test]
+fn threads_on_force_pushed_commits_are_placed_once_fetched_else_say_why() {
+    let f = Fixture::new();
+    let rewritten = f.unpushed_commit();
+    f.reply_force_pushed(&rewritten);
+    f.reply("files", None, "files.json");
+    f.log_git();
+    let unplaced = json!("original commit not available");
+
+    // Neither commit is anywhere the plugin can fetch from.
+    f.run(&["prepare", PR]).ok();
+    for reference in ["github:PRRC_1", "github:PRRC_2"] {
+        let thread = f.comment(reference);
+        assert_eq!(thread["github_unplaced"], unplaced, "{thread}");
+        assert!(thread.get("anchor").is_none(), "{thread}");
+    }
+
+    f.orphan_on_remote(&rewritten);
+    let work = f.work();
+    let in_clone = || {
+        Command::new("git")
+            .current_dir(&work)
+            .args(["cat-file", "-e", &format!("{rewritten}^{{commit}}")])
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success())
+    };
+    assert!(!in_clone(), "the clone doesn't have it yet");
+    f.reset_git_calls();
+    let warm = f.run(&["prepare", PR]);
+    warm.ok();
+    let placed = f.comment("github:PRRC_1");
+    assert_eq!(placed["end"], json!({"old": null, "new": 5}));
+    assert_eq!(
+        placed["anchor"],
+        json!({"before": ["line 3", "line 4"], "lines": ["5ive"], "after": ["line 6", "line 7"]})
+    );
+    assert!(placed.get("github_unplaced").is_none(), "{placed}");
+    let gone = f.comment("github:PRRC_2");
+    assert_eq!(gone["github_unplaced"], unplaced);
+    assert!(gone.get("anchor").is_none(), "{gone}");
+
+    // Both in one fetch, after the session line; origin refuses the whole
+    // fetch for the commit it lacks, so the other is fetched again alone.
+    let logged_fetches = || -> Vec<(String, usize)> {
+        f.git_calls()
+            .iter()
+            .filter(|c| c.starts_with("fetch "))
+            .map(|c| {
+                let (call, printed) = c.rsplit_once(" after ").expect("a count");
+                (call.to_owned(), printed.parse().expect("a count"))
+            })
+            .collect()
+    };
+    let fetched = logged_fetches();
+    let calls: Vec<&str> = fetched.iter().map(|(c, _)| c.as_str()).collect();
+    let mut both = [GONE, rewritten.as_str()];
+    both.sort_unstable();
+    assert_eq!(
+        calls,
+        [
+            format!("fetch --quiet --no-tags origin {} {}", both[0], both[1]),
+            format!("fetch --quiet --no-tags origin {rewritten}"),
+        ]
+    );
+    assert!(fetched[0].1 >= 1, "fetched before the session line");
+
+    // GitHub drops the commit, and the clone's copy is pruned: the thread
+    // keeps the lines it was placed on, and nothing is fetched for it.
+    let remote = f.path("github/acme/widgets.git");
+    git(&remote, &["gc", "-q", "--prune=now"]);
+    git(&work, &["gc", "-q", "--prune=now"]);
+    assert!(!in_clone(), "pruned");
+    f.reset_git_calls();
+    f.run(&["prepare", PR]).ok();
+    assert_eq!(f.comment("github:PRRC_1"), placed);
+    let fetched = logged_fetches();
+    let calls: Vec<&str> = fetched.iter().map(|(c, _)| c.as_str()).collect();
+    assert_eq!(calls, [format!("fetch --quiet --no-tags origin {GONE}")]);
+}
+
+/// When every thread's original commit is in the clone, importing them
+/// costs no git call beyond reading the files.
+#[test]
+fn a_prepare_with_every_original_commit_local_fetches_nothing() {
+    let f = Fixture::new();
+    f.prepare();
+    f.log_git();
+    f.reply("PullRequest", Some(3), "pull_request_page_1.json");
+    f.reply("PullRequest", Some(4), "pull_request_page_2.json");
+    f.run(&["prepare", PR]).ok();
+    let calls: Vec<String> = f
+        .git_calls()
+        .iter()
+        .map(|c| {
+            c.rsplit_once(" after ")
+                .map_or(c.as_str(), |(c, _)| c)
+                .to_owned()
+        })
+        .collect();
+    let (base, head) = (&f.base, &f.head);
+    assert_eq!(
+        calls,
+        [
+            "remote get-url origin".to_owned(),
+            format!("cat-file -e {base}^{{commit}}"),
+            format!("cat-file -e {head}^{{commit}}"),
+            format!("cat-file -e {head}^{{commit}}"),
+            "cat-file --batch".to_owned(),
+            format!("merge-base {base} {head}"),
+        ]
+    );
+}
+
+/// The PR's files come from GitHub, every page of them, and GitHub's own
+/// hunks decide line or file where git's would differ: a draft outside
+/// git's hunk but inside GitHub's goes on its line, and so does an old-side
+/// one in a renamed file. A file GitHub sent without its patch is planned
+/// from git's diff, and its draft says `unsure`; a file comment never does.
+#[test]
+fn drafts_are_planned_by_githubs_hunks_and_by_gits_where_github_left_the_patch_out() {
+    let f = Fixture::new();
+    f.reply("files", Some(1), "files_paged.json");
+    f.prepare();
+    let rest = f.rest();
+    assert_eq!(rest.len(), 1, "{rest:?}");
+    assert!(
+        rest[0].starts_with(&format!(
+            "api repos/acme/widgets/pulls/{PR}/files?per_page=100 --paginate after "
+        )),
+        "{rest:?}"
+    );
+    let answer = f.apply(&json!([
+        {"op": "add", "comment": {"path": "src/long.rs", "side": "new",
+            "start": {"old": null, "new": 17}, "end": {"old": null, "new": 17},
+            "anchor": {"before": [], "lines": ["long 15"], "after": []},
+            "text": "Hm.", "distance": 0}},
+        {"op": "add", "comment": {"path": "docs/new name.txt", "old_path": "docs/old name.txt",
+            "side": "old", "start": {"old": 10, "new": null}, "end": {"old": 10, "new": null},
+            "anchor": {"before": [], "lines": ["moved 10"], "after": []},
+            "text": "Hm.", "distance": 0}},
+        {"op": "add", "comment": {"path": "src/lib.rs", "side": "new",
+            "start": {"old": null, "new": 13}, "end": {"old": null, "new": 13},
+            "anchor": {"before": ["line 11", "line 12"], "lines": ["thirteen"], "after": []},
+            "text": "Needs a test.", "distance": 0}},
+        {"op": "add", "comment": {"path": "src/lib.rs", "text": "Overall fine."}},
+    ]));
+    let id = |i: usize| answer["ids"][i].clone();
+
+    let run = f.run(&["post", PR, "--dry-run"]);
+    run.ok();
+    assert_eq!(
+        run.lines,
+        [
+            json!({"draft": {"id": id(0), "path": "src/long.rs", "plan": "line", "line": 17, "side": "new"}}),
+            json!({"draft": {"id": id(1), "path": "docs/new name.txt", "plan": "line", "line": 10, "side": "old"}}),
+            json!({"draft": {"id": id(2), "path": "src/lib.rs", "plan": "line", "line": 13, "side": "new",
+                "unsure": true}}),
+            json!({"draft": {"id": id(3), "path": "src/lib.rs", "plan": "file"}}),
+            json!({"planned": {"line": 3, "file": 1, "skip": 0}}),
+        ]
+    );
+}
+
+/// GitHub's hunks are kept for the head they're the diff of. A warm
+/// `prepare` that finds the PR moved on keeps those of the session's head;
+/// after a `pull` to a head whose files couldn't be fetched, drafts are
+/// planned from git's diff, `unsure`.
+#[test]
+fn githubs_hunks_plan_only_the_head_they_were_fetched_for() {
+    let f = Fixture::new();
+    f.prepare();
+    f.apply(&json!([
+        {"op": "add", "comment": {"path": "src/lib.rs", "side": "new",
+            "start": {"old": null, "new": 13}, "end": {"old": null, "new": 13},
+            "anchor": {"before": ["line 11", "line 12"], "lines": ["thirteen"], "after": []},
+            "text": "Needs a test.", "distance": 0}},
+    ]));
+    let plan = || {
+        let run = f.run(&["post", PR, "--dry-run"]);
+        run.ok();
+        run.lines[0]["draft"].clone()
+    };
+    assert_eq!(plan().get("unsure"), None);
+
+    f.move_head();
+    f.reply("PullRequest", None, "pull_request_moved.json");
+    f.run(&["prepare", PR]).ok();
+    assert_eq!(plan().get("unsure"), None, "the session's head's are kept");
+
+    f.down("files", Some(3));
+    f.run(&["pull", PR]).ok();
+    let planned = plan();
+    assert_eq!(planned["plan"], "line");
+    assert_eq!(planned["unsure"], true);
+}
+
+/// The PR's files are asked for beside its threads and its fetch, so the
+/// session line doesn't wait for them.
+#[test]
+fn prepare_prints_the_session_without_waiting_for_the_prs_files() {
+    let f = Fixture::new();
+    fs::write(f.path("stub/gh/files.hold"), "").expect("write");
+    f.prepare();
+    let rest = f.rest();
+    assert_eq!(rest.len(), 1, "{rest:?}");
+    let printed: usize = rest[0]
+        .rsplit(' ')
+        .next()
+        .and_then(|n| n.parse().ok())
+        .expect("a count");
+    assert!(printed >= 1, "answered before the session line: {rest:?}");
+}
+
+/// After a post that held the event back, leaving the review pending,
+/// `--apply-event` submits it with the event and summary, without posting
+/// the drafts still left.
+#[test]
+fn apply_event_submits_the_pending_review_without_posting_drafts() {
     let f = Fixture::new();
     f.prepare();
     let ids = f.add_drafts();
@@ -1090,14 +1759,14 @@ fn submit_only_submits_the_pending_review_without_posting_drafts() {
     f.reply("AddPullRequestReviewThread", Some(2), "add_thread_2.json");
     f.reply("AddPullRequestReviewThreadReply", None, "add_reply.json");
     f.reply("SubmitPullRequestReview", None, "submit.json");
-    assert_eq!(f.post("approve", "").last()["pending_review"], true);
+    assert_eq!(f.post("approve", "").last()["held"], true);
     let before = f.operations().len();
 
     let file = f.summary("Ship it\n");
     let run = f.run(&[
         "post",
         PR,
-        "--submit-only",
+        "--apply-event",
         "--event",
         "approve",
         "--summary-file",
@@ -1133,14 +1802,14 @@ fn detect_finds_the_branchs_pr_from_its_session_else_by_one_query() {
     f.reply("Detect", None, "detect.json");
     let run = f.run(&["detect"]);
     run.ok();
-    let mut queried = run.lines[0]["pr"].clone();
+    let mut queried = run.lines[0]["review"].clone();
     let comments = queried
         .as_object_mut()
         .and_then(|pr| pr.remove("comments"))
         .expect("the comments file");
     assert_eq!(
         queried,
-        json!({"number": 7, "title": "Spell out five", "url": URL,
+        json!({"id": "7", "title": "Spell out five", "url": URL,
             "base": f.base, "head": f.head, "last_reviewed_head": null})
     );
     assert_eq!(f.operations(), ["Detect"]);
@@ -1150,11 +1819,11 @@ fn detect_finds_the_branchs_pr_from_its_session_else_by_one_query() {
     let before = f.operations().len();
     let run = f.run(&["detect"]);
     run.ok();
-    assert_eq!(run.lines, [json!({"pr": prepared.session()})]);
+    assert_eq!(run.lines, [json!({"review": prepared.session()})]);
     assert_eq!(f.operations().len(), before, "from the session");
 
     git(&f.work(), &["checkout", "-q", "--detach"]);
-    assert_eq!(f.run(&["detect"]).lines, [json!({"pr": null})]);
+    assert_eq!(f.run(&["detect"]).lines, [json!({"review": null})]);
 }
 
 #[test]
@@ -1164,13 +1833,13 @@ fn list_shows_prs_waiting_on_you_yours_and_the_current_branchs_in_one_query() {
     let run = f.run(&["list"]);
     run.ok();
     let pr = |n: u64, title: &str, author: &str, head: &str, reason: &str| {
-        json!({"number": n, "title": title, "author": author,
+        json!({"id": n.to_string(), "title": title, "author": author,
             "url": format!("https://github.com/acme/widgets/pull/{n}"),
             "head_ref": head, "reason": reason})
     };
     assert_eq!(
         run.lines,
-        [json!({"prs": [
+        [json!({"reviews": [
             pr(7, "Spell out five", "octocat", "five", "current_branch"),
             pr(9, "Add a cache", "hubot", "cache", "review_requested"),
             pr(11, "Document the cache", "ada", "docs", "mine"),
@@ -1220,9 +1889,9 @@ fn what_the_plugin_doesnt_speak_exits_2_with_an_error_line() {
         ),
         (&["post", PR], "1", "usage"),
         (
-            &["post", PR, "--submit-only", "--event", "pending"],
+            &["post", PR, "--apply-event", "--event", "pending"],
             "1",
-            "--submit-only submits",
+            "--apply-event submits",
         ),
         (
             &["post", PR, "--dry-run", "--event", "comment"],
@@ -1262,4 +1931,123 @@ fn version_prints_the_release_version() {
         String::from_utf8_lossy(&out.stdout),
         format!("dffy-review-github {}\n", env!("CARGO_PKG_VERSION"))
     );
+}
+
+/// Only your comments are drafts: one without a `ref` by someone else, an
+/// agent, would go out under your name, so neither the plan nor the post
+/// counts it, and it stays as it was.
+#[test]
+fn a_comment_by_someone_else_is_never_posted() {
+    let f = Fixture::new();
+    f.prepare();
+    let draft = |author: &str, text: &str| {
+        json!({"op": "add", "comment": {"path": "src/lib.rs", "side": "new",
+            "start": {"old": null, "new": 13}, "end": {"old": null, "new": 13},
+            "anchor": {"before": ["line 11", "line 12"], "lines": ["thirteen"], "after": []},
+            "text": text, "author": author, "distance": 0}})
+    };
+    let answer = f.apply(&json!([
+        draft("", "Needs a test."),
+        draft("claude", "Off by one?")
+    ]));
+    let (yours, theirs) = (answer["ids"][0].clone(), answer["ids"][1].clone());
+
+    let run = f.run(&["post", PR, "--dry-run"]);
+    run.ok();
+    assert_eq!(
+        run.lines,
+        [
+            json!({"draft": {"id": yours, "path": "src/lib.rs", "plan": "line", "line": 13, "side": "new"}}),
+            json!({"planned": {"line": 1, "file": 0, "skip": 0}}),
+        ]
+    );
+
+    f.reply("PostState", None, "post_state.json");
+    f.reply("AddReview", None, "add_review.json");
+    f.reply("AddPullRequestReviewThread", None, "add_thread_1.json");
+    let run = f.post("pending", "");
+    run.ok();
+    assert_eq!(
+        (&run.last()["posted"], &run.last()["failed"]),
+        (&json!(1), &json!(0))
+    );
+    assert_eq!(
+        run.last().get("held"),
+        None,
+        "pending is left pending as asked"
+    );
+    assert!(f.draft(yours.as_str().expect("an id")).get("ref").is_some());
+    assert!(
+        f.draft(theirs.as_str().expect("an id"))
+            .get("ref")
+            .is_none()
+    );
+    assert_eq!(
+        f.operations()
+            .iter()
+            .filter(|o| *o == "AddPullRequestReviewThread")
+            .count(),
+        1
+    );
+}
+
+/// Where GitHub's hunks of a file aren't kept, git's decide, drawn as
+/// GitHub draws them: changes with seven unchanged lines between, two
+/// hunks of three lines of context one line apart, are one hunk, so a
+/// draft from the first to the second goes on its lines; with eight
+/// between, they're two, and it becomes a file comment.
+#[test]
+fn gits_hunks_join_as_githubs_do() {
+    for (gap, plan) in [(7, "line"), (8, "file")] {
+        let mut f = Fixture::new();
+        let author = f.path("author");
+        let second = 5 + gap + 1;
+        let changed = numbered((1..=40).map(|i| match i {
+            5 => "five".to_owned(),
+            i if i == second => "changed".to_owned(),
+            i => format!("long {i}"),
+        }));
+        fs::write(author.join("src/long.rs"), changed).expect("write");
+        git(&author, &["commit", "-q", "-am", "two changes"]);
+        f.head = git(&author, &["rev-parse", "HEAD"]);
+        let url = f.path("github/acme/widgets.git");
+        let url = url.to_str().expect("utf-8 path");
+        git(
+            &author,
+            &[
+                "push",
+                "-q",
+                "-f",
+                url,
+                &format!("{}:refs/pull/{PR}/head", f.head),
+            ],
+        );
+        f.reply("PullRequest", Some(1), "pull_request_page_1.json");
+        f.reply("PullRequest", Some(2), "pull_request_page_2.json");
+        f.down("files", None);
+        f.run(&["prepare", PR]).ok();
+        let lines: Vec<String> = (5..=second)
+            .map(|i| match i {
+                5 => "five".to_owned(),
+                i if i == second => "changed".to_owned(),
+                i => format!("long {i}"),
+            })
+            .collect();
+        let answer = f.apply(&json!([
+            {"op": "add", "comment": {"path": "src/long.rs", "side": "new",
+                "start": {"old": 5, "new": 5}, "end": {"old": second, "new": second},
+                "anchor": {"before": ["long 3", "long 4"], "lines": lines,
+                    "after": [format!("long {}", second + 1), format!("long {}", second + 2)]},
+                "text": "Both?", "distance": 0}},
+        ]));
+        let run = f.run(&["post", PR, "--dry-run"]);
+        run.ok();
+        let planned = run
+            .lines
+            .iter()
+            .find(|l| l["draft"]["id"] == answer["ids"][0])
+            .unwrap_or_else(|| panic!("{gap}: {:?}", run.lines));
+        assert_eq!(planned["draft"]["plan"], plan, "{gap}: {planned}");
+        assert_eq!(planned["draft"]["unsure"], true, "{gap}: {planned}");
+    }
 }

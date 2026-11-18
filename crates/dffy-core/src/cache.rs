@@ -50,6 +50,8 @@ pub enum Kind {
     /// A shard of line counts by content (see [`crate::git::StatStore`]):
     /// unlike the other kinds, rewritten as records are added.
     Stats = 5,
+    /// A review plugin's `describe` answer.
+    Described = 6,
 }
 
 /// A cache directory with a size budget.

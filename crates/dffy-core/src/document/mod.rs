@@ -16,9 +16,10 @@
 //! walk a whole file.
 //!
 //! A gap shows as a separator row (`⋯ 40 unchanged lines`) with whatever
-//! the user revealed of it above and below. Revealing more, or switching to
-//! the full text, changes only the rows of its gaps, so the hunks' rows and
-//! every position in them stay put. The syntax diff's hunks cover the same
+//! the user revealed of it above and below, and around lines the host
+//! asked for inside it a separator for each stretch still hidden. Revealing
+//! more, or switching to the full text, changes only the rows of its gaps,
+//! so the hunks' rows and every position in them stay put. The syntax diff's hunks cover the same
 //! lines as the line diff's, so a position also survives that toggle.
 //!
 //! This is the top layer of the core: it uses [`crate::git`],
@@ -138,59 +139,161 @@ pub enum Segment {
 }
 
 /// How much of a gap shows: lines from its top edge, lines from its bottom
-/// edge, and a separator row for the rest when any is hidden.
+/// edge, windows of lines between, and a separator row for each stretch
+/// still hidden around them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Shown {
+pub struct Shown<'a> {
     /// Lines shown from the gap's top.
     pub top: usize,
     /// Lines shown from the gap's bottom.
     pub bottom: usize,
     /// Lines in the gap.
     pub len: usize,
+    /// Lines shown between the edges, as gap lines: in order, each with
+    /// hidden lines on both sides.
+    pub windows: &'a [Range<usize>],
 }
 
-impl Shown {
-    /// Lines under the separator.
+impl Shown<'_> {
+    /// Lines under the separators.
     #[inline]
     #[must_use]
     pub fn hidden(self) -> usize {
-        self.len - self.top - self.bottom
+        let windows: usize = self.windows.iter().map(ExactSizeIterator::len).sum();
+        self.len - self.top - self.bottom - windows
     }
 
-    fn separator(self) -> usize {
-        usize::from(self.hidden() > 0)
+    /// Each hidden stretch, a separator's, then the lines shown under it:
+    /// a window, or after the last stretch the bottom edge's lines. Only
+    /// that last stretch may be empty, when nothing is hidden.
+    fn stretches(self) -> impl Iterator<Item = (Range<usize>, Range<usize>)> {
+        let end = self.len - self.bottom;
+        let ends = self.windows.iter().map(|w| w.start).chain([end]);
+        let starts = std::iter::once(self.top).chain(self.windows.iter().map(|w| w.end));
+        let shown = self
+            .windows
+            .iter()
+            .cloned()
+            .chain(std::iter::once(end..self.len));
+        starts.zip(ends).map(|(s, e)| s..e).zip(shown)
     }
 
     /// Rows the gap takes.
     #[inline]
     #[must_use]
     pub fn rows(self) -> usize {
-        self.top + self.separator() + self.bottom
+        let separators = self.windows.len() + usize::from(self.hidden() > 0);
+        self.len - self.hidden() + separators
     }
 
-    /// The gap line row `row` shows; `None` for the separator.
+    /// The gap line row `row` shows; `None` for a separator.
     #[inline]
     #[must_use]
     pub fn line(self, row: usize) -> Option<usize> {
         if row < self.top {
-            Some(row)
-        } else if self.hidden() > 0 && row == self.top {
-            None
-        } else {
-            Some(self.len - self.bottom + row - self.top - self.separator())
+            return Some(row);
         }
+        let mut row = row - self.top;
+        for (hidden, shown) in self.stretches() {
+            if !hidden.is_empty() {
+                row = row.checked_sub(1)?;
+            }
+            if row < shown.len() {
+                return Some(shown.start + row);
+            }
+            row -= shown.len();
+        }
+        Some(self.len + row)
     }
 
-    /// The row showing gap line `line`, or the separator when it's hidden.
+    /// The gap lines the separator at `row` hides; `None` when the row
+    /// shows a line.
+    #[must_use]
+    pub fn hides(self, row: usize) -> Option<Range<usize>> {
+        let mut at = self.top;
+        for (hidden, shown) in self.stretches() {
+            if !hidden.is_empty() {
+                if at == row {
+                    return Some(hidden);
+                }
+                at += 1;
+            }
+            at += shown.len();
+            if at > row {
+                return None;
+            }
+        }
+        None
+    }
+
+    /// The gap line row `row` shows, or the first its separator hides.
+    fn line_at(self, row: usize) -> usize {
+        self.line(row)
+            .or_else(|| self.hides(row).map(|h| h.start))
+            .unwrap_or(self.top)
+    }
+
+    /// The stretches of gap lines the separators hide, in order.
+    pub fn hidden_lines(self) -> impl Iterator<Item = Range<usize>> {
+        self.stretches()
+            .map(|(hidden, _)| hidden)
+            .filter(|h| !h.is_empty())
+    }
+
+    /// The row showing gap line `line`, or its separator when it's hidden.
     #[inline]
     #[must_use]
     pub fn row(self, line: usize) -> usize {
         if line < self.top {
-            line
-        } else if line >= self.len - self.bottom {
-            self.top + self.separator() + line - (self.len - self.bottom)
-        } else {
-            self.top
+            return line;
+        }
+        let mut row = self.top;
+        for (hidden, shown) in self.stretches() {
+            if hidden.contains(&line) {
+                return row;
+            }
+            row += usize::from(!hidden.is_empty());
+            if shown.contains(&line) {
+                return row + line - shown.start;
+            }
+            row += shown.len();
+        }
+        row
+    }
+}
+
+/// What the user revealed of a gap: lines from each edge, and windows of
+/// lines between. Kept settled for the gap's length: windows in order,
+/// apart from each other and from the edges, or joined to them.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct Reveal {
+    top: usize,
+    bottom: usize,
+    windows: Vec<Range<usize>>,
+}
+
+impl Reveal {
+    /// Joins windows that touch each other or an edge, for a gap of `len`
+    /// lines.
+    fn settle(&mut self, len: usize) {
+        self.top = self.top.min(len);
+        let mut windows = std::mem::take(&mut self.windows);
+        windows.sort_unstable_by_key(|w| w.start);
+        for w in windows {
+            let w = w.start..w.end.min(len);
+            match self.windows.last_mut() {
+                _ if w.start <= self.top => self.top = self.top.max(w.end),
+                Some(last) if w.start <= last.end => last.end = last.end.max(w.end),
+                _ if w.is_empty() => {}
+                _ => self.windows.push(w),
+            }
+        }
+        self.bottom = self.bottom.min(len - self.top);
+        while let Some(last) = self.windows.last()
+            && last.end >= len - self.bottom
+        {
+            self.bottom = self.bottom.max(len - last.start);
+            self.windows.pop();
         }
     }
 }
@@ -203,9 +306,8 @@ struct Shape<'a, A> {
     structural: bool,
     /// Show every gap whole; a piped file's gaps still never open.
     full: bool,
-    /// Lines revealed from the top and bottom edge of each gap, by gap;
-    /// gaps past its end show nothing.
-    reveal: &'a [(usize, usize)],
+    /// What's revealed of each gap, by gap; gaps past its end show nothing.
+    reveal: &'a [Reveal],
     /// Each hunk's arrangement, from its numbers (and no heading).
     arrange: A,
 }
@@ -767,7 +869,7 @@ impl File {
 
     /// How much of gap `gap` shows.
     #[must_use]
-    fn shown<A>(&self, shape: &Shape<'_, A>, gap: usize) -> Shown {
+    fn shown<'s, A>(&self, shape: &Shape<'s, A>, gap: usize) -> Shown<'s> {
         let len = self.gaps.get(gap).map_or(0, |g| g.len);
         let partial = self.is_partial();
         if shape.full && !partial {
@@ -775,18 +877,23 @@ impl File {
                 top: len,
                 bottom: 0,
                 len,
+                windows: &[],
             };
         }
-        let (top, bottom) = if partial {
-            (0, 0)
-        } else {
-            shape.reveal.get(gap).copied().unwrap_or_default()
-        };
-        let top = top.min(len);
-        Shown {
-            top,
-            bottom: bottom.min(len - top),
-            len,
+        match shape.reveal.get(gap).filter(|_| !partial) {
+            // Settled for this length when stored.
+            Some(r) => Shown {
+                top: r.top,
+                bottom: r.bottom,
+                len,
+                windows: &r.windows,
+            },
+            None => Shown {
+                top: 0,
+                bottom: 0,
+                len,
+                windows: &[],
+            },
         }
     }
 
@@ -1063,11 +1170,7 @@ impl File {
             (pos.part, pos.row)
         };
         match self.segment(part) {
-            Some(Segment::Gap(g)) => {
-                let shown = self.shown(shape, g);
-                let line = shown.line(from).unwrap_or(shown.top);
-                self.gaps[g].new + line + 1
-            }
+            Some(Segment::Gap(g)) => self.gaps[g].new + self.shown(shape, g).line_at(from) + 1,
             Some(Segment::Hunk(h)) => {
                 self.ensure_rows(shape, h);
                 self.hunk_line(shape.structural, h, from)
@@ -1093,15 +1196,14 @@ impl File {
             .map_or(1, |b| core.lines[b.line as usize].new + 1)
     }
 
-    /// The gap `pos` is in and the gap line its row shows; the separator
-    /// counts as the gap's first hidden line.
+    /// The gap `pos` is in and the gap line its row shows; a separator
+    /// counts as the first line it hides.
     #[must_use]
     fn gap_anchor<A>(&self, shape: &Shape<'_, A>, pos: Pos) -> Option<(usize, usize)> {
         let Some(Segment::Gap(gap)) = self.segment(pos.part) else {
             return None;
         };
-        let shown = self.shown(shape, gap);
-        Some((gap, shown.line(pos.row).unwrap_or(shown.top)))
+        Some((gap, self.shown(shape, gap).line_at(pos.row)))
     }
 
     /// The part showing gap `gap`.
@@ -1109,40 +1211,86 @@ impl File {
         Some(1 + self.segments.iter().position(|s| *s == Segment::Gap(gap))?)
     }
 
-    /// The edges gap `gap` shows after one more reveal: lines next to the
-    /// hunk below for the gap before the first hunk, next to the hunk above
-    /// for the gap after the last, half of each otherwise. `None` when
+    /// What gap `gap` shows after one more reveal: lines from its edges,
+    /// next to the hunk below for the gap before the first hunk, next to
+    /// the hunk above for the gap after the last, half of each otherwise;
+    /// windows inside it stay until the edges reach them. `None` when
     /// nothing of it is hidden, and always for a piped file.
     #[must_use]
-    fn reveal_more<A>(&self, shape: &Shape<'_, A>, gap: usize) -> Option<(usize, usize)> {
+    fn reveal_more<A>(&self, shape: &Shape<'_, A>, gap: usize) -> Option<Reveal> {
         let gaps = self.gaps.len();
         let shown = self.shown(shape, gap);
         let hidden = shown.hidden();
         if self.is_partial() || gap >= gaps || hidden == 0 {
             return None;
         }
+        let mut reveal = shape.reveal.get(gap).cloned().unwrap_or_default();
         let n = if hidden <= 2 * REVEAL_LINES {
+            // The edges alone wouldn't reach the lines between windows.
+            if !reveal.windows.is_empty() {
+                reveal.top = shown.len;
+            }
             hidden
         } else {
             REVEAL_LINES
         };
-        Some(if gap == 0 {
-            (shown.top, shown.bottom + n)
+        if gap == 0 {
+            reveal.bottom += n;
         } else if gap + 1 == gaps {
-            (shown.top + n, shown.bottom)
+            reveal.top += n;
         } else {
-            (shown.top + n - n / 2, shown.bottom + n / 2)
-        })
+            reveal.top += n - n / 2;
+            reveal.bottom += n / 2;
+        }
+        reveal.settle(shown.len);
+        Some(reveal)
     }
 
-    /// The new lines each gap hides under its separator, by gap, for
+    /// What gap `gap` shows once the gap lines of `side` in `lines` show,
+    /// with `context` lines around them; `None` when they show already, or
+    /// none is in the gap, and always for a piped file.
+    fn reveal_lines(
+        &self,
+        reveal: Option<&Reveal>,
+        gap: usize,
+        (side, lines): (Side, &Range<usize>),
+        context: usize,
+    ) -> Option<Reveal> {
+        let span = self.gaps.get(gap).filter(|_| !self.is_partial())?;
+        let first = match side {
+            Side::Old => span.old,
+            Side::New => span.new,
+        };
+        let (start, end) = (
+            lines.start.max(first) - first,
+            lines.end.min(first + span.len).checked_sub(first)?,
+        );
+        let mut reveal = reveal.cloned().unwrap_or_default();
+        let shown = Shown {
+            top: reveal.top,
+            bottom: reveal.bottom,
+            len: span.len,
+            windows: &reveal.windows,
+        };
+        if start >= end || !shown.hidden_lines().any(|h| h.start < end && start < h.end) {
+            return None;
+        }
+        reveal
+            .windows
+            .push(start.saturating_sub(context)..end + context);
+        reveal.settle(span.len);
+        Some(reveal)
+    }
+
+    /// The new lines the gaps hide under their separators, in order, for
     /// [`find`].
     #[must_use]
     fn hidden_lines<A>(&self, shape: &Shape<'_, A>) -> Vec<Range<usize>> {
         (0..self.gaps.len())
-            .map(|g| {
-                let (span, shown) = (self.gaps[g], self.shown(shape, g));
-                span.new + shown.top..span.new + shown.len - shown.bottom
+            .flat_map(|g| {
+                let start = self.gaps[g].new;
+                let hidden = self.shown(shape, g).hidden_lines();
+                hidden.map(move |h| start + h.start..start + h.end)
             })
             .collect()
     }
@@ -1288,11 +1436,13 @@ impl File {
                 let span = self.gaps[g];
                 match shown.line(pos.row) {
                     None => {
-                        let from = span.old + shown.top;
+                        let hides = shown.hides(pos.row).unwrap_or_default();
+                        let last = hides.end == shown.len - shown.bottom;
                         Content::Separator {
-                            hidden: self.old_count(from..from + shown.hidden()),
+                            hidden: self.old_count(span.old + hides.start..span.old + hides.end),
                             next: cores
                                 .get(g)
+                                .filter(|_| last)
                                 .map(|core| self.header(core, self.heading(views, g))),
                         }
                     }
@@ -1373,7 +1523,8 @@ pub enum Content<'a> {
     Separator {
         /// Old lines it hides, counted as source lines for a rendered view.
         hidden: usize,
-        /// The header of the hunk after it; `None` after the last.
+        /// The header of the hunk after it; `None` after the last, and on a
+        /// separator with revealed lines below it in the same gap.
         next: Option<HunkHeader<'a>>,
     },
     /// An unchanged line of a gap.

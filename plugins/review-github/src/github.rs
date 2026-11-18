@@ -1,8 +1,8 @@
-//! GitHub through `gh api graphql`, which owns auth, tokens and hosts: the
-//! queries and mutations, and the mapping between GitHub's review threads
-//! and the comments file.
+//! GitHub through `gh api`, which owns auth, tokens and hosts: the GraphQL
+//! queries and mutations, the mapping between GitHub's review threads and
+//! the comments file, and the PR's diff as GitHub has it.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::io::Write as _;
 use std::process::{Command, Stdio};
@@ -25,9 +25,9 @@ const PULL_REQUEST: &str = "query PullRequest($owner: String!, $name: String!, $
         totalCount
         pageInfo { hasNextPage endCursor }
         nodes {
-          id isResolved isOutdated path diffSide startDiffSide line startLine originalLine originalStartLine subjectType
+          id isResolved isOutdated path diffSide startDiffSide originalLine originalStartLine subjectType
           comments(first: 100) {
-            nodes { id url body createdAt viewerDidAuthor author { login } commit { oid } originalCommit { oid } }
+            nodes { id url body createdAt viewerDidAuthor author { login } originalCommit { oid } }
           }
         }
       }
@@ -93,18 +93,36 @@ const DETECT: &str = "query Detect($owner: String!, $name: String!, $branch: Str
   }
 }";
 
+pub(crate) const NO_GH: &str =
+    "dffy-review-github needs the GitHub CLI (gh): https://cli.github.com";
+
+/// The host gh sends API calls to: `GH_HOST`, else github.com. No call
+/// passes `--hostname`, so this is the one its login has to be for.
+pub(crate) fn host() -> String {
+    std::env::var("GH_HOST")
+        .ok()
+        .filter(|h| !h.is_empty())
+        .unwrap_or_else(|| "github.com".to_owned())
+}
+
+pub(crate) fn logged_out() -> String {
+    format!("gh isn't logged in to {}; run `gh auth login`", host())
+}
+
 #[derive(Debug)]
 pub(crate) enum Error {
     /// GitHub answered and refused this request; others may still work.
     Rejected(String),
     /// No answer, or a rate limit: stop.
     Failed(String),
+    /// gh isn't installed or isn't logged in: no request can work.
+    Setup(String),
 }
 
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Rejected(m) | Self::Failed(m) => f.write_str(m),
+            Self::Rejected(m) | Self::Failed(m) | Self::Setup(m) => f.write_str(m),
         }
     }
 }
@@ -126,7 +144,10 @@ fn graphql(operation: &str, query: &str, variables: &Value) -> Result<Value, Err
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .map_err(|e| Error::Failed(format!("can't run gh: {e}")))?;
+        .map_err(|e| match e.kind() {
+            std::io::ErrorKind::NotFound => Error::Setup(NO_GH.to_owned()),
+            _ => Error::Failed(format!("can't run gh: {e}")),
+        })?;
     if let Some(mut stdin) = child.stdin.take() {
         stdin
             .write_all(body.to_string().as_bytes())
@@ -158,6 +179,10 @@ fn graphql(operation: &str, query: &str, variables: &Value) -> Result<Value, Err
     if !out.status.success() {
         let stderr = String::from_utf8_lossy(&out.stderr);
         let stderr = stderr.trim();
+        // gh exits 4 without a token; a revoked or expired one gets a 401.
+        if out.status.code() == Some(4) || stderr.contains("HTTP 401") {
+            return Err(Error::Setup(logged_out()));
+        }
         return Err(Error::Failed(if stderr.is_empty() {
             format!("gh exited with {}", out.status)
         } else {
@@ -219,18 +244,82 @@ pub(crate) fn page(remote: &Remote, pr: u64, after: Option<&str>) -> Result<Page
     })
 }
 
+/// GitHub's own diff of a PR, as hunks by path: the lines it takes line
+/// comments on, which a local `git diff` can place differently at a hunk's
+/// edges. A file GitHub lists without a patch has no hunks when nothing
+/// in it changed line by line (binary, or renamed only), and is left out
+/// when its patch was too large; so are the files past the 3000 GitHub
+/// lists. `None` when gh failed.
+pub(crate) fn files(remote: &Remote, pr: u64) -> Option<HashMap<String, Vec<git::Hunk>>> {
+    let out = Command::new("gh")
+        .args([
+            "api",
+            &format!(
+                "repos/{}/{}/pulls/{pr}/files?per_page=100",
+                remote.owner, remote.name
+            ),
+            "--paginate",
+        ])
+        .env("GH_PROMPT_DISABLED", "1")
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
+    out.status
+        .success()
+        .then(|| parse_files(&out.stdout))
+        .flatten()
+}
+
+/// Read as a stream of arrays: `gh api --paginate` merges the pages into
+/// one array, or, by version, prints each page's after the last.
+fn parse_files(pages: &[u8]) -> Option<HashMap<String, Vec<git::Hunk>>> {
+    let mut files = HashMap::new();
+    for page in serde_json::Deserializer::from_slice(pages).into_iter::<Vec<Value>>() {
+        for file in page.ok()? {
+            let Some(name) = file["filename"].as_str() else {
+                continue;
+            };
+            let hunks = match file["patch"].as_str() {
+                Some(patch) => git::patch_hunks(patch),
+                None if file["changes"] == 0 => Vec::new(),
+                None => continue,
+            };
+            files.insert(name.to_owned(), hunks);
+        }
+    }
+    Some(files)
+}
+
+/// Why a line thread is a file comment, in its `github_unplaced`, when it's
+/// its original commit that git doesn't have.
+pub(crate) const UNPLACED: &str = "original commit not available";
+
+/// What the comments file holds of imported threads, by their first
+/// comment's ref.
+#[derive(Default)]
+pub(crate) struct Known {
+    /// Resolved or reopened here and not posted yet: `resolved` stays.
+    pub toggled: HashSet<String>,
+    /// On their lines already. A re-import that can't read them leaves
+    /// them there, so their original commit is never needed again.
+    pub anchored: HashSet<String>,
+    /// With a `github_unplaced`, which goes once it no longer holds.
+    pub unplaced: HashSet<String>,
+}
+
 /// The comments file's operations for a page of threads: each thread's
 /// first comment, with its lines and an anchor read from git, then its
-/// replies. A thread whose lines git can't read comes in as a file comment.
-/// `toggled` holds the refs of threads resolved or reopened here and not
-/// posted yet, whose `resolved` stays as it is.
+/// replies, and the threads whose original commit git doesn't have.
+/// A thread whose lines git can't read comes in as a file comment, and
+/// says why when that's its missing commit.
 pub(crate) fn upserts(
     threads: &[Value],
     base: &str,
     source: &mut Source,
-    toggled: &HashSet<String>,
-) -> Vec<Value> {
-    let mut ops = Vec::new();
+    known: &mut Known,
+) -> (Vec<Value>, Vec<Value>) {
+    let (mut ops, mut waiting) = (Vec::new(), Vec::new());
     for thread in threads {
         let Some((root, replies)) = thread["comments"]["nodes"]
             .as_array()
@@ -243,15 +332,30 @@ pub(crate) fn upserts(
         comment.insert("path".to_owned(), thread["path"].clone());
         comment.insert("github_thread".to_owned(), thread["id"].clone());
         comment.insert("github_resolved".to_owned(), thread["isResolved"].clone());
-        if !toggled.contains(&root_ref) {
+        if !known.toggled.contains(&root_ref) {
             comment.insert("resolved".to_owned(), thread["isResolved"].clone());
         }
         // Only when true: an upsert that adds a comment keeps a null field.
         if thread["isOutdated"] == true {
             comment.insert("outdated".to_owned(), json!(true));
         }
-        if let Some(lines) = placed(thread, root, base, source) {
-            comment.extend(lines);
+        let missing = match placed(thread, base, source) {
+            Some(lines) => {
+                comment.extend(lines);
+                false
+            }
+            None => {
+                !known.anchored.contains(&root_ref)
+                    && thread["subjectType"] == "LINE"
+                    && original_commit(thread).is_some_and(|oid| !source.has_commit(oid))
+            }
+        };
+        if missing {
+            comment.insert("github_unplaced".to_owned(), json!(UNPLACED));
+            known.unplaced.insert(root_ref.clone());
+            waiting.push(thread.clone());
+        } else if known.unplaced.remove(&root_ref) {
+            comment.insert("github_unplaced".to_owned(), Value::Null);
         }
         ops.push(json!({"op": "upsert", "comment": comment}));
         for reply in replies {
@@ -260,7 +364,12 @@ pub(crate) fn upserts(
             ops.push(json!({"op": "upsert", "comment": comment}));
         }
     }
-    ops
+    (ops, waiting)
+}
+
+/// The commit a thread was written on: its first comment's.
+pub(crate) fn original_commit(thread: &Value) -> Option<&str> {
+    thread["comments"]["nodes"][0]["originalCommit"]["oid"].as_str()
 }
 
 fn imported(node: &Value, reference: &str) -> Map<String, Value> {
@@ -284,31 +393,19 @@ fn imported(node: &Value, reference: &str) -> Map<String, Value> {
     .collect()
 }
 
-/// A line thread's side, lines and anchor. GitHub gives the current lines
-/// against the comment's `commit` and, once they're outdated, the original
-/// ones against its `originalCommit`; an old-side line is in that commit's
-/// merge base with the PR's base.
-fn placed(
-    thread: &Value,
-    root: &Value,
-    base: &str,
-    source: &mut Source,
-) -> Option<Map<String, Value>> {
+/// A line thread's side, lines and anchor, from the lines it was written on
+/// in its `originalCommit`, outdated or not: GitHub's current lines are its
+/// own placement on a later head, which dffy redoes from the anchor's text.
+/// An old-side line is in that commit's merge base with the PR's base.
+fn placed(thread: &Value, base: &str, source: &mut Source) -> Option<Map<String, Value>> {
     if thread["subjectType"] != "LINE" {
         return None;
     }
-    let (line, start, commit) = match thread["line"].as_u64() {
-        Some(line) => (line, &thread["startLine"], &root["commit"]["oid"]),
-        None => (
-            thread["originalLine"].as_u64()?,
-            &thread["originalStartLine"],
-            &root["originalCommit"]["oid"],
-        ),
-    };
-    let commit = commit.as_str()?;
+    let line = thread["originalLine"].as_u64()?;
+    let commit = original_commit(thread)?;
     let side = side_name(&thread["diffSide"])?;
     let start_side = side_name(&thread["startDiffSide"]).unwrap_or(side);
-    let start = start.as_u64().unwrap_or(line);
+    let start = thread["originalStartLine"].as_u64().unwrap_or(line);
     let at = if side == "old" {
         source.merge_base(base, commit)?
     } else {
@@ -398,14 +495,25 @@ fn fence(text: &str) -> String {
     "`".repeat(longest.max(2) + 1)
 }
 
-/// Whether GitHub takes `comment` on its lines: it has them, and they're
-/// no further than [`CONTEXT`] from a change.
-pub(crate) fn fits_its_lines(comment: &Value) -> bool {
+/// Whether GitHub takes `comment` on its lines: it has them, and its first
+/// and last are in one of `hunks`, its file's in the PR's diff with
+/// [`CONTEXT`] lines of context. Without them, by the comment's
+/// `distance`, which was measured on the diff it was written on.
+pub(crate) fn fits_its_lines(comment: &Value, hunks: Option<&[git::Hunk]>) -> bool {
     let side = comment["side"].as_str().unwrap_or("new");
     let start_side = comment["start_side"].as_str().unwrap_or(side);
-    comment["end"][side].is_u64()
-        && comment["start"][start_side].is_u64()
-        && comment["distance"].as_u64().is_none_or(|d| d <= CONTEXT)
+    let (Some(start), Some(end)) = (
+        comment["start"][start_side].as_u64(),
+        comment["end"][side].as_u64(),
+    ) else {
+        return false;
+    };
+    match hunks {
+        Some(hunks) => hunks
+            .iter()
+            .any(|h| h.side(start_side).contains(&start) && h.side(side).contains(&end)),
+        None => comment["distance"].as_u64().is_none_or(|d| d <= CONTEXT),
+    }
 }
 
 /// The draft's body, and the variables placing it, for a new thread: on
@@ -613,7 +721,7 @@ pub(crate) fn list(remote: &Remote, branch: Option<&str>) -> Result<Vec<Value>, 
     .filter(|(_, pr)| pr["number"].as_u64().is_some_and(|n| seen.insert(n)))
     .map(|(reason, pr)| {
         json!({
-            "number": pr["number"],
+            "id": pr["number"].as_u64().unwrap_or_default().to_string(),
             "title": pr["title"],
             "author": pr["author"]["login"].as_str().unwrap_or("ghost"),
             "url": pr["url"],
@@ -650,7 +758,13 @@ mod tests {
         let comment = json!({"path": "a.rs", "side": "new", "start_side": "old",
             "start": {"old": 3, "new": null}, "end": {"old": null, "new": 4},
             "text": "Hm.", "distance": 0});
-        assert!(fits_its_lines(&comment));
+        assert!(fits_its_lines(&comment, None));
+        let hunk = |old, new| git::Hunk { old, new };
+        assert!(fits_its_lines(&comment, Some(&[hunk(1..4, 2..6)])));
+        assert!(!fits_its_lines(
+            &comment,
+            Some(&[hunk(1..4, 1..2), hunk(4..9, 4..9)])
+        ));
         assert_eq!(
             thread_variables("R", &comment, false),
             json!({"review": "R", "path": "a.rs", "body": "Hm.", "line": 4, "side": "RIGHT",
@@ -659,11 +773,116 @@ mod tests {
     }
 
     #[test]
+    fn githubs_files_come_from_every_page_without_the_patches_it_left_out() {
+        let pages =
+            br#"[{"filename":"a.rs","patch":"@@ -1,2 +1,3 @@\n a\n+b\n c\n@@ -9 +10,0 @@\n-z"},
+            {"filename":"big.rs","changes":90000},
+            {"filename":"logo.png","changes":0}]
+            [{"filename":"new.rs","previous_filename":"old.rs","changes":0}]"#;
+        let files = parse_files(pages).expect("pages");
+        let hunk = |old, new| git::Hunk { old, new };
+        assert_eq!(files["a.rs"], [hunk(1..3, 1..4), hunk(9..10, 10..10)]);
+        assert_eq!(files["logo.png"], []);
+        assert_eq!(files["new.rs"], []);
+        assert_eq!(files.len(), 3, "{:?}", files.keys());
+        assert_eq!(parse_files(b"[{}] [oops"), None);
+    }
+
+    /// Not a test: compares GitHub's hunks of a PR with git's, file by
+    /// file, in a clone that has the PR's base and head:
+    /// `DFFY_CONFORMANCE='owner/repo#n /path/to/clone' cargo test -p
+    /// dffy-review-github conformance -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "asks GitHub, and needs a clone with the PR's commits"]
+    fn conformance() {
+        let spec = std::env::var("DFFY_CONFORMANCE")
+            .expect("DFFY_CONFORMANCE='owner/repo#n /path/to/clone'");
+        let (pr, clone) = spec.split_once(' ').expect("a PR and a clone");
+        let (repo, number) = pr.split_once('#').expect("owner/repo#n");
+        let (owner, name) = repo.split_once('/').expect("owner/repo");
+        let remote = Remote {
+            owner: owner.to_owned(),
+            name: name.to_owned(),
+            key: String::new(),
+        };
+        let number: u64 = number.parse().expect("a PR number");
+        std::env::set_current_dir(clone).expect("the clone");
+        let found = page(&remote, number, None).expect("the PR");
+        for oid in [&found.base, &found.head] {
+            assert!(
+                git::has_commit(oid),
+                "{oid} isn't in the clone; git fetch origin {oid}"
+            );
+        }
+        let github = files(&remote, number).expect("the PR's files");
+        let local = git::hunks(&found.base, &found.head, CONTEXT).expect("git's diff");
+
+        let lines = |hunks: &[git::Hunk], side: &str| -> HashSet<u64> {
+            hunks.iter().flat_map(|h| h.side(side).clone()).collect()
+        };
+        let (mut differ, mut only_github, mut only_git) = (Vec::new(), Vec::new(), Vec::new());
+        let (mut hunks_github, mut hunks_git, mut lines_github, mut lines_git) = (0, 0, 0, 0);
+        let mut paths: Vec<&String> = github.keys().chain(local.keys()).collect();
+        paths.sort_unstable();
+        paths.dedup();
+        for path in paths {
+            match (github.get(path), local.get(path)) {
+                (Some(g), Some(l)) => {
+                    let g_only = g.iter().filter(|h| !l.contains(h)).count();
+                    let l_only = l.iter().filter(|h| !g.contains(h)).count();
+                    if g_only + l_only > 0 {
+                        differ.push(path);
+                    }
+                    hunks_github += g_only;
+                    hunks_git += l_only;
+                    for side in ["old", "new"] {
+                        let (g, l) = (lines(g, side), lines(l, side));
+                        lines_github += g.difference(&l).count();
+                        lines_git += l.difference(&g).count();
+                    }
+                }
+                // git leaves out a file with no hunks, renamed only or binary.
+                (Some(g), None) if g.is_empty() => {}
+                (Some(_), None) => only_github.push(path),
+                (None, _) => only_git.push(path),
+            }
+        }
+        println!(
+            "{pr} at {}: {} files from GitHub with hunks or none, {} from git",
+            found.head,
+            github.len(),
+            local.len()
+        );
+        println!(
+            "files: {} with different hunks, {} only in GitHub's, {} only in git's \
+             (GitHub left the patch out, or past its 3000)",
+            differ.len(),
+            only_github.len(),
+            only_git.len()
+        );
+        println!(
+            "hunks: {hunks_github} of GitHub's not in git's, {hunks_git} of git's not in GitHub's"
+        );
+        println!(
+            "lines commentable: {lines_github} only by GitHub's hunks, {lines_git} only by git's"
+        );
+        for path in differ {
+            println!("  differs: {path}");
+        }
+        for path in only_github {
+            println!("  only GitHub's: {path}");
+        }
+        for path in only_git {
+            println!("  only git's: {path}");
+        }
+    }
+
+    #[test]
     fn a_quoted_line_with_backticks_gets_a_longer_fence() {
         let comment = json!({"path": "a.md", "side": "old",
             "start": {"old": 8, "new": 8}, "end": {"old": 8, "new": 8},
             "anchor": {"lines": ["```sh"]}, "text": "Why?", "distance": 9});
-        assert!(!fits_its_lines(&comment));
+        assert!(!fits_its_lines(&comment, None));
         assert_eq!(
             thread_variables("R", &comment, true)["body"],
             "Line 8 on the old side:\n````\n```sh\n````\n\nWhy?"

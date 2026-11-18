@@ -4,6 +4,7 @@
 
 use std::collections::HashMap;
 use std::io::{BufRead as _, BufReader, Read as _, Write as _};
+use std::ops::Range;
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 
 use serde_json::{Value, json};
@@ -49,6 +50,28 @@ pub(crate) fn fetch_pulls(prs: &[u64]) -> Result<(), String> {
     let mut args = vec!["fetch", "--quiet", "--no-tags", "origin"];
     args.extend(specs.iter().map(String::as_str));
     git(&args).map(drop)
+}
+
+/// Fetches `commits` from origin by oid, onto no ref, in one fetch. One
+/// origin doesn't have fails the whole fetch, naming it, so it's fetched
+/// again without those named, once for each. Whether any arrived.
+pub(crate) fn fetch_commits(commits: &[&str]) -> bool {
+    let mut wanted = commits.to_vec();
+    while !wanted.is_empty() {
+        let mut args = vec!["fetch", "--quiet", "--no-tags", "origin"];
+        args.extend(&wanted);
+        let Err(e) = git(&args) else {
+            return true;
+        };
+        // git's message, past the command, which names every oid.
+        let said = e.split_once(": ").map_or("", |(_, said)| said);
+        let before = wanted.len();
+        wanted.retain(|c| !said.contains(c));
+        if wanted.len() == before {
+            return false;
+        }
+    }
+    false
 }
 
 /// The GitHub repository `origin` points at.
@@ -112,13 +135,24 @@ impl Source {
     pub(crate) fn lines(&mut self, commit: &str, path: &str) -> Option<&[String]> {
         let spec = format!("{commit}:{path}");
         if !self.files.contains_key(&spec) {
-            let lines = self.read(&spec);
+            let lines = self
+                .read(&spec)
+                .filter(|(kind, _)| kind == "blob")
+                .map(|(_, body)| split_lines(&body));
             self.files.insert(spec.clone(), lines);
         }
         self.files.get(&spec)?.as_deref()
     }
 
-    fn read(&mut self, spec: &str) -> Option<Vec<String>> {
+    /// Whether git has the commit `oid`, asked of the same `cat-file`.
+    /// Not cached: a fetch can bring it, and it's asked only after a read
+    /// at it failed.
+    pub(crate) fn has_commit(&mut self, oid: &str) -> bool {
+        self.read(&format!("{oid}^{{commit}}")).is_some()
+    }
+
+    /// The type and content of the object `spec` names.
+    fn read(&mut self, spec: &str) -> Option<(String, Vec<u8>)> {
         if self.batch.is_none() {
             let mut child = Command::new("git")
                 .args(["cat-file", "--batch"])
@@ -144,7 +178,7 @@ impl Source {
         let mut body = vec![0; size + 1];
         stdout.read_exact(&mut body).ok()?;
         body.truncate(size);
-        (kind == "blob").then(|| split_lines(&body))
+        Some((kind.to_owned(), body))
     }
 
     pub(crate) fn merge_base(&mut self, base: &str, commit: &str) -> Option<String> {
@@ -162,6 +196,99 @@ impl Drop for Source {
             child.wait().ok();
         }
     }
+}
+
+/// A hunk of a diff: the 1-based lines it shows on each side, its changes
+/// and their context.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct Hunk {
+    pub old: Range<u64>,
+    pub new: Range<u64>,
+}
+
+impl Hunk {
+    pub(crate) fn side(&self, side: &str) -> &Range<u64> {
+        if side == "old" { &self.old } else { &self.new }
+    }
+}
+
+/// The hunks of `base...head` with `context` lines around each change, in
+/// one `git diff` for every file, by each file's path at `head` (at the
+/// merge base, for a deleted one). A file changed without hunks, renamed
+/// only or binary, isn't in it. Two hunks one line apart are one, as
+/// GitHub draws them.
+pub(crate) fn hunks(
+    base: &str,
+    head: &str,
+    context: u64,
+) -> Result<HashMap<String, Vec<Hunk>>, String> {
+    let diff = git(&[
+        "-c",
+        "core.quotePath=false",
+        "diff",
+        &format!("-U{context}"),
+        "--inter-hunk-context=1",
+        "--diff-algorithm=myers",
+        "--find-renames",
+        "--no-prefix",
+        "--no-relative",
+        "--no-color",
+        "--no-ext-diff",
+        "--no-textconv",
+        &format!("{base}...{head}"),
+    ])?;
+    Ok(parse_hunks(&diff))
+}
+
+fn parse_hunks(diff: &str) -> HashMap<String, Vec<Hunk>> {
+    let mut files: HashMap<String, Vec<Hunk>> = HashMap::new();
+    let (mut old, mut path, mut in_header) = ("", None, false);
+    for line in diff.lines() {
+        if line.starts_with("diff --git ") {
+            (old, path, in_header) = ("", None, true);
+        } else if line.starts_with("@@ -") {
+            in_header = false;
+            if let (Some(file), Some(hunk)) = (&path, header(line)) {
+                files.entry(String::clone(file)).or_default().push(hunk);
+            }
+        } else if in_header {
+            // Only a header's `---` and `+++` lines name files; in a hunk
+            // they're removed or added lines starting with `--` or `++`.
+            // git ends a name holding a space with a tab, for patch(1).
+            let name = |n: &str| n.strip_suffix('\t').unwrap_or(n).to_owned();
+            if let Some(from) = line.strip_prefix("--- ") {
+                old = from;
+            } else if let Some(to) = line.strip_prefix("+++ ") {
+                path = Some(if to == "/dev/null" {
+                    name(old)
+                } else {
+                    name(to)
+                });
+            }
+        }
+    }
+    files
+}
+
+/// The hunks of one file's patch, as GitHub sends it: its `@@` lines.
+pub(crate) fn patch_hunks(patch: &str) -> Vec<Hunk> {
+    patch.lines().filter_map(header).collect()
+}
+
+/// `@@ -1,3 +1,4 @@`, `None` for any other line.
+fn header(line: &str) -> Option<Hunk> {
+    let mut sides = line.strip_prefix("@@ -")?.split(' ');
+    Some(Hunk {
+        old: span(sides.next()?)?,
+        new: span(sides.next()?.strip_prefix('+')?)?,
+    })
+}
+
+/// `start,count` of a hunk header as lines; `count` is 1 when left out.
+fn span(spec: &str) -> Option<Range<u64>> {
+    let (start, count) = spec.split_once(',').unwrap_or((spec, "1"));
+    let start: u64 = start.parse().ok()?;
+    Some(start..start + count.parse::<u64>().ok()?)
 }
 
 /// A file's lines without their `\n`, decoded as dffy decodes them.
@@ -206,6 +333,47 @@ mod tests {
         assert_eq!(Remote::parse("git@github.com:acme/widgets"), https);
         assert_eq!(Remote::parse("ssh://git@github.com/acme/widgets/"), https);
         assert_eq!(Remote::parse("widgets"), None);
+    }
+
+    #[test]
+    fn hunks_are_keyed_by_the_new_name_and_ignore_header_lookalikes_in_hunks() {
+        let diff = "diff --git a b\n\
+                    --- a b\t\n\
+                    +++ new name\t\n\
+                    @@ -1,3 +1,4 @@ fn f() {\n\
+                    \x20x\n\
+                    +++ added\n\
+                    --- removed\n\
+                    @@ -9 +10,0 @@\n\
+                    -gone\n\
+                    diff --git deleted deleted\n\
+                    --- deleted\n\
+                    +++ /dev/null\n\
+                    @@ -1,2 +0,0 @@\n\
+                    diff --git same.rs renamed.rs\n\
+                    similarity index 100%\n";
+        let hunks = parse_hunks(diff);
+        assert_eq!(
+            hunks["new name"],
+            [
+                Hunk {
+                    old: 1..4,
+                    new: 1..5
+                },
+                Hunk {
+                    old: 9..10,
+                    new: 10..10
+                },
+            ]
+        );
+        assert_eq!(
+            hunks["deleted"],
+            [Hunk {
+                old: 1..3,
+                new: 0..0
+            }]
+        );
+        assert_eq!(hunks.len(), 2);
     }
 
     #[test]

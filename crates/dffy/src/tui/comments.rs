@@ -11,6 +11,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::ops::Range;
+use std::os::unix::fs::MetadataExt;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -18,7 +19,8 @@ use dffy_core::bstr::BString;
 use dffy_core::diff::{Hunk, LineKind, Text};
 use dffy_core::document::{File, Side};
 use dffy_core::git::{FileChange, FileDiff, Status};
-use dffy_core::view::Attributes;
+use dffy_core::highlight;
+use dffy_core::view::{Attributes, Run, Spans};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use super::help;
@@ -35,7 +37,7 @@ use crate::theme::{Ink, Role, Style, Theme};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum Look {
     Resolved,
-    Posted,
+    Open,
     Draft,
 }
 
@@ -45,7 +47,7 @@ impl Look {
     pub(crate) fn glyph(self) -> &'static str {
         match self {
             Self::Resolved => "○",
-            Self::Posted => "●",
+            Self::Open => "●",
             Self::Draft => "◆",
         }
     }
@@ -53,10 +55,25 @@ impl Look {
     pub(crate) fn role(self) -> Role {
         match self {
             Self::Resolved => Role::Dim,
-            Self::Posted => Role::Hint,
+            Self::Open => Role::Hint,
             Self::Draft => Role::Warn,
         }
     }
+}
+
+/// Where a comment stands with the host. Only a review session's file
+/// (one a review plugin keeps) is posted; in any other, nothing is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Standing {
+    /// It has a `ref`: the host's, so its text doesn't change here.
+    Posted,
+    /// Yours, in a review session, not posted yet: what `P` posts.
+    Draft,
+    /// Someone else's, an agent's, in a review session, without a `ref`:
+    /// `P` leaves it, since it would post under your name.
+    Unposted,
+    /// Outside a review session.
+    Kept,
 }
 
 /// Where a thread shows on its file's diff.
@@ -80,8 +97,14 @@ pub(crate) struct Note {
     pub created: String,
     pub text: String,
     pub suggestion: Option<String>,
-    /// Not posted: its text can change.
-    pub draft: bool,
+    pub standing: Standing,
+}
+
+impl Note {
+    /// On the host: its text can't change here.
+    pub(crate) fn posted(&self) -> bool {
+        self.standing == Standing::Posted
+    }
 }
 
 /// A thread placed on its file, as the diff draws it.
@@ -99,6 +122,32 @@ pub(crate) struct Thread {
     pub notes: Vec<Note>,
     /// The commented lines' text, which a suggestion replaces.
     pub lines: Vec<String>,
+    /// For a thread whose lines weren't found, the code it was written on.
+    pub snippet: Option<Snippet>,
+    /// A draft of the local review's file, shown on a review session's
+    /// diff.
+    pub local: bool,
+}
+
+/// The code a thread was written on, drawn at the top of its box when its
+/// lines aren't on screen: the commented lines between their context, with
+/// their numbers in the file as it was then.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Snippet {
+    /// What the heading says instead of `lines not found`: `line 145 not
+    /// found`, `old lines 140–141 not found`.
+    pub heading: String,
+    pub rows: Vec<CodeRow>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CodeRow {
+    /// 1-based.
+    pub number: usize,
+    /// `+` or `-` on a commented line, a space on context.
+    pub sign: &'static str,
+    /// The text, tabs expanded and escaped, in its inks: context dimmed.
+    pub pieces: Vec<(Ink, String)>,
 }
 
 /// The text box open in the diff, and what its text becomes.
@@ -111,6 +160,8 @@ pub(crate) struct Writing {
 pub(crate) enum Writes {
     /// A new thread on `lines` (0-based, in the line diff) of `side`.
     New { side: Side, lines: Range<usize> },
+    /// A new thread on the whole file shown, under its first row.
+    File,
     /// A reply, at the end of the thread with this root.
     Reply(String),
     /// Comment `id` of the thread with root `root`, in place of its text.
@@ -123,6 +174,8 @@ struct Placed {
     threads: Arc<[Thread]>,
     /// Line comments whose anchor matched nowhere.
     unplaced: Vec<String>,
+    /// Local drafts whose anchor matched nowhere: out of view.
+    hidden: Vec<String>,
 }
 
 /// What the text box's or the editor's text becomes, kept while either is
@@ -186,36 +239,145 @@ impl Compose {
     }
 }
 
+/// The comments file shown and, on a review session's, the drafts of the
+/// local review's file (your comments without a ref, and their threads).
+/// A local draft shows only where it places on this diff, marked `local`;
+/// edits, replies and deletes in its thread go to the local file, and
+/// posting moves it to the session's first (see [`Comments::move_local`]).
 pub(super) struct Comments {
     path: PathBuf,
+    /// The local review's file, when it isn't `path`.
+    local: Option<PathBuf>,
+    /// `path` is a review session's: your comments without a ref in it
+    /// are drafts.
+    session: bool,
+    /// `path`'s comments, then `local`'s drafts.
     review: Review,
+    /// The ids of the comments in `review` from `local`.
+    from_local: HashSet<String>,
     /// Each path's comments, replies included, as indices into `review`.
     by_path: HashMap<BString, Vec<usize>>,
     placed: HashMap<BString, Placed>,
     /// Where each commented path is in the list, when it is.
     located: HashMap<BString, usize>,
+    /// What stat said of `path` and `local` just before the last read.
+    stamps: Vec<Option<Stamp>>,
 }
 
+/// Modification time (seconds, nanoseconds), size and inode.
+type Stamp = (i64, i64, u64, u64);
+
 impl Comments {
-    /// No comments until [`Comments::reload`] reads `path`.
-    pub(super) fn new(path: PathBuf) -> Self {
+    /// No comments until [`Comments::reload`] reads `path`, and `local`'s
+    /// drafts when it's another file.
+    pub(super) fn new(path: PathBuf, local: Option<PathBuf>, session: bool) -> Self {
         Self {
+            local: local.filter(|l| *l != path),
             path,
+            session,
             review: Review::default(),
+            from_local: HashSet::new(),
             by_path: HashMap::new(),
             placed: HashMap::new(),
             located: HashMap::new(),
+            stamps: Vec::new(),
         }
+    }
+
+    /// The files read: the comments file, then the local review's.
+    pub(super) fn sources(&self) -> Vec<PathBuf> {
+        std::iter::once(&self.path)
+            .chain(&self.local)
+            .cloned()
+            .collect()
+    }
+
+    /// Whether `c` is a local draft that didn't place, or isn't placed
+    /// yet: out of view.
+    fn hides(&self, c: &Comment) -> bool {
+        // Checked per comment as the status bar draws.
+        !self.from_local.is_empty()
+            && self.from_local.contains(&c.id)
+            && self
+                .placed
+                .get(c.path.as_bytes())
+                .is_none_or(|p| p.hidden.contains(c.in_reply_to.as_ref().unwrap_or(&c.id)))
     }
 
     pub(super) fn notice(&self) -> Option<&str> {
         self.review.notice.as_deref()
     }
 
-    /// Reads the file again. Returns the paths whose comments changed,
-    /// `None` when nothing did; on an error the last read stays.
+    /// Takes the file as a review session's, or not. Returns the paths
+    /// whose threads are to be placed again for it, none when it didn't
+    /// change.
+    pub(super) fn set_session(&mut self, session: bool) -> Vec<BString> {
+        if self.session == session {
+            return Vec::new();
+        }
+        self.session = session;
+        self.placed.clear();
+        self.by_path.keys().cloned().collect()
+    }
+
+    fn standing(&self, c: &Comment) -> Standing {
+        match (&c.reference, self.session, c.author.is_empty()) {
+            (Some(_), ..) => Standing::Posted,
+            (None, false, _) => Standing::Kept,
+            (None, true, true) => Standing::Draft,
+            (None, true, false) => Standing::Unposted,
+        }
+    }
+
+    /// [`Comments::reload`], unless stat says neither file changed since
+    /// the last read, as it doesn't after dffy's own writes, read back as
+    /// they're made.
+    pub(super) fn refresh(&mut self) -> Result<Option<Vec<BString>>, String> {
+        if self.stamped() == self.stamps {
+            return Ok(None);
+        }
+        self.reload()
+    }
+
+    fn stamped(&self) -> Vec<Option<Stamp>> {
+        let stamp = |path: &PathBuf| {
+            std::fs::metadata(path)
+                .ok()
+                .map(|m| (m.mtime(), m.mtime_nsec(), m.size(), m.ino()))
+        };
+        std::iter::once(&self.path)
+            .chain(&self.local)
+            .map(stamp)
+            .collect()
+    }
+
+    /// Reads the files again. Returns the paths whose comments changed,
+    /// `None` when nothing did; on an error in either the last read stays.
     pub(super) fn reload(&mut self) -> Result<Option<Vec<BString>>, String> {
-        let review = review::read(&self.path)?;
+        // Taken first: a write landing during the read then shows as a
+        // change next time. Kept on an error too, so a broken file is
+        // reported once, not on every event.
+        self.stamps = self.stamped();
+        let mut review = review::read(&self.path)?;
+        let mut from_local = HashSet::new();
+        if let Some(local) = &self.local {
+            let drafts = review::read(local)?.comments;
+            // Yours only: posting moves these threads, and someone else's
+            // would go out under your name.
+            let roots: HashSet<String> = drafts
+                .iter()
+                .filter(|c| c.in_reply_to.is_none() && c.reference.is_none() && c.author.is_empty())
+                .map(|c| c.id.clone())
+                .collect();
+            for c in drafts {
+                if c.reference.is_none() && roots.contains(c.in_reply_to.as_ref().unwrap_or(&c.id))
+                {
+                    from_local.insert(c.id.clone());
+                    review.comments.push(c);
+                }
+            }
+        }
+        self.from_local = from_local;
         if review == self.review {
             return Ok(None);
         }
@@ -240,15 +402,66 @@ impl Comments {
         Ok(Some(changed))
     }
 
-    /// Applies `ops` to the file under its lock, then reads it back.
+    /// Applies `ops` to a file under its lock, then reads it back: the
+    /// local review's when the first names a local draft by id (a reply
+    /// in its thread, a change or a removal), else the comments file.
     /// Returns the paths whose comments changed and the id each operation
     /// touched.
     pub(super) fn apply(
         &mut self,
         ops: Vec<Op>,
     ) -> Result<(Vec<BString>, Vec<Option<String>>), String> {
-        let ids = review::apply(&self.path, ops)?;
+        let named = match ops.first() {
+            Some(
+                Op::Add {
+                    reply_to: Some(review::Target::Id(id)),
+                    ..
+                }
+                | Op::Set {
+                    target: review::Target::Id(id),
+                    ..
+                }
+                | Op::Rm(review::Target::Id(id)),
+            ) => Some(id),
+            _ => None,
+        };
+        let file = match &self.local {
+            Some(local) if named.is_some_and(|id| self.from_local.contains(id)) => local,
+            _ => &self.path,
+        };
+        let ids = review::apply(file, ops)?;
         Ok((self.reload()?.unwrap_or_default(), ids))
+    }
+
+    /// The local drafts in view, replies included: what posting moves.
+    fn local_shown(&self) -> impl Iterator<Item = &Comment> {
+        (self.review.comments.iter()).filter(|c| self.from_local.contains(&c.id) && !self.hides(c))
+    }
+
+    /// How many drafts [`Comments::move_local`] would move.
+    pub(super) fn local_drafts(&self) -> usize {
+        if self.from_local.is_empty() {
+            return 0;
+        }
+        (self.local_shown())
+            .filter(|c| self.standing(c) == Standing::Draft)
+            .count()
+    }
+
+    /// Moves the local drafts in view into the comments file, with new ids,
+    /// and out of the local review's once that's written (see
+    /// [`review::move_threads`]), then reads both again. Returns the paths
+    /// whose comments changed.
+    pub(super) fn move_local(&mut self) -> Result<Vec<BString>, String> {
+        let roots: Vec<String> = (self.local_shown())
+            .filter(|c| c.in_reply_to.is_none())
+            .map(|c| c.id.clone())
+            .collect();
+        let Some(local) = self.local.as_ref().filter(|_| !roots.is_empty()) else {
+            return Ok(Vec::new());
+        };
+        review::move_threads(local, &self.path, &roots)?;
+        Ok(self.reload()?.unwrap_or_default())
     }
 
     /// Finds the commented paths in the list `files`, after it changed
@@ -279,16 +492,27 @@ impl Comments {
         self.located.get(path).copied()
     }
 
-    /// The files in the list with comments, in list order.
+    /// The files in the list with comments, in list order; not those whose
+    /// only comments are local drafts that didn't place.
     pub(super) fn files(&self) -> Vec<usize> {
-        let mut out: Vec<usize> = self.located.values().copied().collect();
+        let mut out: Vec<usize> = self
+            .located
+            .iter()
+            .filter(|&(path, _)| self.placed.get(path).is_none_or(|p| !p.threads.is_empty()))
+            .map(|(_, &file)| file)
+            .collect();
         out.sort_unstable();
         out
     }
 
-    /// Every path with comments.
+    /// Every path with comments, less those whose only comments are local
+    /// drafts known not to place.
     pub(super) fn paths(&self) -> HashSet<BString> {
-        self.by_path.keys().cloned().collect()
+        self.by_path
+            .keys()
+            .filter(|&path| self.placed.get(path).is_none_or(|p| !p.threads.is_empty()))
+            .cloned()
+            .collect()
     }
 
     pub(super) fn has(&self, path: &[u8]) -> bool {
@@ -316,15 +540,23 @@ impl Comments {
 
     /// Places `path`'s threads on its old and new text, from version
     /// `version` of its entry; with no text (the diff failed), none find a
-    /// line.
-    pub(super) fn place(&mut self, path: &[u8], version: u64, texts: Option<[&Text; 2]>) {
+    /// line. `highlight` colors the code of those that don't.
+    pub(super) fn place(
+        &mut self,
+        path: &[u8],
+        version: u64,
+        texts: Option<[&Text; 2]>,
+        highlight: bool,
+    ) {
         let Some(indices) = self.by_path.get(path) else {
             return;
         };
         let mut threads = Vec::new();
         let mut unplaced = Vec::new();
+        let mut hidden = Vec::new();
         let roots = review::threads(indices.iter().map(|&i| &self.review.comments[i]));
         for comment in roots.into_iter().filter(|c| c.in_reply_to.is_none()) {
+            let local = self.from_local.contains(&comment.id);
             let at = match comment.range() {
                 None => At::File,
                 Some((side, range)) => {
@@ -341,6 +573,9 @@ impl Comments {
                             review::Side::New => Side::New,
                         };
                         At::Line { side, lines }
+                    } else if local {
+                        hidden.push(comment.id.clone());
+                        continue;
                     } else {
                         unplaced.push(comment.id.clone());
                         At::Lost
@@ -349,7 +584,6 @@ impl Comments {
             };
             threads.push(Thread {
                 root: comment.id.clone(),
-                at,
                 look: self.look(comment),
                 resolved: comment.resolved,
                 outdated: comment.outdated,
@@ -363,7 +597,7 @@ impl Comments {
                         created: c.created.clone(),
                         text: c.text.clone(),
                         suggestion: c.suggestion.clone(),
-                        draft: c.reference.is_none(),
+                        standing: self.standing(c),
                     })
                     .collect(),
                 lines: comment
@@ -371,6 +605,11 @@ impl Comments {
                     .as_ref()
                     .map(|a| a.lines.clone())
                     .unwrap_or_default(),
+                snippet: (at == At::Lost)
+                    .then(|| snippet(comment, highlight))
+                    .flatten(),
+                at,
+                local,
             });
         }
         self.placed.insert(
@@ -379,6 +618,7 @@ impl Comments {
                 version,
                 threads: threads.into(),
                 unplaced,
+                hidden,
             },
         );
     }
@@ -391,33 +631,38 @@ impl Comments {
     /// How many comments `path` has, and how the most pressing thread
     /// among them looks.
     pub(super) fn tally(&self, path: &[u8]) -> Option<(usize, Look)> {
-        let indices = self.by_path.get(path)?;
-        let look = indices
-            .iter()
+        let shown: Vec<&Comment> = (self.by_path.get(path)?.iter())
             .map(|&i| &self.review.comments[i])
+            .filter(|c| !self.hides(c))
+            .collect();
+        if shown.is_empty() {
+            return None;
+        }
+        let look = (shown.iter())
             .filter(|c| c.in_reply_to.is_none())
             .map(|c| self.look(c))
             .max()
-            .unwrap_or(Look::Posted);
-        Some((indices.len(), look))
+            .unwrap_or(Look::Open);
+        Some((shown.len(), look))
     }
 
-    /// Threads in the whole file, and comments not posted yet.
+    /// Threads in the file shown and the local drafts in view, and the
+    /// drafts among their comments.
     pub(super) fn counts(&self) -> (usize, usize) {
-        let comments = &self.review.comments;
+        let shown = || self.review.comments.iter().filter(|c| !self.hides(c));
         (
-            comments.iter().filter(|c| c.in_reply_to.is_none()).count(),
-            comments.iter().filter(|c| c.reference.is_none()).count(),
+            shown().filter(|c| c.in_reply_to.is_none()).count(),
+            shown()
+                .filter(|c| self.standing(c) == Standing::Draft)
+                .count(),
         )
     }
 
-    /// Drafts to post: new threads, and replies.
+    /// Drafts to post, local ones in view included: new threads, and
+    /// replies.
     pub(super) fn unsent(&self) -> (usize, usize) {
-        let drafts = self
-            .review
-            .comments
-            .iter()
-            .filter(|c| c.reference.is_none());
+        let drafts = (self.review.comments.iter())
+            .filter(|c| self.standing(c) == Standing::Draft && !self.hides(c));
         let replies = drafts.clone().filter(|c| c.in_reply_to.is_some()).count();
         (drafts.count() - replies, replies)
     }
@@ -436,11 +681,11 @@ impl Comments {
             .filter(|c| c.in_reply_to.as_deref() == Some(&root.id));
         if std::iter::once(root)
             .chain(replies)
-            .any(|c| c.reference.is_none())
+            .any(|c| self.standing(c) == Standing::Draft)
         {
             Look::Draft
         } else {
-            Look::Posted
+            Look::Open
         }
     }
 
@@ -482,7 +727,13 @@ impl Comments {
             .filter(|c| c.in_reply_to.is_none())
         {
             let path = root.path.as_bytes();
-            if root.range().is_none() {
+            let local = self.from_local.contains(&root.id);
+            if local && self.located.contains_key(path) && !self.placed.contains_key(path) {
+                waiting.push(&root.path);
+            } else if self.hides(root) {
+                // A local draft that isn't on this diff is the local
+                // review's, not this one's.
+            } else if root.range().is_none() {
                 out.push((root, Some(Why::File)));
             } else if !self.located.contains_key(path) {
                 if listing {
@@ -530,11 +781,6 @@ pub(super) fn draft(
     side: Side,
     lines: Range<usize>,
 ) -> Result<Comment, &'static str> {
-    let utf8 = |path: &[u8]| {
-        std::str::from_utf8(path)
-            .map(str::to_owned)
-            .map_err(|_| "the comments file holds UTF-8 paths only; this one isn't")
-    };
     let (text, ours) = match side {
         Side::Old => (&diff.old, review::Side::Old),
         Side::New => (&diff.new, review::Side::New),
@@ -542,6 +788,23 @@ pub(super) fn draft(
     if lines.is_empty() || lines.end > text.len() {
         return Err("no line of code here to comment on");
     }
+    Ok(Comment {
+        side: ours,
+        start: Some(numbers(&diff.hunks, side, lines.start)),
+        end: Some(numbers(&diff.hunks, side, lines.end - 1)),
+        anchor: Some(Anchor::new(text, lines.clone())),
+        distance: review::distance(lines, ours, &diff.hunks),
+        ..file_draft(change)?
+    })
+}
+
+/// A new comment, without its text, on the whole file of `change`.
+pub(super) fn file_draft(change: &FileChange) -> Result<Comment, &'static str> {
+    let utf8 = |path: &[u8]| {
+        std::str::from_utf8(path)
+            .map(str::to_owned)
+            .map_err(|_| "the comments file holds UTF-8 paths only; this one isn't")
+    };
     let old_path = match &change.status {
         Status::Renamed { from, .. } => Some(utf8(from)?),
         _ => None,
@@ -549,11 +812,6 @@ pub(super) fn draft(
     Ok(Comment {
         path: utf8(&change.path)?,
         old_path,
-        side: ours,
-        start: Some(numbers(&diff.hunks, side, lines.start)),
-        end: Some(numbers(&diff.hunks, side, lines.end - 1)),
-        anchor: Some(Anchor::new(text, lines.clone())),
-        distance: review::distance(lines, ours, &diff.hunks),
         ..Comment::default()
     })
 }
@@ -610,6 +868,140 @@ fn numbers(hunks: &[Hunk], side: Side, line: usize) -> LineNumbers {
             new: Some(line),
         },
     }
+}
+
+/// What a thread whose lines weren't found shows of them, from its first
+/// comment; `None` for a comment on the whole file. `highlight` colors the
+/// commented lines in the file's language, parsed with their context.
+///
+/// A line's sign is its side's (`+` new, `-` old) unless the comment says
+/// it was unchanged: dffy numbers such a line on both sides. Hosts number
+/// one side only, so their threads always show the side's sign, and lines
+/// between a range's first and last take it unless both ends were
+/// unchanged.
+pub(crate) fn snippet(comment: &Comment, highlight: bool) -> Option<Snippet> {
+    let (side, range) = comment.range()?;
+    let (first, last) = (range.start + 1, range.end);
+    let old = if side == review::Side::Old {
+        "old "
+    } else {
+        ""
+    };
+    let heading = if first == last {
+        format!("{old}line {first} not found")
+    } else {
+        format!("{old}lines {first}–{last} not found")
+    };
+    let Some(anchor) = &comment.anchor else {
+        return Some(Snippet {
+            heading,
+            rows: Vec::new(),
+        });
+    };
+    let lines: Vec<&str> = (anchor.before.iter())
+        .chain(&anchor.lines)
+        .chain(&anchor.after)
+        .map(String::as_str)
+        .collect();
+    let path = match (side, &comment.old_path) {
+        (review::Side::Old, Some(old)) => old,
+        _ => &comment.path,
+    };
+    let spans = highlight.then(|| painted(path, &lines)).flatten();
+    let unchanged = |n: Option<LineNumbers>| n.is_some_and(|n| n.old.is_some() && n.new.is_some());
+    let (start, end) = (unchanged(comment.start), unchanged(comment.end));
+    let (before, n) = (anchor.before.len(), anchor.lines.len());
+    let rows = lines
+        .iter()
+        .enumerate()
+        .map(|(i, text)| {
+            let number = (range.start + 1 + i).saturating_sub(before);
+            let Some(k) = i.checked_sub(before).filter(|&k| k < n) else {
+                return CodeRow {
+                    number,
+                    sign: " ",
+                    pieces: vec![(Role::Dim.into(), plain(text))],
+                };
+            };
+            let kept = match (k == 0, k + 1 == n) {
+                (_, true) => end,
+                (true, false) => start,
+                (false, false) => start && end,
+            };
+            CodeRow {
+                number,
+                sign: match (kept, side) {
+                    (true, _) => " ",
+                    (false, review::Side::Old) => "-",
+                    (false, review::Side::New) => "+",
+                },
+                pieces: pieces(text, spans.as_ref().map(|s| s.line(i))),
+            }
+        })
+        .collect();
+    Some(Snippet { heading, rows })
+}
+
+#[cfg(test)]
+thread_local! {
+    static PAINTED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Times [`painted`] ran on this thread, to tell that drawing never does.
+#[cfg(test)]
+pub(crate) fn painted_count() -> usize {
+    PAINTED.with(std::cell::Cell::get)
+}
+
+/// The syntax runs of `lines`, parsed together as `path`'s language would
+/// be; `None` without one, or when they don't parse in time.
+fn painted(path: &str, lines: &[&str]) -> Option<Spans> {
+    #[cfg(test)]
+    PAINTED.with(|n| n.set(n.get() + 1));
+    let mut bytes = Vec::new();
+    for line in lines {
+        bytes.extend_from_slice(line.as_bytes());
+        bytes.push(b'\n');
+    }
+    let lang = crate::grammars().detect(path.as_bytes(), &bytes[..bytes.len().min(256)])?;
+    let text = Text::new(bytes);
+    Some(highlight::parse(lang, text.bytes())?.spans(&text, 0..text.len()))
+}
+
+/// A line of code to draw in a box: tabs as four spaces, escaped.
+fn plain(text: &str) -> String {
+    escape(text.replace('\t', "    ").as_bytes())
+}
+
+/// `text` split at `runs`' edges, each piece in its syntax's ink; plain
+/// without runs.
+fn pieces(text: &str, runs: Option<&[Run]>) -> Vec<(Ink, String)> {
+    let Some(runs) = runs else {
+        return vec![(Role::Plain.into(), plain(text))];
+    };
+    let bytes = text.as_bytes();
+    let mut out = Vec::new();
+    let mut push = |ink: Ink, range: Range<usize>| {
+        if !range.is_empty() {
+            out.push((ink, plain(&String::from_utf8_lossy(&bytes[range]))));
+        }
+    };
+    let mut at = 0;
+    for run in runs {
+        let (start, end) = (run.start as usize, (run.end as usize).min(bytes.len()));
+        if start < at || start >= end {
+            continue;
+        }
+        push(Role::Plain.into(), at..start);
+        let ink = Ink {
+            syntax: Some(run.syntax),
+            ..Role::Plain.into()
+        };
+        push(ink, start..end);
+        at = end;
+    }
+    push(Role::Plain.into(), at..bytes.len());
+    out
 }
 
 /// `you` for an empty author.
@@ -736,8 +1128,6 @@ struct Border {
     corners: [&'static str; 4],
     across: &'static str,
     down: &'static str,
-    /// The ends of a folded thread's one row.
-    ends: [&'static str; 2],
 }
 
 impl Border {
@@ -753,22 +1143,16 @@ impl Border {
             (false, true) => ("━", "┃"),
             (true, true) => ("┅", "┇"),
         };
-        if focused {
-            Self {
-                role,
-                corners: ["┏", "┓", "┗", "┛"],
-                across,
-                down,
-                ends: ["╺", "╸"],
-            }
+        let corners = if focused {
+            ["┏", "┓", "┗", "┛"]
         } else {
-            Self {
-                role,
-                corners: ["┌", "┐", "└", "┘"],
-                across,
-                down,
-                ends: ["╶", "╴"],
-            }
+            ["┌", "┐", "└", "┘"]
+        };
+        Self {
+            role,
+            corners,
+            across,
+            down,
         }
     }
 }
@@ -787,40 +1171,52 @@ impl Frame<'_> {
         self.width.saturating_sub(4).max(1)
     }
 
-    /// A row of the border between `ends`, carrying `left` after the first
-    /// and `right` before the last when it has room for them.
-    fn edge(&mut self, ends: [&str; 2], left: &[(Ink, &str)], right: &[(Role, &str)]) {
+    /// A row of the border between `ends`, carrying `spans` after the
+    /// first when it has room for them.
+    fn edge(&mut self, ends: [&str; 2], spans: &[(Ink, &str)]) {
         let Border { role, across, .. } = self.border;
         let room = self.width.saturating_sub(2);
-        let right_width = spans_width(right) + 2;
-        // The left side's text goes first; the right's only beside a
-        // dozen columns of it.
-        let right = if right.is_empty() || right_width + 12 > room {
-            &[][..]
-        } else {
-            right
-        };
-        let right_width = if right.is_empty() { 0 } else { right_width };
         self.c.push(role, ends[0]);
-        let mut used = right_width;
-        if !left.is_empty() && room >= used + 3 {
+        let mut used = 0;
+        if !spans.is_empty() && room >= 3 {
             self.c.push(Role::Plain, " ");
-            used += 2 + cut(self.c, left, room - used - 2);
+            used += 2 + cut(self.c, spans, room - 2);
             self.c.push(Role::Plain, " ");
         }
         self.c.push(role, &across.repeat(room.saturating_sub(used)));
-        if !right.is_empty() {
-            self.c.push(Role::Plain, " ");
-            cut(self.c, right, right_width - 2);
-            self.c.push(Role::Plain, " ");
-        }
         self.c.push(role, ends[1]);
+        self.c.end_line();
+    }
+
+    /// A folded thread's one row, between the box's sides: `left` cut to
+    /// fit, and `right` at the right end when that leaves a dozen columns
+    /// of `left`.
+    fn card(&mut self, left: &[(Ink, &str)], right: &[(Role, &str)]) {
+        let Border { role, down, .. } = self.border;
+        let inner = self.inner();
+        let right_width = match spans_width(right) {
+            w if w > 0 && w + 2 + 12 <= inner => w,
+            _ => 0,
+        };
+        let room = match right_width {
+            0 => inner,
+            w => inner - w - 2,
+        };
+        self.c.push(role, down);
+        self.c.push(Role::Plain, " ");
+        let used = cut(self.c, left, room);
+        self.c.spaces(Role::Plain, inner - used - right_width);
+        if right_width > 0 {
+            cut(self.c, right, right_width);
+        }
+        self.c.push(Role::Plain, " ");
+        self.c.push(role, down);
         self.c.end_line();
     }
 
     fn top(&mut self, spans: &[(Ink, &str)]) {
         let [left, right, ..] = self.border.corners;
-        self.edge([left, right], spans, &[]);
+        self.edge([left, right], spans);
     }
 
     /// A reply's heading, under a blank row parting it from the comment
@@ -832,7 +1228,7 @@ impl Frame<'_> {
 
     fn bottom(&mut self) {
         let [.., left, right] = self.border.corners;
-        self.edge([left, right], &[], &[]);
+        self.edge([left, right], &[]);
     }
 
     /// A row of text inside the box, cut to fit.
@@ -845,6 +1241,31 @@ impl Frame<'_> {
         self.c.spaces(Role::Plain, inner - used + 1);
         self.c.push(role, down);
         self.c.end_line();
+    }
+
+    /// A snippet's code, numbered, each line cut to fit as a suggestion's
+    /// are, then a blank row parting it from the comment.
+    fn code(&mut self, snippet: &Snippet) {
+        let Some(last) = snippet.rows.iter().map(|r| r.number).max() else {
+            return;
+        };
+        let digits = last.to_string().len();
+        for row in &snippet.rows {
+            let number = format!("{:>digits$} ", row.number);
+            let sign = match row.sign {
+                "+" => Role::Added,
+                "-" => Role::Removed,
+                _ => Role::Dim,
+            };
+            let mut spans: Vec<(Ink, &str)> = vec![
+                (Role::Dim.into(), &number),
+                (sign.into(), row.sign),
+                (Role::Plain.into(), " "),
+            ];
+            spans.extend(row.pieces.iter().map(|(ink, text)| (*ink, text.as_str())));
+            self.body(&spans);
+        }
+        self.body::<Role>(&[]);
     }
 
     /// The text box's wrapped rows, its cursor a bar in the text.
@@ -864,12 +1285,24 @@ impl Frame<'_> {
     }
 }
 
+/// What a comment's heading says of where it stands, when that's news: a
+/// comment shows posted by its link, and outside a review session nothing
+/// is posted.
+fn standing_tag(standing: Standing) -> Option<(Role, &'static str)> {
+    match standing {
+        Standing::Draft => Some((Role::Warn, "draft")),
+        Standing::Unposted => Some((Role::Dim, "not posted")),
+        Standing::Posted | Standing::Kept => None,
+    }
+}
+
 /// The words after a thread's first author: its state, then where it is
-/// when that's not on a line.
-fn tags(thread: &Thread, first: &Note) -> Vec<(Role, &'static str)> {
+/// when that's not on a line, with the line it was on.
+fn tags<'a>(thread: &'a Thread, first: &Note) -> Vec<(Role, &'a str)> {
     let mut out = Vec::new();
-    if first.draft {
-        out.push((Role::Warn, "draft"));
+    out.extend(standing_tag(first.standing));
+    if thread.local {
+        out.push((Role::Hint, "local"));
     }
     if thread.resolved {
         out.push((Role::Dim, "resolved"));
@@ -877,10 +1310,11 @@ fn tags(thread: &Thread, first: &Note) -> Vec<(Role, &'static str)> {
     if thread.outdated {
         out.push((Role::Warn, "outdated"));
     }
-    match thread.at {
-        At::File => out.push((Role::Dim, "on the file")),
-        At::Lost => out.push((Role::Warn, "lines not found")),
-        At::Line { .. } => {}
+    match (&thread.at, &thread.snippet) {
+        (At::File, _) => out.push((Role::Dim, "on the file")),
+        (At::Lost, Some(snippet)) => out.push((Role::Warn, &snippet.heading)),
+        (At::Lost, None) => out.push((Role::Warn, "lines not found")),
+        (At::Line { .. }, _) => {}
     }
     out
 }
@@ -889,7 +1323,8 @@ fn tags(thread: &Thread, first: &Note) -> Vec<(Role, &'static str)> {
 /// author, age and state in the top border, each reply's on a row of its
 /// own after a blank one, every comment's text wrapped inside, and a
 /// suggestion as the lines it replaces and its own. Authors are bold.
-/// Collapsed, one row of border sums it up.
+/// Collapsed, one row between the box's sides sums it up, and it returns
+/// true: inks carry no background, so the caller tints that row.
 /// `focused` draws the border heavy. `writing`, when the text box is in
 /// this thread, takes the place of the comment it edits or follows the
 /// last as a reply. `now` is seconds since 1970.
@@ -899,9 +1334,9 @@ pub(crate) fn thread_rows(
     mut writing: Option<&mut Writing>,
     (width, now): (usize, u64),
     c: &mut Canvas,
-) {
+) -> bool {
     let Some(first) = thread.notes.first() else {
-        return;
+        return false;
     };
     let border = Border::new(thread.look == Look::Draft, focused);
     let mut frame = Frame { c, border, width };
@@ -926,13 +1361,8 @@ pub(crate) fn thread_rows(
             1 => "1 reply".to_owned(),
             n => format!("{n} replies"),
         };
-        let right = if count.is_empty() {
-            Vec::new()
-        } else {
-            vec![(Role::Dim, count.as_str())]
-        };
-        frame.edge(border.ends, &spans, &right);
-        return;
+        frame.card(&spans, &[(Role::Dim, count.as_str())]);
+        return true;
     }
     let inner = frame.inner();
     for (i, note) in thread.notes.iter().enumerate() {
@@ -946,10 +1376,8 @@ pub(crate) fn thread_rows(
         spans.extend([(AUTHOR, author.as_str()), (Role::Dim.into(), when.as_str())]);
         let words = if i == 0 {
             tags(thread, note)
-        } else if note.draft {
-            vec![(Role::Warn, "draft")]
         } else {
-            Vec::new()
+            standing_tag(note.standing).into_iter().collect()
         };
         for (role, word) in words {
             spans.extend([(Role::Dim.into(), " · "), (role.into(), word)]);
@@ -958,10 +1386,13 @@ pub(crate) fn thread_rows(
             .as_deref_mut()
             .filter(|w| matches!(&w.at, Writes::Edit { id, .. } if *id == note.id));
         if editing.is_some() {
-            spans.push((Role::Dim.into(), " · esc saves · ctrl+e editor"));
+            spans.push((Role::Dim.into(), " · esc saves · ctrl+g editor"));
         }
         if i == 0 {
             frame.top(&spans);
+            if let Some(snippet) = &thread.snippet {
+                frame.code(snippet);
+            }
         } else {
             frame.heading(&spans);
         }
@@ -988,11 +1419,12 @@ pub(crate) fn thread_rows(
     if let Some(writing) = writing.filter(|w| matches!(w.at, Writes::Reply(_))) {
         frame.heading(&[
             (AUTHOR, "you"),
-            (Role::Dim.into(), " · reply · esc saves · ctrl+e editor"),
+            (Role::Dim.into(), " · reply · esc saves · ctrl+g editor"),
         ]);
         frame.text_box(&mut writing.text);
     }
     frame.bottom();
+    false
 }
 
 /// Writes the text box for a new thread, `width` columns wide: a draft's
@@ -1008,7 +1440,7 @@ pub(crate) fn new_rows(text: &mut TextBox, width: usize, c: &mut Canvas) {
         (AUTHOR, "you"),
         (
             Role::Dim.into(),
-            " · new comment · esc saves, empty discards · ctrl+e editor",
+            " · new comment · esc saves, empty discards · ctrl+g editor",
         ),
     ]);
     frame.text_box(text);
@@ -1117,7 +1549,7 @@ impl Panel {
         let (x, right) = (x0 + 2, end - 3);
         let (list, waiting) = comments.listed(listing);
         self.selected = self.selected.min(list.len().saturating_sub(1));
-        let lines = list_lines(&list, waiting, right - x);
+        let lines = list_lines(comments, &list, waiting, right - x);
         help::frame(grid, (x0, y0, width, height), " comments ", theme);
         let top = y0 + 1;
         let rows = height.saturating_sub(3);
@@ -1179,7 +1611,12 @@ fn location(root: &Comment) -> String {
     }
 }
 
-fn list_lines(list: &[(&Comment, Option<Why>)], waiting: usize, width: usize) -> Vec<Line> {
+fn list_lines(
+    comments: &Comments,
+    list: &[(&Comment, Option<Why>)],
+    waiting: usize,
+    width: usize,
+) -> Vec<Line> {
     let mut lines = Vec::new();
     if waiting > 0 {
         let s = if waiting == 1 { "" } else { "s" };
@@ -1197,12 +1634,12 @@ fn list_lines(list: &[(&Comment, Option<Why>)], waiting: usize, width: usize) ->
         });
     }
     for (i, (root, why)) in list.iter().enumerate() {
-        let state = if root.resolved {
-            "resolved"
-        } else if root.reference.is_none() {
-            "draft"
-        } else {
-            "posted"
+        let state = match comments.standing(root) {
+            _ if root.resolved => " · resolved",
+            Standing::Draft => " · draft",
+            Standing::Unposted => " · not posted",
+            Standing::Posted => " · posted",
+            Standing::Kept => "",
         };
         let note = match why {
             Some(Why::File) => " · on the file",
@@ -1212,7 +1649,7 @@ fn list_lines(list: &[(&Comment, Option<Why>)], waiting: usize, width: usize) ->
         };
         let first = root.text.lines().next().unwrap_or_default();
         let text = format!(
-            "{} · {state}{note} · {}",
+            "{}{state}{note} · {}",
             location(root),
             escape(first.as_bytes())
         );
@@ -1328,5 +1765,37 @@ mod tests {
         assert_eq!(age("2026-11-14T12:00:00Z", now), "3d ago");
         assert_eq!(age("2026-09-01T12:00:00Z", now), "2026-09-01");
         assert_eq!(age("yesterday", now), "yesterday");
+    }
+
+    /// A refresh reads the files only once stat says one changed since the
+    /// last read, so the watcher's event for a write dffy already read back
+    /// costs no read.
+    #[test]
+    fn a_refresh_reads_only_files_changed_since_the_last_read() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("comments.json");
+        std::fs::write(&path, "{\"version\":1,\"notice\":\"a\",\"comments\":[]}").expect("write");
+        let mut comments = Comments::new(path.clone(), None, false);
+        assert_eq!(comments.refresh(), Ok(Some(Vec::new())), "the first read");
+        let before = std::fs::metadata(&path)
+            .expect("stat")
+            .modified()
+            .expect("mtime");
+        // Unreadable, but with the same size, inode and time: never read.
+        std::fs::write(&path, "{\"version\":1,\"notice\":\"a\",\"comments\":[x}").expect("write");
+        let file = std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .expect("open");
+        file.set_modified(before).expect("set the time back");
+        assert_eq!(
+            comments.refresh(),
+            Ok(None),
+            "unchanged as far as stat tells"
+        );
+        file.set_modified(before + std::time::Duration::from_secs(1))
+            .expect("touch");
+        assert!(comments.refresh().is_err(), "read once it changed");
+        assert_eq!(comments.refresh(), Ok(None), "a broken file is said once");
     }
 }

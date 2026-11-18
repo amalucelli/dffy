@@ -1,0 +1,3 @@
+[{"filename":"docs/new name.txt","previous_filename":"docs/old name.txt","status":"renamed","additions":1,"deletions":1,"changes":2,"patch":"@@ -7,7 +7,7 @@\n moved 7\n moved 8\n moved 9\n-moved 10\n+ten\n moved 11\n moved 12\n moved 13"},
+{"filename":"src/lib.rs","status":"modified","additions":2,"deletions":1,"changes":3,"patch":"@@ -2,7 +2,7 @@\n line 2\n line 3\n line 4\n-line 5\n+five\n line 6\n line 7\n line 8\n@@ -10,3 +10,4 @@\n line 10\n line 11\n line 12\n+thirteen"},
+{"filename":"src/long.rs","status":"modified","additions":3,"deletions":1,"changes":4,"patch":"@@ -1,3 +1,5 @@\n+zero\n+zero\n long 1\n long 2\n long 3\n@@ -27,7 +29,7 @@\n long 27\n long 28\n long 29\n-long 30\n+thirty\n long 31\n long 32\n long 33"}]

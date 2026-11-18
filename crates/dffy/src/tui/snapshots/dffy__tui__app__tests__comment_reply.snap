@@ -3,22 +3,22 @@ source: crates/dffy/src/tui/app.rs
 expression: screen(&mut app)
 ---
 ┌ Files · 12 +2 -2 ────────┬─ modified · src/some/deeply/nested/module/file.rs · +2 -2 ────────────┐
-│ ▼ src/                   │        │  │ On the whole file                                       │ ┃
-│   ▼ …eply/nested/module/ │        │  └─────────────────────────────────────────────────────────┘ █
-│     M …le.rs 5   +2   -2 │  1  1  │ line 1                                                       │
-│   M zz.rs                │  2  2● │ line 2                                                       │
-│   M zz0.rs               │        │  ┏ ▾ you · 2h ago ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓ │
-│   M zz1.rs               │        │  ┃ Why two?                                                ┃ │
-│   M zz2.rs               │        │  ┃                                                         ┃ │
-│   M zz3.rs               │        │  ┃ you · 1h ago                                            ┃ │
-│   M zz4.rs               │        │  ┃ Because.                                                ┃ │
-│   M zz5.rs               │        │  ┃                                                         ┃ │
-│   M zz6.rs               │        │  ┃ you · reply · esc saves · ctrl+g editor                 ┃ │
-│   M zz7.rs               │        │  ┃ Sure▏                                                   ┃ │
-│   M zz8.rs               │        │  ┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛ │
-│   M zz9.rs   1           │  3  3  │ line 3                                                       │
-│                          │  4   ○-│ line 4                                                       ▐
+│ ▼ src/                   │ @@ -1,7 +1,7 @@                                                       ┃
+│   ▼ …eply/nested/module/ │        │  ┌ ▾ you · 3h ago · on the file ───────────────────────────┐ █
+│     M …le.rs 5   +2   -2 │        │  │ On the whole file                                       │ │
+│   M zz.rs                │        │  └─────────────────────────────────────────────────────────┘ │
+│   M zz0.rs               │  1  1  │ line 1                                                       │
+│   M zz1.rs               │  2  2● │ line 2                                                       │
+│   M zz2.rs               │        │  ┏ ▾ you · 2h ago ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓ │
+│   M zz3.rs               │        │  ┃ Why two?                                                ┃ │
+│   M zz4.rs               │        │  ┃                                                         ┃ │
+│   M zz5.rs               │        │  ┃ you · 1h ago                                            ┃ │
+│   M zz6.rs               │        │  ┃ Because.                                                ┃ │
+│   M zz7.rs               │        │  ┃                                                         ┃ │
+│   M zz8.rs               │        │  ┃ you · reply · esc saves · ctrl+g editor                 ┃ │
+│   M zz9.rs   1           │        │  ┃ Sure▏                                                   ┃ │
+│                          │        │  ┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛ ▐
+│                          │  3  3  │ line 3                                                       │
+│                          │  4   ○-│ line 4                                                       │
 │                          │        │  │ ▸ you · 2h ago · resolved · Old four                    │ │
-│                          │     4 +│ line four                                                    │
-│                          │  5  5  │ line 5                                                       │
 └«─  working tree  ────────┴─ 1/12 · 1/2 hunk  thread reopened  6 threads ──────── space commands ─┘

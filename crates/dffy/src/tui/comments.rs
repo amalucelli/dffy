@@ -1258,8 +1258,10 @@ impl Summary {
 }
 
 /// The lines of a thread's box: light, heavy while it has the focus, and
-/// dashed while it holds a draft. Shapes differ as well as colors: without
-/// color the theme is attributes only.
+/// with round corners while it holds a draft. The corners tell an open
+/// draft from other threads without color, as the theme is attributes
+/// only; focused, or folded to a card without corners, only the role
+/// does. Lines stay solid: dashed ones break up into dots in some fonts.
 #[derive(Clone, Copy)]
 struct Border {
     role: Role,
@@ -1276,16 +1278,15 @@ impl Border {
             (false, true) => Role::Hint,
             (false, false) => Role::Dim,
         };
-        let (across, down) = match (draft, focused) {
-            (false, false) => ("─", "│"),
-            (true, false) => ("┄", "┆"),
-            (false, true) => ("━", "┃"),
-            (true, true) => ("┅", "┇"),
-        };
-        let corners = if focused {
-            ["┏", "┓", "┗", "┛"]
+        let (across, down) = if focused {
+            ("━", "┃")
         } else {
-            ["┌", "┐", "└", "┘"]
+            ("─", "│")
+        };
+        let corners = match (draft, focused) {
+            (_, true) => ["┏", "┓", "┗", "┛"],
+            (true, false) => ["╭", "╮", "╰", "╯"],
+            (false, false) => ["┌", "┐", "└", "┘"],
         };
         Self {
             role,
@@ -1577,8 +1578,8 @@ const FILTERS: [(&str, &str); 4] = [
 ];
 /// A thread's row narrower than this leaves out its line, and narrower
 /// than [`REPLIES_COLUMNS`] its replies too.
-const LINE_COLUMNS: usize = 22;
-const REPLIES_COLUMNS: usize = 18;
+const LINE_COLUMNS: usize = 23;
+const REPLIES_COLUMNS: usize = 19;
 
 /// How pressing a thread is, most first: the order of a file's threads in
 /// the panel.
@@ -2035,8 +2036,10 @@ fn keeps(list: &Listing, item: &Item, filter: usize, search: &str) -> bool {
 /// and its threads at the right. A thread's row has its mark, its line, a
 /// word when its place or standing needs one (`moved` for lines not found
 /// on a file in the diff, `local`, `not posted`), its author when the row
-/// says it, its first line, and its replies at the right; a resolved one
-/// is dimmed whole.
+/// says it, bold, its first line, and its replies at the right, marked
+/// (`↩2`) so they don't read as the header's count of threads, and left
+/// out without any. A resolved one is dimmed but for its line, its `moved`
+/// and its author's bold.
 fn list_row(c: &mut Canvas, list: &Listing, row: &Row, width: usize) {
     match row {
         Row::Note(text) => {
@@ -2082,11 +2085,15 @@ fn list_row(c: &mut Canvas, list: &Listing, row: &Row, width: usize) {
             let line = (item.line)
                 .filter(|_| width >= LINE_COLUMNS)
                 .map(|n| format!(":{n} "));
+            let moved = Ink {
+                attributes: Attributes::DIM,
+                ..Role::Warn.into()
+            };
             let words = [
                 (thread.at == At::Lost && !list.files[item.group].absent)
-                    .then_some((Role::Dim, "moved")),
-                thread.local.then_some((Role::Hint, "local")),
-                (first.standing == Standing::Unposted).then_some((Role::Dim, "not posted")),
+                    .then_some((moved, "moved")),
+                thread.local.then_some((ink(Role::Hint), "local")),
+                (first.standing == Standing::Unposted).then_some((ink(Role::Dim), "not posted")),
             ];
             let name = author.then(|| who(&first.author));
             let text = escape(first.text.lines().next().unwrap_or_default().as_bytes());
@@ -2095,15 +2102,14 @@ fn list_row(c: &mut Canvas, list: &Listing, row: &Row, width: usize) {
                 (ink(thread.look.role()), thread.look.glyph()),
                 (ink(Role::Plain), " "),
             ];
-            spans.extend(line.as_deref().map(|l| (ink(Role::Plain), l)));
-            for (role, word) in words.into_iter().flatten() {
-                spans.extend([(ink(role), word), (ink(Role::Plain), " ")]);
+            spans.extend(line.as_deref().map(|l| (Role::LineNumber.into(), l)));
+            for (word_ink, word) in words.into_iter().flatten() {
+                spans.extend([(word_ink, word), (ink(Role::Plain), " ")]);
             }
             if let Some(name) = &name {
-                let bold = if thread.resolved {
-                    ink(Role::Dim)
-                } else {
-                    AUTHOR
+                let bold = Ink {
+                    attributes: Attributes::BOLD,
+                    ..ink(Role::Plain)
                 };
                 spans.extend([(bold, name.as_str()), (ink(Role::Plain), " ")]);
             }
@@ -2111,7 +2117,7 @@ fn list_row(c: &mut Canvas, list: &Listing, row: &Row, width: usize) {
             let replies = match thread.notes.len() - 1 {
                 0 => String::new(),
                 _ if width < REPLIES_COLUMNS => String::new(),
-                n => n.to_string(),
+                n => format!("↩{n}"),
             };
             spread(c, &spans, &[(Role::Dim, &replies)], width);
         }

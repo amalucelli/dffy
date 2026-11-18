@@ -2072,7 +2072,7 @@ impl App {
                 self.picker = Some(Picker::new(self.doc.document.files()));
             }
             Act::FilterTree => {
-                self.panel = None;
+                self.close_panel();
                 self.focus_tree();
                 self.tree.editing = true;
             }
@@ -2080,7 +2080,7 @@ impl App {
             Act::ParentFolder => {
                 // From the diff or the comments, the tree starts on the file
                 // shown; in the tree, each `u` climbs a folder further.
-                if !tree || self.panel.take().is_some() {
+                if !tree || self.close_panel() {
                     self.focus_tree();
                 }
                 self.tree.select_parent();
@@ -3421,10 +3421,8 @@ impl App {
 
     /// Opens the text box at `at` holding `text`, writing for `compose`.
     fn open_box(&mut self, compose: Compose, at: Writes, text: &str) {
-        if let Writes::Reply(root) | Writes::Edit { root, .. } = &at
-            && self.doc.fold.collapsed(root)
-        {
-            self.doc.fold.toggle(root);
+        if let Writes::Reply(root) | Writes::Edit { root, .. } = &at {
+            self.doc.fold.keep_open(root);
         }
         self.composing = Some(compose);
         self.doc.writing = Some(Writing {
@@ -3799,7 +3797,7 @@ impl App {
         let on = !self.tree.commented();
         let paths = on.then(|| comments.paths());
         self.tree.set_commented(paths);
-        self.panel = None;
+        self.close_panel();
         if on {
             self.focus_tree();
             if let Some(Item::File(file)) = self.tree.step(0) {
@@ -3818,7 +3816,7 @@ impl App {
     /// when it shows them, the files again.
     fn toggle_comments(&mut self) {
         if self.panel.is_some() && self.tree_shown {
-            self.panel = None;
+            self.close_panel();
             return;
         }
         if self.panel.is_none() {
@@ -3836,6 +3834,13 @@ impl App {
         self.focus_tree();
     }
 
+    /// Closes the comments panel, ending the peek its selection made.
+    /// Returns whether it was open.
+    fn close_panel(&mut self) -> bool {
+        self.doc.peek(None);
+        self.panel.take().is_some()
+    }
+
     /// A key while the comments panel has the keys: false when it's not
     /// the panel's.
     fn panel_key(&mut self, key: Key, mods: Mods) -> bool {
@@ -3851,9 +3856,9 @@ impl App {
         true
     }
 
-    /// Shows the thread with root `root` in the diff, focused, its file
-    /// loaded when it's another, and leaves the keys where they are; a
-    /// thread not placed yet is focused once it is.
+    /// Shows the thread with root `root` in the diff, focused and peeked
+    /// at, its file loaded when it's another, and leaves the keys where
+    /// they are; a thread not placed yet is focused once it is.
     fn follow_thread(&mut self, root: &str) {
         let Some(comments) = &self.comments else {
             return;
@@ -3865,6 +3870,7 @@ impl App {
             .unwrap_or_default();
         self.doc.selection = None;
         self.thread_pending = None;
+        self.doc.peek(Some(root));
         let Some(file) = comments.file_of(path.as_bytes()) else {
             self.doc.set_focus(None);
             self.message(if self.enumerating {
@@ -4666,6 +4672,7 @@ mod tests {
     use super::*;
     use crate::plugin::review::{Draft, Listed, Plan, Reason, Said, Session};
     use crate::review;
+    use crate::theme::Ink;
 
     /// `fd` prepared as a worker does without highlighting.
     fn loaded(fd: FileDiff) -> File {
@@ -7235,8 +7242,15 @@ mod tests {
     /// The screen's first `width` columns with each run of cells in one of
     /// `roles`' styles in `<role>…</>`.
     fn role_markup(app: &mut App, roles: &[Role], width: usize) -> String {
+        let styles: Vec<_> = (roles.iter())
+            .map(|&r| (app.theme.style(r), r.key().to_owned()))
+            .collect();
+        style_markup(app, &styles, width)
+    }
+
+    /// [`role_markup`] for any styles, each in `<label>…</>`.
+    fn style_markup(app: &mut App, styles: &[(Style, String)], width: usize) -> String {
         app.draw();
-        let styles: Vec<_> = roles.iter().map(|&r| (app.theme.style(r), r)).collect();
         let grid = app.screen.shown_grid();
         (0..grid.height())
             .map(|y| {
@@ -7246,13 +7260,13 @@ mod tests {
                     let role = styles
                         .iter()
                         .find(|(style, _)| *style == cell.style())
-                        .map(|&(_, r)| r);
+                        .map(|(_, label)| label.as_str());
                     if role != current {
                         if current.is_some() {
                             line.push_str("</>");
                         }
-                        if let Some(r) = role {
-                            line.extend(["<", r.key(), ">"]);
+                        if let Some(label) = role {
+                            line.extend(["<", label, ">"]);
                         }
                         current = role;
                     }
@@ -8690,7 +8704,7 @@ mod tests {
     /// The comments beside the diff: a header per file (its folder dimmed,
     /// its name bold, its threads), then a row per thread: its mark, its
     /// line, the author when the row above in the file has another, the
-    /// first line, and its replies at the right. A thread whose lines
+    /// first line, and its replies at the right (`↩1`). A thread whose lines
     /// weren't found says `moved`, unless its file isn't in the diff. A
     /// narrow panel leaves out the line, then the replies.
     #[test]
@@ -8701,7 +8715,7 @@ mod tests {
         app.relayout();
         key(&mut app, 'i');
         insta::assert_snapshot!("comment_list", screen(&mut app));
-        let narrow: Vec<String> = [24, 20]
+        let narrow: Vec<String> = [26, 24, 22, 20]
             .into_iter()
             .map(|width| {
                 app.tree_width = Some(width);
@@ -8716,10 +8730,12 @@ mod tests {
         insta::assert_snapshot!("comment_list_narrow", narrow.join("\n\n"));
     }
 
-    /// A resolved thread's row is dimmed whole; the others keep their
-    /// marks' roles.
+    /// A thread's row has its mark in its look's role, its line in the
+    /// line numbers', `moved` dimmed in the warning's, and its author bold;
+    /// a resolved one is dimmed whole, its author still bold. File names
+    /// are bold.
     #[test]
-    fn resolved_rows_are_dimmed_whole() {
+    fn comment_rows_take_their_roles() {
         let dir = tempfile::tempdir().expect("tempdir");
         let mut app = reviewed(&dir, &review_json("src/zz9.rs"), (130, 22));
         app.tree_width = Some(46);
@@ -8728,11 +8744,29 @@ mod tests {
         // Distinct styles for the roles the marks and rows take.
         app.theme = Theme::parse(
             "roles",
-            "warn = yellow underline\nhint = cyan underline\ndim = dim underline\n",
+            "warn = yellow underline\nhint = cyan underline\ndim = dim underline\n\
+             line-number = blue underline\n",
             &mut Vec::new(),
         );
         app.invalidate();
-        let markup = role_markup(&mut app, &[Role::Warn, Role::Hint, Role::Dim], 46);
+        let ink = |role: Role, attributes: Attributes, label: &str| {
+            let ink = Ink {
+                role,
+                syntax: None,
+                attributes,
+            };
+            (app.theme.ink_style(ink), label.to_owned())
+        };
+        let styles = [
+            ink(Role::Warn, Attributes::NONE, "warn"),
+            ink(Role::Hint, Attributes::NONE, "hint"),
+            ink(Role::Dim, Attributes::NONE, "dim"),
+            ink(Role::LineNumber, Attributes::NONE, "line-number"),
+            ink(Role::Warn, Attributes::DIM, "warn+dim"),
+            ink(Role::Dim, Attributes::BOLD, "dim+bold"),
+            ink(Role::Plain, Attributes::BOLD, "bold"),
+        ];
+        let markup = style_markup(&mut app, &styles, 46);
         insta::assert_snapshot!(
             "comment_list_roles",
             markup
@@ -8792,6 +8826,42 @@ mod tests {
         assert_eq!(at(&app), at_(0, "p1"));
         screen(&mut app);
         assert_eq!(selected(&app), "p1");
+    }
+
+    /// Following a folded thread from the comments shows it whole until the
+    /// selection moves on. `z` on it in the diff keeps what it sets, a
+    /// reply keeps it whole, and closing the panel ends the peek.
+    #[test]
+    fn following_unfolds_a_folded_thread_while_its_selected() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut app = listed(&dir, &review_json("src/zz9.rs"), (100, 30));
+        // f1, d1, then p1, outdated and posted, and r1, resolved.
+        key(&mut app, 'j');
+        key(&mut app, 'j');
+        assert_eq!(selected(&app), "p1");
+        assert!(!app.doc.fold.collapsed("p1"));
+        key(&mut app, 'j');
+        assert!(app.doc.fold.collapsed("p1") && !app.doc.fold.collapsed("r1"));
+        press(&mut app, Key::Tab);
+        key(&mut app, 'z');
+        assert!(app.doc.fold.collapsed("r1"));
+        press(&mut app, Key::Tab);
+        key(&mut app, 'k');
+        key(&mut app, 'j');
+        assert_eq!(selected(&app), "r1");
+        assert!(app.doc.fold.collapsed("r1"), "as z left it");
+        key(&mut app, 'k');
+        press(&mut app, Key::Tab);
+        key(&mut app, 'r');
+        assert!(app.doc.writing.is_some());
+        press(&mut app, Key::Esc);
+        press(&mut app, Key::Tab);
+        key(&mut app, 'j');
+        assert_eq!(selected(&app), "r1");
+        assert!(!app.doc.fold.collapsed("p1"), "replied in");
+        key(&mut app, 'i');
+        assert!(app.panel.is_none());
+        assert!(app.doc.fold.collapsed("r1"));
     }
 
     /// `enter` or `tab` hands the keys to the diff, the thread focused for

@@ -834,7 +834,7 @@ fn comment_marks_go_after_the_line_numbers_of_their_side() {
     1○ │ fn main() {             │1  │ fn main() {
        │  │ ▸ you · just now … │ │
     2 -│     let total = count +…│2◆+│     let total = items.le…
-                                 │   │  ┆ ▸ you · just now ·… ┆
+                                 │   │  │ ▸ you · just now ·… │
     3  │     println!("{total}");│3  │     println!("{total}");
     "#);
 
@@ -854,7 +854,7 @@ fn comment_marks_go_after_the_line_numbers_of_their_side() {
          │  │[ansi8  ▸ you · just now · draft · Hm                   ]│
     [2c385b  2   │][262d49      let total = ][603740 count][262d49  + 1;                           ]
     [2c385b    2◆│][262d49      let total = ][2d4d3d items.len()][262d49  + 1;                     ]
-         │  ┆[ansi8  ▸ you · just now · draft · Hm                   ]┆
+         │  │[ansi8  ▸ you · just now · draft · Hm                   ]│
     ");
 }
 
@@ -1313,7 +1313,7 @@ fn tall_rows(doc: &mut Doc) -> Vec<String> {
 /// Threads show as boxes under the row of their last line, a cell into
 /// the code's column: the first comment's author, age and state in the top
 /// border, each reply's on a row over it after a blank one, text wrapped
-/// inside, and a suggestion as a small diff. A thread with a draft has a dashed border.
+/// inside, and a suggestion as a small diff. A thread with a draft has round corners.
 /// Resolved and outdated threads without a draft start folded to one row.
 /// The file's comments hang under its first row and the lost ones under
 /// its last. Split, a thread takes its side's half.
@@ -1671,7 +1671,7 @@ fn folded_threads_take_one_row() {
         .iter()
         .find(|r| r.contains("▸ octocat"))
         .expect("a folded row");
-    insta::assert_snapshot!(summary, @"     │  ┆ ▸ octocat · 2h ago · outdated · Why l…  1 reply ┆");
+    insta::assert_snapshot!(summary, @"     │  │ ▸ octocat · 2h ago · outdated · Why l…  1 reply │");
     assert_eq!(
         folded.iter().filter(|r| !r.is_empty()).count() + 9,
         full.iter().filter(|r| !r.is_empty()).count()
@@ -1765,7 +1765,7 @@ fn a_focused_threads_border_is_heavy() {
         .position(|r| r.contains("▾ octocat"))
         .expect("the focused draft");
     assert!(
-        rows[at].contains('┏') && rows[at + 1].contains('┇'),
+        rows[at].contains('┏') && rows[at + 1].contains('┃'),
         "{rows:#?}"
     );
     assert_eq!(grid.row(at)[8].style(), theme.style(Role::Warn));
@@ -1775,9 +1775,9 @@ fn a_focused_threads_border_is_heavy() {
 }
 
 /// A folded thread is one row drawn as a closed card: the open box's sides
-/// at its columns, dashed for a draft, heavy while it has the focus, its
-/// text cut to fit and the reply count at its right end while there's
-/// room for it.
+/// at its columns, in the warning's role for a draft, heavy while it has
+/// the focus, its text cut to fit and the reply count at its right end
+/// while there's room for it.
 #[test]
 fn a_folded_thread_is_a_card_of_one_row() {
     let cards = |layout: Layout, focus: Option<&str>| {
@@ -1792,27 +1792,27 @@ fn a_folded_thread_is_a_card_of_one_row() {
             .join("\n")
     };
     insta::assert_snapshot!(cards(layout(false, false), None), @"
-    │  ┆ ▸ you · 1m ago · draft · on the file · On the … ┆
+    │  │ ▸ you · 1m ago · draft · on the file · On the … │
     │  │ ▸ ana · 3h ago · resolved · Was count right?    │
-    │  ┆ ▸ octocat · 2h ago · outdated · Why l…  1 reply ┆
+    │  │ ▸ octocat · 2h ago · outdated · Why l…  1 reply │
     │  │ ▸ ana · 4h ago · outdated · lines not…  1 reply │
     ");
     insta::assert_snapshot!(cards(layout(false, false), Some("l")), @"
-    │  ┆ ▸ you · 1m ago · draft · on the file · On the … ┆
+    │  │ ▸ you · 1m ago · draft · on the file · On the … │
     │  │ ▸ ana · 3h ago · resolved · Was count right?    │
-    │  ┆ ▸ octocat · 2h ago · outdated · Why l…  1 reply ┆
+    │  │ ▸ octocat · 2h ago · outdated · Why l…  1 reply │
     │  ┃ ▸ ana · 4h ago · outdated · lines not…  1 reply ┃
     ");
     insta::assert_snapshot!(cards(layout(false, false), Some("n")), @"
-    │  ┆ ▸ you · 1m ago · draft · on the file · On the … ┆
+    │  │ ▸ you · 1m ago · draft · on the file · On the … │
     │  │ ▸ ana · 3h ago · resolved · Was count right?    │
-    │  ┇ ▸ octocat · 2h ago · outdated · Why l…  1 reply ┇
+    │  ┃ ▸ octocat · 2h ago · outdated · Why l…  1 reply ┃
     │  │ ▸ ana · 4h ago · outdated · lines not…  1 reply │
     ");
     insta::assert_snapshot!(cards(layout(true, false), None), @"
-    │  ┆ ▸ you · 1m ago · draft · on the file · On the wh… ┆
+    │  │ ▸ you · 1m ago · draft · on the file · On the wh… │
     │  │ ▸ ana · 3h ago · … │ │
-                              │   │  ┆ ▸ octocat · 2h ago… ┆
+                              │   │  │ ▸ octocat · 2h ago… │
     │  │ ▸ ana · 4h ago · outdated · lines not f…  1 reply │
     ");
     let narrow = Layout {
@@ -1820,9 +1820,9 @@ fn a_folded_thread_is_a_card_of_one_row() {
         ..layout(false, false)
     };
     insta::assert_snapshot!(cards(narrow, None), @"
-    │  ┆ ▸ you · 1m ago · dra… ┆
+    │  │ ▸ you · 1m ago · dra… │
     │  │ ▸ ana · 3h ago · res… │
-    │  ┆ ▸ octocat ·…  1 reply ┆
+    │  │ ▸ octocat ·…  1 reply │
     │  │ ▸ ana · 4h …  1 reply │
     ");
 }
@@ -1846,23 +1846,23 @@ fn a_folded_thread_is_tinted_inside_its_sides() {
     let tints: Vec<&str> = tints.lines().map(str::trim_end).collect();
     insta::assert_snapshot!(tints.join("\n"), @r#"
     @@ -1,5 +1,6 @@
-         │  ┌ ▾ you · 1m ago · draft · on the file ┄┄┄┄┄┄┄┄┄┄┄┐
-         │  ┆ On the whole file                               ┆
-         │  └┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┘
+         │  ╭ ▾ you · 1m ago · draft · on the file ───────────╮
+         │  │ On the whole file                               │
+         │  ╰─────────────────────────────────────────────────╯
     1 1  │ fn main() {
     2  ○-│     let total = count + 1;
          │  │[202020  ▸ ana · 3h ago · resolved · Was count right?    ]│
       2◆+│     let total = items.len() + 1;
-         │  ┌ ▾ octocat · 2h ago · outdated ┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┐
-         │  ┆ Why len() here and not a running count, kept as ┆
-         │  ┆ the items arrive?                               ┆
-         │  ┆ suggested change:                               ┆
-         │  ┆ -     let total = items.len() + 1;              ┆
-         │  ┆ +     let total = items.len();                  ┆
-         │  ┆                                                 ┆
-         │  ┆ you · 30m ago · draft                           ┆
-         │  ┆ Simpler.                                        ┆
-         │  └┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┘
+         │  ╭ ▾ octocat · 2h ago · outdated ──────────────────╮
+         │  │ Why len() here and not a running count, kept as │
+         │  │ the items arrive?                               │
+         │  │ suggested change:                               │
+         │  │ -     let total = items.len() + 1;              │
+         │  │ +     let total = items.len();                  │
+         │  │                                                 │
+         │  │ you · 30m ago · draft                           │
+         │  │ Simpler.                                        │
+         │  ╰─────────────────────────────────────────────────╯
     3 3  │     println!("{total}");
       4 +│     eprintln!("done");
     4 5  │ }
@@ -1924,12 +1924,12 @@ fn the_text_box_is_boxed_where_the_thread_sits() {
         .position(|r| r.contains("Simpler."))
         .expect("the reply");
     insta::assert_snapshot!(rows[at..at + 6].join("\n"), @"
-         │  ┇ Simpler.                                        ┇
-         │  ┇                                                 ┇
-         │  ┇ you · reply · esc saves · ctrl+g editor         ┇
-         │  ┇ Sure, and a reply long enough to wrap in its    ┇
-         │  ┇ box▏                                            ┇
-         │  ┗┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┛
+         │  ┃ Simpler.                                        ┃
+         │  ┃                                                 ┃
+         │  ┃ you · reply · esc saves · ctrl+g editor         ┃
+         │  ┃ Sure, and a reply long enough to wrap in its    ┃
+         │  ┃ box▏                                            ┃
+         │  ┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛
     ");
     doc.writing = Some(new_box());
     doc.refit();
@@ -1941,8 +1941,8 @@ fn the_text_box_is_boxed_where_the_thread_sits() {
     insta::assert_snapshot!(rows[at..at + 4].join("\n"), @"
       4 +│     eprintln!(\"done\");
          │  ┏ ▾ you · new comment · esc saves, empty discard… ┓
-         │  ┇ New▏                                            ┇
-         │  ┗┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┛
+         │  ┃ New▏                                            ┃
+         │  ┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛
     ");
     let mut doc = commented(layout(false, false), 4);
     doc.writing = Some(new_box());
@@ -2022,4 +2022,136 @@ fn threads_are_stepped_through_in_order() {
     assert_eq!(doc.focused().map(|t| t.root.as_str()), Some("l"));
     assert!(doc.go_to_thread("o"));
     assert_eq!(doc.focused().map(|t| t.root.as_str()), Some("o"));
+}
+
+/// An added file of `n` lines, `line 1` to `line n`, with an open thread
+/// under each line of `on` (1-based), its root the line's number.
+fn long_commented(n: usize, on: &[usize], height: usize) -> Doc {
+    let new = (1..=n)
+        .map(|i| format!("line {i}\n"))
+        .collect::<Vec<_>>()
+        .concat();
+    let mut doc = doc_of(
+        file_diff("src/long.rs", "", &new),
+        layout(false, false),
+        height,
+    );
+    doc.now = NOW;
+    let threads: Vec<Thread> = (on.iter())
+        .map(|&line| Thread {
+            root: line.to_string(),
+            at: At::Line {
+                side: document::Side::New,
+                lines: line - 1..line,
+            },
+            look: Look::Open,
+            resolved: false,
+            outdated: false,
+            url: None,
+            notes: vec![note(&line.to_string(), "ana", "09:00", "Here?", false)],
+            lines: Vec::new(),
+            snippet: None,
+            local: false,
+        })
+        .collect();
+    doc.set_threads(0, threads.into());
+    doc
+}
+
+/// A thread gone to lands with its box a third of the way down the pane,
+/// the line it's on right above, unless the whole box shows already; near
+/// either end of the file the position stops there.
+#[test]
+fn a_thread_gone_to_lands_a_third_from_the_top() {
+    let mut doc = long_commented(100, &[6, 50, 54, 99], 30);
+    let top = doc.first_row(0);
+    assert_eq!(doc.document.pos, top);
+    assert!(doc.go_to_thread("6"));
+    assert_eq!(doc.document.pos, top, "on screen already");
+    assert!(doc.go_to_thread("50"));
+    let rows = grid_rows(&mut doc, &Theme::default_theme()).1;
+    let border = rows.iter().position(|r| r.contains('┏')).expect("the box");
+    assert_eq!(border, 10, "{}", rows.join("\n"));
+    assert!(rows[border - 1].contains("line 50"), "{}", rows.join("\n"));
+    let there = doc.document.pos;
+    assert!(doc.go_to_thread("54"));
+    assert_eq!(doc.document.pos, there, "54's box shows below 50's");
+    assert!(doc.go_to_thread("99"));
+    let end = doc.document.pos;
+    doc.bottom();
+    assert_eq!(end, doc.document.pos, "stopped at the end");
+    assert!(doc.go_to_thread("6"));
+    assert_eq!(doc.document.pos, top, "stopped at the start");
+    // A box too tall for a third goes higher to fit, its line above it.
+    let mut doc = long_commented(100, &[50], 12);
+    let mut threads = doc.threads().to_vec();
+    threads[0].notes[0].text = "a\nb\nc\nd\ne\nf\ng\nh".to_owned();
+    doc.set_threads(0, threads.into());
+    assert!(doc.go_to_thread("50"));
+    let rows = grid_rows(&mut doc, &Theme::default_theme()).1;
+    let border = rows.iter().position(|r| r.contains('┏')).expect("the box");
+    assert_eq!(border, 2, "{}", rows.join("\n"));
+    assert!(rows[1].contains("line 50"), "{}", rows.join("\n"));
+    assert!(rows[11].contains('┗'), "{}", rows.join("\n"));
+}
+
+/// A peek shows a folded thread whole until it moves on, and the rows'
+/// heights follow: a box's rows are kept by whether it's folded.
+#[test]
+fn a_peeked_thread_shows_whole_until_the_peek_moves_on() {
+    let mut doc = commented(layout(false, false), 200);
+    let heights = |doc: &mut Doc| {
+        let layout = doc.file_layout(0);
+        let mut pos = doc.first_row(0);
+        loop {
+            let mut c = Canvas::default();
+            doc.render(pos, &layout, &mut c);
+            assert_eq!(c.len(), doc.height(pos, &layout), "{pos:?}");
+            if !doc.next_row(&mut pos, &layout) {
+                break;
+            }
+        }
+    };
+    assert!(doc.fold.collapsed("o") && doc.fold.collapsed("l"));
+    heights(&mut doc);
+    doc.peek(Some("o"));
+    assert!(!doc.fold.collapsed("o"));
+    heights(&mut doc);
+    doc.peek(Some("l"));
+    assert!(doc.fold.collapsed("o") && !doc.fold.collapsed("l"));
+    heights(&mut doc);
+    doc.peek(None);
+    assert!(doc.fold.collapsed("l"));
+    heights(&mut doc);
+    // A tap focusing another thread ends the peek; one on it keeps it.
+    doc.peek(Some("o"));
+    doc.set_focus(Some("o".to_owned()));
+    assert!(!doc.fold.collapsed("o"));
+    doc.set_focus(Some("n".to_owned()));
+    assert!(doc.fold.collapsed("o"));
+}
+
+/// `z` on a peeked thread folds it for good, as on any other, and a thread
+/// `z` unfolded stays so when the peek moves on; `Z` ends the peek, so a
+/// second `Z` unfolds every thread.
+#[test]
+fn z_on_a_peeked_thread_is_the_users_choice() {
+    let mut doc = commented(layout(false, false), 40);
+    doc.peek(Some("o"));
+    doc.fold.toggle("o");
+    assert!(doc.fold.collapsed("o"));
+    doc.peek(Some("l"));
+    doc.peek(Some("o"));
+    assert!(doc.fold.collapsed("o"), "folded by z");
+    doc.peek(None);
+    doc.fold.toggle("l");
+    doc.peek(Some("l"));
+    doc.peek(None);
+    assert!(!doc.fold.collapsed("l"), "unfolded by z");
+    let mut doc = commented(layout(false, false), 40);
+    doc.peek(Some("o"));
+    assert!(doc.fold.toggle_all());
+    assert!(doc.fold.collapsed("o"), "Z ended the peek");
+    doc.peek(Some("o"));
+    assert!(!doc.fold.toggle_all(), "the peeked one doesn't count");
 }

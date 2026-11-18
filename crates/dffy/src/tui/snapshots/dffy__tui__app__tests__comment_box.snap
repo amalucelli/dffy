@@ -7,10 +7,10 @@ expression: screen(&mut app)
 │   ▼ …eply/nested/module/ │  1  1  │ line 1                                                       █
 │     M file.rs    +2   -2 │  2  2  │ line 2                                                       ┃
 │   M zz.rs                │        │  ┏ ▾ you · new comment · esc saves, empty discards · ctrl… ┓ ┃
-│                          │        │  ┇ Why these?                                              ┇ ┃
-│                          │        │  ┇ Pasted                                                  ┇ ┃
-│                          │        │  ┇ lines▏                                                  ┇ ┃
-│                          │        │  ┗┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┛ ┃
+│                          │        │  ┃ Why these?                                              ┃ ┃
+│                          │        │  ┃ Pasted                                                  ┃ ┃
+│                          │        │  ┃ lines▏                                                  ┃ ┃
+│                          │        │  ┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛ ┃
 │                          │  3  3  │ line 3                                                       ┃
 │                          │  4    -│ line 4                                                       ┃
 │                          │     4 +│ line four                                                    ┃

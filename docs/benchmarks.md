@@ -274,6 +274,7 @@ Checked on 2026-11-15 against the versions benchmarked: `hunk` 0.25.0, `lumen` 2
 - Files outside a repository: `hunk diff --files <left> <right>`, two files; `hunk open` browses a folder but doesn't diff two ([files and patches docs](https://github.com/modem-dev/hunk/blob/main/website/src/content/docs/docs/workflows/files-and-patches.md)).
 - Extensions: the README's "Extensions (experimental)" section, TypeScript extensions for commands, themes, VCS backends and sidebars.
 - Binary: the README says the install script, Homebrew, mise and Nix "ship a standalone binary that does not require Node.js", and the npm install needs Node 22+. The standalone binary is built with `bun build --compile` ([build-bin.ts](https://github.com/modem-dev/hunk/blob/main/scripts/build/build-bin.ts)).
+- Line comments and pull requests, checked on 2026-11-18 against the README on main: your own line notes are in its browser review ("mouse line-range notes"), not the terminal viewer. `hunk gh pr 123` opens a pull request, but the README describes neither its review threads nor posting a review.
 
 **`lumen`** ([README](https://github.com/jnsahaj/lumen#readme))
 - Viewer, sidebar (`tab`), watch (`--watch`, `w`), tree-sitter highlighting, mouse selection, "a single static Rust binary", "Works with Git and Jujutsu (jj)": the README, and [src/vcs/jj.rs](https://github.com/jnsahaj/lumen/blob/main/src/vcs/jj.rs).
@@ -281,6 +282,7 @@ Checked on 2026-11-15 against the versions benchmarked: `hunk` 0.25.0, `lumen` 2
 - Word emphasis: `compute_word_diff` in [diff_algo.rs](https://github.com/jnsahaj/lumen/blob/main/src/command/diff/diff_algo.rs). Tree-sitter is used for highlighting only.
 - Not a pager: its arguments are revisions and pull requests, and `-` reads a commit id from stdin, not a diff ([main.rs](https://github.com/jnsahaj/lumen/blob/main/src/main.rs)). No two-file mode.
 - AI and annotations: `draft`, `explain` and `operate` with ten providers, and annotations on selections, hunks and files that you write and export for an agent. Notes written by an agent aren't shown.
+- Pull requests, checked on 2026-11-18 against the README on main: `lumen diff --pr 123` opens one, and marking a file viewed syncs with GitHub. The README describes neither the pull request's review threads nor posting a review.
 
 **`difftastic`** ([README](https://github.com/Wilfred/difftastic#readme), [manual](https://difftastic.wilfred.me.uk/))
 - Structural diff, and a line diff with word highlighting for unsupported files: the README.
@@ -304,3 +306,6 @@ Checked on 2026-11-15 against the versions benchmarked: `hunk` 0.25.0, `lumen` 2
 **GNU diff**: `diff --help` and `diff --version` of diffutils 3.10 (`-u`, `-y` for two columns, `-r`, `--color`; "License GPLv3+").
 
 **dffy**: [viewer.md](viewer.md), [git.md](git.md), [watch.md](watch.md), [usage.md](usage.md#comparing-files-and-folders), [themes.md](themes.md), [plugins.md](plugins.md) and [config.md](config.md) (`view = auto` splits from `split-min-width`, 140 columns), each describing the current code. Highlighting is off in pager mode ([git.md](git.md#piped-input)).
+- Line comments: [comments.md](comments.md) and [viewer.md](viewer.md#comments).
+- Agent annotations are partial. An agent that can run commands can add comments with `dffy comments apply`, and the viewer shows them inline with their author. But no agent integration drives it: the MCP server only reads comments, and there's no skill or plugin for an agent.
+- Pull request review: [viewer.md](viewer.md#code-host-reviews) and the dffy-review-github section of [plugins.md](plugins.md). It's partial because it needs the experimental plugin and the GitHub CLI, and doesn't support forks or GitHub Enterprise yet.

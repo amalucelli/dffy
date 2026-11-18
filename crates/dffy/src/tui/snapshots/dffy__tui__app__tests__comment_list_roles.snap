@@ -1,14 +1,13 @@
 ---
 source: crates/dffy/src/tui/app.rs
-assertion_line: 8663
 expression: "markup.lines().skip(1).take(9).collect::<Vec<_>>().join(\"\\n\")"
 ---
-<hint>│</> <dim>src/some/deeply/nested/module/</>file.rs    <dim>4</> <hint>│</>
+<hint>│</> <dim>src/some/deeply/nested/module/</><bold>file.rs</>    <dim>4</> <hint>│</>
 <hint>│</>   ◆ you On the whole file                  <hint>│</>
-<hint>│</>   <warn>◆</> :2 Why two?                          <dim>1</> <hint>│</>
-<hint>│</>   <hint>●</> :50 octocat Fifty?                     <hint>│</>
-<hint>│</> <dim>  ○ :4 you Old four</>                        <hint>│</>
-<hint>│</> <dim>src/</>zz9.rs                               <dim>1</> <hint>│</>
-<hint>│</>   <warn>◆</> :10 <dim>moved</> you Moved away               <hint>│</>
-<hint>│</> gone.rs<dim> · not in this diff</>               <dim>1</> <hint>│</>
-<hint>│</>   <warn>◆</> :1 you Gone                            <hint>│</>
+<hint>│</>   <warn>◆</> <line-number>:2 </>Why two?                         <dim>↩1</> <hint>│</>
+<hint>│</>   <hint>●</> <line-number>:50 </><bold>octocat</> Fifty?                     <hint>│</>
+<hint>│</> <dim>  ○ </><line-number>:4 </><dim+bold>you</><dim> Old four</>                        <hint>│</>
+<hint>│</> <dim>src/</><bold>zz9.rs</>                               <dim>1</> <hint>│</>
+<hint>│</>   <warn>◆</> <line-number>:10 </><warn+dim>moved</> <bold>you</> Moved away               <hint>│</>
+<hint>│</> <bold>gone.rs</><dim> · not in this diff</>               <dim>1</> <hint>│</>
+<hint>│</>   <warn>◆</> <line-number>:1 </><bold>you</> Gone                            <hint>│</>

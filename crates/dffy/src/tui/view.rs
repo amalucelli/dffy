@@ -195,7 +195,9 @@ impl Card {
 /// there. `Z` then sets every thread, and `z` one. Choices are
 /// kept by root, as folded or not rather than as a flip of the default, so
 /// they outlive reloads of the comments file and a thread resolved or
-/// reopened under them.
+/// reopened under them. The thread the comments panel follows is peeked:
+/// whole over `Z` and its default, though not over a `z` choice, until the
+/// peek moves on.
 #[derive(Debug, Default)]
 pub(crate) struct Fold {
     /// What `Z` last set every thread to.
@@ -204,6 +206,7 @@ pub(crate) struct Fold {
     chosen: HashMap<String, bool>,
     /// Whether each thread of the file shown starts folded, by root.
     defaults: HashMap<String, bool>,
+    peek: Option<String>,
 }
 
 impl Fold {
@@ -211,8 +214,17 @@ impl Fold {
         self.chosen
             .get(root)
             .copied()
+            .or_else(|| (self.peek.as_deref() == Some(root)).then_some(false))
             .or(self.all)
             .unwrap_or_else(|| self.defaults.get(root).copied().unwrap_or(false))
+    }
+
+    /// Keeps thread `root` whole whatever the peek does next: one the text
+    /// box writes in.
+    pub(crate) fn keep_open(&mut self, root: &str) {
+        if self.collapsed(root) || self.peek.as_deref() == Some(root) {
+            self.chosen.insert(root.to_owned(), false);
+        }
     }
 
     pub(crate) fn toggle(&mut self, root: &str) {
@@ -223,6 +235,7 @@ impl Fold {
     /// Folds every thread, or unfolds every one when those of the file
     /// shown all were. Returns whether they're folded now.
     pub(crate) fn toggle_all(&mut self) -> bool {
+        self.peek = None;
         let fold = if self.defaults.is_empty() {
             self.all != Some(true)
         } else {
@@ -2272,9 +2285,25 @@ impl Doc {
         self.threads().iter().find(|t| t.root == root)
     }
 
-    /// Focuses the thread with root `root`, or none.
+    /// Focuses the thread with root `root`, or none. Focusing another
+    /// thread than the one peeked at ends the peek.
     pub(crate) fn set_focus(&mut self, root: Option<String>) {
+        if let Some(root) = &root
+            && self.fold.peek.as_ref().is_some_and(|p| p != root)
+        {
+            self.peek(None);
+        }
         self.focus = root;
+    }
+
+    /// Peeks at the thread with root `root` (see [`Fold`]), or ends the
+    /// peek.
+    pub(crate) fn peek(&mut self, root: Option<&str>) {
+        if self.fold.peek.as_deref() == root {
+            return;
+        }
+        self.fold.peek = root.map(str::to_owned);
+        self.refit();
     }
 
     /// The block drawn on row `y` of the pane in the last frame.
@@ -2411,21 +2440,62 @@ impl Doc {
         let Some(i) = self.threads.iter().position(|t| t.root == root) else {
             return false;
         };
-        self.focus = Some(root.to_owned());
+        self.set_focus(Some(root.to_owned()));
         self.reveal_block(Block::Thread(i), false);
         true
     }
 
-    /// Focuses thread `i`, hung under the row at `pos`, and shows it a few
-    /// rows of code below the top.
+    /// Focuses thread `i`, hung under the row at `pos`, ending a peek at
+    /// another. Unless its box shows whole already, the box lands a third
+    /// of the way down the pane; one too tall for that goes as far higher
+    /// as it takes to fit, though the code it hangs under stays above it.
     fn show_thread(&mut self, pos: Pos, i: usize) {
-        self.focus = Some(self.threads[i].root.clone());
+        self.set_focus(Some(self.threads[i].root.clone()));
         self.found = Some((Block::Thread(i), pos));
+        let Some((pos, range)) = self.block_rows(Block::Thread(i)) else {
+            return;
+        };
+        let first = Pos {
+            offset: range.start,
+            ..pos
+        };
+        if self
+            .rows_to(first)
+            .is_some_and(|y| y + range.len() <= self.height)
+        {
+            return;
+        }
+        let spare = self.height.saturating_sub(range.len());
+        let above = (self.height / 3).min(spare.max(range.start));
         let layout = self.file_layout(pos.file);
-        self.document.pos = pos;
-        self.clamp_in(&layout);
-        self.scroll_in(-OPEN_CONTEXT, &layout);
-        self.reveal_block(Block::Thread(i), false);
+        self.document.pos = first;
+        self.scroll_in(-isize::try_from(above).unwrap_or(0), &layout);
+    }
+
+    /// Screen rows from the top of the pane down to `target`, a screen row
+    /// of a logical row; `None` when it's above the top or below the pane.
+    fn rows_to(&mut self, target: Pos) -> Option<usize> {
+        let top = self.document.pos;
+        if target < top {
+            return None;
+        }
+        let layout = self.file_layout(top.file);
+        let mut at = Pos { offset: 0, ..top };
+        // From the top of `at`'s logical row.
+        let mut rows = 0;
+        while at
+            != (Pos {
+                offset: 0,
+                ..target
+            })
+        {
+            rows += self.height(at, &layout);
+            if rows >= self.height + top.offset || !self.next_row(&mut at, &layout) {
+                return None;
+            }
+        }
+        let y = rows + target.offset - top.offset;
+        (y < self.height).then_some(y)
     }
 
     /// The block the text box is drawn in.

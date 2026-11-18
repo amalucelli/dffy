@@ -124,11 +124,17 @@ fn answers_that_dont_fit_the_request_are_refused() {
     }
 }
 
-/// An executable script named as a renderer in `dir`.
-fn script(dir: &Path, name: &str, body: &str) -> Program {
+/// The test renderer in `dir`, doing what its `name` says (see the
+/// script), with [`ANSWER`] beside it.
+fn script(dir: &Path, name: &str) -> Program {
     let path = dir.join(format!("{PREFIX}{name}"));
-    std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).expect("write script");
+    std::fs::write(
+        &path,
+        include_str!("../../tests/fixtures/stubs/renderer.sh"),
+    )
+    .expect("write script");
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    std::fs::write(dir.join("answer.json"), ANSWER).expect("write answer");
     Program {
         name: name.to_owned(),
         path,
@@ -149,16 +155,7 @@ const ANSWER: &str = r#"{"version":1,"old":[{"kind":"p","source":[0,1],"lines":[
 #[test]
 fn a_renderer_runs_and_its_answer_is_cached() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let marker = dir.path().join("ran");
-    let program = script(
-        dir.path(),
-        "good",
-        &format!(
-            "cat > {input}\necho x >> {marker}\nprintf '%s' '{ANSWER}'",
-            input = dir.path().join("input").display(),
-            marker = marker.display()
-        ),
-    );
+    let program = script(dir.path(), "answers");
     let cache = Cache::new(dir.path().join("cache"), 1 << 20);
     for _ in 0..2 {
         let [old, new] =
@@ -166,11 +163,11 @@ fn a_renderer_runs_and_its_answer_is_cached() {
         assert_eq!(old.blocks[0].lines[0].text, "a");
         assert_eq!(new.blocks[0].lines[0].text, "b");
     }
-    let input = std::fs::read_to_string(dir.path().join("input")).expect("request");
+    let input = std::fs::read_to_string(dir.path().join("request")).expect("request");
     assert_eq!(input, REQUEST.encode());
     assert_eq!(
-        std::fs::read_to_string(marker).expect("marker"),
-        "x\n",
+        std::fs::read_to_string(dir.path().join("runs")).expect("runs"),
+        "run\n",
         "the second render came from the cache"
     );
 }
@@ -179,17 +176,13 @@ fn a_renderer_runs_and_its_answer_is_cached() {
 fn failures_say_what_happened() {
     let dir = tempfile::tempdir().expect("tempdir");
     let cases = [
-        ("crash", "exit 3", "exited with status 3"),
-        ("garbage", "echo nope", "bad answer"),
-        (
-            "says",
-            r#"printf '{"version":1,"error":"no tables"}'; exit 1"#,
-            "said: no tables",
-        ),
-        ("unread", &format!("printf '%s' '{ANSWER}'"), ""),
+        ("crash", "exited with status 3"),
+        ("garbage", "bad answer"),
+        ("says", "said: no tables"),
+        ("unread", ""),
     ];
-    for (name, body, expected) in cases {
-        let program = script(dir.path(), name, body);
+    for (name, expected) in cases {
+        let program = script(dir.path(), name);
         match render(&program, &REQUEST, [1, 1], None, || false) {
             Ok(_) => assert!(expected.is_empty(), "{name} rendered"),
             Err(e) => assert!(
@@ -204,11 +197,7 @@ fn failures_say_what_happened() {
 fn a_slow_renderer_is_killed_with_its_children() {
     let dir = tempfile::tempdir().expect("tempdir");
     let pid = dir.path().join("pid");
-    let program = script(
-        dir.path(),
-        "slow",
-        &format!("sleep 30 &\necho $! > {}\nwait", pid.display()),
-    );
+    let program = script(dir.path(), "hangs");
     let started = Instant::now();
     let result = render(&program, &REQUEST, [1, 1], None, || false);
     assert_eq!(result, Err(Failure::Timeout));
@@ -248,14 +237,7 @@ fn gone(pid_file: &Path) -> bool {
 fn what_a_renderer_started_is_killed_once_it_exits() {
     let dir = tempfile::tempdir().expect("tempdir");
     let pid = dir.path().join("pid");
-    let program = script(
-        dir.path(),
-        "helper",
-        &format!(
-            "sleep 30 </dev/null >/dev/null 2>&1 &\necho $! > {}\ncat >/dev/null\nprintf '%s' '{ANSWER}'",
-            pid.display()
-        ),
-    );
+    let program = script(dir.path(), "helper");
     render(&program, &REQUEST, [1, 1], None, || false).expect("rendered");
     assert!(gone(&pid), "the renderer's helper outlived it");
 }

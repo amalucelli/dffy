@@ -385,14 +385,8 @@ fn editor_gets_the_terminal_and_the_line() {
     let record = bin.path().join("args");
     // Named like vim so it gets vim's `+line` argument.
     let editor = bin.path().join("vim");
-    std::fs::write(
-        &editor,
-        format!(
-            "#!/bin/sh\n[ -t 0 ] && tty=tty || tty=notty\necho \"$tty $*\" > '{}'\n",
-            record.display()
-        ),
-    )
-    .expect("write editor");
+    std::fs::write(&editor, include_str!("fixtures/stubs/editor-records.sh"))
+        .expect("write editor");
     Command::new("chmod")
         .arg("+x")
         .arg(&editor)
@@ -453,7 +447,8 @@ fn ctrl_g_continues_a_comment_in_the_editor() {
     let repo = repo();
     let bin = tempfile::tempdir().expect("tempdir");
     let editor = bin.path().join("vim");
-    std::fs::write(&editor, "#!/bin/sh\nprintf ' in vim\\n' >> \"$2\"\n").expect("write editor");
+    std::fs::write(&editor, include_str!("fixtures/stubs/editor-appends.sh"))
+        .expect("write editor");
     Command::new("chmod")
         .arg("+x")
         .arg(&editor)
@@ -482,14 +477,8 @@ fn the_editor_round_trip_keeps_the_place() {
     let bin = tempfile::tempdir().expect("tempdir");
     let editor = bin.path().join("vim");
     let ran = bin.path().join("ran");
-    std::fs::write(
-        &editor,
-        format!(
-            "#!/bin/sh\n[ -e '{0}' ] || {{ touch '{0}'; exit 1; }}\nprintf ' in vim\\n' >> \"$2\"\n",
-            ran.display()
-        ),
-    )
-    .expect("write editor");
+    std::fs::write(&editor, include_str!("fixtures/stubs/editor-fails-once.sh"))
+        .expect("write editor");
     Command::new("chmod")
         .arg("+x")
         .arg(&editor)
@@ -531,16 +520,16 @@ fn rev_parse(dir: &Path, rev: &str) -> String {
         .to_owned()
 }
 
-/// What `dffy-review-test` describes until a test writes another
-/// `describe.sh`: `dffy pr`, a review read as `PR #7`, and four events.
+/// What `dffy-review-test` describes until a test answers `describe`
+/// another way: `dffy pr`, a review read as `PR #7`, and four events.
 const DESCRIBE: &str = r##"{"version":1,"command":"pr","noun":"pull request","nouns":"pull requests","short":"PR","id_prefix":"#","events":[{"id":"pending","key":"p","label":"pending","done":"review pending","submits":false},{"id":"comment","key":"c","label":"comment","done":"commented"},{"id":"approve","key":"a","label":"approve","done":"approved"},{"id":"request_changes","key":"r","label":"request changes","done":"changes requested"}]}"##;
 
 /// A pull request for `dffy pr`: a repository whose last commit, the PR's
-/// head, changes README.md over its base, the commit before; and
-/// `dffy-review-test` on PATH, which records each call but `describe` and
-/// how it was run, then runs `<verb>.sh` from its directory, which tests
-/// write. It describes [`DESCRIBE`] until a test writes another
-/// `describe.sh`, before its first run: the answer is cached.
+/// head, changes README.md over its base, the commit before; and the test
+/// review plugin as `dffy-review-test` on PATH, which records each call but
+/// `describe` and how it was run, then answers as the test says with
+/// [`Pull::verb`]. It describes [`DESCRIBE`] until a test answers
+/// `describe` another way, before its first run: the answer is cached.
 struct Pull {
     repo: tempfile::TempDir,
     stub: tempfile::TempDir,
@@ -560,21 +549,8 @@ impl Pull {
         git(d, &["commit", "-q", "-am", "head"]);
         let stub = tempfile::tempdir().expect("tempdir");
         let plugin = stub.path().join("dffy-review-test");
-        std::fs::write(
-            &plugin,
-            "#!/bin/sh\n\
-             d=$(dirname \"$0\")\n\
-             [ \"$1\" = describe ] || \
-             { echo \"$*\"; pwd -P; ( : < /dev/tty ) 2>/dev/null && echo tty || echo notty; \
-               echo \"protocol=$DFFY_REVIEW_PROTOCOL comments=$DFFY_COMMENTS dffy=$DFFY\"; } >> \"$d/calls\"\n\
-             . \"$d/$1.sh\"\n",
-        )
-        .expect("write plugin");
-        std::fs::write(
-            stub.path().join("describe.sh"),
-            format!("echo '{DESCRIBE}'"),
-        )
-        .expect("write describe");
+        std::fs::write(&plugin, include_str!("fixtures/stubs/review-plugin.sh"))
+            .expect("write plugin");
         Command::new("chmod")
             .arg("+x")
             .arg(&plugin)
@@ -582,12 +558,14 @@ impl Pull {
             .expect("chmod");
         let base = rev_parse(d, "HEAD~1");
         let head = rev_parse(d, "HEAD");
-        Self {
+        let pull = Self {
             repo,
             stub,
             base,
             head,
-        }
+        };
+        pull.verb("describe", &[DESCRIBE], 0);
+        pull
     }
 
     fn comments(&self) -> std::path::PathBuf {
@@ -602,8 +580,27 @@ impl Pull {
         )
     }
 
-    fn verb(&self, verb: &str, script: &str) {
-        std::fs::write(self.stub.path().join(format!("{verb}.sh")), script).expect("write");
+    /// Makes `verb` print `lines` and exit with `code`. As `<verb>.<flag>`,
+    /// it's the answer to the calls with `--<flag>` instead; each call's
+    /// arguments go in `<verb>.args` or `<verb>.<flag>.args`.
+    fn verb(&self, verb: &str, lines: &[&str], code: i32) {
+        let out: String = lines.iter().flat_map(|line| [*line, "\n"]).collect();
+        let dir = self.stub.path();
+        std::fs::write(dir.join(format!("{verb}.out")), out).expect("write");
+        std::fs::write(dir.join(format!("{verb}.code")), code.to_string()).expect("write");
+    }
+
+    /// Makes `verb` wait to print until the gate it returns is removed.
+    fn gate(&self, verb: &str) -> std::path::PathBuf {
+        let gate = self.stub.path().join(format!("{verb}.gate"));
+        std::fs::write(&gate, "").expect("write");
+        gate
+    }
+
+    /// Keeps `verb` running once it printed, with a child whose pid goes in
+    /// `pid`.
+    fn hold(&self, verb: &str) {
+        std::fs::write(self.stub.path().join(format!("{verb}.hold")), "").expect("write");
     }
 
     fn calls(&self) -> String {
@@ -635,18 +632,19 @@ fn dffy_pr_opens_the_pr_once_prepare_names_its_commits() {
         r#"{"version":1,"comments":[{"id":"c1","path":"README.md","text":"Nice README","author":"octocat","ref":"github:1","created":"2026-11-17T10:00:00Z"}]}"#,
     )
     .expect("write");
-    let gate = pull.stub.path().join("go");
+    let gate = pull.gate("prepare");
     pull.verb(
         "prepare",
-        &format!(
-            "while [ ! -f '{}' ]; do sleep 0.02; done\necho '{}'\necho '{{\"version\":1,\"progress\":\"1/2\"}}'\nsleep 30\n",
-            gate.display(),
-            pull.session(7, &pull.head)
-        ),
+        &[
+            &pull.session(7, &pull.head),
+            r#"{"version":1,"progress":"1/2"}"#,
+        ],
+        0,
     );
+    pull.hold("prepare");
     let mut term = pull.spawn(&["pr", "7"]);
     term.wait_for("the fetching note", |t| t.contains("fetching PR #7…"));
-    std::fs::write(&gate, "").expect("open the gate");
+    std::fs::remove_file(&gate).expect("open the gate");
     term.wait_for("the PR's diff", |t| t.contains("From the PR."));
     term.wait_for("its thread", |t| t.contains("Nice README"));
     term.wait_for("the progress", |t| {
@@ -682,10 +680,8 @@ fn a_prs_general_comments_show_as_its_conversation() {
 ]}"#,
     )
     .expect("write");
-    pull.verb(
-        "prepare",
-        &format!("echo '{}'\nsleep 30\n", pull.session(7, &pull.head)),
-    );
+    pull.verb("prepare", &[&pull.session(7, &pull.head)], 0);
+    pull.hold("prepare");
     let mut term = pull.spawn(&["pr", "7"]);
     term.wait_for("the PR's diff", |t| t.contains("From the PR."));
     term.wait_for("the conversation in the tree", |t| {
@@ -708,13 +704,15 @@ fn the_review_command_is_the_plugins() {
     let pull = Pull::new();
     pull.verb(
         "describe",
-        r#"( : < /dev/tty ) 2>/dev/null && echo tty > "$d/describe-tty" || echo notty > "$d/describe-tty"
-echo '{"version":1,"command":"mr","noun":"merge request","nouns":"merge requests","short":"MR","id_prefix":"!"}'"#,
+        &[
+            r#"{"version":1,"command":"mr","noun":"merge request","nouns":"merge requests","short":"MR","id_prefix":"!"}"#,
+        ],
+        0,
     );
     let session = pull
         .session(7, &pull.head)
         .replace(r#""id":"7""#, r#""id":"I8f2c","label":"7""#);
-    pull.verb("prepare", &format!("echo '{session}'"));
+    pull.verb("prepare", &[&session], 0);
     let mut term = pull.spawn(&["mr", "I8f2c"]);
     term.wait_for("the merge request's diff", |t| t.contains("From the PR."));
     term.wait_for("review mode", |t| t.status().contains("MR !7"));
@@ -724,7 +722,7 @@ echo '{"version":1,"command":"mr","noun":"merge request","nouns":"merge requests
         pull.calls()
     );
     assert_eq!(
-        std::fs::read_to_string(pull.stub.path().join("describe-tty")).expect("described"),
+        std::fs::read_to_string(pull.stub.path().join("described")).expect("described"),
         "notty\n"
     );
     term.send("q");
@@ -753,22 +751,16 @@ fn plain_dffy_attaches_the_branchs_pr() {
         r#"{"version":1,"comments":[{"id":"c1","path":"README.md","text":"Nice README","author":"octocat","ref":"github:1","created":"2026-11-17T10:00:00Z"}]}"#,
     )
     .expect("write");
-    let gate = pull.stub.path().join("go");
+    let gate = pull.gate("detect");
     let session = pull.session(7, &pull.head);
     let pr = session.replacen("\"session\"", "\"review\"", 1);
-    pull.verb(
-        "detect",
-        &format!(
-            "while [ ! -f '{}' ]; do sleep 0.02; done\necho '{pr}'\n",
-            gate.display()
-        ),
-    );
-    pull.verb("prepare", &format!("echo '{session}'"));
+    pull.verb("detect", &[&pr], 0);
+    pull.verb("prepare", &[&session], 0);
     let mut term = pull.spawn(&[]);
     // Against HEAD: the two lines not committed.
     term.wait_for("the working tree's diff", |t| t.contains("+2 -0"));
     assert!(!term.status().contains("PR #7"), "{}", term.status());
-    std::fs::write(&gate, "").expect("open the gate");
+    std::fs::remove_file(&gate).expect("open the gate");
     term.wait_for("the PR", |t| t.status().contains("PR #7"));
     term.wait_for("its thread", |t| t.contains("Nice README"));
     assert!(term.contains("+2 -0"), "{}", term.vt.screen().contents());
@@ -790,8 +782,8 @@ fn plain_dffy_attaches_the_branchs_pr() {
 #[test]
 fn plain_dffy_asks_only_a_described_plugin_for_the_branchs_review() {
     let pull = Pull::new();
-    pull.verb("describe", "exit 1");
-    pull.verb("detect", r#"echo '{"version":1,"review":null}'"#);
+    pull.verb("describe", &[], 1);
+    pull.verb("detect", &[r#"{"version":1,"review":null}"#], 0);
     std::fs::write(pull.repo.path().join("README.md"), "# demo\n\nLocal.\n").expect("write");
     let mut term = pull.spawn(&[]);
     term.wait_for("the working tree's diff", |t| t.contains("Local."));
@@ -806,17 +798,19 @@ fn plain_dffy_asks_only_a_described_plugin_for_the_branchs_review() {
 #[test]
 fn dffy_pr_says_why_a_pr_didnt_open() {
     let pull = Pull::new();
-    for (script, said) in [
+    for (lines, code, said) in [
         (
-            "echo '{\"version\":1,\"error\":\"no such PR\"}'; exit 1",
+            &[r#"{"version":1,"error":"no such PR"}"#][..],
+            1,
             "error: PR #7: no such PR",
         ),
         (
-            "exit 2",
+            &[][..],
+            2,
             "error: PR #7: dffy-review-test doesn't know prepare",
         ),
     ] {
-        pull.verb("prepare", script);
+        pull.verb("prepare", lines, code);
         let mut term = pull.spawn(&["pr", "7"]);
         let status = term.wait_exit();
         assert!(!status.success());
@@ -830,14 +824,8 @@ fn dffy_pr_says_why_a_pr_didnt_open() {
 fn quitting_kills_the_plugin_running() {
     let pull = Pull::new();
     let pid = pull.stub.path().join("pid");
-    pull.verb(
-        "prepare",
-        &format!(
-            "echo '{}'\nsleep 30 & echo $! > '{}'\nwait\n",
-            pull.session(7, &pull.head),
-            pid.display()
-        ),
-    );
+    pull.verb("prepare", &[&pull.session(7, &pull.head)], 0);
+    pull.hold("prepare");
     let mut term = pull.spawn(&["pr", "7"]);
     term.wait_for("the PR's diff", |t| t.contains("From the PR."));
     term.wait_for("the sleep", |_| {
@@ -871,10 +859,8 @@ fn quitting_kills_the_plugin_running() {
 fn ctrl_c_while_fetching_kills_the_plugin() {
     let pull = Pull::new();
     let pid = pull.stub.path().join("pid");
-    pull.verb(
-        "prepare",
-        &format!("sleep 30 & echo $! > '{}'\nwait\n", pid.display()),
-    );
+    pull.verb("prepare", &[], 0);
+    pull.hold("prepare");
     let mut term = pull.spawn(&["pr", "7"]);
     term.wait_for("the fetching note", |t| t.contains("fetching PR #7…"));
     term.wait_for("the sleep", |_| {
@@ -911,7 +897,7 @@ fn since_last_review_from_a_head_not_in_the_clone_stays_on_the_pr() {
         r#""last_reviewed_head":null"#,
         r#""last_reviewed_head":"deadbeef""#,
     );
-    pull.verb("prepare", &format!("echo '{session}'"));
+    pull.verb("prepare", &[&session], 0);
     let mut term = pull.spawn(&["pr", "7"]);
     term.wait_for("the PR's diff", |t| t.contains("From the PR."));
     for _ in 0..2 {
@@ -949,21 +935,21 @@ fn a_picked_pr_updates_in_place_and_posts() {
     git(d, &["update-ref", "refs/pull/11/head", &second]);
     pull.verb(
         "list",
-        r#"echo '{"version":1,"reviews":[{"id":"11","title":"Document the cache","author":"ada","url":"u","head_ref":"docs","reason":"mine"}]}'"#,
+        &[
+            r#"{"version":1,"reviews":[{"id":"11","title":"Document the cache","author":"ada","url":"u","head_ref":"docs","reason":"mine"}]}"#,
+        ],
+        0,
     );
-    pull.verb("prepare", &format!("echo '{}'", pull.session(11, &first)));
-    pull.verb("pull", &format!("echo '{}'", pull.session(11, &second)));
-    let summary = pull.stub.path().join("summary");
+    pull.verb("prepare", &[&pull.session(11, &first)], 0);
+    pull.verb("pull", &[&pull.session(11, &second)], 0);
+    pull.verb("post.dry-run", &[], 0);
     pull.verb(
         "post",
-        &format!(
-            "[ \"$3\" = --dry-run ] && exit 0\n\
-             echo \"$*\" > '{}.args'; cat \"$6\" > '{}'\n\
-             echo '{{\"version\":1,\"progress\":\"1/1\"}}'\n\
-             echo '{{\"version\":1,\"posted\":1,\"failed\":0,\"url\":\"https://example.com/pull/11#review\"}}'\n",
-            summary.display(),
-            summary.display()
-        ),
+        &[
+            r#"{"version":1,"progress":"1/1"}"#,
+            r#"{"version":1,"posted":1,"failed":0,"url":"https://example.com/pull/11#review"}"#,
+        ],
+        0,
     );
     let mut term = pull.spawn(&["pr"]);
     term.wait_for("the picker", |t| t.contains("Yours") && t.contains("#11"));
@@ -1018,13 +1004,13 @@ fn a_picked_pr_updates_in_place_and_posts() {
     let seen = term.output().len();
     term.send("j");
     assert!(sent(&term, seen, b"\x1b]7501;state=idle:app=dffy\x1b\\"));
-    let args = std::fs::read_to_string(summary.with_extension("args")).expect("args");
+    let args = std::fs::read_to_string(pull.stub.path().join("post.args")).expect("args");
     assert!(
         args.starts_with("post 11 --event comment --summary-file "),
         "{args}"
     );
     assert_eq!(
-        std::fs::read_to_string(&summary).expect("summary"),
+        std::fs::read_to_string(pull.stub.path().join("summary")).expect("summary"),
         "Looks good"
     );
     term.send("q");
@@ -1044,26 +1030,39 @@ fn posting_checks_first_and_asks_when_a_comment_is_refused() {
     .expect("write");
     pull.verb(
         "prepare",
-        &format!(
-            "echo '{}'\necho '{{\"version\":1,\"progress\":\"100/312\"}}'\nsleep 30\n",
-            pull.session(7, &pull.head)
-        ),
+        &[
+            &pull.session(7, &pull.head),
+            r#"{"version":1,"progress":"100/312"}"#,
+        ],
+        0,
     );
+    pull.hold("prepare");
     let skipped = r#"{"version":1,"draft":{"id":"c1","path":"README.md","plan":"skip","reason":"file not in the PR"}}"#;
     let refused = r#"{"version":1,"draft":{"id":"c2","path":"README.md","plan":"skip","reason":"Line could not be resolved"}}"#;
-    let args = pull.stub.path().join("submit.args");
+    pull.verb(
+        "post.dry-run",
+        &[
+            skipped,
+            r#"{"version":1,"draft":{"id":"c2","path":"README.md","plan":"file"}}"#,
+            r#"{"version":1,"planned":{"line":0,"file":1,"skip":1}}"#,
+        ],
+        0,
+    );
+    pull.verb(
+        "post.apply-event",
+        &[r#"{"version":1,"posted":0,"failed":0,"url":"https://example.com/pull/7#review"}"#],
+        0,
+    );
     pull.verb(
         "post",
-        &format!(
-            "case \"$*\" in\n\
-             *--dry-run*) echo '{skipped}'; echo '{{\"version\":1,\"draft\":{{\"id\":\"c2\",\"path\":\"README.md\",\"plan\":\"file\"}}}}'; \
-               echo '{{\"version\":1,\"planned\":{{\"line\":0,\"file\":1,\"skip\":1}}}}' ;;\n\
-             *--apply-event*) echo \"$*\" > '{}'; echo '{{\"version\":1,\"posted\":0,\"failed\":0,\"url\":\"https://example.com/pull/7#review\"}}' ;;\n\
-             *) echo '{skipped}'; echo '{refused}'; echo '{{\"version\":1,\"posted\":0,\"failed\":2,\"held\":true,\"held_message\":\"review still pending\",\"url\":\"https://example.com/pull/7#review\"}}' ;;\n\
-             esac\n",
-            args.display()
-        ),
+        &[
+            skipped,
+            refused,
+            r#"{"version":1,"posted":0,"failed":2,"held":true,"held_message":"review still pending","url":"https://example.com/pull/7#review"}"#,
+        ],
+        0,
     );
+    let args = pull.stub.path().join("post.apply-event.args");
     let mut term = pull.spawn(&["pr", "7"]);
     term.wait_for("the PR's diff", |t| t.contains("From the PR."));
     // 100 of 312 threads: Fetching threads · PR #7, a third done.

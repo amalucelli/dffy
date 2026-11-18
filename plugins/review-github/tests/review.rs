@@ -21,56 +21,6 @@ const PR: &str = "7";
 
 const URL: &str = "https://github.com/acme/widgets/pull/7";
 
-/// Each `gh` event records how many lines the plugin had printed by then,
-/// which orders the plugin's output against its requests without sleeps.
-/// GraphQL requests go to `requests` and `events`, REST ones to `rest`.
-const GH: &str = r#"#!/bin/sh
-case "$1" in
-  --version) echo 'gh version 2.0.0 (stub)'; exit 0 ;;
-  auth)
-    printf '%s\n' "$*" >> "$STUB/auth"
-    if [ -f "$STUB/gh/logged-out" ]; then
-      echo 'You are not logged into any GitHub hosts. To log in, run: gh auth login' >&2; exit 1
-    fi
-    printf 'github.com\n  ✓ Logged in to github.com account octocat (keyring)\n'; exit 0 ;;
-esac
-body=$(cat)
-if [ -f "$STUB/gh/logged-out" ]; then
-  echo 'To get started with GitHub CLI, please run:  gh auth login' >&2; exit 4
-fi
-if [ -f "$STUB/gh/bad-token" ]; then echo 'gh: Bad credentials (HTTP 401)' >&2; exit 1; fi
-if [ "$2" != graphql ]; then
-  # REST, named by the path's last segment. A `.hold` makes the answer wait
-  # for the plugin's first line; the log says how many lines it had then.
-  op=$(printf '%s' "$2" | sed 's/?.*//; s|.*/||')
-  n=$(($(cat "$STUB/rest" 2>/dev/null | grep -c "/$op?") + 1))
-  if [ -f "$STUB/gh/$op.hold" ]; then
-    i=0
-    while [ "$(wc -l < "$STUB/out")" -lt 1 ] && [ $i -lt 30 ]; do sleep 0.1; i=$((i + 1)); done
-  fi
-  printf '%s after %s\n' "$*" "$(wc -l < "$STUB/out" | tr -d ' ')" >> "$STUB/rest"
-  for f in "$STUB/gh/$op.$n" "$STUB/gh/$op"; do
-    if [ -f "$f.json" ]; then cat "$f.json"; exit 0; fi
-    if [ -f "$f.down" ]; then echo 'error connecting to api.github.com' >&2; exit 1; fi
-  done
-  echo "gh stub: no fixture for $op call $n" >&2
-  exit 1
-fi
-op=$(printf '%s' "$body" | sed -n 's/.*"operationName":"\([A-Za-z]*\)".*/\1/p')
-printf '%s\n' "$body" >> "$STUB/requests"
-printf 'gh %s after %s\n' "$op" "$(wc -l < "$STUB/out" | tr -d ' ')" >> "$STUB/events"
-n=$(grep -c "\"operationName\":\"$op\"" "$STUB/requests")
-# Something else happening while this request is in flight.
-if [ -f "$STUB/gh/$op.$n.sh" ]; then sh "$STUB/gh/$op.$n.sh" > /dev/null; fi
-for f in "$STUB/gh/$op.$n" "$STUB/gh/$op"; do
-  if [ -f "$f.json" ]; then cat "$f.json"; exit 0; fi
-  if [ -f "$f.error.json" ]; then cat "$f.error.json"; echo "gh: GraphQL error" >&2; exit 1; fi
-  if [ -f "$f.down" ]; then echo 'error connecting to api.github.com' >&2; exit 1; fi
-done
-echo "gh stub: no fixture for $op call $n" >&2
-exit 1
-"#;
-
 /// The dffy built with the workspace, when its `comments apply` works.
 fn real_dffy() -> Option<PathBuf> {
     let exe = PathBuf::from(env!("CARGO_BIN_EXE_dffy-review-github"));
@@ -111,6 +61,14 @@ fn git(dir: &Path, args: &[&str]) -> String {
         .expect("utf-8")
         .trim()
         .to_owned()
+}
+
+/// The git on the test's own PATH.
+fn real_git() -> PathBuf {
+    std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
+        .map(|dir| dir.join("git"))
+        .find(|git| git.is_file())
+        .expect("git on PATH")
 }
 
 fn numbered(lines: impl IntoIterator<Item = String>) -> String {
@@ -252,7 +210,7 @@ impl Fixture {
         fs::create_dir_all(d.join("stub/bin")).expect("stub dir");
         fs::create_dir_all(d.join("stub/gh")).expect("stub dir");
         let gh = d.join("stub/bin/gh");
-        fs::write(&gh, GH).expect("stub");
+        fs::write(&gh, include_str!("fixtures/stubs/gh.sh")).expect("stub");
         fs::set_permissions(&gh, fs::Permissions::from_mode(0o755)).expect("chmod");
         std::os::unix::fs::symlink(&real_dffy, d.join("stub/bin/dffy")).expect("dffy on PATH");
         Self {
@@ -336,11 +294,7 @@ impl Fixture {
         let bin = self.path("nogh");
         if !bin.exists() {
             fs::create_dir(&bin).expect("dir");
-            let git = std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
-                .map(|dir| dir.join("git"))
-                .find(|git| git.is_file())
-                .expect("git on PATH");
-            std::os::unix::fs::symlink(git, bin.join("git")).expect("git");
+            std::os::unix::fs::symlink(real_git(), bin.join("git")).expect("git");
             std::os::unix::fs::symlink(&self.real_dffy, bin.join("dffy")).expect("dffy");
         }
         self.run_on(args, &bin.display().to_string())
@@ -365,6 +319,7 @@ impl Fixture {
             .env_remove("DFFY")
             .env_remove("GH_HOST")
             .env("STUB", self.path("stub"))
+            .env("STUB_GIT", real_git())
             .env("DFFY_REVIEW_PROTOCOL", "1")
             .env("XDG_DATA_HOME", self.path("data"))
             .env("XDG_CONFIG_HOME", self.path("config"))
@@ -591,20 +546,8 @@ impl Fixture {
     /// Puts a `git` on the stub's PATH that logs each call, `<args> after
     /// <lines printed>`, for `git_calls`.
     fn log_git(&self) {
-        let real = std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
-            .map(|dir| dir.join("git"))
-            .find(|git| git.is_file())
-            .expect("git on PATH");
         let wrapper = self.path("stub/bin/git");
-        fs::write(
-            &wrapper,
-            format!(
-                "#!/bin/sh\necho \"$* after $(wc -l < \"$STUB/out\" | tr -d ' ')\" >> \"$STUB/git\"\n\
-                 exec '{}' \"$@\"\n",
-                real.display()
-            ),
-        )
-        .expect("wrapper");
+        fs::write(&wrapper, include_str!("fixtures/stubs/git.sh")).expect("wrapper");
         fs::set_permissions(&wrapper, fs::Permissions::from_mode(0o755)).expect("chmod");
     }
 
@@ -2301,11 +2244,7 @@ fn the_dffy_that_runs_the_plugin_writes_the_comments() {
     let f = Fixture::new();
     let decoy = f.path("stub/bin/dffy");
     fs::remove_file(&decoy).expect("remove");
-    fs::write(
-        &decoy,
-        "#!/bin/sh\necho 'not the dffy that ran the plugin' >&2\nexit 1\n",
-    )
-    .expect("decoy");
+    fs::write(&decoy, include_str!("fixtures/stubs/decoy-dffy.sh")).expect("decoy");
     fs::set_permissions(&decoy, fs::Permissions::from_mode(0o755)).expect("chmod");
     f.reply("PullRequest", Some(1), "pull_request_page_1.json");
     f.reply("PullRequest", Some(2), "pull_request_page_2.json");
@@ -2502,17 +2441,18 @@ fn a_comment_posted_during_an_import_stays_posted() {
         "path": "src/lib.rs", "text": "Posted meanwhile.", "author": "",
         "github_thread": "PRRT_racing", "github_resolved": false}}]);
     fs::write(
-        f.path("stub/gh/PullRequest.3.sh"),
-        format!(
-            "'{}' --comments '{}' comments apply <<'EOF'\n{posted}\nEOF\n",
-            f.real_dffy.display(),
-            f.comments_file().display()
-        ),
+        f.path("stub/gh/PullRequest.3.apply.json"),
+        posted.to_string(),
     )
     .expect("hook");
     f.reply("PullRequest", Some(3), "pull_request_page_1.json");
     f.reply("PullRequest", Some(4), "pull_request_page_2.json");
-    f.run(&["prepare", PR]).ok();
+    let path = std::env::var("PATH").unwrap_or_default();
+    let mut cmd = f.command(
+        &["prepare", PR],
+        &format!("{}:{path}", f.path("stub/bin").display()),
+    );
+    f.finish(cmd.env("STUB_COMMENTS", f.comments_file())).ok();
     assert_eq!(f.comment("github:PRRC_racing")["text"], "Posted meanwhile.");
 }
 

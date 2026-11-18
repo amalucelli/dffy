@@ -1124,26 +1124,24 @@ fn doctor_finds_the_review_plugin_on_path() {
     );
 }
 
-/// `dffy-review-test` in its own directory: `describe` prints
-/// `describe.json` from beside it and adds a line to `described`, so a
-/// test counts the runs; `doctor` reports one check.
+/// The test review plugin as `dffy-review-test` in its own directory:
+/// `describe` answers `answer` and adds a line to `described`, so a test
+/// counts the runs; `doctor` reports one check.
 fn describing_plugin(answer: &str) -> tempfile::TempDir {
     use std::os::unix::fs::PermissionsExt as _;
     let bin = tempfile::tempdir().expect("tempdir");
     let plugin = bin.path().join("dffy-review-test");
+    std::fs::write(&plugin, include_str!("fixtures/stubs/review-plugin.sh")).expect("write");
+    std::fs::set_permissions(&plugin, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    std::fs::write(bin.path().join("describe.out"), answer).expect("write");
     std::fs::write(
-        &plugin,
-        "#!/bin/sh\n\
-         d=$(dirname \"$0\")\n\
-         case \"$1\" in\n\
-         describe) echo run >> \"$d/described\"; cat \"$d/describe.json\" ;;\n\
-         doctor) echo '{\"version\":1,\"checks\":[{\"name\":\"thing\",\"ok\":false,\"detail\":\"not set up\"}]}' ;;\n\
-         *) exit 2 ;;\n\
-         esac\n",
+        bin.path().join("doctor.out"),
+        concat!(
+            r#"{"version":1,"checks":[{"name":"thing","ok":false,"detail":"not set up"}]}"#,
+            "\n"
+        ),
     )
     .expect("write");
-    std::fs::set_permissions(&plugin, std::fs::Permissions::from_mode(0o755)).expect("chmod");
-    std::fs::write(bin.path().join("describe.json"), answer).expect("write");
     bin
 }
 

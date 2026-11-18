@@ -48,7 +48,7 @@ On a terminal, dffy opens a viewer showing one file at a time; when its output i
   - On a file in the tree: copy its path (`Y`) or its absolute path (the `copy_absolute_path` action, with no key by default), open it in the editor (`e`), mark it viewed or not (`v`), comment on the whole file (`C`), show only files with comments or every file (`c`).
   - On a line of code: comment on it, or on the selection (`c`); copy it (`v` then `y`) or the selection (`y`); open the editor at it (`e`).
   - On a `⋯` separator: reveal more of the lines it hides (`x`, on that separator rather than the highlighted one).
-  - On a thread: reply (`r`); edit or delete your last draft in it (`e`, `d`, which asks for a second `d`); resolve or reopen it (`x`); fold or unfold it (`z`); open it on its host (`o`) when it has a link.
+  - On a thread: reply (`r`); edit or delete your last draft in it (`e`, `d`, which asks for a second `d`); resolve or reopen it (`x`); fold or unfold it (`z`); open it on its host (`o`) when it has a link; copy the comment right-clicked as written (`copy_comment`), or the whole thread, each comment under a line of its author and date (`copy_thread`), neither with a key by default.
   - `j`/`k` or the arrows move, `enter` or a tap runs an entry, and `esc` or a tap outside closes it. A right click elsewhere opens the menu there instead.
 - **File tree (`t`):** the left panel, unless it shows the comments (`i`). Folders collapse, single-child folder chains show as one row, and each file has its status letter and line counts. `enter`/`l` opens, `h` collapses, `u` goes to the parent folder, `v` marks a file viewed (dimmed), and `+`/`-` resize. The tree follows the diff as you move between files.
 
@@ -72,6 +72,9 @@ On a terminal, dffy opens a viewer showing one file at a time; when its output i
 ## Selection and copy
 
 - **Mouse:** drag over code to select it, by characters, on one side of a split. It's copied when you let go, and `y` copies it again. A double click selects a word, a triple click the line, and a drag over line numbers whole lines.
+- **In a comment:** a drag over a comment's text selects it by characters, within that comment wherever the pointer goes; a double click selects a word, a triple click the whole comment. It's copied when you let go, and `y` copies it again; any other key ends it, as do a click and a change to the comments. A click without a drag still only focuses the thread, and one on its top line folds it.
+  - What's copied is the Markdown the text was drawn from, as written between the selection's ends: a selection over `two blockers` in **two blockers** copies `**two blockers**`, and part of it, `two`. An element whose whole text the selection holds comes with its markup: bold, italic, struck text, a link, `` `code` ``, a heading (`## …`), a list item (`- [x] …`), a quote, a fenced code block, a table. A double click's word comes without it, and a triple click copies the comment as written, its HTML comments too.
+  - What's drawn other than as written copies as its source: an entity as `&amp;` rather than `&`, and an image's `[image: …]` label as the whole image.
 - **Keyboard:** `v` starts a selection at the top line, `j`/`k` extend it, `s` picks the side of a split, and `y` copies.
 - Copies hold the code only, unless `copy-decorations = true`.
 - Copies go through the terminal (OSC 52), so they work over SSH. Under tmux that needs `set -g set-clipboard on`, which `dffy doctor` checks.
@@ -79,21 +82,36 @@ On a terminal, dffy opens a viewer showing one file at a time; when its output i
 
 [troubleshooting.md](troubleshooting.md#copying-clipboard-and-osc-52) covers terminals that block copies.
 
+## Program status
+
+dffy tells the terminal what it's doing with the [Program Status Protocol](https://superlogical.com/rex/docs/build/program-status) (OSC 7501), so a terminal that supports it, such as Rex, can show it on a tab you aren't looking at. Terminals without support ignore it.
+
+- **working** while the changes are listed and while the review plugin fetches, updates or posts, with how far it got when the plugin counts it.
+- **blocked** when a post left comments out and dffy asks whether to send the review without them.
+- **done** once a review is posted, and **error** when listing, refreshing or a plugin run fails, until you press a key or click.
+- **idle** otherwise. Quitting clears the status.
+
+tmux drops these reports, so inside tmux the terminal doesn't see them.
+
+The window title, which most terminals show on the tab, names the working tree's directory and what dffy shows, such as `dffy · api · PR #7` or `dffy · api · uncommitted`. Quitting puts the previous title back on terminals that keep a title stack.
+
 ## Comments
 
 Review comments live in a comments file ([comments.md](comments.md)): `--comments <file>`, or by default `dffy/comments.json` in the repository's git directory. A piped diff has none.
 
 ### Reading
 
-- **Threads** show in a box right under the last line they're on, in the code's column. The top border carries the first comment's author (`you` for your own), how long ago it was written, and, on a [review from a code host](#code-host-reviews), `draft` for yours until it's posted or `not posted` for someone else's, such as an agent's; each reply follows a blank row, under a line of its own carrying the same for it. Authors are bold. Long comments wrap. Threads under the same line are a blank row apart. The box is drawn in light lines, with round corners in the `warn` style while the thread holds a draft and isn't resolved, heavy while it has the focus (in the `warn` style when it holds a draft).
+- **Threads** show in a box right under the last line they're on, in the code's column. The top border carries the first comment's author (`you` for your own), how long ago it was written, and, on a [review from a code host](#code-host-reviews), `draft` for yours until it's posted or `not posted` for someone else's, such as an agent's; each reply follows a blank row, under a line of its own carrying the same for it. Authors are bold. Threads under the same line are a blank row apart. The box is drawn in light lines, with round corners in the `warn` style while the thread holds a draft and isn't resolved, heavy while it has the focus (in the `warn` style when it holds a draft).
+- **Markdown:** comments show the way code hosts draw them, within the box: headings bold (the first two levels in the keyword color), **bold**, _italic_, struck text dimmed, `code` and links (underlined) in the colors of a rendered Markdown file ([plugins.md](plugins.md)); lists with `•` or their numbers, nested ones indented, and task lists as `☐` and `☑`; quotes behind a `│`, rules as a line, tables in box characters. A line break stays one, and long lines wrap to the box. Fenced code is indented, highlighted in the language its fence names when highlighting is on; its lines and a table's rows too wide for the box are cut with `…`. HTML comments, where bots keep their state, don't show; other HTML shows dimmed, as written. Links only underline: `o` opens the thread, not a link in it.
 - **Drafts** exist only on a review from a code host: your comments there without a `ref`, which `P` posts. In a local review nothing is posted, so nothing is a draft. A comment by someone else without a `ref` is never posted under your name: it shows `not posted` and stays out of the counts.
 - **The thread's state** follows its first comment's author and age: `resolved`, and `outdated` when the host marks the thread outdated. A suggested change shows as the lines it replaces (`-`) and its own (`+`).
 - **Comments on a whole file** sit under the file's first row, marked `on the file`.
 - **Comments whose lines weren't found** sit under the file's last row, marked with the lines they were on: `line 145 not found`, `old lines 140–141 not found` on the old side. The top of the box shows that code as it was, with its line numbers: the commented lines, highlighted in the file's language when highlighting is on, between up to two lines of dimmed context. A commented line's sign is its side's (`+` new, `-` old), or blank when dffy recorded it unchanged; a host's threads record one side only, so theirs always carry the side's sign. Long lines are cut with `…`, as a suggestion's are, whether or not code wraps.
 - **Split view:** a thread takes its side's half.
 - **Marks:** a commented line keeps a mark after its line numbers, on its side of a split: `◆` a thread with a draft in it, `●` open, `○` resolved. The tree shows each file's comment count beside its line counts, in the color of its most pressing thread.
-- **Folded threads** take one row between the box's sides, in its lines, tinted with the `selection-inactive` background (`selection`'s while it has the focus) so it stands out from the code: `▸ author · age · state · first line`, then `2 replies` at its right end when it has any. Resolved threads start folded, and so do outdated ones without a comment not posted in them; the rest start whole.
+- **Folded threads** take one row between the box's sides, in its lines, tinted with the `selection-inactive` background (`selection`'s while it has the focus) so it stands out from the code: `▸ author · age · state · first line`, the first line of text the comment renders to (past its HTML comments, without styles), then `2 replies` at its right end when it has any. Resolved threads start folded, and so do outdated ones without a comment not posted in them; the rest start whole.
 - **`z`** folds the focused thread, or the first on screen, and unfolds it. A tap on a thread's top line (`▾` or `▸`) does the same for that thread. **`Z`** folds every thread, or unfolds them all. A thread you're replying in or editing shows whole.
+- **Copying:** a drag over a comment's text, or a double or triple click on it, copies its Markdown ([Selection and copy](#selection-and-copy)); not while you're writing in its thread. The menu on a thread copies the comment right-clicked, or the whole thread as text: each comment under a line like `ana · 2026-11-17`, its author (`you` for your own) and the day it was written, a blank line apart. With keys bound to `copy_comment` and `copy_thread`, they act on the focused thread: its comment last clicked, else its first.
 
 ### Finding
 
@@ -101,7 +119,7 @@ Review comments live in a comments file ([comments.md](comments.md)): `--comment
 - **The status bar** counts the comments file's threads and, on a review from a code host, its drafts, with the local drafts shown there: `18 threads · 2 drafts`.
 - **`c` in the tree** (or `C` in the command panel) keeps only the files with comments; `f`/`F` and `n`/`N` keep to them, and `esc` in the tree shows every file again.
 - **`i`** turns the left panel to every thread by file, including those on files not in this diff, and gives it the keys; `i` again shows the files. It opens the panel when it's hidden, and its title says which it shows: `Comments · 12 threads · 1 open`.
-  - **Rows:** each file has a header (its folder dimmed, its name bold, how many threads, dimmed, at the right end), then a row per thread: the gutter's mark (`◆` your draft, `●` open, `○` resolved), the line (`:183`) in the `line-number` style, the first line of its first comment, and its replies at the right end (`↩3`, nothing without any). The author shows, bold, before the text, on a file's first row and where it changes. One word shows when it matters: `moved`, in the `warn` style dimmed, for a thread whose lines weren't found, `local` for a local draft, `not posted` for someone else's comment not posted. A resolved thread's row is dimmed but for its line, its `moved` and its author's bold. A narrow panel leaves out the line, then the replies.
+  - **Rows:** each file has a header (its folder dimmed, its name bold, how many threads, dimmed, at the right end), then a row per thread: the gutter's mark (`◆` your draft, `●` open, `○` resolved), the line (`:183`) in the `line-number` style, the first line of text its first comment renders to, and its replies at the right end (`↩3`, nothing without any). The author shows, bold, before the text, on a file's first row and where it changes. One word shows when it matters: `moved`, in the `warn` style dimmed, for a thread whose lines weren't found, `local` for a local draft, `not posted` for someone else's comment not posted. A resolved thread's row is dimmed but for its line, its `moved` and its author's bold. A narrow panel leaves out the line, then the replies.
   - **Order:** files in the tree's order, then those not in this diff (marked `not in this diff`). In a file, threads with a draft in them come first, then open, outdated and resolved ones.
   - **Following:** `j`/`k`, the arrows, the page keys, `g`/`G`, the wheel and a tap go from thread to thread, over the headers, and the diff follows: it opens the thread's file and shows the thread there, focused, as `m` does. The thread in the diff is the preview: a folded one shows whole while it's selected, and folds again once the selection moves on, `m`/`M` or a tap focus another thread, or the panel closes. `z` on it keeps what it sets, as on any thread, and so does replying in it. The keys stay in the panel. `m`/`M` or a tap on a thread in the diff move the selection too.
   - **`enter` or `tab`** gives the diff the keys, on the focused thread, where `r`, `x`, `e`, `d` and `o` act on it. `tab` comes back to the comments; `esc` in the panel gives the diff the keys too, as it does from the tree.
@@ -170,6 +188,15 @@ The command and the words are the plugin's: it names its command, what it review
 
   Afterwards the status bar keeps saying how it ended: `review sent` (with its link for a moment), `approved · 2 comments not posted`, `review still pending · 2 not posted` in the plugin's words for an event held back, or `nothing posted`. The plugin's notice, when its post leaves one, shows over it.
 - **Quitting** stops the plugin, with anything it started.
+
+### Conversation
+
+A review's [general comments](comments.md#general-comments), those on the review rather than a file, show on its **Conversation**: dffy-review-github brings a pull request's description, the comments in its conversation and the summaries submitted with reviews.
+
+- **Where:** first in the tree, above the files, as `≡ Conversation` with how many comments it has, and first in the comments panel (`i`), as a group of its own. It's there in a review session that has general comments, and only then; a local review has none. The diff still opens on the first file; the previous file from there (`F`, `[`) is the Conversation.
+- **The page:** the review's title, then the description, then the other comments by when they were written, each in a box like a thread's: the author in bold, how long ago, its kind (`description`, `review`) and the plugin's label, such as a review's `approved`. Text shows as [Markdown](#reading), as in a thread. It scrolls like a file; `/` doesn't search it.
+- **Keys:** `m` and `M` step through its comments while it shows, and go from file to file past it: they go between threads on code, which these aren't. `o` opens a comment on its host, and is all the right-click menu offers there. It's read-only for now: `r`, `x`, `C` and "Continue in editor" say so, and nothing is folded.
+- **Counts:** the status bar's and the panel title's counts are threads, without the general comments; the tree's row counts those.
 
 ## Layout
 

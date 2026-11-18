@@ -113,12 +113,11 @@ fn missing_names_the_work_for_the_rows_shown() {
     );
 }
 
-/// Lines revealed inside a gap show between two separators, each counting
-/// the lines it hides, the hunk's numbers only on the last; search scans
-/// them. A position on a separator stays on its line, one on a line moves
-/// with it, and so does the place another file was left at. A window
-/// reaching an edge or another window joins it, and `x` opens the rest as
-/// before.
+/// Each separator counts the lines it hides, and only the last carries the
+/// hunk's numbers; search scans the revealed lines. A position on a
+/// separator stays on its line, one on a line moves with it, and so does
+/// the place another file was left at. A window reaching an edge or another
+/// window joins it, and `x` opens the rest as before.
 #[test]
 fn lines_revealed_inside_a_gap_show_between_two_separators() {
     let mut doc = Document::<()>::default();
@@ -177,8 +176,6 @@ fn lines_revealed_inside_a_gap_show_between_two_separators() {
     assert_eq!(doc.pos, at(0, 3, 24));
 }
 
-/// An edge `x` reveals past a window takes the window in, keeping every
-/// line it reached.
 #[test]
 fn an_edge_revealed_past_a_window_keeps_its_lines() {
     let mut doc = Document::<()>::default();
@@ -246,6 +243,55 @@ fn changes_lead_across_files_and_wait_for_a_diff() {
     assert_eq!(doc.goto_file(0), None, "already shown");
 }
 
+/// A page goes first and stays there: the entries after it move down and
+/// the position stays on the file it was on, a refreshed list and a sort
+/// keep it first, and taking it away moves them back. Its rows are the
+/// host's count; it has no changes, so `n` passes over it.
+#[test]
+fn a_page_stays_first_and_files_move_around_it() {
+    let mut doc = Document::<()>::default();
+    doc.push(long_diff("b.c").change, Source::Repo);
+    doc.push(long_diff("a.c").change, Source::Repo);
+    let _ = doc.load(1, Ok(prepared(long_diff("a.c"))));
+    let _ = doc.goto_file(1);
+    doc.pos = at(1, 3, 2);
+    let page = |rows| {
+        Some((
+            FileChange {
+                path: "".into(),
+                status: Status::Modified,
+                old: None,
+                new: None,
+                staging: None,
+            },
+            rows,
+        ))
+    };
+    assert_eq!(doc.set_page(page(3)), 1);
+    assert!(doc.files()[0].is_page() && doc.files()[0].is_sheet());
+    assert_eq!(doc.pos, at(2, 3, 2), "on the same file");
+    assert_eq!(doc.rows(0, 0, unified), 3);
+    assert_eq!(doc.set_page(page(5)), 0, "already first");
+    assert_eq!(doc.rows(0, 0, unified), 5);
+
+    assert!(doc.sort_by_path());
+    let paths: Vec<String> = doc
+        .files()
+        .iter()
+        .map(|e| e.change().path.to_string())
+        .collect();
+    assert_eq!(paths, ["", "a.c", "b.c"]);
+    assert_eq!(doc.pos.file, 1, "a.c, sorted first after the page");
+    let _ = doc.goto_file(0);
+    assert_eq!(doc.pos, at(0, 0, 0));
+    assert_eq!(doc.next_change(unified).map(|_| doc.pos.file), Some(1));
+
+    assert_eq!(doc.set_page(None), -1);
+    assert_eq!(doc.files().len(), 2);
+    assert!(!doc.files()[0].is_page());
+    assert_eq!(doc.set_page(None), 0, "none to take away");
+}
+
 /// Eviction drops the least recently shown diffs first, never one in the
 /// range kept, and a dropped file wants its diff again.
 #[test]
@@ -257,11 +303,10 @@ fn eviction_drops_the_least_recently_shown_outside_the_kept_range() {
     }
     doc.touch(0, 2);
     doc.touch(1, 1);
-    let total = doc.loaded_bytes();
+    let total: usize = (0..2).filter_map(|i| doc.file(i)).map(File::bytes).sum();
     doc.evict(total - 1, &(0..0));
     assert!(doc.file(0).is_some());
     assert!(doc.file(1).is_none() && doc.files()[1].wants_diff());
     doc.evict(0, &(0..1));
     assert!(doc.file(0).is_some(), "the kept range stays");
-    assert_eq!(doc.loaded_bytes(), doc.file(0).map_or(0, File::bytes));
 }

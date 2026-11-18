@@ -61,20 +61,23 @@ enum Kind {
         children: Vec<usize>,
         open: bool,
     },
+    /// The review's conversation, the document's page: the first row,
+    /// outside the root's children, which keep git's order.
+    Page(usize),
 }
 
 impl Node {
     fn children(&self) -> &[usize] {
         match &self.kind {
             Kind::Dir { children, .. } | Kind::Commit { children, .. } => children,
-            Kind::File(_) => &[],
+            Kind::File(_) | Kind::Page(_) => &[],
         }
     }
 
     fn children_mut(&mut self) -> Option<&mut Vec<usize>> {
         match &mut self.kind {
             Kind::Dir { children, .. } | Kind::Commit { children, .. } => Some(children),
-            Kind::File(_) => None,
+            Kind::File(_) | Kind::Page(_) => None,
         }
     }
 
@@ -236,6 +239,8 @@ pub(super) struct Tree {
     /// The paths with comments, while the tree keeps only those, along
     /// with what the filter keeps.
     commented: Option<HashSet<BString>>,
+    /// The page's node, shown first.
+    page: Option<usize>,
 }
 
 impl Default for Tree {
@@ -263,6 +268,7 @@ impl Default for Tree {
             editing: false,
             hits: Vec::new(),
             commented: None,
+            page: None,
         }
     }
 }
@@ -366,7 +372,18 @@ impl Tree {
             ..Self::default()
         };
         for (i, e) in files.iter().enumerate() {
-            if e.is_commit() {
+            if e.is_page() {
+                self.page = Some(self.nodes.len());
+                self.nodes.push(Node {
+                    name: Box::default(),
+                    parent: ROOT,
+                    kind: Kind::Page(i),
+                });
+                if self.leaves.len() <= i {
+                    self.leaves.resize(i + 1, ROOT);
+                }
+                self.leaves[i] = self.nodes.len() - 1;
+            } else if e.is_commit() {
                 self.insert_commit(i, &e.change().path);
             } else {
                 self.insert(i, &e.change().path);
@@ -384,6 +401,17 @@ impl Tree {
         self.rows.clear();
         self.file_rows.clear();
         self.file_rows.resize(self.leaves.len(), None);
+        // A filter typed is for paths, which the page hasn't.
+        if let Some(node) = self.page.filter(|_| self.filter.is_empty())
+            && let Kind::Page(entry) = self.nodes[node].kind
+        {
+            self.file_rows[entry] = Some(0);
+            self.rows.push(Row {
+                node,
+                top: node,
+                depth: 0,
+            });
+        }
         let keep = self.filtered().then(|| self.matches());
         self.flatten(ROOT, 0, keep.as_deref());
         if let Some(node) = self.selected_node {
@@ -446,13 +474,10 @@ impl Tree {
         &self.filter
     }
 
-    /// Whether the tree keeps only some files: by the filter, or those
-    /// with comments.
     fn filtered(&self) -> bool {
         !self.filter.is_empty() || self.commented.is_some()
     }
 
-    /// Whether it keeps only the files with comments.
     pub(super) fn commented(&self) -> bool {
         self.commented.is_some()
     }
@@ -545,6 +570,7 @@ impl Tree {
                         self.hide(bottom, row);
                     }
                 }
+                Kind::Page(_) => {}
             }
         }
     }
@@ -558,6 +584,7 @@ impl Tree {
                 Kind::Dir { children, .. } | Kind::Commit { children, .. } => {
                     stack.extend(children);
                 }
+                Kind::Page(_) => {}
             }
         }
     }
@@ -600,7 +627,7 @@ impl Tree {
             .iter()
             .filter_map(|r| match self.nodes[r.node].kind {
                 Kind::File(file) => Some(file),
-                Kind::Dir { .. } | Kind::Commit { .. } => None,
+                Kind::Dir { .. } | Kind::Commit { .. } | Kind::Page(_) => None,
             })
     }
 
@@ -627,7 +654,7 @@ impl Tree {
     pub(super) fn item(&self) -> Option<Item> {
         let row = self.rows.get(self.selected)?;
         Some(match self.nodes[row.node].kind {
-            Kind::File(file) => Item::File(file),
+            Kind::File(file) | Kind::Page(file) => Item::File(file),
             Kind::Dir { open, .. } => Item::Dir { open },
             Kind::Commit { entry, open, .. } => Item::Commit { file: entry, open },
         })
@@ -808,8 +835,9 @@ impl Tree {
                 (format!(" -{}", totals.removed), Role::Removed),
             ]
         };
-        let typing =
-            (self.editing).then_some((self.filter.as_str(), "type to filter · esc clear "));
+        let typing = self
+            .editing
+            .then_some((self.filter.as_str(), "type to filter · esc clear "));
         frame(grid, place, &parts, typing, (focused, joined), theme);
     }
 
@@ -850,6 +878,15 @@ impl Tree {
         let indent = (row.depth * 2).min(inner / 2);
         let x = 2 + indent;
         match self.nodes[row.node].kind {
+            Kind::Page(_) => {
+                let x = grid.put_str(x, line, end, "≡ ", style(Role::Dim, false));
+                let count = comments.map_or(0, Comments::conversation_len).to_string();
+                let at = end.saturating_sub(count.width() + 1);
+                grid.put_str(x, line, at, "Conversation", named(Role::Plain, false));
+                if at > x {
+                    grid.put_str(at, line, end, &count, style(Role::Hint, false));
+                }
+            }
             Kind::Dir { open, .. } => {
                 let x = grid.put_str(
                     x,

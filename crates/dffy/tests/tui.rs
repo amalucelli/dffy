@@ -448,8 +448,6 @@ fn a_comment_is_written_in_a_box_and_saved() {
     assert!(term.wait_exit().success());
 }
 
-/// `ctrl+g` hands the box's text to the editor, on a file of its own, and
-/// saves what's written there.
 #[test]
 fn ctrl_g_continues_a_comment_in_the_editor() {
     let repo = repo();
@@ -568,7 +566,7 @@ impl Pull {
              d=$(dirname \"$0\")\n\
              [ \"$1\" = describe ] || \
              { echo \"$*\"; pwd -P; ( : < /dev/tty ) 2>/dev/null && echo tty || echo notty; \
-               echo \"protocol=$DFFY_REVIEW_PROTOCOL comments=$DFFY_COMMENTS\"; } >> \"$d/calls\"\n\
+               echo \"protocol=$DFFY_REVIEW_PROTOCOL comments=$DFFY_COMMENTS dffy=$DFFY\"; } >> \"$d/calls\"\n\
              . \"$d/$1.sh\"\n",
         )
         .expect("write plugin");
@@ -604,7 +602,6 @@ impl Pull {
         )
     }
 
-    /// What `verb` does, as shell.
     fn verb(&self, verb: &str, script: &str) {
         std::fs::write(self.stub.path().join(format!("{verb}.sh")), script).expect("write");
     }
@@ -662,7 +659,42 @@ fn dffy_pr_opens_the_pr_once_prepare_names_its_commits() {
         lines[..3],
         ["prepare 7", root.to_str().expect("utf-8"), "notty"]
     );
-    assert_eq!(lines[3], "protocol=1 comments=");
+    assert_eq!(
+        lines[3],
+        format!("protocol=1 comments= dffy={}", env!("CARGO_BIN_EXE_dffy"))
+    );
+    term.send("q");
+    assert!(term.wait_exit().success());
+}
+
+/// A PR's general comments, such as its description, show as a
+/// Conversation first in the tree, while the diff opens on the first file
+/// as before; the previous file from there is the Conversation, which
+/// shows the comments.
+#[test]
+fn a_prs_general_comments_show_as_its_conversation() {
+    let pull = Pull::new();
+    std::fs::write(
+        pull.comments(),
+        r#"{"version":1,"comments":[
+{"id":"c1","path":"README.md","text":"Nice README","author":"octocat","ref":"github:1","created":"2026-11-17T10:00:00Z"},
+{"id":"d1","text":"Spells it out.","author":"octocat","ref":"github:PR_1","created":"2026-11-16T10:00:00Z","kind":"description"}
+]}"#,
+    )
+    .expect("write");
+    pull.verb(
+        "prepare",
+        &format!("echo '{}'\nsleep 30\n", pull.session(7, &pull.head)),
+    );
+    let mut term = pull.spawn(&["pr", "7"]);
+    term.wait_for("the PR's diff", |t| t.contains("From the PR."));
+    term.wait_for("the conversation in the tree", |t| {
+        t.contains("≡ Conversation")
+    });
+    term.send("F");
+    term.wait_for("the conversation", |t| {
+        t.contains("Spells it out.") && t.contains("description")
+    });
     term.send("q");
     assert!(term.wait_exit().success());
 }
@@ -755,8 +787,6 @@ fn plain_dffy_attaches_the_branchs_pr() {
     assert!(term.wait_exit().success());
 }
 
-/// A review plugin that doesn't describe itself isn't asked for the
-/// branch's review either.
 #[test]
 fn plain_dffy_asks_only_a_described_plugin_for_the_branchs_review() {
     let pull = Pull::new();
@@ -967,8 +997,27 @@ fn a_picked_pr_updates_in_place_and_posts() {
     term.send("s");
     term.send("Looks good");
     term.send("\x1b");
+    let posting = term.output().len();
     term.send("\r");
     term.wait_for("the post", |t| t.status().contains("review sent"));
+    // Posting review · PR #11, then Review sent · PR #11, until a key says
+    // it's been seen.
+    assert!(sent(&term, posting, b"\x1b]7501;state=working:app=dffy:"));
+    assert!(sent(
+        &term,
+        posting,
+        b"msg=UG9zdGluZyByZXZpZXcgwrcgUFIgIzEx\x1b\\"
+    ));
+    term.wait_for("done", |t| {
+        sent(
+            t,
+            posting,
+            b"\x1b]7501;state=done:app=dffy:msg=UmV2aWV3IHNlbnQgwrcgUFIgIzEx\x1b\\",
+        )
+    });
+    let seen = term.output().len();
+    term.send("j");
+    assert!(sent(&term, seen, b"\x1b]7501;state=idle:app=dffy\x1b\\"));
     let args = std::fs::read_to_string(summary.with_extension("args")).expect("args");
     assert!(
         args.starts_with("post 11 --event comment --summary-file "),
@@ -995,7 +1044,10 @@ fn posting_checks_first_and_asks_when_a_comment_is_refused() {
     .expect("write");
     pull.verb(
         "prepare",
-        &format!("echo '{}'\nsleep 30\n", pull.session(7, &pull.head)),
+        &format!(
+            "echo '{}'\necho '{{\"version\":1,\"progress\":\"100/312\"}}'\nsleep 30\n",
+            pull.session(7, &pull.head)
+        ),
     );
     let skipped = r#"{"version":1,"draft":{"id":"c1","path":"README.md","plan":"skip","reason":"file not in the PR"}}"#;
     let refused = r#"{"version":1,"draft":{"id":"c2","path":"README.md","plan":"skip","reason":"Line could not be resolved"}}"#;
@@ -1014,6 +1066,14 @@ fn posting_checks_first_and_asks_when_a_comment_is_refused() {
     );
     let mut term = pull.spawn(&["pr", "7"]);
     term.wait_for("the PR's diff", |t| t.contains("From the PR."));
+    // 100 of 312 threads: Fetching threads · PR #7, a third done.
+    term.wait_for("the progress", |t| {
+        sent(
+            t,
+            0,
+            b"\x1b]7501;state=working:app=dffy:progress=32:msg=RmV0Y2hpbmcgdGhyZWFkcyDCtyBQUiAjNw==\x1b\\",
+        )
+    });
     term.send("P");
     term.wait_for("the counts", |t| {
         t.contains("2 comments · 1 as a file comment")
@@ -1027,6 +1087,12 @@ fn posting_checks_first_and_asks_when_a_comment_is_refused() {
     term.send("a");
     term.send("\r");
     term.wait_for("the prompt", |t| t.contains("2 comments weren't posted"));
+    // 2 comments weren't posted · approve without them?
+    assert!(sent(
+        &term,
+        0,
+        b"\x1b]7501;state=blocked:kind=permission:app=dffy:msg=MiBjb21tZW50cyB3ZXJlbid0IHBvc3RlZCDCtyBhcHByb3ZlIHdpdGhvdXQgdGhlbT8=\x1b\\"
+    ));
     assert!(
         term.contains("Line could not be resolved"),
         "{}",
@@ -1684,6 +1750,49 @@ fn v_j_y_copies_the_selected_code_through_osc_52() {
     assert!(term.row(1).contains("▌ line 3"), "{}", term.row(1));
     term.send("q");
     assert!(term.wait_exit().success());
+}
+
+/// The terminal is told dffy's status as a program (OSC 7501): idle once
+/// the changes are listed, and nothing left behind once it quits.
+#[test]
+fn the_terminal_hears_dffys_status_until_it_quits() {
+    let repo = repo();
+    let mut term = Term::spawn(repo.path(), 100, 20, &[]);
+    term.wait_for("the diffs", |t| t.contains(" +3 -3"));
+    term.wait_for("idle", |t| {
+        sent(t, 0, b"\x1b]7501;state=idle:app=dffy\x1b\\")
+    });
+    // The tab is named for what's shown, the shell's title kept to put back.
+    assert!(sent(&term, 0, b"\x1b[22;2t"));
+    let name = repo.path().file_name().expect("name").to_string_lossy();
+    let title = format!("\x1b]2;dffy · {name} · uncommitted\x1b\\");
+    assert!(sent(&term, 0, title.as_bytes()));
+    let before = term.output().len();
+    term.send("q");
+    assert!(term.wait_exit().success());
+    assert!(sent(&term, before, b"\x1b]7501;state=clear\x1b\\"));
+    assert!(sent(&term, before, b"\x1b[23;2t"));
+}
+
+/// A piped diff is read only as far as the viewer goes, or its input may
+/// never end: dffy is idle while it waits, not working.
+#[test]
+fn a_piped_diff_still_being_read_is_idle() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    // The last file isn't known to be whole until the input ends.
+    std::fs::write(dir.path().join("in.diff"), many_files_diff(3)).expect("write");
+    let mut term = Term::spawn_sh(
+        dir.path(),
+        100,
+        20,
+        "{ cat in.diff; sleep 30; } | \"$DFFY\" --paging=always",
+    );
+    term.wait_for("the diff", |t| t.contains("new 0"));
+    term.wait_for("idle", |t| {
+        sent(t, 0, b"\x1b]7501;state=idle:app=dffy\x1b\\")
+    });
+    assert!(!sent(&term, 0, b"\x1b]7501;state=working"));
+    term.send("q");
 }
 
 /// The screen cell (0-based column, row) where `text` starts on a row

@@ -3,9 +3,6 @@
 //! shortcut layer, so nothing lives only here: each entry is something a
 //! key does there, shown with that key, and choosing it does what the key
 //! would. The viewer aims at the target first, as a left click would.
-//!
-//! `j`/`k` or the arrows move, `enter` or a tap runs an entry, `esc` or a
-//! tap outside closes it.
 
 use dffy_core::document::Pos;
 use dffy_core::view::Attributes;
@@ -16,7 +13,6 @@ use crate::keys::Action as Act;
 use crate::term::{Grid, Key, Mods};
 use crate::theme::{Role, Style, Theme};
 
-/// What an entry does: what its key does.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum Run {
     /// The action, as its key runs it in the pane aimed at.
@@ -73,7 +69,6 @@ impl Menu {
             Key::Esc => return Outcome::Close,
             Key::Char('c') if mods.contains(Mods::CTRL) => return Outcome::Close,
             Key::Enter => return Outcome::Run(self.entries[self.cursor].run),
-            // Past either end, the cursor goes round.
             Key::Down | Key::Char('j') => self.cursor = (self.cursor + 1) % len,
             Key::Up | Key::Char('k') => self.cursor = (self.cursor + len - 1) % len,
             _ => {}
@@ -97,13 +92,10 @@ impl Menu {
         }
     }
 
-    /// The widest label and key.
     fn widths(&self) -> (usize, usize) {
-        let widest = |f: fn(&Entry) -> &str| self.entries.iter().map(|e| f(e).width()).max();
-        (
-            widest(|e| &e.label).unwrap_or(0),
-            widest(|e| &e.key).unwrap_or(0),
-        )
+        let widest =
+            |f: fn(&Entry) -> &str| self.entries.iter().map(|e| f(e).width()).max().unwrap_or(0);
+        (widest(|e| &e.label), widest(|e| &e.key))
     }
 
     /// Where it's drawn on a `(width, height)` screen: its corner, width
@@ -141,7 +133,7 @@ impl Menu {
                 grid.fill(x0 + 1, y, x0 + width - 1, label);
                 label.attributes |= Attributes::BOLD;
             }
-            grid.put_str(x, y, key_x.saturating_sub(1), &e.label, label);
+            grid.put_str(x, y, key_x - 1, &e.label, label);
             grid.put_str(key_x, y, end, &e.key, mark(theme.style(Role::Hint)));
         }
     }

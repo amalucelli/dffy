@@ -1,8 +1,6 @@
-//! A multi-line text input drawn inside the diff, for writing comments:
-//! typing, pasting, deleting a character, a word or back to the line's
-//! start, and the cursor moving by character, by word, by wrapped row and
-//! to a row's ends. Rows wrap at spaces to
-//! the width they were last drawn at, which is what up and down move by.
+//! A multi-line text input drawn inside the diff, for writing comments.
+//! Rows wrap at spaces to the width they were last drawn at, which is what
+//! up and down move by.
 
 use std::ops::Range;
 
@@ -31,13 +29,9 @@ impl TextBox {
         &self.text
     }
 
-    /// Edits for `key`: characters, `enter` (a new line), `tab` (four
-    /// spaces), backspace, delete, the arrows, home and end. By word,
-    /// alt+backspace or ctrl+w deletes back, alt+delete or alt+d ahead, and
-    /// alt with the arrows, `b` or `f` moves; ctrl+u deletes back to the
-    /// line's start, ctrl+a is home and ctrl+e end. These are the readline
-    /// keys macOS terminals send for option and command. Other keys with
-    /// ctrl or alt do nothing.
+    /// Edits for `key`. Moves and deletes by word and to the line's start
+    /// take readline's keys, which macOS terminals send for option and
+    /// command. Other keys with ctrl or alt do nothing.
     pub(crate) fn key(&mut self, key: Key, mods: Mods) {
         match (key, mods) {
             (Key::Backspace, Mods::ALT) | (Key::Char('w'), Mods::CTRL) => {
@@ -183,7 +177,7 @@ impl TextBox {
             .map(|(i, r)| {
                 let text = self.text[r.start..trailing(&self.text, r)].to_owned();
                 let cursor = (i == at).then(|| {
-                    let before = &self.text[r.start..self.cursor.max(r.start)];
+                    let before = &self.text[r.start..self.cursor];
                     debug_assert_eq!(before.width(), column);
                     before.len()
                 });
@@ -232,7 +226,7 @@ impl TextBox {
     }
 }
 
-/// The text of `range` without its line's `\n`.
+/// Where `range` ends, before its line's `\n`.
 fn trailing(text: &str, range: &Range<usize>) -> usize {
     if text[range.clone()].ends_with('\n') {
         range.end - 1
@@ -277,9 +271,8 @@ fn locate(text: &str, rows: &[Range<usize>], cursor: usize) -> (usize, usize) {
     let row = rows
         .iter()
         .position(|r| cursor < r.end)
-        .unwrap_or_else(|| rows.len().saturating_sub(1));
-    let start = rows.get(row).map_or(0, |r| r.start);
-    (row, text[start..cursor].width())
+        .unwrap_or(rows.len() - 1);
+    (row, text[rows[row].start..cursor].width())
 }
 
 #[cfg(test)]
@@ -304,8 +297,8 @@ mod tests {
             .collect()
     }
 
-    /// Typing goes in at the cursor, `enter` starts a line, backspace and
-    /// delete take a character either side, and rows wrap at spaces.
+    /// `enter` starts a line, and backspace and delete take a character
+    /// either side.
     #[test]
     fn typing_wraps_and_edits_at_the_cursor() {
         let mut b = typed("one two three");
@@ -377,9 +370,8 @@ mod tests {
         }
     }
 
-    /// Ctrl+u takes the line back to its start, past the rows it wraps
-    /// into; ctrl+a goes to the row's start, like home, and ctrl+e to its
-    /// end, like end.
+    /// Ctrl+u clears past the rows the line wraps into; ctrl+a goes to the
+    /// row's start, like home, and ctrl+e to its end, like end.
     #[test]
     fn ctrl_u_clears_back_to_the_line_start() {
         let mut b = TextBox::new("top\none two three four");
@@ -395,8 +387,8 @@ mod tests {
         assert_eq!(shown(&mut b, 8), ["top", "our|"]);
     }
 
-    /// Up and down go by wrapped rows, keeping the column; home and end go
-    /// to the row's ends.
+    /// Up and down keep the column; home and end go to the wrapped row's
+    /// ends.
     #[test]
     fn the_cursor_moves_by_rows() {
         let mut b = TextBox::new("abcdefghij\nxy");
@@ -415,8 +407,8 @@ mod tests {
         assert_eq!(shown(&mut b, 4)[0], "|abcd");
     }
 
-    /// A paste goes in whole at the cursor, CRLF and CR as line ends, tabs
-    /// as spaces, other controls dropped; an empty box is one empty row.
+    /// CRLF and CR become line ends, tabs spaces, and other controls are
+    /// dropped; an empty box is one empty row.
     #[test]
     fn a_paste_goes_in_at_the_cursor() {
         let mut b = TextBox::default();

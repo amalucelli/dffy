@@ -1189,8 +1189,7 @@ fn the_review_command_is_the_one_the_plugin_describes() {
     assert!(doctor.contains("! review thing not set up"), "{doctor}");
 }
 
-/// `describe` runs once for the program as installed: its answer is
-/// cached until the program changes.
+/// `describe` runs once per installed version of the program.
 #[test]
 fn describe_is_cached_until_the_plugin_changes() {
     let repo = repo();

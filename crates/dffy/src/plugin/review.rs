@@ -216,7 +216,6 @@ fn review_events(events: &Value) -> Result<Vec<ReviewEvent>, String> {
     Ok(out)
 }
 
-/// A review plugin that describes itself.
 #[derive(Debug, Clone)]
 pub(crate) struct Described {
     pub program: Program,
@@ -289,11 +288,13 @@ pub(crate) fn doctor(program: &Program) -> Result<Vec<Check>, String> {
 /// way the other verbs run: detached from the terminal, with stdin closed.
 /// Returns what it printed.
 fn ask(program: &Program, verb: &str, timeout: Duration) -> Result<Vec<u8>, String> {
-    let mut command = Command::new(std::env::current_exe().map_err(|e| e.to_string())?);
+    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+    let mut command = Command::new(&exe);
     command
         .arg(DETACH)
         .arg(&program.path)
         .arg(verb)
+        .env("DFFY", exe)
         .env("DFFY_REVIEW_PROTOCOL", PROTOCOL.to_string())
         .env_remove("DFFY_COMMENTS");
     let (out, status) =
@@ -351,7 +352,6 @@ pub(crate) struct Session {
 }
 
 impl Session {
-    /// The id as shown.
     pub(crate) fn shown(&self) -> &str {
         self.label.as_deref().unwrap_or(&self.id)
     }
@@ -380,7 +380,6 @@ pub(crate) struct Listed {
 }
 
 impl Listed {
-    /// The id as shown.
     pub(crate) fn shown(&self) -> &str {
         self.label.as_deref().unwrap_or(&self.id)
     }
@@ -444,7 +443,6 @@ pub(crate) enum Said {
     Done(Result<(), String>),
 }
 
-/// A line the plugin printed.
 #[derive(Debug, PartialEq, Eq)]
 enum Line {
     Said(Said),
@@ -614,12 +612,14 @@ pub(crate) fn command(
     root: &Path,
     comments: Option<&Path>,
 ) -> io::Result<Command> {
-    let mut command = Command::new(std::env::current_exe()?);
+    let exe = std::env::current_exe()?;
+    let mut command = Command::new(&exe);
     command
         .arg(DETACH)
         .arg(program)
         .args(args)
         .current_dir(root)
+        .env("DFFY", exe)
         .env("DFFY_REVIEW_PROTOCOL", PROTOCOL.to_string());
     match comments {
         Some(path) => command.env("DFFY_COMMENTS", path),
@@ -628,7 +628,6 @@ pub(crate) fn command(
     Ok(command)
 }
 
-/// A run started by [`start`].
 #[derive(Debug)]
 pub(crate) struct Run {
     leader: Pid,
@@ -675,10 +674,10 @@ pub(crate) fn start(
         super::kill(&mut child);
         return Err(io::Error::other("no pipes"));
     };
-    let last_said = std::thread::Builder::new()
+    let last_said = match std::thread::Builder::new()
         .name("dffy-review-err".into())
-        .spawn(move || last_line(stderr));
-    let last_said = match last_said {
+        .spawn(move || last_line(stderr))
+    {
         Ok(thread) => thread,
         Err(e) => {
             super::kill(&mut child);

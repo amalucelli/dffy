@@ -55,8 +55,8 @@ struct Waker {
 // release both, which Core Foundation allows from any thread.
 unsafe impl Send for Waker {}
 
-/// The stop source's work: none, as handling it ends the run that
-/// [`run`] checks the stop flag after.
+/// Does nothing: handling the stop source ends the run, and [`run`]
+/// checks the stop flag after.
 unsafe extern "C-unwind" fn woken(_info: *mut c_void) {}
 
 impl Handle {
@@ -190,7 +190,7 @@ fn run(
     )]
     // SAFETY: `stream` is valid and not yet scheduled. It's scheduled on
     // this thread's run loop, which runs below until the handle asks to
-    // stop, and it's invalidated before the thread, which keeps its run
+    // stop, and it's invalidated before this thread, which keeps the run
     // loop alive, ends.
     unsafe {
         FSEventStreamScheduleWithRunLoop(stream, &run_loop, mode);
@@ -205,7 +205,6 @@ fn run(
         };
         ready.send(Ok(waker)).ok();
         while !stop.load(Ordering::Relaxed) {
-            // No timeout: the loop sleeps until an event or the stop source.
             CFRunLoop::run_in_mode(Some(mode), f64::MAX, true);
         }
         // SAFETY: `stream` was started on this thread.
@@ -269,8 +268,7 @@ mod tests {
     use super::super::excludes::Excludes;
     use super::*;
 
-    /// A stop asked right as the stream starts, before its loop waits,
-    /// still ends the thread: dropping the handle joins it.
+    /// Races the stop against the run loop starting to wait.
     #[test]
     fn dropping_the_handle_right_after_start_ends_the_stream() {
         let dir = tempfile::tempdir().expect("tempdir");

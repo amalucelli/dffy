@@ -1,0 +1,9 @@
+{"data":{"repository":{"pullRequest":{"id":"PR_kwDOAAAAB84AAAAH","title":"Spell out five","url":"https://github.com/acme/widgets/pull/7","body":"Spells out five.\r\n\r\nThe count was off by one.","createdAt":"2026-11-15T08:00:00Z","viewerDidAuthor":false,"author":{"login":"octocat"},"baseRefName":"main","baseRefOid":"@BASE@","headRefOid":"@HEAD@","headRefName":"five","isCrossRepository":false,"state":"OPEN","reviewThreads":{"totalCount":0,"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[]},
+"conversation":{"pageInfo":{"hasNextPage":true,"endCursor":"Y3Vyc29yOnYyOpHOAAC7uQ"},"nodes":[
+{"id":"IC_kwDOAAAAB84AAAC1","url":"https://github.com/acme/widgets/pull/7#issuecomment-3001","body":"Is this ready?","createdAt":"2026-11-16T08:00:00Z","viewerDidAuthor":false,"author":{"login":"hubot"}}
+]},
+"submitted":{"pageInfo":{"hasNextPage":false,"endCursor":"Y3Vyc29yOnYyOpO0MjAyNi0xMS0xNw"},"nodes":[
+{"id":"PRR_kwDOAAAAB84AAAA1","url":"https://github.com/acme/widgets/pull/7#pullrequestreview-1001","body":"Looks good.","state":"APPROVED","submittedAt":"2026-11-17T09:00:00Z","createdAt":"2026-11-17T08:50:00Z","viewerDidAuthor":false,"author":{"login":"hubot"}},
+{"id":"PRR_kwDOAAAAB84AAAA2","url":"https://github.com/acme/widgets/pull/7#pullrequestreview-1002","body":"","state":"COMMENTED","submittedAt":"2026-11-16T10:00:00Z","createdAt":"2026-11-16T09:55:00Z","viewerDidAuthor":false,"author":{"login":"octocat"}},
+{"id":"PRR_kwDOAAAAB84AAAA3","url":"https://github.com/acme/widgets/pull/7#pullrequestreview-1003","body":"Please spell out four too.","state":"CHANGES_REQUESTED","submittedAt":"2026-11-16T12:00:00Z","createdAt":"2026-11-16T11:00:00Z","viewerDidAuthor":true,"author":{"login":"ada"}}
+]}}}}}

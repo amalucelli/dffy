@@ -1,0 +1,4 @@
+{"data":{"repository":{"pullRequest":{"id":"PR_kwDOAAAAB84AAAAH","title":"Spell out five","url":"https://github.com/acme/widgets/pull/7","body":"Spells out five.\r\n\r\nThe count was off by one.","createdAt":"2026-11-15T08:00:00Z","viewerDidAuthor":false,"author":{"login":"octocat"},"baseRefName":"main","baseRefOid":"@BASE@","headRefOid":"@HEAD@","headRefName":"five","isCrossRepository":false,"state":"OPEN",
+"conversation":{"pageInfo":{"hasNextPage":false,"endCursor":"Y3Vyc29yOnYyOpHOAAC7ug"},"nodes":[
+{"id":"IC_kwDOAAAAB84AAAC2","url":"https://github.com/acme/widgets/pull/7#issuecomment-3002","body":"Yes, ready.","createdAt":"2026-11-16T09:00:00Z","viewerDidAuthor":true,"author":{"login":"ada"}}
+]}}}}}

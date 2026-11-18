@@ -71,7 +71,7 @@ The `dffy` binary: CLI, printed output, pager mode, the viewer, the MCP server a
 | `pager` | Pager mode: the stdin reader and line splitting, streaming the core's `patch` events into rendered rows, and `--color-only`. |
 | `plugin` | Renderer plugins: the `render` setting, finding `dffy-render-<name>` on `PATH`, running one with a timeout, the protocol's JSON. `plugin::review`: review plugins (`dffy-review-<name>`), run in the background in a session of their own (through `dffy __review-plugin`, since std starts one only from unsafe code), their JSON lines read on a thread and handed to the viewer as events. |
 | `render` | Turning the core's `view` rows into cells (split, unified, stat): widths, wrapping, the role for each line's state, and escaping, shared by printed output and the viewer. It decides nothing about what a line is. |
-| `term` | The terminal layer: cell grid, raw mode, input parsing, OSC 52. |
+| `term` | The terminal layer: cell grid, raw mode, input parsing, OSC 52, OSC 7501. |
 | `tui` | The viewer (submodules below). |
 | `daemon` | `dffyd`: the broker, its client, and the socket protocol. |
 | `doctor` | `dffy doctor`. |

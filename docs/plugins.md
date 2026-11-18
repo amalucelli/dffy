@@ -287,6 +287,12 @@ It reviews a GitHub pull request in dffy. Run it in a clone whose `origin` is on
 - **Threads.** Threads are merged into the file by `ref`, and drafts are never touched. A thread you resolved or reopened in dffy keeps your state until it's posted. Each comment gets its `url`, and a thread GitHub marks outdated gets `outdated`. A thread's lines and anchor are those it was written on, read from its original commit (at that commit's merge base with the base, for the old side), outdated or not: GitHub's own placement on the current head is ignored, and dffy places the thread by its anchor's text.
   - An original commit a force-push left on no ref isn't brought by the head's fetch. After the last page, the original commits the clone doesn't have are fetched by oid in one `git fetch`, onto no ref, and their threads are placed then. Until then, and for good when GitHub no longer has the commit, the thread is a file comment with `"github_unplaced":"original commit not available"`. A commit GitHub lacks fails the whole fetch, so it's fetched again without the one git names.
   - Once placed, a thread keeps its lines even when its commit later goes from the clone, so the commit is never fetched again for it. One GitHub has dropped is asked for again on each `prepare` or `pull`, after the session line.
+- **Conversation.** The PR's [general comments](comments.md#general-comments) come with its threads, in the same requests, a page of each list at a time: a later page asks only for the lists that have more. They're merged by `ref` too, each with its `url`, and the viewer shows them as the review's [Conversation](viewer.md#conversation).
+  - The PR's description, `"kind":"description"`, written by the PR's author when the PR was opened. An empty description is left out.
+  - Each comment in the PR's conversation, `"kind":"comment"`.
+  - The summary of each review submitted, `"kind":"review"`, dated when it was submitted, with its state as its `label`: `approved`, `changes requested`, `commented` or `dismissed`. A review submitted without a summary, as one with comments on lines only, is left out, and so is your pending review: its summary isn't sent yet.
+  - Progress lines count threads only.
+  - One GitHub no longer has, or whose text was emptied, goes from the file once every page is read, as deleted threads do.
 - **Posting.**
   - Each comment is its own request, paced to stay under GitHub's limit, and its `ref` is written back as soon as it's posted, so posting again never sends one twice.
   - Comments are posted against the session's head, even when the PR has moved on.
@@ -338,6 +344,7 @@ The protocol is experimental, and may change while it is. It knows nothing of an
 | Variable | Value |
 |---|---|
 | `DFFY_REVIEW_PROTOCOL` | `1`. A plugin that speaks another protocol fails with exit status 2. Unset when you run the plugin yourself. |
+| `DFFY` | The path of the dffy that runs the plugin: the one to run for `dffy comments`, so the comments file is written by the same version that reads it. |
 | `DFFY_COMMENTS` | For `check`, `pull` and `post`: the comments file the viewer shows, the session's, as an absolute path. Unset for `describe`, `doctor`, `list`, `detect` and `prepare`. |
 
 **Output.** The plugin prints one JSON object per line on stdout, and each carries `"version": 1`. dffy reads each line as it comes: the viewer opens on the first session line, and progress shows in the status bar.

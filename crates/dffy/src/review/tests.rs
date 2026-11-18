@@ -301,6 +301,36 @@ fn a_posted_comments_text_is_read_only() {
     .expect("the others change");
 }
 
+/// The text is the host's only while the comment stays posted through the
+/// set: clearing the ref frees it in the same op, changing it doesn't.
+#[test]
+fn a_set_checks_the_text_against_the_ref_it_leaves() {
+    let mut c = Review::default();
+    let id = added(&mut c, &format!("[{LINE_COMMENT}]"));
+    ops(
+        &mut c,
+        &format!(r#"[{{"op":"set","id":"{id}","fields":{{"ref":"github:1","text":"Posted."}}}}]"#),
+    )
+    .expect("posts with its text");
+    assert!(
+        ops(
+            &mut c,
+            r#"[{"op":"set","ref":"github:1","fields":{"ref":"github:2","text":"edited"}}]"#,
+        )
+        .is_err()
+    );
+    ops(
+        &mut c,
+        r#"[{"op":"set","ref":"github:1","fields":{"ref":null,"text":"edited"}}]"#,
+    )
+    .expect("unposts and edits");
+    let comment = &c.comments[0];
+    assert_eq!(
+        (comment.reference.as_deref(), comment.text.as_str()),
+        (None, "edited")
+    );
+}
+
 #[test]
 fn refs_belong_to_one_comment() {
     let mut c = Review::default();
@@ -374,6 +404,89 @@ fn upsert_adds_or_updates_by_ref() {
     ] {
         assert!(ops(&mut c, &format!("[{bad}]")).is_err(), "{bad}");
     }
+}
+
+/// A general comment is on the review rather than a file, such as its
+/// description: no `path` and no lines. Its `kind` and `label` are the
+/// integration's words, kept as given. It's written without a `path`, and
+/// reads back the same.
+#[test]
+fn general_comments_roundtrip_without_a_path() {
+    let mut c = Review::default();
+    ops(
+        &mut c,
+        r#"[{"op":"upsert","comment":{"ref":"github:PR_1","text":"Spells out five.","author":"octocat","created":"2026-11-15T08:00:00Z","kind":"description"}},
+            {"op":"upsert","comment":{"ref":"github:PRR_1","text":"Looks good.","author":"hubot","created":"2026-11-16T09:00:00Z","kind":"review","label":"approved"}}]"#,
+    )
+    .expect("applies");
+    let review = &c.comments[1];
+    assert_eq!(
+        (
+            review.path.as_str(),
+            review.kind.as_deref(),
+            review.label.as_deref(),
+            review.range()
+        ),
+        ("", Some("review"), Some("approved"), None)
+    );
+    let encoded = c.encode();
+    let value = json::parse(encoded.as_bytes()).expect("valid JSON");
+    let written = value
+        .get("comments")
+        .and_then(Value::as_array)
+        .expect("comments");
+    assert_eq!(written[0].get("path"), None, "left out");
+    assert_eq!(
+        written[1].get("label"),
+        Some(&Value::String("approved".to_owned()))
+    );
+    assert_eq!(Review::parse(encoded.as_bytes()), Ok(c.clone()));
+
+    // An update keeps it general; one without a ref, or with lines, isn't
+    // one.
+    ops(
+        &mut c,
+        r#"[{"op":"upsert","comment":{"ref":"github:PRR_1","text":"Looks good!","label":"changes requested"}}]"#,
+    )
+    .expect("updates");
+    assert_eq!(c.comments[1].label.as_deref(), Some("changes requested"));
+    for bad in [
+        r#"{"op":"add","comment":{"text":"t","kind":"comment"}}"#,
+        r#"{"op":"upsert","comment":{"ref":"github:L","text":"t","start":{"old":null,"new":1},"end":{"old":null,"new":1},"anchor":{"lines":["x"]}}}"#,
+    ] {
+        assert!(ops(&mut c, &format!("[{bad}]")).is_err(), "{bad}");
+    }
+}
+
+/// `dffy comments` heads a general comment with the conversation, its kind
+/// and its label, before the threads on files.
+#[test]
+fn listing_heads_general_comments_as_the_conversation() {
+    let review = Review::parse(
+        br#"{"version":1,"comments":[
+{"id":"a1","path":"a.rs","text":"File.","author":"ada","created":"t0","resolved":false},
+{"id":"g1","text":"Looks good.","author":"hubot","created":"t1","resolved":false,"ref":"r1","kind":"review","label":"approved"},
+{"id":"g2","text":"Thanks!","author":"","created":"t2","resolved":false,"ref":"r2"}
+]}"#,
+    )
+    .expect("parses");
+    let mut c = Canvas::default();
+    render(&threads(&review.comments), &mut c);
+    let mut out = Vec::new();
+    c.write_to(&mut out, None).expect("writes");
+    insta::assert_snapshot!(String::from_utf8(out).expect("utf-8"), @r"
+    conversation, review, approved
+      g1 hubot, t1, posted
+        Looks good.
+
+    conversation
+      g2 you, t2, posted
+        Thanks!
+
+    a.rs
+      a1 ada, t0
+        File.
+    ");
 }
 
 #[test]

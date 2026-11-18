@@ -393,7 +393,6 @@ pub(crate) struct Config {
     pub syntax_diff: bool,
     pub render: Renderers,
     pub rendered: bool,
-    /// The review plugin's name; `None` without one.
     pub review: Option<String>,
     pub watch: bool,
     pub tree: TreeMode,

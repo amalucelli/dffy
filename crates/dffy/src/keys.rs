@@ -70,6 +70,8 @@ actions! {
     Copy "copy" "copy selection" "copy the selected lines' code",
     CopyPath "copy_path" "copy path" "copy the file's path",
     CopyAbsolutePath "copy_absolute_path" "copy absolute path" "copy where the file is on disk, from the filesystem's root",
+    CopyComment "copy_comment" "copy comment" "copy a comment of the focused thread as written, in Markdown: the one last clicked, else its first",
+    CopyThread "copy_thread" "copy thread" "copy the focused thread: each comment under its author and date, as written",
     Cancel "cancel" "cancel selection" "end the selection; in the tree, clear the filter",
     SwitchPane "switch_pane" "switch panel/diff" "switch between the left panel (the file tree, or the comments) and the diff",
     ToggleTree "toggle_tree" "toggle tree" "show or hide the file tree",
@@ -343,6 +345,8 @@ impl Action {
             | Self::Copy
             | Self::CopyPath
             | Self::CopyAbsolutePath
+            | Self::CopyComment
+            | Self::CopyThread
             | Self::Cancel
             | Self::ToggleCopyDecorations => Group::Copy,
             Self::ToggleWatch | Self::ToggleMouse => Group::Modes,
@@ -389,6 +393,8 @@ impl Action {
             Self::Copy => "Copy selection",
             Self::CopyPath => "Copy file path",
             Self::CopyAbsolutePath => "Copy absolute path",
+            Self::CopyComment => "Copy comment",
+            Self::CopyThread => "Copy thread",
             Self::ToggleCopyDecorations => "Copy with line numbers and signs",
             Self::ToggleMouse => "Mouse selection",
             Self::ToggleWatch => "Watch for changes",
@@ -427,6 +433,8 @@ impl Action {
             Self::Copy => "copy selection",
             Self::CopyPath => "copy path",
             Self::CopyAbsolutePath => "copy absolute path",
+            Self::CopyComment => "copy comment",
+            Self::CopyThread => "copy thread",
             Self::Cancel => "cancel",
             Self::SwitchPane => "switch pane",
             Self::ToggleTree => "tree",

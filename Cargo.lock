@@ -433,6 +433,7 @@ dependencies = [
  "insta",
  "portable-pty",
  "proptest",
+ "pulldown-cmark",
  "rustix",
  "signal-hook",
  "tempfile",

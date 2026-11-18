@@ -110,7 +110,6 @@ pub(super) struct Parser {
     pasting: Option<Vec<u8>>,
 }
 
-/// The end of a bracketed paste.
 const PASTE_END: &[u8] = b"\x1b[201~";
 
 enum Parsed {
@@ -130,12 +129,11 @@ impl Parser {
         self.buf.extend_from_slice(bytes);
         let mut i = 0;
         while i < self.buf.len() {
-            if let Some(text) = &mut self.pasting {
+            if let Some(mut text) = self.pasting.take() {
                 let rest = &self.buf[i..];
                 if let Some(at) = rest.windows(PASTE_END.len()).position(|w| w == PASTE_END) {
                     text.extend_from_slice(&rest[..at]);
                     i += at + PASTE_END.len();
-                    let text = self.pasting.take().unwrap_or_default();
                     emit(Input::Paste(String::from_utf8_lossy(&text).into_owned()));
                     continue;
                 }
@@ -146,6 +144,7 @@ impl Parser {
                     .unwrap_or(0);
                 text.extend_from_slice(&rest[..rest.len() - keep]);
                 i = self.buf.len() - keep;
+                self.pasting = Some(text);
                 break;
             }
             match parse(&self.buf[i..]) {

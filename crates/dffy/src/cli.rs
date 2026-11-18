@@ -48,7 +48,11 @@ const GLOBAL_WITH_VALUE: [&str; 6] = [
 /// dffy's command line, with the review plugin's command when `review`
 /// describes one.
 pub(crate) fn command(review: Option<&Naming>) -> clap::Command {
-    let command = Cli::command();
+    with_review(Cli::command(), review)
+}
+
+/// `command` with the review plugin's command when `review` describes one.
+pub(crate) fn with_review(command: clap::Command, review: Option<&Naming>) -> clap::Command {
     let Some(Naming {
         command: name,
         noun,
@@ -75,13 +79,9 @@ pub(crate) fn command(review: Option<&Naming>) -> clap::Command {
     )
 }
 
-/// Whether `name` is one of dffy's own subcommands or their aliases, which
-/// a review plugin's command can't be.
-pub(crate) fn is_builtin(name: &str) -> bool {
-    is_subcommand(&Cli::command(), name)
-}
-
-fn is_subcommand(command: &clap::Command, name: &str) -> bool {
+/// Whether `name` is one of `command`'s subcommands or their aliases, or
+/// `help`; for dffy's own, a name a review plugin's command can't be.
+pub(crate) fn is_subcommand(command: &clap::Command, name: &str) -> bool {
     name == "help"
         || command
             .get_subcommands()
@@ -93,7 +93,9 @@ fn is_subcommand(command: &clap::Command, name: &str) -> bool {
 pub(crate) fn parse(command: clap::Command, args: &[OsString]) -> Result<Cli, clap::Error> {
     let mut matches = command.try_get_matches_from(args)?;
     let review = match matches.subcommand_name() {
-        Some(name) if !is_builtin(name) => matches
+        // Matches name a subcommand by its name, never an alias, so the
+        // derive's list answers without building the command again.
+        Some(name) if !Command::has_subcommand(name) => matches
             .remove_subcommand()
             .map(|(_, sub)| sub.get_one::<String>("id").cloned()),
         _ => None,
@@ -138,13 +140,32 @@ pub(crate) fn with_default_subcommand(
     command: &clap::Command,
     mut args: Vec<OsString>,
 ) -> Vec<OsString> {
-    let is_subcommand = |name: &str| is_subcommand(command, name);
+    let at = first_command(&args)
+        .filter(|(_, arg)| {
+            !matches!(*arg, "-h" | "--help" | "-V" | "--version") && !is_subcommand(command, arg)
+        })
+        .map(|(i, _)| i);
+    if let Some(i) = at {
+        args.insert(i, OsString::from("diff"));
+    }
+    args
+}
+
+/// dffy's own commands that neither open the viewer nor list dffy's
+/// commands, so the review plugin's command changes nothing they do.
+const WITHOUT_REVIEW: [&str; 6] = ["comments", "config", "themes", "daemon", "mcp", "man"];
+
+/// Whether running `args` needs the review plugin described. The plugin's
+/// own `dffy comments apply` runs don't, so they skip spawning it again.
+pub(crate) fn needs_review(args: &[OsString]) -> bool {
+    first_command(args).is_none_or(|(_, arg)| !WITHOUT_REVIEW.contains(&arg))
+}
+
+/// The first argument that isn't a global option, and where it is.
+fn first_command(args: &[OsString]) -> Option<(usize, &str)> {
     let mut i = 1;
-    while i < args.len() {
-        let arg = args[i].to_str().unwrap_or_default();
-        if matches!(arg, "-h" | "--help" | "-V" | "--version") || is_subcommand(arg) {
-            return args;
-        }
+    while let Some(arg) = args.get(i) {
+        let arg = arg.to_str().unwrap_or_default();
         if GLOBAL_WITH_VALUE.contains(&arg) {
             i += 2;
         } else if GLOBAL_WITH_VALUE.iter().any(|g| {
@@ -153,11 +174,10 @@ pub(crate) fn with_default_subcommand(
         }) {
             i += 1;
         } else {
-            args.insert(i, OsString::from("diff"));
-            return args;
+            return Some((i, arg));
         }
     }
-    args
+    None
 }
 
 #[derive(Debug, Args)]
@@ -534,11 +554,12 @@ mod tests {
 
     #[test]
     fn a_review_command_cant_be_a_builtin_subcommand_or_alias() {
+        let builtin = |name| is_subcommand(&Cli::command(), name);
         for name in ["diff", "show", "config", "doctor", "mcp", "man", "help"] {
-            assert!(is_builtin(name), "{name}");
+            assert!(builtin(name), "{name}");
         }
-        assert!(!is_builtin("mr"));
-        assert!(!is_builtin("pr"));
+        assert!(!builtin("mr"));
+        assert!(!builtin("pr"));
     }
 
     #[test]
@@ -559,6 +580,34 @@ mod tests {
         assert_eq!(early(&["--no-cache", "mr"]), (None, true));
         assert_eq!(early(&["--review", "../evil", "mr"]), (None, false));
         assert_eq!(early(&["--", "--review", "gitlab"]), (None, false));
+    }
+
+    #[test]
+    fn only_the_viewer_and_command_listings_need_the_review_plugin() {
+        let needs = |args: &[&str]| {
+            let mut full = vec![OsString::from("dffy")];
+            full.extend(args.iter().map(OsString::from));
+            needs_review(&full)
+        };
+        for args in [
+            &[][..],
+            &["pr", "7"],
+            &["main..HEAD"],
+            &["show"],
+            &["--help"],
+            &["doctor"],
+        ] {
+            assert!(needs(args), "{args:?}");
+        }
+        for args in [
+            &["comments", "apply"][..],
+            &["-C", "repo", "--review=github", "mcp"],
+        ] {
+            assert!(!needs(args), "{args:?}");
+        }
+        for name in WITHOUT_REVIEW {
+            assert!(is_subcommand(&Cli::command(), name), "{name}");
+        }
     }
 
     fn diff_args(cli: Cli) -> DiffArgs {

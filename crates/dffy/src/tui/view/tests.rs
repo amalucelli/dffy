@@ -9,6 +9,7 @@ use crate::config::Indicators;
 use crate::print;
 use crate::review;
 use crate::theme::Role;
+use crate::tui::markdown;
 use crate::tui::textbox::TextBox;
 
 const OLD: &str = "fn main() {\n    let total = count + 1;\n    println!(\"{total}\");\n}\n\
@@ -166,7 +167,7 @@ fn rows_are_kept_for_each_arrangement() {
     assert_ne!(split.1, unified.1, "the arrangements' rows differ");
     let mut doc = doc(layout(true, false), 7);
     assert_eq!((screen(&mut doc), starts(&mut doc)), split);
-    let before = doc.document.loaded_bytes();
+    let before = doc.document.file(0).map_or(0, File::bytes);
     let mut sizes = Vec::new();
     for on in [false, true, false, true] {
         doc.layout.split = on;
@@ -177,11 +178,10 @@ fn rows_are_kept_for_each_arrangement() {
             *expected,
             "split {on}"
         );
-        sizes.push(doc.document.loaded_bytes());
+        sizes.push(doc.document.file(0).map_or(0, File::bytes));
     }
     assert!(sizes[0] > before);
     assert!(sizes.iter().all(|&s| s == sizes[0]), "{sizes:?}");
-    assert_eq!(doc.document.file(0).map(File::bytes), Some(sizes[0]));
 }
 
 #[test]
@@ -802,8 +802,7 @@ fn background_tints_fill_changed_lines_with_a_stronger_gutter() {
     }
 }
 
-/// A thread's mark sits in the cell after the line numbers, on its side's
-/// half of a split row, and keeps the tint of a changed line's gutter.
+/// A mark keeps the tint of a changed line's gutter.
 #[test]
 fn comment_marks_go_after_the_line_numbers_of_their_side() {
     let marker = |side, line: usize, look| Thread {
@@ -1202,6 +1201,7 @@ fn note(id: &str, author: &str, at: &str, text: &str, draft: bool) -> comments::
         author: author.to_owned(),
         created: format!("2026-11-17T{at}:00Z"),
         text: text.to_owned(),
+        summary: markdown::summary(text),
         suggestion: None,
         standing: if draft {
             comments::Standing::Draft
@@ -1291,8 +1291,7 @@ fn commented(layout: Layout, height: usize) -> Doc {
 /// Every row of the document, its threads' included, as one tall screen
 /// draws them.
 fn all_rows(layout: Layout) -> Vec<String> {
-    let mut doc = commented(layout, 200);
-    tall_rows(&mut doc)
+    tall_rows(&mut commented(layout, 200))
 }
 
 /// Every row `doc` draws on a screen as wide as its layout, less the
@@ -1310,13 +1309,10 @@ fn tall_rows(doc: &mut Doc) -> Vec<String> {
     rows
 }
 
-/// Threads show as boxes under the row of their last line, a cell into
-/// the code's column: the first comment's author, age and state in the top
-/// border, each reply's on a row over it after a blank one, text wrapped
-/// inside, and a suggestion as a small diff. A thread with a draft has round corners.
-/// Resolved and outdated threads without a draft start folded to one row.
-/// The file's comments hang under its first row and the lost ones under
-/// its last. Split, a thread takes its side's half.
+/// A thread hangs under the row of its last line, a comment on the whole
+/// file under the file's first row, and a lost one under its last. Split,
+/// a thread takes its side's half; resolved and outdated threads without a
+/// draft start folded.
 #[test]
 fn threads_hang_under_their_lines() {
     insta::assert_snapshot!("threads_unified", all_rows(layout(false, false)).join("\n"));
@@ -1456,8 +1452,8 @@ fn heights_count_the_rows_of_snippets() {
     }
 }
 
-/// A snippet is highlighted once, when its thread is placed: drawing and
-/// scrolling through it don't parse its code again.
+/// Drawing and scrolling don't parse a snippet's code again: it's
+/// highlighted when its thread is placed.
 #[test]
 fn snippets_are_highlighted_once() {
     let before = comments::painted_count();
@@ -1477,6 +1473,266 @@ fn snippets_are_highlighted_once() {
         doc.scroll(1);
     }
     assert_eq!(comments::painted_count(), before + 2);
+}
+
+/// A bot's review, as a host sends it: state kept in HTML comments, then
+/// Markdown; and a reply with a table wider than a narrow box.
+fn marked_down() -> Arc<[Thread]> {
+    let review = "<!-- cr-status -->\n<!-- cr-state\n{\"sha\":\"03f1ba\",\"verdict\":\"needs-changes\"} -->\n\n\
+## Needs changes\n\n@ana **two blockers** at `03f1ba`, see [the guide](https://example.com/guide):\n\n\
+- [x] tests pass\n- [ ] `scope.ts:382` reads every project\n  - and _session_ chats too\n\n\
+> Default to the chat's own project.\n\n```rust\nlet scope = Scope::Own;\n```\n";
+    let table = "| file | line | verdict |\n|---|--:|---|\n| scope.ts | 382 | blocker |\n| chats.go | 223 | ~~fine~~ blocker |\n";
+    vec![Thread {
+        root: "m".to_owned(),
+        at: At::Line {
+            side: document::Side::New,
+            lines: 1..2,
+        },
+        look: Look::Open,
+        resolved: false,
+        outdated: false,
+        url: None,
+        notes: vec![
+            note("m", "bot", "09:00", review, false),
+            note("m2", "ana", "10:00", table, false),
+        ],
+        lines: Vec::new(),
+        snippet: None,
+        local: false,
+    }]
+    .into()
+}
+
+/// The thread's box, from its border's first row to its last.
+fn box_of(doc: &mut Doc) -> String {
+    let rows = tall_rows(doc);
+    let from = rows
+        .iter()
+        .position(|r| r.contains("▾ bot"))
+        .expect("the box");
+    let side = rows[from].find('┌').expect("its corner");
+    let to = from
+        + rows[from..]
+            .iter()
+            .position(|r| r.get(side..).is_some_and(|r| r.starts_with('└')))
+            .expect("its end");
+    rows[from..=to].join("\n")
+}
+
+/// Comments show as Markdown: the HTML comments gone, the rest styled,
+/// wrapped to the box, and code and tables cut at its edge.
+#[test]
+fn comments_show_as_markdown() {
+    for (name, width) in [("markdown_wide", 72), ("markdown_narrow", 40)] {
+        let mut doc = doc(
+            Layout {
+                width: Some(width),
+                ..layout(false, false)
+            },
+            200,
+        );
+        doc.now = NOW;
+        doc.set_threads(0, marked_down());
+        let shown = box_of(&mut doc);
+        assert!(!shown.contains("cr-st"), "{shown}");
+        insta::assert_snapshot!(name, shown);
+    }
+}
+
+/// Folded, a thread shows the first line its text renders to.
+#[test]
+fn a_folded_thread_shows_its_first_line_of_text() {
+    let mut doc = commented(layout(false, false), 200);
+    doc.set_threads(0, marked_down());
+    doc.fold.toggle("m");
+    doc.refit();
+    let rows = tall_rows(&mut doc);
+    let card = rows.iter().find(|r| r.contains("▸ bot")).expect("the card");
+    assert!(card.contains("· Needs changes"), "{card}");
+}
+
+/// A row's height is the rows its rendered boxes draw, down to a box
+/// narrower than the text's indentation.
+#[test]
+fn heights_count_the_rows_of_rendered_comments() {
+    for width in [72, 40, 14] {
+        let layout = Layout {
+            width: Some(width),
+            ..layout(false, false)
+        };
+        let mut doc = doc(layout, 200);
+        doc.set_threads(0, marked_down());
+        let mut pos = Pos {
+            offset: 0,
+            ..doc.document.pos
+        };
+        let layout = doc.file_layout(0);
+        loop {
+            let mut c = Canvas::default();
+            doc.render(pos, &layout, &mut c);
+            assert_eq!(c.len(), doc.height(pos, &layout), "{pos:?} at {width}");
+            if !doc.next_row(&mut pos, &layout) {
+                break;
+            }
+        }
+    }
+}
+
+/// Drawing and scrolling don't render a comment's text again: each is
+/// rendered once for its box's width, and again only at another.
+#[test]
+fn comments_are_rendered_once_per_width() {
+    let theme = Theme::default_theme();
+    let mut doc = doc(layout(false, false), 6);
+    doc.set_threads(0, marked_down());
+    grid_rows(&mut doc, &theme);
+    let before = markdown::rendered_count();
+    for _ in 0..40 {
+        grid_rows(&mut doc, &theme);
+        doc.scroll(1);
+    }
+    for _ in 0..40 {
+        doc.scroll(-1);
+    }
+    assert_eq!(
+        markdown::rendered_count(),
+        before,
+        "no render while drawing"
+    );
+    doc.layout.width = Some(50);
+    doc.refit();
+    grid_rows(&mut doc, &theme);
+    assert_eq!(
+        markdown::rendered_count(),
+        before + 2,
+        "both comments, once"
+    );
+}
+
+/// The row and column of `needle`'s first character in `rows`.
+fn cell_in(rows: &[String], needle: &str) -> (usize, usize) {
+    rows.iter()
+        .enumerate()
+        .find_map(|(y, r)| Some((y, r[..r.find(needle)?].chars().count())))
+        .unwrap_or_else(|| panic!("{needle}:\n{}", rows.join("\n")))
+}
+
+fn marked_doc(width: usize) -> Doc {
+    let mut doc = doc(
+        Layout {
+            width: Some(width),
+            ..layout(false, false)
+        },
+        200,
+    );
+    doc.now = NOW;
+    doc.set_threads(0, marked_down());
+    doc
+}
+
+/// A cell of a comment's text is that comment's, and stands for the
+/// source bytes it was drawn from; borders, padding and headings aren't
+/// text. Held to one comment, as a drag is, a cell above it stands for its
+/// text's start and one below for its end.
+#[test]
+fn cells_of_a_comment_map_to_its_source() {
+    let threads = marked_down();
+    let mut doc = marked_doc(72);
+    let rows = tall_rows(&mut doc);
+    let source = |note: usize, hit: Option<Hit>| match hit {
+        Some(Hit::Note {
+            thread: 0,
+            note: n,
+            bytes,
+        }) if n == note => threads[0].notes[note].text[bytes].to_owned(),
+        other => panic!("{other:?}"),
+    };
+    let (y, x) = cell_in(&rows, "two blockers");
+    assert_eq!(source(0, doc.note_hit(y, x, None)), "t");
+    let (ry, rx) = cell_in(&rows, "chats.go");
+    assert_eq!(source(1, doc.note_hit(ry, rx, None)), "c");
+    let (hy, hx) = cell_in(&rows, "▾ bot");
+    assert_eq!(doc.note_hit(hy, hx + 3, None), None, "the heading");
+    let left = rows[hy].find('┌').map(|b| rows[hy][..b].chars().count());
+    assert_eq!(
+        doc.note_hit(y, left.expect("a box"), None),
+        None,
+        "its side"
+    );
+    assert_eq!(doc.note_hit(y, left.expect("a box") + 1, None), None);
+
+    let review = &threads[0].notes[0].text;
+    let start = review.find("Needs").expect("its heading");
+    let end = review.find("Own;").expect("its code") + "Own;".len();
+    let held = |doc: &mut Doc, y: usize| match doc.note_hit(y, 0, Some((0, 0))) {
+        Some(Hit::Note { bytes, .. }) => bytes,
+        other => panic!("{other:?}"),
+    };
+    assert_eq!(held(&mut doc, 0), start..start, "above");
+    assert_eq!(held(&mut doc, ry), end..end, "in the reply below");
+    assert_eq!(held(&mut doc, rows.len() + 5), end..end, "past the end");
+
+    // Split, the box is in the new side's half.
+    let mut split = doc_of(
+        diff(),
+        Layout {
+            width: Some(120),
+            ..layout(true, false)
+        },
+        200,
+    );
+    split.now = NOW;
+    split.set_threads(0, Arc::clone(&threads));
+    let rows = tall_rows(&mut split);
+    let (y, x) = cell_in(&rows, "two blockers");
+    assert!(x > 60, "{x}");
+    assert_eq!(source(0, split.note_hit(y, x, None)), "t");
+}
+
+/// The rows of the thread's box, the cells reversed in `[…]`.
+fn reversed_box(doc: &mut Doc) -> String {
+    let width = doc.layout.width.unwrap_or(60);
+    let mut grid = Grid::new(width, doc.height);
+    doc.draw(&mut grid, None, (0, width, 0), &Theme::default_theme(), 1);
+    let rows: Vec<String> = (0..doc.height)
+        .map(|y| {
+            let mut line = String::new();
+            let mut on = false;
+            for cell in grid.row(y) {
+                let reversed = cell.style().attributes.contains(Attributes::REVERSE);
+                if reversed != on {
+                    line.push(if reversed { '[' } else { ']' });
+                    on = reversed;
+                }
+                line.push_str(cell.text());
+            }
+            if on {
+                line.push(']');
+            }
+            line.trim_end().to_owned()
+        })
+        .collect();
+    let from = rows.iter().position(|r| r.contains("▾ bot")).expect("box");
+    let to = rows.iter().rposition(|r| r.contains('└')).expect("end");
+    rows[from..=to].join("\n")
+}
+
+/// A selection in a comment shows its glyphs reversed, on every wrapped
+/// row it runs over and in that comment alone; ending it clears them.
+#[test]
+fn a_selection_in_a_comment_shows_reversed() {
+    let mut doc = marked_doc(40);
+    let rows = tall_rows(&mut doc);
+    let (ay, ax) = cell_in(&rows, "two");
+    let (by, bx) = cell_in(&rows, "tests pass");
+    let anchor = doc.note_hit(ay, ax, None).expect("a cell of text");
+    doc.select_hit(&anchor);
+    let cursor = doc.note_hit(by, bx + 3, Some((0, 0))).expect("held");
+    doc.select_to_hit(&cursor);
+    insta::assert_snapshot!("comment_selection", reversed_box(&mut doc));
+    doc.note_selection = None;
+    assert!(!reversed_box(&mut doc).contains('['));
 }
 
 /// A posted thread on new line 2 with two replies, then another on the
@@ -1695,9 +1951,8 @@ fn folded_threads_take_one_row() {
     assert_eq!(doc.document.pos.offset, 0);
 }
 
-/// A fold is kept by the thread's root as folded or not, so it outlives
-/// the comments file reloading, the thread reopened or resolved under it
-/// included; a thread no one folded follows its state.
+/// Folds are kept by root, so one outlives its thread being reopened or
+/// resolved; a thread no one folded follows its state.
 #[test]
 fn folds_outlive_reloads_of_the_comments_file() {
     let mut doc = commented(layout(false, false), 40);
@@ -1736,8 +1991,8 @@ fn folds_outlive_reloads_of_the_comments_file() {
     );
 }
 
-/// The focused thread's border is heavy, in the hint color, or in the
-/// draft color when a draft is in it; the background stays the code's.
+/// The border takes the hint color, or the draft color with a draft in
+/// it; the background stays the code's.
 #[test]
 fn a_focused_threads_border_is_heavy() {
     let theme = Theme::default_theme();
@@ -1951,23 +2206,33 @@ fn the_text_box_is_boxed_where_the_thread_sits() {
     assert!(shown.contains("New▏"), "{shown}");
 }
 
-/// A frame after a scroll draws whole while threads are on screen, the
-/// same as drawing it fresh: their rows change without a scroll.
+/// Their rows change without a scroll, so a frame after one copies them
+/// from the last only while they show the same: at the same time, with the
+/// focus where it was.
 #[test]
-fn frames_with_threads_on_screen_are_drawn_whole() {
+fn frames_with_threads_on_screen_are_copied_while_they_show_the_same() {
+    type Change = fn(&mut Doc);
     let theme = Theme::default_theme();
+    let text = |g: &Grid| (0..6).map(|y| g.row_text(y)).collect::<Vec<_>>();
     let mut doc = commented(layout(false, false), 6);
     let mut before = Grid::new(60, 6);
     doc.draw(&mut before, None, (0, 60, 0), &theme, 1);
-    doc.scroll(1);
-    doc.set_focus(Some("f".to_owned()));
-    let mut after = Grid::new(60, 6);
-    let (_, scrolled) = doc.draw(&mut after, Some(&before), (0, 60, 0), &theme, 2);
-    assert_eq!(scrolled, None, "not copied");
-    let mut fresh = Grid::new(60, 6);
-    doc.draw(&mut fresh, None, (0, 60, 0), &theme, 3);
-    let text = |g: &Grid| (0..6).map(|y| g.row_text(y)).collect::<Vec<_>>();
-    assert_eq!(text(&after), text(&fresh));
+    let changes: [(Change, bool); 3] = [
+        (|_| {}, true),
+        (|doc| doc.set_focus(Some("f".to_owned())), false),
+        (|doc| doc.now += 3600, false),
+    ];
+    for (change, copied) in changes {
+        doc.scroll(1);
+        change(&mut doc);
+        let mut after = Grid::new(60, 6);
+        let (_, scrolled) = doc.draw(&mut after, Some(&before), (0, 60, 0), &theme, 2);
+        assert_eq!(scrolled.is_some(), copied);
+        let mut fresh = Grid::new(60, 6);
+        doc.draw(&mut fresh, None, (0, 60, 0), &theme, 3);
+        assert_eq!(text(&after), text(&fresh));
+        before = fresh;
+    }
     // Without threads on screen, the rows still on it are copied.
     let mut plain = self::doc(layout(false, false), 3);
     let mut before = Grid::new(60, 3);
@@ -1978,8 +2243,6 @@ fn frames_with_threads_on_screen_are_drawn_whole() {
     assert!(scrolled.is_some());
 }
 
-/// A thread's rows are found by screen row for a tap, and never hit code:
-/// a press there selects nothing.
 #[test]
 fn a_thread_row_is_found_by_row_and_never_hits_code() {
     let theme = Theme::default_theme();
@@ -2037,7 +2300,8 @@ fn long_commented(n: usize, on: &[usize], height: usize) -> Doc {
         height,
     );
     doc.now = NOW;
-    let threads: Vec<Thread> = (on.iter())
+    let threads: Vec<Thread> = on
+        .iter()
         .map(|&line| Thread {
             root: line.to_string(),
             at: At::Line {
@@ -2058,9 +2322,9 @@ fn long_commented(n: usize, on: &[usize], height: usize) -> Doc {
     doc
 }
 
-/// A thread gone to lands with its box a third of the way down the pane,
-/// the line it's on right above, unless the whole box shows already; near
-/// either end of the file the position stops there.
+/// The line it's on stays right above the box; a box already whole on
+/// screen doesn't move, and near either end of the file the position
+/// stops there.
 #[test]
 fn a_thread_gone_to_lands_a_third_from_the_top() {
     let mut doc = long_commented(100, &[6, 50, 54, 99], 30);
@@ -2095,8 +2359,8 @@ fn a_thread_gone_to_lands_a_third_from_the_top() {
     assert!(rows[11].contains('┗'), "{}", rows.join("\n"));
 }
 
-/// A peek shows a folded thread whole until it moves on, and the rows'
-/// heights follow: a box's rows are kept by whether it's folded.
+/// Row heights follow the peek: a box's rows are kept by whether it's
+/// folded.
 #[test]
 fn a_peeked_thread_shows_whole_until_the_peek_moves_on() {
     let mut doc = commented(layout(false, false), 200);

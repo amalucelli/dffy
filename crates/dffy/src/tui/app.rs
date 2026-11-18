@@ -18,7 +18,7 @@ mod review;
 
 use std::collections::HashMap;
 use std::fmt::Write as _;
-use std::ops::Range;
+use std::ops::{ControlFlow, Range};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -119,8 +119,8 @@ pub(crate) enum Action {
     Browse(String),
     /// Run `dffy-review-<plugin> <args>` in the background, with
     /// `--summary-file` holding `summary` when there is one; what it says
-    /// comes back as [`Event::Review`] under `id`. A run other than a
-    /// `check` stops the one before it.
+    /// comes back as [`Event::Review`] under `id`. A `prepare`, `pull` or
+    /// `post` stops the one before it.
     Plugin {
         id: u64,
         plugin: String,
@@ -281,7 +281,6 @@ pub(crate) struct App {
     remembered: Vec<(&'static str, String)>,
     remembered_at: Option<Instant>,
     commands: Option<Commands>,
-    /// The menu a right click opened.
     menu: Option<Menu>,
     search: Option<Search>,
     /// The last search id handed out. Kept across cleared searches, so a
@@ -310,6 +309,9 @@ pub(crate) struct App {
     tree_width: Option<usize>,
     /// The code row last clicked or tapped, where `v` starts.
     tapped: Option<(Pos, Side)>,
+    /// The comment last clicked, by its thread's root and its id, which
+    /// `copy_comment` copies.
+    tapped_note: Option<(String, String)>,
     press: Option<Press>,
     /// The last click: when, where, and how many in a row.
     clicks: Option<(Instant, (usize, usize), u8)>,
@@ -362,7 +364,7 @@ pub(crate) struct App {
     naming: Option<Naming>,
     /// The review shown, in review mode.
     reviewing: Option<review::Mode>,
-    /// The review plugin's run other than a check, while it runs.
+    /// The review plugin's `prepare`, `pull` or post, while it runs.
     job: Option<review::Running>,
     /// The last run id handed out.
     run_id: u64,
@@ -391,6 +393,15 @@ pub(crate) struct App {
     /// The note is the first-run tip, which any key dismisses.
     tip: bool,
     enumerating: bool,
+    /// A finished post or a failure the terminal reports until the next
+    /// key or click, which means the user has seen it.
+    unseen: Option<term::Status>,
+    /// The program status last sent to the terminal.
+    reported: Option<term::Status>,
+    /// What the window title last sent names.
+    titled: Option<String>,
+    /// The working tree's directory name, for the window title.
+    repository: Option<String>,
     /// What the repository's diff selects, to word an empty list.
     selected: Option<(Revisions, DefaultDiff)>,
     /// What an empty `--staged` or `--unstaged` list leaves out.
@@ -444,6 +455,7 @@ impl App {
         let mut doc = Doc::new(placeholder, height);
         doc.document.structural = config.syntax_diff;
         doc.set_rendered_mode(config.rendered);
+        doc.set_highlight(config.highlight);
         doc.document.full = config.context == Context::Full;
         doc.overview = true;
         let mut tree = Tree::default();
@@ -502,6 +514,7 @@ impl App {
             keys: config.keys.clone(),
             tree_width: config.tree_width,
             tapped: None,
+            tapped_note: None,
             press: None,
             clicks: None,
             drag_edge: None,
@@ -545,6 +558,10 @@ impl App {
             message: None,
             tip: false,
             enumerating: true,
+            unseen: None,
+            reported: None,
+            titled: None,
+            repository: None,
             selected: None,
             others: None,
             piped: false,
@@ -593,6 +610,10 @@ impl App {
     /// with, for the words of an empty list.
     pub(crate) fn set_selected(&mut self, revisions: Revisions, default: DefaultDiff) {
         self.selected = Some((revisions, default));
+    }
+
+    pub(crate) fn set_repository(&mut self, name: Option<String>) {
+        self.repository = name;
     }
 
     /// The files come from a piped diff: they keep its order.
@@ -838,16 +859,66 @@ impl App {
 
     /// Redraws everything on the next frame; the terminal was used by
     /// something else.
+    /// Also after the editor, which may have reported a status and set a
+    /// title of its own.
     pub(crate) fn invalidate(&mut self) {
         self.screen.invalidate();
         self.dirty = true;
         self.kept = false;
+        self.reported = None;
+        self.titled = None;
+    }
+
+    /// The window title and the program status report (OSC 7501), those
+    /// that changed since they were last sent.
+    pub(crate) fn status_report(&mut self) -> Option<Vec<u8>> {
+        let mut out = Vec::new();
+        if self.titled.as_ref() != Some(&self.description) {
+            let shown = self.description.as_str();
+            out = match &self.repository {
+                Some(name) => term::window_title(&[name, shown]),
+                None => term::window_title(&[shown]),
+            };
+            self.titled = Some(self.description.clone());
+        }
+        let status = self
+            .review_status()
+            .or_else(|| self.unseen.clone())
+            .unwrap_or_else(|| {
+                // A piped diff is read only as far as the viewer goes, so it
+                // can stay unfinished for as long as dffy runs.
+                if self.enumerating && !self.piped {
+                    term::Status {
+                        state: term::State::Working,
+                        message: Some("Listing changes".to_owned()),
+                        ..term::Status::default()
+                    }
+                } else {
+                    term::Status::default()
+                }
+            });
+        if self.reported.as_ref() != Some(&status) {
+            out.extend_from_slice(&status.report());
+            self.reported = Some(status);
+        }
+        (!out.is_empty()).then_some(out)
     }
 
     pub(crate) fn message(&mut self, text: impl Into<String>) {
         self.message = Some((text.into(), Instant::now() + MESSAGE_TIME));
         self.tip = false;
         self.dirty = true;
+    }
+
+    /// A failure's note, which the terminal also hears about: the note is
+    /// gone in seconds, and the user may be in another tab.
+    fn failed(&mut self, text: String) {
+        self.unseen = Some(term::Status {
+            state: term::State::Error,
+            message: Some(text.clone()),
+            ..term::Status::default()
+        });
+        self.message(text);
     }
 
     /// When the loop should wake up without an event.
@@ -886,8 +957,14 @@ impl App {
             .comments
             .as_ref()
             .zip(self.doc.document.files().get(file))
-            .and_then(|(c, e)| c.threads(&e.change().path))
-            .unwrap_or_else(|| Arc::new([]));
+            .and_then(|(c, e)| {
+                if e.is_page() {
+                    Some(c.conversation())
+                } else {
+                    c.threads(&e.change().path)
+                }
+            })
+            .unwrap_or_default();
         self.doc.set_threads(file, threads);
     }
 
@@ -939,7 +1016,7 @@ impl App {
             Event::EnumerationDone(error) => {
                 self.enumerating = false;
                 if let Some(error) = error {
-                    self.message(format!("listing changes failed: {error}"));
+                    self.failed(format!("listing changes failed: {error}"));
                 }
                 if !self.piped && self.doc.sort_by_path() {
                     // Positions moved, so a search's marks and counts are
@@ -955,12 +1032,13 @@ impl App {
                         picker.rebuild(self.doc.document.files());
                     }
                 }
+                self.sync_conversation();
                 self.count_pass = true;
                 self.dirty = true;
             }
             Event::Diffed(done) => self.done(done),
             Event::Refreshed(update) => self.refreshed(&update),
-            Event::RefreshFailed(error) => self.message(format!("refreshing failed: {error}")),
+            Event::RefreshFailed(error) => self.failed(format!("refreshing failed: {error}")),
             Event::Others(others) => {
                 self.others = others;
                 self.dirty |= self.doc.document.files().is_empty();
@@ -994,6 +1072,7 @@ impl App {
                 }
                 return self.review_said(id, said);
             }
+            Event::ReviewMoved(count) => self.review_updated(count),
             // The loop handles these; they need the terminal.
             Event::Resize | Event::Interrupt => {}
         }
@@ -1052,6 +1131,8 @@ impl App {
         if let Some(picker) = &mut self.picker {
             picker.rebuild(self.doc.document.files());
         }
+        // A list that was empty takes the page that waited for it.
+        self.sync_conversation();
         self.count_pass = true;
         self.dirty = true;
     }
@@ -1318,6 +1399,7 @@ impl App {
         }
         self.dirty = true;
         self.focus = None;
+        self.unseen = None;
         if std::mem::take(&mut self.tip) {
             self.message = None;
         }
@@ -1327,7 +1409,7 @@ impl App {
         if self.menu.is_some() {
             return self.menu_input(&input);
         }
-        if let std::ops::ControlFlow::Break(done) = self.review_input(&input) {
+        if let ControlFlow::Break(done) = self.review_input(&input) {
             return done;
         }
         if self.commands.is_some() {
@@ -1414,8 +1496,16 @@ impl App {
     }
 
     /// Runs `action` as its key does in the pane with the keys: lines
-    /// selected in the diff take it first.
+    /// selected in the diff take it first. Text selected in a comment
+    /// stays only for `y`.
     fn dispatch(&mut self, action: Act) -> Option<Action> {
+        if self.doc.note_selection.is_some() && action != Act::Copy {
+            self.doc.note_selection = None;
+            // `esc` backs out of it alone.
+            if action == Act::Cancel && self.pane == Pane::Diff {
+                return None;
+            }
+        }
         if self.doc.selection.is_some() && self.pane == Pane::Diff {
             match self.selecting(action) {
                 Ok(done) => return done,
@@ -1466,8 +1556,7 @@ impl App {
         None
     }
 
-    /// Input while the menu is open; see [`Menu`]. A right click elsewhere
-    /// opens the menu there instead.
+    /// A right click elsewhere opens the menu there instead.
     fn menu_input(&mut self, input: &Input) -> Option<Action> {
         // An armed `d` is kept for the key right after it, never a later one.
         self.deleting = false;
@@ -1552,8 +1641,6 @@ impl App {
         let entry = &self.doc.document.files()[file];
         let on_disk = !entry.is_commit() && !self.piped;
         let editable = on_disk && entry.change().new.is_some();
-        let viewed = entry.viewed();
-        let commented = self.tree.commented();
         let mut entries = vec![self.menu_entry(true, "Copy path", Act::CopyPath)];
         if on_disk {
             entries.push(self.menu_entry(true, "Copy absolute path", Act::CopyAbsolutePath));
@@ -1561,7 +1648,7 @@ impl App {
         if editable {
             entries.push(self.menu_entry(true, "Open in editor", Act::Edit));
         }
-        let mark = if viewed {
+        let mark = if entry.viewed() {
             "Mark unviewed"
         } else {
             "Mark viewed"
@@ -1571,7 +1658,7 @@ impl App {
             if on_disk {
                 entries.push(self.menu_entry(true, "Comment on file", Act::CommentFile));
             }
-            let filter = if commented {
+            let filter = if self.tree.commented() {
                 "Show every file"
             } else {
                 "Show only files with comments"
@@ -1587,11 +1674,13 @@ impl App {
     /// keys for it.
     fn aim_diff(&mut self, x: usize, y: usize) -> Vec<menu::Entry> {
         self.pane = Pane::Diff;
+        self.doc.note_selection = None;
         match self.doc.block_row_at(y - 1) {
             Some((Block::Thread(i), _)) => {
                 let thread = self.doc.threads()[i].clone();
                 self.doc.selection = None;
                 self.doc.set_focus(Some(thread.root.clone()));
+                self.tapped_note = self.doc.note_at(y - 1);
                 return self.thread_entries(&thread);
             }
             Some((Block::New, _)) => return Vec::new(),
@@ -1647,13 +1736,26 @@ impl App {
         entries
     }
 
-    /// The focused thread's keys, as far as they'd act on `thread`.
+    /// The focused thread's keys, as far as they'd act on `thread`, then
+    /// its copies.
     fn thread_entries(&self, thread: &comments::Thread) -> Vec<menu::Entry> {
         let key = |label: &str, c: char| menu::Entry {
             label: label.to_owned(),
             key: c.to_string(),
             run: Run::Thread(c),
         };
+        let copies = [
+            self.menu_entry(false, "Copy comment", Act::CopyComment),
+            self.menu_entry(false, "Copy thread", Act::CopyThread),
+        ];
+        // The conversation is read-only, and never folds.
+        if matches!(thread.at, comments::At::Conversation { .. }) {
+            return (thread.url.as_deref().is_some_and(is_web))
+                .then(|| key("Open on host", 'o'))
+                .into_iter()
+                .chain(copies)
+                .collect();
+        }
         let mut entries = vec![key("Reply", 'r')];
         if thread.notes.iter().any(|n| !n.posted()) {
             entries.push(key("Edit draft", 'e'));
@@ -1669,6 +1771,7 @@ impl App {
         if thread.url.as_deref().is_some_and(is_web) {
             entries.push(key("Open on host", 'o'));
         }
+        entries.extend(copies);
         entries
     }
 
@@ -2136,10 +2239,20 @@ impl App {
             Act::Help => self.help = Some(Help::default()),
             Act::ScrollRight | Act::ScrollLeft | Act::ScrollReset => self.scroll_code(action),
             Act::Select => self.start_selection(),
+            Act::Copy if self.doc.note_selection.is_some() => {
+                let done = self.copy();
+                if done.is_some() {
+                    self.doc.note_selection = None;
+                }
+                return done;
+            }
             Act::Copy if self.doc.selection.is_some() => return self.copy(),
             Act::Copy => self.message("nothing selected; v selects lines"),
             Act::CopyPath => return self.copy_path(),
             Act::CopyAbsolutePath => return self.copy_full_path(),
+            Act::CopyComment | Act::CopyThread => {
+                return self.copy_thread(action == Act::CopyThread);
+            }
             Act::HalfPageDown => self.scroll_diff(half),
             Act::HalfPageUp => self.scroll_diff(-half),
         }
@@ -2794,6 +2907,7 @@ impl App {
         }
         if action == Act::ToggleHighlight {
             self.highlight = !self.highlight;
+            self.doc.set_highlight(self.highlight);
             self.remember("highlight", self.highlight.to_string());
         } else {
             self.whitespace = if self.whitespace == Whitespace::Exact {
@@ -2915,6 +3029,7 @@ impl App {
         }
         let tapped = self.take_tapped();
         self.doc.set_focus(None);
+        self.doc.note_selection = None;
         if !self.doc.select(tapped) {
             self.message("no lines of code here to select");
         }
@@ -2927,8 +3042,25 @@ impl App {
             .filter(|(pos, _)| (0..self.doc.height).any(|y| self.doc.row_at(y) == Some(*pos)))
     }
 
-    /// `y`: the selected lines on the clipboard.
+    /// `y`: the selected lines on the clipboard, or the Markdown of the
+    /// text selected in a comment.
     fn copy(&mut self) -> Option<Action> {
+        if self.doc.note_selection.is_some() {
+            let (text, whole) = self.doc.note_selected()?;
+            if text.is_empty() {
+                return None;
+            }
+            let note = if whole {
+                "copied a comment".to_owned()
+            } else {
+                let n = text.chars().count();
+                format!(
+                    "copied {n} char{} of a comment",
+                    if n == 1 { "" } else { "s" }
+                )
+            };
+            return self.copy_text(text, note);
+        }
         let copied = self.doc.selected(self.copy_decorations)?;
         if copied.text.len() > term::MAX_CLIPBOARD_BYTES {
             self.message(format!(
@@ -2964,11 +3096,58 @@ impl App {
         })
     }
 
+    /// `text` on the clipboard, saying `note`, unless it's more than a copy
+    /// can hold.
+    fn copy_text(&mut self, text: String, note: String) -> Option<Action> {
+        if text.len() > term::MAX_CLIPBOARD_BYTES {
+            self.message(format!(
+                "too much to copy: {}KB, over the {}KB a copy can hold",
+                text.len() / 1000,
+                term::MAX_CLIPBOARD_BYTES / 1000
+            ));
+            return None;
+        }
+        Some(Action::Copy {
+            text: text.into_bytes(),
+            note,
+        })
+    }
+
+    /// `copy_comment`: the focused thread's comment last clicked, else its
+    /// first, as written; `copy_thread` (`whole`): the thread, each comment
+    /// under its author and date.
+    fn copy_thread(&mut self, whole: bool) -> Option<Action> {
+        let Some(thread) = self.doc.focused().cloned() else {
+            self.message("no thread focused to copy; m goes to the next");
+            return None;
+        };
+        if whole {
+            let n = thread.notes.len();
+            let s = if n == 1 { "" } else { "s" };
+            let note = format!("copied a thread of {n} comment{s}");
+            return self.copy_text(comments::thread_text(&thread), note);
+        }
+        let clicked = self
+            .tapped_note
+            .as_ref()
+            .filter(|(root, _)| *root == thread.root)
+            .and_then(|(_, id)| thread.notes.iter().find(|n| n.id == *id));
+        let text = clicked
+            .or_else(|| thread.notes.first())?
+            .text
+            .trim_end_matches(['\n', '\r']);
+        self.copy_text(text.to_owned(), "copied a comment".to_owned())
+    }
+
     /// `Y`: the path of the file shown, as the repository has it.
     fn copy_path(&mut self) -> Option<Action> {
         let entry = self.doc.document.files().get(self.doc.document.pos.file)?;
         let path = match &entry.source() {
             Source::Commit(commit) => commit.id.as_ref()?.as_bytes().into(),
+            Source::Page { .. } => {
+                self.message("the conversation has no path");
+                return None;
+            }
             _ => entry.change().path.clone(),
         };
         Some(Action::Copy {
@@ -2981,7 +3160,11 @@ impl App {
     fn copy_full_path(&mut self) -> Option<Action> {
         let entry = self.doc.document.files().get(self.doc.document.pos.file)?;
         if entry.is_commit() {
-            self.message("a commit has no file on disk");
+            self.message(if entry.is_page() {
+                "the conversation has no file on disk"
+            } else {
+                "a commit has no file on disk"
+            });
             return None;
         }
         Some(Action::CopyFullPath(entry.change().path.clone()))
@@ -3105,6 +3288,7 @@ impl App {
             return;
         }
         self.doc.selection = None;
+        self.doc.note_selection = None;
         if self.over_tree(x) {
             self.pane = Pane::Tree;
             // Under the panel's top border.
@@ -3137,7 +3321,8 @@ impl App {
             return;
         }
         // A tap on a thread focuses it, and on its header also folds or
-        // unfolds it; one on code leaves it.
+        // unfolds it; one on code leaves it. A press on a comment's text
+        // starts a selection there as one on code does.
         match self.doc.block_row_at(y - 1) {
             Some((Block::Thread(i), header)) => {
                 let root = self.doc.threads()[i].root.clone();
@@ -3146,6 +3331,21 @@ impl App {
                     self.doc.refit();
                 }
                 self.doc.set_focus(Some(root));
+                self.tapped_note = self.doc.note_at(y - 1);
+                let hit = x
+                    .checked_sub(self.content_x())
+                    .filter(|_| !header)
+                    .and_then(|column| self.doc.note_hit(y - 1, column, None));
+                if let Some(hit) = hit {
+                    if count > 1 {
+                        self.doc.select_word(&hit, count == 3);
+                    }
+                    self.press = Some(Press {
+                        hit,
+                        at: (x, y),
+                        selected: count > 1,
+                    });
+                }
                 return;
             }
             Some((Block::New, _)) => return,
@@ -3171,10 +3371,10 @@ impl App {
     }
 
     /// The pointer moved with the button held: a selection from where it
-    /// went down to the cell under it, by characters from code, by lines
-    /// from the line numbers, and on the side it started on. Held past the
-    /// top or bottom of the pane, the view scrolls and the selection goes
-    /// on, a line at a time.
+    /// went down to the cell under it, by characters from code or in the
+    /// comment it started in, by lines from the line numbers, and on the
+    /// side it started on. Held past the top or bottom of the pane, the
+    /// view scrolls and the selection goes on, a line at a time.
     fn drag(&mut self, x: usize, y: usize) {
         let Some(press) = &mut self.press else {
             return;
@@ -3185,6 +3385,20 @@ impl App {
             }
             press.selected = true;
             self.doc.select_hit(&press.hit);
+        }
+        if let Hit::Note { thread, note, .. } = press.hit {
+            let pane = y.saturating_sub(1);
+            self.drag_edge = None;
+            if y == 0 || pane >= self.doc.height {
+                self.drag_edge = Some((x, y));
+                self.doc.scroll(if y == 0 { -1 } else { 1 });
+            }
+            let column = x.saturating_sub(self.content_x());
+            let row = pane.min(self.doc.height.saturating_sub(1));
+            if let Some(hit) = self.doc.note_hit(row, column, Some((thread, note))) {
+                self.doc.select_to_hit(&hit);
+            }
+            return;
         }
         let Some(side) = self.doc.selection.as_ref().map(|s| s.side) else {
             return;
@@ -3207,7 +3421,7 @@ impl App {
     fn release(&mut self) -> Option<Action> {
         self.drag_edge = None;
         let press = self.press.take()?;
-        if press.selected && self.doc.selection.is_some() {
+        if press.selected && (self.doc.selection.is_some() || self.doc.note_selection.is_some()) {
             return self.copy();
         }
         None
@@ -3220,7 +3434,11 @@ impl App {
         let file = tapped.map_or(self.doc.document.pos.file, |pos| pos.file);
         let entry = self.doc.document.files().get(file)?;
         if entry.is_commit() {
-            self.message("a commit has no file to open");
+            self.message(if entry.is_page() {
+                "the conversation has no file to open"
+            } else {
+                "a commit has no file to open"
+            });
             return None;
         }
         let change = &entry.change();
@@ -3242,6 +3460,9 @@ impl App {
         let session = self.reviewing.is_some();
         self.comments = Some(Comments::new(path, self.local_comments.clone(), session));
         self.reload_comments();
+        // A file with no comments reads as unchanged, yet replaces one that
+        // may have had a conversation.
+        self.sync_conversation();
     }
 
     /// Takes the local review's file, whose drafts show on a review
@@ -3278,6 +3499,7 @@ impl App {
     /// places their threads on those diffed; the others wait for their
     /// diffs.
     fn placed_again(&mut self, changed: &[BString]) {
+        self.sync_conversation();
         let Some(comments) = &mut self.comments else {
             return;
         };
@@ -3290,6 +3512,70 @@ impl App {
             self.place(file);
         }
         self.dirty = true;
+    }
+
+    /// Puts the conversation page first while a review session's comments
+    /// have general comments, sized to them, and takes it away when they
+    /// have none. The page's threads are made once it shows. While no file
+    /// is listed it waits, so the viewer still opens on the first file.
+    fn sync_conversation(&mut self) {
+        let count = self
+            .comments
+            .as_ref()
+            .filter(|_| self.reviewing.is_some())
+            .map_or(0, Comments::conversation_len);
+        let files = self.doc.document.files();
+        let shown = files.first().map(view::Entry::source);
+        let shown = match shown {
+            Some(Source::Page { rows }) if *rows == count + 1 => return,
+            Some(Source::Page { .. }) => true,
+            _ => false,
+        };
+        if !shown && (count == 0 || files.is_empty()) {
+            return;
+        }
+        if let Some(mode) = &self.reviewing {
+            let title = mode.session.title.as_deref().unwrap_or(&mode.label);
+            title.clone_into(&mut self.doc.page_title);
+        }
+        let moved = self.doc.set_page((count > 0).then_some(count));
+        if moved != 0 {
+            self.files_moved(moved);
+        }
+        self.dirty = true;
+        self.kept = false;
+    }
+
+    /// After every entry moved by `by`, the page having come or gone: what
+    /// holds a file by its place in the list follows it.
+    fn files_moved(&mut self, by: isize) {
+        let shift = |file: &mut usize| *file = file.saturating_add_signed(by);
+        if let Some(search) = &mut self.search {
+            if by > 0 {
+                search.counts.insert(0, None);
+            } else if !search.counts.is_empty() {
+                search.counts.remove(0);
+            }
+            if let Some((file, _)) = &mut search.pending {
+                shift(file);
+            }
+        }
+        if let Some(target) = &mut self.render {
+            shift(&mut target.file);
+        }
+        if let Some((file, _)) = &mut self.thread_pending {
+            shift(file);
+        }
+        let visible = &mut self.visible;
+        *visible = visible.start.saturating_add_signed(by)..visible.end.saturating_add_signed(by);
+        // Positions in the old list, a click's or a tap's, are dropped.
+        self.tapped = None;
+        self.press = None;
+        self.rebuild_tree();
+        if let Some(picker) = &mut self.picker {
+            picker.rebuild(self.doc.document.files());
+        }
+        self.sync_threads();
     }
 
     /// Places the threads of `file`, diffed or failed to be, if it has any,
@@ -3332,10 +3618,8 @@ impl App {
             self.kept = false;
         }
         // `m`, `M` or the panel went here before its threads were.
-        if let Some((pending, _)) = &self.thread_pending
-            && *pending == file
-            && self.doc.document.pos.file == file
-            && let Some((_, seek)) = self.thread_pending.take()
+        if self.doc.document.pos.file == file
+            && let Some((_, seek)) = self.thread_pending.take_if(|(pending, _)| *pending == file)
         {
             self.sync_threads();
             match seek {
@@ -3380,9 +3664,8 @@ impl App {
         self.save(compose, at, &text);
     }
 
-    /// Saves `text` as `compose` says, and focuses its thread; `None` when
-    /// it's empty or unchanged. When the write fails, the text stays in
-    /// the box (`at`) to try again.
+    /// Saves `text` as `compose` says, and focuses its thread. When the
+    /// write fails, the text stays in the box (`at`) to try again.
     fn save(&mut self, compose: Compose, at: Option<Writes>, text: &str) {
         let root = match &compose {
             Compose::New(_) => None,
@@ -3419,7 +3702,6 @@ impl App {
         }
     }
 
-    /// Opens the text box at `at` holding `text`, writing for `compose`.
     fn open_box(&mut self, compose: Compose, at: Writes, text: &str) {
         if let Writes::Reply(root) | Writes::Edit { root, .. } = &at {
             self.doc.fold.keep_open(root);
@@ -3568,17 +3850,18 @@ impl App {
             return;
         };
         if entry.is_commit() {
-            self.message("a commit has no file to comment on");
+            self.message(if entry.is_page() {
+                "the conversation is read-only here for now"
+            } else {
+                "a commit has no file to comment on"
+            });
             return;
         }
         match comments::file_draft(entry.change()) {
             Ok(comment) => {
                 // The box is in the diff, which a tree over it would hide.
                 if self.pane == Pane::Tree {
-                    self.pane = Pane::Diff;
-                    if !self.side_tree() {
-                        self.show_tree(false);
-                    }
+                    self.leave_panel();
                 }
                 self.doc.set_focus(None);
                 self.open_box(Compose::New(Box::new(comment)), Writes::File, "");
@@ -3593,6 +3876,14 @@ impl App {
     /// `esc` saves it and focuses its thread, and this takes it from there.
     fn comment_in_editor(&mut self) -> Option<Action> {
         if !self.can_comment() {
+            return None;
+        }
+        if self
+            .doc
+            .focused()
+            .is_some_and(|t| matches!(t.at, comments::At::Conversation { .. }))
+        {
+            self.message("the conversation is read-only here for now; o opens it on the host");
             return None;
         }
         let focused = self.doc.focused().map(|t| {
@@ -3617,11 +3908,9 @@ impl App {
         Some(Action::Compose(text))
     }
 
-    /// A key while a thread is focused: `r` replies, `e` edits your last
-    /// draft in it, `x` resolves or reopens it, `d` twice deletes your last
-    /// draft (the thread, when that's its first comment), `o` opens it on
-    /// its host and `esc` leaves it. `Err` for other keys, which act as
-    /// they would without the focus. `deleting` after a first `d`.
+    /// A key while a thread is focused. `Err` for keys it doesn't take,
+    /// which act as they would without the focus; `deleting` after a first
+    /// `d`.
     fn thread_key(&mut self, key: Key, mods: Mods, deleting: bool) -> Result<Option<Action>, ()> {
         let thread = self
             .doc
@@ -3630,16 +3919,23 @@ impl App {
             .ok_or(())?
             .clone();
         let draft = thread.notes.iter().rev().find(|n| !n.posted());
+        let general = matches!(thread.at, comments::At::Conversation { .. });
         match key {
+            // The selection ends below; the focus stays for the next `esc`.
+            Key::Esc if self.doc.note_selection.is_some() => {}
             Key::Esc => self.doc.set_focus(None),
+            Key::Char('r' | 'x') if general => {
+                self.message("the conversation is read-only here for now; o opens it on the host");
+            }
             Key::Char('r') => {
-                let warning = (self.naming.as_ref())
+                let warning = self
+                    .naming
+                    .as_ref()
                     .and_then(|n| n.outdated_reply_warning.as_deref())
                     .filter(|_| thread.outdated && !self.warned_outdated);
                 if let Some(warning) = warning {
-                    let note = format!("outdated: {}", escape(warning.as_bytes()));
                     self.warned_outdated = true;
-                    self.message(note);
+                    self.message(format!("outdated: {}", escape(warning.as_bytes())));
                 }
                 let root = thread.root.clone();
                 self.open_box(Compose::Reply(root.clone()), Writes::Reply(root), "");
@@ -3702,10 +3998,10 @@ impl App {
             },
             _ => return Err(()),
         }
+        self.doc.note_selection = None;
         Ok(None)
     }
 
-    /// An action on the review's comments.
     fn comment_action(&mut self, action: Act) -> Option<Action> {
         match action {
             Act::Comment => self.comment(),
@@ -3795,8 +4091,7 @@ impl App {
             return;
         };
         let on = !self.tree.commented();
-        let paths = on.then(|| comments.paths());
-        self.tree.set_commented(paths);
+        self.tree.set_commented(on.then(|| comments.paths()));
         self.close_panel();
         if on {
             self.focus_tree();
@@ -3871,7 +4166,15 @@ impl App {
         self.doc.selection = None;
         self.thread_pending = None;
         self.doc.peek(Some(root));
-        let Some(file) = comments.file_of(path.as_bytes()) else {
+        // A general comment is on the conversation page, the first entry.
+        let page = (self.doc.document.files().first())
+            .is_some_and(view::Entry::is_page)
+            .then_some(0);
+        let Some(file) = (if path.is_empty() {
+            page
+        } else {
+            comments.file_of(path.as_bytes())
+        }) else {
             self.doc.set_focus(None);
             self.message(if self.enumerating {
                 "still listing files; its file isn't here yet".to_owned()
@@ -3929,7 +4232,7 @@ impl App {
                 change: files[file].change().clone(),
                 piped: match &files[file].source() {
                     Source::Piped(piped) => Some(Arc::clone(piped)),
-                    Source::Repo | Source::Commit(_) => None,
+                    Source::Repo | Source::Commit(_) | Source::Page { .. } => None,
                 },
             })
         };
@@ -4022,7 +4325,7 @@ impl App {
                 change: files[file].change().clone(),
                 piped: match &files[file].source() {
                     Source::Piped(piped) => Some(Arc::clone(piped)),
-                    Source::Repo | Source::Commit(_) => None,
+                    Source::Repo | Source::Commit(_) | Source::Page { .. } => None,
                 },
                 needle: Arc::clone(&search.needle),
                 id: search.id,
@@ -4163,7 +4466,7 @@ impl App {
             || self.menu.is_some();
         self.sync_threads();
         self.doc.now = now();
-        let unsent = self.unsent();
+        let unsent = self.posting.is_some().then(|| self.unsent());
         let held_waits = self.keys_elsewhere();
         let (tree_top, tree_rows) = self.tree_rows();
         let picker_top = self.picker_top();
@@ -4250,7 +4553,9 @@ impl App {
         if let Some(picker) = &mut self.reviews {
             picker.draw(grid, &self.theme);
         }
-        if let (Some(dialog), Some(mode)) = (&mut self.posting, &self.reviewing) {
+        if let (Some(dialog), Some(mode), Some(unsent)) =
+            (&mut self.posting, &self.reviewing, unsent)
+        {
             dialog.draw(grid, &self.theme, mode, unsent);
         }
         if let (Some(held), Some(mode), false) = (&self.held, &self.reviewing, held_waits) {
@@ -4478,7 +4783,11 @@ fn heading(app: &App) -> Option<Heading> {
             !commit && !matches!(entry.change().status, Status::Untracked | Status::Unmerged)
         })
         .map(crate::render::stat::staging_word);
-    let path = escape(&entry.change().path);
+    let path = if entry.is_page() {
+        "Conversation".to_owned()
+    } else {
+        escape(&entry.change().path)
+    };
     let (dir, name) = match path.rfind('/') {
         Some(i) => (path[..=i].to_owned(), path[i + 1..].to_owned()),
         None => (String::new(), path.clone()),
@@ -4492,6 +4801,14 @@ fn heading(app: &App) -> Option<Heading> {
         }));
     }
     let dim = |text: &str| (text.to_owned(), Role::Dim);
+    if entry.is_page() {
+        return Some(Heading::File(Title {
+            head: Vec::new(),
+            flex: (path, Role::Plain, Cut::Right),
+            name: (String::new(), Role::Plain),
+            tail: Vec::new(),
+        }));
+    }
     if let Source::Commit(c) = &entry.source() {
         let (head, subject) = match &c.id {
             Some(id) => (
@@ -8616,6 +8933,180 @@ mod tests {
         (app.doc.document.pos.file, focused.unwrap_or_default())
     }
 
+    /// `json` with general comments, on the review rather than a file, as
+    /// a review plugin imports them: the description last in the file and
+    /// the others out of date order.
+    fn with_conversation(json: &str) -> String {
+        let general = [
+            r#"{"id":"c2","text":"Is this ready?","author":"hubot","created":"2026-11-16T09:00:00Z","ref":"h:2","kind":"comment"}"#,
+            r#"{"id":"r1","text":"Looks good, one question inline.","author":"octocat","created":"2026-11-16T12:00:00Z","ref":"h:3","kind":"review","label":"approved","url":"https://example.com/7#review-1"}"#,
+            r#"{"id":"c1","text":"Thanks for looking.","author":"","created":"2026-11-15T10:00:00Z","ref":"h:1","kind":"comment"}"#,
+            r#"{"id":"d1","text":"Spells out five.\n\nThe count was off by one.","author":"ana","created":"2026-11-15T12:00:00Z","ref":"h:0","kind":"description"}"#,
+        ];
+        json.replacen(
+            r#""comments":["#,
+            &format!(r#""comments":[{},"#, general.join(",")),
+            1,
+        )
+    }
+
+    /// [`reviewed`] with general comments too.
+    fn conversing(dir: &tempfile::TempDir, (width, height): (usize, usize)) -> (App, PathBuf) {
+        let (mut app, path) = commented(dir);
+        std::fs::write(&path, with_conversation(&review_json("src/zz9.rs"))).expect("write");
+        let prepare = app.start_review("test".to_owned(), session(dir, HEAD, None));
+        said(&mut app, prepare, Said::Done(Ok(())));
+        app.resize(width, height);
+        screen(&mut app);
+        // After the conversation, first.
+        let far = 12;
+        assert_eq!(app.doc.document.files()[far].change().path, "src/zz9.rs");
+        app.event(Event::Diffed(Done::Diff {
+            file: far,
+            version: app.version(far),
+            result: Ok(Box::new(loaded(diff("src/zz9.rs")))),
+        }));
+        (app, path)
+    }
+
+    /// A review session with general comments has a Conversation first in
+    /// the tree, counted there and not as threads; the files keep their
+    /// place around it, and it goes with the last general comment. A local
+    /// review shows none: nothing there comes from a host.
+    #[test]
+    fn the_conversation_comes_first_in_a_review_with_general_comments() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (mut app, path) = commented(&dir);
+        std::fs::write(&path, with_conversation(&review_json("src/zz9.rs"))).expect("write");
+        app.event(Event::Comments);
+        app.resize(160, 30);
+        let local = screen(&mut app);
+        assert!(!app.doc.document.files()[0].is_page(), "{local}");
+        assert!(
+            !local.contains("Conversation") && local.contains("6 threads ─"),
+            "{local}"
+        );
+
+        app.doc.goto_file(3);
+        let on = app.doc.document.files()[3].change().path.clone();
+        let built = comments::conversed_count();
+        let prepare = app.start_review("test".to_owned(), session(&dir, HEAD, None));
+        said(&mut app, prepare, Said::Done(Ok(())));
+        let shown = screen(&mut app);
+        assert!(app.doc.document.files()[0].is_page());
+        let file = app.doc.document.pos.file;
+        assert_eq!(
+            (file, &app.doc.document.files()[file].change().path),
+            (4, &on),
+            "on its file still"
+        );
+        let first = shown.lines().nth(1).unwrap_or_default();
+        assert!(
+            first.contains("≡ Conversation") && first.contains(" 4 "),
+            "{shown}"
+        );
+        assert!(shown.contains("6 threads · 5 drafts"), "{shown}");
+        assert_eq!(
+            comments::conversed_count(),
+            built,
+            "nothing made until it shows"
+        );
+
+        std::fs::write(&path, review_json("src/zz9.rs")).expect("write");
+        app.event(Event::Comments);
+        let shown = screen(&mut app);
+        assert!(!app.doc.document.files()[0].is_page(), "{shown}");
+        let file = app.doc.document.pos.file;
+        assert_eq!(
+            (file, &app.doc.document.files()[file].change().path),
+            (3, &on)
+        );
+    }
+
+    /// The Conversation shows the review's title, then its description and
+    /// the other general comments by date, each in a thread's box with its
+    /// kind and label. Its comments are made once, however it scrolls, and
+    /// they're read-only.
+    #[test]
+    fn the_conversation_page_shows_the_title_then_each_comment_by_date() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (mut app, path) = conversing(&dir, (72, 40));
+        let written = std::fs::read(&path).expect("read");
+        let built = comments::conversed_count();
+        app.open(0);
+        insta::assert_snapshot!("conversation_page", screen(&mut app));
+        assert_eq!(comments::conversed_count(), built + 1);
+        for _ in 0..6 {
+            key(&mut app, 'j');
+            screen(&mut app);
+        }
+        key(&mut app, 'g');
+        screen(&mut app);
+        assert_eq!(comments::conversed_count(), built + 1, "made once");
+
+        key(&mut app, 'm');
+        assert_eq!(at(&app), (0, "d1".to_owned()));
+        key(&mut app, 'r');
+        assert!(status(&mut app).contains("read-only"));
+        assert!(app.doc.writing.is_none());
+        key(&mut app, ' ');
+        assert_eq!(press(&mut app, Key::Char('E')), None, "nor in the editor");
+        assert!(app.composing.is_none());
+        assert_eq!(std::fs::read(&path).expect("read"), written);
+    }
+
+    /// On the Conversation, with no code and no gutter, a drag in a comment
+    /// copies its Markdown as on a file's thread, across its paragraphs.
+    #[test]
+    fn a_drag_on_the_conversation_copies_a_comment() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (mut app, _) = conversing(&dir, (72, 40));
+        app.open(0);
+        let (x, y) = cell_of(&mut app, "five.");
+        let (tx, ty) = cell_of(&mut app, "count");
+        app.event(Event::Input(Input::Click { x, y }));
+        app.event(Event::Input(Input::Drag { x: tx + 4, y: ty }));
+        assert_eq!(
+            app.event(Event::Input(Input::Release { x: tx + 4, y: ty })),
+            Some(copied("five.\n\nThe count", "copied 16 chars of a comment"))
+        );
+    }
+
+    /// The comments panel lists the general comments first, apart from the
+    /// files' threads, which alone its title counts; picking one shows it
+    /// on the Conversation.
+    #[test]
+    fn the_comments_panel_lists_the_conversation_first() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (mut app, _) = conversing(&dir, (130, 30));
+        key(&mut app, 'i');
+        let listed = left(&mut app);
+        let lines: Vec<&str> = listed.lines().collect();
+        assert!(
+            lines[0].starts_with("┌ Comments · 6 threads · 5 open ─"),
+            "{listed}"
+        );
+        assert!(
+            lines[1].contains("Conversation") && lines[1].trim_end().ends_with("4 │"),
+            "{listed}"
+        );
+        let order: Vec<usize> = ["Spells out", "Thanks for", "Is this ready", "Loo"]
+            .iter()
+            .map(|t| lines.iter().position(|l| l.contains(t)).expect(t))
+            .collect();
+        assert!(order.is_sorted(), "{listed}");
+        assert!(lines[order[3]].contains("review approved"), "{listed}");
+        assert!(lines[order[3] + 1].contains(FILE.rsplit('/').next().expect("a name")));
+        key(&mut app, 'g');
+        assert_eq!(at(&app), (0, "d1".to_owned()));
+        key(&mut app, 'f');
+        let open = left(&mut app);
+        assert!(
+            !open.contains("Conversation"),
+            "the filters keep threads: {open}"
+        );
+    }
+
     /// `i` turns the left panel to the comment threads, showing it when
     /// it's hidden, with the keys, and back to the files; its title says
     /// which. Nothing of the list is made while the files show, however
@@ -9446,6 +9937,8 @@ mod tests {
                 "Delete draft d",
                 "Resolve x",
                 "Fold z",
+                "Copy comment",
+                "Copy thread",
             ]
         );
         choose(&mut app, "Edit draft");
@@ -9473,7 +9966,14 @@ mod tests {
         right_click(&mut app, "Fifty?");
         assert_eq!(
             menu_rows(&app),
-            ["Reply r", "Resolve x", "Unfold z", "Open on host o"]
+            [
+                "Reply r",
+                "Resolve x",
+                "Unfold z",
+                "Open on host o",
+                "Copy comment",
+                "Copy thread"
+            ]
         );
         let opened = choose(&mut app, "Open on host");
         assert_eq!(opened, press(&mut app, Key::Char('o')));
@@ -9484,6 +9984,144 @@ mod tests {
                 .comments
                 .iter()
                 .any(|c| c.id == "p1" && c.resolved)
+        );
+    }
+
+    /// A viewer of [`app`]'s file with a thread on its new line 2: ana's
+    /// comment in Markdown, then your reply.
+    fn marked(dir: &tempfile::TempDir, config: &Config) -> App {
+        let mut app = app_of(config, "working tree", diff(FILE), (100, 30));
+        let path = dir.path().join("comments.json");
+        let json = format!(
+            r#"{{"version":1,"comments":[{{"id":"d1","path":"{FILE}","side":"new","start":{{"old":null,"new":2}},"end":{{"old":null,"new":2}},"text":"Use **two blockers** at `03f1ba`.\n\n- [x] tests pass","author":"ana","created":"2026-11-17T10:00:00Z","anchor":{{"before":[],"lines":["line 2"],"after":[]}}}},{{"id":"d2","path":"{FILE}","text":"Because.","author":"","created":"2026-11-17T11:00:00Z","in_reply_to":"d1"}}]}}"#
+        );
+        std::fs::write(&path, json).expect("write");
+        app.set_comments(path);
+        app
+    }
+
+    const MARKED: &str = "Use **two blockers** at `03f1ba`.\n\n- [x] tests pass";
+
+    fn copied(text: &str, note: &str) -> Action {
+        Action::Copy {
+            text: text.as_bytes().to_vec(),
+            note: note.to_owned(),
+        }
+    }
+
+    /// A drag in a comment selects its text by characters and copies the
+    /// Markdown it was drawn from when let go. Past the comment it stops at
+    /// the comment's end, not in the reply below. Neither the drag nor the
+    /// frames it draws render the comment again.
+    #[test]
+    fn a_drag_in_a_comment_copies_its_markdown() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut app = marked(&dir, &Config::default());
+        let (x, y) = cell_of(&mut app, "two");
+        let to = cell_of(&mut app, "blockers").0 + 7;
+        let rendered = crate::tui::markdown::rendered_count();
+        app.event(Event::Input(Input::Click { x, y }));
+        for x in x + 1..=to {
+            app.event(Event::Input(Input::Drag { x, y }));
+            app.draw();
+        }
+        let done = app.event(Event::Input(Input::Release { x: to, y }));
+        app.draw();
+        assert_eq!(
+            crate::tui::markdown::rendered_count(),
+            rendered,
+            "no comment rendered again"
+        );
+        assert_eq!(
+            done,
+            Some(copied("**two blockers**", "copied 16 chars of a comment"))
+        );
+        assert_eq!(app.doc.focused().map(|t| t.root.as_str()), Some("d1"));
+
+        let (rx, ry) = cell_of(&mut app, "Because.");
+        app.event(Event::Input(Input::Click { x, y }));
+        app.event(Event::Input(Input::Drag { x: rx, y: ry }));
+        assert_eq!(
+            app.event(Event::Input(Input::Release { x: rx, y: ry })),
+            Some(copied(
+                "**two blockers** at `03f1ba`.\n\n- [x] tests pass",
+                "copied 47 chars of a comment"
+            ))
+        );
+    }
+
+    /// A click in a comment focuses its thread and copies nothing; a
+    /// double click copies the word, a triple click the whole comment as
+    /// written. A click on the thread's top line still folds it.
+    #[test]
+    fn clicks_in_a_comment_copy_a_word_or_the_comment() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut app = marked(&dir, &Config::default());
+        let (x, y) = cell_of(&mut app, "blockers");
+        let click = |app: &mut App| {
+            app.event(Event::Input(Input::Click { x, y }));
+            app.event(Event::Input(Input::Release { x, y }))
+        };
+        assert_eq!(click(&mut app), None);
+        assert_eq!(app.doc.focused().map(|t| t.root.as_str()), Some("d1"));
+        assert!(!app.doc.fold.collapsed("d1"));
+        let word = Some(copied("blockers", "copied 8 chars of a comment"));
+        assert_eq!(click(&mut app), word);
+        assert_eq!(press(&mut app, Key::Char('y')), word, "y copies it again");
+        assert_eq!(click(&mut app), Some(copied(MARKED, "copied a comment")));
+        key(&mut app, 'j');
+        assert!(app.doc.note_selection.is_none(), "another key ends it");
+        let (x, y) = cell_of(&mut app, "▾ ana");
+        app.event(Event::Input(Input::Click { x, y }));
+        app.event(Event::Input(Input::Release { x, y }));
+        assert!(app.doc.fold.collapsed("d1"));
+    }
+
+    /// A drag that starts on code selects code, even when it goes on into a
+    /// comment.
+    #[test]
+    fn a_drag_from_code_into_a_comment_copies_code() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut app = marked(&dir, &Config::default());
+        let (x, y) = cell_of(&mut app, "line 2");
+        let (cx, cy) = cell_of(&mut app, "two");
+        app.event(Event::Input(Input::Click { x, y }));
+        app.event(Event::Input(Input::Drag { x: x + 5, y }));
+        app.event(Event::Input(Input::Drag { x: cx, y: cy }));
+        assert_eq!(
+            app.event(Event::Input(Input::Release { x: cx, y: cy })),
+            Some(copied("line 2", "copied 6 chars"))
+        );
+    }
+
+    /// On a thread the menu also copies the comment right-clicked as it was
+    /// written, and the whole thread, each comment under its author and
+    /// date. They have no keys unless bound, and bound, show them.
+    #[test]
+    fn the_menu_of_a_thread_copies_a_comment_or_the_thread() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut config = Config::default();
+        config.apply_source("keybind = alt+c=copy_thread\n", &mut Vec::new());
+        let mut app = marked(&dir, &config);
+        right_click(&mut app, "Because.");
+        assert_eq!(
+            menu_rows(&app)[menu_rows(&app).len() - 2..],
+            ["Copy comment", "Copy thread alt+c"]
+        );
+        assert_eq!(
+            choose(&mut app, "Copy comment"),
+            Some(copied("Because.", "copied a comment"))
+        );
+        assert_eq!(
+            choose_again(&mut app, "two", "Copy comment"),
+            Some(copied(MARKED, "copied a comment"))
+        );
+        let thread = format!("ana · 2026-11-17\n{MARKED}\n\nyou · 2026-11-17\nBecause.");
+        let whole = Some(copied(&thread, "copied a thread of 2 comments"));
+        assert_eq!(choose_again(&mut app, "Because.", "Copy thread"), whole);
+        assert_eq!(
+            app.event(Event::Input(Input::Key(Key::Char('c'), Mods::ALT))),
+            whole
         );
     }
 
@@ -9670,9 +10308,6 @@ mod tests {
         assert_eq!(typed.as_deref(), Some("fifty"));
     }
 
-    /// When another program changes the file, its threads are placed again
-    /// and its notice shows.
-    /// Whether `root`'s thread is placed on [`FILE`].
     fn placed(app: &App, root: &str) -> bool {
         (app.comments.as_ref())
             .and_then(|c| c.threads(FILE.as_bytes()))

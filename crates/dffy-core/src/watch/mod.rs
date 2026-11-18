@@ -137,7 +137,7 @@ impl Root {
             _ => Path::new("."),
         };
         let worktree = dir.canonicalize()?;
-        // Never watched or read, as in `plain`.
+        // A placeholder: a plain root never watches or reads it.
         let git_dir = worktree.join(".git");
         Ok(Self {
             common_dir: git_dir.clone(),

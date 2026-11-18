@@ -358,8 +358,7 @@ fn an_exit_without_an_error_line_is_worded() {
     );
 }
 
-/// Killing a run kills what it started too, and the run still ends with
-/// its `Done`.
+/// A killed run still ends with its `Done`.
 #[test]
 fn a_killed_run_takes_what_it_started_along() {
     let dir = tempfile::tempdir().expect("tempdir");

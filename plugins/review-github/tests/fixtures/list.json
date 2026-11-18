@@ -8,6 +8,7 @@
 {"number":11,"title":"Document the cache","url":"https://github.com/acme/widgets/pull/11","headRefName":"docs","author":{"login":"ada"}}
 ]},
 "repository":{"pullRequests":{"nodes":[
-{"number":7,"title":"Spell out five","url":"https://github.com/acme/widgets/pull/7","headRefName":"five","author":{"login":"octocat"}}
+{"number":12,"title":"A fork's five","url":"https://github.com/acme/widgets/pull/12","headRefName":"five","author":{"login":"forker"},"isCrossRepository":true,"headRepositoryOwner":{"login":"forker"}},
+{"number":7,"title":"Spell out five","url":"https://github.com/acme/widgets/pull/7","headRefName":"five","author":{"login":"octocat"},"isCrossRepository":false,"headRepositoryOwner":{"login":"acme"}}
 ]}}
 }}

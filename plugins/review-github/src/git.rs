@@ -9,8 +9,8 @@ use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 
 use serde_json::{Value, json};
 
-/// Lines of context an anchor keeps on each side; dffy's own anchors keep
-/// as many, and placement compares them whole.
+/// Lines of context an anchor keeps on each side. Must match dffy's own
+/// anchors: placement compares them whole.
 const CONTEXT: usize = 2;
 
 pub(crate) fn git(args: &[&str]) -> Result<String, String> {
@@ -31,17 +31,12 @@ pub(crate) fn git(args: &[&str]) -> Result<String, String> {
     Ok(String::from_utf8_lossy(&out.stdout).trim_end().to_owned())
 }
 
-pub(crate) fn has_commit(oid: &str) -> bool {
-    git(&["cat-file", "-e", &format!("{oid}^{{commit}}")]).is_ok()
-}
-
 /// Where a fetched PR head is kept. A ref rather than `FETCH_HEAD`, so the
 /// next fetch doesn't drop it and gc doesn't prune it before a reopen.
 pub(crate) fn pull_ref(pr: u64) -> String {
     format!("refs/dffy/pull/{pr}")
 }
 
-/// Fetches the heads of `prs` from origin in one fetch.
 pub(crate) fn fetch_pulls(prs: &[u64]) -> Result<(), String> {
     let specs: Vec<String> = prs
         .iter()
@@ -52,18 +47,24 @@ pub(crate) fn fetch_pulls(prs: &[u64]) -> Result<(), String> {
     git(&args).map(drop)
 }
 
-/// Fetches `commits` from origin by oid, onto no ref, in one fetch. One
-/// origin doesn't have fails the whole fetch, naming it, so it's fetched
-/// again without those named, once for each. Whether any arrived.
+/// Fetches `commits` from origin by oid, onto no ref. A commit origin
+/// lacks fails the whole fetch and git names it, so the fetch retries
+/// without the named ones. Returns whether any arrived.
 pub(crate) fn fetch_commits(commits: &[&str]) -> bool {
     let mut wanted = commits.to_vec();
     while !wanted.is_empty() {
-        let mut args = vec!["fetch", "--quiet", "--no-tags", "origin"];
+        let mut args = vec![
+            "fetch",
+            "--quiet",
+            "--no-tags",
+            "--end-of-options",
+            "origin",
+        ];
         args.extend(&wanted);
         let Err(e) = git(&args) else {
             return true;
         };
-        // git's message, past the command, which names every oid.
+        // Past the echoed command, which names every oid.
         let said = e.split_once(": ").map_or("", |(_, said)| said);
         let before = wanted.len();
         wanted.retain(|c| !said.contains(c));
@@ -121,6 +122,78 @@ impl Remote {
     }
 }
 
+/// Which of origin's PRs a branch is the head of.
+pub(crate) enum Head {
+    Pull(u64),
+    /// From the branch called `name` of origin, or of a fork of
+    /// `fork_owner`'s.
+    Branch {
+        name: String,
+        fork_owner: Option<String>,
+    },
+}
+
+impl Head {
+    /// What `gh pr checkout` set `branch` to track: the PR's own ref when
+    /// you can't push to the fork, else the fork's branch, by the fork's
+    /// URL or a remote of it, under a local name that may not be the
+    /// branch's (`<owner>/main` for a fork's default branch). Without an
+    /// upstream, the branch of origin's with its name.
+    pub(crate) fn of(branch: &str, origin: &Remote) -> Self {
+        let config = |key: &str| git(&["config", "--get", &format!("branch.{branch}.{key}")]).ok();
+        let own = |name: &str| Self::Branch {
+            name: name.to_owned(),
+            fork_owner: None,
+        };
+        let Some(merge) = config("merge") else {
+            return own(branch);
+        };
+        if let Some(pr) = merge
+            .strip_prefix("refs/pull/")
+            .and_then(|r| r.strip_suffix("/head")?.parse().ok())
+        {
+            return Self::Pull(pr);
+        }
+        // `.` is a local branch, which says nothing of a PR.
+        let (Some(name), Some(remote)) = (
+            merge.strip_prefix("refs/heads/"),
+            config("remote").filter(|r| r != "."),
+        ) else {
+            return own(branch);
+        };
+        if remote == "origin" {
+            return own(name);
+        }
+        let url = git(&["remote", "get-url", &remote]).unwrap_or(remote);
+        match Remote::parse(&url) {
+            Some(r) if r == *origin => own(name),
+            Some(r) => Self::Branch {
+                name: name.to_owned(),
+                fork_owner: Some(r.owner),
+            },
+            None => own(branch),
+        }
+    }
+
+    /// Whether a PR from a branch of this name is this one, by whether
+    /// it's a fork's, and whose, as GitHub or a session says.
+    pub(crate) fn owns(&self, cross_repository: &Value, owner: &Value) -> bool {
+        match self {
+            Self::Pull(_) => false,
+            Self::Branch {
+                fork_owner: None, ..
+            } => cross_repository != true,
+            Self::Branch {
+                fork_owner: Some(fork),
+                ..
+            } => {
+                cross_repository == true
+                    && owner.as_str().is_some_and(|o| o.eq_ignore_ascii_case(fork))
+            }
+        }
+    }
+}
+
 /// Files at commits, read through one `git cat-file --batch`, and merge
 /// bases, both cached for a run.
 #[derive(Default)]
@@ -144,16 +217,17 @@ impl Source {
         self.files.get(&spec)?.as_deref()
     }
 
-    /// Whether git has the commit `oid`, asked of the same `cat-file`.
-    /// Not cached: a fetch can bring it, and it's asked only after a read
-    /// at it failed.
+    /// Asks the same `cat-file`, which sees what a fetch brings after it
+    /// started. Not cached, for that reason.
     pub(crate) fn has_commit(&mut self, oid: &str) -> bool {
         self.read(&format!("{oid}^{{commit}}")).is_some()
     }
 
     /// The type and content of the object `spec` names.
     fn read(&mut self, spec: &str) -> Option<(String, Vec<u8>)> {
-        if self.batch.is_none() {
+        let (_, stdin, stdout) = if let Some(batch) = &mut self.batch {
+            batch
+        } else {
             let mut child = Command::new("git")
                 .args(["cat-file", "--batch"])
                 .stdin(Stdio::piped())
@@ -163,9 +237,8 @@ impl Source {
                 .ok()?;
             let stdin = child.stdin.take()?;
             let stdout = BufReader::new(child.stdout.take()?);
-            self.batch = Some((child, stdin, stdout));
-        }
-        let (_, stdin, stdout) = self.batch.as_mut()?;
+            self.batch.insert((child, stdin, stdout))
+        };
         writeln!(stdin, "{spec}")
             .and_then(|()| stdin.flush())
             .ok()?;
@@ -184,7 +257,7 @@ impl Source {
     pub(crate) fn merge_base(&mut self, base: &str, commit: &str) -> Option<String> {
         self.merge_bases
             .entry(format!("{base} {commit}"))
-            .or_insert_with(|| git(&["merge-base", base, commit]).ok())
+            .or_insert_with(|| git(&["merge-base", "--end-of-options", base, commit]).ok())
             .clone()
     }
 }
@@ -235,7 +308,9 @@ pub(crate) fn hunks(
         "--no-color",
         "--no-ext-diff",
         "--no-textconv",
+        "--end-of-options",
         &format!("{base}...{head}"),
+        "--",
     ])?;
     Ok(parse_hunks(&diff))
 }

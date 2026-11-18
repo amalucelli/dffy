@@ -29,7 +29,8 @@ use dffy_core::git::{FileDiff, Update};
 use dffy_core::patch;
 use dffy_core::view::{Arrangement, Attributes, HunkHeader, Row, display_text};
 
-use super::comments::{self, At, Look, Thread, Writes, Writing};
+use super::comments::{self, At, Look, NoteRows, Thread, Writes, Writing};
+use super::markdown;
 use super::piped::Body;
 use crate::pager;
 use crate::render::{Canvas, Layout};
@@ -122,6 +123,35 @@ pub(crate) enum Hit {
     },
     /// The line numbers and marks left of a line's code.
     Gutter { pos: Pos, side: Side, line: usize },
+    /// A comment's rendered text: thread `thread` of the file's threads,
+    /// its comment `note`, and what [`markdown::SourceMap::at`] gives for
+    /// the cell, in the comment's Markdown.
+    Note {
+        thread: usize,
+        note: usize,
+        bytes: Range<usize>,
+    },
+}
+
+/// Text selected in a comment, held as its Markdown: from the source the
+/// cell pressed stands for to the one under the pointer, as a selection by
+/// characters over code runs. In source terms, it outlives the box being
+/// drawn again at another width.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct NoteSelection {
+    root: String,
+    note: String,
+    anchor: Range<usize>,
+    cursor: Range<usize>,
+    /// A double click's word, copied as it is rather than widened over
+    /// the markup of an element it fills.
+    word: bool,
+}
+
+impl NoteSelection {
+    fn range(&self) -> Range<usize> {
+        self.anchor.start.min(self.cursor.start)..self.anchor.end.max(self.cursor.end)
+    }
 }
 
 /// A copied selection, for the status bar.
@@ -150,7 +180,7 @@ pub(crate) enum Block {
 
 /// What [`Doc::render`] wrote for a row: whether it's a gap's separator,
 /// and how many of its screen rows are code; its blocks' follow.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct Rows {
     separator: bool,
     code: usize,
@@ -160,7 +190,7 @@ struct Rows {
 
 /// A folded thread's row: which of its row's screen rows it is, the
 /// columns inside its sides, and whether it has the focus.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug)]
 struct Card {
     row: usize,
     columns: Range<usize>,
@@ -250,6 +280,7 @@ impl Fold {
     fn learn(&mut self, threads: &[Thread]) {
         self.defaults = threads
             .iter()
+            .filter(|t| !matches!(t.at, At::Conversation { .. }))
             .map(|t| {
                 let quiet =
                     t.resolved || (t.outdated && t.notes.iter().all(comments::Note::posted));
@@ -290,6 +321,34 @@ pub(crate) struct Context {
     pub heading: String,
 }
 
+/// A thread's box at one width. The focus and the ages don't change it:
+/// they're in a border's one row.
+#[derive(Default)]
+struct Boxed {
+    width: usize,
+    /// Its rows open and folded, once counted.
+    rows: [Option<usize>; 2],
+    /// Its comments' text as drawn open, once it has been.
+    bodies: Option<Vec<markdown::Body>>,
+    /// Where each comment is in the box as last drawn open, without the
+    /// text box in it.
+    notes: Option<Vec<NoteRows>>,
+}
+
+impl Boxed {
+    /// Thread `i`'s box in `boxes`, emptied when it was another width.
+    fn at(boxes: &mut HashMap<usize, Self>, i: usize, width: usize) -> &mut Self {
+        let this = boxes.entry(i).or_default();
+        if this.width != width {
+            *this = Self {
+                width,
+                ..Self::default()
+            };
+        }
+        this
+    }
+}
+
 pub(crate) struct Doc {
     pub document: Document<Body>,
     pub layout: Layout,
@@ -313,17 +372,18 @@ pub(crate) struct Doc {
     /// rows only when drawn there again.
     painted: Option<(usize, usize, usize)>,
     pub selection: Option<Selection>,
+    pub note_selection: Option<NoteSelection>,
     /// The comment threads placed on `threads_file`, the file shown.
     threads: Arc<[Thread]>,
     threads_file: usize,
     /// Each thread on a line, by the side's index and its last line.
     by_line: HashMap<(usize, usize), Vec<usize>>,
-    /// Rows of each thread's box by its index, the box's width and whether
-    /// it's folded, so a row's height doesn't wrap the box's text again.
-    /// The focus and the ages don't change them: they're in a border's one
-    /// row. Emptied only when the threads are replaced, so it grows by a
-    /// width per thread at each resize until then.
-    box_rows: HashMap<(usize, usize, bool), usize>,
+    /// Each thread's box by its index, at the width it was last drawn at,
+    /// so neither a row's height nor a frame renders its text again.
+    /// Emptied when the threads are replaced.
+    box_rows: HashMap<usize, Boxed>,
+    /// Fenced code in comments is highlighted.
+    highlight: bool,
     pub fold: Fold,
     /// The root of the thread `m`, `M` or a click focused.
     focus: Option<String>,
@@ -331,12 +391,16 @@ pub(crate) struct Doc {
     pub writing: Option<Writing>,
     /// Seconds since 1970, for the threads' ages.
     pub now: u64,
-    /// The last frame drew rows of a thread or the text box, which the
-    /// next frame doesn't copy: what they show changes without the rows
-    /// above them moving.
-    blocks_drawn: bool,
+    /// The `now` at which rows of a thread or the text box on screen were
+    /// drawn, since the last frame drawn whole. What they show changes
+    /// without the rows above them moving, so the next frame copies them
+    /// only at the same `now`, their ages unchanged; a change of focus or
+    /// of threads draws the next frame whole.
+    blocks_drawn: Option<u64>,
     /// The row a block was last found under, checked before it's used.
     found: Option<(Block, Pos)>,
+    /// What the conversation page's first row says: the review's title.
+    pub page_title: String,
 }
 
 impl Doc {
@@ -355,16 +419,19 @@ impl Doc {
             drawn: Vec::new(),
             painted: None,
             selection: None,
+            note_selection: None,
             threads: Arc::new([]),
             threads_file: 0,
             by_line: HashMap::new(),
             box_rows: HashMap::new(),
+            highlight: true,
             fold: Fold::default(),
             focus: None,
             writing: None,
             now: 0,
-            blocks_drawn: false,
+            blocks_drawn: None,
             found: None,
+            page_title: String::new(),
         }
     }
 
@@ -462,6 +529,38 @@ impl Doc {
             self.place(file, false);
         }
         self.normalize();
+    }
+
+    /// Puts the conversation page of `comments` comments first, or takes
+    /// it away with `None` (see [`Document::set_page`]). The selection and
+    /// the threads shown move with their files, and the next frame is drawn
+    /// whole. Returns how far the other entries moved.
+    pub(crate) fn set_page(&mut self, comments: Option<usize>) -> isize {
+        let page = comments.map(|n| {
+            let change = dffy_core::git::FileChange {
+                path: BString::default(),
+                status: dffy_core::git::Status::Modified,
+                old: None,
+                new: None,
+                staging: None,
+            };
+            (change, n + 1)
+        });
+        let moved = self.document.set_page(page);
+        if moved != 0 {
+            if let Some(s) = &mut self.selection {
+                s.anchor.file = s.anchor.file.saturating_add_signed(moved);
+                s.cursor.file = s.cursor.file.saturating_add_signed(moved);
+            }
+            self.threads_file = self.threads_file.saturating_add_signed(moved);
+            self.found = None;
+            self.target = None;
+            self.drawn.clear();
+            self.separators.clear();
+        }
+        self.painted = None;
+        self.normalize();
+        moved
     }
 
     /// Stores a worker's diff (see [`Document::load`]); a selection in the
@@ -591,20 +690,30 @@ impl Doc {
                     &line[..],
                 )
             }
-            Source::Repo => return None,
+            Source::Repo | Source::Page { .. } => return None,
         };
         Some((role, display_text(text).into()))
     }
 
     /// Row `row` of a sheet: a commit's lines, then how many files it has
-    /// and a row per file; or a combined diff's lines. Long lines are cut
-    /// and scroll sideways like code.
+    /// and a row per file; or a combined diff's lines; or the conversation
+    /// page's title, then a blank row over each comment's box. Long lines
+    /// are cut and scroll sideways like code.
     fn sheet_row(&self, file: usize, row: usize, c: &mut Canvas) {
         if let Some((role, line)) = self.sheet_text(file, row) {
             self.layout.text_row(role, &line, c);
             return;
         }
         let files = self.document.files();
+        if files[file].is_page() {
+            if row == 0 {
+                let title = display_text(self.page_title.as_bytes());
+                self.layout.text_row(Role::FileHeader, title, c);
+            } else {
+                c.end_line();
+            }
+            return;
+        }
         let Source::Commit(commit) = files[file].source() else {
             c.end_line();
             return;
@@ -759,8 +868,8 @@ impl Doc {
         (code + gaps + boxes).max(1)
     }
 
-    /// Screen rows of code the logical row at `pos` takes; the rest are
-    /// its blocks'.
+    /// Screen rows of code the logical row at `pos` takes, the rest being
+    /// its blocks'; `usize::MAX`, unmeasured, when it has no blocks.
     fn code_height(&mut self, pos: Pos, layout: &Layout) -> usize {
         if self.blocks(pos, layout).is_empty() {
             return usize::MAX;
@@ -779,7 +888,8 @@ impl Doc {
     }
 
     /// Takes `threads`, those of `file`, the file shown. Rows they hang
-    /// under change height, so the position is kept within its row.
+    /// under change height, so the position is kept within its row. Text
+    /// selected in a comment ends: its text may have changed under its id.
     pub(crate) fn set_threads(&mut self, file: usize, threads: Arc<[Thread]>) {
         let same = if threads.is_empty() {
             self.threads.is_empty()
@@ -799,10 +909,12 @@ impl Doc {
             }
         }
         self.box_rows.clear();
+        self.note_selection = None;
         self.fold.learn(&threads);
         self.threads = threads;
         self.threads_file = file;
         self.found = None;
+        self.painted = None;
         self.refit();
     }
 
@@ -841,6 +953,16 @@ impl Doc {
         };
         if pos.file != self.threads_file || (self.threads.is_empty() && new.is_none() && !on_file) {
             return Vec::new();
+        }
+        if self.on_page(pos.file) {
+            // Comment `i` hangs under row `i + 1`, the title being row 0.
+            return (pos.part == 0)
+                .then(|| pos.row.checked_sub(1))
+                .flatten()
+                .filter(|&i| i < self.threads.len())
+                .map(Block::Thread)
+                .into_iter()
+                .collect();
         }
         let threads = Arc::clone(&self.threads);
         let logical = Pos { offset: 0, ..pos };
@@ -888,9 +1010,8 @@ impl Doc {
             }
         }
         if logical.part + 1 == parts && threads.iter().any(|t| t.at == At::Lost) {
-            let part = parts - 1;
-            let rows = self.document.rows(pos.file, part, arrange(layout));
-            if (logical.part, logical.row) == (part, rows.saturating_sub(1)) {
+            let rows = self.document.rows(pos.file, logical.part, arrange(layout));
+            if logical.row == rows.saturating_sub(1) {
                 out.extend(
                     (0..threads.len())
                         .filter(|&i| threads[i].at == At::Lost)
@@ -899,6 +1020,17 @@ impl Doc {
             }
         }
         out
+    }
+
+    fn on_page(&self, file: usize) -> bool {
+        self.document.files().get(file).is_some_and(Entry::is_page)
+    }
+
+    /// Whether `block` is one of the conversation page's comments, drawn
+    /// across the pane and never folded.
+    fn in_conversation(&self, block: Block) -> bool {
+        matches!(block, Block::Thread(i)
+            if matches!(self.threads.get(i).map(|t| &t.at), Some(At::Conversation { .. })))
     }
 
     /// The lines of `side` the separator at `pos` hides; `None` when it
@@ -916,9 +1048,7 @@ impl Doc {
         Some(first + hides.start..first + hides.end)
     }
 
-    /// Appends `block`'s rows, hung under the row at `pos`: blank under
-    /// the gutter but for its rule, then the block's box from a cell into
-    /// the code's column to a cell before the pane's edge. In a split row a
+    /// Appends `block`'s rows, hung under the row at `pos`; in a split row a
     /// thread on a line takes its side's half. `gap` puts a blank row over
     /// it, to part it from the block above. Returns the row of a folded
     /// thread, counted in `c`.
@@ -931,7 +1061,8 @@ impl Doc {
         c: &mut Canvas,
     ) -> Option<Card> {
         let (start, gutter, boxed, old_half) = self.block_columns(block, pos, layout);
-        let mut rows = Canvas::default();
+        let mut rows = std::mem::take(&mut self.scratch);
+        rows.clear();
         if gap {
             rows.spaces(Role::Plain, boxed);
             rows.end_line();
@@ -939,17 +1070,21 @@ impl Doc {
         let left = start + gutter.saturating_sub(2) + 3;
         let card = self.block_box(block, boxed, &mut rows).map(|focused| Card {
             row: c.len() + usize::from(gap),
-            columns: left + 1..(left + boxed).saturating_sub(1),
+            columns: left + 1..left + boxed - 1,
             focused,
         });
+        // The conversation page has no code, so no gutter's rule.
+        let ruled = !self.in_conversation(block);
         for row in rows.rows() {
             if start > 0 {
                 c.spaces(Role::Plain, start - 1);
                 c.push(Role::Dim, "│");
             }
-            c.spaces(Role::Plain, gutter.saturating_sub(2));
-            c.push(Role::Dim, "│");
-            c.spaces(Role::Plain, 2);
+            if ruled {
+                c.spaces(Role::Plain, gutter.saturating_sub(2));
+                c.push(Role::Dim, "│");
+                c.spaces(Role::Plain, 2);
+            }
             for (ink, piece) in row {
                 c.push_ink(ink, piece);
             }
@@ -959,32 +1094,51 @@ impl Doc {
             }
             c.end_line();
         }
+        self.scratch = rows;
         card
     }
 
-    /// Screen rows of `block` hung under the row at `pos`.
     fn block_height(&mut self, block: Block, pos: Pos, layout: &Layout) -> usize {
         let (_, _, boxed, _) = self.block_columns(block, pos, layout);
         // The text box changes with every key, so a box holding it is
         // counted afresh.
         let key = match block {
-            Block::Thread(i) if !self.writes_in(i) => {
-                Some((i, boxed, self.fold.collapsed(&self.threads[i].root)))
-            }
+            Block::Thread(i) if !self.writes_in(i) => Some((i, usize::from(self.collapsed(i)))),
             _ => None,
         };
-        if let Some(&rows) = key.and_then(|k| self.box_rows.get(&k)) {
+        if let Some((i, folded)) = key
+            && let Some(rows) = Boxed::at(&mut self.box_rows, i, boxed).rows[folded]
+        {
             return rows;
         }
-        let mut c = Canvas::default();
+        let mut c = std::mem::take(&mut self.scratch);
+        c.clear();
         self.block_box(block, boxed, &mut c);
-        if let Some(k) = key {
-            self.box_rows.insert(k, c.len());
+        let rows = c.len();
+        self.scratch = c;
+        if let Some((i, folded)) = key {
+            Boxed::at(&mut self.box_rows, i, boxed).rows[folded] = Some(rows);
         }
-        c.len()
+        rows
     }
 
-    /// Whether the text box writes in thread `i`, a reply or an edit.
+    /// Highlights fenced code in comments, or stops; their boxes are drawn
+    /// again.
+    pub(crate) fn set_highlight(&mut self, on: bool) {
+        if self.highlight != on {
+            self.highlight = on;
+            for boxed in self.box_rows.values_mut() {
+                boxed.bodies = None;
+            }
+            self.painted = None;
+        }
+    }
+
+    /// Whether thread `i` shows folded; the conversation's never do.
+    fn collapsed(&self, i: usize) -> bool {
+        !self.in_conversation(Block::Thread(i)) && self.fold.collapsed(&self.threads[i].root)
+    }
+
     fn writes_in(&self, i: usize) -> bool {
         self.writing.as_ref().is_some_and(|w| match &w.at {
             Writes::Reply(root) | Writes::Edit { root, .. } => *root == self.threads[i].root,
@@ -1002,6 +1156,9 @@ impl Doc {
         layout: &Layout,
     ) -> (usize, usize, usize, bool) {
         let width = layout.width.unwrap_or(80);
+        if self.in_conversation(block) {
+            return (0, 0, width, false);
+        }
         let numbers = if layout.line_numbers {
             layout.digits
         } else {
@@ -1010,7 +1167,7 @@ impl Doc {
         let side = match block {
             Block::Thread(i) => match &self.threads[i].at {
                 At::Line { side, .. } => Some(*side),
-                At::File | At::Lost => None,
+                At::File | At::Lost | At::Conversation { .. } => None,
             },
             Block::New => match &self.writing {
                 Some(Writing {
@@ -1059,11 +1216,33 @@ impl Doc {
                 let threads = Arc::clone(&self.threads);
                 let thread = &threads[i];
                 let writes = self.writes_in(i);
-                let writing = self.writing.as_mut().filter(|_| writes);
+                let collapsed = self.collapsed(i);
                 let focused = writes || self.focus.as_deref() == Some(thread.root.as_str());
-                let collapsed = self.fold.collapsed(&thread.root);
-                comments::thread_rows(thread, (collapsed, focused), writing, (boxed, self.now), c)
-                    .then_some(focused)
+                let mut notes = Boxed::at(&mut self.box_rows, i, boxed)
+                    .notes
+                    .take()
+                    .unwrap_or_default();
+                let bodies: &[markdown::Body] = if collapsed && !writes {
+                    &[]
+                } else {
+                    let highlight = self.highlight;
+                    Boxed::at(&mut self.box_rows, i, boxed)
+                        .bodies
+                        .get_or_insert_with(|| comments::bodies(thread, boxed, highlight))
+                };
+                let writing = self.writing.as_mut().filter(|_| writes);
+                let card = comments::thread_rows(
+                    thread,
+                    bodies,
+                    (collapsed, focused),
+                    writing,
+                    (boxed, self.now),
+                    (c, &mut notes),
+                );
+                if !collapsed && !writes {
+                    Boxed::at(&mut self.box_rows, i, boxed).notes = Some(notes);
+                }
+                card.then_some(focused)
             }
             Block::New => {
                 if let Some(writing) = &mut self.writing {
@@ -1477,12 +1656,12 @@ impl Doc {
             self.separators.clear();
             self.drawn.clear();
             self.drawn.resize(self.height, None);
+            self.blocks_drawn = None;
             (None, 0..self.height, self.document.pos)
         };
         let kept = self.separators.len();
         let mut y = rows.start;
         let mut last = pos;
-        self.blocks_drawn = false;
         while y < rows.end {
             c.clear();
             let drawn = self.render(pos, &layout, &mut c);
@@ -1501,7 +1680,7 @@ impl Doc {
                     card.tint(grid, (x, end, top + y), theme);
                 }
                 if i >= drawn.code {
-                    self.blocks_drawn = true;
+                    self.blocks_drawn = Some(self.now);
                 }
                 self.drawn[y] = Some(Pos { offset: i, ..pos });
                 y += 1;
@@ -1523,6 +1702,7 @@ impl Doc {
             .flatten()
             .map_or(last, |p| Pos { offset: 0, ..p });
         self.draw_selection(grid, area, &layout);
+        self.draw_note_selection(grid, area);
         self.draw_search(grid, area, theme, &layout, rows);
         self.draw_markers(grid, area, theme, &layout);
         self.document.touch(file, frame);
@@ -1566,7 +1746,7 @@ impl Doc {
             && let Some(&(y, _)) = self.separators.iter().skip(1).find(|(_, p)| *p == old)
         {
             c.clear();
-            self.render(old, layout, c);
+            self.render_code(old, layout, c);
             if let Some(row) = c.rows().next() {
                 grid.fill(x, top + y, end, Style::PLAIN);
                 let after = paint(grid, x, top + y, end, row, theme, Attributes::NONE);
@@ -1578,7 +1758,7 @@ impl Doc {
         if let Some(&(y, pos)) = self.separators.first() {
             self.target = Some(pos);
             c.clear();
-            self.render(pos, layout, c);
+            self.render_code(pos, layout, c);
             if let Some(row) = c.rows().next() {
                 grid.fill(x, top + y, end, Style::PLAIN);
                 paint(grid, x, top + y, end, row, theme, Attributes::NONE);
@@ -1592,9 +1772,9 @@ impl Doc {
     /// negative), the rows left to draw, and the position the first of
     /// them shows. `None`, having changed nothing, when the last frame
     /// showed another file, no row of this frame, or rows other than the
-    /// document's (the note), while lines are selected, or when it drew a
-    /// thread or the text box: scrolling with a selection held is rare,
-    /// and a thread's rows change with no scroll (an age, the focus).
+    /// document's (the note), while lines or text are selected, or when it drew a
+    /// thread or the text box at another `now`: scrolling with a selection
+    /// held is rare, and a thread's ages change with no scroll.
     fn reuse(
         &mut self,
         grid: &mut Grid,
@@ -1608,7 +1788,8 @@ impl Doc {
             || first.file != pos.file
             || self.note(pos.file).is_some()
             || self.selection.is_some()
-            || self.blocks_drawn
+            || self.note_selection.is_some()
+            || self.blocks_drawn.is_some_and(|at| at != self.now)
             || (previous.width(), previous.height()) != (grid.width(), grid.height())
         {
             return None;
@@ -1693,7 +1874,7 @@ impl Doc {
                 code = self.code_height(logical, layout);
                 if bytes.is_some() {
                     mapped.clear();
-                    self.render(logical, layout, &mut mapped);
+                    self.render_code(logical, layout, &mut mapped);
                 }
             }
             let Some(line) = lines[side].filter(|l| (lo..=hi).contains(l) && pos.offset < code)
@@ -1766,7 +1947,7 @@ impl Doc {
             }
             if previous != Some(logical) {
                 mapped.clear();
-                self.render(logical, layout, &mut mapped);
+                self.render_code(logical, layout, &mut mapped);
                 previous = Some(logical);
             }
             let split = self.split_row(logical, layout);
@@ -1833,7 +2014,7 @@ impl Doc {
                 continue;
             }
             mapped.clear();
-            self.render(logical, layout, &mut mapped);
+            self.render_code(logical, layout, &mut mapped);
             let split = self.split_row(logical, layout);
             let Some(map) = mapped.map() else { continue };
             let mut put = |side: Option<usize>, look: Look| {
@@ -1974,7 +2155,7 @@ impl Doc {
         let split = self.split_row(pos, &layout);
         let mut c = std::mem::take(&mut self.mapped);
         c.clear();
-        self.render(pos, &layout, &mut c);
+        self.render_code(pos, &layout, &mut c);
         let ours = |row: usize, s: usize| row == drawn.offset && (!split || s == side.index());
         let map = c.map()?;
         let area = map.areas.iter().find(|a| ours(a.row, a.side)).copied();
@@ -2031,8 +2212,8 @@ impl Doc {
         Some(display_text(raw.strip_suffix(b"\n").unwrap_or(raw)))
     }
 
-    /// Starts a selection where `hit` is: by characters on code, by lines
-    /// on the gutter.
+    /// Starts a selection where `hit` is: by characters on code and in a
+    /// comment, by lines on the gutter.
     pub(crate) fn select_hit(&mut self, hit: &Hit) {
         let (pos, side, line, bytes) = match hit {
             Hit::Code {
@@ -2042,7 +2223,16 @@ impl Doc {
                 bytes,
             } => (*pos, *side, *line, Some((bytes.clone(), bytes.clone()))),
             Hit::Gutter { pos, side, line } => (*pos, *side, *line, None),
+            Hit::Note {
+                thread,
+                note,
+                bytes,
+            } => {
+                self.select_note(*thread, *note, bytes.clone()..bytes.clone(), false);
+                return;
+            }
         };
+        self.note_selection = None;
         self.selection = Some(Selection {
             side,
             anchor: pos,
@@ -2052,8 +2242,44 @@ impl Doc {
         });
     }
 
-    /// Moves the selection's end to `hit`, on the selection's side.
+    /// Selects in comment `note` of thread `thread` from `range.start` to
+    /// `range.end`, each what [`markdown::SourceMap::at`] gave.
+    fn select_note(&mut self, thread: usize, note: usize, range: Range<Range<usize>>, word: bool) {
+        let Some(t) = self.threads.get(thread) else {
+            return;
+        };
+        let Some(n) = t.notes.get(note) else {
+            return;
+        };
+        self.selection = None;
+        self.note_selection = Some(NoteSelection {
+            root: t.root.clone(),
+            note: n.id.clone(),
+            anchor: range.start,
+            cursor: range.end,
+            word,
+        });
+    }
+
+    /// Moves the selection's end to `hit`, on the selection's side, or in
+    /// the comment it's in.
     pub(crate) fn select_to_hit(&mut self, hit: &Hit) {
+        if let Hit::Note {
+            thread,
+            note,
+            bytes,
+        } = hit
+        {
+            if let Some(selection) = &mut self.note_selection
+                && let Some(t) = self.threads.get(*thread)
+                && t.root == selection.root
+                && t.notes.get(*note).is_some_and(|n| n.id == selection.note)
+            {
+                selection.cursor = bytes.clone();
+                selection.word = false;
+            }
+            return;
+        }
         let Some(selection) = &mut self.selection else {
             return;
         };
@@ -2065,6 +2291,7 @@ impl Doc {
                 bytes,
             } => (*pos, *side, *line, bytes.clone()),
             Hit::Gutter { pos, side, line } => (*pos, *side, *line, 0..0),
+            Hit::Note { .. } => return,
         };
         if side != selection.side || pos.file != selection.anchor.file {
             return;
@@ -2078,8 +2305,29 @@ impl Doc {
 
     /// Selects the word at `hit` (letters, digits and `_`), the run of
     /// blanks there, or the one other character; with `whole`, the line's
-    /// code instead.
+    /// code instead, or in a comment, the whole comment.
     pub(crate) fn select_word(&mut self, hit: &Hit, whole: bool) {
+        if let Hit::Note {
+            thread,
+            note,
+            bytes,
+        } = hit
+        {
+            let Some(text) = self.threads.get(*thread).and_then(|t| t.notes.get(*note)) else {
+                return;
+            };
+            let len = text.text.len();
+            let range = if whole {
+                (0..0)..(len..len)
+            } else {
+                let (start, end) = document::word(text.text.as_bytes(), bytes.start);
+                // A glyph drawn for a whole construct, an entity, comes whole.
+                let word = start.min(bytes.start)..end.max(bytes.end);
+                word.clone()..word
+            };
+            self.select_note(*thread, *note, range, !whole);
+            return;
+        }
         let Hit::Code {
             pos,
             side,
@@ -2097,6 +2345,7 @@ impl Doc {
         } else {
             document::word(text, bytes.start)
         };
+        self.note_selection = None;
         self.selection = Some(Selection {
             side: *side,
             anchor: *pos,
@@ -2104,6 +2353,229 @@ impl Doc {
             lines: (*line, *line),
             bytes: Some((start..start, end..end)),
         });
+    }
+
+    /// Thread `i`'s open box under the row at `pos`: the pane's column its
+    /// text starts at, its width, and where each comment is in it. `None`
+    /// folded, or with the text box in it.
+    fn box_notes(
+        &mut self,
+        i: usize,
+        pos: Pos,
+        layout: &Layout,
+    ) -> Option<(usize, usize, Vec<NoteRows>)> {
+        if self.collapsed(i) || self.writes_in(i) {
+            return None;
+        }
+        let block = Block::Thread(i);
+        let (start, gutter, boxed, _) = self.block_columns(block, pos, layout);
+        // The columns `render_block` draws before the box: hits and the
+        // highlight miss by as many if the two drift.
+        let ruled = if self.in_conversation(block) {
+            0
+        } else {
+            gutter.saturating_sub(2) + 3
+        };
+        if Boxed::at(&mut self.box_rows, i, boxed).notes.is_none() {
+            let mut c = std::mem::take(&mut self.scratch);
+            c.clear();
+            self.block_box(block, boxed, &mut c);
+            self.scratch = c;
+        }
+        let notes = Boxed::at(&mut self.box_rows, i, boxed).notes.clone()?;
+        Some((start + ruled + comments::TEXT_COLUMN, boxed, notes))
+    }
+
+    /// Comment `k` of thread `i` as its box draws it, `boxed` wide.
+    fn note_body(&mut self, i: usize, k: usize, boxed: usize) -> Option<&markdown::Body> {
+        let threads = Arc::clone(&self.threads);
+        let highlight = self.highlight;
+        Boxed::at(&mut self.box_rows, i, boxed)
+            .bodies
+            .get_or_insert_with(|| comments::bodies(&threads[i], boxed, highlight))
+            .get(k)
+    }
+
+    /// What the cell at row `y` of the pane, `column` from its left, shows
+    /// of a comment's text as of the last frame: on a row of the text, from
+    /// its first column to the box's padding. `within` (a thread and its
+    /// comment, as a drag stays in) takes any cell instead: one on the
+    /// comment's rows as there, one before them as its text's start, and
+    /// one after as its end.
+    pub(crate) fn note_hit(
+        &mut self,
+        y: usize,
+        column: usize,
+        within: Option<(usize, usize)>,
+    ) -> Option<Hit> {
+        let drawn = self.drawn.get(y).copied().flatten();
+        let (thread, pos) = if let Some((i, _)) = within {
+            (i, self.find_block(Block::Thread(i))?)
+        } else {
+            let (Block::Thread(i), _) = self.block_row_at(y)? else {
+                return None;
+            };
+            (
+                i,
+                Pos {
+                    offset: 0,
+                    ..drawn?
+                },
+            )
+        };
+        let layout = self.file_layout(pos.file);
+        let block = Block::Thread(thread);
+        let (_, rows) = self
+            .block_ranges(pos, &layout)
+            .into_iter()
+            .find(|(b, _)| *b == block)?;
+        let (left, boxed, notes) = self.box_notes(thread, pos, &layout)?;
+        let text_at = |k: usize| {
+            let text = &notes[k].text;
+            rows.start + text.start..rows.start + text.end
+        };
+        let (note, row, col) = if let Some((_, k)) = within {
+            notes.get(k)?;
+            let text = text_at(k);
+            let at = |offset| Pos { offset, ..pos };
+            match drawn {
+                Some(d) if d < at(text.start) => (k, None, 0),
+                Some(d) if d < at(text.end) => {
+                    (k, Some(d.offset - text.start), column.saturating_sub(left))
+                }
+                _ => (k, Some(usize::MAX), 0),
+            }
+        } else {
+            let offset = drawn?.offset;
+            let k = (0..notes.len()).find(|&k| text_at(k).contains(&offset))?;
+            let col = column
+                .checked_sub(left)
+                .filter(|&c| c < comments::inner(boxed))?;
+            (k, Some(offset - text_at(k).start), col)
+        };
+        let map = &self.note_body(thread, note, boxed)?.map;
+        let bytes = match row {
+            Some(row) => map.at(row, col),
+            None => map.text().start..map.text().start,
+        };
+        Some(Hit::Note {
+            thread,
+            note,
+            bytes,
+        })
+    }
+
+    /// The thread and comment drawn on row `y` of the pane in the last
+    /// frame, by root and id: the comment whose heading is there or above;
+    /// a folded thread's first.
+    pub(crate) fn note_at(&mut self, y: usize) -> Option<(String, String)> {
+        let drawn = self.drawn.get(y).copied().flatten()?;
+        let pos = Pos { offset: 0, ..drawn };
+        let (Block::Thread(i), _) = self.block_row_at(y)? else {
+            return None;
+        };
+        let layout = self.file_layout(pos.file);
+        let (_, rows) = self
+            .block_ranges(pos, &layout)
+            .into_iter()
+            .find(|(b, _)| *b == Block::Thread(i))?;
+        let k = self.box_notes(i, pos, &layout).map_or(0, |(_, _, notes)| {
+            let row = drawn.offset - rows.start;
+            notes.iter().rposition(|n| n.first <= row).unwrap_or(0)
+        });
+        let thread = &self.threads[i];
+        Some((thread.root.clone(), thread.notes.get(k)?.id.clone()))
+    }
+
+    /// The thread and comment the comment selection is in, while they're
+    /// on the file shown.
+    fn selected_note(&self) -> Option<(usize, usize)> {
+        let selection = self.note_selection.as_ref()?;
+        let i = self
+            .threads()
+            .iter()
+            .position(|t| t.root == selection.root)?;
+        let k = self.threads[i]
+            .notes
+            .iter()
+            .position(|n| n.id == selection.note)?;
+        Some((i, k))
+    }
+
+    /// Shows the text selected in a comment reversed, glyph by glyph, on
+    /// the rows of it on screen.
+    fn draw_note_selection(&mut self, grid: &mut Grid, (x, end, top): (usize, usize, usize)) {
+        let Some(range) = self.note_selection.as_ref().map(NoteSelection::range) else {
+            return;
+        };
+        let Some((i, k)) = self.selected_note() else {
+            return;
+        };
+        let block = Block::Thread(i);
+        let Some(pos) = self.find_block(block) else {
+            return;
+        };
+        let layout = self.file_layout(pos.file);
+        let Some((_, rows)) = self
+            .block_ranges(pos, &layout)
+            .into_iter()
+            .find(|(b, _)| *b == block)
+        else {
+            return;
+        };
+        let Some((left, boxed, notes)) = self.box_notes(i, pos, &layout) else {
+            return;
+        };
+        let text = rows.start + notes[k].text.start..rows.start + notes[k].text.end;
+        let shown: Vec<(usize, usize)> = (0..self.drawn.len())
+            .filter_map(|y| {
+                let d = self.drawn[y]?;
+                (Pos { offset: 0, ..d } == pos && text.contains(&d.offset))
+                    .then(|| (y, d.offset - text.start))
+            })
+            .collect();
+        let inner = comments::inner(boxed);
+        let Some(body) = self.note_body(i, k, boxed) else {
+            return;
+        };
+        for (y, row) in shown {
+            // Past the box's padding, a row is cut.
+            for cells in body
+                .map
+                .cells(row, range.clone())
+                .filter(|c| c.end <= inner)
+            {
+                grid.toggle(
+                    (x + left + cells.start).min(end),
+                    top + y,
+                    (x + left + cells.end).min(end),
+                    Attributes::REVERSE,
+                );
+            }
+        }
+    }
+
+    /// The Markdown the comment selection copies, less its line breaks at
+    /// the end, and whether that's the whole comment.
+    pub(crate) fn note_selected(&mut self) -> Option<(String, bool)> {
+        let selection = self.note_selection.clone()?;
+        let (i, k) = self.selected_note()?;
+        let range = if selection.word {
+            selection.range()
+        } else {
+            let pos = self.find_block(Block::Thread(i))?;
+            let layout = self.file_layout(pos.file);
+            let (_, boxed, _) = self.box_notes(i, pos, &layout)?;
+            let map = &self.note_body(i, k, boxed)?.map;
+            map.span(&selection.anchor, &selection.cursor)
+        };
+        let text = &self.threads[i].notes[k].text;
+        let all = text.trim_end_matches(['\n', '\r']);
+        let copied = text.get(range.clone())?.trim_end_matches(['\n', '\r']);
+        Some((
+            copied.to_owned(),
+            range.start == 0 && copied.len() == all.len(),
+        ))
     }
 
     /// Whether the selection holds the row at `pos`, on `side` when the
@@ -2293,6 +2765,10 @@ impl Doc {
         {
             self.peek(None);
         }
+        if self.focus != root {
+            // A box's border shows the focus: the next frame is drawn whole.
+            self.painted = None;
+        }
         self.focus = root;
     }
 
@@ -2303,6 +2779,7 @@ impl Doc {
             return;
         }
         self.fold.peek = root.map(str::to_owned);
+        self.painted = None;
         self.refit();
     }
 
@@ -2328,8 +2805,7 @@ impl Doc {
     /// neither's.
     fn block_ranges(&mut self, pos: Pos, layout: &Layout) -> Vec<(Block, Range<usize>)> {
         let mut first = self.code_rows(pos, layout);
-        let blocks = self.blocks(pos, layout);
-        blocks
+        self.blocks(pos, layout)
             .into_iter()
             .map(|block| {
                 let rows = first..first + self.block_height(block, pos, layout);
@@ -2342,8 +2818,8 @@ impl Doc {
     /// The thread to fold with `z`: the focused one, else the first drawn
     /// in the last frame.
     pub(crate) fn nearest_thread(&mut self) -> Option<usize> {
-        if let Some(root) = self.focused().map(|t| t.root.clone()) {
-            return self.threads.iter().position(|t| t.root == root);
+        if let Some(f) = self.focused() {
+            return self.threads.iter().position(|t| t.root == f.root);
         }
         (0..self.drawn.len()).find_map(|y| match self.block_at(y) {
             Some(Block::Thread(i)) => Some(i),
@@ -2351,7 +2827,6 @@ impl Doc {
         })
     }
 
-    /// The first logical row of `file`.
     fn first_row(&self, file: usize) -> Pos {
         Pos {
             file,
@@ -2394,14 +2869,13 @@ impl Doc {
             offset: 0,
             ..self.document.pos
         };
-        let focused = self.focused().map(|t| t.root.clone());
-        let current = focused.and_then(|root| {
+        let current = self.focused().and_then(|f| {
             placed
                 .iter()
-                .position(|&(_, i)| self.threads[i].root == root)
+                .position(|&(_, i)| self.threads[i].root == f.root)
         });
         let next = match (current, forward) {
-            (Some(k), true) => Some(k + 1).filter(|&k| k < placed.len()),
+            (Some(k), true) => Some(k + 1),
             (Some(k), false) => k.checked_sub(1),
             (None, true) => placed.iter().position(|&(p, _)| p >= top),
             (None, false) => placed.iter().rposition(|&(p, _)| p < top),
@@ -2498,7 +2972,6 @@ impl Doc {
         (y < self.height).then_some(y)
     }
 
-    /// The block the text box is drawn in.
     pub(crate) fn writing_block(&self) -> Option<Block> {
         match &self.writing.as_ref()?.at {
             Writes::New { .. } | Writes::File => Some(Block::New),
@@ -2547,10 +3020,10 @@ impl Doc {
     /// Whether any row of the focused thread is on screen, counted from the
     /// position rather than the last frame: keys can come between frames.
     pub(crate) fn focused_shown(&mut self) -> bool {
-        let Some(root) = self.focused().map(|t| t.root.clone()) else {
-            return false;
-        };
-        let Some(i) = self.threads.iter().position(|t| t.root == root) else {
+        let Some(i) = self
+            .focused()
+            .and_then(|f| self.threads.iter().position(|t| t.root == f.root))
+        else {
             return false;
         };
         let Some((pos, range)) = self.block_rows(Block::Thread(i)) else {

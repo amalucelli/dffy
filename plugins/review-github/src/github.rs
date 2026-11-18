@@ -9,7 +9,7 @@ use std::process::{Command, Stdio};
 
 use serde_json::{Map, Value, json};
 
-use crate::git::{self, Remote, Source};
+use crate::git::{self, Head, Remote, Source};
 
 /// Threads a page; at 100 comments each it stays under GitHub's node limit.
 const THREADS_PER_PAGE: u32 = 100;
@@ -17,23 +17,71 @@ const THREADS_PER_PAGE: u32 = 100;
 /// Hosts accept a line comment only this close to a change.
 pub(crate) const CONTEXT: u64 = 3;
 
-const PULL_REQUEST: &str = "query PullRequest($owner: String!, $name: String!, $number: Int!, $after: String, $first: Int!) {
+/// What an import reads of a comment, on a thread's first page of them and
+/// on the pages after.
+macro_rules! review_comment {
+    () => {
+        "fragment ReviewComment on PullRequestReviewComment {
+  id url body createdAt viewerDidAuthor author { login } originalCommit { oid }
+}"
+    };
+}
+
+/// `reviews` names your pending review's comments, so an import never
+/// takes them for deleted, whether or not `reviewThreads` lists them.
+/// The PR's body, its `conversation` and its `submitted` reviews are its
+/// general comments; a page after the first asks only for the lists with
+/// more to read. A pending review isn't among them: it's your summary not
+/// sent yet.
+const PULL_REQUEST: &str = concat!(
+    "query PullRequest($owner: String!, $name: String!, $number: Int!, $after: String, $first: Int!, $threads: Boolean!, $comments: Boolean!, $commentsAfter: String, $reviews: Boolean!, $reviewsAfter: String) {
   repository(owner: $owner, name: $name) {
     pullRequest(number: $number) {
-      title url baseRefOid headRefOid headRefName
-      reviewThreads(first: $first, after: $after) {
+      id title url body createdAt viewerDidAuthor author { login }
+      baseRefOid headRefOid headRefName isCrossRepository headRepositoryOwner { login } state
+      reviews(states: [PENDING], first: 1) {
+        nodes { comments(first: 100) { pageInfo { hasNextPage } nodes { id } } }
+      }
+      conversation: comments(first: 100, after: $commentsAfter) @include(if: $comments) {
+        pageInfo { hasNextPage endCursor }
+        nodes { id url body createdAt viewerDidAuthor author { login } }
+      }
+      submitted: reviews(first: 100, after: $reviewsAfter, states: [APPROVED, CHANGES_REQUESTED, COMMENTED, DISMISSED]) @include(if: $reviews) {
+        pageInfo { hasNextPage endCursor }
+        nodes { id url body state submittedAt createdAt viewerDidAuthor author { login } }
+      }
+      reviewThreads(first: $first, after: $after) @include(if: $threads) {
         totalCount
         pageInfo { hasNextPage endCursor }
         nodes {
           id isResolved isOutdated path diffSide startDiffSide originalLine originalStartLine subjectType
           comments(first: 100) {
-            nodes { id url body createdAt viewerDidAuthor author { login } originalCommit { oid } }
+            pageInfo { hasNextPage endCursor }
+            nodes { ...ReviewComment }
           }
         }
       }
     }
   }
-}";
+}
+",
+    review_comment!()
+);
+
+const THREAD_COMMENTS: &str = concat!(
+    "query ThreadComments($thread: ID!, $after: String!) {
+  node(id: $thread) {
+    ... on PullRequestReviewThread {
+      comments(first: 100, after: $after) {
+        pageInfo { hasNextPage endCursor }
+        nodes { ...ReviewComment }
+      }
+    }
+  }
+}
+",
+    review_comment!()
+);
 
 /// Pending reviews are visible only to their author, so the first one is
 /// yours.
@@ -77,21 +125,28 @@ const UPDATE_REVIEW: &str = "mutation UpdatePullRequestReview($review: ID!, $bod
 }";
 
 /// Without a branch, `@include` leaves out the current branch's PRs rather
-/// than asking for every PR.
-const LIST: &str = "query List($owner: String!, $name: String!, $requested: String!, $mine: String!, $branch: String!, $onBranch: Boolean!) {
+/// than asking for every PR. The current branch's are found as `DETECT`
+/// finds them.
+const LIST: &str = "query List($owner: String!, $name: String!, $requested: String!, $mine: String!, $branch: String!, $onBranch: Boolean!, $number: Int!, $byNumber: Boolean!) {
   requested: search(query: $requested, type: ISSUE, first: 50) { nodes { ...Listed } }
   mine: search(query: $mine, type: ISSUE, first: 50) { nodes { ...Listed } }
   repository(owner: $owner, name: $name) @include(if: $onBranch) {
-    pullRequests(headRefName: $branch, states: OPEN, first: 5) { nodes { ...Listed } }
+    pullRequests(headRefName: $branch, states: OPEN, first: 50) @skip(if: $byNumber) { nodes { ...Listed } }
+    pullRequest(number: $number) @include(if: $byNumber) { ...Listed }
   }
 }
-fragment Listed on PullRequest { number title url headRefName author { login } }";
+fragment Listed on PullRequest { number title url headRefName author { login } isCrossRepository headRepositoryOwner { login } state }";
 
-const DETECT: &str = "query Detect($owner: String!, $name: String!, $branch: String!) {
+/// By the branch's name, or by number for a PR `gh pr checkout` had the
+/// branch track by its own ref. Forks' PRs from branches of the same name
+/// come too, so a fork's PR past the first 50 of them isn't found.
+const DETECT: &str = "query Detect($owner: String!, $name: String!, $branch: String!, $number: Int!, $byNumber: Boolean!) {
   repository(owner: $owner, name: $name) {
-    pullRequests(headRefName: $branch, states: OPEN, first: 1) { nodes { number title url baseRefOid headRefOid } }
+    pullRequests(headRefName: $branch, states: OPEN, first: 50) @skip(if: $byNumber) { nodes { ...Detected } }
+    pullRequest(number: $number) @include(if: $byNumber) { ...Detected }
   }
-}";
+}
+fragment Detected on PullRequest { number title url baseRefOid headRefOid isCrossRepository headRepositoryOwner { login } state }";
 
 pub(crate) const NO_GH: &str =
     "dffy-review-github needs the GitHub CLI (gh): https://cli.github.com";
@@ -209,39 +264,169 @@ fn string(value: &Value) -> String {
 
 /// A page of a PR's review threads.
 pub(crate) struct Page {
-    pub title: Value,
-    pub url: Value,
+    /// What the session keeps of the PR: `title`, `url`, its branch in
+    /// `head_ref`, `state`, whether it's a fork's in `cross_repository`,
+    /// and the branch's owner in `head_owner`.
+    pub about: Value,
     pub base: String,
     pub head: String,
-    /// The PR's branch.
-    pub head_ref: Value,
+    /// Each thread's comments are only its first page of them until
+    /// [`rest_of_thread`] adds the others.
     pub threads: Vec<Value>,
     /// The PR's threads, on every page.
     pub total: u64,
-    pub next: Option<String>,
+    /// Where the next page starts; `None` after the last.
+    pub next: Option<After>,
+    /// The ids of your pending review's comments; `None` when there are
+    /// more than were asked for.
+    pub pending: Option<Vec<String>>,
+    /// The page's general comments, as the comments file holds them, by
+    /// when they were written: the PR's description on the first page,
+    /// then comments in its conversation and the summaries of reviews.
+    pub conversation: Vec<Value>,
 }
 
-pub(crate) fn page(remote: &Remote, pr: u64, after: Option<&str>) -> Result<Page, Error> {
-    let data = graphql(
-        "PullRequest",
-        PULL_REQUEST,
-        &json!({"owner": remote.owner, "name": remote.name, "number": pr, "after": after, "first": THREADS_PER_PAGE}),
-    )?;
+/// Where each of a PR's lists goes on, for the lists with more to read.
+#[derive(Debug, Default, Clone)]
+pub(crate) struct After {
+    pub threads: Option<String>,
+    pub comments: Option<String>,
+    pub reviews: Option<String>,
+}
+
+/// `list`'s cursor, when it has more.
+fn more(list: &Value) -> Option<String> {
+    list["pageInfo"]["endCursor"]
+        .as_str()
+        .filter(|_| list["pageInfo"]["hasNextPage"] == true)
+        .map(str::to_owned)
+}
+
+/// The first page with `None`, which asks for every list from its start.
+pub(crate) fn page(remote: &Remote, pr: u64, after: Option<&After>) -> Result<Page, Error> {
+    let mut vars = json!({"owner": remote.owner, "name": remote.name, "number": pr, "first": THREADS_PER_PAGE});
+    let lists = [
+        ("after", "threads", after.map(|a| &a.threads)),
+        ("commentsAfter", "comments", after.map(|a| &a.comments)),
+        ("reviewsAfter", "reviews", after.map(|a| &a.reviews)),
+    ];
+    for (cursor, wanted, from) in lists {
+        vars[cursor] = json!(from.cloned().flatten());
+        vars[wanted] = json!(from.is_none_or(Option::is_some));
+    }
+    let mut data = graphql("PullRequest", PULL_REQUEST, &vars)?;
+    let nodes = data
+        .pointer_mut("/repository/pullRequest/reviewThreads/nodes")
+        .map(Value::take);
     let found = pull_request(&data, pr)?;
     let threads = &found["reviewThreads"];
+    let pending = &found["reviews"]["nodes"][0]["comments"];
     Ok(Page {
-        title: found["title"].clone(),
-        url: found["url"].clone(),
+        about: json!({"title": found["title"], "url": found["url"], "head_ref": found["headRefName"],
+            "state": found["state"], "cross_repository": found["isCrossRepository"],
+            "head_owner": found["headRepositoryOwner"]["login"]}),
         base: string(&found["baseRefOid"]),
         head: string(&found["headRefOid"]),
-        head_ref: found["headRefName"].clone(),
-        threads: threads["nodes"].as_array().cloned().unwrap_or_default(),
+        pending: (pending["pageInfo"]["hasNextPage"] != true).then(|| {
+            pending["nodes"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|c| c["id"].as_str().map(str::to_owned))
+                .collect()
+        }),
+        threads: match nodes {
+            Some(Value::Array(nodes)) => nodes,
+            _ => Vec::new(),
+        },
         total: threads["totalCount"].as_u64().unwrap_or_default(),
-        next: threads["pageInfo"]["endCursor"]
-            .as_str()
-            .filter(|_| threads["pageInfo"]["hasNextPage"] == true)
-            .map(str::to_owned),
+        next: Some(After {
+            threads: more(threads),
+            comments: more(&found["conversation"]),
+            reviews: more(&found["submitted"]),
+        })
+        .filter(|a| a.threads.is_some() || a.comments.is_some() || a.reviews.is_some()),
+        conversation: conversation(found, after.is_none()),
     })
+}
+
+/// The general comments of `pr`, a page of the PR: its description when
+/// `first`, the comments in its conversation and the summaries of its
+/// reviews, by when each was written. Those without text are left out, as
+/// a review submitted with comments on lines only.
+fn conversation(pr: &Value, first: bool) -> Vec<Value> {
+    let nodes = |list: &str| pr[list]["nodes"].as_array().into_iter().flatten();
+    let description = first.then_some((pr, "description", None));
+    let comments = nodes("conversation").map(|c| (c, "comment", None));
+    let reviews = nodes("submitted").map(|r| {
+        let label = match r["state"].as_str() {
+            Some("APPROVED") => Some("approved"),
+            Some("CHANGES_REQUESTED") => Some("changes requested"),
+            Some("COMMENTED") => Some("commented"),
+            Some("DISMISSED") => Some("dismissed"),
+            _ => None,
+        };
+        (r, "review", label)
+    });
+    let mut out: Vec<Value> = description
+        .into_iter()
+        .chain(comments)
+        .chain(reviews)
+        .filter_map(|(node, kind, label)| {
+            let text = string(&node["body"]).replace("\r\n", "\n");
+            if text.trim().is_empty() {
+                return None;
+            }
+            let author = if node["viewerDidAuthor"] == true {
+                ""
+            } else {
+                node["author"]["login"].as_str().unwrap_or("ghost")
+            };
+            // A review joins the conversation when it's submitted.
+            let created = if node["submittedAt"].is_string() {
+                &node["submittedAt"]
+            } else {
+                &node["createdAt"]
+            };
+            let mut comment = json!({"ref": format!("github:{}", string(&node["id"])),
+                "url": node["url"], "text": text, "author": author, "created": created,
+                "kind": kind});
+            if let Some(label) = label {
+                comment["label"] = json!(label);
+            }
+            Some(comment)
+        })
+        .collect();
+    out.sort_by(|a, b| string(&a["created"]).cmp(&string(&b["created"])));
+    out
+}
+
+/// Adds to a thread from a [`Page`] the comments past its first page, a
+/// query a page.
+pub(crate) fn rest_of_thread(thread: &mut Value) -> Result<(), Error> {
+    loop {
+        let info = &thread["comments"]["pageInfo"];
+        let Some(after) = info["endCursor"]
+            .as_str()
+            .filter(|_| info["hasNextPage"] == true)
+            .map(str::to_owned)
+        else {
+            return Ok(());
+        };
+        let mut data = graphql(
+            "ThreadComments",
+            THREAD_COMMENTS,
+            &json!({"thread": thread["id"], "after": after}),
+        )?;
+        let mut more = data["node"]["comments"].take();
+        if let (Some(have), Some(nodes)) = (
+            thread["comments"]["nodes"].as_array_mut(),
+            more["nodes"].as_array_mut(),
+        ) {
+            have.append(nodes);
+        }
+        thread["comments"]["pageInfo"] = more["pageInfo"].take();
+    }
 }
 
 /// GitHub's own diff of a PR, as hunks by path: the lines it takes line
@@ -290,10 +475,6 @@ fn parse_files(pages: &[u8]) -> Option<HashMap<String, Vec<git::Hunk>>> {
     }
     Some(files)
 }
-
-/// Why a line thread is a file comment, in its `github_unplaced`, when it's
-/// its original commit that git doesn't have.
-pub(crate) const UNPLACED: &str = "original commit not available";
 
 /// What the comments file holds of imported threads, by their first
 /// comment's ref.
@@ -351,7 +532,10 @@ pub(crate) fn upserts(
             }
         };
         if missing {
-            comment.insert("github_unplaced".to_owned(), json!(UNPLACED));
+            comment.insert(
+                "github_unplaced".to_owned(),
+                json!("original commit not available"),
+            );
             known.unplaced.insert(root_ref.clone());
             waiting.push(thread.clone());
         } else if known.unplaced.remove(&root_ref) {
@@ -440,8 +624,7 @@ fn side_name(side: &Value) -> Option<&'static str> {
 
 /// GitHub keeps a suggestion inside the body, as a closing fenced block.
 fn split_suggestion(body: &str) -> (String, Option<String>) {
-    let trimmed = body.trim_end();
-    trimmed
+    body.trim_end()
         .strip_suffix("```")
         .and_then(|b| b.rsplit_once("```suggestion\n"))
         .filter(|(text, _)| text.is_empty() || text.ends_with('\n'))
@@ -672,62 +855,103 @@ pub(crate) fn set_review_body(review: &str, body: &str) -> Result<(), Error> {
     .map(drop)
 }
 
-/// The open PR whose branch is `branch`, in origin's repository:
-/// `{number, title, url, base, head}`.
-pub(crate) fn detect(remote: &Remote, branch: &str) -> Result<Option<Value>, Error> {
-    let data = graphql(
-        "Detect",
-        DETECT,
-        &json!({"owner": remote.owner, "name": remote.name, "branch": branch}),
-    )?;
-    let pr = &data["repository"]["pullRequests"]["nodes"][0];
+/// `DETECT`'s and `LIST`'s variables for the PRs `head` is the branch of.
+fn head_variables(head: Option<&Head>) -> Value {
+    let (branch, number) = match head {
+        Some(Head::Pull(pr)) => ("", Some(*pr)),
+        Some(Head::Branch { name, .. }) => (name.as_str(), None),
+        None => ("", None),
+    };
+    json!({"branch": branch, "number": number.unwrap_or_default(), "byNumber": number.is_some()})
+}
+
+/// The open PRs `head` is the branch of in the repository `DETECT` or
+/// `LIST` answered with.
+fn heads<'a>(repository: &'a Value, head: &Head) -> Vec<&'a Value> {
+    match head {
+        Head::Pull(_) => Some(&repository["pullRequest"])
+            .filter(|pr| pr["state"] == "OPEN")
+            .into_iter()
+            .collect(),
+        Head::Branch { .. } => repository["pullRequests"]["nodes"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|pr| {
+                head.owns(
+                    &pr["isCrossRepository"],
+                    &pr["headRepositoryOwner"]["login"],
+                )
+            })
+            .collect(),
+    }
+}
+
+/// The open PR `head` is the branch of: `{number, title, url, base, head}`.
+pub(crate) fn detect(remote: &Remote, head: &Head) -> Result<Option<Value>, Error> {
+    let mut vars = head_variables(Some(head));
+    vars["owner"] = json!(remote.owner);
+    vars["name"] = json!(remote.name);
+    let data = graphql("Detect", DETECT, &vars)?;
+    let Some(pr) = heads(&data["repository"], head).into_iter().next() else {
+        return Ok(None);
+    };
     Ok(pr["number"].as_u64().map(|number| {
         json!({"number": number, "title": pr["title"], "url": pr["url"],
             "base": pr["baseRefOid"], "head": pr["headRefOid"]})
     }))
 }
 
-/// The open PRs to pick from, each once: the current branch's, then those
-/// asking for your review, then yours.
-pub(crate) fn list(remote: &Remote, branch: Option<&str>) -> Result<Vec<Value>, Error> {
+/// The open PRs to pick from, each once: those the current branch is the
+/// head of, then those asking for your review, then yours.
+pub(crate) fn list(remote: &Remote, head: Option<&Head>) -> Result<Vec<Value>, Error> {
     let repo = format!("repo:{}/{}", remote.owner, remote.name);
-    let data = graphql(
-        "List",
-        LIST,
-        &json!({
-            "owner": remote.owner,
-            "name": remote.name,
-            "requested": format!("is:pr is:open review-requested:@me {repo}"),
-            "mine": format!("is:pr is:open author:@me {repo}"),
-            "branch": branch.unwrap_or_default(),
-            "onBranch": branch.is_some(),
-        }),
-    )?;
+    let mut vars = head_variables(head);
+    for (key, value) in [
+        ("owner", json!(remote.owner)),
+        ("name", json!(remote.name)),
+        (
+            "requested",
+            json!(format!("is:pr is:open review-requested:@me {repo}")),
+        ),
+        ("mine", json!(format!("is:pr is:open author:@me {repo}"))),
+        ("onBranch", json!(head.is_some())),
+    ] {
+        vars[key] = value;
+    }
+    let data = graphql("List", LIST, &vars)?;
+    let current = head
+        .map(|h| heads(&data["repository"], h))
+        .unwrap_or_default();
     let mut seen = HashSet::new();
-    Ok([
-        ("current_branch", &data["repository"]["pullRequests"]["nodes"]),
-        ("review_requested", &data["requested"]["nodes"]),
-        ("mine", &data["mine"]["nodes"]),
-    ]
-    .into_iter()
-    .flat_map(|(reason, nodes)| {
-        nodes
-            .as_array()
+    Ok(current
+        .into_iter()
+        .map(|pr| ("current_branch", pr))
+        .chain(
+            [
+                ("review_requested", &data["requested"]["nodes"]),
+                ("mine", &data["mine"]["nodes"]),
+            ]
             .into_iter()
-            .flatten()
-            .map(move |pr| (reason, pr))
-    })
+            .flat_map(|(reason, nodes)| {
+                nodes
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .map(move |pr| (reason, pr))
+            }),
+        )
     // Search results that aren't PRs come back as empty objects.
-    .filter(|(_, pr)| pr["number"].as_u64().is_some_and(|n| seen.insert(n)))
-    .map(|(reason, pr)| {
-        json!({
-            "id": pr["number"].as_u64().unwrap_or_default().to_string(),
+    .filter_map(|(reason, pr)| {
+        let number = pr["number"].as_u64().filter(|n| seen.insert(*n))?;
+        Some(json!({
+            "id": number.to_string(),
             "title": pr["title"],
             "author": pr["author"]["login"].as_str().unwrap_or("ghost"),
             "url": pr["url"],
             "head_ref": pr["headRefName"],
             "reason": reason,
-        })
+        }))
     })
     .collect())
 }
@@ -808,9 +1032,10 @@ mod tests {
         let number: u64 = number.parse().expect("a PR number");
         std::env::set_current_dir(clone).expect("the clone");
         let found = page(&remote, number, None).expect("the PR");
+        let mut source = Source::default();
         for oid in [&found.base, &found.head] {
             assert!(
-                git::has_commit(oid),
+                source.has_commit(oid),
                 "{oid} isn't in the clone; git fetch origin {oid}"
             );
         }

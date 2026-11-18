@@ -14,6 +14,7 @@ mod comments;
 mod editor;
 mod fuzzy;
 mod help;
+mod markdown;
 mod menu;
 mod picker;
 pub(crate) mod piped;
@@ -24,8 +25,9 @@ pub(crate) mod worker;
 
 use std::io::{self, Write};
 use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, ExitCode, ExitStatus};
+use std::process::{Command, ExitCode};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, mpsc};
 use std::thread::JoinHandle;
@@ -77,6 +79,9 @@ pub(crate) enum Event {
         id: u64,
         said: Said,
     },
+    /// How many commits a review's update moved its head by, when git
+    /// could tell.
+    ReviewMoved(Option<usize>),
     /// Nothing happened before the app's deadline.
     Tick,
 }
@@ -215,6 +220,11 @@ pub(crate) fn run(
     );
     prepare(&mut app, ctx);
     app.set_selected(selected, ctx.config.default_diff);
+    app.set_repository(
+        repo.workdir()
+            .and_then(Path::file_name)
+            .map(|name| name.to_string_lossy().into_owned()),
+    );
     if let Some(commit) = commit {
         app.event(Event::Piped(piped::Item::Commit(commit)));
     }
@@ -241,11 +251,6 @@ pub(crate) fn run(
         _ => comments.clone(),
     };
     app.set_local_comments(local);
-    let watching = comments.and_then(|path| {
-        let files = app.comment_files(path.clone());
-        app.set_comments(path);
-        watch_comments(files, tx.clone())
-    });
     let mut review_run = None;
     let mut detect = None;
     match start {
@@ -277,7 +282,9 @@ pub(crate) fn run(
     crate::plugin::stop_on_panic();
     term::install_panic_hook();
     let mut session = Session {
-        watching,
+        watching: None,
+        unread: comments,
+        detect,
         review_run,
         tty,
         reader: None,
@@ -296,16 +303,6 @@ pub(crate) fn run(
     if watch {
         app.set_watching(true);
         session.set_watch(&mut app, true);
-    }
-    if let Some(Action::Plugin {
-        id,
-        plugin,
-        args,
-        comments,
-        summary,
-    }) = detect
-    {
-        session.plugin(id, &plugin, args, comments.as_deref(), summary);
     }
     let result = session.interact(&mut app, tx, &rx);
     term::restore();
@@ -350,6 +347,8 @@ pub(crate) fn run_piped(tty: &Tty, stdin: Stdin, ctx: &Ctx) -> Result<ExitCode, 
     term::install_panic_hook();
     let mut session = Session {
         watching: None,
+        unread: None,
+        detect: None,
         review_run: None,
         tty,
         reader: None,
@@ -386,27 +385,26 @@ fn watch_comments(
     paths: Vec<PathBuf>,
     events: mpsc::Sender<Event>,
 ) -> Option<JoinHandle<Vec<Watcher>>> {
-    let start = move || {
-        let watchers = paths
-            .iter()
-            .filter_map(|path| {
-                if let Some(dir) = path.parent() {
-                    std::fs::create_dir_all(dir).ok();
-                }
-                let events = events.clone();
-                Watcher::start(Root::file(path).ok()?, move |notice| match notice {
-                    Notice::Changed(_) | Notice::Rescan => events.send(Event::Comments).is_ok(),
-                    Notice::Polling(_) => true,
-                })
-                .ok()
-            })
-            .collect();
-        events.send(Event::Comments).ok();
-        watchers
-    };
     std::thread::Builder::new()
         .name("dffy-comments-watch".into())
-        .spawn(start)
+        .spawn(move || {
+            let watchers = paths
+                .iter()
+                .filter_map(|path| {
+                    if let Some(dir) = path.parent() {
+                        std::fs::create_dir_all(dir).ok();
+                    }
+                    let events = events.clone();
+                    Watcher::start(Root::file(path).ok()?, move |notice| match notice {
+                        Notice::Changed(_) | Notice::Rescan => events.send(Event::Comments).is_ok(),
+                        Notice::Polling(_) => true,
+                    })
+                    .ok()
+                })
+                .collect();
+            events.send(Event::Comments).ok();
+            watchers
+        })
         .ok()
 }
 
@@ -445,6 +443,7 @@ fn write_summary(text: &str) -> io::Result<PathBuf> {
     std::fs::File::options()
         .write(true)
         .create_new(true)
+        .mode(0o600)
         .open(&path)
         .and_then(|mut file| file.write_all(text.as_bytes()))?;
     Ok(path)
@@ -528,7 +527,13 @@ struct Session<'a> {
     /// them returns them; see [`watch_comments`]. Never joined: dropping the
     /// handle drops the watches once the thread ends, which stops them.
     watching: Option<JoinHandle<Vec<Watcher>>>,
-    /// The review plugin's run other than a check, the last one started.
+    /// The comments file, read and watched only once the first frame is
+    /// out: its parse and the watch thread aren't the first frame's.
+    unread: Option<PathBuf>,
+    /// The `detect` run for the branch's review, started once the first
+    /// frame is out: spawning the plugin takes a fork and exec.
+    detect: Option<Action>,
+    /// The last `prepare`, `pull` or `post` started.
     review_run: Option<review::Run>,
     tty: &'a Tty,
     reader: Option<Reader>,
@@ -657,12 +662,26 @@ impl Session<'_> {
 
     fn run(&mut self, app: &mut App, rx: &mpsc::Receiver<Event>) -> io::Result<()> {
         loop {
-            if let Some(frame) = app.draw() {
-                self.tty.write(frame)?;
-                self.pool.replace(app.jobs());
-                if let Some(gate) = &self.gate {
-                    gate.want(app.wanted());
+            self.paint(app)?;
+            if self.unread.is_some() || self.detect.is_some() {
+                if let Some(path) = self.unread.take() {
+                    let files = app.comment_files(path.clone());
+                    app.set_comments(path);
+                    self.watching = watch_comments(files, self.events.clone());
                 }
+                if let Some(Action::Plugin {
+                    id,
+                    plugin,
+                    args,
+                    comments,
+                    summary,
+                }) = self.detect.take()
+                {
+                    self.plugin(id, &plugin, args, comments.as_deref(), summary);
+                }
+                // The threads they placed and the jobs they want go out
+                // before the loop waits.
+                continue;
             }
             if let Some(files) = app.take_count_pass() {
                 self.pool.count(files);
@@ -739,7 +758,23 @@ impl Session<'_> {
         }
     }
 
-    /// Puts `text` on the clipboard, then says `note`.
+    /// A frame when something changed, with the program status if that
+    /// did, and the work the new frame wants.
+    fn paint(&mut self, app: &mut App) -> io::Result<()> {
+        let Some(frame) = app.draw() else {
+            return Ok(());
+        };
+        self.tty.write(frame)?;
+        if let Some(report) = app.status_report() {
+            self.tty.write(&report)?;
+        }
+        self.pool.replace(app.jobs());
+        if let Some(gate) = &self.gate {
+            gate.want(app.wanted());
+        }
+        Ok(())
+    }
+
     fn copy(&self, app: &mut App, text: &[u8], mut note: String) -> io::Result<()> {
         self.tty.write(&term::clipboard(text))?;
         let tmux = self.tmux_clipboard.get_or_init(term::tmux_clipboard);
@@ -786,19 +821,22 @@ impl Session<'_> {
         Ok(())
     }
 
-    /// Hands the terminal to the program `run` starts, given the terminal
-    /// for its input, and takes it back once `run` returns. The outer
-    /// error is the terminal's, the inner one `run`'s.
-    fn hand_over(
+    /// Returns whether the editor exited cleanly; why not goes in the
+    /// status bar.
+    fn in_editor(
         &self,
         app: &mut App,
         reader: &Reader,
-        run: impl FnOnce(std::fs::File) -> io::Result<ExitStatus>,
-    ) -> io::Result<io::Result<ExitStatus>> {
+        path: &Path,
+        line: usize,
+    ) -> io::Result<bool> {
         reader.pause();
         self.suspended.store(true, Ordering::Relaxed);
         term::restore();
-        let status = self.tty.try_clone().and_then(run);
+        let status = self
+            .tty
+            .try_clone()
+            .and_then(|tty| editor::open(path, line, tty));
         self.tty.enter()?;
         if !app.mouse() {
             self.tty.write(term::MOUSE_OFF)?;
@@ -808,20 +846,6 @@ impl Session<'_> {
         let (width, height) = self.tty.size();
         app.resize(width, height);
         app.invalidate();
-        Ok(status)
-    }
-
-    /// Hands the terminal to the editor on `path` at `line` and takes it
-    /// back. Returns whether the editor exited cleanly; why not goes in
-    /// the status bar.
-    fn in_editor(
-        &self,
-        app: &mut App,
-        reader: &Reader,
-        path: &Path,
-        line: usize,
-    ) -> io::Result<bool> {
-        let status = self.hand_over(app, reader, |tty| editor::open(path, line, tty))?;
         Ok(match status {
             Ok(status) if status.success() => true,
             Ok(status) => {
@@ -921,16 +945,24 @@ impl Session<'_> {
         }
         if let (Some((old, new)), Some(root)) = (moved, self.files.as_ref().and_then(Repo::workdir))
         {
-            let count = Command::new("git")
-                .args(["rev-list", "--count", &format!("{old}..{new}")])
-                .current_dir(root)
-                .stdin(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .output()
-                .ok()
-                .filter(|out| out.status.success())
-                .and_then(|out| String::from_utf8(out.stdout).ok()?.trim().parse().ok());
-            app.review_updated(count);
+            let (root, events) = (root.to_owned(), self.events.clone());
+            // A git process takes milliseconds to start, which the loop
+            // spends drawing instead.
+            std::thread::Builder::new()
+                .name("dffy-review-count".into())
+                .spawn(move || {
+                    let count = Command::new("git")
+                        .args(["rev-list", "--count", &format!("{old}..{new}")])
+                        .current_dir(root)
+                        .stdin(std::process::Stdio::null())
+                        .stderr(std::process::Stdio::null())
+                        .output()
+                        .ok()
+                        .filter(|out| out.status.success())
+                        .and_then(|out| String::from_utf8(out.stdout).ok()?.trim().parse().ok());
+                    events.send(Event::ReviewMoved(count)).ok();
+                })
+                .ok();
         }
     }
 
@@ -942,12 +974,11 @@ impl Session<'_> {
             return Ok(());
         };
         let path = std::env::temp_dir().join(format!("dffy-comment-{}.md", std::process::id()));
-        // Left over from a run that crashed; `create_new` then refuses to
-        // follow a link put in its place.
         std::fs::remove_file(&path).ok();
         let created = std::fs::File::options()
             .write(true)
             .create_new(true)
+            .mode(0o600)
             .open(&path)
             .and_then(|mut file| file.write_all(text.as_bytes()));
         if let Err(e) = created {
@@ -970,12 +1001,8 @@ impl Session<'_> {
 mod tests {
     use super::*;
 
-    /// The comments files are watched, even one whose directory doesn't
-    /// exist yet, and an event says the watches are in place: creating one,
-    /// replacing it through a rename, or writing the other then sends an
-    /// event, and dropping the handle, never joined, ends the watches. How
-    /// many events a write makes is the backend's; the app's reload skips
-    /// those that changed nothing.
+    /// How many events a write makes is the backend's; the app's reload
+    /// skips those that changed nothing.
     #[test]
     fn a_change_to_the_comments_file_sends_an_event() {
         let dir = tempfile::tempdir().expect("tempdir");

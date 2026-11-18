@@ -16,11 +16,12 @@
 //! walk a whole file.
 //!
 //! A gap shows as a separator row (`⋯ 40 unchanged lines`) with whatever
-//! the user revealed of it above and below, and around lines the host
-//! asked for inside it a separator for each stretch still hidden. Revealing
-//! more, or switching to the full text, changes only the rows of its gaps,
-//! so the hunks' rows and every position in them stay put. The syntax diff's hunks cover the same
-//! lines as the line diff's, so a position also survives that toggle.
+//! the user revealed of it above and below. Lines the host reveals inside
+//! a gap split it, with a separator for each stretch still hidden.
+//! Revealing more, or switching to the full text, changes only the rows of
+//! its gaps, so the hunks' rows and every position in them stay put. The
+//! syntax diff's hunks cover the same lines as the line diff's, so a
+//! position also survives that toggle.
 //!
 //! This is the top layer of the core: it uses [`crate::git`],
 //! [`crate::highlight`], [`crate::structural`] and [`crate::cache`], and none
@@ -163,9 +164,10 @@ impl Shown<'_> {
         self.len - self.top - self.bottom - windows
     }
 
-    /// Each hidden stretch, a separator's, then the lines shown under it:
-    /// a window, or after the last stretch the bottom edge's lines. Only
-    /// that last stretch may be empty, when nothing is hidden.
+    /// Each stretch a separator hides, paired with the lines shown below
+    /// it: the next window, or the bottom edge's lines after the last
+    /// stretch. Only the last stretch may be empty, when the gap hides
+    /// nothing.
     fn stretches(self) -> impl Iterator<Item = (Range<usize>, Range<usize>)> {
         let end = self.len - self.bottom;
         let ends = self.windows.iter().map(|w| w.start).chain([end]);
@@ -263,8 +265,8 @@ impl Shown<'_> {
 }
 
 /// What the user revealed of a gap: lines from each edge, and windows of
-/// lines between. Kept settled for the gap's length: windows in order,
-/// apart from each other and from the edges, or joined to them.
+/// lines between. Kept settled for the gap's length: windows sorted, none
+/// touching another window or an edge.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct Reveal {
     top: usize,
@@ -273,8 +275,8 @@ struct Reveal {
 }
 
 impl Reveal {
-    /// Joins windows that touch each other or an edge, for a gap of `len`
-    /// lines.
+    /// Clamps to a gap of `len` lines and joins windows that touch each
+    /// other or an edge.
     fn settle(&mut self, len: usize) {
         self.top = self.top.min(len);
         let mut windows = std::mem::take(&mut self.windows);
@@ -1253,7 +1255,8 @@ impl File {
         &self,
         reveal: Option<&Reveal>,
         gap: usize,
-        (side, lines): (Side, &Range<usize>),
+        side: Side,
+        lines: &Range<usize>,
         context: usize,
     ) -> Option<Reveal> {
         let span = self.gaps.get(gap).filter(|_| !self.is_partial())?;
@@ -1265,16 +1268,18 @@ impl File {
             lines.start.max(first) - first,
             lines.end.min(first + span.len).checked_sub(first)?,
         );
-        let mut reveal = reveal.cloned().unwrap_or_default();
+        let (top, bottom, windows) =
+            reveal.map_or((0, 0, &[][..]), |r| (r.top, r.bottom, &r.windows[..]));
         let shown = Shown {
-            top: reveal.top,
-            bottom: reveal.bottom,
+            top,
+            bottom,
             len: span.len,
-            windows: &reveal.windows,
+            windows,
         };
         if start >= end || !shown.hidden_lines().any(|h| h.start < end && start < h.end) {
             return None;
         }
+        let mut reveal = reveal.cloned().unwrap_or_default();
         reveal
             .windows
             .push(start.saturating_sub(context)..end + context);
@@ -1289,8 +1294,9 @@ impl File {
         (0..self.gaps.len())
             .flat_map(|g| {
                 let start = self.gaps[g].new;
-                let hidden = self.shown(shape, g).hidden_lines();
-                hidden.map(move |h| start + h.start..start + h.end)
+                self.shown(shape, g)
+                    .hidden_lines()
+                    .map(move |h| start + h.start..start + h.end)
             })
             .collect()
     }

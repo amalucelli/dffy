@@ -57,7 +57,7 @@ pub(super) fn copy(rendered: &Rendered, side: Side, lo: usize, hi: usize) -> Cop
 
 /// The language a code block's fence names: `rust`, or an extension such
 /// as `rs`.
-fn language<'g>(grammars: &'g Registry, name: &str) -> Option<&'g Language> {
+pub(crate) fn language<'g>(grammars: &'g Registry, name: &str) -> Option<&'g Language> {
     let name = name.trim().to_ascii_lowercase();
     grammars
         .named(&name)

@@ -138,7 +138,7 @@ The result:
 {"notice":null,"comments":[{"id":"9f3c2a71b04e5d18","path":"src/lib.rs","side":"new",…},…],"total_comments":14,"next_cursor":null}
 ```
 
-- **`comments`:** each comment as the file holds it ([comments.md](comments.md#the-file-version-1)), unknown fields included, in thread order: a thread's first comment, then its replies in the order they were added. Threads go by path, then by first line, file comments first. A page may end inside a thread; the next page continues it.
+- **`comments`:** each comment as the file holds it ([comments.md](comments.md#the-file-version-1)), unknown fields included, in thread order: a thread's first comment, then its replies in the order they were added. [General comments](comments.md#general-comments), which have no `path`, come first; then threads by path and first line, file comments first. With `path`, general comments are left out. A page may end inside a thread; the next page continues it.
 - **`notice`:** the file's `notice`, set by the integration that keeps the comments, such as that they're stale; null without one.
 - **`total_comments`:** the number of comments `path` selects, on every page.
 - A missing comments file has no comments. Outside a repository, without `--comments`, the tool returns an error.

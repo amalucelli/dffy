@@ -197,6 +197,12 @@ expression: text
 <dim># copy_absolute_path: copy where the file is on disk, from the filesystem's root</>
 <dim># (no key by default)</>
 
+<dim># copy_comment: copy a comment of the focused thread as written, in Markdown: the one last clicked, else its first</>
+<dim># (no key by default)</>
+
+<dim># copy_thread: copy the focused thread: each comment under its author and date, as written</>
+<dim># (no key by default)</>
+
 <dim># cancel: end the selection; in the tree, clear the filter</>
 <hint>keybind</><dim> = </>esc=cancel
 

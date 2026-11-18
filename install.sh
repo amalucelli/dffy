@@ -66,7 +66,11 @@ detect_arch() {
 # download URL DEST
 download() {
 	if has curl; then
-		curl -fsSL --retry 3 -o "$2" "$1" || die "download failed: $1"
+		# DFFY_BASE_URL may point at a local build over file:// or plain http.
+		case "$1" in
+		https://*) curl --proto '=https' --tlsv1.2 -fsSL --retry 3 -o "$2" "$1" || die "download failed: $1" ;;
+		*) curl -fsSL --retry 3 -o "$2" "$1" || die "download failed: $1" ;;
+		esac
 	elif has wget; then
 		wget -q -O "$2" "$1" || die "download failed: $1"
 	else

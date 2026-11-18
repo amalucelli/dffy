@@ -47,12 +47,12 @@ A comment:
 | Field | Meaning |
 |---|---|
 | `id` | A string dffy assigns when the comment is added. It never changes and is never given to another comment, even after this one is removed. Treat it as opaque. |
-| `path` | The file's path on the new side, relative to the repository root, as in [json.md](json.md#files). |
+| `path` | The file's path on the new side, relative to the repository root, as in [json.md](json.md#files). Left out for a [general comment](#general-comments). |
 | `old_path` | The path on the old side, for a renamed file only. |
 | `side` | `old` or `new`: the side of the last commented line. |
 | `start_side` | `old` or `new`: the side of the first commented line. When it's left out, it's `side`. |
 | `start`, `end` | The first and last commented lines, each `{"old": <n>, "new": <n>}`: the line's number on each side, 1-based, or `null` on a side it isn't on, as a line in [json.md](json.md#lines). A context line has both numbers, an added line only `new`, a removed line only `old`. Left out for a comment on the whole file. |
-| `text` | The comment, as Markdown. |
+| `text` | The comment, as Markdown: `CommonMark` with GitHub's tables, strikethrough and task lists, which GitLab and Gerrit read too. The viewer draws it rendered ([viewer.md](viewer.md#reading)), a line break kept as one and HTML comments hidden, so an integration passes a host's text through as it is. A `suggestion` fenced block left in the text shows as code; the viewer draws a suggested change from `suggestion`. |
 | `suggestion` | Optional replacement text for the commented lines, without a final newline. |
 | `author` | Who wrote it, a free string. Empty means you; only your comments are [drafts](#drafts). |
 | `created` | When it was written, RFC 3339 (`2026-11-17T10:42:00Z`). dffy writes UTC; integrations give their host's timestamp. |
@@ -63,13 +63,31 @@ A comment:
 | `distance` | How many lines the commented lines are from the nearest change on their side, 0 when they include one, in the diff the comment was written on. A hint for hosts that accept a comment on lines only near a change, whose diff may not be that one. Left out when it isn't known. See [Distance](#distance). |
 | `url` | The comment on its host, set by an integration. `o` on a focused thread in the viewer opens it; only `http` and `https` links open. |
 | `outdated` | `true` when the host marks the thread outdated (its lines changed since). Read from the thread's first comment; left out when false. The viewer shows it, and before you reply to one says the review plugin's warning about such threads, when it has one. |
+| `kind` | Optional, for a general comment: what it is, `description`, `review` or `comment`, set by the integration. See [General comments](#general-comments). |
+| `label` | Optional, for a general comment: a word the integration gives it, such as a review's verdict (`approved`). dffy shows it as given. |
 
-- `id`, `path`, `text`, `author`, `created` and `resolved` are always present. dffy leaves out the other fields when they don't apply; a reader treats a field that's `null` as left out.
+- `id`, `text`, `author`, `created` and `resolved` are always present, and so is `path` on every comment but a general one. dffy leaves out the other fields when they don't apply; a reader treats a field that's `null` as left out.
 - **Kinds of comment:**
   - A **line comment** has `start`, `end`, `side` and `anchor`.
   - A **file comment** has none of them.
+  - A **general comment** has no `path` either.
   - A **reply** has `in_reply_to`, and its thread's `path` and `old_path`; its place is its thread's. It has no lines or anchor of its own.
 - **Text:** a line of `anchor` is the line without its `\n`; a `\r` before it stays. A line that isn't valid UTF-8 has each invalid sequence replaced by U+FFFD, and an anchor taken from it only matches the same replaced text.
+
+### General comments
+
+A general comment is on the review as a whole, not on a file: a pull request's description, a comment in its conversation, the summary submitted with a review. Other hosts have the same, as a merge request's notes or a change's messages.
+
+```json
+{"id":"5d0e7b13a9c2f486","text":"Looks good, one question inline.","author":"hubot","created":"2026-11-17T12:30:00Z","resolved":false,"ref":"github:PRR_kwDOA","url":"https://github.com/acme/widgets/pull/7#pullrequestreview-2001","kind":"review","label":"approved"}
+```
+
+- It has no `path`, `old_path`, `side`, lines or anchor.
+- Only an integration adds one, importing it from a host, so it has a `ref`: `add` and `upsert` refuse a comment without a `path` and without a `ref`, and one without a `path` that has lines. dffy doesn't write general comments yet.
+- `kind` says what it is, in words that aren't any host's: `description` for the review's own description, `review` for the summary of a submitted review, `comment` for any other. A reader shows a kind it doesn't know as a comment.
+- `label` is the integration's word for it, shown as given; dffy-review-github gives a review's state, such as `approved` or `changes requested`.
+- A reader that doesn't know general comments reads one as a comment on no file, and keeps its `kind` and `label` as fields it doesn't know.
+- The viewer shows a review session's general comments as its [Conversation](viewer.md#conversation).
 
 ### Anchors
 
@@ -115,7 +133,7 @@ dffy comments --json              # the file, for scripts
 dffy --comments pr.json comments  # another file
 ```
 
-`dffy comments` lists the comments as threads. Each thread starts with its file and lines (`src/lib.rs:12-14`, `(old side)` for lines on the old side, nothing more for a file comment) and `resolved` when it is. Then come its comments in the order they were added, each with its `id`, author (`you` when it's empty), time and `posted` when it has a `ref`, over its text. Threads go by path, then by first line. The file's `notice`, when it has one, comes first.
+`dffy comments` lists the comments as threads. Each thread starts with its file and lines (`src/lib.rs:12-14`, `(old side)` for lines on the old side, nothing more for a file comment) and `resolved` when it is. Then come its comments in the order they were added, each with its `id`, author (`you` when it's empty), time and `posted` when it has a `ref`, over its text. Threads go by path, then by first line. General comments come before them, each headed `conversation` with its `kind` and `label` (`conversation, review, approved`). The file's `notice`, when it has one, comes first.
 
 For [the file above](#the-file-version-1):
 
@@ -169,13 +187,13 @@ The operations are all or nothing: when one fails, nothing is written. Batch eve
 - `side` may be left out for `new`;
 - a reply names its thread with `in_reply_to`, the `id` of any comment in the thread, or with `in_reply_to_ref`, its `ref`. That comment must be in the file already or added earlier in the same list. A reply needs only `text`; it takes its thread's `path` and `old_path`, and any lines or anchor it's given are dropped.
 
-A line comment needs `start`, `end` and an `anchor` with at least one line; `start` needs a number on `start_side`, and `end` on `side`. A file comment needs `path` and `text`.
+A line comment needs `start`, `end` and an `anchor` with at least one line; `start` needs a number on `start_side`, and `end` on `side`. A file comment needs `path` and `text`. A [general comment](#general-comments) needs `ref` and `text`, and no lines.
 
 **`set`.** `fields` holds any of:
 
 | Field | Sets |
 |---|---|
-| `text` | The text. Refused on a comment with a `ref`: it's posted, and its text is the host's. |
+| `text` | The text. Refused on a comment with a `ref`, unless the same `set` removes it: it's posted, and its text is the host's. |
 | `resolved` | Whether the thread is resolved; set it on the thread's first comment. |
 | `ref` | The `ref`, after posting the comment; `null` removes it. |
 | `anchor` | The anchor, for a comment placed again on newer text. |

@@ -20,7 +20,7 @@ use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 
-use crate::git::{Remote, Source};
+use crate::git::{Head, Remote, Source};
 use crate::github::{Error, Page};
 
 const USAGE: &str = "usage: dffy-review-github describe | doctor | list | detect | prepare <pr> \
@@ -56,9 +56,6 @@ fn description() -> Value {
         "outdated_reply_warning": "GitHub collapses this thread, so a reply there is easy to miss",
     })
 }
-
-/// What dffy shows when refused drafts held the event back.
-const HELD: &str = "review still pending";
 
 const VERBS: [&str; 9] = [
     "describe", "doctor", "list", "detect", "prepare", "check", "pull", "post", "prefetch",
@@ -135,8 +132,13 @@ fn fail(code: u8, message: &str) -> ExitCode {
     ExitCode::from(code)
 }
 
+/// The dffy that ran the plugin writes its comments: it names itself in
+/// `DFFY`, which a run by hand doesn't have.
 fn dffy_comments(file: &Path) -> Command {
-    let mut cmd = Command::new("dffy");
+    let dffy = std::env::var_os("DFFY")
+        .filter(|d| !d.is_empty())
+        .unwrap_or_else(|| "dffy".into());
+    let mut cmd = Command::new(dffy);
     cmd.arg("--comments").arg(file).arg("comments");
     cmd
 }
@@ -198,11 +200,14 @@ fn toggled(comment: &Value) -> bool {
             != comment["github_resolved"].as_bool().unwrap_or_default()
 }
 
+/// What a session keeps of [`Page::about`] for `detect` alone, which tells
+/// the PR of a branch by them without asking GitHub.
+const FOR_DETECT: [&str; 4] = ["head_ref", "state", "cross_repository", "head_owner"];
+
 /// A PR under review, and what's kept for it: the comments file, drafts
 /// included, the session dffy was last given, and GitHub's hunks of a
-/// head for `post` to plan with. It's in the data
-/// directory, not the state or cache one, because the drafts are your
-/// writing.
+/// base and head for `post` to plan with. Kept in the data directory, not the state
+/// or cache one: the drafts are your writing.
 struct Review {
     remote: Remote,
     pr: u64,
@@ -237,18 +242,21 @@ impl Review {
     }
 
     /// The session line's `session`, without `comments`, as last printed,
-    /// with the PR's branch in `head_ref`, which `detect` looks for.
+    /// with [`FOR_DETECT`] as GitHub last said. A session saved before
+    /// `state`, `cross_repository` and `head_owner` were kept has none of
+    /// them, and is taken as open and origin's own.
     fn session(&self) -> Option<Value> {
         serde_json::from_slice(&fs::read(self.dir.join("session.json")).ok()?).ok()
     }
 
     /// `session` as dffy reads it: the PR's number as its id, with the
-    /// comments file, without the branch.
+    /// comments file, without what only `detect` reads.
     fn printed(&self, session: &Value) -> Value {
         let mut session = session.clone();
         if let Some(fields) = session.as_object_mut() {
-            fields.remove("head_ref");
-            fields.remove("number");
+            for field in FOR_DETECT.iter().chain(&["number"]) {
+                fields.remove(*field);
+            }
         }
         session["id"] = json!(self.pr.to_string());
         session["comments"] = json!(self.file().to_string_lossy());
@@ -272,24 +280,38 @@ impl Review {
             .map_err(|e| format!("can't write {}: {e}", path.display()))
     }
 
-    /// Keeps GitHub's hunks of the PR at `head`, for `post` to plan with,
-    /// in place of any kept before.
+    /// Keeps GitHub's hunks of the PR from `base` to `head`, for `post` to
+    /// plan with, in place of any kept before.
     fn keep_hunks(
         &self,
+        base: &str,
         head: &str,
         files: &HashMap<String, Vec<git::Hunk>>,
     ) -> Result<(), String> {
         let files: serde_json::Map<String, Value> = files
             .iter()
             .map(|(path, hunks)| {
-                let hunks: Vec<Value> = hunks
-                    .iter()
-                    .map(|h| json!([h.old.start, h.old.end, h.new.start, h.new.end]))
-                    .collect();
-                (path.clone(), json!(hunks))
+                (
+                    path.clone(),
+                    hunks
+                        .iter()
+                        .map(|h| json!([h.old.start, h.old.end, h.new.start, h.new.end]))
+                        .collect(),
+                )
             })
             .collect();
-        self.write("hunks.json", &json!({"head": head, "files": files}))
+        self.write(
+            "hunks.json",
+            &json!({"base": base, "head": head, "files": files}),
+        )
+    }
+
+    /// The base GitHub's kept hunks of `head` were of, empty when that
+    /// wasn't kept; `None` without hunks of `head`.
+    fn hunks_base(&self, head: &str) -> Option<String> {
+        let kept: Value =
+            serde_json::from_slice(&fs::read(self.dir.join("hunks.json")).ok()?).ok()?;
+        (kept["head"] == head).then(|| kept["base"].as_str().unwrap_or_default().to_owned())
     }
 
     /// GitHub's hunks by path, when they were kept for `head`.
@@ -326,20 +348,20 @@ impl Review {
         self.save(&session)
     }
 
-    /// Saves and prints the session on `head`, keeping the head `post`
-    /// last reviewed.
+    /// Saves and prints the session on `head` with what it keeps of the PR,
+    /// `about` (see [`Page::about`]), keeping the head `post` last reviewed.
     fn start(
         &self,
         saved: Option<&Value>,
         (base, head): (&str, &str),
-        title: &Value,
-        url: &Value,
-        head_ref: &Value,
+        about: &Value,
     ) -> Result<(), String> {
-        let last_reviewed = saved.map_or(Value::Null, |s| s["last_reviewed_head"].clone());
-        let session = json!({"number": self.pr, "title": title, "url": url,
-            "base": base, "head": head, "last_reviewed_head": last_reviewed,
-            "head_ref": head_ref});
+        let mut session = about.clone();
+        session["number"] = json!(self.pr);
+        session["base"] = json!(base);
+        session["head"] = json!(head);
+        session["last_reviewed_head"] =
+            saved.map_or(Value::Null, |s| s["last_reviewed_head"].clone());
         self.save(&session)?;
         self.emit_session(&session);
         Ok(())
@@ -347,12 +369,21 @@ impl Review {
 }
 
 /// Writes `page`, and the pages after it as they arrive, into the comments
-/// file, with a progress line for each. Then fetches the original commits
+/// file, threads and general comments, with a progress line for each page
+/// of threads. Then fetches the original commits
 /// git didn't have, which a force-push left off the PR's head, and places
 /// the threads written on them. The fetched commits get no ref: once
 /// placed, a thread's lines are in the file, and a re-import that can't
-/// read them leaves them.
-fn import(review: &Review, mut page: Page) -> Result<(), String> {
+/// read them leaves them. Once every page is written, the comments of
+/// `before` GitHub no longer has go, as [`sweep`] says; not after a page
+/// that failed, which stops the import, nor when fewer threads came than
+/// GitHub counted, or your pending review had more comments than were read.
+fn import(
+    review: &Review,
+    mut page: Page,
+    source: &mut Source,
+    before: &HashSet<String>,
+) -> Result<(), String> {
     let file = review.file();
     let mut known = github::Known::default();
     for c in comments(&read(&file)?) {
@@ -369,20 +400,46 @@ fn import(review: &Review, mut page: Page) -> Result<(), String> {
             }
         }
     }
-    let mut source = Source::default();
-    let (mut written, mut waiting) = (0, Vec::new());
+    let (mut written, mut waiting, mut seen, mut pending_read) =
+        (0, Vec::new(), HashSet::new(), true);
+    let total = page.total;
+    // A page after the first may carry only the conversation's lists.
+    let mut with_threads = true;
     loop {
-        let (ops, missing) = github::upserts(&page.threads, &page.base, &mut source, &mut known);
+        for thread in &mut page.threads {
+            github::rest_of_thread(thread)?;
+        }
+        let ids = page
+            .threads
+            .iter()
+            .flat_map(|t| t["comments"]["nodes"].as_array().into_iter().flatten())
+            .filter_map(|c| c["id"].as_str());
+        seen.extend(ids.map(|id| format!("github:{id}")));
+        match &page.pending {
+            Some(pending) => seen.extend(pending.iter().map(|id| format!("github:{id}"))),
+            None => pending_read = false,
+        }
+        let (mut ops, missing) = github::upserts(&page.threads, &page.base, source, &mut known);
+        for comment in std::mem::take(&mut page.conversation) {
+            seen.extend(comment["ref"].as_str().map(str::to_owned));
+            ops.push(json!({"op": "upsert", "comment": comment}));
+        }
         if !ops.is_empty() {
             apply(&file, &ops)?;
         }
         waiting.extend(missing);
         written += page.threads.len();
-        emit(json!({"progress": format!("{written}/{}", page.total)}));
+        if with_threads {
+            emit(json!({"progress": format!("{written}/{total}")}));
+        }
         let Some(after) = page.next.take() else {
             break;
         };
+        with_threads = after.threads.is_some();
         page = github::page(&review.remote, review.pr, Some(&after))?;
+    }
+    if pending_read && u64::try_from(written) == Ok(total) {
+        sweep(&file, before, &seen)?;
     }
     let mut commits: Vec<&str> = waiting.iter().filter_map(github::original_commit).collect();
     commits.sort_unstable();
@@ -396,25 +453,94 @@ fn import(review: &Review, mut page: Page) -> Result<(), String> {
     apply(&file, &ops)
 }
 
+/// The refs of the comments the file has from GitHub, read before asking
+/// GitHub for the first page: a `post` while that's on its way writes a
+/// ref the page can't have, and it mustn't look gone. Empty when the file
+/// can't be read, which `import`'s own read reports.
+fn on_github(file: &Path) -> HashSet<String> {
+    read(file)
+        .map(|f| {
+            comments(&f)
+                .iter()
+                .filter_map(|c| c["ref"].as_str().filter(|r| r.starts_with("github:")))
+                .map(str::to_owned)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Of the comments GitHub had before its first page was asked for, by ref
+/// in `before`, removes those it no longer has, not in `seen`, whoever
+/// wrote them: only their author can delete a comment or discard a pending
+/// review, and posting yours again would undo that. A first comment whose
+/// thread still holds replies not posted, or not gone, stays as what they
+/// answer, posted no longer, so they aren't lost with it.
+fn sweep(file: &Path, before: &HashSet<String>, seen: &HashSet<String>) -> Result<(), String> {
+    if before.is_subset(seen) {
+        return Ok(());
+    }
+    let current = read(file)?;
+    let all = comments(&current);
+    let gone = |c: &Value| {
+        c["ref"]
+            .as_str()
+            .is_some_and(|r| before.contains(r) && !seen.contains(r))
+    };
+    // Removing a first comment removes its thread's replies with it.
+    let removed = |root: &Value| {
+        gone(root)
+            && all
+                .iter()
+                .filter(|c| c["in_reply_to"] == root["id"])
+                .all(gone)
+    };
+    let mut ops = Vec::new();
+    for c in all.iter().filter(|c| gone(c)) {
+        if c["in_reply_to"].is_null() && !removed(c) {
+            // Without these `post` would take it for posted, or its thread.
+            ops.push(
+                json!({"op": "upsert", "comment": {"ref": c["ref"], "url": null,
+                "outdated": null, "github_thread": null, "github_resolved": null,
+                "github_unplaced": null}}),
+            );
+            ops.push(json!({"op": "set", "id": c["id"], "fields": {"ref": null}}));
+        } else if !all
+            .iter()
+            .any(|root| root["id"] == c["in_reply_to"] && removed(root))
+        {
+            ops.push(json!({"op": "rm", "id": c["id"]}));
+        }
+    }
+    if ops.is_empty() {
+        return Ok(());
+    }
+    apply(file, &ops)
+}
+
+/// GitHub's hunks of the PR, by path.
+type Files = HashMap<String, Vec<git::Hunk>>;
+
 /// GitHub's hunks of the PR, asked for in the background.
-fn fetch_files(review: &Review) -> JoinHandle<Option<HashMap<String, Vec<git::Hunk>>>> {
+fn fetch_files(review: &Review) -> JoinHandle<Option<Files>> {
     let (remote, pr) = (review.remote.clone(), review.pr);
     std::thread::spawn(move || github::files(&remote, pr))
 }
 
 /// Writes the threads from `page` on, then keeps the hunks `files` gets
-/// when they're of the session's head. GitHub doesn't say which head its
-/// files are of; they're taken as `page`'s, asked for at the same time.
+/// when they're of the session's head. GitHub doesn't say which base and
+/// head its files are of; they're taken as `page`'s, asked for at the same
+/// time.
 fn import_with_files(
     review: &Review,
-    page: Page,
-    files: JoinHandle<Option<HashMap<String, Vec<git::Hunk>>>>,
+    (page, before): (Page, &HashSet<String>),
+    files: Option<JoinHandle<Option<Files>>>,
     session_head: &str,
+    source: &mut Source,
 ) -> Result<(), String> {
-    let head = page.head.clone();
-    let imported = import(review, page);
-    if let (true, Ok(Some(hunks))) = (head == session_head, files.join()) {
-        review.keep_hunks(&head, &hunks)?;
+    let (base, head) = (page.base.clone(), page.head.clone());
+    let imported = import(review, page, source, before);
+    if let (true, Some(Ok(Some(hunks)))) = (head == session_head, files.map(JoinHandle::join)) {
+        review.keep_hunks(&base, &head, &hunks)?;
     }
     imported
 }
@@ -423,24 +549,42 @@ fn import_with_files(
 /// session at once; the head stays the one dffy shows until `pull`.
 fn prepare(pr: u64) -> Result<(), String> {
     let review = Review::new(pr)?;
+    let mut source = Source::default();
     // A session without a url was saved with GitHub down, on a guessed base.
     let Some(session) = review.session().filter(|s| {
         s["url"].is_string()
             && [&s["base"], &s["head"]]
                 .iter()
-                .all(|oid| oid.as_str().is_some_and(git::has_commit))
+                .all(|oid| oid.as_str().is_some_and(|oid| source.has_commit(oid)))
     }) else {
         return pull(&review);
     };
     review.emit_session(&session);
-    let files = fetch_files(&review);
+    let head = session["head"].as_str().unwrap_or_default();
+    // GitHub's hunks of a base and head don't change; `pull` asks again.
+    let kept_base = review.hunks_base(head);
+    let mut files = kept_base.is_none().then(|| fetch_files(&review));
+    let before = on_github(&review.file());
     let page = github::page(&review.remote, pr, None)?;
+    // Kept for another base: the PR was retargeted, or the one below it
+    // merged. Asked for only now, as GitHub's base comes with the page.
+    if kept_base.is_some_and(|base| base != page.base) {
+        files = Some(fetch_files(&review));
+    }
+    // Read again, as a `post` may have saved it since.
+    if let Some(mut kept) = review.session()
+        && FOR_DETECT.iter().any(|&k| kept[k] != page.about[k])
+    {
+        for key in FOR_DETECT {
+            kept[key] = page.about[key].clone();
+        }
+        review.save(&kept)?;
+    }
     // Threads on a newer head read their anchors from it.
-    if !git::has_commit(&page.head) {
+    if !source.has_commit(&page.head) {
         git::fetch_pulls(&[pr])?;
     }
-    let head = session["head"].as_str().unwrap_or_default();
-    import_with_files(&review, page, files, head)
+    import_with_files(&review, (page, &before), files, head, &mut source)
 }
 
 /// Fetches the head, the first page of threads and the PR's files
@@ -450,6 +594,7 @@ fn pull(review: &Review) -> Result<(), String> {
     let pr = review.pr;
     let saved = review.session();
     let files = fetch_files(review);
+    let before = on_github(&review.file());
     let (fetched, first) = std::thread::scope(|s| {
         let fetch = s.spawn(|| git::fetch_pulls(&[pr]));
         let first = github::page(&review.remote, pr, None);
@@ -471,36 +616,35 @@ fn pull(review: &Review) -> Result<(), String> {
                 Some(base) => base.to_owned(),
                 None => git::git(&["rev-parse", "refs/remotes/origin/HEAD"])?,
             };
-            let kept = |field: &str| saved.as_ref().map_or(Value::Null, |s| s[field].clone());
             review.start(
                 saved.as_ref(),
                 (&base, &head),
-                &kept("title"),
-                &kept("url"),
-                &kept("head_ref"),
+                saved.as_ref().unwrap_or(&Value::Null),
             )?;
             return Err(format!("couldn't reach GitHub, comments may be stale: {e}"));
         }
     };
-    if !git::has_commit(&page.head) {
+    let mut source = Source::default();
+    if !source.has_commit(&page.head) {
         fetched?;
         return Err(format!(
             "origin's refs/pull/{pr}/head isn't the PR's head {}; try again",
             page.head
         ));
     }
-    if !git::has_commit(&page.base) {
-        git::git(&["fetch", "--quiet", "--no-tags", "origin", &page.base])?;
+    if !source.has_commit(&page.base) {
+        git::git(&[
+            "fetch",
+            "--quiet",
+            "--no-tags",
+            "--end-of-options",
+            "origin",
+            &page.base,
+        ])?;
     }
-    review.start(
-        saved.as_ref(),
-        (&page.base, &page.head),
-        &page.title,
-        &page.url,
-        &page.head_ref,
-    )?;
+    review.start(saved.as_ref(), (&page.base, &page.head), &page.about)?;
     let head = page.head.clone();
-    import_with_files(review, page, files, &head)
+    import_with_files(review, (page, &before), Some(files), &head, &mut source)
 }
 
 /// Whether origin's head for the PR is still the session's, from git alone.
@@ -519,35 +663,47 @@ fn check(pr: u64) -> Result<(), String> {
     Ok(())
 }
 
-/// The open PR of the branch checked out, for plain `dffy`: from a session
-/// kept for that branch when there's one, which needs nothing from GitHub,
-/// else from one query by the branch's name. `{"review": null}` without
-/// one, or on a detached HEAD.
+/// The open PR the branch checked out is the head of, for plain `dffy`, as
+/// [`Head::of`] tells it. From a session kept for it when there's one that
+/// GitHub last said is open, which needs nothing from GitHub, else from
+/// one query. `{"review": null}` without one, or on a detached HEAD.
 fn detect() -> Result<(), String> {
     let Ok(branch) = git::git(&["symbolic-ref", "--quiet", "--short", "HEAD"]) else {
         emit(json!({ "review": null }));
         return Ok(());
     };
     let remote = Remote::origin()?;
-    let mut kept: Vec<u64> = fs::read_dir(repository_dir(&remote)?)
-        .into_iter()
-        .flatten()
-        .flatten()
-        .filter_map(|entry| entry.file_name().to_str()?.parse().ok())
-        .collect();
-    // A branch's newest PR first: older ones on it are likely closed.
-    kept.sort_unstable_by(|a, b| b.cmp(a));
+    let head = Head::of(&branch, &remote);
+    let kept: Vec<u64> = if let Head::Pull(pr) = head {
+        vec![pr]
+    } else {
+        let mut kept: Vec<u64> = fs::read_dir(repository_dir(&remote)?)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter_map(|entry| entry.file_name().to_str()?.parse().ok())
+            .collect();
+        // A branch's newest PR first: older ones on it are likely closed.
+        kept.sort_unstable_by(|a, b| b.cmp(a));
+        kept
+    };
+    let ours = |s: &Value| match &head {
+        Head::Pull(_) => true,
+        Head::Branch { name, .. } => {
+            s["head_ref"] == name.as_str() && head.owns(&s["cross_repository"], &s["head_owner"])
+        }
+    };
     for pr in kept {
         let review = Review::of(remote.clone(), pr)?;
         if let Some(session) = review
             .session()
-            .filter(|s| s["head_ref"] == branch.as_str())
+            .filter(|s| ours(s) && s["state"].as_str().is_none_or(|s| s == "OPEN"))
         {
             emit(json!({ "review": review.printed(&session) }));
             return Ok(());
         }
     }
-    let Some(mut found) = github::detect(&remote, &branch)? else {
+    let Some(mut found) = github::detect(&remote, &head)? else {
         emit(json!({ "review": null }));
         return Ok(());
     };
@@ -562,8 +718,10 @@ fn detect() -> Result<(), String> {
 
 fn open_prs() -> Result<Vec<Value>, String> {
     let remote = Remote::origin()?;
-    let branch = git::git(&["symbolic-ref", "--quiet", "--short", "HEAD"]).ok();
-    Ok(github::list(&remote, branch.as_deref())?)
+    let head = git::git(&["symbolic-ref", "--quiet", "--short", "HEAD"])
+        .ok()
+        .map(|branch| Head::of(&branch, &remote));
+    Ok(github::list(&remote, head.as_ref())?)
 }
 
 fn list() -> Result<(), String> {
@@ -667,7 +825,6 @@ enum Event {
     Submit(&'static str),
 }
 
-/// What a `post` run does.
 enum PostMode {
     Post(Event),
     /// Says what `post` would do with each draft, without asking GitHub.
@@ -821,11 +978,19 @@ fn at_head(
             placed[key][side] = json!(line + delta);
         }
     }
+    // A range from the other side is anchored by its last line alone, so
+    // nothing says where its start went: it goes on that line.
+    if delta != 0 && placed["start_side"].as_str().is_some_and(|s| s != side) {
+        if let Some(fields) = placed.as_object_mut() {
+            fields.remove("start_side");
+        }
+        placed["start"] = json!({ side: placed["end"][side] });
+    }
     Ok(placed)
 }
 
-/// What `post` does with a draft, decided before anything is sent from git
-/// and the hunks `prepare` or `pull` kept; `--dry-run` prints it. `unsure`
+/// What `post` does with a draft, decided from git and the hunks `prepare`
+/// or `pull` kept before anything is sent; `--dry-run` prints it. `unsure`
 /// says line or file was decided by git's diff of the PR, not GitHub's.
 enum Plan {
     /// On its lines at the PR's head, or a reply in its thread.
@@ -871,8 +1036,9 @@ impl Plan {
 struct Planner {
     /// The session's base and head.
     commits: Option<(String, String)>,
-    /// The paths the PR changes, when git could list them.
-    changed: Option<HashSet<String>>,
+    /// The paths the PR changes, when git could list them: read on the
+    /// first draft that isn't a reply.
+    changed: OnceCell<Option<HashSet<String>>>,
     /// GitHub's hunks of the session's head by path, when they were kept.
     github: HashMap<String, Vec<git::Hunk>>,
     /// git's hunks of the PR by path, for files GitHub's don't cover: read
@@ -891,17 +1057,6 @@ impl Planner {
                 s["head"].as_str()?.to_owned(),
             ))
         });
-        let changed = commits.as_ref().and_then(|(base, head)| {
-            let range = format!("{base}...{head}");
-            let names = git::git(&["diff", "--name-only", "-z", "--find-renames", &range]).ok()?;
-            Some(
-                names
-                    .split('\0')
-                    .filter(|n| !n.is_empty())
-                    .map(str::to_owned)
-                    .collect(),
-            )
-        });
         let github = commits
             .as_ref()
             .and_then(|(_, head)| review.hunks(head))
@@ -913,7 +1068,7 @@ impl Planner {
             .collect();
         Self {
             commits,
-            changed,
+            changed: OnceCell::new(),
             github,
             local: OnceCell::new(),
             threads,
@@ -933,7 +1088,28 @@ impl Planner {
             };
         }
         let path = draft["path"].as_str().unwrap_or_default();
-        if self.changed.as_ref().is_some_and(|c| !c.contains(path)) {
+        let changed = self.changed.get_or_init(|| {
+            let (base, head) = self.commits.as_ref()?;
+            let range = format!("{base}...{head}");
+            let names = git::git(&[
+                "diff",
+                "--name-only",
+                "-z",
+                "--find-renames",
+                "--end-of-options",
+                &range,
+                "--",
+            ])
+            .ok()?;
+            Some(
+                names
+                    .split('\0')
+                    .filter(|n| !n.is_empty())
+                    .map(str::to_owned)
+                    .collect(),
+            )
+        });
+        if changed.as_ref().is_some_and(|c| !c.contains(path)) {
             return Plan::Skip("file not in the PR".to_owned());
         }
         let placed = match &self.commits {
@@ -953,9 +1129,10 @@ impl Planner {
                 let (base, head) = self.commits.as_ref()?;
                 git::hunks(base, head, github::CONTEXT).ok()
             });
-            let hunks = local.as_ref();
             (
-                hunks.map(|h| h.get(path).map_or(&[][..], Vec::as_slice)),
+                local
+                    .as_ref()
+                    .map(|h| h.get(path).map_or(&[][..], Vec::as_slice)),
                 true,
             )
         };
@@ -1037,7 +1214,10 @@ fn post(pr: u64, event: Event, summary: Option<&str>) -> Result<(), String> {
 
     let mut notes = Vec::new();
     if !post.left.is_empty() || held {
-        let why: Vec<&str> = (post.left.iter().map(|l| l.note.as_str()))
+        let why: Vec<&str> = post
+            .left
+            .iter()
+            .map(|l| l.note.as_str())
             .chain(post.resolves_refused.iter().map(String::as_str))
             .collect();
         let pending = if held { ", review left pending" } else { "" };
@@ -1067,7 +1247,7 @@ fn post(pr: u64, event: Event, summary: Option<&str>) -> Result<(), String> {
     // `pending` leaves the review pending as asked; only a submit is held.
     if matches!(event, Event::Submit(_)) && !submitted {
         done["held"] = json!(true);
-        done["held_message"] = json!(HELD);
+        done["held_message"] = json!("review still pending");
     }
     emit(done);
     failure.map_or(Ok(()), Err)
@@ -1193,7 +1373,6 @@ impl<'a> Post<'a> {
     /// back right away, so a retry skips it. Fails only when that write
     /// does.
     fn draft(&mut self, comment: &Value, on_file: bool) -> Result<(), String> {
-        let at = location(comment);
         let thread = if let Some(root) = comment["in_reply_to"].as_str() {
             // Its root was planned, then refused.
             let Some(thread) = self.threads.get(root).cloned() else {
@@ -1238,7 +1417,8 @@ impl<'a> Post<'a> {
                 )
                 .map_err(|e| {
                     format!(
-                        "posted {at} but couldn't record it, so a retry would post it again: {e}"
+                        "posted {} but couldn't record it, so a retry would post it again: {e}",
+                        location(comment)
                     )
                 })?;
                 self.posted += 1;
@@ -1279,10 +1459,7 @@ impl<'a> Post<'a> {
     /// no comment in it, as for an approval alone, starts a review first.
     fn send(&mut self, event: Event, summary: &str) -> Result<(), Error> {
         match (event, &self.review) {
-            (Event::Submit(event), _) => {
-                let review = self.review_id()?;
-                github::submit(&review, event, summary)
-            }
+            (Event::Submit(event), _) => github::submit(&self.review_id()?, event, summary),
             (Event::Pending, Some((review, _))) if !summary.is_empty() => {
                 github::set_review_body(review, summary)
             }

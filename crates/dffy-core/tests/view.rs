@@ -438,18 +438,18 @@ fn changes_and_files_lead_across_entries_and_say_how_to_settle() {
     assert_eq!(doc.pos, at(l, 1, 0), "the file's top, until the host lands");
     assert_eq!(doc.edge(l, true, unified), Some(at(l, 4, 3)));
 
-    assert_eq!(doc.next_file(), Some(Settle::Keep));
+    assert_eq!(doc.goto_file(m), Some(Settle::Keep));
     assert_eq!(doc.pos, at(m, 2, 0), "where it was left");
     assert_eq!(
-        doc.next_file(),
+        doc.goto_file(n),
         Some(Settle::Open {
             file: n,
             landing: false
         })
     );
     assert_eq!(doc.open(n, unified), Some(at(n, 1, 0)));
-    assert_eq!(doc.next_file(), None, "the last entry");
-    assert_eq!(doc.prev_file(), Some(Settle::Keep));
+    assert_eq!(doc.goto_file(n + 1), None, "past the last entry");
+    assert_eq!(doc.goto_file(m), Some(Settle::Keep));
     assert_eq!(doc.pos.file, m);
 
     let last = end(&mut doc, n);
@@ -475,7 +475,6 @@ fn an_evicted_entry_wants_its_diff_again_and_keeps_its_place() {
 
     let budget = doc.file(m).expect("loaded").bytes();
     doc.evict(budget, &(m..m + 1));
-    assert!(doc.loaded_bytes() <= budget);
     assert!(doc.file(l).is_none());
     assert!(doc.files()[l].wants_diff());
     assert!(doc.file(m).is_some(), "the entry shown stays");

@@ -1091,8 +1091,6 @@ fn file_diff_loads_both_sides() {
     assert!(fd.binary && fd.hunks.is_empty());
 }
 
-/// A linked worktree has a git directory of its own, apart from the
-/// repository's shared one.
 #[test]
 fn git_dir_is_the_worktrees_own() {
     let dir = init();

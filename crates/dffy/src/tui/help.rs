@@ -482,8 +482,7 @@ pub(super) fn frame(
     grid.put_str(close, y0, end - 1, CLOSE, theme.style(Role::Dim));
 }
 
-/// A box over the screen at `x0`, `y0`, `width` by `height`: cleared, in a
-/// border.
+/// Clears the box and draws its border.
 pub(super) fn border(
     grid: &mut Grid,
     (x0, y0, width, height): (usize, usize, usize, usize),

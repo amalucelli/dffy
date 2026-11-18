@@ -74,7 +74,6 @@ pub(crate) struct Facts {
     /// The `render` setting's extensions and renderers, with where each
     /// renderer's executable is, if it's on PATH.
     pub renderers: Vec<(String, String, Option<PathBuf>)>,
-    /// The review plugin set; `None` without one.
     pub review: Option<ReviewFacts>,
 }
 
@@ -875,8 +874,8 @@ impl Facts {
         checks.push(check);
         for own in review.checks.iter().flatten().flatten() {
             let mark = if own.ok { Mark::Ok } else { Mark::Warn };
-            // Details are escaped as they're drawn; labels are dffy's own
-            // but for this one.
+            // Details are escaped when drawn, labels aren't, and this label
+            // comes from the plugin.
             checks.push(Check::new(
                 mark,
                 format!("review {}", escape(own.name.as_bytes())),

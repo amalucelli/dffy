@@ -9,6 +9,7 @@ use std::fs::{self, File};
 use std::hash::{BuildHasher as _, RandomState};
 use std::io::{self, Write as _};
 use std::ops::Range;
+use std::os::unix::fs::OpenOptionsExt as _;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -18,7 +19,6 @@ use crate::plugin::json::{self, Value};
 use crate::render::{Canvas, escape};
 use crate::theme::Role;
 
-/// The format version dffy reads and writes.
 const VERSION: usize = 1;
 
 /// Lines of context an anchor keeps on each side of the commented lines.
@@ -72,10 +72,12 @@ pub(crate) struct Anchor {
 }
 
 /// A comment as the file holds it. Line comments have `start`, `end` and
-/// `anchor`; file comments and replies have none of them.
+/// `anchor`; file comments and replies have none of them. A general
+/// comment, on the review rather than a file, has no path either.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub(crate) struct Comment {
     pub id: String,
+    /// Empty for a general comment.
     pub path: String,
     pub old_path: Option<String>,
     /// The side of `end`; only meaningful for a line comment.
@@ -103,6 +105,12 @@ pub(crate) struct Comment {
     /// The host marks the thread outdated: its lines changed since it was
     /// written. Set on a thread's first comment.
     pub outdated: bool,
+    /// What a general comment is, in the integration's word: `description`,
+    /// `review`, `comment`, or one dffy doesn't know.
+    pub kind: Option<String>,
+    /// A word the integration gives a general comment, shown as given,
+    /// such as a review's verdict.
+    pub label: Option<String>,
     /// Fields dffy doesn't know, in file order, written back as read.
     pub extra: Fields,
 }
@@ -219,11 +227,10 @@ pub(crate) fn move_threads(from: &Path, to: &Path, roots: &[String]) -> Result<u
         }
         update(to, |target| {
             for root in moved.iter().filter(|c| c.in_reply_to.is_none()) {
-                let id = target.insert(root.clone(), None, now)?;
-                let reply_to = Target::Id(id);
+                let reply_to = Target::Id(target.insert(root.clone(), None, now)?);
                 for reply in moved
                     .iter()
-                    .filter(|c| c.in_reply_to == Some(root.id.clone()))
+                    .filter(|c| c.in_reply_to.as_ref() == Some(&root.id))
                 {
                     target.insert(reply.clone(), Some(&reply_to), now)?;
                 }
@@ -259,9 +266,17 @@ fn update<T>(
     lock.lock().map_err(|e| failed("lock", &lock_path, e))?;
     let mut comments = read(path)?;
     let out = change(&mut comments)?;
-    // One fixed name is enough: only the lock's holder writes it.
+    // One fixed name is enough: only the lock's holder writes it. One left
+    // by a crash is removed, and `create_new` won't follow a link put in
+    // its place.
     let tmp = sibling(path, ".tmp");
-    let mut file = File::create(&tmp).map_err(|e| failed("create", &tmp, e))?;
+    fs::remove_file(&tmp).ok();
+    let mut file = File::options()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&tmp)
+        .map_err(|e| failed("create", &tmp, e))?;
     file.write_all(comments.encode().as_bytes())
         .and_then(|()| file.sync_all())
         .map_err(|e| failed("write", &tmp, e))?;
@@ -409,7 +424,7 @@ impl Review {
                 }
                 let comment = &mut self.comments[i];
                 if let Some(text) = change.text {
-                    if comment.reference.is_some() {
+                    if comment.reference.is_some() && change.reference != Some(None) {
                         return Err(format!(
                             "comment {} is posted (it has a ref), so its text is the host's",
                             comment.id
@@ -535,8 +550,16 @@ impl Review {
         if comment.in_reply_to.is_some() {
             return Ok(());
         }
+        // A general comment comes only from an integration, which names it
+        // by its ref.
         if comment.path.is_empty() {
-            return Err("a comment needs a path".to_owned());
+            if comment.reference.is_none() {
+                return Err("a comment needs a path".to_owned());
+            }
+            if comment.start.is_some() || comment.end.is_some() {
+                return Err("a general comment, without a path, has no lines".to_owned());
+            }
+            return Ok(());
         }
         let (Some(start), Some(end)) = (comment.start, comment.end) else {
             if comment.start.is_some() || comment.end.is_some() {
@@ -639,6 +662,8 @@ impl Comment {
                 "ref" => c.reference = string(&key, value)?,
                 "anchor" => c.anchor = anchor(value)?,
                 "url" => c.url = string(&key, value)?,
+                "kind" => c.kind = string(&key, value)?,
+                "label" => c.label = string(&key, value)?,
                 "outdated" => {
                     c.outdated = match value {
                         Value::Null => false,
@@ -665,15 +690,17 @@ impl Comment {
     /// The file's fields in order, leaving out those that don't apply.
     pub(crate) fn to_fields(&self) -> Fields {
         let text = |s: &str| Value::String(s.to_owned());
-        let mut f = vec![
-            ("id".to_owned(), text(&self.id)),
-            ("path".to_owned(), text(&self.path)),
-        ];
+        let mut f = vec![("id".to_owned(), text(&self.id))];
         let put = |f: &mut Fields, key: &str, value: Option<Value>| {
             if let Some(value) = value {
                 f.push((key.to_owned(), value));
             }
         };
+        put(
+            &mut f,
+            "path",
+            (!self.path.is_empty()).then(|| text(&self.path)),
+        );
         put(&mut f, "old_path", self.old_path.as_deref().map(text));
         if self.end.is_some() {
             put(&mut f, "side", Some(text(self.side.name())));
@@ -711,6 +738,8 @@ impl Comment {
             "outdated",
             self.outdated.then_some(Value::Bool(true)),
         );
+        put(&mut f, "kind", self.kind.as_deref().map(text));
+        put(&mut f, "label", self.label.as_deref().map(text));
         f.extend(self.extra.iter().cloned());
         f
     }
@@ -828,8 +857,7 @@ fn parse_op(item: Value) -> Result<Op, String> {
     let Value::Object(mut fields) = item else {
         return Err("not an object".to_owned());
     };
-    let op = take(&mut fields, "op");
-    match op.as_ref().and_then(Value::as_str) {
+    match take(&mut fields, "op").as_ref().and_then(Value::as_str) {
         Some("add") => {
             let (fields, reply_to) = comment_fields(take(&mut fields, "comment"))?;
             if fields.iter().any(|(k, _)| k == "id") {
@@ -1007,9 +1035,9 @@ pub(crate) fn distance(range: Range<usize>, side: Side, hunks: &[Hunk]) -> Optio
 }
 
 /// `comments` in thread order, for listing: each thread's first comment,
-/// then its replies in the order they were added. Threads go by path, then
-/// by first line, file comments first. A reply whose thread isn't among
-/// `comments` stands as a thread of its own.
+/// then its replies in the order they were added. General comments come
+/// first, then threads by path and first line, file comments first. A
+/// reply whose thread isn't among `comments` stands as a thread of its own.
 pub(crate) fn threads<'a>(comments: impl IntoIterator<Item = &'a Comment>) -> Vec<&'a Comment> {
     let all: Vec<&Comment> = comments.into_iter().collect();
     let ids: HashSet<&str> = all.iter().map(|c| c.id.as_str()).collect();
@@ -1049,9 +1077,19 @@ pub(crate) fn render(comments: &[&Comment], c: &mut Canvas) {
             if i > 0 {
                 c.end_line();
             }
-            c.push(Role::FileHeader, &escape(comment.path.as_bytes()));
+            if comment.path.is_empty() {
+                c.push(Role::FileHeader, "conversation");
+                for word in [&comment.kind, &comment.label].into_iter().flatten() {
+                    c.push(Role::Dim, &format!(", {}", escape(word.as_bytes())));
+                }
+            } else {
+                c.push(Role::FileHeader, &escape(comment.path.as_bytes()));
+            }
             match (&comment.in_reply_to, comment.range()) {
-                (Some(root), _) => c.push(Role::Dim, &format!(", reply in thread {root}")),
+                (Some(root), _) => c.push(
+                    Role::Dim,
+                    &format!(", reply in thread {}", escape(root.as_bytes())),
+                ),
                 (None, Some((side, lines))) => {
                     let (first, last) = (lines.start + 1, lines.end);
                     let mut place = if first == last {

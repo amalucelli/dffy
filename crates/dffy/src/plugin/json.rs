@@ -294,14 +294,9 @@ pub(crate) fn write(out: &mut String, value: &Value) {
     match value {
         Value::Null => out.push_str("null"),
         Value::Bool(b) => out.push_str(if *b { "true" } else { "false" }),
-        #[expect(
-            clippy::cast_possible_truncation,
-            reason = "checked: whole and below 2^53, where f64 is exact"
-        )]
-        Value::Number(n) if n.fract() == 0.0 && n.abs() < 9e15 => {
-            out.push_str(&(*n as i64).to_string());
+        Value::Number(n) => {
+            let _ = write!(out, "{n}");
         }
-        Value::Number(n) => out.push_str(&n.to_string()),
         Value::String(text) => string(out, text),
         Value::Array(items) => {
             out.push('[');

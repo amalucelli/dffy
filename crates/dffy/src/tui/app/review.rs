@@ -2,11 +2,10 @@
 //! showing `<base>...<head>` with the review's comments file. The plugin
 //! runs in the background (see [`crate::plugin::review`]): what it says
 //! comes back as [`Event::Review`] for the run's id, and runs that are no
-//! longer wanted are ignored. Here are the state of the review, the run
-//! going on, the picker of reviews and the dialog that posts the review.
-//! Every word naming the host's kind of review is the plugin's.
+//! longer wanted are ignored. Every word naming the host's kind of review is the plugin's.
 
 use std::collections::HashMap;
+use std::fmt::Write as _;
 use std::ops::ControlFlow;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -15,11 +14,9 @@ use dffy_core::git::Revisions;
 use dffy_core::view::Attributes;
 use unicode_width::UnicodeWidthStr;
 
-use std::fmt::Write as _;
-
 use super::{Action, App, Comments, escape, is_web};
 use crate::plugin::review::{self, Draft, Listed, Plan, Reason, ReviewEvent, Said, Session};
-use crate::term::{Grid, Input, Key, Mods};
+use crate::term::{self, Grid, Input, Key, Mods};
 use crate::theme::{Role, Style, Theme};
 use crate::tui::help;
 use crate::tui::textbox::TextBox;
@@ -41,7 +38,6 @@ pub(super) struct Mode {
     /// With `plain`: the review's base against the working tree instead,
     /// so changes not pushed yet show with the review's.
     pub whole: bool,
-    /// The event of the last post.
     pub event: Option<ReviewEvent>,
     /// How the last post ended, which the status bar keeps saying.
     pub outcome: Option<String>,
@@ -126,6 +122,15 @@ impl Job {
     fn posts(self) -> bool {
         matches!(self, Self::Post | Self::ApplyEvent(_))
     }
+
+    fn doing(self) -> &'static str {
+        match self {
+            Self::Prepare => "fetching threads",
+            Self::Pull => "updating",
+            Self::Post => "posting",
+            Self::ApplyEvent(_) => "sending",
+        }
+    }
 }
 
 pub(super) struct Running {
@@ -186,22 +191,15 @@ impl Unposted {
 /// for an event `held` back (`review still pending · 2 not posted`), or
 /// `nothing posted`.
 fn outcome(event: &ReviewEvent, (posted, failed): (usize, usize), held: Option<&str>) -> String {
-    let not_posted = |text: &str| match failed {
-        0 => text.to_owned(),
-        n => format!("{text} · {} not posted", plural(n, "comment")),
-    };
     match held {
         Some(held) if failed > 0 => format!("{held} · {failed} not posted"),
         Some(held) => held.to_owned(),
         None if !event.submits && posted + failed == 0 => "nothing posted".to_owned(),
         None if event.submits && failed == 0 => "review sent".to_owned(),
-        None => not_posted(&event.done),
+        None if failed == 0 => event.done.clone(),
+        None => format!("{} · {} not posted", event.done, plural(failed, "comment")),
     }
 }
-
-/// What the status bar says of an event held back when the plugin doesn't
-/// say.
-const HELD: &str = "review not sent";
 
 /// The dialog `P` opens.
 pub(super) struct Dialog {
@@ -251,7 +249,7 @@ pub(super) struct Picker {
 }
 
 impl Picker {
-    fn new(mut reviews: Vec<Listed>, nouns: &str, prefix: &str) -> Self {
+    fn new(reviews: Vec<Listed>, nouns: &str, prefix: &str) -> Self {
         let mut groups: Vec<String> = Vec::new();
         let mut title_of = |listed: &Listed| {
             let title = match listed.reason {
@@ -266,7 +264,7 @@ impl Picker {
             })
         };
         // Sorted stably, so the plugin's groups keep the order they came.
-        let mut keyed: Vec<(Reason, usize, Listed)> = (reviews.drain(..))
+        let mut keyed: Vec<(Reason, usize, Listed)> = (reviews.into_iter())
             .map(|listed| (listed.reason, title_of(&listed), listed))
             .collect();
         keyed.sort_by_key(|&(reason, group, _)| (reason, group));
@@ -548,7 +546,6 @@ impl App {
         })
     }
 
-    /// What the dialog's dry run said.
     fn preflighted(&mut self, said: Said) {
         let Some(preflight) = self.posting.as_mut().map(|d| &mut d.preflight) else {
             return;
@@ -676,6 +673,8 @@ impl App {
         let mode = self.reviewing.as_ref()?;
         let revisions = mode.revisions();
         self.description = mode.description();
+        let title = mode.session.title.as_deref().unwrap_or(&mode.label);
+        title.clone_into(&mut self.doc.page_title);
         if let Some((selected, _)) = &mut self.selected {
             selected.clone_from(&revisions);
         }
@@ -703,7 +702,6 @@ impl App {
         self.review_range()
     }
 
-    /// Whether "Since last review" is on, for the command panel.
     pub(super) fn since_review(&self) -> bool {
         self.reviewing.as_ref().is_some_and(|p| p.since_last)
     }
@@ -758,7 +756,7 @@ impl App {
         }
     }
 
-    /// What a run said. Runs no longer wanted say nothing.
+    /// Runs no longer wanted are ignored.
     pub(super) fn review_said(&mut self, id: u64, said: Said) -> Option<Action> {
         if self.reviewing.as_ref().is_some_and(|p| p.check == Some(id)) {
             self.checked(said);
@@ -807,12 +805,26 @@ impl App {
                         if let Some(notice) = self.comments.as_ref().and_then(Comments::notice) {
                             self.message(escape(notice.as_bytes()));
                         }
+                        self.unseen = self.reviewing.as_ref().and_then(|mode| {
+                            let mut outcome = mode.outcome.as_ref()?.chars();
+                            let first = outcome.next()?.to_uppercase();
+                            Some(term::Status {
+                                state: term::State::Done,
+                                message: Some(format!(
+                                    "{}{} · {}",
+                                    first,
+                                    outcome.as_str(),
+                                    mode.label
+                                )),
+                                ..term::Status::default()
+                            })
+                        });
                     }
                     (_, Ok(())) => {}
                     (job, Err(e)) => {
                         let e = escape(e.as_bytes());
                         let label = &running.label;
-                        self.message(match job {
+                        self.failed(match job {
                             Job::Prepare => format!("{label}: {e}"),
                             Job::Pull => format!("updating {label} failed: {e}"),
                             Job::Post => format!("posting failed: {e}"),
@@ -844,7 +856,8 @@ impl App {
             mode.session.last_reviewed_head = Some(mode.session.head.clone());
         }
         mode.resolves.clear();
-        let message = held.then(|| running.held_message.unwrap_or_else(|| HELD.to_owned()));
+        let message =
+            held.then(|| (running.held_message).unwrap_or_else(|| "review not sent".to_owned()));
         let text = outcome(&event, (posted, failed), message.as_deref());
         if event.submits && held && failed > 0 {
             mode.outcome = Some(text);
@@ -894,7 +907,7 @@ impl App {
     }
 
     /// Input while the prompt after a post that left drafts out is open.
-    pub(super) fn held_input(&mut self, input: &Input) -> Option<Action> {
+    fn held_input(&mut self, input: &Input) -> Option<Action> {
         let &Input::Key(key, mods) = input else {
             return None;
         };
@@ -941,7 +954,6 @@ impl App {
         None
     }
 
-    /// What `list` said, for the picker.
     fn listed(&mut self, said: Said) {
         match said {
             Said::Listed(reviews) => {
@@ -1008,14 +1020,13 @@ impl App {
         }
     }
 
-    /// After an update moved the head from `old` to `new`, how many
-    /// commits that is, when git could tell.
+    /// After an update moved the head, how many commits it moved by, when
+    /// git could tell.
     pub(crate) fn review_updated(&mut self, count: Option<usize>) {
         let (Some(mode), Some(count)) = (&self.reviewing, count) else {
             return;
         };
-        let s = if count == 1 { "" } else { "s" };
-        let note = format!("{} updated · {count} new commit{s}", mode.label);
+        let note = format!("{} updated · {}", mode.label, plural(count, "new commit"));
         self.message(note);
     }
 
@@ -1047,13 +1058,7 @@ impl App {
         let mode = self.reviewing.as_ref()?;
         let mut text = mode.label.clone();
         if let Some(running) = &self.job {
-            let doing = match running.job {
-                Job::Prepare => "fetching threads",
-                Job::Pull => "updating",
-                Job::Post => "posting",
-                Job::ApplyEvent(_) => "sending",
-            };
-            let _ = write!(text, " · {doing}");
+            let _ = write!(text, " · {}", running.job.doing());
             if let Some(progress) = &running.progress {
                 let _ = write!(text, " {progress}");
             }
@@ -1067,6 +1072,42 @@ impl App {
             text.push_str(" · o opens it");
         }
         Some(text)
+    }
+
+    /// The review's part of the program status: the prompt after a post
+    /// waits on the user, and a plugin run is work going on.
+    pub(super) fn review_status(&self) -> Option<term::Status> {
+        if let Some(held) = &self.held {
+            let n = held.failed;
+            let were = if n == 1 { "wasn't" } else { "weren't" };
+            return Some(term::Status {
+                state: term::State::Blocked,
+                message: Some(format!(
+                    "{} {were} posted · {} without them?",
+                    plural(n, "comment"),
+                    held.event.label
+                )),
+                ..term::Status::default()
+            });
+        }
+        let running = self.job.as_ref()?;
+        let doing = match running.job {
+            Job::Prepare => "Fetching threads",
+            Job::Pull => "Fetching updates",
+            Job::Post => "Posting review",
+            Job::ApplyEvent(_) => "Sending review",
+        };
+        // Plugins count progress as done of all: `100/312`.
+        let progress = running.progress.as_deref().and_then(|p| {
+            let (done, all) = p.split_once('/')?;
+            let (done, all) = (done.parse::<u64>().ok()?, all.parse::<u64>().ok()?);
+            u8::try_from(done.min(all) * 100 / all.max(1)).ok()
+        });
+        Some(term::Status {
+            state: term::State::Working,
+            message: Some(format!("{doing} · {}", running.label)),
+            progress,
+        })
     }
 
     /// Input that review mode's overlays take, or `o` while a posted review's
@@ -1093,8 +1134,7 @@ impl App {
         }
     }
 
-    /// Input while the post dialog is open.
-    pub(super) fn post_input(&mut self, input: &Input) -> Option<Action> {
+    fn post_input(&mut self, input: &Input) -> Option<Action> {
         let dialog = self.posting.as_mut()?;
         let (key, mods) = match input {
             Input::Paste(text) => {
@@ -1125,7 +1165,7 @@ impl App {
             Key::Tab | Key::Char('s') => dialog.writing = true,
             Key::Up | Key::Char('k') => dialog.event = dialog.event.saturating_sub(1),
             Key::Down | Key::Char('j') => {
-                dialog.event = (dialog.event + 1).min(dialog.events.len().saturating_sub(1));
+                dialog.event = (dialog.event + 1).min(dialog.events.len() - 1);
             }
             Key::Char(c) if dialog.events.iter().any(|e| e.key == c) => {
                 dialog.event = dialog.events.iter().position(|e| e.key == c).unwrap_or(0);
@@ -1297,10 +1337,7 @@ impl Preflight {
 }
 
 impl Dialog {
-    /// Draws the dialog for `mode`, which would send `unsent` (see
-    /// [`App::unsent`]).
     pub(super) fn draw(&mut self, grid: &mut Grid, theme: &Theme, mode: &Mode, unsent: Unsent) {
-        let dialog = self;
         let (gw, gh) = (grid.width(), grid.height());
         if gw < 20 || gh < 8 {
             return;
@@ -1310,13 +1347,11 @@ impl Dialog {
         } else {
             64.min(gw - 4)
         };
-        let inner = width - 4;
         let mut lines: Vec<(String, Style)> = Vec::new();
         let dim = theme.style(Role::Dim);
-        lines.push((dialog.preflight.what(unsent), Style::PLAIN));
+        lines.push((self.preflight.what(unsent), Style::PLAIN));
         lines.extend(
-            dialog
-                .preflight
+            self.preflight
                 .note()
                 .map(|(text, warn)| (text, if warn { theme.style(Role::Warn) } else { dim })),
         );
@@ -1331,28 +1366,28 @@ impl Dialog {
         }
         lines.push((String::new(), Style::PLAIN));
         let first_event = lines.len();
-        for (i, event) in dialog.events.iter().enumerate() {
-            let dot = if i == dialog.event { "(•)" } else { "( )" };
+        for (i, event) in self.events.iter().enumerate() {
+            let dot = if i == self.event { "(•)" } else { "( )" };
             lines.push((
                 format!("{dot} {}  {}", event.key, event.label),
                 Style::PLAIN,
             ));
         }
         lines.push((String::new(), Style::PLAIN));
-        let hint = if dialog.writing {
+        let hint = if self.writing {
             "summary · esc back"
         } else {
             "summary · s writes"
         };
         lines.push((hint.to_owned(), dim));
         let summary_at = lines.len();
-        let rows = dialog.summary.rows(inner.saturating_sub(2));
+        let rows = self.summary.rows(width - 6);
         let shown = rows.len().clamp(1, 6);
         let skip = rows
             .iter()
             .position(|(_, c)| c.is_some())
             .map_or(0, |at| (at + 1).saturating_sub(shown));
-        let footer = if dialog.writing {
+        let footer = if self.writing {
             "enter new line · esc done"
         } else {
             "enter sends · j/k or the letter picks · esc closes"
@@ -1368,9 +1403,8 @@ impl Dialog {
                 break;
             }
             grid.put_str(x, y, right, text, *style);
-            let event = (i.checked_sub(first_event)).filter(|&e| e < dialog.events.len());
-            if event == Some(dialog.event) {
-                let mut bold = theme.selected(Style::PLAIN, !dialog.writing);
+            if i.checked_sub(first_event) == Some(self.event) {
+                let mut bold = theme.selected(Style::PLAIN, !self.writing);
                 bold.attributes |= Attributes::BOLD;
                 grid.map_styles(x, y, right, |_| bold);
             }
@@ -1381,11 +1415,11 @@ impl Dialog {
                 break;
             }
             let end = grid.put_str(x + 2, y, right, text, Style::PLAIN);
-            if let (Some(at), true) = (cursor, dialog.writing) {
+            if let Some(at) = cursor
+                && self.writing
+            {
                 let column = x + 2 + text[..*at].width();
-                grid.map_styles(column, y, (column + 1).max(end.min(column + 1)), |s| {
-                    theme.selected(s, true)
-                });
+                grid.map_styles(column, y, column + 1, |s| theme.selected(s, true));
                 if column >= end {
                     grid.put_str(column, y, right, " ", theme.selected(Style::PLAIN, true));
                 }
@@ -1465,11 +1499,9 @@ impl Held {
 }
 
 impl App {
-    /// Input while the review picker is open: `j`/`k` or the arrows move,
-    /// `enter` opens, `esc` closes.
-    pub(super) fn review_picker_input(&mut self, input: &Input) -> Option<Action> {
+    fn review_picker_input(&mut self, input: &Input) -> Option<Action> {
         let picker = self.reviews.as_mut()?;
-        let last = picker.reviews.len().saturating_sub(1);
+        let last = picker.reviews.len() - 1;
         match *input {
             Input::Key(Key::Char('c'), mods) if mods.contains(Mods::CTRL) => {
                 return Some(Action::Quit);
@@ -1488,7 +1520,7 @@ impl App {
                     .min(last);
             }
             Input::Key(Key::Enter, _) => {
-                let listed = picker.reviews.get(picker.cursor)?;
+                let listed = &picker.reviews[picker.cursor];
                 let (id, shown) = (listed.id.clone(), listed.shown().to_owned());
                 self.reviews = None;
                 let label = self.review_label(&shown);
@@ -1516,23 +1548,21 @@ impl App {
 
 impl Picker {
     pub(super) fn draw(&mut self, grid: &mut Grid, theme: &Theme) {
-        let picker = self;
         let (gw, gh) = (grid.width(), grid.height());
         if gw < 20 || gh < 6 {
             return;
         }
-        // Group titles, then each review under its group's.
         let mut lines: Vec<Option<usize>> = Vec::new();
         let mut titles: Vec<&str> = Vec::new();
         let mut last = None;
-        for (i, &group) in picker.group.iter().enumerate() {
+        for (i, &group) in self.group.iter().enumerate() {
             if last != Some(group) {
                 if last.is_some() {
                     lines.push(None);
                     titles.push("");
                 }
                 lines.push(None);
-                titles.push(&picker.groups[group]);
+                titles.push(&self.groups[group]);
                 last = Some(group);
             }
             lines.push(Some(i));
@@ -1546,16 +1576,16 @@ impl Picker {
             (lines.len() + 4).min(gh - 2)
         };
         let (x0, y0) = ((gw - width) / 2, (gh - height) / 2);
-        help::frame(grid, (x0, y0, width, height), &picker.title, theme);
-        let rows = height.saturating_sub(3);
+        help::frame(grid, (x0, y0, width, height), &self.title, theme);
+        let rows = height - 3;
         let at = lines
             .iter()
-            .position(|l| *l == Some(picker.cursor))
+            .position(|l| *l == Some(self.cursor))
             .unwrap_or(0);
-        if at < picker.scroll {
-            picker.scroll = at.saturating_sub(1);
-        } else if at >= picker.scroll + rows {
-            picker.scroll = at + 1 - rows;
+        if at < self.scroll {
+            self.scroll = at.saturating_sub(1);
+        } else if at >= self.scroll + rows {
+            self.scroll = at + 1 - rows;
         }
         let (x, right) = (x0 + 2, x0 + width - 3);
         let dim = theme.style(Role::Dim);
@@ -1563,18 +1593,18 @@ impl Picker {
             .iter()
             .zip(&titles)
             .enumerate()
-            .skip(picker.scroll)
+            .skip(self.scroll)
             .take(rows)
         {
-            let y = y0 + 1 + row - picker.scroll;
+            let y = y0 + 1 + row - self.scroll;
             let Some(i) = *line else {
                 let mut bold = theme.style(Role::Plain);
                 bold.attributes |= Attributes::BOLD;
                 grid.put_str(x, y, right, title, bold);
                 continue;
             };
-            let listed = &picker.reviews[i];
-            let selected = i == picker.cursor;
+            let listed = &self.reviews[i];
+            let selected = i == self.cursor;
             let mark = |s: Style| if selected { theme.selected(s, true) } else { s };
             if selected {
                 grid.fill(x - 1, y, right + 1, mark(Style::PLAIN));
@@ -1583,7 +1613,7 @@ impl Picker {
                 x,
                 y,
                 right,
-                &format!("{:<w$}", picker.tags[i], w = picker.tag_width),
+                &format!("{:<w$}", self.tags[i], w = self.tag_width),
                 mark(theme.style(Role::Hint)),
             );
             let author = format!("  {}", escape(listed.author.as_bytes()));
@@ -1600,7 +1630,7 @@ impl Picker {
         help::scrollbar(
             grid,
             (x0 + width - 2, y0 + 1, rows),
-            (lines.len(), picker.scroll),
+            (lines.len(), self.scroll),
             dim,
         );
         grid.put_str(

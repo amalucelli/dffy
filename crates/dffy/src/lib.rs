@@ -6,27 +6,6 @@ mod config;
 mod daemon;
 mod docs;
 mod doctor;
-
-/// `dffy doctor`: fails when a check does.
-fn doctor(ctx: &Ctx, dir: Option<&Path>, json: bool) -> Result<ExitCode, Error> {
-    let facts = doctor::Facts::gather(ctx, dir);
-    let failed = if json {
-        let (text, failed) = facts.json();
-        io::stdout().lock().write_all(text.as_bytes())?;
-        failed
-    } else {
-        let mut c = Canvas::default();
-        let failed = facts.render(&mut c);
-        // Its exit code is always success; the checks decide doctor's.
-        let _ = write_stdout(ctx, &c)?;
-        failed
-    };
-    Ok(if failed {
-        ExitCode::FAILURE
-    } else {
-        ExitCode::SUCCESS
-    })
-}
 mod json;
 mod keys;
 mod mcp;
@@ -192,7 +171,6 @@ impl Ctx {
         self.color_err.then_some(&self.theme)
     }
 
-    /// The review plugin, when it describes its command.
     pub(crate) fn described(&self) -> Option<&plugin::review::Described> {
         self.review.as_ref()?.as_ref().ok()
     }
@@ -304,7 +282,7 @@ pub fn main() -> ExitCode {
     if raw.nth(1).is_some_and(|a| a == plugin::review::DETACH) {
         return plugin::review::exec_detached(raw);
     }
-    let raw: Vec<std::ffi::OsString> = std::env::args_os().collect();
+    let raw: Vec<_> = std::env::args_os().collect();
     // Read before parsing: the review plugin they name adds a subcommand.
     let loaded = config::load();
     let (review_flag, no_cache) = cli::early_flags(&raw);
@@ -312,16 +290,19 @@ pub fn main() -> ExitCode {
         .then(Cache::default_dir)
         .flatten()
         .map(|dir| Cache::new(dir, loaded.config.cache_size));
+    let builtin = Cli::command();
     let review = review_flag
         .or_else(|| loaded.config.review.clone())
+        .filter(|_| cli::needs_review(&raw))
         .map(|name| {
             let program = plugin::find(plugin::REVIEW_PREFIX, &name)
                 .ok_or_else(|| format!("{}{name} isn't on PATH", plugin::REVIEW_PREFIX))?;
-            let naming = plugin::review::describe(&program, cache.as_ref(), cli::is_builtin)?;
+            let reserved = |command: &str| cli::is_subcommand(&builtin, command);
+            let naming = plugin::review::describe(&program, cache.as_ref(), reserved)?;
             Ok(plugin::review::Described { program, naming })
         });
     let described = review.as_ref().and_then(|r| r.as_ref().ok());
-    let mut command = cli::command(described.map(|d| &d.naming));
+    let mut command = cli::with_review(builtin, described.map(|d| &d.naming));
     let args = cli::with_default_subcommand(&command, raw);
     if let Some(choice) = color_flag(&args) {
         command = command.color(choice);
@@ -515,6 +496,27 @@ fn print_err(ctx: &Ctx, canvas: &Canvas) {
     let mut buf = Vec::new();
     canvas.write_to(&mut buf, ctx.err_theme()).ok();
     io::stderr().lock().write_all(&buf).ok();
+}
+
+/// `dffy doctor`: fails when a check does.
+fn doctor(ctx: &Ctx, dir: Option<&Path>, json: bool) -> Result<ExitCode, Error> {
+    let facts = doctor::Facts::gather(ctx, dir);
+    let failed = if json {
+        let (text, failed) = facts.json();
+        io::stdout().lock().write_all(text.as_bytes())?;
+        failed
+    } else {
+        let mut c = Canvas::default();
+        let failed = facts.render(&mut c);
+        // Its exit code is always success; the checks decide doctor's.
+        let _ = write_stdout(ctx, &c)?;
+        failed
+    };
+    Ok(if failed {
+        ExitCode::FAILURE
+    } else {
+        ExitCode::SUCCESS
+    })
 }
 
 /// The comments file: `file` (`--comments`) relative to where dffy runs

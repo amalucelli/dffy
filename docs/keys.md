@@ -96,6 +96,8 @@ keybind = leader:z=toggle_wrap
 | `copy` | `y` | `y` | Copy the selected lines' code |
 | `copy_path` | `Y` | `Y` | Copy the file's path |
 | `copy_absolute_path` |  |  | Copy where the file is on disk, from the filesystem's root |
+| `copy_comment` |  |  | Copy a comment of the focused thread as written, in Markdown: the one last clicked, else its first |
+| `copy_thread` |  |  | Copy the focused thread: each comment under its author and date, as written |
 | `cancel` | `esc` |  | End the selection; in the tree, clear the filter |
 | `toggle_copy_decorations` |  | `D` | Copies include line numbers and +/- signs, or only the code |
 

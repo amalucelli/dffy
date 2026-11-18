@@ -51,6 +51,13 @@ pub enum Source<P> {
     /// A commit's header, or text from a piped diff: no diff of its own. A
     /// commit's files are the entries after it, up to the next commit.
     Commit(Arc<Commit>),
+    /// A page the host draws, such as a review's conversation: `rows` rows
+    /// in part 0, no diff and no files of its own. It's always the first
+    /// entry (see [`Document::set_page`]).
+    Page {
+        /// At least 1.
+        rows: usize,
+    },
 }
 
 /// An entry's diff.
@@ -105,7 +112,8 @@ pub struct Entry<P> {
     /// The file changed since `counts` were taken.
     recount: bool,
     viewed: bool,
-    /// Lines revealed from the top and bottom edge of each gap.
+    /// What's revealed of each gap, by gap. Gaps past its end show nothing,
+    /// so a file nothing was revealed in holds none.
     reveal: Vec<Reveal>,
     /// Where the file was left when another was shown.
     saved: Option<Pos>,
@@ -128,7 +136,7 @@ impl<P> Entry<P> {
         let counts = match &source {
             Source::Repo => None,
             Source::Piped(file) => Some(file.counts),
-            Source::Commit(_) => Some(Counts::default()),
+            Source::Commit(_) | Source::Page { .. } => Some(Counts::default()),
         };
         let mut entry = Self {
             change,
@@ -230,20 +238,27 @@ impl<P> Entry<P> {
         !self.is_sheet() && (self.stale || matches!(self.state, State::Pending))
     }
 
-    /// A commit's header or a piped text block, not a file.
+    /// Not a file: a commit's header, a piped text block, or a page.
     #[inline]
     #[must_use]
     pub fn is_commit(&self) -> bool {
-        matches!(self.source, Source::Commit(_))
+        matches!(self.source, Source::Commit(_) | Source::Page { .. })
     }
 
-    /// Shown as rows of text in part 0 rather than hunks: a commit, or a
+    /// The page the host draws (see [`Source::Page`]).
+    #[inline]
+    #[must_use]
+    pub fn is_page(&self) -> bool {
+        matches!(self.source, Source::Page { .. })
+    }
+
+    /// Shown as rows in part 0 rather than hunks: a commit, a page, or a
     /// piped combined diff, which is shown as it came.
     #[inline]
     #[must_use]
     pub fn is_sheet(&self) -> bool {
         match &self.source {
-            Source::Commit(_) => true,
+            Source::Commit(_) | Source::Page { .. } => true,
             Source::Piped(file) => file.combined.is_some(),
             Source::Repo => false,
         }
@@ -254,7 +269,9 @@ impl<P> Entry<P> {
     pub fn status(&self) -> FileStatus {
         match &self.source {
             Source::Piped(file) => file.status,
-            Source::Repo | Source::Commit(_) => file_status(&self.change.status),
+            Source::Repo | Source::Commit(_) | Source::Page { .. } => {
+                file_status(&self.change.status)
+            }
         }
     }
 
@@ -297,8 +314,8 @@ impl<P> Entry<P> {
             }
             (render, _) => render,
         }));
-        if let State::Loaded(file) = &self.state {
-            self.reveal = vec![Reveal::default(); file.gaps().len()];
+        if matches!(self.state, State::Loaded(_)) {
+            self.reveal.clear();
         }
         self.saved = None;
         self.placed = false;
@@ -455,13 +472,6 @@ impl<P> Document<P> {
         &self.commits
     }
 
-    /// Bytes the loaded diffs hold, as [`File::bytes`] counts them.
-    #[inline]
-    #[must_use]
-    pub fn loaded_bytes(&self) -> usize {
-        self.loaded_bytes
-    }
-
     /// Whether rendered views show where they're ready.
     #[inline]
     #[must_use]
@@ -498,8 +508,54 @@ impl<P> Document<P> {
         commit + 1..self.commits.get(next).copied().unwrap_or(self.files.len())
     }
 
-    /// Commits at the head of the list (`dffy show`'s), which stay first
-    /// when the files after them are sorted or replaced.
+    /// Puts a page of `rows` rows (see [`Source::Page`]) first in the list,
+    /// or with `None` takes away the one there; a page there already takes
+    /// the new count of rows. Returns how far every other entry moved: 1
+    /// when the page was put first, -1 when it was taken away, else 0. The
+    /// position moves with its file, or from the page taken away to the
+    /// first file; the search's file moves too, and other positions held in
+    /// files are dropped ([`Document::forget_positions`]). The host
+    /// normalizes the position.
+    pub fn set_page(&mut self, page: Option<(FileChange, usize)>) -> isize {
+        let present = self.files.first().is_some_and(Entry::is_page);
+        let moved: isize = match (page, present) {
+            (Some((_, rows)), true) => {
+                self.files[0].source = Source::Page { rows };
+                return 0;
+            }
+            (None, false) => return 0,
+            (Some((change, rows)), false) => {
+                self.files
+                    .insert(0, Entry::new(change, Source::Page { rows }));
+                // An empty list's position becomes the page's.
+                if self.files.len() > 1 {
+                    self.pos.file += 1;
+                }
+                1
+            }
+            (None, true) => {
+                self.files.remove(0);
+                if self.pos.file == 0 {
+                    self.pos = Pos::default();
+                } else {
+                    self.pos.file -= 1;
+                }
+                -1
+            }
+        };
+        for c in &mut self.commits {
+            *c = c.saturating_add_signed(moved);
+        }
+        if let Some(found) = &mut self.search {
+            found.file = found.file.saturating_add_signed(moved);
+        }
+        self.forget_positions();
+        moved
+    }
+
+    /// Commits and the page at the head of the list (`dffy show`'s, or a
+    /// review's), which stay first when the files after them are sorted or
+    /// replaced.
     fn head(&self) -> usize {
         self.files.iter().take_while(|e| e.is_commit()).count()
     }
@@ -659,7 +715,7 @@ impl<P> Document<P> {
             Ok(loaded) => {
                 self.loaded_bytes += loaded.bytes();
                 entry.counts = Some(loaded.counts());
-                entry.reveal.resize(loaded.gaps().len(), Reveal::default());
+                entry.reveal.truncate(loaded.gaps().len());
                 // A diff of the same file may cut its gaps differently.
                 for (reveal, gap) in entry.reveal.iter_mut().zip(loaded.gaps()) {
                     reveal.settle(gap.len);
@@ -994,6 +1050,7 @@ impl<P> Document<P> {
                 None => commit.lines.len().max(1),
             }),
             Source::Piped(piped) => Some(piped.combined.as_ref().map_or(0, Vec::len).max(1)),
+            Source::Page { rows } => Some((*rows).max(1)),
             Source::Repo => None,
         }
     }
@@ -1169,16 +1226,6 @@ impl<P> Document<P> {
                 Settle::Keep
             },
         )
-    }
-
-    /// [`Document::goto_file`] for the next entry.
-    pub fn next_file(&mut self) -> Option<Settle> {
-        self.goto_file(self.pos.file + 1)
-    }
-
-    /// [`Document::goto_file`] for the previous entry.
-    pub fn prev_file(&mut self) -> Option<Settle> {
-        self.goto_file(self.pos.file.checked_sub(1)?)
     }
 
     /// Shows `file` from its top, keeping the current file's place.
@@ -1418,17 +1465,18 @@ impl<P> Document<P> {
     }
 
     /// Puts `pos` back on gap line `line` after the gap changed.
-    fn reanchor(&self, gap: usize, line: Option<usize>, pos: &mut Pos) {
+    fn reanchor(&self, gap: usize, line: Option<usize>, mut pos: Pos) -> Pos {
         if let Some(line) = line
             && let Some((loaded, shape)) = self.view(pos.file)
         {
             pos.row = loaded.shown(&shape, gap).row(line);
             pos.offset = 0;
         }
+        pos
     }
 
-    /// Stores `reveal` for gap `gap` of `file`, keeping the position, and
-    /// the place the file was left at, on their lines of the gap.
+    /// Stores `reveal` for gap `gap` of `file`, keeping the position and
+    /// the file's saved place on their lines of the gap.
     fn set_reveal(&mut self, file: usize, gap: usize, gaps: usize, reveal: Reveal) {
         let saved = self.files[file].saved;
         let anchors = (
@@ -1438,12 +1486,9 @@ impl<P> Document<P> {
         let entry = &mut self.files[file];
         entry.reveal.resize(gaps, Reveal::default());
         entry.reveal[gap] = reveal;
-        let mut pos = self.pos;
-        self.reanchor(gap, anchors.0, &mut pos);
-        self.pos = pos;
-        if let Some(mut saved) = saved {
-            self.reanchor(gap, anchors.1, &mut saved);
-            self.files[file].saved = Some(saved);
+        self.pos = self.reanchor(gap, anchors.0, self.pos);
+        if let Some(saved) = saved {
+            self.files[file].saved = Some(self.reanchor(gap, anchors.1, saved));
         }
     }
 
@@ -1464,12 +1509,11 @@ impl<P> Document<P> {
     }
 
     /// Reveals the lines of `side` in `lines` (0-based) of `file` that its
-    /// gaps hide, with `context` lines around them within each gap, the
-    /// rest of the gap staying hidden; for lines the host wants seen, such
-    /// as a comment's. Positions in the gaps stay on their lines, as with
-    /// [`Document::expand`]. Lines of a hunk, a piped file and a rendered
-    /// view are left as they are. Returns whether any line was hidden; the
-    /// host then normalizes the position.
+    /// gaps hide, with `context` lines around them, leaving the rest of
+    /// each gap hidden. Positions in the gaps stay on their lines, as with
+    /// [`Document::expand`]. Hunks, piped files and rendered views are left
+    /// as they are. Returns whether any line was hidden; the host then
+    /// normalizes the position.
     pub fn reveal_lines(
         &mut self,
         file: usize,
@@ -1477,7 +1521,9 @@ impl<P> Document<P> {
         lines: Range<usize>,
         context: usize,
     ) -> bool {
-        let Some(entry) = (self.files.get(file))
+        let Some(entry) = self
+            .files
+            .get(file)
             .filter(|e| !matches!(e.render.as_deref(), Some(Render::Shown(_))))
         else {
             return false;
@@ -1486,10 +1532,11 @@ impl<P> Document<P> {
             return false;
         };
         let gaps = loaded.gaps().len();
-        let revealed: Vec<(usize, Reveal)> = (0..gaps)
+        let revealed: Vec<_> = (0..gaps)
             .filter_map(|g| {
-                let reveal = loaded.reveal_lines(entry.reveal.get(g), g, (side, &lines), context);
-                Some((g, reveal?))
+                loaded
+                    .reveal_lines(entry.reveal.get(g), g, side, &lines, context)
+                    .map(|reveal| (g, reveal))
             })
             .collect();
         let any = !revealed.is_empty();
@@ -1513,9 +1560,7 @@ impl<P> Document<P> {
         };
         self.full = !self.full;
         if let Some((g, line)) = gap {
-            let mut pos = self.pos;
-            self.reanchor(g, line, &mut pos);
-            self.pos = pos;
+            self.pos = self.reanchor(g, line, self.pos);
         }
         true
     }

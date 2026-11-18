@@ -26,7 +26,10 @@ On a terminal, dffy opens a viewer showing one file at a time; when its output i
 | `r` | Rendered view, for file types with a renderer plugin (experimental, [plugins.md](plugins.md)) |
 | `v` `y` `Y` | Select lines / copy them / copy the file's path |
 | `e` | Open `$VISUAL` or `$EDITOR` at the line |
-| `esc` | Step back: close a panel, end a search or filter, cancel a selection, leave the tree |
+| `c` `m` `M` | Comment on the selection or the top line / next or previous comment thread ([Comments](#comments)) |
+| `z` `Z` `i` | Fold a thread or all of them / list every thread |
+| `p` `P` | On a pull request (`dffy pr`): update it in place / post your review ([Pull requests](#pull-requests), experimental) |
+| `esc` | Step back: close a panel, end a search or filter, cancel a selection, leave a thread or the tree |
 | `q` | Quit |
 
 [keys.md](keys.md) lists every action with its keys, the tree's and the command panel's keys, and how to rebind them with `keybind` lines.
@@ -65,9 +68,85 @@ On a terminal, dffy opens a viewer showing one file at a time; when its output i
 - **Keyboard:** `v` starts a selection at the top line, `j`/`k` extend it, `s` picks the side of a split, and `y` copies.
 - Copies hold the code only, unless `copy-decorations = true`.
 - Copies go through the terminal (OSC 52), so they work over SSH. Under tmux that needs `set -g set-clipboard on`, which `dffy doctor` checks.
-- For the terminal's own selection while dffy has the mouse, hold `shift` while dragging, or press `M` to hand the mouse back.
+- For the terminal's own selection while dffy has the mouse, hold `shift` while dragging, or press `space` then `M` to hand the mouse back.
 
 [troubleshooting.md](troubleshooting.md#copying-clipboard-and-osc-52) covers terminals that block copies.
+
+## Comments
+
+Review comments live in a comments file ([comments.md](comments.md)): `--comments <file>`, or by default `dffy/comments.json` in the repository's git directory. A piped diff has none.
+
+### Reading
+
+- **Threads** show in a box right under the last line they're on, in the code's column. The top border carries the first comment's author (`you` for your own), how long ago it was written, and `draft` until it's posted; each reply follows a blank row, under a line of its own carrying the same for it. Authors are bold. Long comments wrap. Threads under the same line are a blank row apart. The box is drawn in light lines, dashed while the thread holds a draft and isn't resolved, heavy while it has the focus.
+- **The thread's state** follows its first comment's author and age: `resolved`, and `outdated` when the host marks the thread outdated. A suggested change shows as the lines it replaces (`-`) and its own (`+`).
+- **Comments on a whole file** sit under the file's first row, marked `on the file`. Comments whose lines weren't found sit under its last row, marked `lines not found`.
+- **Split view:** a thread takes its side's half.
+- **Marks:** a commented line keeps a mark after its line numbers, on its side of a split: `◆` a thread with a draft in it, `●` posted, `○` resolved. The tree shows each file's comment count beside its line counts, in the color of its most pressing thread.
+- **Folded threads** take one row of border: `▸ author · age · state · first line`, then `2 replies` at its right end when it has any. Resolved threads start folded, and so do outdated ones without a draft in them; the rest start whole.
+- **`z`** folds the focused thread, or the first on screen, and unfolds it. A tap on a thread's top line (`▾` or `▸`) does the same for that thread. **`Z`** folds every thread, or unfolds them all. A thread you're replying in or editing shows whole.
+
+### Finding
+
+- **`m`** and **`M`** go to the next and previous thread, on into the next or previous file with comments, the way `n` and `N` go between changes. The thread they land on takes the focus.
+- **The status bar** counts the comments file's threads and drafts: `18 threads · 2 drafts`.
+- **`c` in the tree** (or `C` in the command panel) keeps only the files with comments; `f`/`F` and `n`/`N` keep to them, and `esc` in the tree shows every file again.
+- **`i`** lists every thread with its place, state and first line, including those on files not in this diff. `enter` goes to one and focuses it.
+
+### Writing
+
+- **`c`** opens a text box right under the selected lines, or with no selection the line `v` would start on. In a rendered view, the comment goes on the source lines the selection was drawn from.
+  - Every key types into it: `enter` starts a new line, and the arrows, `home`, `end`, backspace and delete edit. A paste goes in whole, its line breaks kept.
+  - `esc` saves the draft and focuses its thread; an empty box saves nothing, and a draft edited down to nothing is deleted. `ctrl+c` saves it and quits.
+  - When the save fails, the box stays open with the text and says why; a second `esc` discards it.
+  - `ctrl+e` continues in `$VISUAL` or `$EDITOR`, with the text so far. If the editor fails, the box opens again with it.
+- **A focused thread** has a heavy border; `m`, `M` or a tap on it focuses one. While it has the focus:
+  - `r` replies in a box at the end of the thread. Replying to an `outdated` thread first says that GitHub collapses outdated threads, so the reply is easy to miss there.
+  - `e` edits your last draft in it, in place.
+  - `x` resolves the thread, or reopens it.
+  - `d`, pressed twice, deletes your last draft in it; when that's its first comment, the whole thread.
+  - `o` opens it on its host, when it's posted.
+  - `esc` leaves it. Other keys keep their meaning: `r`, `x`, `e`, `d` and `o` act on the thread only while it's focused.
+- **Posted comments** (those with a `ref`) belong to the host: only resolving changes them.
+- **From a phone:** `ctrl+e` needs ctrl, so the command panel's "Continue in editor" (`space` then `E`) does the same: with a thread focused, it opens your draft there (after `esc` saved the box), or a reply to it; with none, a new comment on the line.
+
+### Placing and reloading
+
+- **Placing:** a comment sits on its lines while their text matches what it was written on, or on the one place nearby where those lines and the two around them match. Files with comments are diffed in the background, so every thread finds its place, or is known to have none.
+- **Hidden lines:** a thread on lines a `⋯` separator hides shows under the separator. In a rendered view, a thread shows under the last row drawn from its lines, and threads on rows hidden in a rendered view's gaps don't show; `i` still lists them.
+- **Search** doesn't look in comments.
+- **Reloading:** dffy checks the file four times a second and shows changes from other programs, such as a review plugin, as they're written. The file's `notice`, when it has one, shows in the status bar.
+
+## Pull requests
+
+Experimental. `dffy pr` reviews a pull request through a review plugin, named with `review = <name>` or `--review <name>` ([plugins.md](plugins.md#review-plugins) has `dffy-review-github`). The plugin runs in the background and has no screen; everything happens in the viewer.
+
+- **Opening:**
+  - `dffy pr 6064` says `fetching #6064…` until the PR's commits are in the clone, then shows `<base>...<head>` with the PR's comments file. A PR opened before shows at once. Its threads keep arriving while you read, `fetching threads 100/312` in the status bar.
+  - `dffy pr` opens the current branch's PR, or with none, the usual diff with the picker open.
+  - Plain `dffy` (no revisions or paths) on a branch with a review plugin set opens as usual and asks the plugin, in the background, for the branch's PR. When there's one, the view switches in place to the PR's base against the working tree (`--merge-base <base>`), with the PR's threads: your fixes not pushed yet show with the PR's changes, and the status bar says `PR #6064 + working tree`. A clean working tree still prints `no changes` without waiting for the answer.
+  - Drafts written there are posted on the lines they have at the PR's head; one on lines the head doesn't have yet stays a draft and says so.
+  - **The picker** (`space` then `P`, "Open pull request…") lists the PRs on this branch, those waiting on your review and yours, by group. `j`/`k` move, `enter` opens one in place of what's shown, `esc` closes.
+- **The status bar** starts with the PR: `PR #6064 · 18 threads · 2 drafts`, with what the plugin is doing while it runs.
+- **Keeping up:** every 60 seconds dffy asks the plugin whether the PR's head moved, which costs the host's API nothing. When it has: `PR #6064 updated · new commits · p to update`.
+  - **`p`** fetches the head and the threads and shows them in place: you stay where you are, threads move with their lines, and your drafts stay. The note counts the new commits.
+- **Since last review** (`space` then `R`) shows only what changed from the head your last review was posted on to the head, and back to the whole PR. It needs a review posted from dffy on that PR.
+- **Posting:** **`P`** opens a dialog:
+  - what goes: new comments, replies, and the threads resolved or reopened since the last post in this session;
+  - what the plugin will do with them, checked in the background as the dialog opens (`checking what can be posted…`), without reaching the host: `12 comments · 1 as a file comment`, then `2 can't be posted and stay drafts · v goes to them`. A draft can't be posted when its lines aren't at the PR's head (changes not pushed yet), its file isn't in the PR, or its thread isn't posted. **`v`** closes the dialog on the first of them, its thread focused, with why in the status bar; `m`/`M` go on through the threads from there. Sending anyway submits the review without them, and they stay drafts;
+  - a warning when the PR moved since what's shown: the review goes on the head shown;
+  - the event: `p` pending (kept as your draft on the host), `c` comment, `a` approve, `r` request changes; `j`/`k` move too;
+  - a summary: `s` (or `tab`) writes in it, `esc` comes back.
+
+  `enter` sends it in the background, `posting 3/12` in the status bar. Once posted, the comments turn to the posted look; `o` opens the review, until another key is pressed. `esc` closes the dialog and keeps the summary for next time.
+
+  When the host refuses drafts while posting, which the check couldn't foresee, the plugin doesn't submit a comment, approval or request for changes without them, and a prompt lists every draft not posted, with why:
+  - `s` submits the review without them;
+  - `f` goes to the first of them to fix it, and `m`/`M` on through the threads; the review stays pending;
+  - `k` (or `esc`) keeps the review pending.
+
+  Afterwards the status bar keeps saying how it ended: `review sent` (with its link for a moment), `approved · 2 comments not posted`, or `review still pending · 2 not posted`.
+- **Quitting** stops the plugin, with anything it started.
 
 ## Layout
 

@@ -196,6 +196,7 @@ fn values(key: &str) -> String {
         "pager" => "a shell command".to_owned(),
         "theme" => "a theme name".to_owned(),
         "render" => "`extension:name` pairs, space-separated".to_owned(),
+        "review" => "a plugin name, or empty".to_owned(),
         "split-min-width" => "columns".to_owned(),
         "tab-width" => "columns, at least 1".to_owned(),
         "context" => "lines, or `full`".to_owned(),

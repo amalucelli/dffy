@@ -521,6 +521,14 @@ impl Repo {
         }
     }
 
+    /// The git directory: in a linked worktree its own (under the shared
+    /// one's `worktrees/`), not the one its worktrees share. `None` for
+    /// paths compared outside git.
+    #[must_use]
+    pub fn git_dir(&self) -> Option<&Path> {
+        self.git().ok().map(gix::Repository::git_dir)
+    }
+
     /// Streams the changed files of `spec` to `emit`, which can stop the
     /// enumeration early by returning [`ControlFlow::Break`].
     ///

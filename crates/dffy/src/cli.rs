@@ -31,7 +31,14 @@ pub(crate) struct Cli {
 
 /// Global options that take a value, as they can appear before the
 /// subcommand.
-const GLOBAL_WITH_VALUE: [&str; 4] = ["-C", "--color", "--paging", "--theme"];
+const GLOBAL_WITH_VALUE: [&str; 6] = [
+    "-C",
+    "--color",
+    "--paging",
+    "--theme",
+    "--comments",
+    "--review",
+];
 
 /// Inserts `diff` before the first argument that is neither a global option
 /// nor a subcommand, so `dffy -C repo main..HEAD --stat` parses as
@@ -80,9 +87,21 @@ pub(crate) struct Global {
     /// Theme: a built-in or a file in the config's themes directory
     #[arg(long, value_name = "name", global = true)]
     pub theme: Option<String>,
+    /// Review comments file; the default is dffy/comments.json in the
+    /// repository's git directory
+    #[arg(long, value_name = "file", global = true)]
+    pub comments: Option<PathBuf>,
+    /// Review plugin dffy pr runs, dffy-review-<name>, over the config's
+    /// review for this run
+    #[arg(long, value_name = "name", global = true, value_parser = review_name)]
+    pub review: Option<String>,
     /// Neither read nor write the disk cache, for debugging
     #[arg(long, global = true, hide = true)]
     pub no_cache: bool,
+}
+
+fn review_name(name: &str) -> Result<String, String> {
+    crate::plugin::check_name(name).map(|()| name.to_owned())
 }
 
 #[derive(Debug, Subcommand)]
@@ -91,6 +110,32 @@ pub(crate) enum Command {
     Diff(DiffArgs),
     /// Show a commit against its first parent, with its header
     Show(ShowArgs),
+    /// List the review comments, or change them with apply
+    #[command(long_about = "List the review comments of --comments <file>, or of \
+        dffy/comments.json in the repository's git directory.\n\n\
+        With --json, print the file in its format. `dffy comments apply` reads a \
+        JSON list of operations on stdin, applies them all or none, and prints the \
+        ids they touched. See docs/comments.md.")]
+    Comments {
+        /// Print the comments file as JSON (docs/comments.md)
+        #[arg(long)]
+        json: bool,
+        #[command(subcommand)]
+        action: Option<CommentsAction>,
+    },
+    /// Review a pull request in the viewer, through the review plugin
+    #[command(
+        long_about = "Review a pull request in the viewer, through the review \
+        plugin (review = <name> in the config, or --review <name>).\n\n\
+        With a number, it opens that PR: its diff from base to head, with its review \
+        threads, as soon as the head is in the clone. Without one, it opens the \
+        current branch's PR, or lists the PRs to pick from. Experimental; see \
+        docs/plugins.md."
+    )]
+    Pr {
+        /// The pull request's number
+        number: Option<u64>,
+    },
     /// Print the effective configuration
     Config {
         /// Print every key with its documentation and default value instead
@@ -129,8 +174,8 @@ pub(crate) enum Command {
     #[command(
         long_about = "Serve diffs to coding agents over the Model Context Protocol.\n\n\
         Speaks MCP on stdin and stdout for the repository at -C or the current \
-        directory, with three tools: changed_files, file_diff and diff. They return \
-        the objects of dffy --json, a page at a time. Register it with an agent, as \
+        directory, with four tools: changed_files, file_diff and diff return the \
+        objects of dffy --json, and list_comments the review comments, a page at a time. Register it with an agent, as \
         in: claude mcp add dffy -- dffy mcp. See docs/mcp.md."
     )]
     Mcp,
@@ -151,6 +196,12 @@ pub(crate) enum DocPage {
     Keys,
     /// The settings table of docs/config.md
     Config,
+}
+
+#[derive(Debug, Clone, Copy, Subcommand)]
+pub(crate) enum CommentsAction {
+    /// Apply a JSON list of operations from stdin, all or none, and print the ids they touched
+    Apply,
 }
 
 #[derive(Debug, Clone, Subcommand)]
@@ -415,6 +466,7 @@ mod tests {
     #[test]
     fn explicit_diff_takes_revisions_named_like_subcommands() {
         assert_eq!(diff_args(parse(&["diff", "config"])).revs, ["config"]);
+        assert_eq!(diff_args(parse(&["diff", "comments"])).revs, ["comments"]);
         assert!(matches!(
             parse(&["config"]).command,
             Some(Command::Config {
@@ -438,6 +490,15 @@ mod tests {
         let cli = parse(&["-Crepo", "--paging=never", "v6.0..v6.1"]);
         assert_eq!(cli.global.dir, Some(PathBuf::from("repo")));
         assert_eq!(diff_args(cli).revs, ["v6.0..v6.1"]);
+        let cli = parse(&["--comments", "pr.json", "main...HEAD"]);
+        assert_eq!(cli.global.comments, Some(PathBuf::from("pr.json")));
+        assert_eq!(diff_args(cli).revs, ["main...HEAD"]);
+        // As dffy-review-github starts it.
+        let cli = parse(&["--review", "github", "--comments", "pr.json", "a...b"]);
+        assert_eq!(cli.global.review.as_deref(), Some("github"));
+        assert_eq!(diff_args(cli).revs, ["a...b"]);
+        let full = ["dffy", "--review", "../evil", "HEAD"].map(OsString::from);
+        assert!(Cli::try_parse_from(with_default_subcommand(full.to_vec())).is_err());
     }
 
     #[test]

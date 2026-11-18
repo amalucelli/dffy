@@ -20,11 +20,13 @@ use signal_hook::iterator::Signals;
 use super::input::{ESC_TIMEOUT_MS, Input, Parser};
 
 /// Alternate screen, hidden cursor, no autowrap (so writing the
-/// bottom-right cell never scrolls), and button, wheel and drag reports
-/// (motion only while a button is held) in the SGR mouse encoding.
-pub(super) const ENTER: &[u8] = b"\x1b[?1049h\x1b[?25l\x1b[?7l\x1b[?1000h\x1b[?1002h\x1b[?1006h";
+/// bottom-right cell never scrolls), button, wheel and drag reports
+/// (motion only while a button is held) in the SGR mouse encoding, and
+/// bracketed paste, so pasted text never runs as keys.
+pub(super) const ENTER: &[u8] =
+    b"\x1b[?1049h\x1b[?25l\x1b[?7l\x1b[?1000h\x1b[?1002h\x1b[?1006h\x1b[?2004h";
 pub(super) const LEAVE: &[u8] =
-    b"\x1b[0m\x1b[?1006l\x1b[?1002l\x1b[?1000l\x1b[?7h\x1b[?25h\x1b[?1049l";
+    b"\x1b[0m\x1b[?2004l\x1b[?1006l\x1b[?1002l\x1b[?1000l\x1b[?7h\x1b[?25h\x1b[?1049l";
 /// Mouse reports off, so the terminal's own selection works, and back on.
 pub(crate) const MOUSE_OFF: &[u8] = b"\x1b[?1006l\x1b[?1002l\x1b[?1000l";
 pub(crate) const MOUSE_ON: &[u8] = b"\x1b[?1000h\x1b[?1002h\x1b[?1006h";

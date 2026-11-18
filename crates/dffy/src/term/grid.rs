@@ -63,7 +63,6 @@ impl Cell {
         std::str::from_utf8(&self.bytes[..usize::from(self.len)]).unwrap_or(" ")
     }
 
-    #[cfg(test)]
     pub(crate) fn style(&self) -> Style {
         self.style
     }

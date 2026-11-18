@@ -1,8 +1,8 @@
 # MCP server
 
-`dffy mcp` is a [Model Context Protocol](https://modelcontextprotocol.io) server for coding agents such as Claude Code, Cursor and Zed's agent. It lets an agent ask which files a diff changes and read the diffs it needs, a page at a time. The results are the header and file objects of `dffy --json` ([json.md](json.md)), so a long change doesn't land in the agent's context all at once.
+`dffy mcp` is a [Model Context Protocol](https://modelcontextprotocol.io) server for coding agents such as Claude Code, Cursor and Zed's agent. It lets an agent ask which files a diff changes and read the diffs it needs, a page at a time. The results are the header and file objects of `dffy --json` ([json.md](json.md)), so a long change doesn't land in the agent's context all at once. It also lists the review comments left on the code ([comments.md](comments.md)).
 
-It runs over stdio: the agent starts `dffy mcp` and talks to it on stdin and stdout. It serves the repository of the directory it starts in, or the one `-C <path>` names.
+It runs over stdio: the agent starts `dffy mcp` and talks to it on stdin and stdout. It serves the repository of the directory it starts in, or the one `-C <path>` names, and the comments file `--comments <file>` names, or the repository's.
 
 ## Registering it
 
@@ -51,10 +51,11 @@ In Claude Code, MCP tools can be deferred until the agent searches for them. Tha
 | `changed_files` | A page of file objects without hunks: path, status, counts, language. | First, to see what changed and how much. It's cheap even for thousands of files. |
 | `file_diff` | One file object with its hunks and lines. | Next, for each file that matters. |
 | `diff` | Several file objects with hunks, in path order. | For a small change, or everything under a few paths. |
+| `list_comments` | Review comments, thread by thread. | To read what reviewers said about the code, or a local review's notes. |
 
 With `syntax: true`, a file whose changes are only formatting gets `classification: "formatting_only"`, and one whose changes are only moved code gets `"moved_only"`. Its lines are marked `reformatted` or `moved`. An agent can skip such files, or read them knowing nothing was edited. [json.md](json.md#files) defines both.
 
-Every tool takes `range`:
+Every diff tool takes `range`:
 
 - **Default:** without `range`, a tool shows the uncommitted changes, `HEAD` against the working tree with untracked files included, as plain `dffy` does. With `default-diff = unstaged` in the config, it shows the unstaged changes instead.
 - **Revisions:** `range` takes revisions as `git diff` does: `"main..HEAD"`, `"main...HEAD"`, `"HEAD~3"`, or `"v1.0 v2.0"`. Pass them as one string, split at spaces, or as an array.
@@ -121,6 +122,27 @@ The result:
 
 `truncated_files` lists the files of this page cut short. Each entry's `cursor` continues that file with `file_diff`, given the same `path`, `range`, `syntax` and `context`.
 
+### `list_comments`
+
+Read-only: it reads the comments file on every call and never writes it. Writing is `dffy comments apply`'s job ([comments.md](comments.md#writing-dffy-comments-apply)).
+
+| Input | Default | Meaning |
+|---|---|---|
+| `path` | all | Only the comments on this file, relative to the repository root. A renamed file's old path finds them too. |
+| `limit` | 100 | Comments per page, 1 to 1000. |
+| `cursor` | | The previous page's `next_cursor`. |
+
+The result:
+
+```json
+{"notice":null,"comments":[{"id":"9f3c2a71b04e5d18","path":"src/lib.rs","side":"new",…},…],"total_comments":14,"next_cursor":null}
+```
+
+- **`comments`:** each comment as the file holds it ([comments.md](comments.md#the-file-version-1)), unknown fields included, in thread order: a thread's first comment, then its replies in the order they were added. Threads go by path, then by first line, file comments first. A page may end inside a thread; the next page continues it.
+- **`notice`:** the file's `notice`, set by the integration that keeps the comments, such as that they're stale; null without one.
+- **`total_comments`:** the number of comments `path` selects, on every page.
+- A missing comments file has no comments. Outside a repository, without `--comments`, the tool returns an error.
+
 ## Results
 
 A successful call returns two things:
@@ -128,7 +150,7 @@ A successful call returns two things:
 - **`structuredContent`:** the objects described above.
 - **`content`:** the same result as text, for clients that show the model only text.
 
-The text is a unified diff with a status line per file, a second column for the syntax diff's marks (`>` moved, `~` reformatted), and the cursor to continue with when there is one:
+For the diff tools, the text is a unified diff with a status line per file, a second column for the syntax diff's marks (`>` moved, `~` reformatted), and the cursor to continue with when there is one:
 
 ```
 M spacing.c +1 -1 [formatting_only]
@@ -147,13 +169,15 @@ M long.txt +12 -12
 [truncated: 30 more lines; next_cursor: … (pass it as cursor, with the same arguments)]
 ```
 
+For `list_comments`, the text is the listing of `dffy comments` ([comments.md](comments.md#reading-dffy-comments)) under a count of the comments.
+
 ## Paging and truncation
 
 - **Pages of files:** `changed_files` and `diff` return files in the order printed output lists them (git's path order, renames paired). `next_cursor` is null on the last page.
 - **Long files:** `file_diff` and `diff` cut a long file at a hunk boundary. A hunk too large for a whole result is cut at a line boundary. A hunk cut short gets `old_start`, `old_lines`, `new_start` and `new_lines` for the lines it holds, so every hunk in a result is consistent on its own. The parts of a file, read in order, hold each of its lines once.
 - **Progress:** every result holds at least one line or one file, so following `next_cursor` always reaches the end.
 - **Cursors:** a cursor is opaque. It continues only the request that returned it: the same tool and arguments, except `cursor`, `limit`, `max_files` and the line limits, which may change between pages.
-- **Stale cursors:** a cursor is refused with a tool error when its request's arguments differ, or when the diff changed since. A diff changes when a revision now names another commit, a file joins or leaves the list, or, for `file_diff`, the file's content changes. Call again without `cursor` to start over.
+- **Stale cursors:** a cursor is refused with a tool error when its request's arguments differ, or when the diff changed since. A diff changes when a revision now names another commit, a file joins or leaves the list, or, for `file_diff`, the file's content changes. For `list_comments`, the list changes when a comment is added or removed. Call again without `cursor` to start over.
 
 ## Limits
 

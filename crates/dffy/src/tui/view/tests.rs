@@ -8,6 +8,7 @@ use super::*;
 use crate::config::Indicators;
 use crate::print;
 use crate::theme::Role;
+use crate::tui::textbox::TextBox;
 
 const OLD: &str = "fn main() {\n    let total = count + 1;\n    println!(\"{total}\");\n}\n\
     // a comment long enough to wrap in a narrow split column, and then some more\n";
@@ -794,6 +795,60 @@ fn background_tints_fill_changed_lines_with_a_stronger_gutter() {
     }
 }
 
+/// A thread's mark sits in the cell after the line numbers, on its side's
+/// half of a split row, and keeps the tint of a changed line's gutter.
+#[test]
+fn comment_marks_go_after_the_line_numbers_of_their_side() {
+    let marker = |side, line: usize, look| Thread {
+        root: format!("{side:?}"),
+        at: At::Line {
+            side,
+            lines: line..line + 1,
+        },
+        look,
+        resolved: false,
+        outdated: false,
+        url: None,
+        notes: vec![note("x", "", "11:00", "Hm", true)],
+        lines: Vec::new(),
+    };
+    let markers: Arc<[_]> = Arc::new([
+        marker(document::Side::New, 1, Look::Draft),
+        marker(document::Side::Old, 0, Look::Resolved),
+    ]);
+    let mut split = doc(layout(true, false), 6);
+    split.set_threads(0, Arc::clone(&markers));
+    split.fold.toggle_all();
+    let (_, rows) = grid_rows(&mut split, &Theme::default_theme());
+    insta::assert_snapshot!(rows.join("\n"), @r#"
+    @@ -1,5 +1,6 @@
+    1○ │ fn main() {             │1  │ fn main() {
+       │  ╶ ▸ you · just now … ╴ │
+    2 -│     let total = count +…│2◆+│     let total = items.le…
+                                 │   │  ╶ ▸ you · just now ·… ╴
+    3  │     println!("{total}");│3  │     println!("{total}");
+    "#);
+
+    let mut layout = layout(false, false);
+    layout.indicators = Indicators::Background;
+    let mut theme = Theme::default_theme();
+    theme.tint(crate::theme::DARK_BACKGROUND);
+    let mut unified = doc(layout, 7);
+    unified.set_threads(0, markers);
+    unified.fold.toggle_all();
+    let mut grid = Grid::new(60, 7);
+    unified.draw(&mut grid, None, (0, 60, 0), &theme, 1);
+    let tints = backgrounds(&grid, 1..6);
+    let tints: Vec<&str> = tints.lines().map(str::trim_end).collect();
+    insta::assert_snapshot!(tints.join("\n"), @"
+     1 1○│ fn main() {
+         │  ╶ ▸ you · just now · draft · Hm ──────────────────╴
+    [2c385b  2   │][262d49      let total = ][603740 count][262d49  + 1;                           ]
+    [2c385b    2◆│][262d49      let total = ][2d4d3d items.len()][262d49  + 1;                     ]
+         │  ╶ ▸ you · just now · draft · Hm ┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄╴
+    ");
+}
+
 #[test]
 fn background_tints_give_moved_code_its_own_hue() {
     let old = "int a(void) { return 1; }\nint b(void) { return 2; }\n";
@@ -1127,4 +1182,551 @@ fn the_file_shown_in_place_of_one_gone_keeps_its_place_on_reload() {
     let fd = diff(0, &doc);
     load(&mut doc, 0, fd);
     assert_eq!(doc.document.pos, left);
+}
+
+/// Noon on 2026-11-17, UTC: what the threads' ages count from.
+const NOW: u64 = 1_794_916_800;
+
+fn note(id: &str, author: &str, at: &str, text: &str, draft: bool) -> comments::Note {
+    comments::Note {
+        id: id.to_owned(),
+        author: author.to_owned(),
+        created: format!("2026-11-17T{at}:00Z"),
+        text: text.to_owned(),
+        suggestion: None,
+        draft,
+    }
+}
+
+/// A draft on the whole file; a resolved thread on removed old line 2; an
+/// outdated posted one on added new line 2, long enough to wrap, with a
+/// suggestion and your draft reply; and an outdated one with a reply whose
+/// lines are gone. The resolved one and the lost one start folded.
+fn threads() -> Arc<[Thread]> {
+    let thread = |root: &str, at: At, look: Look, notes: Vec<comments::Note>| Thread {
+        root: root.to_owned(),
+        at,
+        look,
+        resolved: look == Look::Resolved,
+        outdated: false,
+        url: None,
+        notes,
+        lines: Vec::new(),
+    };
+    let mut asked = note(
+        "n",
+        "octocat",
+        "10:00",
+        "Why len() here and not a running count, kept as the items arrive?",
+        false,
+    );
+    asked.suggestion = Some("    let total = items.len();".to_owned());
+    vec![
+        thread(
+            "f",
+            At::File,
+            Look::Draft,
+            vec![note("f", "", "11:59", "On the whole file", true)],
+        ),
+        thread(
+            "o",
+            At::Line {
+                side: document::Side::Old,
+                lines: 1..2,
+            },
+            Look::Resolved,
+            vec![note("o", "ana", "09:00", "Was count right?", false)],
+        ),
+        Thread {
+            outdated: true,
+            lines: vec!["    let total = items.len() + 1;".to_owned()],
+            ..thread(
+                "n",
+                At::Line {
+                    side: document::Side::New,
+                    lines: 1..2,
+                },
+                Look::Draft,
+                vec![asked, note("r", "", "11:30", "Simpler.", true)],
+            )
+        },
+        Thread {
+            outdated: true,
+            ..thread(
+                "l",
+                At::Lost,
+                Look::Posted,
+                vec![
+                    note("l", "ana", "08:00", "Moved away", false),
+                    note("l2", "octocat", "08:30", "It did", false),
+                ],
+            )
+        },
+    ]
+    .into()
+}
+
+fn commented(layout: Layout, height: usize) -> Doc {
+    let mut doc = doc(layout, height);
+    doc.now = NOW;
+    doc.set_threads(0, threads());
+    doc
+}
+
+/// Every row of the document, its threads' included, as one tall screen
+/// draws them.
+fn all_rows(layout: Layout) -> Vec<String> {
+    let mut doc = commented(layout, 200);
+    tall_rows(&mut doc)
+}
+
+/// Every row `doc` draws on a screen as wide as its layout, less the
+/// empty ones at the end.
+fn tall_rows(doc: &mut Doc) -> Vec<String> {
+    let width = doc.layout.width.unwrap_or(60);
+    let mut grid = Grid::new(width, doc.height);
+    doc.draw(&mut grid, None, (0, width, 0), &Theme::default_theme(), 1);
+    let mut rows: Vec<String> = (0..doc.height)
+        .map(|y| grid.row_text(y).trim_end().to_owned())
+        .collect();
+    while rows.last().is_some_and(String::is_empty) {
+        rows.pop();
+    }
+    rows
+}
+
+/// Threads show as boxes under the row of their last line, a cell into
+/// the code's column: the first comment's author, age and state in the top
+/// border, each reply's on a row over it after a blank one, text wrapped
+/// inside, and a suggestion as a small diff. A thread with a draft has a dashed border.
+/// Resolved and outdated threads without a draft start folded to one row.
+/// The file's comments hang under its first row and the lost ones under
+/// its last. Split, a thread takes its side's half.
+#[test]
+fn threads_hang_under_their_lines() {
+    insta::assert_snapshot!("threads_unified", all_rows(layout(false, false)).join("\n"));
+    insta::assert_snapshot!("threads_split", all_rows(layout(true, false)).join("\n"));
+    insta::assert_snapshot!("threads_wrapped", all_rows(layout(false, true)).join("\n"));
+    let narrow = Layout {
+        width: Some(34),
+        ..layout(false, false)
+    };
+    insta::assert_snapshot!("threads_narrow", all_rows(narrow).join("\n"));
+}
+
+/// A posted thread on new line 2 with two replies, then another on the
+/// same line.
+fn conversation() -> Arc<[Thread]> {
+    let on_line_2 = |root: &str, notes| Thread {
+        root: root.to_owned(),
+        at: At::Line {
+            side: document::Side::New,
+            lines: 1..2,
+        },
+        look: Look::Posted,
+        resolved: false,
+        outdated: false,
+        url: None,
+        notes,
+        lines: Vec::new(),
+    };
+    vec![
+        on_line_2(
+            "a",
+            vec![
+                note(
+                    "a",
+                    "ana",
+                    "09:00",
+                    "Should this count the items as they arrive, rather than call len() once at the end?",
+                    false,
+                ),
+                note("a2", "octocat", "10:00", "It could, but the list is short.", false),
+                note("a3", "ana", "11:30", "Fair, leaving it.", false),
+            ],
+        ),
+        on_line_2(
+            "b",
+            vec![note("b", "octocat", "10:30", "Name it count?", false)],
+        ),
+    ]
+    .into()
+}
+
+/// A thread reads as one conversation: each reply under a blank row and a
+/// line of its own heading it, inside the box, its author bold as the first
+/// comment's is in the border. Threads on one line are a blank row apart,
+/// a row that belongs to neither, and scrolling counts it.
+#[test]
+fn replies_read_as_one_conversation() {
+    let theme = Theme::default_theme();
+    let threads = conversation();
+    let width = 70;
+    let commented = |height| {
+        let mut doc = doc(
+            Layout {
+                width: Some(width),
+                ..layout(false, false)
+            },
+            height,
+        );
+        doc.now = NOW;
+        doc.set_threads(0, Arc::clone(&threads));
+        doc.set_focus(Some("a".to_owned()));
+        doc
+    };
+    let draw = |doc: &mut Doc| {
+        let mut grid = Grid::new(width, doc.height);
+        doc.draw(&mut grid, None, (0, width, 0), &theme, 1);
+        let rows: Vec<String> = (0..doc.height)
+            .map(|y| grid.row_text(y).trim_end().to_owned())
+            .collect();
+        (grid, rows)
+    };
+    let mut tall = commented(40);
+    let (grid, mut expected) = draw(&mut tall);
+    while expected.last().is_some_and(String::is_empty) {
+        expected.pop();
+    }
+    let at = expected
+        .iter()
+        .position(|r| r.contains("items.len()"))
+        .expect("the line");
+    let end = expected
+        .iter()
+        .position(|r| r.contains("println!"))
+        .expect("the next line");
+    insta::assert_snapshot!("threads_conversation", expected[at..end].join("\n"));
+    let bold = |y: usize, name: &str| {
+        let x = expected[y].find(name).expect("the author");
+        let x = expected[y][..x].chars().count();
+        grid.row(y)[x].style().attributes.contains(Attributes::BOLD)
+    };
+    let reply = expected
+        .iter()
+        .position(|r| r.contains("octocat · 2h ago"))
+        .expect("the reply's heading");
+    assert!(bold(at + 1, "ana") && bold(reply, "octocat"));
+    assert!(!bold(reply + 1, "It could"), "the text isn't");
+    let gap = expected
+        .iter()
+        .position(|r| r.contains("▾ octocat"))
+        .expect("the second thread")
+        - 1;
+    assert_eq!(tall.block_at(gap), None, "{expected:#?}");
+    assert_eq!(tall.block_row_at(gap + 1), Some((Block::Thread(1), true)));
+    let height = 4;
+    let mut doc = commented(height);
+    for top in 0..=expected.len() - height {
+        assert_eq!(
+            draw(&mut doc).1,
+            expected[top..top + height],
+            "scrolled {top}"
+        );
+        doc.scroll(1);
+    }
+}
+
+/// A thread's rows count in the row's height: scrolling a row at a time
+/// goes through them, a page moves a screen of them, and the bottom shows
+/// the last thread's last row.
+#[test]
+fn scrolling_goes_through_the_rows_of_threads() {
+    let theme = Theme::default_theme();
+    for (split, wrap) in [(false, false), (true, false), (false, true)] {
+        let expected = all_rows(layout(split, wrap));
+        let height = 4;
+        let mut doc = commented(layout(split, wrap), height);
+        for top in 0..=expected.len() - height {
+            let (_, rows) = grid_rows(&mut doc, &theme);
+            assert_eq!(rows, expected[top..top + height], "scrolled {top}");
+            doc.scroll(1);
+        }
+        let (_, rows) = grid_rows(&mut doc, &theme);
+        assert_eq!(rows, expected[expected.len() - height..], "kept full");
+        doc.scroll(-100);
+        doc.scroll(isize::try_from(height).expect("small"));
+        assert_eq!(grid_rows(&mut doc, &theme).1, expected[height..2 * height]);
+        doc.bottom();
+        assert_eq!(
+            grid_rows(&mut doc, &theme).1,
+            expected[expected.len() - height..],
+            "split {split} wrap {wrap}"
+        );
+    }
+}
+
+/// A thread whose text grew in a reload of the comments file takes the
+/// rows it wraps to now, though its box was measured before.
+#[test]
+fn a_reloaded_threads_rows_count_its_new_text() {
+    let theme = Theme::default_theme();
+    let longer: Arc<[Thread]> = threads()
+        .iter()
+        .map(|t| {
+            let mut t = t.clone();
+            if t.root == "n" {
+                t.notes[0].text = t.notes[0].text.repeat(3);
+            }
+            t
+        })
+        .collect();
+    let mut tall = commented(layout(false, false), 200);
+    tall.set_threads(0, Arc::clone(&longer));
+    let expected = tall_rows(&mut tall);
+    let height = 4;
+    let mut doc = commented(layout(false, false), height);
+    doc.scroll(100);
+    doc.set_threads(0, longer);
+    doc.scroll(-100);
+    for top in 0..=expected.len() - height {
+        assert_eq!(
+            grid_rows(&mut doc, &theme).1,
+            expected[top..top + height],
+            "scrolled {top}"
+        );
+        doc.scroll(1);
+    }
+}
+
+/// `z` folds a thread to one row that sums it up, or unfolds one that
+/// started folded; `Z` folds every one, then unfolds them all; a position
+/// inside rows that went away moves up to the row.
+#[test]
+fn folded_threads_take_one_row() {
+    let theme = Theme::default_theme();
+    let mut doc = commented(layout(false, false), 40);
+    let full = grid_rows(&mut doc, &theme).1;
+    doc.fold.toggle("n");
+    doc.refit();
+    let folded = grid_rows(&mut doc, &theme).1;
+    let summary = folded
+        .iter()
+        .find(|r| r.contains("▸ octocat"))
+        .expect("a folded row");
+    insta::assert_snapshot!(summary, @"     │  ╶ ▸ octocat · 2h ago · outdated · Why l…  1 reply ╴");
+    assert_eq!(
+        folded.iter().filter(|r| !r.is_empty()).count() + 9,
+        full.iter().filter(|r| !r.is_empty()).count()
+    );
+    doc.fold.toggle("o");
+    doc.refit();
+    assert!(screen(&mut doc).contains("│ Was count right?"));
+    assert!(doc.fold.toggle_all());
+    let all = grid_rows(&mut doc, &theme).1;
+    assert_eq!(
+        all.iter().filter(|r| r.contains('▸')).count(),
+        4,
+        "{all:#?}"
+    );
+    assert!(!doc.fold.toggle_all(), "folded already: all unfold");
+    assert!(!doc.fold.collapsed("o"), "resolved, unfolded with the rest");
+    let mut doc = commented(layout(false, false), 4);
+    doc.bottom();
+    doc.fold.toggle_all();
+    doc.refit();
+    assert_eq!(doc.document.pos.offset, 0);
+}
+
+/// A fold is kept by the thread's root as folded or not, so it outlives
+/// the comments file reloading, the thread reopened or resolved under it
+/// included; a thread no one folded follows its state.
+#[test]
+fn folds_outlive_reloads_of_the_comments_file() {
+    let mut doc = commented(layout(false, false), 40);
+    assert!(doc.fold.collapsed("o") && doc.fold.collapsed("l"));
+    assert!(!doc.fold.collapsed("n") && !doc.fold.collapsed("f"));
+    doc.fold.toggle("o");
+    // Reopened, and no longer outdated on the host.
+    let open: Vec<Thread> = threads()
+        .iter()
+        .map(|t| Thread {
+            resolved: false,
+            outdated: false,
+            look: t.look.max(Look::Posted),
+            ..t.clone()
+        })
+        .collect();
+    doc.set_threads(0, open.into());
+    assert!(!doc.fold.collapsed("o") && !doc.fold.collapsed("l"));
+    doc.set_threads(0, threads());
+    assert!(!doc.fold.collapsed("o"), "unfolded by z, resolved again");
+    assert!(doc.fold.collapsed("l"), "outdated again");
+    // A local review's comments are all drafts: resolving still folds.
+    let local: Vec<Thread> = threads()
+        .iter()
+        .map(|t| Thread {
+            resolved: t.root == "f",
+            ..t.clone()
+        })
+        .collect();
+    doc.set_threads(0, local.into());
+    assert!(doc.fold.collapsed("f"));
+    let rows = tall_rows(&mut doc);
+    assert!(
+        rows.iter().any(|r| r.contains("│ Was count right?")),
+        "{rows:#?}"
+    );
+}
+
+/// The focused thread's border is heavy, in the hint color, or in the
+/// draft color when a draft is in it; the background stays the code's.
+#[test]
+fn a_focused_threads_border_is_heavy() {
+    let theme = Theme::default_theme();
+    let mut doc = commented(layout(false, false), 40);
+    doc.fold.toggle("o");
+    doc.set_focus(Some("o".to_owned()));
+    let (grid, rows) = grid_rows(&mut doc, &theme);
+    let at = rows
+        .iter()
+        .position(|r| r.contains("▾ ana"))
+        .expect("the focused thread");
+    insta::assert_snapshot!(rows[at - 1..at + 4].join("\n"), @"
+    2  ○-│     let total = count + 1;
+         │  ┏ ▾ ana · 3h ago · resolved ━━━━━━━━━━━━━━━━━━━━━━┓
+         │  ┃ Was count right?                                ┃
+         │  ┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛
+      2◆+│     let total = items.len() + 1;
+    ");
+    assert_eq!(grid.row(at)[8].style(), theme.style(Role::Hint));
+    assert_eq!(grid.row(at + 1)[20].style().bg, None);
+    doc.set_focus(Some("n".to_owned()));
+    let (grid, rows) = grid_rows(&mut doc, &theme);
+    let at = rows
+        .iter()
+        .position(|r| r.contains("▾ octocat"))
+        .expect("the focused draft");
+    assert!(
+        rows[at].contains('┏') && rows[at + 1].contains('┇'),
+        "{rows:#?}"
+    );
+    assert_eq!(grid.row(at)[8].style(), theme.style(Role::Warn));
+    doc.set_focus(Some("l".to_owned()));
+    let rows = grid_rows(&mut doc, &theme).1;
+    assert!(rows.iter().any(|r| r.contains("╺ ▸ ana")), "{rows:#?}");
+}
+
+/// The text box is drawn as a box too: a reply in its thread's box under a
+/// heading of its own, a new comment in a draft's box under its lines. Each
+/// counts in its row's height, and revealing it shows its cursor.
+#[test]
+fn the_text_box_is_boxed_where_the_thread_sits() {
+    let new_box = || Writing {
+        at: Writes::New {
+            side: document::Side::New,
+            lines: 3..4,
+        },
+        text: TextBox::new("New"),
+    };
+    let mut doc = commented(layout(false, false), 40);
+    doc.writing = Some(Writing {
+        at: Writes::Reply("n".to_owned()),
+        text: TextBox::new("Sure, and a reply long enough to wrap in its box"),
+    });
+    doc.refit();
+    let rows = tall_rows(&mut doc);
+    let at = rows
+        .iter()
+        .position(|r| r.contains("Simpler."))
+        .expect("the reply");
+    insta::assert_snapshot!(rows[at..at + 6].join("\n"), @"
+         │  ┇ Simpler.                                        ┇
+         │  ┇                                                 ┇
+         │  ┇ you · reply · esc saves · ctrl+e editor         ┇
+         │  ┇ Sure, and a reply long enough to wrap in its    ┇
+         │  ┇ box▏                                            ┇
+         │  ┗┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┛
+    ");
+    doc.writing = Some(new_box());
+    doc.refit();
+    let rows = tall_rows(&mut doc);
+    let at = rows
+        .iter()
+        .position(|r| r.contains("eprintln!"))
+        .expect("the line");
+    insta::assert_snapshot!(rows[at..at + 4].join("\n"), @"
+      4 +│     eprintln!(\"done\");
+         │  ┏ ▾ you · new comment · esc saves, empty discard… ┓
+         │  ┇ New▏                                            ┇
+         │  ┗┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┛
+    ");
+    let mut doc = commented(layout(false, false), 4);
+    doc.writing = Some(new_box());
+    doc.reveal_block(Block::New, true);
+    let shown = screen(&mut doc);
+    assert!(shown.contains("New▏"), "{shown}");
+}
+
+/// A frame after a scroll draws whole while threads are on screen, the
+/// same as drawing it fresh: their rows change without a scroll.
+#[test]
+fn frames_with_threads_on_screen_are_drawn_whole() {
+    let theme = Theme::default_theme();
+    let mut doc = commented(layout(false, false), 6);
+    let mut before = Grid::new(60, 6);
+    doc.draw(&mut before, None, (0, 60, 0), &theme, 1);
+    doc.scroll(1);
+    doc.set_focus(Some("f".to_owned()));
+    let mut after = Grid::new(60, 6);
+    let (_, scrolled) = doc.draw(&mut after, Some(&before), (0, 60, 0), &theme, 2);
+    assert_eq!(scrolled, None, "not copied");
+    let mut fresh = Grid::new(60, 6);
+    doc.draw(&mut fresh, None, (0, 60, 0), &theme, 3);
+    let text = |g: &Grid| (0..6).map(|y| g.row_text(y)).collect::<Vec<_>>();
+    assert_eq!(text(&after), text(&fresh));
+    // Without threads on screen, the rows still on it are copied.
+    let mut plain = self::doc(layout(false, false), 3);
+    let mut before = Grid::new(60, 3);
+    plain.draw(&mut before, None, (0, 60, 0), &theme, 1);
+    plain.scroll(1);
+    let mut after = Grid::new(60, 3);
+    let (_, scrolled) = plain.draw(&mut after, Some(&before), (0, 60, 0), &theme, 2);
+    assert!(scrolled.is_some());
+}
+
+/// A thread's rows are found by screen row for a tap, and never hit code:
+/// a press there selects nothing.
+#[test]
+fn a_thread_row_is_found_by_row_and_never_hits_code() {
+    let theme = Theme::default_theme();
+    let mut doc = commented(layout(false, false), 40);
+    let (_, rows) = grid_rows(&mut doc, &theme);
+    let y = rows
+        .iter()
+        .position(|r| r.contains("Simpler."))
+        .expect("the reply");
+    assert_eq!(doc.block_at(y), Some(Block::Thread(2)));
+    assert_eq!(doc.hit(y, 20, None), None);
+    let code = rows
+        .iter()
+        .position(|r| r.contains("items.len()"))
+        .expect("the line");
+    assert_eq!(doc.block_at(code), None);
+    assert!(doc.hit(code, 20, None).is_some());
+}
+
+/// `m` goes through the file's threads in the order the diff shows them,
+/// from the top row when none is focused, focusing each and putting it on
+/// screen; `M` goes back.
+#[test]
+fn threads_are_stepped_through_in_order() {
+    let mut doc = commented(layout(false, false), 8);
+    let mut seen = Vec::new();
+    while doc.step_thread(true) {
+        let focused = doc.focused().expect("focused").root.clone();
+        let shown = screen(&mut doc);
+        assert!(shown.contains(['┏', '╺']), "{focused} on screen:\n{shown}");
+        seen.push(focused);
+    }
+    assert_eq!(seen, ["f", "o", "n", "l"]);
+    assert!(doc.step_thread(false));
+    assert_eq!(doc.focused().map(|t| t.root.as_str()), Some("n"));
+    doc.set_focus(None);
+    doc.document.top();
+    assert!(!doc.step_thread(false), "none above the top");
+    assert!(doc.edge_thread(true));
+    assert_eq!(doc.focused().map(|t| t.root.as_str()), Some("l"));
+    assert!(doc.go_to_thread("o"));
+    assert_eq!(doc.focused().map(|t| t.root.as_str()), Some("o"));
 }

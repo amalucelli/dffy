@@ -1,0 +1,21 @@
+[package]
+name = "dffy-review-github"
+description = "An experimental dffy review plugin that reviews GitHub pull requests in dffy"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+readme.workspace = true
+keywords = ["diff", "github", "review", "terminal", "dffy"]
+categories = ["command-line-utilities", "development-tools"]
+
+[lints]
+workspace = true
+
+[dependencies]
+serde_json = "1.0.154"
+
+[dev-dependencies]
+tempfile = "3.27.0"

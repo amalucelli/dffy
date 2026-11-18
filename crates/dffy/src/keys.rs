@@ -97,6 +97,18 @@ actions! {
     ToggleMouse "toggle_mouse" "toggle mouse" "take mouse input, or leave it to the terminal's own selection (many terminals select natively with shift held while dragging)",
     ToggleCopyDecorations "toggle_copy_decorations" "copy decorations" "copies include line numbers and +/- signs, or only the code",
     Edit "edit" "open in editor" "open the file in $EDITOR at the top line",
+    Comment "comment" "comment on lines" "comment on the selected lines, or the line v would start on, in a text box under them; esc saves it",
+    Comments "comments" "list comments" "list every comment thread, files not in the diff included; enter goes to one",
+    NextThread "next_thread" "next thread" "next comment thread, on into the next file with comments; it takes the focus, where r replies, e edits, x resolves, d deletes and o opens it on its host",
+    PrevThread "prev_thread" "prev thread" "previous comment thread, back into the previous file with comments",
+    ToggleThread "toggle_thread" "fold thread" "fold or unfold the focused comment thread, or the first on screen",
+    ToggleThreads "toggle_threads" "fold all threads" "fold every comment thread to one row, or unfold them all",
+    CommentInEditor "comment_in_editor" "comment in $EDITOR" "write in $EDITOR: your draft in the focused thread, else a reply to it, else a comment on the line; ctrl+e does it from the text box",
+    CommentedFiles "commented_files" "files with comments" "the tree shows only the files with comments, or every file; f/F and n/N keep to them",
+    ReviewPull "review_pull" "update the PR" "on a pull request (dffy pr), fetch its new commits and threads and show them in place (experimental, see review)",
+    ReviewPost "review_post" "post the review" "on a pull request (dffy pr), open the dialog that posts your drafts, replies and resolves as a review (experimental, see review)",
+    OpenPullRequest "open_pull_request" "open a PR" "list the pull requests on this branch, yours and those waiting on your review, to open one (experimental, see review)",
+    SinceLastReview "since_last_review" "since last review" "on a pull request, show only what changed since the head of your last review posted from dffy, or the whole PR again",
     Help "help" "show this help" "show or hide this help",
     Quit "quit" "quit" "quit",
 }
@@ -194,8 +206,16 @@ const DEFAULTS: &[(Table, &str, Action)] = &[
     (M, "d", Action::ToggleSyntax),
     (M, "r", Action::ToggleRendered),
     (M, "w", Action::ToggleWatch),
-    (M, "M", Action::ToggleMouse),
     (M, "e", Action::Edit),
+    (M, "c", Action::Comment),
+    (M, "i", Action::Comments),
+    (M, "m", Action::NextThread),
+    (M, "M", Action::PrevThread),
+    (M, "z", Action::ToggleThread),
+    (M, "Z", Action::ToggleThreads),
+    (T, "c", Action::CommentedFiles),
+    (M, "p", Action::ReviewPull),
+    (M, "P", Action::ReviewPost),
     (M, "?", Action::Help),
     (M, "q", Action::Quit),
     (M, "ctrl+c", Action::Quit),
@@ -215,6 +235,7 @@ const DEFAULTS: &[(Table, &str, Action)] = &[
     (L, "b", Action::ToggleStatusBar),
     (L, "o", Action::OpenPicker),
     (L, "f", Action::FilterTree),
+    (L, "C", Action::CommentedFiles),
     // Not `/`: the panel filters its rows with that.
     (L, "S", Action::Search),
     (L, "t", Action::ToggleTree),
@@ -226,6 +247,9 @@ const DEFAULTS: &[(Table, &str, Action)] = &[
     (L, "M", Action::ToggleMouse),
     (L, "a", Action::ToggleWatch),
     (L, "c", Action::CycleTheme),
+    (L, "E", Action::CommentInEditor),
+    (L, "P", Action::OpenPullRequest),
+    (L, "R", Action::SinceLastReview),
     (L, "?", Action::Help),
 ];
 
@@ -275,6 +299,8 @@ impl Action {
             | Self::Bottom
             | Self::NextChange
             | Self::PrevChange
+            | Self::NextThread
+            | Self::PrevThread
             | Self::ScrollRight
             | Self::ScrollLeft
             | Self::ScrollReset => Group::Navigation,
@@ -289,6 +315,7 @@ impl Action {
             | Self::Collapse
             | Self::ParentFolder
             | Self::MarkViewed
+            | Self::CommentedFiles
             | Self::TreeWider
             | Self::TreeNarrower => Group::Files,
             Self::Expand
@@ -304,14 +331,26 @@ impl Action {
             | Self::ToggleLineNumbers
             | Self::ToggleHunkHeaders
             | Self::ToggleStatusBar
-            | Self::CycleTheme => Group::View,
+            | Self::CycleTheme
+            | Self::ToggleThread
+            | Self::ToggleThreads => Group::View,
             Self::Select
             | Self::Copy
             | Self::CopyPath
             | Self::Cancel
             | Self::ToggleCopyDecorations => Group::Copy,
             Self::ToggleWatch | Self::ToggleMouse => Group::Modes,
-            Self::Leader | Self::Edit | Self::Help | Self::Quit => Group::Other,
+            Self::Leader
+            | Self::Edit
+            | Self::Comment
+            | Self::Comments
+            | Self::CommentInEditor
+            | Self::ReviewPull
+            | Self::ReviewPost
+            | Self::OpenPullRequest
+            | Self::SinceLastReview
+            | Self::Help
+            | Self::Quit => Group::Other,
         }
     }
 
@@ -344,6 +383,10 @@ impl Action {
             Self::ToggleCopyDecorations => "Copy with line numbers and signs",
             Self::ToggleMouse => "Mouse selection",
             Self::ToggleWatch => "Watch for changes",
+            Self::CommentInEditor => "Continue in editor",
+            Self::CommentedFiles => "Files with comments",
+            Self::OpenPullRequest => "Open pull request…",
+            Self::SinceLastReview => "Since last review",
             Self::Help => "All keys",
             other => other.label(),
         }
@@ -401,6 +444,18 @@ impl Action {
             Self::ToggleMouse => "mouse",
             Self::ToggleCopyDecorations => "copy decorations",
             Self::Edit => "edit",
+            Self::Comment => "comment",
+            Self::Comments => "comments",
+            Self::NextThread => "next thread",
+            Self::PrevThread => "previous thread",
+            Self::ToggleThread => "fold thread",
+            Self::ToggleThreads => "fold threads",
+            Self::CommentInEditor => "comment in editor",
+            Self::CommentedFiles => "files with comments",
+            Self::ReviewPull => "update PR",
+            Self::ReviewPost => "post review",
+            Self::OpenPullRequest => "open pull request",
+            Self::SinceLastReview => "since last review",
             Self::Help => "all keys",
             Self::Quit => "quit",
         }

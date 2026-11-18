@@ -985,6 +985,7 @@ mod tests {
             color_out: false,
             color_err: false,
             cache: None,
+            comments: None,
         }
     }
 }

@@ -1,0 +1,11 @@
+{"data":{"repository":{"pullRequest":{"id":"PR_kwDOAAAAB84AAAAH","title":"Spell out five","url":"https://github.com/acme/widgets/pull/7","baseRefName":"main","baseRefOid":"@BASE@","headRefOid":"@HEAD@","reviewThreads":{"totalCount":4,"pageInfo":{"hasNextPage":false,"endCursor":"Y3Vyc29yOnYyOpK1"},"nodes":[
+{"id":"PRRT_kwDOAAAAB84AAAA2","isResolved":true,"isOutdated":false,"path":"src/lib.rs","diffSide":"LEFT","startDiffSide":null,"line":5,"startLine":null,"originalLine":5,"originalStartLine":null,"subjectType":"LINE","comments":{"nodes":[
+{"id":"PRRC_kwDOAAAAB84AAAB3","url":"https://github.com/acme/widgets/pull/7#discussion_r1003","body":"Why was this removed?","createdAt":"2026-11-16T11:00:00Z","viewerDidAuthor":false,"author":{"login":"hubot"},"commit":{"oid":"@HEAD@"},"originalCommit":{"oid":"@HEAD@"}}
+]}},
+{"id":"PRRT_kwDOAAAAB84AAAA3","isResolved":false,"isOutdated":true,"path":"src/lib.rs","diffSide":"RIGHT","startDiffSide":null,"line":null,"startLine":null,"originalLine":2,"originalStartLine":null,"subjectType":"LINE","comments":{"nodes":[
+{"id":"PRRC_kwDOAAAAB84AAAB4","url":"https://github.com/acme/widgets/pull/7#discussion_r1004","body":"Outdated, on the first version.","createdAt":"2026-11-15T08:00:00Z","viewerDidAuthor":false,"author":null,"commit":null,"originalCommit":{"oid":"@BASE@"}}
+]}},
+{"id":"PRRT_kwDOAAAAB84AAAA4","isResolved":false,"isOutdated":false,"path":"notes.txt","diffSide":"RIGHT","startDiffSide":null,"line":null,"startLine":null,"originalLine":null,"originalStartLine":null,"subjectType":"FILE","comments":{"nodes":[
+{"id":"PRRC_kwDOAAAAB84AAAB5","url":"https://github.com/acme/widgets/pull/7#discussion_r1005","body":"This file needs a header.","createdAt":"2026-11-16T12:00:00Z","viewerDidAuthor":false,"author":{"login":"octocat"},"commit":{"oid":"@HEAD@"},"originalCommit":{"oid":"@HEAD@"}}
+]}}
+]}}}}}

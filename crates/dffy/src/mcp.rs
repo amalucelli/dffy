@@ -1,6 +1,7 @@
 //! `dffy mcp`: a Model Context Protocol server on stdin and stdout, for
 //! coding agents. Its tools return the header and file objects of `--json`
-//! (docs/json.md) a page at a time, each result also rendered as plain text
+//! (docs/json.md), or the review comments (docs/comments.md), a page at a
+//! time, each result also rendered as plain text
 //! for clients that show the model only text. docs/mcp.md is the user's
 //! side of it.
 //!
@@ -25,9 +26,10 @@ use dffy_core::git::{FileChange, Repo, Revisions};
 
 use crate::config::{Context, DefaultDiff};
 use crate::json::{self, Compared, Detail, Files, Window};
-use crate::plugin::json::{Value, parse, string};
+use crate::plugin::json::{Value, parse, string, write};
 use crate::print::{Plan, Summary, Target};
-use crate::{Ctx, Error};
+use crate::render::Canvas;
+use crate::{Ctx, Error, review};
 
 /// The revision with per-request metadata.
 const MODERN: &str = "2026-07-28";
@@ -58,7 +60,8 @@ const INSTRUCTIONS: &str = "dffy shows the changes in the git repository it was 
     uncommitted edits (omit range), a branch (range: main...HEAD), the last commits \
     (range: HEAD~3..HEAD) or any two revisions. Start with changed_files to see which files changed and by how much, then call file_diff \
     for the files that matter. With syntax: true, files whose changes are only formatting or \
-    only moved code are classified, so you can skip them. Results are paged: pass next_cursor \
+    only moved code are classified, so you can skip them. list_comments returns the review \
+    comments left on the code, with their threads. Results are paged: pass next_cursor \
     back as cursor, with the same arguments, to continue.";
 
 /// The tools, as `tools/list` returns them. Written readable here and
@@ -152,17 +155,44 @@ const TOOLS: &str = r#"[
     "required": ["header", "files", "truncated_files", "total_files", "next_cursor"]
   },
   "annotations": {"readOnlyHint": true, "idempotentHint": true, "openWorldHint": false}
+},
+{
+  "name": "list_comments",
+  "title": "Review comments",
+  "description": "List the review comments on the code: comments people left on lines or files of the diff, with their replies and whether each thread is resolved. Comments come in threads, each thread's first comment then its replies, threads in path and line order. Each comment has id, path, the side (old or new) and start and end lines it's on (1-based; none for a comment on a whole file or a reply), text, author (empty means the user), created, in_reply_to for a reply, resolved, and anchor, the commented lines' text. Read-only. Paged: when next_cursor isn't null, call again with it as cursor and the same arguments.",
+  "inputSchema": {
+    "type": "object",
+    "properties": {
+      "path": {"type": "string", "description": "Only the comments on this file, relative to the repository root. A renamed file's old path works too."},
+      "limit": {"type": "integer", "minimum": 1, "maximum": 1000, "default": 100, "description": "Comments per page."},
+      "cursor": {"type": "string", "description": "next_cursor from the previous page."}
+    },
+    "additionalProperties": false
+  },
+  "outputSchema": {
+    "type": "object",
+    "properties": {
+      "notice": {"type": ["string", "null"], "description": "A note from the integration that keeps the comments, such as that they're stale."},
+      "comments": {"type": "array", "items": {"type": "object"}, "description": "Comments as the comments file holds them (docs/comments.md)."},
+      "total_comments": {"type": "integer"},
+      "next_cursor": {"type": ["string", "null"]}
+    },
+    "required": ["notice", "comments", "total_comments", "next_cursor"]
+  },
+  "annotations": {"readOnlyHint": true, "idempotentHint": true, "openWorldHint": false}
 }
 ]"#;
 
 /// Serves the protocol until stdin closes. `dir` is where the repository
 /// is looked for, relative to the current directory.
-pub(crate) fn serve(dir: Option<&Path>, ctx: &Ctx) -> Result<(), Error> {
+/// `comments` is `--comments`, relative to `dir`.
+pub(crate) fn serve(dir: Option<&Path>, comments: Option<&Path>, ctx: &Ctx) -> Result<(), Error> {
     let cwd = std::env::current_dir()
         .map_err(|e| Error::fatal(format!("can't read the current directory: {e}")))?;
     let base = dir.map_or_else(|| cwd.clone(), |dir| cwd.join(dir));
     let mut server = Server {
         repo: Repo::discover(&base).ok(),
+        comments: comments.map(|file| base.join(file)),
         base,
         ctx,
         legacy: false,
@@ -190,6 +220,8 @@ struct Server<'a> {
     /// `None` until the repository is found; looked for again on each call
     /// until then.
     repo: Option<Repo>,
+    /// The comments file `--comments` names; else the repository's.
+    comments: Option<PathBuf>,
     /// Where dffy looks for the repository.
     base: PathBuf,
     ctx: &'a Ctx,
@@ -358,6 +390,7 @@ impl Server<'_> {
             "changed_files" => self.changed_files(&args),
             "file_diff" => self.file_diff(&args),
             "diff" => self.diff(&args),
+            "list_comments" => self.list_comments(&args),
             _ => return Err(Fault::new(INVALID_PARAMS, format!("Unknown tool: {name}"))),
         };
         let mut s = String::from(r#""content":[{"type":"text","text":"#);
@@ -462,46 +495,8 @@ fn reply(id: Option<&str>, result: Result<String, Fault>) -> String {
 /// `value` as one line of JSON.
 fn compact(value: &Value) -> String {
     let mut s = String::new();
-    write_value(value, &mut s);
+    write(&mut s, value);
     s
-}
-
-fn write_value(value: &Value, s: &mut String) {
-    match value {
-        Value::Null => s.push_str("null"),
-        Value::Bool(b) => s.push_str(if *b { "true" } else { "false" }),
-        #[expect(
-            clippy::cast_possible_truncation,
-            reason = "checked: whole and below 2^53, where f64 is exact"
-        )]
-        Value::Number(n) if n.fract() == 0.0 && n.abs() < 9e15 => {
-            s.push_str(&(*n as i64).to_string());
-        }
-        Value::Number(n) => s.push_str(&n.to_string()),
-        Value::String(text) => string(s, text),
-        Value::Array(items) => {
-            s.push('[');
-            for (i, item) in items.iter().enumerate() {
-                if i > 0 {
-                    s.push(',');
-                }
-                write_value(item, s);
-            }
-            s.push(']');
-        }
-        Value::Object(fields) => {
-            s.push('{');
-            for (i, (key, item)) in fields.iter().enumerate() {
-                if i > 0 {
-                    s.push(',');
-                }
-                string(s, key);
-                s.push(':');
-                write_value(item, s);
-            }
-            s.push('}');
-        }
-    }
 }
 
 /// A tool's result: the objects, and their text rendering.
@@ -958,6 +953,84 @@ impl Server<'_> {
         Ok(Output { structured, text })
     }
 
+    fn list_comments(&mut self, args: &Args) -> Result<Output, String> {
+        args.only(&["path", "limit", "cursor"])?;
+        let path = args.string("path")?;
+        let limit = args.number("limit", 100, [1, 1000])?;
+        let cursor = args.cursor()?;
+        let file = if let Some(file) = &self.comments {
+            file.clone()
+        } else {
+            let repo = self.repo()?;
+            let git_dir = repo
+                .git_dir()
+                .ok_or("the repository has no git directory for a comments file")?;
+            review::default_path(git_dir)
+        };
+        let file = review::read(&file)?;
+        let listed = review::threads(
+            file.comments
+                .iter()
+                .filter(|c| path.is_none_or(|p| c.path == p || c.old_path.as_deref() == Some(p))),
+        );
+        let mut h = DefaultHasher::new();
+        "list_comments".hash(&mut h);
+        path.hash(&mut h);
+        for comment in &listed {
+            comment.id.hash(&mut h);
+        }
+        let fingerprint = h.finish();
+        let start = cursor.map_or(Ok((0, 0)), |c| c.check(fingerprint))?.0;
+        let end = start.saturating_add(limit).min(listed.len());
+        let page = listed.get(start..end).ok_or(STALE)?;
+        let next = (end < listed.len()).then(|| {
+            Cursor {
+                fingerprint,
+                at: (end, 0),
+            }
+            .encode()
+        });
+        let mut structured = String::from(r#"{"notice":"#);
+        optional_string(&mut structured, file.notice.as_deref());
+        structured.push_str(r#","comments":["#);
+        for (i, comment) in page.iter().enumerate() {
+            if i > 0 {
+                structured.push(',');
+            }
+            write(&mut structured, &Value::Object(comment.to_fields()));
+        }
+        let _ = write!(
+            structured,
+            r#"],"total_comments":{},"next_cursor":"#,
+            listed.len()
+        );
+        optional_string(&mut structured, next.as_deref());
+        structured.push('}');
+        let mut text = format!("{} comments", listed.len());
+        if let Some(path) = path {
+            let _ = write!(text, " on {path}");
+        }
+        if start > 0 || next.is_some() {
+            let _ = write!(text, ", showing {}-{end}", start + 1);
+        }
+        text.push('\n');
+        if let Some(notice) = &file.notice {
+            let _ = writeln!(text, "notice: {notice}");
+        }
+        let mut canvas = Canvas::default();
+        review::render(page, &mut canvas);
+        let mut bytes = Vec::new();
+        canvas
+            .write_to(&mut bytes, None)
+            .map_err(|e| e.to_string())?;
+        if !bytes.is_empty() {
+            text.push('\n');
+            text.push_str(&String::from_utf8_lossy(&bytes));
+        }
+        next_line(next.as_deref(), "comments", &mut text);
+        Ok(Output { structured, text })
+    }
+
     /// What `range` compares, in words.
     fn compared(&self, range: &Range) -> String {
         if !range.revisions.is_empty() {
@@ -1252,6 +1325,9 @@ mod tests {
             .iter()
             .filter_map(|t| t.get("name").and_then(Value::as_str).map(str::to_owned))
             .collect();
-        assert_eq!(names, ["changed_files", "file_diff", "diff"]);
+        assert_eq!(
+            names,
+            ["changed_files", "file_diff", "diff", "list_comments"]
+        );
     }
 }

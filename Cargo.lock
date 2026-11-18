@@ -509,6 +509,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "dffy-review-github"
+version = "0.2.1"
+dependencies = [
+ "serde_json",
+ "tempfile",
+]
+
+[[package]]
 name = "divan"
 version = "0.1.21"
 source = "registry+https://github.com/rust-lang/crates.io-index"

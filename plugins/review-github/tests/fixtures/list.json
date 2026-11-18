@@ -1,0 +1,13 @@
+{"data":{
+"requested":{"nodes":[
+{"number":9,"title":"Add a cache","url":"https://github.com/acme/widgets/pull/9","headRefName":"cache","author":{"login":"hubot"}},
+{"number":7,"title":"Spell out five","url":"https://github.com/acme/widgets/pull/7","headRefName":"five","author":{"login":"octocat"}},
+{}
+]},
+"mine":{"nodes":[
+{"number":11,"title":"Document the cache","url":"https://github.com/acme/widgets/pull/11","headRefName":"docs","author":{"login":"ada"}}
+]},
+"repository":{"pullRequests":{"nodes":[
+{"number":7,"title":"Spell out five","url":"https://github.com/acme/widgets/pull/7","headRefName":"five","author":{"login":"octocat"}}
+]}}
+}}

@@ -8,7 +8,14 @@
 //!
 //! Rows come from the same [`Layout`] code print mode uses, so both
 //! frontends draw identical lines, less print's file headers.
+//!
+//! Review threads and the text box writing one are drawn as extra screen
+//! rows of the row they hang under, after its code, so the core's rows and
+//! positions don't know about them: a row's height counts them, and
+//! scrolling, paging and revealing go through them as through a wrapped
+//! line's rows.
 
+use std::collections::HashMap;
 use std::ops::Range;
 use std::sync::Arc;
 
@@ -22,6 +29,7 @@ use dffy_core::git::{FileDiff, Update};
 use dffy_core::patch;
 use dffy_core::view::{Arrangement, Attributes, HunkHeader, Row, display_text};
 
+use super::comments::{self, At, Look, Thread, Writes, Writing};
 use super::piped::Body;
 use crate::pager;
 use crate::render::{Canvas, Layout};
@@ -32,6 +40,17 @@ pub(crate) mod rendered;
 
 /// Rows kept above a file's first change when it opens there.
 const OPEN_CONTEXT: isize = 3;
+
+/// A hunk header that says nothing of its hunk, for how the layout
+/// arranges rows that aren't in one.
+const ANY_HUNK: HunkHeader<'static> = HunkHeader {
+    old_start: 1,
+    old_len: 1,
+    new_start: 1,
+    new_len: 1,
+    heading: b"",
+    hidden: 0,
+};
 
 /// An entry of the viewer's document: a piped file's hunks wait in the
 /// spill until it's drawn.
@@ -120,6 +139,100 @@ pub(crate) struct Copied {
     pub missing: usize,
 }
 
+/// Something drawn under a row besides its code.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Block {
+    /// The thread at this index of the file's threads.
+    Thread(usize),
+    /// The text box writing a new thread.
+    New,
+}
+
+/// What [`Doc::render`] wrote for a row: whether it's a gap's separator,
+/// and how many of its screen rows are code; its blocks' follow.
+#[derive(Debug, Default)]
+struct Rows {
+    separator: bool,
+    code: usize,
+}
+
+/// Which threads are folded to one row. Resolved threads start folded, and
+/// outdated ones unless a draft is in them: on a reviewed PR they outnumber
+/// the open ones, and an unsent reply shouldn't hide. In a local review
+/// every comment is a draft, so resolving is what folds there. `Z` then sets every thread, and `z` one. Choices are
+/// kept by root, as folded or not rather than as a flip of the default, so
+/// they outlive reloads of the comments file and a thread resolved or
+/// reopened under them.
+#[derive(Debug, Default)]
+pub(crate) struct Fold {
+    /// What `Z` last set every thread to.
+    all: Option<bool>,
+    /// What `z` set threads to since, by root.
+    chosen: HashMap<String, bool>,
+    /// Whether each thread of the file shown starts folded, by root.
+    defaults: HashMap<String, bool>,
+}
+
+impl Fold {
+    pub(crate) fn collapsed(&self, root: &str) -> bool {
+        self.chosen
+            .get(root)
+            .copied()
+            .or(self.all)
+            .unwrap_or_else(|| self.defaults.get(root).copied().unwrap_or(false))
+    }
+
+    pub(crate) fn toggle(&mut self, root: &str) {
+        let folded = !self.collapsed(root);
+        self.chosen.insert(root.to_owned(), folded);
+    }
+
+    /// Folds every thread, or unfolds every one when those of the file
+    /// shown all were. Returns whether they're folded now.
+    pub(crate) fn toggle_all(&mut self) -> bool {
+        let fold = if self.defaults.is_empty() {
+            self.all != Some(true)
+        } else {
+            self.defaults.keys().any(|root| !self.collapsed(root))
+        };
+        self.all = Some(fold);
+        self.chosen.clear();
+        fold
+    }
+
+    /// Takes the threads of the file shown, for their defaults.
+    fn learn(&mut self, threads: &[Thread]) {
+        self.defaults = threads
+            .iter()
+            .map(|t| {
+                let quiet = t.resolved || (t.outdated && !t.notes.iter().any(|n| n.draft));
+                (t.root.clone(), quiet)
+            })
+            .collect();
+    }
+}
+
+/// Which rows of a side a row stands for, to hang threads under it.
+enum Covers {
+    /// The line it shows.
+    Line(usize),
+    /// A rendered view's row: the source lines it was drawn from, and the
+    /// next row's. A thread hangs under the last row drawn from its line.
+    Rendered(Range<usize>, Range<usize>),
+    /// A separator: the lines it hides.
+    Hidden(Range<usize>),
+}
+
+impl Covers {
+    fn holds(&self, last: usize) -> bool {
+        match self {
+            Self::Line(line) => *line == last,
+            Self::Rendered(here, next) => here.contains(&last) && !next.contains(&last),
+            Self::Hidden(lines) => lines.contains(&last),
+        }
+    }
+}
+
 /// Where the top row is, for the title: the hunk it's in, or the heading
 /// above it in revealed unchanged lines.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -153,6 +266,30 @@ pub(crate) struct Doc {
     /// rows only when drawn there again.
     painted: Option<(usize, usize, usize)>,
     pub selection: Option<Selection>,
+    /// The comment threads placed on `threads_file`, the file shown.
+    threads: Arc<[Thread]>,
+    threads_file: usize,
+    /// Each thread on a line, by the side's index and its last line.
+    by_line: HashMap<(usize, usize), Vec<usize>>,
+    /// Rows of each thread's box by its index, the box's width and whether
+    /// it's folded, so a row's height doesn't wrap the box's text again.
+    /// The focus and the ages don't change them: they're in a border's one
+    /// row. Emptied only when the threads are replaced, so it grows by a
+    /// width per thread at each resize until then.
+    box_rows: HashMap<(usize, usize, bool), usize>,
+    pub fold: Fold,
+    /// The root of the thread `m`, `M` or a click focused.
+    focus: Option<String>,
+    /// The text box, while it's open; keys go to it.
+    pub writing: Option<Writing>,
+    /// Seconds since 1970, for the threads' ages.
+    pub now: u64,
+    /// The last frame drew rows of a thread or the text box, which the
+    /// next frame doesn't copy: what they show changes without the rows
+    /// above them moving.
+    blocks_drawn: bool,
+    /// The row a block was last found under, checked before it's used.
+    found: Option<(Block, Pos)>,
 }
 
 impl Doc {
@@ -171,6 +308,16 @@ impl Doc {
             drawn: Vec::new(),
             painted: None,
             selection: None,
+            threads: Arc::new([]),
+            threads_file: 0,
+            by_line: HashMap::new(),
+            box_rows: HashMap::new(),
+            fold: Fold::default(),
+            focus: None,
+            writing: None,
+            now: 0,
+            blocks_drawn: false,
+            found: None,
         }
     }
 
@@ -479,9 +626,20 @@ impl Doc {
     }
 
     /// Appends the screen rows of the logical row at `pos` (ignoring its
-    /// offset), drawn with its file's `layout`. Returns whether it's a
-    /// gap's separator.
-    fn render(&mut self, pos: Pos, layout: &Layout, c: &mut Canvas) -> bool {
+    /// offset), drawn with its file's `layout`: its code, then the threads
+    /// and the text box under it.
+    fn render(&mut self, pos: Pos, layout: &Layout, c: &mut Canvas) -> Rows {
+        let start = c.len();
+        let separator = self.render_code(pos, layout, c);
+        let code = c.len() - start;
+        for (i, block) in self.blocks(pos, layout).into_iter().enumerate() {
+            self.render_block(block, pos, layout, i > 0, c);
+        }
+        Rows { separator, code }
+    }
+
+    /// [`Doc::render`]'s code rows. Returns whether it's a gap's separator.
+    fn render_code(&mut self, pos: Pos, layout: &Layout, c: &mut Canvas) -> bool {
         if pos.part == 0 {
             if self
                 .document
@@ -532,18 +690,317 @@ impl Doc {
     /// Screen rows the logical row at `pos` takes, in its file's `layout`.
     fn height(&mut self, pos: Pos, layout: &Layout) -> usize {
         // Rendered views show only while the mode is on, so a line diff
-        // without wrapping pays one flag here.
-        if pos.part == 0
-            || !(self.layout.wrap || (self.document.rendered() && self.is_rendered(pos.file)))
-        {
-            return 1;
+        // without wrapping pays a flag and a lookup here for its code.
+        let one = pos.part == 0
+            || !(self.layout.wrap || (self.document.rendered() && self.is_rendered(pos.file)));
+        let blocks = self.blocks(pos, layout);
+        let code = if one { 1 } else { self.code_rows(pos, layout) };
+        let gaps = blocks.len().saturating_sub(1);
+        let boxes: usize = blocks
+            .into_iter()
+            .map(|block| self.block_height(block, pos, layout))
+            .sum();
+        (code + gaps + boxes).max(1)
+    }
+
+    /// Screen rows of code the logical row at `pos` takes; the rest are
+    /// its blocks'.
+    fn code_height(&mut self, pos: Pos, layout: &Layout) -> usize {
+        if self.blocks(pos, layout).is_empty() {
+            return usize::MAX;
         }
+        self.code_rows(pos, layout)
+    }
+
+    /// [`Doc::render_code`]'s rows for the logical row at `pos`.
+    fn code_rows(&mut self, pos: Pos, layout: &Layout) -> usize {
         let mut c = std::mem::take(&mut self.scratch);
         c.clear();
-        self.render(pos, layout, &mut c);
-        let n = c.rows().count().max(1);
+        self.render_code(pos, layout, &mut c);
+        let rows = c.len();
         self.scratch = c;
-        n
+        rows
+    }
+
+    /// Takes `threads`, those of `file`, the file shown. Rows they hang
+    /// under change height, so the position is kept within its row.
+    pub(crate) fn set_threads(&mut self, file: usize, threads: Arc<[Thread]>) {
+        let same = if threads.is_empty() {
+            self.threads.is_empty()
+        } else {
+            Arc::ptr_eq(&threads, &self.threads)
+        };
+        if same && file == self.threads_file {
+            return;
+        }
+        self.by_line.clear();
+        for (i, thread) in threads.iter().enumerate() {
+            if let At::Line { side, lines } = &thread.at {
+                self.by_line
+                    .entry((side.index(), lines.end - 1))
+                    .or_default()
+                    .push(i);
+            }
+        }
+        self.box_rows.clear();
+        self.fold.learn(&threads);
+        self.threads = threads;
+        self.threads_file = file;
+        self.found = None;
+        self.refit();
+    }
+
+    /// The threads of the file shown.
+    pub(crate) fn threads(&self) -> &[Thread] {
+        if self.threads_file == self.document.pos.file {
+            &self.threads
+        } else {
+            &[]
+        }
+    }
+
+    /// Keeps the position within its row and the screen full, after the
+    /// blocks under rows changed.
+    pub(crate) fn refit(&mut self) {
+        if self.document.files().is_empty() {
+            return;
+        }
+        let layout = self.file_layout(self.document.pos.file);
+        let pos = self.document.pos;
+        self.document.pos.offset = pos.offset.min(self.height(pos, &layout) - 1);
+        self.clamp_in(&layout);
+    }
+
+    /// The blocks hung under the row at `pos`, in the order they're drawn:
+    /// under the file's first row the comments on the whole file; under
+    /// a line the threads on it, old side first, then the text box when it
+    /// writes a new one there; under a separator the threads on the lines
+    /// it hides; under the file's last row the threads whose lines are
+    /// gone.
+    fn blocks(&mut self, pos: Pos, layout: &Layout) -> Vec<Block> {
+        let new = match &self.writing {
+            Some(Writing {
+                at: Writes::New { side, lines },
+                ..
+            }) => Some((*side, lines.end - 1)),
+            _ => None,
+        };
+        if pos.file != self.threads_file || (self.threads.is_empty() && new.is_none()) {
+            return Vec::new();
+        }
+        let threads = Arc::clone(&self.threads);
+        let logical = Pos { offset: 0, ..pos };
+        let parts = self.document.parts(pos.file);
+        let mut out = Vec::new();
+        if (logical.part, logical.row) == (usize::from(parts > 1), 0) {
+            out.extend(
+                (0..threads.len())
+                    .filter(|&i| threads[i].at == At::File)
+                    .map(Block::Thread),
+            );
+        }
+        let lines = self.document.row_lines(logical, arrange(layout));
+        let rendered = self.document.file(pos.file).and_then(File::rendered);
+        for side in [Side::Old, Side::New] {
+            let covers = match (lines[side.index()], rendered) {
+                (Some(line), None) => Covers::Line(line),
+                (Some(line), Some(r)) => Covers::Rendered(
+                    r.source_lines(side, line, line),
+                    r.source_lines(side, line + 1, line + 1),
+                ),
+                (None, None) => match self.hidden(logical, side) {
+                    Some(lines) => Covers::Hidden(lines),
+                    None => continue,
+                },
+                (None, Some(_)) => continue,
+            };
+            if let Covers::Line(line) = covers {
+                if let Some(list) = self.by_line.get(&(side.index(), line)) {
+                    out.extend(list.iter().copied().map(Block::Thread));
+                }
+            } else {
+                out.extend((0..threads.len()).filter_map(|i| match &threads[i].at {
+                    At::Line { side: s, lines } if *s == side && covers.holds(lines.end - 1) => {
+                        Some(Block::Thread(i))
+                    }
+                    _ => None,
+                }));
+            }
+            if new.is_some_and(|(s, last)| s == side && covers.holds(last)) {
+                out.push(Block::New);
+            }
+        }
+        if logical.part + 1 == parts && threads.iter().any(|t| t.at == At::Lost) {
+            let part = parts - 1;
+            let rows = self.document.rows(pos.file, part, arrange(layout));
+            if (logical.part, logical.row) == (part, rows.saturating_sub(1)) {
+                out.extend(
+                    (0..threads.len())
+                        .filter(|&i| threads[i].at == At::Lost)
+                        .map(Block::Thread),
+                );
+            }
+        }
+        out
+    }
+
+    /// The lines of `side` the separator at `pos` hides; `None` when it
+    /// isn't one.
+    fn hidden(&self, pos: Pos, side: Side) -> Option<Range<usize>> {
+        let Some(Segment::Gap(g)) = self.document.segment(pos.file, pos.part) else {
+            return None;
+        };
+        let shown = self.document.shown(pos.file, g)?;
+        if shown.hidden() == 0 || shown.line(pos.row).is_some() {
+            return None;
+        }
+        let span = *self.document.file(pos.file)?.gaps().get(g)?;
+        let first = match side {
+            Side::Old => span.old,
+            Side::New => span.new,
+        } + shown.top;
+        Some(first..first + shown.hidden())
+    }
+
+    /// Appends `block`'s rows, hung under the row at `pos`: blank under
+    /// the gutter but for its rule, then the block's box from a cell into
+    /// the code's column to a cell before the pane's edge. In a split row a
+    /// thread on a line takes its side's half. `gap` puts a blank row over
+    /// it, to part it from the block above.
+    fn render_block(&mut self, block: Block, pos: Pos, layout: &Layout, gap: bool, c: &mut Canvas) {
+        let (start, gutter, boxed, old_half) = self.block_columns(block, pos, layout);
+        let mut rows = Canvas::default();
+        if gap {
+            rows.spaces(Role::Plain, boxed);
+            rows.end_line();
+        }
+        self.block_box(block, boxed, &mut rows);
+        for row in rows.rows() {
+            if start > 0 {
+                c.spaces(Role::Plain, start - 1);
+                c.push(Role::Dim, "│");
+            }
+            c.spaces(Role::Plain, gutter.saturating_sub(2));
+            c.push(Role::Dim, "│");
+            c.spaces(Role::Plain, 2);
+            for (ink, piece) in row {
+                c.push_ink(ink, piece);
+            }
+            if old_half {
+                c.spaces(Role::Plain, 1);
+                c.push(Role::Dim, "│");
+            }
+            c.end_line();
+        }
+    }
+
+    /// Screen rows of `block` hung under the row at `pos`.
+    fn block_height(&mut self, block: Block, pos: Pos, layout: &Layout) -> usize {
+        let (_, _, boxed, _) = self.block_columns(block, pos, layout);
+        // The text box changes with every key, so a box holding it is
+        // counted afresh.
+        let key = match block {
+            Block::Thread(i) if !self.writes_in(i) => {
+                Some((i, boxed, self.fold.collapsed(&self.threads[i].root)))
+            }
+            _ => None,
+        };
+        if let Some(&rows) = key.and_then(|k| self.box_rows.get(&k)) {
+            return rows;
+        }
+        let mut c = Canvas::default();
+        self.block_box(block, boxed, &mut c);
+        if let Some(k) = key {
+            self.box_rows.insert(k, c.len());
+        }
+        c.len()
+    }
+
+    /// Whether the text box writes in thread `i`, a reply or an edit.
+    fn writes_in(&self, i: usize) -> bool {
+        self.writing.as_ref().is_some_and(|w| match &w.at {
+            Writes::Reply(root) | Writes::Edit { root, .. } => *root == self.threads[i].root,
+            Writes::New { .. } => false,
+        })
+    }
+
+    /// Where [`Doc::render_block`] puts `block`'s rows: the column they
+    /// start at, the gutter's width after it, the box's width, and whether
+    /// they're a split row's old half, closed by a rule.
+    fn block_columns(
+        &mut self,
+        block: Block,
+        pos: Pos,
+        layout: &Layout,
+    ) -> (usize, usize, usize, bool) {
+        let width = layout.width.unwrap_or(80);
+        let numbers = if layout.line_numbers {
+            layout.digits
+        } else {
+            0
+        };
+        let side = match block {
+            Block::Thread(i) => match &self.threads[i].at {
+                At::Line { side, .. } => Some(*side),
+                At::File | At::Lost => None,
+            },
+            Block::New => match &self.writing {
+                Some(Writing {
+                    at: Writes::New { side, .. },
+                    ..
+                }) => Some(*side),
+                _ => None,
+            },
+        };
+        // A block across the pane follows the layout, not its row: the
+        // file's first row is a header, never split.
+        let split = !layout.one_sided
+            && match side {
+                Some(_) => self.split_row(pos, layout),
+                None => layout.arrangement(&ANY_HUNK) == Arrangement::Split,
+            };
+        let half = layout.lead_width() + numbers + layout.mark_width();
+        let left = width.saturating_sub(1) / 2;
+        let (start, gutter, end) = match (split, side) {
+            (true, Some(Side::Old)) => (0, half, left),
+            (true, Some(Side::New)) => (left + 1, half, width),
+            (true, None) => (0, half, width),
+            (false, _) => {
+                let columns = if layout.one_sided { 1 } else { 2 };
+                let numbers = if numbers == 0 {
+                    0
+                } else {
+                    columns * (numbers + 1) - 1
+                };
+                (
+                    0,
+                    layout.lead_width() + numbers + layout.mark_width(),
+                    width,
+                )
+            }
+        };
+        let boxed = end.saturating_sub(start + gutter + 2);
+        (start, gutter, boxed, split && side == Some(Side::Old))
+    }
+
+    /// Writes `block`'s box, `boxed` columns wide, into `c`.
+    fn block_box(&mut self, block: Block, boxed: usize, c: &mut Canvas) {
+        match block {
+            Block::Thread(i) => {
+                let threads = Arc::clone(&self.threads);
+                let thread = &threads[i];
+                let writes = self.writes_in(i);
+                let writing = self.writing.as_mut().filter(|_| writes);
+                let focused = writes || self.focus.as_deref() == Some(thread.root.as_str());
+                let collapsed = self.fold.collapsed(&thread.root);
+                comments::thread_rows(thread, (collapsed, focused), writing, (boxed, self.now), c);
+            }
+            Block::New => {
+                if let Some(writing) = &mut self.writing {
+                    comments::new_rows(&mut writing.text, boxed, c);
+                }
+            }
+        }
     }
 
     /// Moves `pos` to the next logical row of its file; false at the end.
@@ -933,9 +1390,11 @@ impl Doc {
         let kept = self.separators.len();
         let mut y = rows.start;
         let mut last = pos;
+        self.blocks_drawn = false;
         while y < rows.end {
             c.clear();
-            if self.render(pos, &layout, &mut c) && pos.offset == 0 {
+            let drawn = self.render(pos, &layout, &mut c);
+            if drawn.separator && pos.offset == 0 {
                 self.separators.push((y, pos));
             }
             for (i, row) in c.rows().enumerate().skip(pos.offset) {
@@ -945,6 +1404,9 @@ impl Doc {
                 let after = paint(grid, x, top + y, end, row, theme, Attributes::NONE);
                 if let Some(fill) = c.fill(i) {
                     grid.fill(after, top + y, end, theme.ink_style(fill));
+                }
+                if i >= drawn.code {
+                    self.blocks_drawn = true;
                 }
                 self.drawn[y] = Some(Pos { offset: i, ..pos });
                 y += 1;
@@ -967,6 +1429,7 @@ impl Doc {
             .map_or(last, |p| Pos { offset: 0, ..p });
         self.draw_selection(grid, area, &layout);
         self.draw_search(grid, area, theme, &layout, rows);
+        self.draw_markers(grid, area, theme, &layout);
         self.document.touch(file, frame);
         if let Some(note) = self.note(file) {
             let text_width = unicode_width::UnicodeWidthStr::width(note);
@@ -1034,8 +1497,9 @@ impl Doc {
     /// negative), the rows left to draw, and the position the first of
     /// them shows. `None`, having changed nothing, when the last frame
     /// showed another file, no row of this frame, or rows other than the
-    /// document's (the note), or while lines are selected: scrolling with
-    /// a selection held is rare, and those frames are drawn whole.
+    /// document's (the note), while lines are selected, or when it drew a
+    /// thread or the text box: scrolling with a selection held is rare,
+    /// and a thread's rows change with no scroll (an age, the focus).
     fn reuse(
         &mut self,
         grid: &mut Grid,
@@ -1049,6 +1513,7 @@ impl Doc {
             || first.file != pos.file
             || self.note(pos.file).is_some()
             || self.selection.is_some()
+            || self.blocks_drawn
             || (previous.width(), previous.height()) != (grid.width(), grid.height())
         {
             return None;
@@ -1119,6 +1584,7 @@ impl Doc {
         let side = selection.side.index();
         let mut previous = None;
         let mut lines = [None, None];
+        let mut code = 0;
         let mut mapped = std::mem::take(&mut self.mapped);
         for y in 0..self.drawn.len() {
             let Some(pos) = self.drawn[y] else { continue };
@@ -1129,12 +1595,14 @@ impl Doc {
             if previous != Some(logical) {
                 lines = self.document.row_lines(logical, arrange(layout));
                 previous = Some(logical);
+                code = self.code_height(logical, layout);
                 if bytes.is_some() {
                     mapped.clear();
                     self.render(logical, layout, &mut mapped);
                 }
             }
-            let Some(line) = lines[side].filter(|l| (lo..=hi).contains(l)) else {
+            let Some(line) = lines[side].filter(|l| (lo..=hi).contains(l) && pos.offset < code)
+            else {
                 continue;
             };
             if let (Some((from, to)), Some(map)) = (bytes, mapped.map()) {
@@ -1231,6 +1699,104 @@ impl Doc {
         self.document.search = Some(marks);
     }
 
+    /// Marks the rows of lines with comment threads in the gutter, in the
+    /// cell after the line numbers, its background kept. A unified row with
+    /// threads on both sides takes the most pressing look. `layout` is the
+    /// drawn file's.
+    fn draw_markers(
+        &mut self,
+        grid: &mut Grid,
+        (x, end, top): (usize, usize, usize),
+        theme: &Theme,
+        layout: &Layout,
+    ) {
+        let file = self.document.pos.file;
+        if self.threads().is_empty() {
+            return;
+        }
+        let threads = Arc::clone(&self.threads);
+        let mut mapped = std::mem::take(&mut self.mapped);
+        let mut previous = None;
+        for y in 0..self.drawn.len() {
+            let Some(pos) = self.drawn[y] else { continue };
+            let logical = Pos { offset: 0, ..pos };
+            if pos.file != file || previous == Some(logical) {
+                continue;
+            }
+            previous = Some(logical);
+            let lines = self.document.row_lines(logical, arrange(layout));
+            let looks = [Side::Old, Side::New].map(|side| {
+                let line = lines[side.index()]?;
+                let source = self.source_lines(file, side, line, line);
+                threads
+                    .iter()
+                    .filter(|t| matches!(&t.at, At::Line { side: s, lines } if *s == side && overlap(lines, &source)))
+                    .map(|t| t.look)
+                    .max()
+            });
+            if looks == [None, None] {
+                continue;
+            }
+            mapped.clear();
+            self.render(logical, layout, &mut mapped);
+            let split = self.split_row(logical, layout);
+            let Some(map) = mapped.map() else { continue };
+            let mut put = |side: Option<usize>, look: Look| {
+                let Some(area) = map
+                    .areas
+                    .iter()
+                    .find(|a| a.row == pos.offset && side.is_none_or(|s| s == a.side))
+                else {
+                    return;
+                };
+                let column = x + area.col.saturating_sub(layout.mark_width());
+                let mut style = theme.style(look.role());
+                style.bg = grid
+                    .row(top + y)
+                    .get(column)
+                    .and_then(|cell| cell.style().bg)
+                    .or(style.bg);
+                grid.put_str(column, top + y, end, look.glyph(), style);
+            };
+            if split {
+                for side in [Side::Old, Side::New] {
+                    if let Some(look) = looks[side.index()] {
+                        put(Some(side.index()), look);
+                    }
+                }
+            } else if let Some(look) = looks.into_iter().flatten().max() {
+                put(None, look);
+            }
+        }
+        self.mapped = mapped;
+    }
+
+    /// The lines of `file`'s line diff that lines `lo..=hi` of `side` show:
+    /// themselves, or in a rendered view the blocks they were drawn from.
+    fn source_lines(&self, file: usize, side: Side, lo: usize, hi: usize) -> Range<usize> {
+        match self.document.file(file).and_then(File::rendered) {
+            Some(rendered) => rendered.source_lines(side, lo, hi),
+            None => lo..hi + 1,
+        }
+    }
+
+    /// The lines a new comment goes on, in the line diff of their file:
+    /// the selection's, else the line `v` would start on from `at`.
+    pub(crate) fn comment_target(
+        &mut self,
+        at: Option<(Pos, Side)>,
+    ) -> Option<(usize, Side, Range<usize>)> {
+        let (file, side, lo, hi) = if let Some(s) = &self.selection {
+            let (lo, hi) = s.range();
+            (s.anchor.file, s.side, lo, hi)
+        } else {
+            let (pos, side, line) = self.start(at)?;
+            (pos.file, side, line, line)
+        };
+        let lines = self.source_lines(file, side, lo, hi);
+        (!lines.is_empty()).then_some((file, side, lines))
+    }
+
     /// The row showing match `m` of `file`.
     pub(crate) fn match_pos(&mut self, file: usize, m: &document::Match) -> Option<Pos> {
         let layout = self.file_layout(file);
@@ -1260,17 +1826,7 @@ impl Doc {
             Some(Segment::Hunk(_)) => {
                 self.document.arrangement(pos, arrange(layout)) == Some(Arrangement::Split)
             }
-            Some(Segment::Gap(_)) => {
-                let header = HunkHeader {
-                    old_start: 1,
-                    old_len: 1,
-                    new_start: 1,
-                    new_len: 1,
-                    heading: b"",
-                    hidden: 0,
-                };
-                layout.arrangement(&header) == Arrangement::Split
-            }
+            Some(Segment::Gap(_)) => layout.arrangement(&ANY_HUNK) == Arrangement::Split,
             Some(Segment::Start) | None => false,
         }
     }
@@ -1310,6 +1866,9 @@ impl Doc {
         let drawn = self.drawn.get(y).copied().flatten()?;
         let pos = Pos { offset: 0, ..drawn };
         let layout = self.file_layout(pos.file);
+        if drawn.offset >= self.code_height(pos, &layout) {
+            return None;
+        }
         let lines = self.document.row_lines(pos, arrange(&layout));
         let confined = side.is_some();
         let side = match side {
@@ -1456,6 +2015,21 @@ impl Doc {
     /// the first row on screen holding code, on its new side when it has
     /// one. Returns whether there was a line to start on.
     pub(crate) fn select(&mut self, at: Option<(Pos, Side)>) -> bool {
+        let Some((pos, side, line)) = self.start(at) else {
+            return false;
+        };
+        self.selection = Some(Selection {
+            side,
+            anchor: pos,
+            cursor: pos,
+            lines: (line, line),
+            bytes: None,
+        });
+        true
+    }
+
+    /// Where [`Doc::select`] starts: the row and line there.
+    fn start(&mut self, at: Option<(Pos, Side)>) -> Option<(Pos, Side, usize)> {
         let start = at.or_else(|| {
             let rows: Vec<Pos> = (0..self.drawn.len())
                 .filter_map(|y| self.row_at(y))
@@ -1469,20 +2043,9 @@ impl Doc {
                 Some((pos, side))
             })
         });
-        let Some((pos, side)) = start else {
-            return false;
-        };
-        let Some(line) = self.row_lines(pos)[side.index()] else {
-            return false;
-        };
-        self.selection = Some(Selection {
-            side,
-            anchor: pos,
-            cursor: pos,
-            lines: (line, line),
-            bytes: None,
-        });
-        true
+        let (pos, side) = start?;
+        let line = self.row_lines(pos)[side.index()]?;
+        Some((pos, side, line))
     }
 
     /// The next row after `from` (before it, with `back`) that holds a line
@@ -1601,6 +2164,280 @@ impl Doc {
                 isize::try_from(rows - self.height).unwrap_or(isize::MAX),
                 &layout,
             );
+        }
+    }
+
+    /// The focused thread, while it's on the file shown.
+    pub(crate) fn focused(&self) -> Option<&Thread> {
+        let root = self.focus.as_deref()?;
+        self.threads().iter().find(|t| t.root == root)
+    }
+
+    /// Focuses the thread with root `root`, or none.
+    pub(crate) fn set_focus(&mut self, root: Option<String>) {
+        self.focus = root;
+    }
+
+    /// The block drawn on row `y` of the pane in the last frame.
+    pub(crate) fn block_at(&mut self, y: usize) -> Option<Block> {
+        self.block_row_at(y).map(|(b, _)| b)
+    }
+
+    /// The block drawn on row `y` in the last frame, and whether `y` is
+    /// its first row: a thread's header, or its folded row.
+    pub(crate) fn block_row_at(&mut self, y: usize) -> Option<(Block, bool)> {
+        let drawn = self.drawn.get(y).copied().flatten()?;
+        let pos = Pos { offset: 0, ..drawn };
+        let layout = self.file_layout(pos.file);
+        self.block_ranges(pos, &layout)
+            .into_iter()
+            .find(|(_, r)| r.contains(&drawn.offset))
+            .map(|(b, r)| (b, r.start == drawn.offset))
+    }
+
+    /// The screen rows (from its first) of each block under the logical
+    /// row at `pos`, after its code's. The blank row between two blocks is
+    /// neither's.
+    fn block_ranges(&mut self, pos: Pos, layout: &Layout) -> Vec<(Block, Range<usize>)> {
+        let mut first = self.code_rows(pos, layout);
+        let blocks = self.blocks(pos, layout);
+        blocks
+            .into_iter()
+            .map(|block| {
+                let rows = first..first + self.block_height(block, pos, layout);
+                first = rows.end + 1;
+                (block, rows)
+            })
+            .collect()
+    }
+
+    /// The thread to fold with `z`: the focused one, else the first drawn
+    /// in the last frame.
+    pub(crate) fn nearest_thread(&mut self) -> Option<usize> {
+        if let Some(root) = self.focused().map(|t| t.root.clone()) {
+            return self.threads.iter().position(|t| t.root == root);
+        }
+        (0..self.drawn.len()).find_map(|y| match self.block_at(y) {
+            Some(Block::Thread(i)) => Some(i),
+            _ => None,
+        })
+    }
+
+    /// The first logical row of `file`.
+    fn first_row(&self, file: usize) -> Pos {
+        Pos {
+            file,
+            part: usize::from(self.document.parts(file) > 1),
+            row: 0,
+            offset: 0,
+        }
+    }
+
+    /// Each thread of the file shown with the row it hangs under, in the
+    /// order the diff shows them. Walks the file's rows, as `m` and `M`
+    /// are pressed: placing them at load would cost every file the walk.
+    fn placed_threads(&mut self) -> Vec<(Pos, usize)> {
+        let file = self.document.pos.file;
+        let mut out = Vec::new();
+        if self.threads().is_empty() {
+            return out;
+        }
+        let layout = self.file_layout(file);
+        let mut pos = self.first_row(file);
+        loop {
+            for block in self.blocks(pos, &layout) {
+                if let Block::Thread(i) = block {
+                    out.push((pos, i));
+                }
+            }
+            if out.len() == self.threads.len() || !self.next_row(&mut pos, &layout) {
+                return out;
+            }
+        }
+    }
+
+    /// Focuses and shows the thread after the focused one, or before it
+    /// without `forward`; with none focused, the first at or below the top
+    /// row, or the last above it. False when there's none that way in the
+    /// file shown.
+    pub(crate) fn step_thread(&mut self, forward: bool) -> bool {
+        let placed = self.placed_threads();
+        let top = Pos {
+            offset: 0,
+            ..self.document.pos
+        };
+        let focused = self.focused().map(|t| t.root.clone());
+        let current = focused.and_then(|root| {
+            placed
+                .iter()
+                .position(|&(_, i)| self.threads[i].root == root)
+        });
+        let next = match (current, forward) {
+            (Some(k), true) => Some(k + 1).filter(|&k| k < placed.len()),
+            (Some(k), false) => k.checked_sub(1),
+            (None, true) => placed.iter().position(|&(p, _)| p >= top),
+            (None, false) => placed.iter().rposition(|&(p, _)| p < top),
+        };
+        let Some(&(pos, i)) = next.and_then(|k| placed.get(k)) else {
+            return false;
+        };
+        self.show_thread(pos, i);
+        true
+    }
+
+    /// Focuses and shows the first thread of the file shown, or its last.
+    pub(crate) fn edge_thread(&mut self, last: bool) -> bool {
+        let placed = self.placed_threads();
+        let edge = if last { placed.last() } else { placed.first() };
+        let Some(&(pos, i)) = edge else {
+            return false;
+        };
+        self.show_thread(pos, i);
+        true
+    }
+
+    /// Focuses and shows the thread with root `root` on the file shown.
+    pub(crate) fn go_to_thread(&mut self, root: &str) -> bool {
+        let placed = self.placed_threads();
+        let Some(&(pos, i)) = placed.iter().find(|&&(_, i)| self.threads[i].root == root) else {
+            return false;
+        };
+        self.show_thread(pos, i);
+        true
+    }
+
+    /// Focuses thread `i`, hung under the row at `pos`, and shows it a few
+    /// rows of code below the top.
+    fn show_thread(&mut self, pos: Pos, i: usize) {
+        self.focus = Some(self.threads[i].root.clone());
+        self.found = Some((Block::Thread(i), pos));
+        let layout = self.file_layout(pos.file);
+        self.document.pos = pos;
+        self.clamp_in(&layout);
+        self.scroll_in(-OPEN_CONTEXT, &layout);
+        self.reveal_block(Block::Thread(i), false);
+    }
+
+    /// The block the text box is drawn in.
+    pub(crate) fn writing_block(&self) -> Option<Block> {
+        match &self.writing.as_ref()?.at {
+            Writes::New { .. } => Some(Block::New),
+            Writes::Reply(root) | Writes::Edit { root, .. } => self
+                .threads()
+                .iter()
+                .position(|t| t.root == *root)
+                .map(Block::Thread),
+        }
+    }
+
+    /// The row `block` hangs under in the file shown.
+    fn find_block(&mut self, block: Block) -> Option<Pos> {
+        let file = self.document.pos.file;
+        let layout = self.file_layout(file);
+        if let Some((b, pos)) = self.found
+            && b == block
+            && pos.file == file
+            && self.blocks(pos, &layout).contains(&block)
+        {
+            return Some(pos);
+        }
+        let mut pos = self.first_row(file);
+        loop {
+            if self.blocks(pos, &layout).contains(&block) {
+                self.found = Some((block, pos));
+                return Some(pos);
+            }
+            if !self.next_row(&mut pos, &layout) {
+                return None;
+            }
+        }
+    }
+
+    /// The row `block` hangs under, and its screen rows within that row.
+    fn block_rows(&mut self, block: Block) -> Option<(Pos, Range<usize>)> {
+        let pos = self.find_block(block)?;
+        let layout = self.file_layout(pos.file);
+        let (_, range) = self
+            .block_ranges(pos, &layout)
+            .into_iter()
+            .find(|(b, _)| *b == block)?;
+        Some((pos, range))
+    }
+
+    /// Whether any row of the focused thread is on screen, counted from the
+    /// position rather than the last frame: keys can come between frames.
+    pub(crate) fn focused_shown(&mut self) -> bool {
+        let Some(root) = self.focused().map(|t| t.root.clone()) else {
+            return false;
+        };
+        let Some(i) = self.threads.iter().position(|t| t.root == root) else {
+            return false;
+        };
+        let Some((pos, range)) = self.block_rows(Block::Thread(i)) else {
+            return false;
+        };
+        let top = self.document.pos;
+        if (Pos {
+            offset: range.end - 1,
+            ..pos
+        }) < top
+        {
+            return false;
+        }
+        let layout = self.file_layout(pos.file);
+        let mut at = top;
+        let mut rows = 0;
+        while (Pos { offset: 0, ..at }) != pos {
+            rows += self.height(at, &layout) - at.offset;
+            if rows >= self.height || !self.next_row(&mut at, &layout) {
+                return false;
+            }
+        }
+        rows + range.start.saturating_sub(at.offset) < self.height
+    }
+
+    /// Scrolls just enough that `block` shows: from its first row, or with
+    /// `end` (the text box, its cursor last), through its last.
+    pub(crate) fn reveal_block(&mut self, block: Block, end: bool) {
+        let Some((pos, range)) = self.block_rows(block) else {
+            return;
+        };
+        let layout = self.file_layout(pos.file);
+        let first = Pos {
+            offset: range.start,
+            ..pos
+        };
+        if first < self.document.pos {
+            self.document.pos = if end {
+                Pos {
+                    offset: range.end.saturating_sub(self.height).max(range.start),
+                    ..pos
+                }
+            } else {
+                first
+            };
+            self.clamp_in(&layout);
+            return;
+        }
+        // Screen rows from the top of the pane through the block's last.
+        let mut at = self.document.pos;
+        let mut rows = 0;
+        loop {
+            if (Pos { offset: 0, ..at }) == pos {
+                rows += range.end - at.offset;
+                break;
+            }
+            rows += self.height(at, &layout) - at.offset;
+            if !self.next_row(&mut at, &layout) {
+                return;
+            }
+        }
+        if rows > self.height {
+            let mut by = rows - self.height;
+            if !end {
+                by = by.min(rows - range.len());
+            }
+            self.scroll_in(isize::try_from(by).unwrap_or(isize::MAX), &layout);
         }
     }
 
@@ -1734,6 +2571,10 @@ impl Doc {
         }
         widest
     }
+}
+
+fn overlap(a: &Range<usize>, b: &Range<usize>) -> bool {
+    a.start < b.end && b.start < a.end
 }
 
 /// Writes one canvas row into the grid, adding `attributes` to every

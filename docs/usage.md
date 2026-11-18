@@ -6,11 +6,13 @@ dffy [options] [--no-index] <path> <path>
 dffy --json [options] [<rev>...] [-- <path>...]
 dffy show [<rev>] [-- <path>...]
 dffy config [--default]
+dffy comments [--json] | comments apply
+dffy pr [<number>]
 dffy mcp
 dffy themes | doctor | daemon status|stop | completions <shell>
 ```
 
-Without a subcommand dffy runs `diff`, so `dffy main..HEAD` is `dffy diff main..HEAD`. A revision with the same name as a subcommand needs the explicit form: `dffy diff config`.
+Without a subcommand dffy runs `diff`, so `dffy main..HEAD` is `dffy diff main..HEAD`. A revision with the same name as a subcommand needs the explicit form: `dffy diff config`, `dffy diff comments`.
 
 ## Viewer or printed output
 
@@ -33,6 +35,8 @@ Otherwise dffy prints.
 |---|---|
 | `diff` | Changes between the working tree, the index and revisions. The default. |
 | `show [<rev>]` | A commit against its first parent, with the commit header. `<rev>` defaults to `HEAD`; a root commit is compared with the empty tree. |
+| `comments` | The review comments, as threads. `--json` prints the comments file; `comments apply` changes it with a JSON list of operations on stdin. See [comments.md](comments.md). |
+| `pr [<number>]` | Experimental. A pull request in the viewer, through the review plugin (`review` or `--review`): `<base>...<head>` with its review threads, which you answer and post from there. Without a number, the current branch's PR, or a list to pick from. It needs a terminal. See [viewer.md](viewer.md#pull-requests) and [plugins.md](plugins.md#review-plugins). |
 | `config` | The effective settings, each marked with where its value comes from. `--default` prints every key with its documentation and default instead. See [config.md](config.md). |
 | `themes` | The available themes, with a preview. `--dump <name>` prints a built-in theme as a theme file to copy and edit. See [themes.md](themes.md). |
 | `doctor` | Checks git, the repository, the watches it needs, the terminal, the config, the cache and `dffyd`, and times dffy on the repository; `--json` prints it all as one object. See [troubleshooting.md](troubleshooting.md#dffy-doctor). |
@@ -210,6 +214,8 @@ These can go before or after the subcommand.
 | `--color auto\|always\|never` | When to color output. `auto` colors terminals, and follows `NO_COLOR` and `CLICOLOR_FORCE`. |
 | `--paging auto\|never` | `never` writes straight to the terminal and also keeps the viewer from opening. |
 | `--theme <name>` | A built-in theme or a file in the config's `themes/` directory. See [themes.md](themes.md). |
+| `--comments <file>` | The review comments file, relative to `-C`'s directory; the default is `dffy/comments.json` in the repository's git directory. See [comments.md](comments.md#where-the-file-is). |
+| `--review <name>` | The review plugin `dffy pr` runs, `dffy-review-<name>`, over the `review` setting. See [plugins.md](plugins.md#review-plugins). |
 | `-h`, `--help` | Help; `dffy diff --help` lists the diff options. |
 | `-V`, `--version` | The version. |
 

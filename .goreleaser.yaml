@@ -62,6 +62,24 @@ builds:
       - aarch64-unknown-linux-gnu
       - x86_64-unknown-linux-gnu
 
+  - id: review-github-darwin
+    builder: rust
+    binary: dffy-review-github
+    tool: cargo
+    command: build
+    flags: [--release, --package=dffy-review-github]
+    targets:
+      - aarch64-apple-darwin
+      - x86_64-apple-darwin
+
+  - id: review-github-linux
+    builder: rust
+    binary: dffy-review-github
+    flags: [--release, --package=dffy-review-github]
+    targets:
+      - aarch64-unknown-linux-gnu
+      - x86_64-unknown-linux-gnu
+
 archives:
   - id: dffy
     ids: [darwin, linux]
@@ -78,6 +96,11 @@ archives:
   - id: dffy-render-mermaid
     ids: [render-mermaid-darwin, render-mermaid-linux]
     name_template: "dffy-render-mermaid_{{ .Os }}_{{ .Arch }}"
+    formats: [tar.gz]
+
+  - id: dffy-review-github
+    ids: [review-github-darwin, review-github-linux]
+    name_template: "dffy-review-github_{{ .Os }}_{{ .Arch }}"
     formats: [tar.gz]
 
 checksum:
@@ -125,6 +148,20 @@ homebrew_casks:
         install_steps: |
           on_macos do
             run "/usr/bin/xattr", args: ["-dr", "com.apple.quarantine", "{{ .StagedPath }}/dffy-render-mermaid"]
+          end
+
+  - name: dffy-review-github
+    ids: [dffy-review-github]
+    description: "Experimental GitHub pull request review plugin for dffy"
+    homepage: https://github.com/amalucelli/dffy
+    repository:
+      owner: amalucelli
+      name: homebrew-tap
+    hooks:
+      post:
+        install_steps: |
+          on_macos do
+            run "/usr/bin/xattr", args: ["-dr", "com.apple.quarantine", "{{ .StagedPath }}/dffy-review-github"]
           end
 
 changelog:

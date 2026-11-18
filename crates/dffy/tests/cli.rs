@@ -1071,6 +1071,86 @@ fn doctor_json_and_outside_a_repository() {
     assert!(out.status.success(), "{out:?}");
 }
 
+/// The review plugin `--review` names is `dffy-review-<name>` in an
+/// absolute PATH directory: a renderer of that name isn't it, and neither
+/// is one in a relative directory.
+#[test]
+fn doctor_finds_the_review_plugin_on_path() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let repo = repo();
+    let bin = tempfile::tempdir().expect("tempdir");
+    let renderers = tempfile::tempdir().expect("tempdir");
+    std::fs::create_dir(repo.path().join("rel")).expect("mkdir");
+    for file in [
+        bin.path().join("dffy-review-test"),
+        renderers.path().join("dffy-render-test"),
+        repo.path().join("rel/dffy-review-test"),
+    ] {
+        std::fs::write(&file, "#!/bin/sh\n").expect("write");
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    }
+    let doctor = |path: String, json: bool| {
+        let args: &[&str] = if json {
+            &["--review", "test", "doctor", "--json"]
+        } else {
+            &["--color=never", "--review", "test", "doctor"]
+        };
+        stdout(
+            &dffy_cmd(repo.path(), args)
+                .env("PATH", path)
+                .output()
+                .expect("spawn dffy"),
+        )
+    };
+    let system = "/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin";
+    let found = doctor(format!("rel:{}:{system}", bin.path().display()), true);
+    let plugin = bin.path().join("dffy-review-test");
+    assert!(
+        found.contains(&format!(
+            "\"review\":{{\"name\":\"test\",\"path\":\"{}\"}}",
+            plugin.display()
+        )),
+        "{found}"
+    );
+    let missing = doctor(format!("rel:{}:{system}", renderers.path().display()), true);
+    assert!(
+        missing.contains("\"review\":{\"name\":\"test\",\"path\":null}"),
+        "{missing}"
+    );
+    let text = doctor(format!("{}:{system}", renderers.path().display()), false);
+    assert!(
+        text.contains("! review      dffy-review-test isn't on PATH"),
+        "{text}"
+    );
+}
+
+/// `dffy pr` says what it lacks, with a usage error's status: a review
+/// plugin set, the plugin on PATH, a terminal.
+#[test]
+fn dffy_pr_says_what_it_needs() {
+    let repo = repo();
+    let bin = tempfile::tempdir().expect("tempdir");
+    let path = format!("{}:/usr/bin:/bin", bin.path().display());
+    for (args, said) in [
+        (
+            &["pr", "7"][..],
+            "dffy pr needs a review plugin, and none is set",
+        ),
+        (
+            &["--review", "test", "pr"],
+            "dffy-review-test isn't on PATH",
+        ),
+    ] {
+        let out = dffy_cmd(repo.path(), args)
+            .env("PATH", &path)
+            .output()
+            .expect("spawn dffy");
+        assert_eq!(out.status.code(), Some(128), "{args:?}");
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(err.contains(said), "{args:?}: {err}");
+    }
+}
+
 #[test]
 fn completions_and_man_page() {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -1170,6 +1250,168 @@ fn as_interactive_diff_filter_dffy_prints_and_git_refuses_the_line_count() {
     assert!(!out.status.success());
     assert!(
         stderr(&out).contains("mismatched output from interactive.diffFilter"),
+        "{}",
+        stderr(&out)
+    );
+}
+
+/// dffy with `args`, `comments apply` among them, and `ops` on stdin.
+fn comments_apply(dir: &Path, args: &[&str], ops: &str) -> Output {
+    let mut child = dffy_cmd(dir, args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn dffy");
+    child
+        .stdin
+        .take()
+        .expect("piped stdin")
+        .write_all(ops.as_bytes())
+        .expect("write operations");
+    child.wait_with_output().expect("dffy exits")
+}
+
+/// The ids of an `apply` answer, `{"ids":["…",…]}`, none of them null.
+fn answer_ids(out: &Output) -> Vec<String> {
+    assert!(out.status.success(), "{}", stderr(out));
+    let answer = stdout(out);
+    let list = answer
+        .strip_prefix(r#"{"ids":["#)
+        .and_then(|s| s.strip_suffix("]}\n"));
+    assert!(list.is_some(), "an answer: {answer}");
+    list.expect("checked")
+        .split(',')
+        .map(|id| id.trim_matches('"').to_owned())
+        .collect()
+}
+
+/// The write contract end to end: operations go in through `apply`, the
+/// file comes out of `--json` exactly as written, a failing batch leaves
+/// the file as it was, and the listing shows the threads.
+#[test]
+fn comments_apply_round_trips_through_the_default_file() {
+    let repo = repo();
+    let d = repo.path();
+    let anchor = r#"{"before":[],"lines":["pub fn add(a: i64, b: i64) -> i64 {"],"after":["    a + b","}"]}"#;
+    let apply = ["comments", "apply"];
+    let added = comments_apply(
+        d,
+        &apply,
+        &format!(
+            r#"[{{"op":"add","comment":{{"path":"src/lib.rs","start":{{"old":null,"new":1}},"end":{{"old":null,"new":1}},"text":"Why i64?","created":"2026-11-17T10:42:00Z","anchor":{anchor},"github_thread":7}}}},
+            {{"op":"add","comment":{{"path":"README.md","text":"Say more.","author":"octocat","created":"2026-11-17T10:43:00Z"}}}}]"#
+        ),
+    );
+    let ids = answer_ids(&added);
+    assert_eq!(ids.len(), 2);
+    let replied = comments_apply(
+        d,
+        &apply,
+        &format!(
+            r#"[{{"op":"add","comment":{{"in_reply_to":"{}","text":"It overflowed.\nTwice.","author":"octocat","created":"2026-11-17T10:44:00Z"}}}},{{"op":"set","id":"{}","fields":{{"resolved":true}}}}]"#,
+            ids[0], ids[0]
+        ),
+    );
+    let reply = &answer_ids(&replied)[0];
+    let file = d.join(".git/dffy/comments.json");
+    let written = std::fs::read_to_string(&file).expect("apply wrote the default file");
+    let json = dffy(d, &["comments", "--json"]);
+    assert!(json.status.success(), "{}", stderr(&json));
+    assert_eq!(stdout(&json), written);
+    assert!(
+        written.starts_with(r#"{"version":1,"comments":["#),
+        "{written}"
+    );
+    assert!(
+        written.contains(&format!(r#""in_reply_to":"{}""#, ids[0])),
+        "{written}"
+    );
+    assert!(written.contains(r#""resolved":true"#), "{written}");
+    assert!(written.contains(r#""github_thread":7"#), "{written}");
+
+    let failed = comments_apply(
+        d,
+        &apply,
+        r#"[{"op":"notice","notice":"lost"},{"op":"set","id":"nope","fields":{"text":"x"}}]"#,
+    );
+    assert_eq!(failed.status.code(), Some(128));
+    assert_eq!(
+        stderr(&failed),
+        "error: operation 1 (set): comment nope doesn't exist\n"
+    );
+    assert_eq!(stdout(&failed), "");
+    assert_eq!(
+        std::fs::read_to_string(&file).expect("still there"),
+        written
+    );
+
+    let listed = stdout(&dffy(d, &["--color=never", "comments"]))
+        .replace(&ids[0], "<root>")
+        .replace(&ids[1], "<file>")
+        .replace(reply.as_str(), "<reply>");
+    insta::assert_snapshot!(listed, @r"
+    README.md
+      <file> octocat, 2026-11-17T10:43:00Z
+        Say more.
+
+    src/lib.rs:1, resolved
+      <root> you, 2026-11-17T10:42:00Z
+        Why i64?
+      <reply> octocat, 2026-11-17T10:44:00Z
+        It overflowed.
+        Twice.
+    ");
+}
+
+/// `--comments` picks the file before the subcommand, between it and
+/// `apply`, or after, relative to `-C`; without it, outside a repository,
+/// there's no file to use.
+#[test]
+fn comments_takes_its_file_from_the_flag_anywhere() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let d = dir.path();
+    std::fs::create_dir(d.join("pr")).expect("mkdir");
+    let ops = r#"[{"op":"add","comment":{"path":"a.txt","text":"Hi."}},{"op":"notice","notice":"stale"}]"#;
+    for (args, file) in [
+        (
+            &["-C", "pr", "--comments", "one.json", "comments", "apply"][..],
+            "pr/one.json",
+        ),
+        (&["comments", "--comments", "two.json", "apply"], "two.json"),
+        (
+            &["comments", "apply", "--comments", "three.json"],
+            "three.json",
+        ),
+    ] {
+        let out = comments_apply(d, args, ops);
+        assert!(out.status.success(), "{args:?}: {}", stderr(&out));
+        assert!(stdout(&out).ends_with(",null]}\n"), "{}", stdout(&out));
+        assert!(d.join(file).is_file(), "{args:?}");
+    }
+    let read = dffy(d, &["comments", "--comments", "pr/one.json", "--json"]);
+    assert!(read.status.success(), "{}", stderr(&read));
+    assert!(
+        stdout(&read).starts_with(r#"{"version":1,"notice":"stale","comments":["#),
+        "{}",
+        stdout(&read)
+    );
+    let listed = dffy(
+        d,
+        &["--color=never", "--comments", "pr/one.json", "comments"],
+    );
+    assert!(
+        stdout(&listed).starts_with("notice: stale\n"),
+        "{}",
+        stdout(&listed)
+    );
+
+    let none = dffy(d, &["comments", "--comments", "missing.json", "--json"]);
+    assert_eq!(stdout(&none), "{\"version\":1,\"comments\":[\n]}\n");
+    let out = dffy(d, &["comments", "--json"]);
+    assert_eq!(out.status.code(), Some(128));
+    assert!(
+        stderr(&out).contains("--comments <file>"),
         "{}",
         stderr(&out)
     );

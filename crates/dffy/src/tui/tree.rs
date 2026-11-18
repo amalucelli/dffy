@@ -20,6 +20,7 @@ use dffy_core::document::Counts;
 use dffy_core::view::Attributes;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
+use super::comments::Comments;
 use super::fuzzy;
 use super::view::Entry;
 use crate::render::{escape, stat};
@@ -232,6 +233,9 @@ pub(super) struct Tree {
     /// For each file, the matched characters of its name when the filter
     /// keeps it; `None` when it hides it. Empty without a filter.
     hits: Vec<Option<Vec<usize>>>,
+    /// The paths with comments, while the tree keeps only those, along
+    /// with what the filter keeps.
+    commented: Option<HashSet<BString>>,
 }
 
 impl Default for Tree {
@@ -258,6 +262,7 @@ impl Default for Tree {
             filter: String::new(),
             editing: false,
             hits: Vec::new(),
+            commented: None,
         }
     }
 }
@@ -354,6 +359,7 @@ impl Tree {
         *self = Self {
             collapsed: std::mem::take(&mut self.collapsed),
             filter: std::mem::take(&mut self.filter),
+            commented: self.commented.take(),
             editing: self.editing,
             scroll: self.scroll,
             height: self.height,
@@ -378,7 +384,7 @@ impl Tree {
         self.rows.clear();
         self.file_rows.clear();
         self.file_rows.resize(self.leaves.len(), None);
-        let keep = (!self.filter.is_empty()).then(|| self.matches());
+        let keep = self.filtered().then(|| self.matches());
         self.flatten(ROOT, 0, keep.as_deref());
         if let Some(node) = self.selected_node {
             self.selected = self.rows.iter().position(|r| r.node == node).unwrap_or(0);
@@ -399,7 +405,11 @@ impl Tree {
             if !matches!(self.nodes[leaf].kind, Kind::File(_)) {
                 continue;
             }
-            let path = escape(&self.file_path(leaf));
+            let raw = self.file_path(leaf);
+            if self.commented.as_ref().is_some_and(|c| !c.contains(&raw)) {
+                continue;
+            }
+            let path = escape(&raw);
             let Some((_, at)) = fuzzy::score(&self.filter, &path) else {
                 continue;
             };
@@ -436,11 +446,30 @@ impl Tree {
         &self.filter
     }
 
+    /// Whether the tree keeps only some files: by the filter, or those
+    /// with comments.
+    fn filtered(&self) -> bool {
+        !self.filter.is_empty() || self.commented.is_some()
+    }
+
+    /// Whether it keeps only the files with comments.
+    pub(super) fn commented(&self) -> bool {
+        self.commented.is_some()
+    }
+
+    /// Keeps only the files at `paths`, those with comments, as well as
+    /// the filter keeps them; every file again with `None`. Selects the
+    /// first file kept when the selection's is hidden.
+    pub(super) fn set_commented(&mut self, paths: Option<HashSet<BString>>) {
+        self.commented = paths;
+        self.set_filter(&self.filter.clone());
+    }
+
     /// Sets the filter. When it hides the selection, the first file it
     /// keeps is selected.
     pub(super) fn set_filter(&mut self, filter: &str) {
         self.filter = filter.to_lowercase();
-        if self.filter.is_empty() {
+        if !self.filtered() {
             self.hits.clear();
         }
         self.stale = true;
@@ -458,7 +487,7 @@ impl Tree {
 
     /// Whether `file` is one the filter keeps (every file without one).
     pub(super) fn in_scope(&mut self, file: usize) -> bool {
-        if self.filter.is_empty() {
+        if !self.filtered() {
             return true;
         }
         self.refresh();
@@ -700,6 +729,7 @@ impl Tree {
         (top, height, width): (usize, usize, usize),
         files: &[Entry],
         totals: &Totals,
+        comments: Option<&Comments>,
         listing: bool,
         focused: bool,
         joined: bool,
@@ -729,7 +759,15 @@ impl Tree {
         {
             let line = top + 1 + y - self.scroll;
             let selected = (y == self.selected).then_some(focused);
-            self.draw_row(grid, line, *row, selected, files, totals, width - 1, theme);
+            self.draw_row(
+                grid,
+                line,
+                *row,
+                selected,
+                (files, totals, comments),
+                width - 1,
+                theme,
+            );
         }
     }
 
@@ -768,19 +806,25 @@ impl Tree {
         }
         let end = width - 1;
         let growing = if listing { "+" } else { "" };
-        let parts = if self.filter.is_empty() {
+        let parts = if self.filtered() {
+            let kept = self.hits.iter().filter(|h| h.is_some()).count();
+            let mut parts = vec![
+                (" Files".to_owned(), Role::Plain),
+                (format!(" · {kept}/{}{growing}", totals.files), Role::Dim),
+            ];
+            if self.commented.is_some() {
+                parts.push((" · with comments".to_owned(), Role::Hint));
+            }
+            if !self.filter.is_empty() {
+                parts.push((format!(" · {}", self.filter), Role::Hint));
+            }
+            parts
+        } else {
             vec![
                 (" Files".to_owned(), Role::Plain),
                 (format!(" · {}{growing}", totals.files), Role::Dim),
                 (format!(" +{}", totals.added), Role::Added),
                 (format!(" -{}", totals.removed), Role::Removed),
-            ]
-        } else {
-            let kept = self.hits.iter().filter(|h| h.is_some()).count();
-            vec![
-                (" Files".to_owned(), Role::Plain),
-                (format!(" · {kept}/{}{growing}", totals.files), Role::Dim),
-                (format!(" · {}", self.filter), Role::Hint),
             ]
         };
         // Whole parts only, the deletions dropped first: a number cut
@@ -812,9 +856,10 @@ impl Tree {
     }
 
     /// `row` at screen line `line`, its counts in the column `totals`
-    /// sizes, ending at column `end`. A selected row (`Some`, whether the
-    /// tree has the keys) takes the theme's selection background, its name
-    /// in bold; letters and counts keep their colors.
+    /// sizes, ending at column `end`; a file with comments has their count
+    /// just left of that column. A selected row (`Some`, whether the tree
+    /// has the keys) takes the theme's selection background, its name in
+    /// bold; letters and counts keep their colors.
     #[expect(
         clippy::too_many_arguments,
         reason = "one call site, each a distinct input"
@@ -825,8 +870,7 @@ impl Tree {
         line: usize,
         row: Row,
         selected: Option<bool>,
-        files: &[Entry],
-        totals: &Totals,
+        (files, totals, comments): (&[Entry], &Totals, Option<&Comments>),
         end: usize,
         theme: &Theme,
     ) {
@@ -893,7 +937,15 @@ impl Tree {
                 let (letter, role) = stat::status_letter(entry.status());
                 let x = grid.put_str(x, line, end, letter, style(role, dim)) + 1;
                 let name = escape(&self.nodes[row.node].name);
-                let (stats_x, counts) = place_counts(entry.counts(), (x, end), totals);
+                let (mut stats_x, counts) = place_counts(entry.counts(), (x, end), totals);
+                if let Some((n, look)) = comments.and_then(|c| c.tally(&entry.change().path)) {
+                    let tag = n.to_string();
+                    let at = stats_x.saturating_sub(tag.width() + 1);
+                    if at > x {
+                        grid.put_str(at, line, stats_x, &tag, style(look.role(), false));
+                        stats_x = at;
+                    }
+                }
                 let room = stats_x.saturating_sub(x + 1);
                 let shown = fit_left(&name, room);
                 // The filter's matches, when the name shows whole.
@@ -1018,6 +1070,7 @@ mod tests {
             (0, height, 34),
             files,
             &totals,
+            None,
             false,
             true,
             false,
@@ -1154,6 +1207,7 @@ mod tests {
             (0, 10, 34),
             files,
             &totals,
+            None,
             false,
             true,
             false,
@@ -1216,6 +1270,7 @@ mod tests {
                     (0, 10, 34),
                     files,
                     &totals,
+                    None,
                     false,
                     focused,
                     false,
@@ -1279,6 +1334,7 @@ mod tests {
                     (0, 4, width),
                     files,
                     &totals,
+                    None,
                     false,
                     true,
                     false,

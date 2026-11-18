@@ -62,6 +62,9 @@ expression: text
 <dim># Show files that have a renderer (see render) rendered in the viewer, diffed block by block, instead of as lines; `r` toggles it.</>
 <hint>rendered</><dim> = </>false
 
+<dim># Experimental: the review plugin, the program dffy-review-<name> on PATH, that `dffy pr` runs to review a pull request in the viewer, and that plain `dffy` asks for the branch's pull request; empty for none. --review <name> sets it for one run. See docs/plugins.md.</>
+<hint>review</><dim> = </>
+
 <dim># Start the viewer in watch mode, refreshing as files, the index or refs change; `w` toggles it. With nothing to show, a watching viewer opens and waits for changes instead of printing that there are none.</>
 <hint>watch</><dim> = </>false
 
@@ -89,7 +92,7 @@ expression: text
 <dim># Show the one-time tip about the command panel on the first run of the viewer.</>
 <hint>tips</><dim> = </>true
 
-<dim># Take mouse input in the viewer: clicks, the wheel, and dragging over code to select and copy it. `M` turns it off for the terminal's own selection (many terminals, Ghostty included, also select natively with shift held while dragging).</>
+<dim># Take mouse input in the viewer: clicks, the wheel, and dragging over code to select and copy it. `M` in the command panel turns it off for the terminal's own selection (many terminals, Ghostty included, also select natively with shift held while dragging).</>
 <hint>mouse</><dim> = </>true
 
 <dim># Keep results that are slow to compute (renames, highlighting of large files) in $XDG_CACHE_HOME/dffy.</>
@@ -281,7 +284,6 @@ expression: text
 <hint>keybind</><dim> = </>leader:a=toggle_watch
 
 <dim># toggle_mouse: take mouse input, or leave it to the terminal's own selection (many terminals select natively with shift held while dragging)</>
-<hint>keybind</><dim> = </>M=toggle_mouse
 <hint>keybind</><dim> = </>leader:M=toggle_mouse
 
 <dim># toggle_copy_decorations: copies include line numbers and +/- signs, or only the code</>
@@ -289,6 +291,43 @@ expression: text
 
 <dim># edit: open the file in $EDITOR at the top line</>
 <hint>keybind</><dim> = </>e=edit
+
+<dim># comment: comment on the selected lines, or the line v would start on, in a text box under them; esc saves it</>
+<hint>keybind</><dim> = </>c=comment
+
+<dim># comments: list every comment thread, files not in the diff included; enter goes to one</>
+<hint>keybind</><dim> = </>i=comments
+
+<dim># next_thread: next comment thread, on into the next file with comments; it takes the focus, where r replies, e edits, x resolves, d deletes and o opens it on its host</>
+<hint>keybind</><dim> = </>m=next_thread
+
+<dim># prev_thread: previous comment thread, back into the previous file with comments</>
+<hint>keybind</><dim> = </>M=prev_thread
+
+<dim># toggle_thread: fold or unfold the focused comment thread, or the first on screen</>
+<hint>keybind</><dim> = </>z=toggle_thread
+
+<dim># toggle_threads: fold every comment thread to one row, or unfold them all</>
+<hint>keybind</><dim> = </>Z=toggle_threads
+
+<dim># comment_in_editor: write in $EDITOR: your draft in the focused thread, else a reply to it, else a comment on the line; ctrl+e does it from the text box</>
+<hint>keybind</><dim> = </>leader:E=comment_in_editor
+
+<dim># commented_files: the tree shows only the files with comments, or every file; f/F and n/N keep to them</>
+<hint>keybind</><dim> = </>tree:c=commented_files
+<hint>keybind</><dim> = </>leader:C=commented_files
+
+<dim># review_pull: on a pull request (dffy pr), fetch its new commits and threads and show them in place (experimental, see review)</>
+<hint>keybind</><dim> = </>p=review_pull
+
+<dim># review_post: on a pull request (dffy pr), open the dialog that posts your drafts, replies and resolves as a review (experimental, see review)</>
+<hint>keybind</><dim> = </>P=review_post
+
+<dim># open_pull_request: list the pull requests on this branch, yours and those waiting on your review, to open one (experimental, see review)</>
+<hint>keybind</><dim> = </>leader:P=open_pull_request
+
+<dim># since_last_review: on a pull request, show only what changed since the head of your last review posted from dffy, or the whole PR again</>
+<hint>keybind</><dim> = </>leader:R=since_last_review
 
 <dim># help: show or hide this help</>
 <hint>keybind</><dim> = </>?=help

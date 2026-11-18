@@ -73,6 +73,9 @@ pub(crate) struct Facts {
     /// The `render` setting's extensions and renderers, with where each
     /// renderer's executable is, if it's on PATH.
     pub renderers: Vec<(String, String, Option<PathBuf>)>,
+    /// The review plugin set, with where its executable is, if it's on
+    /// PATH; `None` without one.
+    pub review: Option<(String, Option<PathBuf>)>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -213,6 +216,10 @@ impl Facts {
                 })
             }),
             renderers: renderers(&ctx.config.render),
+            review: ctx.config.review.as_ref().map(|name| {
+                let found = crate::plugin::find(crate::plugin::REVIEW_PREFIX, name);
+                (name.clone(), found.map(|p| p.path))
+            }),
         }
     }
 
@@ -325,6 +332,15 @@ impl Facts {
                         })
                         .collect(),
                 ),
+            ),
+            (
+                "review",
+                self.review.as_ref().map_or(Json::Null, |(name, found)| {
+                    Json::Object(vec![
+                        ("name", Json::str(name)),
+                        ("path", found.as_ref().map_or(Json::Null, Json::path)),
+                    ])
+                }),
             ),
         ]);
         let mut out = String::new();
@@ -824,6 +840,18 @@ impl Facts {
                 .hint("install it, or see docs/plugins.md; files of this type show as lines"),
             });
         }
+        if let Some((name, found)) = &self.review {
+            let program = format!("{}{name}", crate::plugin::REVIEW_PREFIX);
+            checks.push(match found {
+                Some(path) => Check::new(
+                    Mark::Ok,
+                    "review",
+                    format!("{program}: {}", self.short(path)),
+                ),
+                None => Check::new(Mark::Warn, "review", format!("{program} isn't on PATH"))
+                    .hint("install it, or see docs/plugins.md; until then the review keys say so"),
+            });
+        }
     }
 }
 
@@ -833,7 +861,7 @@ fn renderers(render: &crate::plugin::Renderers) -> Vec<(String, String, Option<P
         .pairs()
         .iter()
         .map(|(ext, name)| {
-            let found = crate::plugin::find(name).map(|p| p.path);
+            let found = crate::plugin::find(crate::plugin::PREFIX, name).map(|p| p.path);
             (ext.clone(), name.clone(), found)
         })
         .collect()
@@ -1225,6 +1253,7 @@ mod tests {
                 ),
                 ("csv".to_owned(), "csv".to_owned(), None),
             ],
+            review: None,
         }
     }
 
@@ -1390,6 +1419,38 @@ mod tests {
             (speed.largest, speed.largest_skipped) = (None, true);
         }
         insta::assert_snapshot!(check(&text(&facts).0, "speed").join("\n"));
+    }
+
+    /// The review plugin set, found or not; nothing without one.
+    #[test]
+    fn the_review_plugin_is_listed_with_its_path() {
+        let review = |found: Option<&str>| {
+            let facts = Facts {
+                review: Some(("github".to_owned(), found.map(PathBuf::from))),
+                ..facts()
+            };
+            let json = facts.json().0;
+            let at = json.find("\"review\":").expect("the review key");
+            (
+                check(&text(&facts).0, "review").join("\n"),
+                json[at..].to_owned(),
+            )
+        };
+        let (found, found_json) = review(Some("/home/u/bin/dffy-review-github"));
+        let (missing, missing_json) = review(None);
+        insta::assert_snapshot!(
+            [found, found_json, missing, missing_json].join("\n"),
+            @r#"
+        <ok>✓</> review      dffy-review-github: ~/bin/dffy-review-github
+        "review":{"name":"github","path":"/home/u/bin/dffy-review-github"}}
+
+        <warn>!</> review      dffy-review-github isn't on PATH
+          <hint>hint:</> install it, or see docs/plugins.md; until then the review keys say so
+        "review":{"name":"github","path":null}}
+        "#
+        );
+        assert_eq!(check(&text(&facts()).0, "review"), Vec::<&str>::new());
+        assert!(facts().json().0.contains("\"review\":null"));
     }
 
     /// The JSON's keys, with every value as text shows it; a path with a

@@ -10,7 +10,7 @@ expression: text
 │ b page_up         page up                     ┃│
 │ ctrl+d            half page down              ┃│
 │ ctrl+u            half page up                ┃│
-│ g home            top of file                 ┃│
+│ g home            top of file                 ││
 │ G end             bottom of file              ││
 │ n }               next change                 ││
 │ N {               prev change                 ││

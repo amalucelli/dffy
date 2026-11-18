@@ -4,7 +4,6 @@ expression: "shown(&mut help, &keys, 100, 20)"
 ---
 
 
-
        ┌─ keybinds ──────────────────────────────────────────────────────────── esc close ─┐
        │  Move  Files  View  Copy  Other                                                   │
        │                                                                                   │
@@ -15,6 +14,7 @@ expression: "shown(&mut help, &keys, 100, 20)"
        │ o                 find file               v                 mark viewed           │
        │ /                 search diff             +                 widen tree            │
        │ u                 parent folder           -                 narrow tree           │
+       │                                           c                 files with comments   │
        │                                                                                   │
        │ more settings: space · all keys: docs/keys.md                                     │
        │ tab section · / search · esc close                                                │

@@ -1,0 +1,31 @@
+---
+source: crates/dffy/src/tui/view/tests.rs
+expression: "all_rows(narrow).join(\"\\n\")"
+---
+@@ -1,5 +1,6 @@
+     │  ┌ ▾ you · 1m ago · dra… ┐
+     │  ┆ On the whole file     ┆
+     │  └┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┘
+1 1  │ fn main() {
+2  ○-│     let total = count + 1;
+     │  ╶ ▸ ana · 3h ago · res… ╴
+  2◆+│     let total = items.len(…
+     │  ┌ ▾ octocat · 2h ago ·… ┐
+     │  ┆ Why len() here and    ┆
+     │  ┆ not a running count,  ┆
+     │  ┆ kept as the items     ┆
+     │  ┆ arrive?               ┆
+     │  ┆ suggested change:     ┆
+     │  ┆ -     let total = it… ┆
+     │  ┆ +     let total = it… ┆
+     │  ┆                       ┆
+     │  ┆ you · 30m ago · draft ┆
+     │  ┆ Simpler.              ┆
+     │  └┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┘
+3 3  │     println!("{total}");
+  4 +│     eprintln!("done");
+4 5  │ }
+5   -│ // a comment long enough t…
+  6 +│ // a comment long enough t…
+     │\ No newline at end of file
+     │  ╶ ▸ ana · 4h …  1 reply ╴

@@ -17,7 +17,7 @@ use crate::term::{Grid, Key, Mods};
 use crate::theme::{Role, Style, Theme};
 
 /// Narrower screens get the whole screen.
-const FULL_SCREEN_BELOW: usize = 70;
+pub(super) const FULL_SCREEN_BELOW: usize = 70;
 const TITLE: &str = " keybinds ";
 const CLOSE: &str = " esc close ";
 const HINTS: &str = "tab section · / search · esc close";

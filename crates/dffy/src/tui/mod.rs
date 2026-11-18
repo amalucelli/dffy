@@ -10,17 +10,20 @@
 mod app;
 mod chrome;
 mod commands;
+mod comments;
 mod editor;
 mod fuzzy;
 mod help;
 mod picker;
 pub(crate) mod piped;
+mod textbox;
 mod tree;
 pub(crate) mod view;
 pub(crate) mod worker;
 
 use std::io::{self, Write};
-use std::process::ExitCode;
+use std::path::{Path, PathBuf};
+use std::process::{Command, ExitCode, ExitStatus};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant};
@@ -35,6 +38,7 @@ pub(crate) use worker::Done;
 
 use crate::daemon::client::{self, Subscription};
 use crate::pager::stdin::Stdin;
+use crate::plugin::review::{self, Pr, Said};
 use crate::print::{self, Plan};
 use crate::render::Canvas;
 use crate::state;
@@ -63,6 +67,13 @@ pub(crate) enum Event {
     /// The list is empty, and this is what the view leaves out of the
     /// uncommitted changes, if it shows only part of them.
     Others(Option<print::Others>),
+    /// The comments file changed on disk.
+    Comments,
+    /// A review plugin's run `id` said this.
+    Review {
+        id: u64,
+        said: Said,
+    },
     /// Nothing happened before the app's deadline.
     Tick,
 }
@@ -94,9 +105,27 @@ fn prepare(app: &mut App, ctx: &Ctx) {
     }
 }
 
+/// How `dffy pr` starts the viewer.
+pub(crate) enum PrStart {
+    /// On the PR whose `prepare` printed `session` and goes on as `run`,
+    /// saying the rest on `rest`.
+    Open {
+        plugin: String,
+        session: review::Session,
+        run: review::Run,
+        rest: mpsc::Receiver<Said>,
+    },
+    /// With the picker of `prs` open, for a branch without a PR.
+    Pick { plugin: String, prs: Vec<Pr> },
+    /// Plain `dffy` on a branch: `plugin` looks for its PR, and the viewer
+    /// switches to it, against the working tree, if there's one.
+    Detect { plugin: String },
+}
+
 /// Runs the viewer on `tty` for `plan` until the user quits. An empty diff
 /// prints [`print::empty_message`] instead, without taking over the screen,
-/// unless watching: then the viewer waits for changes.
+/// unless watching or opening a PR: then the viewer waits for changes.
+/// Looking for the branch's PR doesn't hold an empty diff open.
 #[expect(
     clippy::too_many_lines,
     reason = "the viewer's startup in order: workers, change set, first file, session"
@@ -107,6 +136,7 @@ pub(crate) fn run(
     revisions: Revisions,
     focus: Option<BString>,
     description: String,
+    pr: Option<PrStart>,
     ctx: &Ctx,
 ) -> Result<ExitCode, Error> {
     let (tx, rx) = mpsc::channel();
@@ -149,7 +179,10 @@ pub(crate) fn run(
             Ok(Event::EnumerationDone(Some(error))) => return Err(Error::fatal(error)),
             Ok(Event::EnumerationDone(None)) | Err(_) => {
                 // A commit without changes still has its header to show.
-                if watch || commit.is_some() {
+                let opened = pr
+                    .as_ref()
+                    .is_some_and(|p| !matches!(p, PrStart::Detect { .. }));
+                if watch || commit.is_some() || opened {
                     break None;
                 }
                 let mut c = Canvas::default();
@@ -187,11 +220,51 @@ pub(crate) fn run(
     if let Some(focus) = focus {
         app.focus(focus);
     }
+    // Watched from before the first read, so no change falls between.
+    // Absolute: review plugins get it, and run from the working tree's root.
+    let comments = ctx
+        .comments
+        .clone()
+        .or_else(|| repo.git_dir().map(crate::review::default_path))
+        .map(|path| std::path::absolute(&path).unwrap_or(path));
+    let watching = comments.and_then(|path| {
+        let stop = watch_comments(path.clone(), tx.clone());
+        app.set_comments(path);
+        stop
+    });
+    let mut review_run = None;
+    let mut detect = None;
+    match pr {
+        Some(PrStart::Detect { plugin }) => detect = Some(app.detect_pr(plugin)),
+        Some(PrStart::Open {
+            plugin,
+            session,
+            run,
+            rest,
+        }) => {
+            let id = app.start_pr(plugin, session);
+            let events = tx.clone();
+            std::thread::Builder::new()
+                .name("dffy-review-rest".into())
+                .spawn(move || {
+                    for said in rest {
+                        if events.send(Event::Review { id, said }).is_err() {
+                            return;
+                        }
+                    }
+                })?;
+            review_run = Some(run);
+        }
+        Some(PrStart::Pick { plugin, prs }) => app.pick_pr(plugin, prs),
+        None => {}
+    }
 
     state::flush_on_panic();
     crate::plugin::stop_on_panic();
     term::install_panic_hook();
     let mut session = Session {
+        watching,
+        review_run,
         tty,
         reader: None,
         pool: &pool,
@@ -209,6 +282,16 @@ pub(crate) fn run(
     if watch {
         app.set_watching(true);
         session.set_watch(&mut app, true);
+    }
+    if let Some(Action::Plugin {
+        id,
+        plugin,
+        args,
+        comments,
+        summary,
+    }) = detect
+    {
+        session.plugin(id, &plugin, args, comments.as_deref(), summary);
     }
     let result = session.interact(&mut app, tx, &rx);
     term::restore();
@@ -252,6 +335,8 @@ pub(crate) fn run_piped(tty: &Tty, stdin: Stdin, ctx: &Ctx) -> Result<ExitCode, 
     state::flush_on_panic();
     term::install_panic_hook();
     let mut session = Session {
+        watching: None,
+        review_run: None,
         tty,
         reader: None,
         pool: &pool,
@@ -270,6 +355,80 @@ pub(crate) fn run_piped(tty: &Tty, stdin: Stdin, ctx: &Ctx) -> Result<ExitCode, 
     term::restore();
     result?;
     Ok(ExitCode::SUCCESS)
+}
+
+/// How often the comments file is looked at. The loop has no tick of its
+/// own, and watch mode covers only the repository, not a file elsewhere;
+/// a watcher on this one file is the upgrade if idle wakeups ever matter.
+const COMMENTS_POLL: Duration = Duration::from_millis(250);
+
+/// Sends [`Event::Comments`] whenever `path`'s modification time or size
+/// changes, looking every [`COMMENTS_POLL`], until the returned sender is
+/// dropped or the loop is gone. The first look happens before this
+/// returns. `None` when the thread couldn't start.
+fn watch_comments(path: PathBuf, events: mpsc::Sender<Event>) -> Option<mpsc::Sender<()>> {
+    let stamp = |path: &Path| {
+        std::fs::metadata(path)
+            .ok()
+            .map(|m| (m.modified().ok(), m.len()))
+    };
+    let mut last = stamp(&path);
+    let (stop, stopped) = mpsc::channel::<()>();
+    std::thread::Builder::new()
+        .name("dffy-comments".to_owned())
+        .spawn(move || {
+            while let Err(mpsc::RecvTimeoutError::Timeout) = stopped.recv_timeout(COMMENTS_POLL) {
+                let now = stamp(&path);
+                if now != last {
+                    last = now;
+                    if events.send(Event::Comments).is_err() {
+                        return;
+                    }
+                }
+            }
+        })
+        .ok()?;
+    Some(stop)
+}
+
+/// Opens `url` with the platform's opener, detached from the terminal;
+/// says so when it can't start.
+fn browse(app: &mut App, url: &str) {
+    let opener = if cfg!(target_os = "macos") {
+        "open"
+    } else {
+        "xdg-open"
+    };
+    let started = Command::new(opener)
+        .arg(url)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn();
+    match started {
+        // Reaped off the loop: openers return at once, but a slow one
+        // shouldn't hold a frame.
+        Ok(mut child) => {
+            std::thread::spawn(move || child.wait());
+            app.message("opened in the browser");
+        }
+        Err(e) => app.message(format!("couldn't run {opener}: {e}")),
+    }
+}
+
+/// Writes a review's summary to a new file of its own, for a plugin's
+/// `--summary-file`.
+fn write_summary(text: &str) -> io::Result<PathBuf> {
+    let path = std::env::temp_dir().join(format!("dffy-summary-{}.md", std::process::id()));
+    // Left over from a run that crashed; `create_new` then refuses to
+    // follow a link put in its place.
+    std::fs::remove_file(&path).ok();
+    std::fs::File::options()
+        .write(true)
+        .create_new(true)
+        .open(&path)
+        .and_then(|mut file| file.write_all(text.as_bytes()))?;
+    Ok(path)
 }
 
 /// The watch's sink: changes go to the change-set thread, the watch's
@@ -346,6 +505,10 @@ fn route_compared(
 }
 
 struct Session<'a> {
+    /// Stops the comments file's watch once dropped.
+    watching: Option<mpsc::Sender<()>>,
+    /// The review plugin's run other than a check, the last one started.
+    review_run: Option<review::Run>,
     tty: &'a Tty,
     reader: Option<Reader>,
     pool: &'a worker::Pool,
@@ -518,6 +681,20 @@ impl Session<'_> {
                     event => match app.event(event) {
                         Some(Action::Quit) => return Ok(()),
                         Some(Action::Edit { path, line }) => self.edit(app, &path, line)?,
+                        Some(Action::Compose(text)) => self.compose(app, &text)?,
+                        Some(Action::Browse(url)) => browse(app, &url),
+                        Some(Action::Plugin {
+                            id,
+                            plugin,
+                            args,
+                            comments,
+                            summary,
+                        }) => self.plugin(id, &plugin, args, comments.as_deref(), summary),
+                        Some(Action::Retarget {
+                            revisions,
+                            comments,
+                            moved,
+                        }) => self.retarget(app, revisions, comments, moved),
                         Some(Action::Watch(on)) => self.set_watch(app, on),
                         Some(Action::Mouse(on)) => {
                             self.tty
@@ -562,13 +739,23 @@ impl Session<'_> {
             });
             return Ok(());
         };
+        self.in_editor(app, reader, &full, line)?;
+        Ok(())
+    }
+
+    /// Hands the terminal to the program `run` starts, given the terminal
+    /// for its input, and takes it back once `run` returns. The outer
+    /// error is the terminal's, the inner one `run`'s.
+    fn hand_over(
+        &self,
+        app: &mut App,
+        reader: &Reader,
+        run: impl FnOnce(std::fs::File) -> io::Result<ExitStatus>,
+    ) -> io::Result<io::Result<ExitStatus>> {
         reader.pause();
         self.suspended.store(true, Ordering::Relaxed);
         term::restore();
-        let status = self
-            .tty
-            .try_clone()
-            .and_then(|tty| editor::open(&full, line, tty));
+        let status = self.tty.try_clone().and_then(run);
         self.tty.enter()?;
         if !app.mouse() {
             self.tty.write(term::MOUSE_OFF)?;
@@ -578,11 +765,187 @@ impl Session<'_> {
         let (width, height) = self.tty.size();
         app.resize(width, height);
         app.invalidate();
-        match status {
-            Ok(status) if status.success() => {}
-            Ok(status) => app.message(format!("the editor exited with {status}")),
-            Err(e) => app.message(format!("couldn't start the editor: {e}")),
+        Ok(status)
+    }
+
+    /// Hands the terminal to the editor on `path` at `line` and takes it
+    /// back. Returns whether the editor exited cleanly; why not goes in
+    /// the status bar.
+    fn in_editor(
+        &self,
+        app: &mut App,
+        reader: &Reader,
+        path: &Path,
+        line: usize,
+    ) -> io::Result<bool> {
+        let status = self.hand_over(app, reader, |tty| editor::open(path, line, tty))?;
+        Ok(match status {
+            Ok(status) if status.success() => true,
+            Ok(status) => {
+                app.message(format!("the editor exited with {status}"));
+                false
+            }
+            Err(e) => {
+                app.message(format!("couldn't start the editor: {e}"));
+                false
+            }
+        })
+    }
+
+    /// Starts `dffy-review-<plugin> <args>` in the background, in the
+    /// working tree's root, as run `id`; a summary goes in a file of its
+    /// own, removed once the run is over. A `prepare`, `pull` or `post`
+    /// kills the one before it. A run that can't start says why as its end.
+    fn plugin(
+        &mut self,
+        id: u64,
+        plugin: &str,
+        mut args: Vec<String>,
+        comments: Option<&Path>,
+        summary: Option<String>,
+    ) {
+        let name = format!("{}{plugin}", crate::plugin::REVIEW_PREFIX);
+        let events = self.events.clone();
+        let fail = |why: String| {
+            events
+                .send(Event::Review {
+                    id,
+                    said: Said::Done(Err(why)),
+                })
+                .ok();
+        };
+        let Some(root) = self.files.as_ref().and_then(Repo::workdir) else {
+            return fail("there's no working tree to run the review plugin in".to_owned());
+        };
+        let Some(program) = crate::plugin::find(crate::plugin::REVIEW_PREFIX, plugin) else {
+            return fail(format!("{name} isn't on PATH (see docs/plugins.md)"));
+        };
+        let summary = match summary.map(|text| write_summary(&text)).transpose() {
+            Ok(file) => file,
+            Err(e) => return fail(format!("couldn't write the summary: {e}")),
+        };
+        if let Some(file) = &summary {
+            args.extend(["--summary-file".to_owned(), file.display().to_string()]);
         }
+        let verb = args.first().cloned().unwrap_or_default();
+        // `check`, `list`, `detect` and `post --dry-run` run beside these.
+        let one_at_a_time = matches!(verb.as_str(), "prepare" | "pull" | "post")
+            && !args.iter().any(|a| a == "--dry-run");
+        if one_at_a_time && let Some(old) = self.review_run.take() {
+            old.kill();
+        }
+        let sink = self.events.clone();
+        let started = review::command(&program.path, &args, root, comments).and_then(|command| {
+            review::start(command, &name, &verb, move |said| {
+                if let (Said::Done(_), Some(file)) = (&said, &summary) {
+                    std::fs::remove_file(file).ok();
+                }
+                sink.send(Event::Review { id, said }).is_ok()
+            })
+        });
+        match started {
+            Ok(run) if one_at_a_time => self.review_run = Some(run),
+            Ok(_) => {}
+            Err(e) => fail(format!("couldn't start {name}: {e}")),
+        }
+    }
+
+    /// Lists `revisions` from now on, with the comments in `comments` when
+    /// that's another file. `moved` is a PR's head before and after an
+    /// update, whose commits are counted for the note.
+    fn retarget(
+        &mut self,
+        app: &mut App,
+        mut revisions: Revisions,
+        comments: Option<PathBuf>,
+        moved: Option<(String, String)>,
+    ) {
+        // Checked first: once the list has a range that doesn't resolve,
+        // every refresh after fails too.
+        if let (Some(last), Some(repo)) = (app.reviewed_from(), &self.files)
+            && !repo.is_revision(last)
+            && let Some(whole) = app.reviewed_head_missing()
+        {
+            revisions = whole;
+        }
+        self.requests.send(Request::Retarget(revisions)).ok();
+        if let Some(path) = comments {
+            self.watching = watch_comments(path.clone(), self.events.clone());
+            app.set_comments(path);
+        }
+        if let (Some((old, new)), Some(root)) = (moved, self.files.as_ref().and_then(Repo::workdir))
+        {
+            let count = Command::new("git")
+                .args(["rev-list", "--count", &format!("{old}..{new}")])
+                .current_dir(root)
+                .stdin(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .output()
+                .ok()
+                .filter(|out| out.status.success())
+                .and_then(|out| String::from_utf8(out.stdout).ok()?.trim().parse().ok());
+            app.pr_updated(count);
+        }
+    }
+
+    /// Writes a comment in the editor, from `text`, on a temporary file
+    /// removed after; what's written goes to [`App::composed`].
+    fn compose(&self, app: &mut App, text: &str) -> io::Result<()> {
+        let Some(reader) = &self.reader else {
+            app.composed(None);
+            return Ok(());
+        };
+        let path = std::env::temp_dir().join(format!("dffy-comment-{}.md", std::process::id()));
+        // Left over from a run that crashed; `create_new` then refuses to
+        // follow a link put in its place.
+        std::fs::remove_file(&path).ok();
+        let created = std::fs::File::options()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .and_then(|mut file| file.write_all(text.as_bytes()));
+        if let Err(e) = created {
+            app.message(format!("couldn't write {}: {e}", path.display()));
+            app.composed(None);
+            return Ok(());
+        }
+        let written = if self.in_editor(app, reader, &path, 1)? {
+            std::fs::read_to_string(&path).ok()
+        } else {
+            None
+        };
+        std::fs::remove_file(&path).ok();
+        app.composed(written);
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The comments file is looked at from the start: writing it, even
+    /// creating it, sends one event, and stopping the watch ends the thread.
+    #[test]
+    fn a_change_to_the_comments_file_sends_an_event() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("comments.json");
+        let (tx, rx) = mpsc::channel();
+        let stop = watch_comments(path.clone(), tx).expect("starts");
+        let wait = Duration::from_secs(2);
+        assert!(rx.recv_timeout(COMMENTS_POLL * 2).is_err(), "nothing yet");
+        std::fs::write(&path, "{\"version\":1,\"comments\":[]}").expect("write");
+        assert!(matches!(rx.recv_timeout(wait), Ok(Event::Comments)));
+        assert!(
+            rx.recv_timeout(COMMENTS_POLL * 2).is_err(),
+            "once per change"
+        );
+        std::fs::write(&path, "{\"version\":1,\"notice\":\"x\",\"comments\":[]}").expect("write");
+        assert!(matches!(rx.recv_timeout(wait), Ok(Event::Comments)));
+        drop(stop);
+        assert!(matches!(
+            rx.recv_timeout(wait),
+            Err(mpsc::RecvTimeoutError::Disconnected)
+        ));
     }
 }

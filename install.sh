@@ -1,12 +1,12 @@
 #!/bin/sh
-# Installs the dffy binary, and optionally renderer plugins, from a GitHub release.
+# Installs the dffy binary, and optionally plugins, from a GitHub release.
 #
 #   curl -fsSL https://raw.githubusercontent.com/amalucelli/dffy/main/install.sh | sh
 #   curl -fsSL https://raw.githubusercontent.com/amalucelli/dffy/main/install.sh | sh -s -- --plugin markdown
 #
 # Options:
-#   --plugin NAME     also install the renderer plugin dffy-render-NAME next to dffy;
-#                     repeatable. Plugins: markdown, mermaid
+#   --plugin NAME     also install a plugin next to dffy; repeatable. Plugins: markdown
+#                     and mermaid (dffy-render-NAME), review-github (dffy-review-github)
 #
 # Environment:
 #   DFFY_PLUGINS      plugins to install, separated by spaces or commas; adds to --plugin
@@ -87,8 +87,8 @@ sha256() {
 # add_plugin NAME
 add_plugin() {
 	case "$1" in
-	markdown | mermaid) ;;
-	*) die "unknown plugin '$1'; available: markdown, mermaid" ;;
+	markdown | mermaid | review-github) ;;
+	*) die "unknown plugin '$1'; available: markdown, mermaid, review-github" ;;
 	esac
 	case " $plugins " in
 	*" $1 "*) ;;
@@ -179,7 +179,10 @@ main() {
 
 	binaries=dffy
 	for name in $plugins; do
-		binaries="$binaries dffy-render-$name"
+		case "$name" in
+		review-*) binaries="$binaries dffy-$name" ;;
+		*) binaries="$binaries dffy-render-$name" ;;
+		esac
 	done
 
 	say "downloading $binaries${version:+ ($version)}"

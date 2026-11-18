@@ -1,45 +1,44 @@
 ---
 source: crates/dffy/src/tui/app.rs
-assertion_line: 3574
 expression: panel_markup(&mut app)
 ---
 <dim>┌</> Files <dim>·</> <dim>2</> +2 -2 <dim>────────────────────┬─</> modified <dim>·</> <dim>src/some/deeply/nested/module/</>file.rs <dim>·</> +2 -2 <dim>───────────────────────</> @@ -1,7 +1,7 @@ <dim>─┐</>
 <dim>│</> <dim>▼</> src/                              <dim>│</> @<dim>┌─</> commands <dim>────────────────────────────────</> <dim>esc</> <dim>close</> <dim>─┐</>                                         <dim>┃</>
-<dim>│</>   <dim>▼</> some/deeply/nested/module/      <dim>│</>  <dim>│</> Files                                                 <dim>│</>ne 1                                     <dim>┃</>
-<dim>│</>     M file.rs               +2   -2 <dim>│</>  <dim>│</>     Find file…                                   o    <dim>│</>ne 2                                     █
-<dim>│</>   M zz.rs                           <dim>│</>  <dim>│</>     Filter tree…                                 f <dim>/</>  <dim>│</>ne 3                                     <dim>┃</>
-<dim>│</>                                     <dim>│</>  <dim>│</>     Search in diff…                              S <dim>/</>  <dim>│</>ne four                                  <dim>┃</>
-<dim>│</>                                     <dim>│</>  <dim>│</> [x] File tree                                    t <dim>T</>  <dim>│</>ne 5                                     <dim>┃</>
-<dim>│</>                                     <dim>│</>  <dim>│</>     Next file                                    n <dim>f</>  <dim>│</>ne 6                                     <dim>┃</>
-<dim>│</>                                     <dim>│</>  <dim>│</>     Previous file                                p <dim>F</>  <dim>│</>ne 7                                     <dim>┃</>
-<dim>│</>                                     <dim>│</> ⋯<dim>│</>                                                       <dim>│</>                                         <dim>┃</>
-<dim>│</>                                     <dim>│</> <dim>4│</> View                                                  <dim>│</>ne 47                                    <dim>┃</>
-<dim>│</>                                     <dim>│</> <dim>4│</>     Layout <dim>‹</> auto (split here) <dim>›</>                 s    <dim>│</>ne 48                                    <dim>┃</>
-<dim>│</>                                     <dim>│</> <dim>4│</> [ ] Wrap long lines                              w <dim>W</>  <dim>│</>ne 49                                    <dim>┃</>
-<dim>│</>                                     <dim>│</> 5<dim>│</> [ ] Syntax diff                                  d    <dim>│</>ne fifty                                 <dim>┃</>
-<dim>│</>                                     <dim>│</> <dim>5│</> [ ] Rendered view                                r    <dim>│</>ne 51                                    <dim>┃</>
-<dim>│</>                                     <dim>│</> <dim>5│</>     More context                                 x    <dim>│</>ne 52                                    <dim>┃</>
-<dim>│</>                                     <dim>│</> <dim>5│</> [ ] Whole file                                   X    <dim>│</>ne 53                                    <dim>┃</>
-<dim>│</>                                     <dim>│</> <dim>⋯│</>     Indicators <dim>‹</> classic <dim>›</>                       i    <dim>│</>                                         <dim>┃</>
-<dim>│</>                                     <dim>│</>  <dim>│</>     Modified lines <dim>‹</> changed <dim>›</>                   e    <dim>│</>                                         <dim>┃</>
-<dim>│</>                                     <dim>│</>  <dim>│</> [x] Syntax highlighting                          H    <dim>│</>                                         <dim>┃</>
-<dim>│</>                                     <dim>│</>  <dim>│</> [ ] Ignore whitespace                            W    <dim>│</>                                         <dim>┃</>
-<dim>│</>                                     <dim>│</>  <dim>│</> [x] Line numbers                                 L    <dim>│</>                                         <dim>┃</>
-<dim>│</>                                     <dim>│</>  <dim>│</> [x] Hunk headers                                 m    <dim>│</>                                         <dim>┃</>
-<dim>│</>                                     <dim>│</>  <dim>│</>     Status bar <dim>‹</> bottom <dim>›</>                        b    <dim>│</>                                         <dim>┃</>
-<dim>│</>                                     <dim>│</>  <dim>│</>     Theme <dim>‹</> default <dim>›</>                            c    <dim>│</>                                         <dim>┃</>
-<dim>│</>                                     <dim>│</>  <dim>│</>                                                       <dim>│</>                                         <dim>┃</>
-<dim>│</>                                     <dim>│</>  <dim>│</> Copy                                                  <dim>│</>                                         <dim>┃</>
-<dim>│</>                                     <dim>│</>  <dim>│</>     Copy selection                               y    <dim>│</>                                         <dim>┃</>
-<dim>│</>                                     <dim>│</>  <dim>│</>     Copy file path                               Y    <dim>│</>                                         <dim>┃</>
-<dim>│</>                                     <dim>│</>  <dim>│</> [ ] Copy with line numbers and signs             D    <dim>│</>                                         <dim>┃</>
-<dim>│</>                                     <dim>│</>  <dim>│</>                                                       <dim>│</>                                         <dim>┃</>
-<dim>│</>                                     <dim>│</>  <dim>│</> Modes                                                 <dim>│</>                                         <dim>┃</>
-<dim>│</>                                     <dim>│</>  <dim>│</> [x] Mouse selection                              M    <dim>│</>                                         █
-<dim>│</>                                     <dim>│</>  <dim>│</> [ ] Watch for changes                            a <dim>w</>  <dim>│</>                                         <dim>┃</>
-<dim>│</>                                     <dim>│</>  <dim>│</>                                                       <dim>│</>                                         <dim>┃</>
-<dim>│</>                                     <dim>│</>  <dim>│</> Help                                                  <dim>│</>                                         <dim>┃</>
-<dim>│</>                                     <dim>│</>  <dim>│</>     All keys                                     ?    <dim>│</>                                         <dim>│</>
+<dim>│</>   <dim>▼</> some/deeply/nested/module/      <dim>│</>  <dim>│</> Files                                                <dim>┃│</>ne 1                                     <dim>┃</>
+<dim>│</>     M file.rs               +2   -2 <dim>│</>  <dim>│</>     Find file…                                   o   <dim>┃│</>ne 2                                     █
+<dim>│</>   M zz.rs                           <dim>│</>  <dim>│</>     Filter tree…                                 f <dim>/</> <dim>┃│</>ne 3                                     <dim>┃</>
+<dim>│</>                                     <dim>│</>  <dim>│</> [ ] Files with comments                          C <dim>c</> <dim>┃│</>ne four                                  <dim>┃</>
+<dim>│</>                                     <dim>│</>  <dim>│</>     Search in diff…                              S <dim>/</> <dim>┃│</>ne 5                                     <dim>┃</>
+<dim>│</>                                     <dim>│</>  <dim>│</> [x] File tree                                    t <dim>T</> <dim>┃│</>ne 6                                     <dim>┃</>
+<dim>│</>                                     <dim>│</>  <dim>│</>     Next file                                    n <dim>f</> <dim>┃│</>ne 7                                     <dim>┃</>
+<dim>│</>                                     <dim>│</> ⋯<dim>│</>     Previous file                                p <dim>F</> <dim>┃│</>                                         <dim>┃</>
+<dim>│</>                                     <dim>│</> <dim>4│</>                                                      <dim>┃│</>ne 47                                    <dim>┃</>
+<dim>│</>                                     <dim>│</> <dim>4│</> View                                                 <dim>┃│</>ne 48                                    <dim>┃</>
+<dim>│</>                                     <dim>│</> <dim>4│</>     Layout <dim>‹</> auto (split here) <dim>›</>                 s   <dim>┃│</>ne 49                                    <dim>┃</>
+<dim>│</>                                     <dim>│</> 5<dim>│</> [ ] Wrap long lines                              w <dim>W</> <dim>┃│</>ne fifty                                 <dim>┃</>
+<dim>│</>                                     <dim>│</> <dim>5│</> [ ] Syntax diff                                  d   <dim>┃│</>ne 51                                    <dim>┃</>
+<dim>│</>                                     <dim>│</> <dim>5│</> [ ] Rendered view                                r   <dim>┃│</>ne 52                                    <dim>┃</>
+<dim>│</>                                     <dim>│</> <dim>5│</>     More context                                 x   <dim>┃│</>ne 53                                    <dim>┃</>
+<dim>│</>                                     <dim>│</> <dim>⋯│</> [ ] Whole file                                   X   <dim>┃│</>                                         <dim>┃</>
+<dim>│</>                                     <dim>│</>  <dim>│</>     Indicators <dim>‹</> classic <dim>›</>                       i   <dim>┃│</>                                         <dim>┃</>
+<dim>│</>                                     <dim>│</>  <dim>│</>     Modified lines <dim>‹</> changed <dim>›</>                   e   <dim>┃│</>                                         <dim>┃</>
+<dim>│</>                                     <dim>│</>  <dim>│</> [x] Syntax highlighting                          H   <dim>┃│</>                                         <dim>┃</>
+<dim>│</>                                     <dim>│</>  <dim>│</> [ ] Ignore whitespace                            W   <dim>┃│</>                                         <dim>┃</>
+<dim>│</>                                     <dim>│</>  <dim>│</> [x] Line numbers                                 L   <dim>┃│</>                                         <dim>┃</>
+<dim>│</>                                     <dim>│</>  <dim>│</> [x] Hunk headers                                 m   <dim>┃│</>                                         <dim>┃</>
+<dim>│</>                                     <dim>│</>  <dim>│</>     Status bar <dim>‹</> bottom <dim>›</>                        b   <dim>┃│</>                                         <dim>┃</>
+<dim>│</>                                     <dim>│</>  <dim>│</>     Theme <dim>‹</> default <dim>›</>                            c   <dim>┃│</>                                         <dim>┃</>
+<dim>│</>                                     <dim>│</>  <dim>│</>                                                      <dim>┃│</>                                         <dim>┃</>
+<dim>│</>                                     <dim>│</>  <dim>│</> Copy                                                 <dim>┃│</>                                         <dim>┃</>
+<dim>│</>                                     <dim>│</>  <dim>│</>     Copy selection                               y   <dim>┃│</>                                         <dim>┃</>
+<dim>│</>                                     <dim>│</>  <dim>│</>     Copy file path                               Y   <dim>┃│</>                                         <dim>┃</>
+<dim>│</>                                     <dim>│</>  <dim>│</> [ ] Copy with line numbers and signs             D   <dim>┃│</>                                         <dim>┃</>
+<dim>│</>                                     <dim>│</>  <dim>│</>                                                      <dim>┃│</>                                         <dim>┃</>
+<dim>│</>                                     <dim>│</>  <dim>│</> Modes                                                <dim>┃│</>                                         █
+<dim>│</>                                     <dim>│</>  <dim>│</> [x] Mouse selection                              M   <dim>││</>                                         <dim>┃</>
+<dim>│</>                                     <dim>│</>  <dim>│</> [ ] Watch for changes                            a <dim>w</> <dim>││</>                                         <dim>┃</>
+<dim>│</>                                     <dim>│</>  <dim>│</>                                                      <dim>││</>                                         <dim>┃</>
+<dim>│</>                                     <dim>│</>  <dim>│</> Help                                                 <dim>││</>                                         <dim>│</>
 <dim>│</>                                     <dim>│</>  <dim>│</> <dim>key</> <dim>or</> <dim>enter</> <dim>runs</> <dim>·</> <dim>j/k</> <dim>move</> <dim>·</> <dim>/</> <dim>search</> <dim>·</> <dim>esc</> <dim>close</>   <dim>│</>                                         <dim>│</>
 <dim>│</>                                     <dim>│</>  <dim>└───────────────────────────────────────────────────────┘</>                                         <dim>│</>
 <dim>└──</>  working tree  1/2 <dim>·</> 1/2 hunk <dim>────┴─</> <dim>split</> <dim>─────────────────────────────────────────────────────</> <dim>/</> <dim>search</> <dim>·</> <dim>tab</> <dim>tree</> <dim>·</> <dim>space</> <dim>commands</> <dim>─┘</>

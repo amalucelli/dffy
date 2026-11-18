@@ -1,12 +1,12 @@
 ---
 source: crates/dffy/src/tui/app.rs
-assertion_line: 3576
 expression: screen(&mut phone)
 ---
 ┌─ commands ───────────────────────── esc close ─┐
 │ Files                                         ┃│
 │     Find file…                            o   ┃│
 │     Filter tree…                          f / ┃│
+│ [ ] Files with comments                   C c ┃│
 │     Search in diff…                       S / ┃│
 │ [ ] File tree                             t T ┃│
 │     Next file                             n f ┃│
@@ -21,15 +21,14 @@ expression: screen(&mut phone)
 │ [ ] Whole file                            X   ┃│
 │     Indicators ‹ classic ›                i   ┃│
 │     Modified lines ‹ changed ›            e   ┃│
-│ [x] Syntax highlighting                   H   ┃│
-│ [ ] Ignore whitespace                     W   ┃│
-│ [x] Line numbers                          L   ┃│
+│ [x] Syntax highlighting                   H   ││
+│ [ ] Ignore whitespace                     W   ││
+│ [x] Line numbers                          L   ││
 │ [x] Hunk headers                          m   ││
 │     Status bar ‹ bottom ›                 b   ││
 │     Theme ‹ default ›                     c   ││
 │                                               ││
 │ Copy                                          ││
 │     Copy selection                        y   ││
-│     Copy file path                        Y   ││
 │ key or enter runs · j/k move · / search · esc  │
 └────────────────────────────────────────────────┘

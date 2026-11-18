@@ -37,6 +37,8 @@ pub(crate) enum Request {
     Refresh(Vec<BString>),
     /// Anything may have changed, git state included.
     Rescan,
+    /// List these revisions instead, from now on.
+    Retarget(Revisions),
 }
 
 /// What the change set lists, to count what it leaves out when it lists
@@ -57,14 +59,14 @@ pub(crate) struct Selected {
 /// asks.
 pub(crate) fn changes(
     mut set: ChangeSet,
-    selected: Selected,
+    mut selected: Selected,
     tx: Sender<Event>,
 ) -> io::Result<Sender<Request>> {
     let (requests, rx) = mpsc::channel();
     thread::Builder::new()
         .name("dffy-changes".into())
         .spawn(move || {
-            let others = |empty: bool| {
+            let others = |selected: &Selected, empty: bool| {
                 let others = empty
                     .then(|| print::others(&selected.repo, &selected.revisions, &selected.paths))
                     .flatten();
@@ -81,7 +83,7 @@ pub(crate) fn changes(
             if tx
                 .send(Event::EnumerationDone(result.err().map(|e| e.to_string())))
                 .is_err()
-                || !others(empty)
+                || !others(&selected, empty)
             {
                 return;
             }
@@ -100,6 +102,11 @@ pub(crate) fn changes(
                     match request {
                         Request::Refresh(p) => paths.extend(p),
                         Request::Rescan => rescan = true,
+                        Request::Retarget(revisions) => {
+                            set.set_revisions(revisions.clone());
+                            selected.revisions = revisions;
+                            rescan = true;
+                        }
                     }
                 }
                 paths.sort_unstable();
@@ -118,7 +125,9 @@ pub(crate) fn changes(
                     Ok(None) => None,
                     Err(e) => Some(Event::RefreshFailed(e.to_string())),
                 };
-                if event.is_some_and(|event| tx.send(event).is_err()) || (empty && !others(true)) {
+                if event.is_some_and(|event| tx.send(event).is_err())
+                    || (empty && !others(&selected, true))
+                {
                     return;
                 }
             }

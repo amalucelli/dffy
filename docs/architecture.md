@@ -69,7 +69,7 @@ The `dffy` binary: CLI, printed output, pager mode, the viewer, the MCP server a
 | `mcp` | `dffy mcp`: the Model Context Protocol server ([mcp.md](mcp.md)). Hand-written JSON-RPC over stdio on the `plugin` module's JSON, both protocol eras, the three tools, cursors and the text rendering. |
 | `no_index` | When two arguments are paths to compare rather than revisions, and what the comparison is called (`git difftool`'s temporary copies included). |
 | `pager` | Pager mode: the stdin reader and line splitting, streaming the core's `patch` events into rendered rows, and `--color-only`. |
-| `plugin` | Renderer plugins: the `render` setting, finding `dffy-render-<name>` on `PATH`, running one with a timeout, the protocol's JSON. |
+| `plugin` | Renderer plugins: the `render` setting, finding `dffy-render-<name>` on `PATH`, running one with a timeout, the protocol's JSON. `plugin::review`: review plugins (`dffy-review-<name>`), run in the background in a session of their own (through `dffy __review-plugin`, since std starts one only from unsafe code), their JSON lines read on a thread and handed to the viewer as events. |
 | `render` | Turning the core's `view` rows into cells (split, unified, stat): widths, wrapping, the role for each line's state, and escaping, shared by printed output and the viewer. It decides nothing about what a line is. |
 | `term` | The terminal layer: cell grid, raw mode, input parsing, OSC 52. |
 | `tui` | The viewer (submodules below). |
@@ -81,7 +81,7 @@ The viewer's submodules, under `tui`:
 
 | Submodule | What it owns |
 |---|---|
-| `app` | State and event handling. |
+| `app` | State and event handling. `app::pr` is pull request mode: the PR shown, the review plugin's run, the PR picker and the post dialog. A PR's update or another PR goes through the change-set thread as a new range, the way watch mode's refreshes do. |
 | `view` | The screen layer over the core's `Document`: rows' heights when wrapping, scrolling and keeping the screen full, opening a file a few rows above its first change, drawing, the overview column, selections and the mouse. It reports what `Document::missing` names for the rows drawn in the last frame. `view::rendered` turns a renderer's blocks into a rendered `File`. |
 | `worker` | The change-set thread, and the pool that runs diffs, renderings and the core's `File::prepare` steps off the UI thread. `app` turns the screen's `missing()` into the pool's jobs. |
 | `tree`, `picker`, `commands`, `help` | The file tree, the file picker, the command panel, the key list. |
@@ -105,6 +105,10 @@ The viewer's submodules, under `tui`:
 | `sequence` | Sequence diagrams: parser, column spacing, and a block per statement. |
 
 Each module draws once, at the narrowest label wrap that fits the width; sizes are measured before drawing. Past the size limits in [plugins.md](plugins.md#the-mermaid-plugin), the library returns nothing: layout cost grows with edges times layers, and drawing cost with the drawing's area.
+
+### `plugins/review-github`
+
+`dffy-review-github`, the GitHub review plugin ([plugins.md](plugins.md#review-plugins)). It reaches GitHub only through `gh api`, fetches code only with git, and reads and writes the comments file only through `dffy comments`, so the lock and the format stay dffy's. `github` holds the GraphQL requests and turns review threads into comment operations; `git` holds the fetches and the anchors read from the PR's commits.
 
 ### `xtask`
 

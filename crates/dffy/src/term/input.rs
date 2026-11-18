@@ -42,9 +42,12 @@ impl Mods {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Input {
     Key(Key, Mods),
+    /// Text pasted while bracketed paste is on, whole, its line ends as
+    /// the terminal sent them.
+    Paste(String),
     /// A wheel step: negative scrolls up. Cells are 0-based.
     Scroll {
         delta: i8,
@@ -97,11 +100,19 @@ pub(super) struct Parser {
     /// It stays, waiting for the rest with no timeout: read as Alt with
     /// the key, the reply's rest would arrive as keys.
     introduced: bool,
+    /// A bracketed paste started: its text so far. Read to its end with
+    /// no timeout and no length limit, since it's text, not a sequence.
+    pasting: Option<Vec<u8>>,
 }
+
+/// The end of a bracketed paste.
+const PASTE_END: &[u8] = b"\x1b[201~";
 
 enum Parsed {
     /// Bytes consumed and what they meant, if anything.
     Done(usize, Option<Input>),
+    /// A bracketed paste starts after these bytes.
+    Paste(usize),
     Incomplete,
 }
 
@@ -114,11 +125,33 @@ impl Parser {
         self.buf.extend_from_slice(bytes);
         let mut i = 0;
         while i < self.buf.len() {
+            if let Some(text) = &mut self.pasting {
+                let rest = &self.buf[i..];
+                if let Some(at) = rest.windows(PASTE_END.len()).position(|w| w == PASTE_END) {
+                    text.extend_from_slice(&rest[..at]);
+                    i += at + PASTE_END.len();
+                    let text = self.pasting.take().unwrap_or_default();
+                    emit(Input::Paste(String::from_utf8_lossy(&text).into_owned()));
+                    continue;
+                }
+                // What could be the start of the end stays for the next read.
+                let keep = (1..PASTE_END.len())
+                    .rev()
+                    .find(|&n| rest.ends_with(&PASTE_END[..n]))
+                    .unwrap_or(0);
+                text.extend_from_slice(&rest[..rest.len() - keep]);
+                i = self.buf.len() - keep;
+                break;
+            }
             match parse(&self.buf[i..]) {
                 Parsed::Done(n, input) => {
                     if let Some(input) = input {
                         emit(input);
                     }
+                    i += n;
+                }
+                Parsed::Paste(n) => {
+                    self.pasting = Some(Vec::new());
                     i += n;
                 }
                 Parsed::Incomplete if self.buf.len() - i > MAX_SEQUENCE => i += 1,
@@ -131,7 +164,7 @@ impl Parser {
     /// Whether the start of a sequence is waiting for more bytes; call
     /// [`Parser::timeout`] when none come within [`ESC_TIMEOUT_MS`].
     pub(super) fn pending(&self) -> bool {
-        !self.buf.is_empty() && !self.introduced
+        !self.buf.is_empty() && !self.introduced && self.pasting.is_none()
     }
 
     /// No more bytes came. A lone ESC is the Escape key, ESC with one byte
@@ -139,6 +172,9 @@ impl Parser {
     /// for its rest, and anything longer is dropped; a string's rest is
     /// dropped too when it comes.
     pub(super) fn timeout(&mut self, emit: &mut impl FnMut(Input)) {
+        if self.pasting.is_some() {
+            return;
+        }
         match self.buf[..] {
             [0x1b, b']' | b'P' | b'_' | b'^'] => {
                 self.introduced = true;
@@ -250,6 +286,7 @@ fn escape(b: &[u8]) -> Parsed {
         _ => match parse(&b[1..]) {
             Parsed::Done(n, Some(Input::Key(k, mods))) => key(n + 1, k, mods.with(Mods::ALT)),
             Parsed::Done(n, other) => Parsed::Done(n + 1, other),
+            Parsed::Paste(n) => Parsed::Paste(n + 1),
             Parsed::Incomplete => Parsed::Incomplete,
         },
     }
@@ -342,6 +379,7 @@ fn csi(b: &[u8]) -> Parsed {
         b'Z' => Key::BackTab,
         b'P'..=b'S' => Key::F(last - b'P' + 1),
         b'~' => match params[0] {
+            Some(200) => return Parsed::Paste(end + 1),
             Some(1 | 7) => Key::Home,
             Some(4 | 8) => Key::End,
             Some(2) => Key::Insert,
@@ -538,11 +576,43 @@ mod tests {
         );
     }
 
+    /// A paste's end with no start, as after one cut short, is swallowed
+    /// like any unknown sequence.
     #[test]
     fn unknown_sequences_are_swallowed_whole() {
         assert_eq!(
-            keys(&[b"\x1b[?1;2c\x1b]2;title\x07\x1b[200~x\x1b[99zq"]),
+            keys(&[b"\x1b[?1;2c\x1b]2;title\x07\x1b[201~x\x1b[99zq"]),
             [(Key::Char('x'), N), (Key::Char('q'), N)]
+        );
+    }
+
+    /// A bracketed paste arrives as one input whatever its length and
+    /// however the reads split it, its terminator included; escapes and
+    /// line ends inside it are text, and the escape timeout never fires
+    /// in the middle of one.
+    #[test]
+    fn a_bracketed_paste_is_one_input() {
+        let mut parser = Parser::default();
+        let mut out = Vec::new();
+        let long = "y".repeat(500);
+        for chunk in [
+            &b"a\x1b[200~li"[..],
+            b"ne\r\n\x1b[Ax",
+            long.as_bytes(),
+            b"\x1b[20",
+        ] {
+            parser.feed(chunk, &mut |i| out.push(i));
+            assert!(!parser.pending(), "no timeout mid-paste");
+        }
+        parser.timeout(&mut |i| out.push(i));
+        parser.feed(b"1~b", &mut |i| out.push(i));
+        assert_eq!(
+            out,
+            [
+                Input::Key(Key::Char('a'), N),
+                Input::Paste(format!("line\r\n\x1b[Ax{long}")),
+                Input::Key(Key::Char('b'), N),
+            ]
         );
     }
 

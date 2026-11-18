@@ -85,7 +85,7 @@ Copies hold the code only. `copy-decorations = true` (or `D` in the command pane
 dffy takes mouse input for clicks, the wheel, and drags that select and copy code. While it does, the terminal's own selection doesn't work. To get it back:
 
 - Hold `shift` while dragging. Many terminals select natively then, whatever the program asks for.
-- Press `M` to hand the mouse to the terminal, and `M` again to take it back. `mouse = false` in the config starts with it off.
+- Press `space` then `M` to hand the mouse to the terminal, and the same again to take it back. `mouse = false` in the config starts with it off.
 
 ## Colors
 

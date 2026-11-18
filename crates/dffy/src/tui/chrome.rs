@@ -157,6 +157,9 @@ pub(super) struct Status {
     pub middle: Option<String>,
     /// `middle` is a note: cut short rather than dropped.
     pub note: bool,
+    /// The review's comments: `18 threads · 2 drafts`. Dropped with the
+    /// search, after the modes and the hints.
+    pub review: Option<String>,
     /// Where the diff search is (`match 3/17`) and whether the tree has a
     /// filter: kept longer than the other mode words.
     pub search: Option<String>,
@@ -228,6 +231,7 @@ fn place_status(status: &Status, segments: &[Range<usize>]) -> Placed {
     let [long, medium, short] = &status.hints;
     let hints = [None, dim(short), dim(medium), dim(long)];
     let (extra, search) = (dim(&status.extra), dim(&status.search));
+    let review = dim(&status.review);
     // (extra, middle whole, hints, search, hunk) kept, from all down to
     // none; the hints shorten before they go. A note outlasts the hints
     // and the search, and is then cut rather than dropped.
@@ -278,6 +282,7 @@ fn place_status(status: &Status, segments: &[Range<usize>]) -> Placed {
         let right = hints.as_ref().map_or(0, |h| group_width(h));
         let room = main.end.saturating_sub(x + right);
         let others: Vec<Spans> = [
+            review.clone().filter(|_| with_search),
             search.clone().filter(|_| with_search),
             extra.clone().filter(|_| with_extra),
         ]

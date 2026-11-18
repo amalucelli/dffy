@@ -15,6 +15,7 @@ mod pager;
 mod plugin;
 mod print;
 mod render;
+mod review;
 mod state;
 mod term;
 mod theme;
@@ -26,14 +27,14 @@ pub mod bench;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use std::sync::LazyLock;
+use std::sync::{Arc, LazyLock, Mutex, PoisonError};
 
 use clap::{ColorChoice, CommandFactory, FromArgMatches};
 use dffy_core::cache::Cache;
 use dffy_core::git;
 use dffy_core::highlight::Registry;
 
-use cli::{Cli, Command, CommonArgs, DaemonAction, DiffArgs, ShowArgs, ViewArgs};
+use cli::{Cli, Command, CommentsAction, CommonArgs, DaemonAction, DiffArgs, ShowArgs, ViewArgs};
 use config::{Config, DefaultDiff, Indicators, ModifiedLines, Paging, View, Warning};
 use output::{Output, Term};
 use render::{Canvas, Layout};
@@ -60,7 +61,8 @@ pub(crate) fn grammars() -> &'static Registry {
 pub(crate) enum Error {
     /// The reader of our output went away; exit quietly with success.
     BrokenPipe,
-    /// Ctrl-C while a pager was showing our output; exit quietly.
+    /// Ctrl-C while a pager was showing our output, or before `dffy pr`'s
+    /// viewer opened; exit quietly.
     Interrupted,
     Fatal {
         message: String,
@@ -147,6 +149,8 @@ pub(crate) struct Ctx {
     pub color_err: bool,
     /// `None` when the cache is off or there's nowhere to put it.
     pub cache: Option<Cache>,
+    /// `--comments`, resolved; the viewer defaults to the repository's.
+    pub comments: Option<PathBuf>,
 }
 
 impl Ctx {
@@ -267,6 +271,10 @@ impl Ctx {
 
 /// Runs dffy with the process's arguments.
 pub fn main() -> ExitCode {
+    let mut raw = std::env::args_os();
+    if raw.nth(1).is_some_and(|a| a == plugin::review::DETACH) {
+        return plugin::review::exec_detached(raw);
+    }
     let args = cli::with_default_subcommand(std::env::args_os().collect());
     let mut command = Cli::command();
     if let Some(choice) = color_flag(&args) {
@@ -324,6 +332,11 @@ pub fn main() -> ExitCode {
         config_warnings: warnings,
         theme,
         term,
+        comments: cli
+            .global
+            .comments
+            .as_deref()
+            .and_then(|file| comments_file(cli.global.dir.as_deref(), Some(file)).ok()),
     };
     let mut canvas = Canvas::default();
     for warning in &ctx.config_warnings {
@@ -392,6 +405,10 @@ fn apply_flags(config: &mut Config, cli: &Cli) -> Vec<&'static str> {
     if g.no_cache {
         config.cache = false;
         set.push("cache");
+    }
+    if let Some(review) = &g.review {
+        config.review = Some(review.clone());
+        set.push("review");
     }
     let (view, watch) = match &cli.command {
         Some(Command::Diff(d)) => (&d.common.view, d.watch),
@@ -483,12 +500,90 @@ fn doctor(ctx: &Ctx, dir: Option<&Path>, json: bool) -> Result<ExitCode, Error> 
     })
 }
 
+/// The comments file: `file` (`--comments`) relative to where dffy runs
+/// (`-C`), or the default in the repository's git directory.
+fn comments_file(dir: Option<&Path>, file: Option<&Path>) -> Result<PathBuf, Error> {
+    let cwd = std::env::current_dir()
+        .map_err(|e| Error::fatal(format!("can't read the current directory: {e}")))?;
+    let base = dir.map_or_else(|| cwd.clone(), |dir| cwd.join(dir));
+    if let Some(file) = file {
+        return Ok(base.join(file));
+    }
+    let not_found = || Error::Fatal {
+        message: format!(
+            "{} isn't in a git repository, so it has no comments file",
+            base.display()
+        ),
+        hint: Some(
+            "name one with --comments <file>, or run dffy inside a repository or with -C <path>"
+                .to_owned(),
+        ),
+    };
+    let repo = git::Repo::discover(&base).map_err(|_| not_found())?;
+    let git_dir = repo.git_dir().ok_or_else(not_found)?;
+    Ok(review::default_path(git_dir))
+}
+
+/// `dffy comments`: the file listed, printed as JSON, or written by `apply`.
+fn comments(
+    path: &Path,
+    json: bool,
+    action: Option<CommentsAction>,
+    ctx: &Ctx,
+) -> Result<ExitCode, Error> {
+    match action {
+        Some(CommentsAction::Apply) => {
+            use std::io::{IsTerminal, Read};
+            if io::stdin().is_terminal() {
+                return Err(Error::Fatal {
+                    message:
+                        "dffy comments apply reads operations from stdin, and stdin is a terminal"
+                            .into(),
+                    hint: Some(
+                        "pipe a JSON list in, as in: echo '[…]' | dffy comments apply".into(),
+                    ),
+                });
+            }
+            let mut input = Vec::new();
+            io::stdin().lock().read_to_end(&mut input)?;
+            let answer = review::apply_json(path, &input).map_err(Error::fatal)?;
+            io::stdout().lock().write_all(answer.as_bytes())?;
+            Ok(ExitCode::SUCCESS)
+        }
+        None => {
+            let file = review::read(path).map_err(Error::fatal)?;
+            if json {
+                io::stdout().lock().write_all(file.encode().as_bytes())?;
+                return Ok(ExitCode::SUCCESS);
+            }
+            let mut c = Canvas::default();
+            if let Some(notice) = &file.notice {
+                c.push(Role::Warn, "notice:");
+                c.line(
+                    Role::Plain,
+                    &format!(" {}", render::escape(notice.as_bytes())),
+                );
+                c.end_line();
+            }
+            if file.comments.is_empty() {
+                c.line(Role::Dim, "no comments");
+            }
+            review::render(&review::threads(&file.comments), &mut c);
+            write_stdout(ctx, &c)
+        }
+    }
+}
+
 fn run(cli: Cli, ctx: &Ctx) -> Result<ExitCode, Error> {
     let dir = cli.global.dir.as_deref();
     match cli.command {
         None => diff(dir, &DiffArgs::default(), ctx),
         Some(Command::Diff(args)) => diff(dir, &args, ctx),
         Some(Command::Show(args)) => show(dir, &args, ctx),
+        Some(Command::Comments { json, action }) => {
+            let path = comments_file(dir, cli.global.comments.as_deref())?;
+            comments(&path, json, action, ctx)
+        }
         Some(Command::Config {
             markdown: Some(page),
             ..
@@ -541,6 +636,7 @@ fn run(cli: Cli, ctx: &Ctx) -> Result<ExitCode, Error> {
             Ok(ExitCode::SUCCESS)
         }
         Some(Command::Doctor { json }) => doctor(ctx, dir, json),
+        Some(Command::Pr { number }) => pr(dir, number, ctx),
         Some(Command::Daemon { action }) => {
             let mut c = Canvas::default();
             match action {
@@ -562,7 +658,7 @@ fn run(cli: Cli, ctx: &Ctx) -> Result<ExitCode, Error> {
             write_stdout(ctx, &c)
         }
         Some(Command::Mcp) => {
-            mcp::serve(dir, ctx)?;
+            mcp::serve(dir, cli.global.comments.as_deref(), ctx)?;
             Ok(ExitCode::SUCCESS)
         }
         Some(Command::Completions { shell }) => {
@@ -652,12 +748,219 @@ fn diff(dir: Option<&Path>, args: &DiffArgs, ctx: &Ctx) -> Result<ExitCode, Erro
         let plan = print::prepare(dir, &target, &c.paths, print::Summary::Diff, c.view.reverse)?;
         let focus = c.focus.as_deref().map(|f| plan.relative(f)).transpose()?;
         let description = describe(&revisions, c.view.reverse);
-        return tui::run(&tty, plan, revisions, focus, description, &ctx.viewer());
+        let detect = detect_pr(args, &plan, ctx);
+        return tui::run(
+            &tty,
+            plan,
+            revisions,
+            focus,
+            description,
+            detect,
+            &ctx.viewer(),
+        );
     }
     if ctx.config.watch {
         warn(ctx, "--watch needs the viewer on a terminal; printing once");
     }
     run_print(dir, &target, &args.common, args.exit_code, ctx)
+}
+
+/// `dffy pr`: the viewer on PR `number`, or the current branch's, or the
+/// picker of PRs on the diff `dffy` shows. It opens once the plugin's
+/// `prepare` names the PR's commits, and the plugin goes on downloading
+/// threads behind it.
+fn pr(dir: Option<&Path>, number: Option<u64>, ctx: &Ctx) -> Result<ExitCode, Error> {
+    // The plugin runs in a session of its own, which the terminal's Ctrl-C
+    // doesn't reach: until the viewer handles signals, they kill it here.
+    let phase = Arc::new(Mutex::new(Phase::Waiting));
+    let handler = Arc::clone(&phase);
+    term::on_signals(move |signal| {
+        let mut phase = handler.lock().unwrap_or_else(PoisonError::into_inner);
+        if signal == term::Signal::Interrupt && *phase == Phase::Waiting {
+            *phase = Phase::Interrupted;
+            plugin::stop_all();
+        }
+        *phase == Phase::Waiting
+    })?;
+    let result = open_pr(dir, number, ctx, &phase);
+    // A `prepare` started before an error is stopped too, not only one the
+    // viewer ran.
+    plugin::stop_all();
+    if *phase.lock().unwrap_or_else(PoisonError::into_inner) == Phase::Interrupted {
+        return Err(Error::Interrupted);
+    }
+    result
+}
+
+/// How far `dffy pr` got, for a signal before its viewer handles them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Phase {
+    Waiting,
+    Interrupted,
+    Viewing,
+}
+
+fn open_pr(
+    dir: Option<&Path>,
+    number: Option<u64>,
+    ctx: &Ctx,
+    phase: &Mutex<Phase>,
+) -> Result<ExitCode, Error> {
+    use plugin::review::{self, Reason, Said};
+    let (name, program) = review_plugin(ctx)?;
+    let tty = ctx
+        .term
+        .stdout_tty
+        .then(term::Tty::open)
+        .and_then(Result::ok)
+        .ok_or_else(|| Error::fatal("dffy pr opens the viewer, which needs a terminal"))?;
+    let cwd = std::env::current_dir()
+        .map_err(|e| Error::fatal(format!("can't read the current directory: {e}")))?;
+    let repo = git::Repo::discover(&dir.map_or_else(|| cwd.clone(), |dir| cwd.join(dir)))?;
+    let root = repo.workdir().ok_or(git::Error::NoWorktree)?;
+    let program_name = format!("{}{name}", plugin::REVIEW_PREFIX);
+    let start = |args: &[String]| -> Result<_, Error> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let command = review::command(&program.path, args, root, None)?;
+        let run = review::start(command, &program_name, &args[0], move |said| {
+            tx.send(said).is_ok()
+        })
+        .map_err(|e| Error::fatal(format!("couldn't start {program_name}: {e}")))?;
+        Ok((run, rx))
+    };
+    // Until the viewer takes the screen.
+    let say = |text: &str| {
+        if ctx.term.stderr_tty {
+            eprint!("\r\x1b[K{text}");
+        }
+    };
+    let viewer = |revisions: git::Revisions, description, start, viewer: &Ctx| {
+        {
+            let mut phase = phase.lock().unwrap_or_else(PoisonError::into_inner);
+            if *phase != Phase::Waiting {
+                return Err(Error::Interrupted);
+            }
+            *phase = Phase::Viewing;
+        }
+        let target = print::Target::Diff(&revisions);
+        let plan = print::prepare(dir, &target, &[], print::Summary::Diff, false)?;
+        tui::run(
+            &tty,
+            plan,
+            revisions,
+            None,
+            description,
+            Some(start),
+            viewer,
+        )
+    };
+    let number = if let Some(number) = number {
+        number
+    } else {
+        say("listing pull requests…");
+        let (_, rx) = start(&["list".to_owned()])?;
+        let prs = first_said(&rx, |said| match said {
+            Said::Prs(prs) => Some(prs),
+            _ => None,
+        });
+        say("");
+        let prs = prs.map_err(|e| {
+            Error::fatal(e.unwrap_or_else(|| format!("{program_name} listed nothing")))
+        })?;
+        if let Some(pr) = prs.iter().find(|p| p.reason == Reason::CurrentBranch) {
+            pr.number
+        } else {
+            let revisions = git::Revisions {
+                unstaged: ctx.config.default_diff == DefaultDiff::Unstaged,
+                ..git::Revisions::default()
+            };
+            let description = describe(&revisions, false);
+            let pick = tui::PrStart::Pick { plugin: name, prs };
+            return viewer(revisions, description, pick, &ctx.viewer());
+        }
+    };
+    say(&format!("fetching #{number}…"));
+    let (run, rx) = start(&["prepare".to_owned(), number.to_string()])?;
+    let session = first_said(&rx, |said| match said {
+        Said::Session(session) => Some(session),
+        _ => None,
+    });
+    say("");
+    let session = session.map_err(|e| {
+        let e = e.unwrap_or_else(|| format!("{program_name} prepare named no commits"));
+        Error::fatal(format!("PR #{number}: {e}"))
+    })?;
+    let revisions = git::Revisions {
+        revs: vec![format!("{}...{}", session.base, session.head)],
+        ..git::Revisions::default()
+    };
+    let mut ctx = ctx.viewer();
+    ctx.comments = Some(session.comments.clone());
+    let open = tui::PrStart::Open {
+        plugin: name,
+        session,
+        run,
+        rest: rx,
+    };
+    viewer(revisions, format!("PR #{number}"), open, &ctx)
+}
+
+/// Plain `dffy` (no revisions or paths) on a branch, with a review plugin
+/// set: the viewer asks the plugin for the branch's PR as it starts.
+fn detect_pr(args: &DiffArgs, plan: &print::Plan, ctx: &Ctx) -> Option<tui::PrStart> {
+    let unnamed = args.revs.is_empty()
+        && !(args.staged || args.unstaged || args.merge_base || args.common.view.reverse)
+        && args.common.paths.is_empty();
+    let on_branch = || {
+        plan.repo
+            .git_dir()
+            .and_then(|dir| std::fs::read(dir.join("HEAD")).ok())
+            .is_some_and(|head| head.starts_with(b"ref: refs/heads/"))
+    };
+    let plugin = ctx
+        .config
+        .review
+        .clone()
+        .filter(|_| unnamed && on_branch())?;
+    Some(tui::PrStart::Detect { plugin })
+}
+
+/// The review plugin set, and its program.
+fn review_plugin(ctx: &Ctx) -> Result<(String, plugin::Program), Error> {
+    let Some(name) = ctx.config.review.clone() else {
+        return Err(Error::Fatal {
+            message: "dffy pr needs a review plugin, and none is set".into(),
+            hint: Some(
+                "set review = <name> in the config, or pass --review <name>; see docs/plugins.md"
+                    .into(),
+            ),
+        });
+    };
+    let program = plugin::find(plugin::REVIEW_PREFIX, &name).ok_or_else(|| Error::Fatal {
+        message: format!("{}{name} isn't on PATH", plugin::REVIEW_PREFIX),
+        hint: Some("docs/install.md says how to install it".into()),
+    })?;
+    Ok((name, program))
+}
+
+/// The first line on `said` that `pick` takes; `Err` with the run's
+/// error when it ended first, `Err(None)` when it ended well.
+fn first_said<T>(
+    said: &std::sync::mpsc::Receiver<plugin::review::Said>,
+    mut pick: impl FnMut(plugin::review::Said) -> Option<T>,
+) -> Result<T, Option<String>> {
+    use plugin::review::Said;
+    loop {
+        match said.recv() {
+            Ok(Said::Done(result)) => return Err(result.err()),
+            Ok(line) => {
+                if let Some(picked) = pick(line) {
+                    return Ok(picked);
+                }
+            }
+            Err(_) => return Err(None),
+        }
+    }
 }
 
 /// `dffy A B`: two files or folders outside git (see [`no_index`]).
@@ -688,7 +991,15 @@ fn compare(
         let plan = print::Plan::compare(repo, base, print::Summary::Diff, c.view.reverse);
         let focus = c.focus.as_deref().map(|f| plan.relative(f)).transpose()?;
         let revisions = git::Revisions::default();
-        return tui::run(&tty, plan, revisions, focus, description, &ctx.viewer());
+        return tui::run(
+            &tty,
+            plan,
+            revisions,
+            focus,
+            description,
+            None,
+            &ctx.viewer(),
+        );
     }
     if ctx.config.watch {
         warn(ctx, "--watch needs the viewer on a terminal; printing once");
@@ -845,7 +1156,15 @@ fn show(dir: Option<&Path>, args: &ShowArgs, ctx: &Ctx) -> Result<ExitCode, Erro
             ..git::Revisions::default()
         };
         let description = format!("show {}", args.rev);
-        return tui::run(&tty, plan, revisions, focus, description, &ctx.viewer());
+        return tui::run(
+            &tty,
+            plan,
+            revisions,
+            focus,
+            description,
+            None,
+            &ctx.viewer(),
+        );
     }
     run_print(
         dir,
@@ -985,5 +1304,37 @@ mod tests {
         let last_used = [("ignore-all-space".to_owned(), "true".to_owned())];
         config.layer(&mut sources, &last_used, config::Source::LastUsed);
         assert_eq!(config.whitespace, Whitespace::IgnoreChange);
+    }
+
+    /// `--review` wins over the config's `review` for the run, before the
+    /// subcommand too, and nothing remembered replaces it.
+    #[test]
+    fn the_review_flag_beats_the_config() {
+        for args in [
+            &["dffy", "--review", "flag", "HEAD"][..],
+            &["dffy", "--review=flag", "doctor"],
+        ] {
+            let args = cli::with_default_subcommand(
+                args.iter().map(|a| std::ffi::OsString::from(*a)).collect(),
+            );
+            let matches = Cli::command().try_get_matches_from(args).expect("parses");
+            let cli = Cli::from_arg_matches(&matches).expect("arguments");
+            let mut config = Config::default();
+            let mut sources = config::Sources::default();
+            for key in config.apply_source("review = configured\n", &mut Vec::new()) {
+                sources.set(key, config::Source::Config);
+            }
+            assert_eq!(config.review.as_deref(), Some("configured"));
+            for key in apply_flags(&mut config, &cli) {
+                sources.set(key, config::Source::Flag);
+            }
+            let last_used = [("review".to_owned(), "remembered".to_owned())];
+            config.layer(&mut sources, &last_used, config::Source::LastUsed);
+            assert_eq!(config.review.as_deref(), Some("flag"));
+            assert_eq!(sources.get("review"), config::Source::Flag);
+        }
+        let mut config = Config::default();
+        assert_eq!(config.review, None);
+        assert!(config.set("review", "Not/A-Name").is_err());
     }
 }

@@ -13,6 +13,10 @@ use std::path::Path;
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 
 #[path = "../src/plugin/json.rs"]
+#[expect(
+    dead_code,
+    reason = "requests are built as text, so no value is written"
+)]
 mod json;
 
 use json::{Value, parse, string};
@@ -297,7 +301,10 @@ fn changed_files_pages_through_the_list_after_the_handshake() {
         .iter()
         .filter_map(|t| t.get("name").and_then(Value::as_str))
         .collect();
-    assert_eq!(names, ["changed_files", "file_diff", "diff"]);
+    assert_eq!(
+        names,
+        ["changed_files", "file_diff", "diff", "list_comments"]
+    );
 
     let range = r#""range":"main~1 main""#;
     let first = server.call("changed_files", &format!("{{{range},\"limit\":4}}"));
@@ -494,6 +501,11 @@ fn invalid_input_is_a_tool_error() {
         ("changed_files", r#"{"range":"nope"}"#, "nope"),
         ("changed_files", r#"{"cursor":"garbage"}"#, "start over"),
         ("diff", r#"{"max_line":3}"#, "unknown argument"),
+        (
+            "list_comments",
+            r#"{"path":["a"]}"#,
+            "path must be a string",
+        ),
     ] {
         let call = server.call(tool, args);
         assert!(call.is_error(), "{tool} {args}: {}", call.line);
@@ -560,6 +572,73 @@ fn modern_requests_carry_their_version() {
         .and_then(|d| d.get("requested"))
         .and_then(Value::as_str);
     assert_eq!(requested, Some("2024-01-01"));
+}
+
+/// `list_comments` reads the repository's comments file on each call:
+/// threads in path order, each comment's object as the file has it, a page
+/// at a time; `path` keeps one file's, by its old path too, and a cursor
+/// from before the file changed is refused.
+#[test]
+fn list_comments_pages_through_threads() {
+    let repo = repo();
+    let d = repo.path();
+    let comments = |extra: &str| {
+        format!(
+            r#"{{"version":1,"notice":"comments as of 10:42","comments":[
+{{"id":"c0000000000000a1","path":"lib.rs","side":"new","start":{{"old":null,"new":1}},"end":{{"old":null,"new":1}},"text":"Why i64?","author":"","created":"2026-11-17T10:42:00Z","resolved":false,"anchor":{{"before":[],"lines":["pub fn add(a: i64, b: i64) -> i64 {{"],"after":["    a + b","}}"]}},"distance":0}},
+{{"id":"c0000000000000b2","path":"docs/user/guide.md","old_path":"docs/guide.md","text":"Moved?","author":"octocat","created":"2026-11-17T10:43:00Z","resolved":true}},
+{{"id":"c0000000000000c3","path":"lib.rs","text":"It overflowed.","author":"octocat","created":"2026-11-17T10:44:00Z","in_reply_to":"c0000000000000a1","resolved":false,"ref":"github:PRRC_1"}}{extra}
+]}}
+"#
+        )
+    };
+    write(d, ".git/dffy/comments.json", &comments(""));
+    let mut server = Server::start(d);
+    initialize(&mut server);
+    let ids = |call: &Call| -> Vec<String> {
+        call.structured()
+            .get("comments")
+            .and_then(Value::as_array)
+            .expect("comments")
+            .iter()
+            .filter_map(|c| c.get("id").and_then(Value::as_str).map(str::to_owned))
+            .collect()
+    };
+    let first = server.call("list_comments", r#"{"limit":2}"#);
+    assert_eq!(ids(&first), ["c0000000000000b2", "c0000000000000a1"]);
+    let cursor = first.cursor().expect("more comments").to_owned();
+    let second = server.call(
+        "list_comments",
+        &format!(r#"{{"limit":2,"cursor":"{cursor}"}}"#),
+    );
+    assert_eq!(ids(&second), ["c0000000000000c3"]);
+    assert_eq!(second.cursor(), None);
+    insta::assert_snapshot!(
+        "mcp_list_comments",
+        snapshot(&[
+            first.raw_structured(),
+            first.text().to_owned(),
+            second.text().to_owned(),
+        ])
+    );
+    let lib = server.call("list_comments", r#"{"path":"lib.rs"}"#);
+    assert_eq!(ids(&lib), ["c0000000000000a1", "c0000000000000c3"]);
+    let renamed = server.call("list_comments", r#"{"path":"docs/guide.md"}"#);
+    assert_eq!(ids(&renamed), ["c0000000000000b2"]);
+
+    write(
+        d,
+        ".git/dffy/comments.json",
+        &comments(
+            r#",{"id":"c0000000000000d4","path":"a.rs","text":"New.","author":"","created":"2026-11-17T10:45:00Z","resolved":false}"#,
+        ),
+    );
+    let stale = server.call(
+        "list_comments",
+        &format!(r#"{{"limit":2,"cursor":"{cursor}"}}"#),
+    );
+    assert!(stale.is_error());
+    assert!(stale.text().contains("start over"), "{}", stale.text());
 }
 
 /// The repository stays open across calls, and each call sees it as it is

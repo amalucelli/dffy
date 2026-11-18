@@ -1,0 +1,25 @@
+---
+source: crates/dffy/tests/mcp.rs
+expression: "snapshot(&[first.raw_structured(), first.text().to_owned(),\nsecond.text().to_owned(),])"
+---
+{"notice":"comments as of 10:42","comments":[{"id":"c0000000000000b2","path":"docs/user/guide.md","old_path":"docs/guide.md","text":"Moved?","author":"octocat","created":"2026-11-17T10:43:00Z","resolved":true},{"id":"c0000000000000a1","path":"lib.rs","side":"new","start":{"old":null,"new":1},"end":{"old":null,"new":1},"text":"Why i64?","author":"","created":"2026-11-17T10:42:00Z","resolved":false,"anchor":{"before":[],"lines":["pub fn add(a: i64, b: i64) -> i64 {"],"after":["    a + b","}"]},"distance":0}],"total_comments":3,"next_cursor":"<cursor>"}
+--
+3 comments, showing 1-2
+notice: comments as of 10:42
+
+docs/user/guide.md, resolved
+  c0000000000000b2 octocat, 2026-11-17T10:43:00Z
+    Moved?
+
+lib.rs:1
+  c0000000000000a1 you, 2026-11-17T10:42:00Z
+    Why i64?
+More comments: next_cursor <cursor> (pass it as cursor, with the same arguments)
+
+--
+3 comments, showing 3-3
+notice: comments as of 10:42
+
+lib.rs, reply in thread c0000000000000a1
+  c0000000000000c3 octocat, 2026-11-17T10:44:00Z, posted
+    It overflowed.

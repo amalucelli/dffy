@@ -45,6 +45,8 @@ keybind = leader:z=toggle_wrap
 | `scroll_right` | `>` `L` |  | Scroll the code right, without wrapping |
 | `scroll_left` | `<` `H` |  | Scroll the code left |
 | `scroll_reset` | `0` |  | Scroll the code back to its first column |
+| `next_thread` | `m` |  | Next comment thread, on into the next file with comments; it takes the focus, where r replies, e edits, x resolves, d deletes and o opens it on its host |
+| `prev_thread` | `M` |  | Previous comment thread, back into the previous file with comments |
 
 ### Files/tree
 
@@ -63,6 +65,7 @@ keybind = leader:z=toggle_wrap
 | `mark_viewed` | `v` in the tree |  | Mark a file in the tree viewed |
 | `tree_wider` | `+` in the tree |  | Widen the tree |
 | `tree_narrower` | `-` in the tree |  | Narrow the tree |
+| `commented_files` | `c` in the tree | `C` | The tree shows only the files with comments, or every file; f/F and n/N keep to them |
 
 ### View
 
@@ -82,6 +85,8 @@ keybind = leader:z=toggle_wrap
 | `toggle_hunk_headers` |  | `m` | Show or hide the @@ numbers of hunks |
 | `toggle_status_bar` |  | `b` | The status bar in the frame's bottom border or its top one |
 | `cycle_theme` |  | `c` | The next theme, built-in or yours |
+| `toggle_thread` | `z` |  | Fold or unfold the focused comment thread, or the first on screen |
+| `toggle_threads` | `Z` |  | Fold every comment thread to one row, or unfold them all |
 
 ### Selection & copy
 
@@ -98,7 +103,7 @@ keybind = leader:z=toggle_wrap
 | Action | Keys | Command panel | Description |
 |---|---|---|---|
 | `toggle_watch` | `w` | `a` | Watch for changes |
-| `toggle_mouse` | `M` | `M` | Take mouse input, or leave it to the terminal's own selection (many terminals select natively with shift held while dragging) |
+| `toggle_mouse` |  | `M` | Take mouse input, or leave it to the terminal's own selection (many terminals select natively with shift held while dragging) |
 
 ### Other
 
@@ -106,6 +111,13 @@ keybind = leader:z=toggle_wrap
 |---|---|---|---|
 | `leader` | `space` |  | Open the command panel; its next key runs a command |
 | `edit` | `e` |  | Open the file in $EDITOR at the top line |
+| `comment` | `c` |  | Comment on the selected lines, or the line v would start on, in a text box under them; esc saves it |
+| `comments` | `i` |  | List every comment thread, files not in the diff included; enter goes to one |
+| `comment_in_editor` |  | `E` | Write in $EDITOR: your draft in the focused thread, else a reply to it, else a comment on the line; ctrl+e does it from the text box |
+| `review_pull` | `p` |  | On a pull request (dffy pr), fetch its new commits and threads and show them in place (experimental, see review) |
+| `review_post` | `P` |  | On a pull request (dffy pr), open the dialog that posts your drafts, replies and resolves as a review (experimental, see review) |
+| `open_pull_request` |  | `P` | List the pull requests on this branch, yours and those waiting on your review, to open one (experimental, see review) |
+| `since_last_review` |  | `R` | On a pull request, show only what changed since the head of your last review posted from dffy, or the whole PR again |
 | `help` | `?` | `?` | Show or hide this help |
 | `quit` | `q` `ctrl+c` |  | Quit |
 
@@ -121,6 +133,7 @@ While the file tree has focus, these keys come first; every other key does what 
 | `v` | `mark_viewed` | Mark a file in the tree viewed |
 | `+` | `tree_wider` | Widen the tree |
 | `-` | `tree_narrower` | Narrow the tree |
+| `c` | `commented_files` | The tree shows only the files with comments, or every file; f/F and n/N keep to them |
 
 ## Command panel
 
@@ -143,6 +156,7 @@ While the file tree has focus, these keys come first; every other key does what 
 | `b` | Status bar | `toggle_status_bar` |
 | `o` | Find file… | `open_picker` |
 | `f` | Filter tree… | `filter_tree` |
+| `C` | Files with comments | `commented_files` |
 | `S` | Search in diff… | `search` |
 | `t` | File tree | `toggle_tree` |
 | `n` | Next file | `next_file` |
@@ -153,4 +167,7 @@ While the file tree has focus, these keys come first; every other key does what 
 | `M` | Mouse selection | `toggle_mouse` |
 | `a` | Watch for changes | `toggle_watch` |
 | `c` | Theme | `cycle_theme` |
+| `E` | Continue in editor | `comment_in_editor` |
+| `P` | Open pull request… | `open_pull_request` |
+| `R` | Since last review | `since_last_review` |
 | `?` | All keys | `help` |

@@ -2,9 +2,10 @@
 //! the terminal, threads or processes: the loop in [`super::run`] owns
 //! those and carries out the [`Action`]s returned here.
 //!
-//! Keys go to one of two panes, the diff or the file tree; `tab` switches.
-//! On wide terminals the tree is a panel beside the diff, on narrow ones
-//! (phones included) an overlay over it that closes once a file is picked.
+//! Keys go to one of two panes, the diff or the left panel; `tab` switches.
+//! The left panel shows the file tree, or after `i` the comment threads.
+//! On wide terminals it's beside the diff, on narrow ones (phones
+//! included) an overlay over it that closes once a file is picked.
 //! Every action has a key that needs neither ctrl nor a symbol, since
 //! phone keyboards put symbols a layer away; mouse clicks and taps are
 //! shortcuts only. Keys map to actions through the config's bindings.
@@ -219,7 +220,7 @@ impl RenderTarget {
 enum Seek {
     /// Its first (`m`), or with `true` its last (`M`).
     Edge(bool),
-    /// The one with this root, picked in the panel.
+    /// The one with this root, selected in the comments panel.
     Root(String),
 }
 
@@ -227,6 +228,8 @@ enum Seek {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Pane {
     Diff,
+    /// The left panel: the tree, or the comments while [`App::panel`] is
+    /// open.
     Tree,
 }
 
@@ -338,6 +341,7 @@ pub(crate) struct App {
     /// The local review's file, plain `dffy`'s: a review session's
     /// comments file shows its drafts too.
     local_comments: Option<PathBuf>,
+    /// The comment threads, shown in the left panel in place of the tree.
     panel: Option<Panel>,
     /// What the text box's or the editor's text becomes, while either is
     /// open.
@@ -1206,11 +1210,11 @@ impl App {
     }
 
     /// The count pass to start, once per list and only while the tree
-    /// shows: the files on screen in the tree first, then those near them,
+    /// shows, not the comments: the files on screen in the tree first, then those near them,
     /// then the rest in order. Started again when the tree scrolls to files
     /// not counted yet.
     pub(crate) fn take_count_pass(&mut self) -> Option<Vec<Counted>> {
-        if !self.tree_shown || self.enumerating {
+        if !self.tree_shown || self.enumerating || self.panel.is_some() {
             return None;
         }
         let files = self.doc.document.files();
@@ -1338,9 +1342,6 @@ impl App {
             }
             return None;
         }
-        if self.panel.is_some() {
-            return self.panel_input(&input);
-        }
         if self.picker.is_some() {
             return self.picker_input(&input);
         }
@@ -1359,6 +1360,9 @@ impl App {
         }
         if self.search.as_ref().is_some_and(|s| s.editing) {
             self.search_key(key, mods);
+            return None;
+        }
+        if self.pane == Pane::Tree && self.panel_key(key, mods) {
             return None;
         }
         let deleting = std::mem::take(&mut self.deleting);
@@ -1422,7 +1426,7 @@ impl App {
     }
 
     /// A paste with no overlay open: its first line goes into the search
-    /// or the tree's filter being typed. Anywhere else it's dropped, never
+    /// or the left panel's filter being typed. Anywhere else it's dropped, never
     /// read as keys.
     fn paste_line(&mut self, text: &str) {
         let line = text.lines().next().unwrap_or_default();
@@ -1431,6 +1435,10 @@ impl App {
         } else if self.search.as_ref().is_some_and(|s| s.editing) {
             line.chars()
                 .for_each(|c| self.search_key(Key::Char(c), Mods::NONE));
+        } else if self.panel.as_ref().is_some_and(|p| p.editing) {
+            line.chars().for_each(|c| {
+                self.panel_key(Key::Char(c), Mods::NONE);
+            });
         }
     }
 
@@ -1439,10 +1447,14 @@ impl App {
         match *input {
             Input::Scroll { delta, x, .. } => {
                 let rows = isize::from(delta) * WHEEL_ROWS;
-                if self.over_tree(usize::from(x)) {
-                    self.tree.scroll_by(rows);
-                } else {
+                if !self.over_tree(usize::from(x)) {
                     self.scroll_diff(rows);
+                } else if let Some(panel) = &mut self.panel {
+                    if let Some(root) = panel.scroll_by(isize::from(delta)) {
+                        self.follow_thread(&root);
+                    }
+                } else {
+                    self.tree.scroll_by(rows);
                 }
             }
             Input::Click { x, y } => self.click(usize::from(x), usize::from(y)),
@@ -1524,6 +1536,9 @@ impl App {
     /// Selects the tree's row at `line`, the keys on the tree; for a file,
     /// shows it, as moving onto it does, and lists the tree's keys for it.
     fn aim_tree(&mut self, line: usize) -> Vec<menu::Entry> {
+        if self.panel.is_some() {
+            return Vec::new();
+        }
         let Some(item) = self.tree.click(line) else {
             return Vec::new();
         };
@@ -1999,10 +2014,9 @@ impl App {
             }
             Act::Select | Act::Cancel => self.doc.selection = None,
             // The panel's copy acts on the selection, so opening it keeps it;
-            // a comment goes on it, and the comments shown are its.
+            // a comment goes on it.
             Act::Comment
             | Act::CommentInEditor
-            | Act::Comments
             | Act::ScrollLeft
             | Act::ScrollRight
             | Act::ScrollReset
@@ -2047,10 +2061,7 @@ impl App {
             Act::Quit => return Some(Action::Quit),
             Act::SwitchPane => {
                 if tree {
-                    self.pane = Pane::Diff;
-                    if !self.side_tree() {
-                        self.show_tree(false);
-                    }
+                    self.leave_panel();
                 } else {
                     self.focus_tree();
                 }
@@ -2061,14 +2072,15 @@ impl App {
                 self.picker = Some(Picker::new(self.doc.document.files()));
             }
             Act::FilterTree => {
+                self.panel = None;
                 self.focus_tree();
                 self.tree.editing = true;
             }
             Act::Search => self.start_search(),
             Act::ParentFolder => {
-                // From the diff, the tree starts on the file shown; in the
-                // tree, each `u` climbs a folder further.
-                if !tree {
+                // From the diff or the comments, the tree starts on the file
+                // shown; in the tree, each `u` climbs a folder further.
+                if !tree || self.panel.take().is_some() {
                     self.focus_tree();
                 }
                 self.tree.select_parent();
@@ -3039,6 +3051,11 @@ impl App {
     /// tree closes.
     fn open(&mut self, file: usize) {
         self.doc.goto_file(file);
+        self.leave_panel();
+    }
+
+    /// Gives the diff the keys; a left panel over it closes.
+    fn leave_panel(&mut self) {
         self.pane = Pane::Diff;
         if !self.side_tree() {
             self.show_tree(false);
@@ -3094,6 +3111,12 @@ impl App {
             let Some(line) = y.checked_sub(tree_top + 1) else {
                 return;
             };
+            if let Some(panel) = &mut self.panel {
+                if let Some(root) = panel.click(line) {
+                    self.follow_thread(&root);
+                }
+                return;
+            }
             match self.tree.click(line) {
                 Some(Item::File(file)) => self.open(file),
                 Some(Item::Dir { open }) => self.tree.set_open(!open),
@@ -3689,7 +3712,7 @@ impl App {
         match action {
             Act::Comment => self.comment(),
             Act::CommentFile => self.comment_file(),
-            Act::Comments => self.open_panel(),
+            Act::Comments => self.toggle_comments(),
             Act::NextThread | Act::PrevThread => {
                 self.doc.selection = None;
                 self.step_thread(action == Act::NextThread);
@@ -3776,6 +3799,7 @@ impl App {
         let on = !self.tree.commented();
         let paths = on.then(|| comments.paths());
         self.tree.set_commented(paths);
+        self.panel = None;
         if on {
             self.focus_tree();
             if let Some(Item::File(file)) = self.tree.step(0) {
@@ -3789,40 +3813,48 @@ impl App {
         });
     }
 
-    /// `i`: the panel listing every thread.
-    fn open_panel(&mut self) {
-        if self.can_comment() {
-            self.panel = Some(Panel::new());
-        }
-    }
-
-    /// Input while the comments panel is open.
-    fn panel_input(&mut self, input: &Input) -> Option<Action> {
-        let (Some(panel), Some(comments)) = (&mut self.panel, &self.comments) else {
+    /// `i`: the left panel shows every comment thread, with the keys,
+    /// starting on the focused one or the first of the file shown; or,
+    /// when it shows them, the files again.
+    fn toggle_comments(&mut self) {
+        if self.panel.is_some() && self.tree_shown {
             self.panel = None;
-            return None;
-        };
-        let outcome = match *input {
-            Input::Key(key, mods) => panel.key((comments, self.enumerating), &self.keys, key, mods),
-            Input::Scroll { delta, .. } => {
-                panel.scroll_by(isize::from(delta) * WHEEL_ROWS);
-                comments::Outcome::Stay
-            }
-            _ => comments::Outcome::Stay,
-        };
-        match outcome {
-            comments::Outcome::Stay => {}
-            comments::Outcome::Close => self.panel = None,
-            comments::Outcome::Open(root) => {
-                self.panel = None;
-                self.open_thread(&root);
-            }
+            return;
         }
-        None
+        if self.panel.is_none() {
+            if !self.can_comment() {
+                return;
+            }
+            let Some(comments) = &self.comments else {
+                return;
+            };
+            let root = self.doc.focused().map(|t| t.root.as_str());
+            let file = self.doc.document.files().get(self.doc.document.pos.file);
+            let path = file.map_or(&[][..], |e| &e.change().path[..]);
+            self.panel = Some(Panel::new(comments, self.enumerating, (root, path)));
+        }
+        self.focus_tree();
     }
 
-    /// Goes to the thread with root `root`, in its file, and focuses it.
-    fn open_thread(&mut self, root: &str) {
+    /// A key while the comments panel has the keys: false when it's not
+    /// the panel's.
+    fn panel_key(&mut self, key: Key, mods: Mods) -> bool {
+        let (Some(panel), Some(comments)) = (&mut self.panel, &self.comments) else {
+            return false;
+        };
+        match panel.key((comments, self.enumerating), &self.keys, key, mods) {
+            comments::Outcome::Stay => {}
+            comments::Outcome::Moved(root) => self.follow_thread(&root),
+            comments::Outcome::Diff => self.leave_panel(),
+            comments::Outcome::Pass => return false,
+        }
+        true
+    }
+
+    /// Shows the thread with root `root` in the diff, focused, its file
+    /// loaded when it's another, and leaves the keys where they are; a
+    /// thread not placed yet is focused once it is.
+    fn follow_thread(&mut self, root: &str) {
         let Some(comments) = &self.comments else {
             return;
         };
@@ -3831,7 +3863,10 @@ impl App {
             .first()
             .map(|c| c.path.clone())
             .unwrap_or_default();
+        self.doc.selection = None;
+        self.thread_pending = None;
         let Some(file) = comments.file_of(path.as_bytes()) else {
+            self.doc.set_focus(None);
             self.message(if self.enumerating {
                 "still listing files; its file isn't here yet".to_owned()
             } else {
@@ -3839,9 +3874,10 @@ impl App {
             });
             return;
         };
-        self.open(file);
+        self.doc.goto_file(file);
         self.sync_threads();
         if !self.doc.go_to_thread(root) {
+            self.doc.set_focus(None);
             self.thread_pending = Some((file, Seek::Root(root.to_owned())));
             self.message("waiting for this file's diff");
         }
@@ -4068,7 +4104,7 @@ impl App {
             status_top: self.status_bar == StatusBar::Top,
             tree: self.side_width().filter(|_| tree),
             overlay: self.tree_shown && narrow && tree,
-            tree_editing: self.tree.editing,
+            tree_editing: self.tree.editing || self.panel.as_ref().is_some_and(|p| p.editing),
             heading: heading(self),
             context: self.context(),
             status,
@@ -4115,7 +4151,6 @@ impl App {
         let overlays = self.picker.is_some()
             || self.help.is_some()
             || self.commands.is_some()
-            || self.panel.is_some()
             || self.reviews.is_some()
             || self.posting.is_some()
             || self.held.is_some()
@@ -4136,28 +4171,40 @@ impl App {
         // The picker covers the tree, and refreshing it costs a pass over
         // every file while the picker reads a long input.
         if let Some(columns) = tree_columns.filter(|_| self.picker.is_none()) {
-            let files = self.doc.document.files();
-            if self.pane == Pane::Diff && !files.is_empty() {
-                self.tree.follow(self.doc.document.pos.file);
-            }
-            let totals = Totals::of(files, self.enumerating);
             if chrome.overlay {
                 // Blank out the diff under it.
                 for y in tree_top..tree_top + tree_rows {
                     grid.fill(0, y, columns, Style::PLAIN);
                 }
             }
-            self.tree.draw(
-                grid,
-                (tree_top, tree_rows, columns),
-                files,
-                &totals,
-                self.comments.as_ref(),
-                self.enumerating,
-                self.pane == Pane::Tree,
-                framed && !chrome.overlay,
-                &self.theme,
-            );
+            let place = (tree_top, tree_rows, columns);
+            let (focused, joined) = (self.pane == Pane::Tree, framed && !chrome.overlay);
+            if let (Some(panel), Some(comments)) = (&mut self.panel, &self.comments) {
+                // As the tree follows the file, `m` or a tap in the diff
+                // moves the selection.
+                if let Some(thread) = self.doc.focused() {
+                    panel.select(&thread.root);
+                }
+                let comments = (comments, self.enumerating);
+                panel.draw(grid, place, comments, (focused, joined), &self.theme);
+            } else {
+                let files = self.doc.document.files();
+                if self.pane == Pane::Diff && !files.is_empty() {
+                    self.tree.follow(self.doc.document.pos.file);
+                }
+                let totals = Totals::of(files, self.enumerating);
+                self.tree.draw(
+                    grid,
+                    place,
+                    files,
+                    &totals,
+                    self.comments.as_ref(),
+                    self.enumerating,
+                    focused,
+                    joined,
+                    &self.theme,
+                );
+            }
         }
         // After the tree, so an empty one over the diff says why.
         if let Some(text) = empty {
@@ -4190,9 +4237,6 @@ impl App {
         }
         if let (Some(commands), Some(entries)) = (&mut self.commands, entries) {
             commands.draw(grid, &self.theme, &entries);
-        }
-        if let (Some(panel), Some(comments)) = (&mut self.panel, &self.comments) {
-            panel.draw(grid, &self.theme, comments, self.enumerating);
         }
         if let Some(help) = &mut self.help {
             help.draw(grid, &self.theme, &self.keys);
@@ -4584,7 +4628,13 @@ fn hints(app: &App, narrow: bool) -> [Option<String>; 3] {
             .find(|c| app.keys.action(tree, c.key, c.mods) == Some(action))
             .map(crate::keys::Chord::name)
     };
-    let (find, other) = if tree {
+    let (find, other) = if tree && app.panel.is_some() {
+        let search = key(Act::FilterTree).map(|k| format!("{k} search · "));
+        (
+            Some(format!("{}f filter", search.unwrap_or_default())),
+            "diff",
+        )
+    } else if tree {
         (key(Act::FilterTree).map(|k| format!("{k} filter")), "diff")
     } else {
         (key(Act::Search).map(|k| format!("{k} search")), "tree")
@@ -7182,9 +7232,9 @@ mod tests {
         insta::assert_snapshot!("syntax_diff_off", off);
     }
 
-    /// The screen with each run of cells in one of `roles`' styles in
-    /// `<role>…</>`.
-    fn role_markup(app: &mut App, roles: &[Role]) -> String {
+    /// The screen's first `width` columns with each run of cells in one of
+    /// `roles`' styles in `<role>…</>`.
+    fn role_markup(app: &mut App, roles: &[Role], width: usize) -> String {
         app.draw();
         let styles: Vec<_> = roles.iter().map(|&r| (app.theme.style(r), r)).collect();
         let grid = app.screen.shown_grid();
@@ -7192,7 +7242,7 @@ mod tests {
             .map(|y| {
                 let mut line = String::new();
                 let mut current = None;
-                for cell in grid.row(y) {
+                for cell in grid.row(y).iter().take(width) {
                     let role = styles
                         .iter()
                         .find(|(style, _)| *style == cell.style())
@@ -7244,10 +7294,16 @@ mod tests {
         );
         key(&mut app, 't');
         read_back(&mut app);
-        insta::assert_snapshot!("piped_merge_commit", role_markup(&mut app, &roles));
+        insta::assert_snapshot!(
+            "piped_merge_commit",
+            role_markup(&mut app, &roles, usize::MAX)
+        );
         key(&mut app, 'f');
         read_back(&mut app);
-        insta::assert_snapshot!("piped_merge_combined", role_markup(&mut app, &roles));
+        insta::assert_snapshot!(
+            "piped_merge_combined",
+            role_markup(&mut app, &roles, usize::MAX)
+        );
     }
 
     /// `view = auto` splits from `split-min-width` columns of screen, 140
@@ -7879,7 +7935,7 @@ mod tests {
         press(&mut app, Key::Esc);
 
         let pr_before = std::fs::read(&pr).expect("read");
-        app.open_thread("l1");
+        app.follow_thread("l1");
         // `e` takes the thread's last draft: the reply.
         key(&mut app, 'e');
         typed(&mut app, " more");
@@ -8460,10 +8516,9 @@ mod tests {
     }
 
     /// Files with comments beyond the ones on screen and prefetched are
-    /// diffed so their threads get placed; until then the list says it's
-    /// still looking. `i` lists every thread, those on a file not in the
-    /// diff and those whose lines are gone included; `enter` goes to one
-    /// and focuses it, where it hangs at the end of its file.
+    /// diffed so their threads get placed; until then the comments panel
+    /// says it's still looking, and it lists the far file's threads once
+    /// they are, those on a file not in the diff included.
     #[test]
     fn far_files_with_comments_are_diffed_and_every_thread_listed() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -8478,11 +8533,9 @@ mod tests {
             "the far file is diffed"
         );
         key(&mut app, 'i');
-        let listed = screen(&mut app);
-        assert!(
-            listed.contains("finding the lines of comments in 1 file"),
-            "{listed}"
-        );
+        let listed = left(&mut app);
+        assert!(listed.contains("finding the lines"), "{listed}");
+        assert!(!listed.contains("Moved"), "{listed}");
         let loaded = loaded(diff("src/zz9.rs"));
         app.event(Event::Diffed(Done::Diff {
             file: far,
@@ -8495,19 +8548,386 @@ mod tests {
                 .any(|j| matches!(j, Job::Diff { file, .. } if *file == far)),
             "placed, it isn't diffed again"
         );
-        insta::assert_snapshot!("comment_list", screen(&mut app));
-        for _ in 0..5 {
-            press(&mut app, Key::Down);
-        }
+        let listed = left(&mut app);
+        assert!(
+            listed.contains("Moved") && listed.contains("Gone"),
+            "{listed}"
+        );
+    }
+
+    /// [`commented`] with `json` for its comments, in a review session so
+    /// your comments are drafts, every file placed, `width` × `height`.
+    fn reviewed(dir: &tempfile::TempDir, json: &str, (width, height): (usize, usize)) -> App {
+        let (mut app, path) = commented(dir);
+        std::fs::write(&path, json).expect("write");
+        let prepare = app.start_review("test".to_owned(), session(dir, HEAD, None));
+        said(&mut app, prepare, Said::Done(Ok(())));
+        app.resize(width, height);
+        screen(&mut app);
+        let far = 11;
+        app.event(Event::Diffed(Done::Diff {
+            file: far,
+            version: app.version(far),
+            result: Ok(Box::new(loaded(diff("src/zz9.rs")))),
+        }));
+        app
+    }
+
+    /// [`reviewed`] with the comments in the left panel.
+    fn listed(dir: &tempfile::TempDir, json: &str, size: (usize, usize)) -> App {
+        let mut app = reviewed(dir, json, size);
+        key(&mut app, 'i');
+        app
+    }
+
+    /// The selected thread's root in the comments panel.
+    fn selected(app: &App) -> String {
+        let panel = app.panel.as_ref().expect("the comments show");
+        panel.selected().unwrap_or_default().to_owned()
+    }
+
+    /// The left panel's columns of the screen.
+    fn left(app: &mut App) -> String {
+        let shown = screen(app);
+        let width = app.tree_columns().unwrap_or(0);
+        (shown.lines())
+            .map(|l| l.chars().take(width).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// The file shown and the root of the thread focused in it.
+    fn at(app: &App) -> (usize, String) {
+        let focused = app.doc.focused().map(|t| t.root.clone());
+        (app.doc.document.pos.file, focused.unwrap_or_default())
+    }
+
+    /// `i` turns the left panel to the comment threads, showing it when
+    /// it's hidden, with the keys, and back to the files; its title says
+    /// which. Nothing of the list is made while the files show, however
+    /// the comments change.
+    #[test]
+    fn i_switches_the_left_panel_between_files_and_comments() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let json = review_json("src/zz9.rs");
+        let mut app = reviewed(&dir, &json, (100, 20));
+        key(&mut app, 't');
+        assert!(!app.tree_shown);
+        let made = comments::listed_count();
+        key(&mut app, 'i');
+        assert!(app.tree_shown && app.pane == Pane::Tree);
+        let shown = screen(&mut app);
+        assert!(shown.starts_with("┌ Comments · 6 threads ─"), "{shown}");
+        assert_eq!(comments::listed_count(), made + 1);
+        assert!(
+            app.take_count_pass().is_none(),
+            "no counting for a tree not shown"
+        );
+        key(&mut app, 'i');
+        assert!(app.panel.is_none() && app.pane == Pane::Tree);
+        assert!(app.take_count_pass().is_some());
+        let shown = screen(&mut app);
+        assert!(shown.starts_with("┌ Files · 12 "), "{shown}");
+        let path = dir.path().join("comments.json");
+        std::fs::write(&path, json.replace("Why two?", "Why 2?")).expect("write");
+        app.event(Event::Comments);
+        assert!(screen(&mut app).contains("Why 2?"));
+        assert_eq!(comments::listed_count(), made + 1);
+    }
+
+    /// On a narrow screen the comments open over the diff; `enter` closes
+    /// them on the thread, and `i` brings them back with the keys.
+    #[test]
+    fn narrow_comments_open_over_the_diff_and_come_back_with_i() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut app = reviewed(&dir, &review_json("src/zz9.rs"), (40, 30));
+        key(&mut app, 'i');
+        assert!(app.tree_shown && app.pane == Pane::Tree);
+        key(&mut app, 'j');
         press(&mut app, Key::Enter);
-        assert!(app.panel.is_none());
-        assert_eq!(app.doc.document.pos.file, far);
-        assert_eq!(app.doc.focused().map(|t| t.root.as_str()), Some("m1"));
+        assert!(!app.tree_shown);
+        assert_eq!((app.pane, at(&app)), (Pane::Diff, (0, "d1".to_owned())));
+        key(&mut app, 'i');
+        assert!(app.tree_shown && app.pane == Pane::Tree);
         let shown = screen(&mut app);
         assert!(
-            shown.contains("line 10 not found") && shown.contains("Moved away"),
+            shown
+                .lines()
+                .nth(1)
+                .is_some_and(|l| l.starts_with("┌ Comments")),
             "{shown}"
         );
+    }
+
+    /// A thread listed before its file's diff is in, one on the whole
+    /// file: following it opens the file and waits, as `m` does, then
+    /// focuses it once the file's threads are placed.
+    #[test]
+    fn following_a_thread_whose_file_isnt_diffed_yet_waits_for_it() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (mut app, path) = commented(&dir);
+        let json = review_json("src/zz9.rs");
+        let whole = r#"{"id":"z1","path":"src/zz9.rs","text":"On the far file","created":"2026-11-17T09:00:00Z"}"#;
+        let json = format!("{},{whole}]}}", json.strip_suffix("]}").expect("a list"));
+        std::fs::write(&path, json).expect("write");
+        app.event(Event::Comments);
+        screen(&mut app);
+        key(&mut app, 'i');
+        for _ in 0..4 {
+            key(&mut app, 'j');
+        }
+        assert_eq!(selected(&app), "z1");
+        assert_eq!(at(&app), (11, String::new()));
+        assert!(status(&mut app).contains("waiting for this file's diff"));
+        app.event(Event::Diffed(Done::Diff {
+            file: 11,
+            version: app.version(11),
+            result: Ok(Box::new(loaded(diff("src/zz9.rs")))),
+        }));
+        assert_eq!(at(&app), (11, "z1".to_owned()));
+    }
+
+    /// The comments beside the diff: a header per file (its folder dimmed,
+    /// its name bold, its threads), then a row per thread: its mark, its
+    /// line, the author when the row above in the file has another, the
+    /// first line, and its replies at the right. A thread whose lines
+    /// weren't found says `moved`, unless its file isn't in the diff. A
+    /// narrow panel leaves out the line, then the replies.
+    #[test]
+    fn the_comments_panel_lists_one_quiet_row_per_thread() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut app = reviewed(&dir, &review_json("src/zz9.rs"), (130, 22));
+        app.tree_width = Some(46);
+        app.relayout();
+        key(&mut app, 'i');
+        insta::assert_snapshot!("comment_list", screen(&mut app));
+        let narrow: Vec<String> = [24, 20]
+            .into_iter()
+            .map(|width| {
+                app.tree_width = Some(width);
+                app.relayout();
+                left(&mut app)
+                    .lines()
+                    .take(11)
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            })
+            .collect();
+        insta::assert_snapshot!("comment_list_narrow", narrow.join("\n\n"));
+    }
+
+    /// A resolved thread's row is dimmed whole; the others keep their
+    /// marks' roles.
+    #[test]
+    fn resolved_rows_are_dimmed_whole() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut app = reviewed(&dir, &review_json("src/zz9.rs"), (130, 22));
+        app.tree_width = Some(46);
+        app.relayout();
+        key(&mut app, 'i');
+        // Distinct styles for the roles the marks and rows take.
+        app.theme = Theme::parse(
+            "roles",
+            "warn = yellow underline\nhint = cyan underline\ndim = dim underline\n",
+            &mut Vec::new(),
+        );
+        app.invalidate();
+        let markup = role_markup(&mut app, &[Role::Warn, Role::Hint, Role::Dim], 46);
+        insta::assert_snapshot!(
+            "comment_list_roles",
+            markup
+                .lines()
+                .skip(1)
+                .take(9)
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+    }
+
+    /// Moving through the comments shows each thread in the diff, focused,
+    /// loading its file when it's another, while the keys stay in the
+    /// panel; opening it moves nothing. A thread on a file not in the diff
+    /// says so and leaves nothing focused. The wheel and a tap move the
+    /// selection too.
+    #[test]
+    fn moving_through_the_comments_shows_each_thread_in_the_diff() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut app = listed(&dir, &review_json("src/zz9.rs"), (100, 30));
+        assert_eq!(selected(&app), "f1");
+        assert_eq!(at(&app), (0, String::new()), "opening moves nothing");
+        let mut seen = Vec::new();
+        for _ in 0..5 {
+            key(&mut app, 'j');
+            seen.push(at(&app));
+        }
+        let at_ = |file: usize, root: &str| (file, root.to_owned());
+        assert_eq!(
+            seen,
+            [
+                at_(0, "d1"),
+                at_(0, "p1"),
+                at_(0, "r1"),
+                at_(11, "m1"),
+                at_(11, "")
+            ]
+        );
+        assert!(status(&mut app).contains("gone.rs isn't in this diff"));
+        assert_eq!(app.pane, Pane::Tree);
+        key(&mut app, 'k');
+        assert_eq!(at(&app), at_(11, "m1"));
+        key(&mut app, 'g');
+        assert_eq!(at(&app), at_(0, "f1"));
+        app.event(Event::Input(Input::Scroll {
+            delta: 1,
+            x: 5,
+            y: 5,
+        }));
+        assert_eq!((selected(&app), at(&app)), ("d1".to_owned(), at_(0, "d1")));
+        // Under the header: f1, d1, p1, then r1.
+        app.event(Event::Input(Input::Click { x: 5, y: 5 }));
+        assert_eq!((selected(&app), at(&app)), ("r1".to_owned(), at_(0, "r1")));
+        // The selection follows `m` in the diff.
+        press(&mut app, Key::Tab);
+        key(&mut app, 'm');
+        assert_eq!(at(&app), at_(0, "p1"));
+        screen(&mut app);
+        assert_eq!(selected(&app), "p1");
+    }
+
+    /// `enter` or `tab` hands the keys to the diff, the thread focused for
+    /// `r`, `x`, `e`, `d` and `o`; `tab` comes back to the comments, and
+    /// `esc` in them hands the keys to the diff as it does from the tree.
+    #[test]
+    fn enter_or_tab_hands_the_keys_to_the_diff_on_the_thread() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut app = listed(&dir, &review_json("src/zz9.rs"), (100, 30));
+        let path = dir.path().join("comments.json");
+        key(&mut app, 'j');
+        press(&mut app, Key::Enter);
+        assert_eq!((app.pane, at(&app)), (Pane::Diff, (0, "d1".to_owned())));
+        key(&mut app, 'x');
+        assert!(
+            read_comments(&path)
+                .comments
+                .iter()
+                .any(|c| c.id == "d1" && c.resolved)
+        );
+        press(&mut app, Key::Tab);
+        assert!(app.pane == Pane::Tree && app.panel.is_some());
+        assert!(screen(&mut app).starts_with("┌ Comments"));
+        key(&mut app, 'j');
+        let root = selected(&app);
+        press(&mut app, Key::Tab);
+        assert_eq!((app.pane, at(&app).1), (Pane::Diff, root));
+        press(&mut app, Key::Tab);
+        press(&mut app, Key::Esc);
+        assert!(app.pane == Pane::Diff && app.panel.is_some());
+    }
+
+    /// `f` steps through All, Open, Drafts and Resolved, `F` back; the title
+    /// counts what's kept of every thread and names the filter. `/` keeps
+    /// the threads whose path, author or text has what's typed, with the
+    /// filter; `esc` clears it, then hands the keys to the diff. A filter
+    /// that keeps nothing says so.
+    #[test]
+    fn the_comments_panel_filters_by_state_and_text() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut app = listed(&dir, &review_json("src/zz9.rs"), (130, 30));
+        app.tree_width = Some(46);
+        app.relayout();
+        let title = |app: &mut App| screen(app).lines().next().unwrap_or_default().to_owned();
+        assert!(title(&mut app).starts_with("┌ Comments · 6 threads · 5 open ─"));
+        let texts = |app: &mut App| {
+            let shown = left(app);
+            [
+                "On the whole",
+                "Why two?",
+                "Fifty?",
+                "Old four",
+                "Moved away",
+                "Gone",
+            ]
+            .into_iter()
+            .filter(|t| shown.contains(t))
+            .collect::<Vec<_>>()
+        };
+        key(&mut app, 'f');
+        assert_eq!(
+            texts(&mut app),
+            ["On the whole", "Why two?", "Fifty?", "Moved away", "Gone"]
+        );
+        assert!(title(&mut app).starts_with("┌ Comments · 5/6 · open ─"));
+        key(&mut app, 'f');
+        assert_eq!(
+            texts(&mut app),
+            ["On the whole", "Why two?", "Moved away", "Gone"]
+        );
+        key(&mut app, 'f');
+        assert_eq!(texts(&mut app), ["Old four"]);
+        assert_eq!(selected(&app), "r1");
+        assert_eq!(at(&app).1, "r1", "the diff follows the selection");
+        key(&mut app, 'F');
+        key(&mut app, 'F');
+        typed(&mut app, "/octo");
+        assert_eq!(texts(&mut app), ["Fifty?"], "the author");
+        assert!(screen(&mut app).contains("└« /octo▏ ─"));
+        press(&mut app, Key::Esc);
+        typed(&mut app, "/zz9");
+        assert_eq!(texts(&mut app), ["Moved away"], "the path");
+        let file = app.doc.document.pos.file;
+        press(&mut app, Key::Down);
+        app.event(Event::Input(Input::Key(Key::Char('n'), Mods::CTRL)));
+        assert_eq!(
+            app.doc.document.pos.file, file,
+            "typing leaves the tree alone"
+        );
+        press(&mut app, Key::Enter);
+        assert!(title(&mut app).starts_with("┌ Comments · 1/6 · open · /zz9 ─"));
+        key(&mut app, 'f');
+        key(&mut app, 'f');
+        assert!(
+            left(&mut app).contains("no thread matches"),
+            "the filter keeps the search"
+        );
+        key(&mut app, 'F');
+        key(&mut app, 'F');
+        press(&mut app, Key::Esc);
+        assert_eq!(app.pane, Pane::Tree, "esc clears the search first");
+        typed(&mut app, "/because");
+        assert_eq!(texts(&mut app), ["Why two?"], "a reply's text");
+        press(&mut app, Key::Enter);
+        press(&mut app, Key::Esc);
+        for _ in 0..4 {
+            key(&mut app, 'f');
+        }
+        assert_eq!(texts(&mut app).len(), 5, "round to Open");
+        press(&mut app, Key::Esc);
+        assert_eq!(app.pane, Pane::Diff);
+    }
+
+    /// A resolved thread with a draft reply in it is a draft: first among
+    /// its file's, and kept by Drafts as well as Resolved, since posting
+    /// sends it.
+    #[test]
+    fn a_resolved_thread_with_a_draft_in_it_lists_as_a_draft() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let json = review_json("src/zz9.rs");
+        let reply = r#"{"id":"r2","path":"src/some/deeply/nested/module/file.rs","text":"Reopen?","author":"","created":"2026-11-17T11:00:00Z","in_reply_to":"r1"}"#;
+        let json = format!("{},{reply}]}}", json.strip_suffix("]}").expect("a list"));
+        let mut app = listed(&dir, &json, (100, 40));
+        let mut seen = vec![selected(&app)];
+        for _ in 0..3 {
+            key(&mut app, 'j');
+            seen.push(selected(&app));
+        }
+        assert_eq!(seen, ["f1", "d1", "r1", "p1"]);
+        let listed = |app: &mut App| left(app).contains("Old four");
+        key(&mut app, 'f');
+        assert!(!listed(&mut app), "not open");
+        key(&mut app, 'f');
+        assert!(listed(&mut app), "a draft");
+        key(&mut app, 'f');
+        assert!(listed(&mut app), "resolved");
     }
 
     /// `m` goes from thread to thread in the order the diff shows them,

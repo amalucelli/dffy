@@ -1,24 +1,27 @@
 ---
 source: crates/dffy/src/tui/app.rs
+assertion_line: 8634
 expression: screen(&mut app)
 ---
-┌ Files · 12 +4 -4 ────────┬─ modified · src/some/deeply/nested/module/file.rs · +2 -2 ────────────┐
-│ ┌─ comments ─────────────────────────────────────────────────────────────────────── esc close ─┐ ┃
-│ │ gone.rs:1 · file not in this diff · Gone                                                     │ █
-│ │ src/some/deeply/nested/module/file.rs · on the file · On the whole file                      │ │
-│ │ src/some/deeply/nested/module/file.rs:2 · Why two?                                           │ │
-│ │ src/some/deeply/nested/module/file.rs:4 (old) · resolved · Old four                          │ │
-│ │ src/some/deeply/nested/module/file.rs:50 · posted · Fifty?                                   │ │
-│ │ src/zz9.rs:10 · lines not found · Moved away                                                 │ │
-│ │                                                                                              │ │
-│ │                                                                                              │ │
-│ │                                                                                              │ │
-│ │                                                                                              │ │
-│ │                                                                                              │ │
-│ │                                                                                              │ │
-│ │                                                                                              │ │
-│ │                                                                                              │ ▐
-│ │                                                                                              │ │
-│ │ enter goes to it · esc close                                                                 │ │
-│ └──────────────────────────────────────────────────────────────────────────────────────────────┘ │
-└──  working tree  ────────┴─ 1/12 · 1/2 hunk  unified  6 threads ───── / search · space commands ─┘
+┌ Comments · 6 threads · 5 open ─────────────┬─ modified · src/some/deeply/nested/module/file.rs · +2 -2 ────── @@ -1,7 +1,7 @@ ─┐
+│ src/some/deeply/nested/module/file.rs    4 │ @@ -1,7 +1,7 @@                                                                   ┃
+│   ◆ you On the whole file                  │        │  ┌ ▾ you · 3h ago · draft · on the file ┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┐ █
+│   ◆ :2 Why two?                          1 │        │  ┆ On the whole file                                                   ┆ ┃
+│   ● :50 octocat Fifty?                     │        │  └┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┘ │
+│   ○ :4 you Old four                        │  1  1  │ line 1                                                                   │
+│ src/zz9.rs                               1 │  2  2◆ │ line 2                                                                   │
+│   ◆ :10 moved you Moved away               │        │  ┌ ▾ you · 2h ago · draft ┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┐ │
+│ gone.rs · not in this diff               1 │        │  ┆ Why two?                                                            ┆ │
+│   ◆ :1 you Gone                            │        │  ┆                                                                     ┆ │
+│                                            │        │  ┆ you · 1h ago · draft                                                ┆ │
+│                                            │        │  ┆ Because.                                                            ┆ │
+│                                            │        │  └┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┘ │
+│                                            │  3  3  │ line 3                                                                   │
+│                                            │  4   ○-│ line 4                                                                   │
+│                                            │        │  │ ▸ you · 2h ago · resolved · Old four                                │ │
+│                                            │     4 +│ line four                                                                │
+│                                            │  5  5  │ line 5                                                                   ▐
+│                                            │  6  6  │ line 6                                                                   │
+│                                            │  7  7  │ line 7                                                                   │
+│                                            │ ⋯ 39 unchanged lines  @@ -47,7 +47,7 @@ line 46                                   │
+└«─  review 7  1/12 · 1/2 hunk ──────────────┴─ unified  review 7 · 6 threads · 5 drafts ─ / search · f filter · space commands ─┘

@@ -586,7 +586,8 @@ impl App {
                 drafts.len() - 1
             );
         }
-        self.open_thread(&root);
+        self.follow_thread(&root);
+        self.leave_panel();
         self.message(note);
     }
 

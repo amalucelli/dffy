@@ -779,32 +779,13 @@ impl Tree {
     fn draw_frame(
         &self,
         grid: &mut Grid,
-        (top, height, width): (usize, usize, usize),
+        place: (usize, usize, usize),
         totals: &Totals,
         listing: bool,
         focused: bool,
         joined: bool,
         theme: &Theme,
     ) {
-        let border = theme.style(if focused { Role::Hint } else { Role::Dim });
-        let bottom = top + height - 1;
-        for y in top + 1..bottom {
-            grid.put_str(0, y, width, "│", border);
-            grid.put_str(width - 1, y, width, "│", border);
-        }
-        let (top_right, bottom_right) = if joined {
-            ("┬", "┴")
-        } else {
-            ("┐", "┘")
-        };
-        for (y, left, right) in [(top, "┌", top_right), (bottom, "└", bottom_right)] {
-            grid.put_str(0, y, width, left, border);
-            for x in 1..width - 1 {
-                grid.put_str(x, y, width, "─", border);
-            }
-            grid.put_str(width - 1, y, width, right, border);
-        }
-        let end = width - 1;
         let growing = if listing { "+" } else { "" };
         let parts = if self.filtered() {
             let kept = self.hits.iter().filter(|h| h.is_some()).count();
@@ -827,32 +808,9 @@ impl Tree {
                 (format!(" -{}", totals.removed), Role::Removed),
             ]
         };
-        // Whole parts only, the deletions dropped first: a number cut
-        // short would read as a smaller one.
-        let room = end.saturating_sub(2);
-        let mut shown = parts.len();
-        while shown > 1 && parts[..shown].iter().map(|(t, _)| t.width()).sum::<usize>() > room {
-            shown -= 1;
-        }
-        let mut x = 1;
-        for (text, role) in &parts[..shown] {
-            x = grid.put_str(x, top, end, text, theme.style(*role));
-        }
-        grid.put_str(x, top, end, " ", theme.style(Role::Plain));
-        if self.editing {
-            // Right of the `«` the viewer puts in the corner.
-            let text = format!(" /{}▏ ", self.filter);
-            let x = grid.put_str(2, bottom, end, &text, theme.style(Role::Hint));
-            if self.filter.is_empty() {
-                grid.put_str(
-                    x,
-                    bottom,
-                    end,
-                    "type to filter · esc clear ",
-                    theme.style(Role::Dim),
-                );
-            }
-        }
+        let typing =
+            (self.editing).then_some((self.filter.as_str(), "type to filter · esc clear "));
+        frame(grid, place, &parts, typing, (focused, joined), theme);
     }
 
     /// `row` at screen line `line`, its counts in the column `totals`
@@ -981,6 +939,59 @@ impl Tree {
         }
         parts.reverse();
         parts.join(&b'/').into()
+    }
+}
+
+/// Draws the left panel's border into columns `0..width` of rows
+/// `top..top + height`: `parts` of its title in the top edge, whole ones
+/// only, the last dropped first, since a number cut short would read as a
+/// smaller one; `typing`, what's typed and a hint shown while it's empty,
+/// in the bottom edge. With `joined`, its right edge is the divider of a
+/// frame going on to the right, and its corners there are `┬` and `┴`.
+pub(super) fn frame(
+    grid: &mut Grid,
+    (top, height, width): (usize, usize, usize),
+    parts: &[(String, Role)],
+    typing: Option<(&str, &str)>,
+    (focused, joined): (bool, bool),
+    theme: &Theme,
+) {
+    let border = theme.style(if focused { Role::Hint } else { Role::Dim });
+    let bottom = top + height - 1;
+    for y in top + 1..bottom {
+        grid.put_str(0, y, width, "│", border);
+        grid.put_str(width - 1, y, width, "│", border);
+    }
+    let (top_right, bottom_right) = if joined {
+        ("┬", "┴")
+    } else {
+        ("┐", "┘")
+    };
+    for (y, left, right) in [(top, "┌", top_right), (bottom, "└", bottom_right)] {
+        grid.put_str(0, y, width, left, border);
+        for x in 1..width - 1 {
+            grid.put_str(x, y, width, "─", border);
+        }
+        grid.put_str(width - 1, y, width, right, border);
+    }
+    let end = width - 1;
+    let room = end.saturating_sub(2);
+    let mut shown = parts.len();
+    while shown > 1 && parts[..shown].iter().map(|(t, _)| t.width()).sum::<usize>() > room {
+        shown -= 1;
+    }
+    let mut x = 1;
+    for (text, role) in &parts[..shown] {
+        x = grid.put_str(x, top, end, text, theme.style(*role));
+    }
+    grid.put_str(x, top, end, " ", theme.style(Role::Plain));
+    if let Some((typed, hint)) = typing {
+        // Right of the `«` the viewer puts in the corner.
+        let text = format!(" /{typed}▏ ");
+        let x = grid.put_str(2, bottom, end, &text, theme.style(Role::Hint));
+        if typed.is_empty() {
+            grid.put_str(x, bottom, end, hint, theme.style(Role::Dim));
+        }
     }
 }
 

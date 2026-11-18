@@ -200,7 +200,7 @@ expression: text
 <dim># cancel: end the selection; in the tree, clear the filter</>
 <hint>keybind</><dim> = </>esc=cancel
 
-<dim># switch_pane: switch between the file tree and the diff</>
+<dim># switch_pane: switch between the left panel (the file tree, or the comments) and the diff</>
 <hint>keybind</><dim> = </>tab=switch_pane
 <hint>keybind</><dim> = </>shift+tab=switch_pane
 
@@ -301,7 +301,7 @@ expression: text
 <dim># comment_file: comment on the whole file shown, in a text box under its first row; esc saves it</>
 <hint>keybind</><dim> = </>C=comment_file
 
-<dim># comments: list every comment thread, files not in the diff included; enter goes to one</>
+<dim># comments: the left panel lists every comment thread in place of the files, or the files again; moving through the threads shows each in the diff, enter or tab goes to it</>
 <hint>keybind</><dim> = </>i=comments
 
 <dim># next_thread: next comment thread, on into the next file with comments; it takes the focus, where r replies, e edits, x resolves, d deletes and o opens it on its host</>

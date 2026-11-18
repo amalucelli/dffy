@@ -5,7 +5,8 @@ On a terminal, dffy opens a viewer showing one file at a time; when its output i
 - Nearly every action has a key that needs no ctrl or symbol, so it works from a phone keyboard too. Mouse clicks and taps are shortcuts.
 - The status bar names the keys to start from for the pane that has the keys, shortened when the screen is narrow:
   - in the diff, `/ search · tab tree · space commands`;
-  - in the tree, `/ filter · tab diff · space commands`.
+  - in the tree, `/ filter · tab diff · space commands`;
+  - in the comments, `/ search · f filter · tab diff · space commands`.
 - The first run shows a one-time tip (`tips = false` turns it off).
 
 ## Most used keys
@@ -20,16 +21,16 @@ On a terminal, dffy opens a viewer showing one file at a time; when its output i
 | `/` | Search the diff, or filter the tree when it has the keys ([Search](#search)) |
 | `o` | Find a file by name |
 | `x` `X` | 20 more lines of the highlighted `⋯ N unchanged lines` gap / every file whole or changes only |
-| `t` `tab` | Show or hide the file tree / move the keys between the tree and the diff |
+| `t` `tab` | Show or hide the left panel / move the keys between it and the diff |
 | `s` | Layout: split, unified, auto |
 | `W` `d` `w` | Wrap long lines / syntax diff / watch mode |
 | `r` | Rendered view, for file types with a renderer plugin (experimental, [plugins.md](plugins.md)) |
 | `v` `y` `Y` | Select lines / copy them / copy the file's path |
 | `e` | Open `$VISUAL` or `$EDITOR` at the line last tapped, else the top line |
 | `c` `m` `M` | Comment on the selection or the top line / next or previous comment thread ([Comments](#comments)) |
-| `z` `Z` `i` | Fold a thread or all of them / list every thread |
+| `z` `Z` `i` | Fold a thread or all of them / every thread in the left panel, or the files again |
 | `p` `P` | On a review a review plugin opened: update it in place / post your review ([Code host reviews](#code-host-reviews), experimental) |
-| `esc` | Step back: close a panel, end a search or filter, cancel a selection, leave a thread or the tree |
+| `esc` | Step back: close a panel, end a search or filter, cancel a selection, leave a thread or the left panel |
 | `q` | Quit |
 
 [keys.md](keys.md) lists every action with its keys, the tree's and the command panel's keys, and how to rebind them with `keybind` lines.
@@ -49,7 +50,7 @@ On a terminal, dffy opens a viewer showing one file at a time; when its output i
   - On a `⋯` separator: reveal more of the lines it hides (`x`, on that separator rather than the highlighted one).
   - On a thread: reply (`r`); edit or delete your last draft in it (`e`, `d`, which asks for a second `d`); resolve or reopen it (`x`); fold or unfold it (`z`); open it on its host (`o`) when it has a link.
   - `j`/`k` or the arrows move, `enter` or a tap runs an entry, and `esc` or a tap outside closes it. A right click elsewhere opens the menu there instead.
-- **File tree (`t`):** folders collapse, single-child folder chains show as one row, and each file has its status letter and line counts. `enter`/`l` opens, `h` collapses, `u` goes to the parent folder, `v` marks a file viewed (dimmed), and `+`/`-` resize. The tree follows the diff as you move between files.
+- **File tree (`t`):** the left panel, unless it shows the comments (`i`). Folders collapse, single-child folder chains show as one row, and each file has its status letter and line counts. `enter`/`l` opens, `h` collapses, `u` goes to the parent folder, `v` marks a file viewed (dimmed), and `+`/`-` resize. The tree follows the diff as you move between files.
 
 ## Where a file opens
 
@@ -99,7 +100,13 @@ Review comments live in a comments file ([comments.md](comments.md)): `--comment
 - **`m`** and **`M`** go to the next and previous thread, on into the next or previous file with comments, the way `n` and `N` go between changes. The thread they land on takes the focus.
 - **The status bar** counts the comments file's threads and, on a review from a code host, its drafts, with the local drafts shown there: `18 threads · 2 drafts`.
 - **`c` in the tree** (or `C` in the command panel) keeps only the files with comments; `f`/`F` and `n`/`N` keep to them, and `esc` in the tree shows every file again.
-- **`i`** lists every thread with its place, state and first line, including those on files not in this diff. `enter` goes to one and focuses it.
+- **`i`** turns the left panel to every thread by file, including those on files not in this diff, and gives it the keys; `i` again shows the files. It opens the panel when it's hidden, and its title says which it shows: `Comments · 12 threads · 1 open`.
+  - **Rows:** each file has a header (its folder dimmed, its name bold, how many threads), then a row per thread: the gutter's mark (`◆` your draft, `●` open, `○` resolved), the line (`:183`), the first line of its first comment, and how many replies at the right end. The author shows, bold, before the text, on a file's first row and where it changes. One word shows when it matters: a dim `moved` for a thread whose lines weren't found, `local` for a local draft, `not posted` for someone else's comment not posted. A resolved thread's row is dimmed whole. A narrow panel leaves out the line, then the replies.
+  - **Order:** files in the tree's order, then those not in this diff (marked `not in this diff`). In a file, threads with a draft in them come first, then open, outdated and resolved ones.
+  - **Following:** `j`/`k`, the arrows, the page keys, `g`/`G`, the wheel and a tap go from thread to thread, over the headers, and the diff follows: it opens the thread's file and shows the thread there, focused, as `m` does. The thread in the diff is the preview. The keys stay in the panel. `m`/`M` or a tap on a thread in the diff move the selection too.
+  - **`enter` or `tab`** gives the diff the keys, on the focused thread, where `r`, `x`, `e`, `d` and `o` act on it. `tab` comes back to the comments; `esc` in the panel gives the diff the keys too, as it does from the tree.
+  - **Filters:** `f` (`F` back) steps through All, Open (every thread not resolved, drafts included), Drafts (threads with a draft in them) and Resolved. With a filter, the title counts what it keeps and names it: `Comments · 3/12 · open`.
+  - **`/`** keeps the threads whose path (fuzzily), author or text has what's typed, with the filter. `esc` clears it, then gives the diff the keys.
 
 ### Writing
 
@@ -123,7 +130,7 @@ Review comments live in a comments file ([comments.md](comments.md)): `--comment
 ### Placing and reloading
 
 - **Placing:** a comment sits on its lines while their text matches what it was written on, or on the one place nearby where those lines and the two around them match. Files with comments are diffed in the background, so every thread finds its place, or is known to have none.
-- **Hidden lines:** when a thread is placed on lines a `⋯` separator hides, folded or resolved ones included, those lines show with two unchanged lines above and below, between a separator for the lines still hidden above and one for those below; the screen stays where it was. `x` then reveals more from the gap's edges. In a rendered view, a thread shows under the last row drawn from its lines, and threads on rows hidden in a rendered view's gaps don't show; `i` still lists them.
+- **Hidden lines:** when a thread is placed on lines a `⋯` separator hides, folded or resolved ones included, those lines show with two unchanged lines above and below, between a separator for the lines still hidden above and one for those below; the screen stays where it was. `x` then reveals more from the gap's edges. In a rendered view, a thread shows under the last row drawn from its lines, and threads on rows hidden in a rendered view's gaps don't show; `i`'s list still has them.
 - **Search** doesn't look in comments.
 - **Reloading:** dffy watches the file and shows changes from other programs, such as a review plugin or `dffy comments apply` in another shell, as they're written ([comments.md](comments.md) has how). The file's `notice`, when it has one, shows in the status bar.
 
@@ -136,7 +143,7 @@ The command and the words are the plugin's: it names its command, what it review
 - **Opening:**
   - `dffy pr 6064` says `fetching PR #6064…` until the review's commits are in the clone, then shows `<base>...<head>` with the review's comments file. A review opened before shows at once. Its threads keep arriving while you read, `fetching threads 100/312` in the status bar.
   - `dffy pr` opens the current branch's review, or with none, the usual diff with the picker open.
-  - Plain `dffy` (no revisions or paths) on a branch opens as usual and asks the plugin, in the background, for the branch's review. When there's one, what's shown stays plain `dffy`'s, your changes not committed, and the review adds its comments file (threads on the files shown, by their anchors; the rest in `i`'s list), its part of the status bar, `p`, `P` and the checks for new commits. A clean working tree still prints `no changes` without waiting for the answer.
+  - Plain `dffy` (no revisions or paths) on a branch opens as usual and asks the plugin, in the background, for the branch's review. When there's one, what's shown stays plain `dffy`'s, your changes not committed, and the review adds its comments file (threads on the files shown, by their anchors; the rest in the comments panel, `i`), its part of the status bar, `p`, `P` and the checks for new commits. A clean working tree still prints `no changes` without waiting for the answer.
   - **Show whole pull request** (`space` then `A`, in the plugin's words; "Show whole review" without them) switches to the review's base against the working tree (`--merge-base <base>`), titled `PR #6064 + working tree`: the review's changes with your fixes not pushed yet. The same entry, then "Show working tree changes", goes back. `dffy pr` always shows the whole review.
   - Drafts written there are posted on the lines they have at the review's head; one on lines the head doesn't have yet stays a draft and says so.
   - **Local drafts:** on a review, your drafts in plain `dffy`'s comments file (`--comments`, or `dffy/comments.json` in the git directory) show too where they place on the review's diff, marked `local`. Those that don't place stay out of view, out of `i`'s list and the counts: they're the local review's. Editing, replying to, resolving or deleting in a local draft's thread writes the local file; a new comment goes to the review's. Both files are watched.
@@ -171,7 +178,7 @@ One frame goes around the tree and the diff. Its top and bottom edges are the on
 - **Top edge:** names the file (`modified · staged · src/tui/app.rs · +3 -1`) and, at the right, the hunk or function you're in (`@@ fn render()`, or the function alone with `hunk-headers = false`). Short of room, the function goes first, then the folder, cut from the left; the name and counts stay.
 - **Bottom edge:** the status bar. What's compared (`uncommitted`, `v6.0..v6.1`, `stdin`), the position (`3/269 · 1/4 hunk`), the modes and the keys. A note (`copied 3 lines`) takes the modes' place for a moment. `status-bar = top`, or `b` in the command panel, moves it to the top edge.
 
-Under 16 rows or 100 columns (a phone), there's no frame. A title row and a status row are the only chrome, and every other row shows code. Under 100 columns, the tree opens over the diff, and the title becomes a file switcher, `‹ 3/12 name.rs ›`, with tap targets.
+Under 16 rows or 100 columns (a phone), there's no frame. A title row and a status row are the only chrome, and every other row shows code. Under 100 columns, the left panel opens over the diff, and the title becomes a file switcher, `‹ 3/12 name.rs ›`, with tap targets.
 
 ### Change marks
 
@@ -199,7 +206,7 @@ Code and paths never reach the terminal raw. Control characters show in caret no
 
 Most actions have a plain-letter key, and the command panel (`space`) reaches the rest with letters too, so a phone keyboard rarely needs ctrl or its symbol layer. Taps arrive as clicks and swipes as the wheel.
 
-- Under 100 columns, the tree opens over the whole diff instead of beside it, and a tap on a file opens it and closes the tree. The title row's `‹ 3/12 name.rs ›` switcher moves between files with a tap on an arrow and opens the picker with a tap on the name.
+- Under 100 columns, the left panel opens over the whole diff instead of beside it; a tap on a file opens it and closes the tree, and `enter` on a thread in the comments closes them on it. The title row's `‹ 3/12 name.rs ›` switcher moves between files with a tap on an arrow and opens the picker with a tap on the name.
 - `o` finds a file by typing part of its name, without opening the tree.
 - The command panel and the key list take the whole screen on narrow terminals.
 - A remembered split layout shows unified there, without forgetting the split.

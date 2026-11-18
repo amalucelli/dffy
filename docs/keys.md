@@ -54,7 +54,7 @@ keybind = leader:z=toggle_wrap
 |---|---|---|---|
 | `next_file` | `f` `]` `alt+f` `alt+right` | `n` | Next file |
 | `prev_file` | `F` `[` `alt+b` `alt+left` | `p` | Previous file |
-| `switch_pane` | `tab` `shift+tab` |  | Switch between the file tree and the diff |
+| `switch_pane` | `tab` `shift+tab` |  | Switch between the left panel (the file tree, or the comments) and the diff |
 | `toggle_tree` | `T` `t` | `t` | Show or hide the file tree |
 | `open_picker` | `o` | `o` | Find a file: type part of its path, enter opens it |
 | `search` | `/` | `S` | Search the diff's text; n/N then go between matches, esc clears |
@@ -114,7 +114,7 @@ keybind = leader:z=toggle_wrap
 | `edit` | `e` |  | Open the file in $EDITOR at the line last tapped, else the top line |
 | `comment` | `c` |  | Comment on the selected lines, or the line v would start on, in a text box under them; esc saves it |
 | `comment_file` | `C` |  | Comment on the whole file shown, in a text box under its first row; esc saves it |
-| `comments` | `i` |  | List every comment thread, files not in the diff included; enter goes to one |
+| `comments` | `i` |  | The left panel lists every comment thread in place of the files, or the files again; moving through the threads shows each in the diff, enter or tab goes to it |
 | `comment_in_editor` |  | `E` | Write in $EDITOR: your draft in the focused thread, else a reply to it, else a comment on the line; ctrl+g does it from the text box |
 | `review_pull` | `p` |  | On a review a review plugin opened, fetch its new commits and threads and show them in place (experimental, see review) |
 | `review_post` | `P` |  | On a review a review plugin opened, open the dialog that posts your drafts, replies and resolves as a review (experimental, see review) |

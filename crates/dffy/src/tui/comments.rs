@@ -23,14 +23,14 @@ use dffy_core::highlight;
 use dffy_core::view::{Attributes, Run, Spans};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-use super::help;
 use super::textbox::TextBox;
-use super::view::Entry;
+use super::view::{Entry, paint};
+use super::{fuzzy, tree};
 use crate::keys::{Action as Act, Keys};
 use crate::render::{Canvas, escape};
 use crate::review::{self, Anchor, Comment, LineNumbers, Op, Review};
 use crate::term::{Grid, Key, Mods};
-use crate::theme::{Ink, Role, Style, Theme};
+use crate::theme::{Ink, Role, Theme};
 
 /// How a thread shows, least pressing first: a thread with a draft in it
 /// is a draft, though its root is posted.
@@ -172,8 +172,6 @@ pub(crate) enum Writes {
 struct Placed {
     version: u64,
     threads: Arc<[Thread]>,
-    /// Line comments whose anchor matched nowhere.
-    unplaced: Vec<String>,
     /// Local drafts whose anchor matched nowhere: out of view.
     hidden: Vec<String>,
 }
@@ -262,6 +260,9 @@ pub(super) struct Comments {
     located: HashMap<BString, usize>,
     /// What stat said of `path` and `local` just before the last read.
     stamps: Vec<Option<Stamp>>,
+    /// Changes whenever the threads listed or placed may have: what the
+    /// panel's list is kept against.
+    generation: u64,
 }
 
 /// Modification time (seconds, nanoseconds), size and inode.
@@ -281,6 +282,7 @@ impl Comments {
             placed: HashMap::new(),
             located: HashMap::new(),
             stamps: Vec::new(),
+            generation: 0,
         }
     }
 
@@ -316,6 +318,7 @@ impl Comments {
             return Vec::new();
         }
         self.session = session;
+        self.generation += 1;
         self.placed.clear();
         self.by_path.keys().cloned().collect()
     }
@@ -378,6 +381,9 @@ impl Comments {
             }
         }
         self.from_local = from_local;
+        // Before the check: the local drafts may change when the review
+        // doesn't.
+        self.generation += 1;
         if review == self.review {
             return Ok(None);
         }
@@ -467,6 +473,7 @@ impl Comments {
     /// Finds the commented paths in the list `files`, after it changed
     /// order or content.
     pub(super) fn locate(&mut self, files: &[Entry]) {
+        self.generation += 1;
         self.located.clear();
         if self.by_path.is_empty() {
             return;
@@ -483,6 +490,7 @@ impl Comments {
     pub(super) fn locate_one(&mut self, file: usize, entry: &Entry) {
         let path = &entry.change().path;
         if !entry.is_commit() && self.by_path.contains_key(path) {
+            self.generation += 1;
             self.located.insert(path.clone(), file);
         }
     }
@@ -552,7 +560,6 @@ impl Comments {
             return;
         };
         let mut threads = Vec::new();
-        let mut unplaced = Vec::new();
         let mut hidden = Vec::new();
         let roots = review::threads(indices.iter().map(|&i| &self.review.comments[i]));
         for comment in roots.into_iter().filter(|c| c.in_reply_to.is_none()) {
@@ -577,50 +584,53 @@ impl Comments {
                         hidden.push(comment.id.clone());
                         continue;
                     } else {
-                        unplaced.push(comment.id.clone());
                         At::Lost
                     }
                 }
             };
-            threads.push(Thread {
-                root: comment.id.clone(),
-                look: self.look(comment),
-                resolved: comment.resolved,
-                outdated: comment.outdated,
-                url: comment.url.clone(),
-                notes: self
-                    .thread(&comment.id)
-                    .into_iter()
-                    .map(|c| Note {
-                        id: c.id.clone(),
-                        author: c.author.clone(),
-                        created: c.created.clone(),
-                        text: c.text.clone(),
-                        suggestion: c.suggestion.clone(),
-                        standing: self.standing(c),
-                    })
-                    .collect(),
-                lines: comment
-                    .anchor
-                    .as_ref()
-                    .map(|a| a.lines.clone())
-                    .unwrap_or_default(),
-                snippet: (at == At::Lost)
-                    .then(|| snippet(comment, highlight))
-                    .flatten(),
-                at,
-                local,
-            });
+            threads.push(self.thread_of(comment, at, highlight));
         }
+        self.generation += 1;
         self.placed.insert(
             path.into(),
             Placed {
                 version,
                 threads: threads.into(),
-                unplaced,
                 hidden,
             },
         );
+    }
+
+    /// The thread whose first comment is `root`, shown `at`. `highlight`
+    /// colors the code of one whose lines weren't found.
+    fn thread_of(&self, root: &Comment, at: At, highlight: bool) -> Thread {
+        Thread {
+            root: root.id.clone(),
+            look: self.look(root),
+            resolved: root.resolved,
+            outdated: root.outdated,
+            url: root.url.clone(),
+            notes: self
+                .thread(&root.id)
+                .into_iter()
+                .map(|c| Note {
+                    id: c.id.clone(),
+                    author: c.author.clone(),
+                    created: c.created.clone(),
+                    text: c.text.clone(),
+                    suggestion: c.suggestion.clone(),
+                    standing: self.standing(c),
+                })
+                .collect(),
+            lines: root
+                .anchor
+                .as_ref()
+                .map(|a| a.lines.clone())
+                .unwrap_or_default(),
+            snippet: (at == At::Lost).then(|| snippet(root, highlight)).flatten(),
+            local: self.from_local.contains(&root.id),
+            at,
+        }
     }
 
     /// The threads of `path`, once placed.
@@ -715,11 +725,10 @@ impl Comments {
         std::iter::once(first).chain(replies).collect()
     }
 
-    /// Every thread, by path and line, each with where it is when that's
-    /// not on a line: on a whole file, on a file not in the diff, or whose
-    /// lines weren't found. Also how many commented files are still to be
-    /// placed; `listing` while the list of files is still growing.
-    fn listed(&self, listing: bool) -> (Vec<(&Comment, Option<Why>)>, usize) {
+    /// Every thread's first comment, those on files not in the diff
+    /// included, and how many commented files are still to be placed;
+    /// `listing` while the list of files is still growing.
+    fn listed(&self, listing: bool) -> (Vec<&Comment>, usize) {
         let mut out = Vec::new();
         let mut waiting: Vec<&str> = Vec::new();
         for root in review::threads(&self.review.comments)
@@ -733,25 +742,86 @@ impl Comments {
             } else if self.hides(root) {
                 // A local draft that isn't on this diff is the local
                 // review's, not this one's.
-            } else if root.range().is_none() {
-                out.push((root, Some(Why::File)));
-            } else if !self.located.contains_key(path) {
-                if listing {
-                    waiting.push(&root.path);
-                } else {
-                    out.push((root, Some(Why::Absent)));
-                }
+            } else if root.range().is_none()
+                || self.placed.contains_key(path)
+                || (!self.located.contains_key(path) && !listing)
+            {
+                out.push(root);
             } else {
-                match self.placed.get(path) {
-                    Some(p) if p.unplaced.contains(&root.id) => out.push((root, Some(Why::Moved))),
-                    Some(_) => out.push((root, None)),
-                    None => waiting.push(&root.path),
-                }
+                waiting.push(&root.path);
             }
         }
         waiting.sort_unstable();
         waiting.dedup();
         (out, waiting.len())
+    }
+
+    /// [`Comments::listed`] by file: files in the list's order, then those
+    /// not in it by path; a file's threads most pressing first, then by
+    /// line. Placed threads are shared with the diff; threads on a file
+    /// that isn't placed are made here, their code not highlighted.
+    fn listing(&self, listing: bool) -> Listing {
+        let (list, waiting) = self.listed(listing);
+        let mut by_path: HashMap<&str, Vec<&Comment>> = HashMap::new();
+        for &root in &list {
+            by_path.entry(&root.path).or_default().push(root);
+        }
+        let mut paths: Vec<&str> = by_path.keys().copied().collect();
+        paths.sort_unstable_by_key(|&p| (self.file_of(p.as_bytes()).unwrap_or(usize::MAX), p));
+        let mut files = Vec::with_capacity(paths.len());
+        let mut items = Vec::with_capacity(list.len());
+        for path in paths {
+            let roots = &by_path[path];
+            let absent = !self.located.contains_key(path.as_bytes());
+            let threads: Arc<[Thread]> = match self.placed.get(path.as_bytes()) {
+                Some(placed) => Arc::clone(&placed.threads),
+                None => (roots.iter())
+                    .map(|root| {
+                        let at = if root.range().is_some() {
+                            At::Lost
+                        } else {
+                            At::File
+                        };
+                        self.thread_of(root, at, false)
+                    })
+                    .collect(),
+            };
+            let start = items.len();
+            for root in roots {
+                let Some(at) = threads.iter().position(|t| t.root == root.id) else {
+                    continue;
+                };
+                let line = match (&threads[at].at, root.range()) {
+                    (At::Line { lines, .. }, _) => Some(lines.start + 1),
+                    (_, Some((_, lines))) => Some(lines.start + 1),
+                    (_, None) => None,
+                };
+                items.push(Item {
+                    group: files.len(),
+                    rank: Rank::of(&threads[at]),
+                    threads: Arc::clone(&threads),
+                    at,
+                    line,
+                });
+            }
+            items[start..].sort_by_key(|i| (i.rank, i.line.unwrap_or(0)));
+            files.push(Group {
+                path: path.to_owned(),
+                absent,
+            });
+        }
+        #[cfg(test)]
+        LISTED.with(|n| n.set(n.get() + 1));
+        Listing {
+            key: (self.generation, listing),
+            counts: [
+                items.len(),
+                items.iter().filter(|i| !i.thread().resolved).count(),
+            ],
+            files,
+            items,
+            waiting,
+        }
     }
 }
 
@@ -953,6 +1023,18 @@ pub(crate) fn painted_count() -> usize {
     PAINTED.with(std::cell::Cell::get)
 }
 
+#[cfg(test)]
+thread_local! {
+    static LISTED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Times the comments panel's list was made on this thread, to tell that
+/// it isn't while the panel shows the files.
+#[cfg(test)]
+pub(crate) fn listed_count() -> usize {
+    LISTED.with(std::cell::Cell::get)
+}
+
 /// The syntax runs of `lines`, parsed together as `path`'s language would
 /// be; `None` without one, or when they don't parse in time.
 fn painted(path: &str, lines: &[&str]) -> Option<Spans> {
@@ -1118,6 +1200,63 @@ fn cut<I: Into<Ink> + Copy>(c: &mut Canvas, spans: &[(I, &str)], width: usize) -
     used + 1
 }
 
+/// Pushes `width` columns: `left` cut to fit, and `right` at the right end
+/// when that leaves a dozen columns of `left`.
+fn spread(c: &mut Canvas, left: &[(Ink, &str)], right: &[(Role, &str)], width: usize) {
+    let right_width = match spans_width(right) {
+        w if w > 0 && w + 2 + 12 <= width => w,
+        _ => 0,
+    };
+    let room = match right_width {
+        0 => width,
+        w => width - w - 2,
+    };
+    let used = cut(c, left, room);
+    c.spaces(Role::Plain, width - used - right_width);
+    if right_width > 0 {
+        cut(c, right, right_width);
+    }
+}
+
+/// A thread summed up on one row, as a folded thread's card says it.
+struct Summary {
+    author: String,
+    /// ` · 2h ago`.
+    when: String,
+    /// The first line of the first comment.
+    text: String,
+    /// `2 replies`; empty without any.
+    replies: String,
+}
+
+impl Summary {
+    fn new(first: &Note, replies: usize, now: u64) -> Self {
+        Self {
+            author: who(&first.author),
+            when: format!(" · {}", age(&first.created, now)),
+            text: escape(first.text.lines().next().unwrap_or_default().as_bytes()),
+            replies: match replies {
+                0 => String::new(),
+                1 => "1 reply".to_owned(),
+                n => format!("{n} replies"),
+            },
+        }
+    }
+
+    /// The author, the age, `thread`'s tags (see [`tags`]) and the text.
+    fn spans<'a>(&'a self, thread: &'a Thread, first: &Note) -> Vec<(Ink, &'a str)> {
+        let mut spans = vec![
+            (AUTHOR, self.author.as_str()),
+            (Role::Dim.into(), &self.when),
+        ];
+        for (role, tag) in tags(thread, first) {
+            spans.extend([(Role::Dim.into(), " · "), (role.into(), tag)]);
+        }
+        spans.extend([(Role::Dim.into(), " · "), (Role::Plain.into(), &self.text)]);
+        spans
+    }
+}
+
 /// The lines of a thread's box: light, heavy while it has the focus, and
 /// dashed while it holds a draft. Shapes differ as well as colors: without
 /// color the theme is attributes only.
@@ -1188,27 +1327,13 @@ impl Frame<'_> {
         self.c.end_line();
     }
 
-    /// A folded thread's one row, between the box's sides: `left` cut to
-    /// fit, and `right` at the right end when that leaves a dozen columns
-    /// of `left`.
+    /// A folded thread's one row, between the box's sides.
     fn card(&mut self, left: &[(Ink, &str)], right: &[(Role, &str)]) {
         let Border { role, down, .. } = self.border;
         let inner = self.inner();
-        let right_width = match spans_width(right) {
-            w if w > 0 && w + 2 + 12 <= inner => w,
-            _ => 0,
-        };
-        let room = match right_width {
-            0 => inner,
-            w => inner - w - 2,
-        };
         self.c.push(role, down);
         self.c.push(Role::Plain, " ");
-        let used = cut(self.c, left, room);
-        self.c.spaces(Role::Plain, inner - used - right_width);
-        if right_width > 0 {
-            cut(self.c, right, right_width);
-        }
+        spread(self.c, left, right, inner);
         self.c.push(Role::Plain, " ");
         self.c.push(role, down);
         self.c.end_line();
@@ -1313,7 +1438,7 @@ fn tags<'a>(thread: &'a Thread, first: &Note) -> Vec<(Role, &'a str)> {
     match (&thread.at, &thread.snippet) {
         (At::File, _) => out.push((Role::Dim, "on the file")),
         (At::Lost, Some(snippet)) => out.push((Role::Warn, &snippet.heading)),
-        (At::Lost, None) => out.push((Role::Warn, "lines not found")),
+        (At::Lost, _) => out.push((Role::Warn, "lines not found")),
         (At::Line { .. }, _) => {}
     }
     out
@@ -1341,27 +1466,10 @@ pub(crate) fn thread_rows(
     let border = Border::new(thread.look == Look::Draft, focused);
     let mut frame = Frame { c, border, width };
     if collapsed && writing.is_none() {
-        let author = who(&first.author);
-        let when = format!(" · {}", age(&first.created, now));
-        let text = escape(first.text.lines().next().unwrap_or_default().as_bytes());
-        let mut spans = vec![
-            (Role::Dim.into(), "▸ "),
-            (AUTHOR, author.as_str()),
-            (Role::Dim.into(), when.as_str()),
-        ];
-        for (role, tag) in tags(thread, first) {
-            spans.extend([(Role::Dim.into(), " · "), (role.into(), tag)]);
-        }
-        spans.extend([
-            (Role::Dim.into(), " · "),
-            (Role::Plain.into(), text.as_str()),
-        ]);
-        let count = match thread.notes.len() - 1 {
-            0 => String::new(),
-            1 => "1 reply".to_owned(),
-            n => format!("{n} replies"),
-        };
-        frame.card(&spans, &[(Role::Dim, count.as_str())]);
+        let summary = Summary::new(first, thread.notes.len() - 1, now);
+        let mut spans = vec![(Role::Dim.into(), "▸ ")];
+        spans.extend(summary.spans(thread, first));
+        frame.card(&spans, &[(Role::Dim, &summary.replies)]);
         return true;
     }
     let inner = frame.inner();
@@ -1447,50 +1555,265 @@ pub(crate) fn new_rows(text: &mut TextBox, width: usize, c: &mut Canvas) {
     frame.bottom();
 }
 
-/// Why a thread isn't on a line.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Why {
-    /// A comment on the whole file.
-    File,
-    /// Its file isn't in this diff.
-    Absent,
-    /// Its lines weren't found where they were or near.
-    Moved,
-}
-
-/// What a key in the panel asks of the viewer.
+/// What a key in the comments panel did.
 #[derive(Debug, PartialEq, Eq)]
 pub(super) enum Outcome {
     Stay,
-    Close,
-    /// Go to the thread with this root, and its file.
-    Open(String),
+    /// The selection moved to the thread with this root: the diff shows it.
+    Moved(String),
+    /// The keys go to the diff.
+    Diff,
+    /// Not the panel's: the key does what it does in the tree.
+    Pass,
 }
 
-/// The panel over the diff listing every thread; `enter` goes to the one
-/// selected.
+/// The filters in the order `f` steps through them, as the title names
+/// them, and what each says when it keeps nothing.
+const FILTERS: [(&str, &str); 4] = [
+    ("", "no threads"),
+    ("open", "no open threads"),
+    ("drafts", "no drafts"),
+    ("resolved", "no resolved threads"),
+];
+/// A thread's row narrower than this leaves out its line, and narrower
+/// than [`REPLIES_COLUMNS`] its replies too.
+const LINE_COLUMNS: usize = 22;
+const REPLIES_COLUMNS: usize = 18;
+
+/// How pressing a thread is, most first: the order of a file's threads in
+/// the panel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum Rank {
+    Draft,
+    Open,
+    Outdated,
+    Resolved,
+}
+
+impl Rank {
+    /// A thread with a draft in it is a draft, even resolved: posting
+    /// sends it.
+    fn of(thread: &Thread) -> Self {
+        if thread.notes.iter().any(|n| n.standing == Standing::Draft) {
+            Self::Draft
+        } else if thread.resolved {
+            Self::Resolved
+        } else if thread.outdated {
+            Self::Outdated
+        } else {
+            Self::Open
+        }
+    }
+}
+
+/// Every thread the panel lists, by file, made from one generation of the
+/// comments.
+struct Listing {
+    /// That generation, and whether the list of files was still growing.
+    key: (u64, bool),
+    files: Vec<Group>,
+    /// File by file, in [`Listing::files`]' order.
+    items: Vec<Item>,
+    /// Threads, and open ones.
+    counts: [usize; 2],
+    /// Commented files still to be placed.
+    waiting: usize,
+}
+
+struct Group {
+    path: String,
+    /// Not in the list of files.
+    absent: bool,
+}
+
+struct Item {
+    /// Its file, in [`Listing::files`].
+    group: usize,
+    rank: Rank,
+    /// Its file's threads, and which it is.
+    threads: Arc<[Thread]>,
+    at: usize,
+    /// Its first line, 1-based; `None` on the whole file.
+    line: Option<usize>,
+}
+
+impl Item {
+    fn thread(&self) -> &Thread {
+        &self.threads[self.at]
+    }
+}
+
+/// A row of the panel's list.
+enum Row {
+    /// A file's header, with how many of its threads are kept.
+    File {
+        group: usize,
+        threads: usize,
+    },
+    /// A thread, by its index in [`Listing::items`]; `author` when the row
+    /// names its author, who isn't the row above's.
+    Thread {
+        item: usize,
+        author: bool,
+    },
+    Note(String),
+}
+
+/// The comment threads listed by file in the left panel, in place of the
+/// tree (`i`). Moving the selection shows the thread in the diff, which is
+/// its preview: see [`Outcome::Moved`].
+///
+/// The list is made when the panel opens, and again only when the
+/// comments or the list of files change; its rows when the filter or the
+/// search change too. A frame draws the rows on screen.
 pub(super) struct Panel {
+    /// Which of [`FILTERS`].
+    filter: usize,
+    /// Typed after `/`, lowercase.
+    search: String,
+    /// Keys go to the search.
+    pub editing: bool,
+    listing: Option<Listing>,
+    rows: Vec<Row>,
+    /// The filter or the search changed since `rows` were made.
+    stale: bool,
+    /// The last root [`Panel::select`] didn't find in `rows`, so a frame
+    /// with a thread focused that the filter hides doesn't look again.
+    missed: Option<String>,
+    /// A thread's row, when there's one.
     selected: usize,
     scroll: usize,
-    /// Rows the panel showed last, for paging.
-    page: usize,
+    /// Rows the panel showed last, for paging and taps.
+    height: usize,
 }
 
 impl Panel {
-    pub(super) fn new() -> Self {
-        Self {
+    /// `listing` while the list of files is still growing. The selection
+    /// starts on the thread with root `near.0`, else on the first of file
+    /// `near.1`'s, else on the first.
+    pub(super) fn new(comments: &Comments, listing: bool, near: (Option<&str>, &[u8])) -> Self {
+        let mut panel = Self {
+            filter: 0,
+            search: String::new(),
+            editing: false,
+            listing: None,
+            rows: Vec::new(),
+            stale: true,
+            missed: None,
             selected: 0,
             scroll: 0,
-            page: 1,
+            height: 1,
+        };
+        panel.sync(comments, listing);
+        if let Some(list) = &panel.listing
+            && let Some(i) = panel.rows.iter().position(|r| match r {
+                Row::Thread { item, .. } => {
+                    let item = &list.items[*item];
+                    near.0.map_or_else(
+                        || list.files[item.group].path.as_bytes() == near.1,
+                        |root| item.thread().root == root,
+                    )
+                }
+                _ => false,
+            })
+        {
+            panel.selected = i;
+        }
+        panel
+    }
+
+    /// The selected thread's root.
+    pub(super) fn selected(&self) -> Option<&str> {
+        let Row::Thread { item, .. } = self.rows.get(self.selected)? else {
+            return None;
+        };
+        Some(&self.listing.as_ref()?.items[*item].thread().root)
+    }
+
+    /// Selects the thread with root `root`, when it's listed.
+    pub(super) fn select(&mut self, root: &str) {
+        if self.selected() == Some(root) || self.missed.as_deref() == Some(root) {
+            return;
+        }
+        let Some(list) = &self.listing else {
+            return;
+        };
+        match self.rows.iter().position(
+            |r| matches!(r, Row::Thread { item, .. } if list.items[*item].thread().root == root),
+        ) {
+            Some(i) => self.selected = i,
+            None => self.missed = Some(root.to_owned()),
         }
     }
 
-    pub(super) fn scroll_by(&mut self, rows: isize) {
-        self.scroll = self.scroll.saturating_add_signed(rows);
+    /// The wheel moves the selection a thread a notch. Returns the root it
+    /// moved to.
+    pub(super) fn scroll_by(&mut self, by: isize) -> Option<String> {
+        let before = self.selected().map(str::to_owned);
+        self.step(by);
+        self.selected()
+            .filter(|&r| before.as_deref() != Some(r))
+            .map(str::to_owned)
     }
 
-    /// What `key` does; keys the panel doesn't use close it, as in `?`.
-    /// `listing` while the list of files is still growing.
+    /// Selects the thread at panel line `y` (0 is the first row below the
+    /// border), and returns its root.
+    pub(super) fn click(&mut self, y: usize) -> Option<String> {
+        let row = self.scroll + y;
+        if y >= self.height || !matches!(self.rows.get(row), Some(Row::Thread { .. })) {
+            return None;
+        }
+        self.selected = row;
+        self.selected().map(str::to_owned)
+    }
+
+    /// Moves the selection `by` threads, over the headers, stopping at
+    /// either end.
+    fn step(&mut self, by: isize) {
+        let threads: Vec<usize> = (self.rows.iter().enumerate())
+            .filter(|(_, r)| matches!(r, Row::Thread { .. }))
+            .map(|(i, _)| i)
+            .collect();
+        if let Some(at) = threads.iter().position(|&i| i == self.selected) {
+            self.selected = threads[at.saturating_add_signed(by).min(threads.len() - 1)];
+        }
+    }
+
+    /// Makes the list again when the comments or the list of files
+    /// changed, and the rows when the filter or the search did too,
+    /// keeping the selected thread when it's still listed, else the next
+    /// one.
+    fn sync(&mut self, comments: &Comments, listing: bool) {
+        let key = (comments.generation, listing);
+        let old = self.listing.as_ref().is_none_or(|l| l.key != key);
+        if !old && !self.stale {
+            return;
+        }
+        let root = self.selected().map(str::to_owned);
+        if old {
+            self.listing = Some(comments.listing(listing));
+        }
+        self.stale = false;
+        let Some(list) = &self.listing else {
+            return;
+        };
+        self.rows = rows(list, self.filter, &self.search);
+        self.missed = None;
+        let threads = (self.rows.iter().enumerate())
+            .filter_map(|(i, r)| match r {
+                Row::Thread { item, .. } => Some((i, &list.items[*item].thread().root)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let next = (threads.iter())
+            .find(|(_, r)| Some(r.as_str()) == root.as_deref())
+            .or_else(|| threads.iter().find(|&&(i, _)| i >= self.selected))
+            .or_else(|| threads.last());
+        self.selected = next.map_or(0, |&(i, _)| i);
+    }
+
+    /// What `key` does; `listing` while the list of files is still
+    /// growing.
     pub(super) fn key(
         &mut self,
         (comments, listing): (&Comments, bool),
@@ -1498,187 +1821,323 @@ impl Panel {
         key: Key,
         mods: Mods,
     ) -> Outcome {
-        let list = comments.listed(listing).0;
-        let len = list.len();
-        let page = self.page.max(1);
-        match (key, keys.action(false, key, mods)) {
-            (Key::Enter, _) => list
-                .get(self.selected)
-                .map_or(Outcome::Stay, |(c, _)| Outcome::Open(c.id.clone())),
-            (Key::Down, _) | (_, Some(Act::ScrollDown)) => {
-                self.selected = (self.selected + 1).min(len.saturating_sub(1));
-                Outcome::Stay
+        self.sync(comments, listing);
+        let before = self.selected().map(str::to_owned);
+        let outcome = self.act(keys, key, mods);
+        // A filter or search dropping the selected thread moves it too.
+        self.sync(comments, listing);
+        match (outcome, self.selected()) {
+            (Outcome::Stay, Some(root)) if before.as_deref() != Some(root) => {
+                Outcome::Moved(root.to_owned())
             }
-            (Key::Up, _) | (_, Some(Act::ScrollUp)) => {
-                self.selected = self.selected.saturating_sub(1);
-                Outcome::Stay
-            }
-            (Key::PageDown, _) | (_, Some(Act::PageDown | Act::HalfPageDown)) => {
-                self.selected = (self.selected + page).min(len.saturating_sub(1));
-                Outcome::Stay
-            }
-            (Key::PageUp, _) | (_, Some(Act::PageUp | Act::HalfPageUp)) => {
-                self.selected = self.selected.saturating_sub(page);
-                Outcome::Stay
-            }
-            _ => Outcome::Close,
+            (outcome, _) => outcome,
         }
     }
 
-    /// Draws the panel in the middle of the screen, the whole screen on a
-    /// narrow one.
+    /// While the search is typed, keys with ctrl still move and quit.
+    fn act(&mut self, keys: &Keys, key: Key, mods: Mods) -> Outcome {
+        if self.editing && !mods.contains(Mods::CTRL) {
+            match key {
+                Key::Esc => {
+                    self.search.clear();
+                    self.editing = false;
+                }
+                Key::Enter => self.editing = false,
+                Key::Backspace => {
+                    self.search.pop();
+                }
+                Key::Char(c) => self.search.extend(c.to_lowercase()),
+                _ => return Outcome::Stay,
+            }
+            self.stale = true;
+            return Outcome::Stay;
+        }
+        let page = isize::try_from(self.height.max(1)).unwrap_or(isize::MAX);
+        let plain = !mods.contains(Mods::CTRL) && !mods.contains(Mods::ALT);
+        match (key, keys.action(true, key, mods)) {
+            (Key::Esc, _) if !self.search.is_empty() => {
+                self.search.clear();
+                self.stale = true;
+            }
+            (Key::Esc | Key::Enter, _) | (_, Some(Act::Open)) => return Outcome::Diff,
+            (Key::Char('f'), _) if plain => {
+                self.filter = (self.filter + 1) % FILTERS.len();
+                self.stale = true;
+            }
+            (Key::Char('F'), _) if plain => {
+                self.filter = (self.filter + FILTERS.len() - 1) % FILTERS.len();
+                self.stale = true;
+            }
+            (_, Some(Act::FilterTree)) => self.editing = true,
+            (_, Some(Act::ScrollDown)) => self.step(1),
+            (_, Some(Act::ScrollUp)) => self.step(-1),
+            (_, Some(Act::PageDown | Act::HalfPageDown)) => self.step(page),
+            (_, Some(Act::PageUp | Act::HalfPageUp)) => self.step(-page),
+            (_, Some(Act::Top)) => self.step(isize::MIN),
+            (_, Some(Act::Bottom)) => self.step(isize::MAX),
+            // The tree's, which isn't shown.
+            (_, Some(Act::Collapse | Act::MarkViewed)) => {}
+            _ => return Outcome::Pass,
+        }
+        Outcome::Stay
+    }
+
+    /// The title's parts: every thread and the open ones, or with a filter
+    /// or a search, how many of them it keeps and what it is.
+    fn title(&self, list: &Listing) -> Vec<(String, Role)> {
+        let [all, open] = list.counts;
+        let mut parts = vec![(" Comments".to_owned(), Role::Plain)];
+        if self.filter == 0 && self.search.is_empty() {
+            let s = if all == 1 { "" } else { "s" };
+            parts.push((format!(" · {all} thread{s}"), Role::Dim));
+            parts.push((format!(" · {open} open"), Role::Dim));
+            return parts;
+        }
+        let kept = (self.rows.iter())
+            .filter(|r| matches!(r, Row::Thread { .. }))
+            .count();
+        parts.push((format!(" · {kept}/{all}"), Role::Dim));
+        if self.filter > 0 {
+            parts.push((format!(" · {}", FILTERS[self.filter].0), Role::Hint));
+        }
+        if !self.search.is_empty() {
+            parts.push((format!(" · /{}", self.search), Role::Hint));
+        }
+        parts
+    }
+
+    /// Draws the panel into columns `0..width` of rows `top..top + height`,
+    /// scrolled to show the selected thread and, for a file's first, its
+    /// header; see [`tree::frame`] for `joined`.
     pub(super) fn draw(
         &mut self,
         grid: &mut Grid,
+        (top, height, width): (usize, usize, usize),
+        (comments, listing): (&Comments, bool),
+        (focused, joined): (bool, bool),
         theme: &Theme,
-        comments: &Comments,
-        listing: bool,
     ) {
-        let (gw, gh) = (grid.width(), grid.height());
-        if gw < 12 || gh < 6 {
+        if height < 3 || width < 5 {
             return;
         }
-        let full = gw < help::FULL_SCREEN_BELOW;
-        let (width, height) = if full {
-            (gw, gh)
-        } else {
-            ((gw - 4).min(100), gh - 2)
+        self.sync(comments, listing);
+        self.height = height - 2;
+        let selected = matches!(self.rows.get(self.selected), Some(Row::Thread { .. }));
+        if selected {
+            let first = match self.selected.checked_sub(1).map(|i| &self.rows[i]) {
+                Some(Row::File { .. }) => self.selected - 1,
+                _ => self.selected,
+            };
+            if first < self.scroll {
+                self.scroll = first;
+            } else if self.selected >= self.scroll + self.height {
+                self.scroll = self.selected + 1 - self.height;
+            }
+        }
+        self.scroll = self.scroll.min(self.rows.len().saturating_sub(self.height));
+        let Some(list) = &self.listing else {
+            return;
         };
-        let (x0, y0) = ((gw - width) / 2, (gh - height) / 2);
-        let end = x0 + width;
-        let (x, right) = (x0 + 2, end - 3);
-        let (list, waiting) = comments.listed(listing);
-        self.selected = self.selected.min(list.len().saturating_sub(1));
-        let lines = list_lines(comments, &list, waiting, right - x);
-        help::frame(grid, (x0, y0, width, height), " comments ", theme);
-        let top = y0 + 1;
-        let rows = height.saturating_sub(3);
-        self.page = rows;
-        if let Some(at) = lines.iter().position(|l| l.item == Some(self.selected)) {
-            if at < self.scroll {
-                self.scroll = at;
-            } else if at >= self.scroll + rows {
-                self.scroll = at + 1 - rows;
-            }
-        }
-        self.scroll = self.scroll.min(lines.len().saturating_sub(rows));
-        for (i, line) in lines.iter().skip(self.scroll).take(rows).enumerate() {
-            let mut style = theme.style(line.role);
-            if line.item == Some(self.selected) {
-                grid.fill(
-                    x - 1,
-                    top + i,
-                    right + 1,
-                    theme.selected(Style::PLAIN, true),
-                );
-                style = theme.selected(style, true);
-                style.attributes |= Attributes::BOLD;
-            }
-            grid.put_str(x, top + i, right, &line.text, style);
-        }
-        help::scrollbar(
+        let typing =
+            (self.editing).then_some((self.search.as_str(), "type to search · esc clear "));
+        let place = (top, height, width);
+        tree::frame(
             grid,
-            (end - 2, top, rows),
-            (lines.len(), self.scroll),
-            theme.style(Role::Dim),
+            place,
+            &self.title(list),
+            typing,
+            (focused, joined),
+            theme,
         );
-        grid.put_str(
-            x,
-            y0 + height - 2,
-            right,
-            "enter goes to it · esc close",
-            theme.style(Role::Dim),
-        );
+        let (x, right) = (2, width - 2);
+        let mut c = Canvas::default();
+        for row in self.rows.iter().skip(self.scroll).take(self.height) {
+            list_row(&mut c, list, row, right - x);
+        }
+        for (i, cells) in c.rows().enumerate() {
+            let y = top + 1 + i;
+            paint(grid, x, y, right, cells, theme, Attributes::NONE);
+            if selected && self.scroll + i == self.selected {
+                grid.map_styles(1, y, width - 1, |s| theme.selected(s, focused));
+            }
+        }
     }
 }
 
-/// A row of the panel's text.
-struct Line {
-    text: String,
-    role: Role,
-    /// The thread it's of.
-    item: Option<usize>,
-}
-
-/// Where a thread is: `path:12` on the new side, `path:12 (old)` on the
-/// old one, the path alone for a file comment.
-fn location(root: &Comment) -> String {
-    let path = escape(root.path.as_bytes());
-    match root.range() {
-        Some((review::Side::New, lines)) => format!("{path}:{}", lines.start + 1),
-        Some((review::Side::Old, lines)) => format!("{path}:{} (old)", lines.start + 1),
-        None => path,
+/// The rows of `list` that filter `filter` and `search` keep: each file's
+/// header, then its threads.
+fn rows(list: &Listing, filter: usize, search: &str) -> Vec<Row> {
+    let mut rows = Vec::new();
+    if list.waiting > 0 {
+        let s = if list.waiting == 1 { "" } else { "s" };
+        rows.push(Row::Note(format!(
+            "finding the lines of comments in {} file{s}…",
+            list.waiting
+        )));
     }
-}
-
-fn list_lines(
-    comments: &Comments,
-    list: &[(&Comment, Option<Why>)],
-    waiting: usize,
-    width: usize,
-) -> Vec<Line> {
-    let mut lines = Vec::new();
-    if waiting > 0 {
-        let s = if waiting == 1 { "" } else { "s" };
-        lines.push(Line {
-            text: format!("finding the lines of comments in {waiting} file{s}…"),
-            role: Role::Dim,
-            item: None,
+    if list.items.is_empty() {
+        if list.waiting == 0 {
+            rows.push(Row::Note(
+                "no comments yet: c comments on the line at the top".to_owned(),
+            ));
+        }
+        return rows;
+    }
+    let kept: Vec<usize> = (0..list.items.len())
+        .filter(|&i| keeps(list, &list.items[i], filter, search))
+        .collect();
+    if kept.is_empty() {
+        rows.push(Row::Note(if search.is_empty() {
+            FILTERS[filter].1.to_owned()
+        } else {
+            format!("no thread matches /{search}")
+        }));
+    }
+    for threads in kept.chunk_by(|&a, &b| list.items[a].group == list.items[b].group) {
+        rows.push(Row::File {
+            group: list.items[threads[0]].group,
+            threads: threads.len(),
         });
+        let mut above = None;
+        for &item in threads {
+            let author = list.items[item].thread().notes.first().map(|n| &n.author);
+            rows.push(Row::Thread {
+                item,
+                author: author != above,
+            });
+            above = author;
+        }
     }
-    if list.is_empty() && waiting == 0 {
-        lines.push(Line {
-            text: "no comments yet: c comments on the line at the top".to_owned(),
-            role: Role::Dim,
-            item: None,
-        });
-    }
-    for (i, (root, why)) in list.iter().enumerate() {
-        let state = match comments.standing(root) {
-            _ if root.resolved => " · resolved",
-            Standing::Draft => " · draft",
-            Standing::Unposted => " · not posted",
-            Standing::Posted => " · posted",
-            Standing::Kept => "",
-        };
-        let note = match why {
-            Some(Why::File) => " · on the file",
-            Some(Why::Absent) => " · file not in this diff",
-            Some(Why::Moved) => " · lines not found",
-            None => "",
-        };
-        let first = root.text.lines().next().unwrap_or_default();
-        let text = format!(
-            "{}{state}{note} · {}",
-            location(root),
-            escape(first.as_bytes())
-        );
-        lines.push(Line {
-            text: fit(&text, width),
-            role: Role::Plain,
-            item: Some(i),
-        });
-    }
-    lines
+    rows
 }
 
-/// `text` cut to `width` columns, with `…` when it's longer.
-fn fit(text: &str, width: usize) -> String {
+/// Whether filter `filter` and `search` keep `item`: the search finds its
+/// file's path, fuzzily, or what a comment's author or text has.
+fn keeps(list: &Listing, item: &Item, filter: usize, search: &str) -> bool {
+    let thread = item.thread();
+    let state = match filter {
+        1 => !thread.resolved,
+        2 => item.rank == Rank::Draft,
+        3 => thread.resolved,
+        _ => true,
+    };
+    state
+        && (search.is_empty()
+            || fuzzy::score_close(search, &list.files[item.group].path).is_some()
+            || thread.notes.iter().any(|n| {
+                who(&n.author).to_lowercase().contains(search)
+                    || n.text.to_lowercase().contains(search)
+            }))
+}
+
+/// Writes `row` of the panel's list, `width` columns wide. A file's header
+/// has its folders dimmed and cut from the left to leave its name whole,
+/// and its threads at the right. A thread's row has its mark, its line, a
+/// word when its place or standing needs one (`moved` for lines not found
+/// on a file in the diff, `local`, `not posted`), its author when the row
+/// says it, its first line, and its replies at the right; a resolved one
+/// is dimmed whole.
+fn list_row(c: &mut Canvas, list: &Listing, row: &Row, width: usize) {
+    match row {
+        Row::Note(text) => {
+            cut(c, &[(Role::Dim, text.as_str())], width);
+        }
+        Row::File { group, threads } => {
+            let group = &list.files[*group];
+            let path = escape(group.path.as_bytes());
+            let (dir, name) = path.split_at(path.rfind('/').map_or(0, |i| i + 1));
+            let absent = if group.absent {
+                " · not in this diff"
+            } else {
+                ""
+            };
+            let count = threads.to_string();
+            let room = width.saturating_sub(count.width() + 2);
+            let dir = tail(dir, room.saturating_sub(name.width() + absent.width()));
+            spread(
+                c,
+                &[
+                    (Role::Dim.into(), &dir),
+                    (AUTHOR, name),
+                    (Role::Dim.into(), absent),
+                ],
+                &[(Role::Dim, &count)],
+                width,
+            );
+        }
+        Row::Thread { item, author } => {
+            let item = &list.items[*item];
+            let thread = item.thread();
+            let Some(first) = thread.notes.first() else {
+                c.end_line();
+                return;
+            };
+            let ink = |role: Role| -> Ink {
+                if thread.resolved {
+                    Role::Dim.into()
+                } else {
+                    role.into()
+                }
+            };
+            let line = (item.line)
+                .filter(|_| width >= LINE_COLUMNS)
+                .map(|n| format!(":{n} "));
+            let words = [
+                (thread.at == At::Lost && !list.files[item.group].absent)
+                    .then_some((Role::Dim, "moved")),
+                thread.local.then_some((Role::Hint, "local")),
+                (first.standing == Standing::Unposted).then_some((Role::Dim, "not posted")),
+            ];
+            let name = author.then(|| who(&first.author));
+            let text = escape(first.text.lines().next().unwrap_or_default().as_bytes());
+            let mut spans = vec![
+                (ink(Role::Plain), "  "),
+                (ink(thread.look.role()), thread.look.glyph()),
+                (ink(Role::Plain), " "),
+            ];
+            spans.extend(line.as_deref().map(|l| (ink(Role::Plain), l)));
+            for (role, word) in words.into_iter().flatten() {
+                spans.extend([(ink(role), word), (ink(Role::Plain), " ")]);
+            }
+            if let Some(name) = &name {
+                let bold = if thread.resolved {
+                    ink(Role::Dim)
+                } else {
+                    AUTHOR
+                };
+                spans.extend([(bold, name.as_str()), (ink(Role::Plain), " ")]);
+            }
+            spans.push((ink(Role::Plain), &text));
+            let replies = match thread.notes.len() - 1 {
+                0 => String::new(),
+                _ if width < REPLIES_COLUMNS => String::new(),
+                n => n.to_string(),
+            };
+            spread(c, &spans, &[(Role::Dim, &replies)], width);
+        }
+    }
+    c.end_line();
+}
+
+/// The end of `text` that fits `width` columns, after `…` when that's not
+/// all of it.
+fn tail(text: &str, width: usize) -> String {
     if text.width() <= width {
         return text.to_owned();
     }
-    let mut out = String::new();
-    let mut used = 0;
-    for c in text.chars() {
-        let w = c.width().unwrap_or(0);
-        if used + w + 1 > width {
+    if width == 0 {
+        return String::new();
+    }
+    let mut used = 1;
+    let mut start = text.len();
+    for (i, ch) in text.char_indices().rev() {
+        used += ch.width().unwrap_or(0);
+        if used > width {
             break;
         }
-        used += w;
-        out.push(c);
+        start = i;
     }
-    out.push('…');
-    out
+    format!("…{}", &text[start..])
 }
 
 /// `text`'s lines wrapped at spaces to `width` columns; a word longer than

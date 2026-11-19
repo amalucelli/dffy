@@ -468,9 +468,12 @@ impl App {
     /// file from then on, or where there's no file to comment on, the text
     /// goes to a file of its own ([`App::take_orphaned`]). Either is said.
     pub(super) fn keep_orphaned_box(&mut self) {
+        // Gone from the file, not only from the threads shown, as a thread
+        // waiting to be placed again after its diff changed is.
         let gone = self.doc.writing().is_some_and(|w| match &w.at {
             Writes::Reply(root) | Writes::Edit { root, .. } => {
                 !self.doc.threads().iter().any(|t| t.root == *root)
+                    && (self.comments.as_ref()).is_none_or(|c| c.thread_root(root).is_none())
             }
             Writes::New { .. } | Writes::File => false,
         });

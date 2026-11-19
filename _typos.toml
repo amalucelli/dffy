@@ -1,3 +1,7 @@
+[default]
+# Commit ids, base64 inside terminal escapes, and words a narrow box cuts short.
+extend-ignore-re = ["\\b[0-9a-f]{6,40}\\b", "[A-Za-z0-9+/]{24,}={0,2}", "\\w+…"]
+
 [files]
 # Fixtures are captured git output; abbreviated object ids read as words.
 extend-exclude = [".claude/", "target/", "crates/dffy/tests/fixtures/"]

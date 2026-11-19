@@ -68,7 +68,7 @@ On a terminal, dffy opens a viewer showing one file at a time; when its output i
 
 - **In the diff,** it searches the diff's text, across files, and the comments shown in it.
   - It's case-insensitive unless the search has a capital letter.
-  - A match in a comment lands on the row of its box that shows it (a folded thread's one row), and `n`/`N` go through code and comments in the order they show. The conversation page isn't searched.
+  - A match in a comment lands on the row of its box that shows it (a folded thread's one row), and `n`/`N` go through code and comments in the order they show, the Conversation's comments included.
   - Matches are highlighted as they're found, and typing doesn't wait for a large file to be searched.
   - `enter` goes to the first match. `n`/`N` then go between matches (`match 3/17` in the status bar) instead of between changes, and `esc` ends the search.
 - **In the tree,** it filters the tree fuzzily. `f`/`F` and `n`/`N` keep to the files the filter keeps, and `esc` clears it.
@@ -195,7 +195,7 @@ Review comments live in a comments file ([comments.md](comments.md)): `--comment
 
 - **Placing:** a comment sits on its lines while their text matches what it was written on, or on the one place nearby where those lines and the two around them match. Files with comments are diffed in the background, so every thread finds its place, or is known to have none.
 - **Hidden lines:** when a thread is placed on lines a `⋯` separator hides, folded or resolved ones included, those lines show with two unchanged lines above and below, between a separator for the lines still hidden above and one for those below; the screen stays where it was. `x` then reveals more from the gap's edges. In a rendered view, a thread shows under the last row drawn from its lines, and threads on rows hidden in a rendered view's gaps don't show; `i`'s list still has them.
-- **Search** (`/`) looks in comments too: the text of a file's placed threads counts among its matches, in every file, and `n` steps through them where they show.
+- **Search** (`/`) looks in comments too, in every file ([Search](#search)).
 - **Reloading:** dffy watches the file and shows changes from other programs, such as a review plugin or `dffy comments apply` in another shell, as they're written ([comments.md](comments.md) has how). The file's `notice`, when it has one, shows in the status bar. A reply or an edit whose thread goes while you write it, as when an update removes it, keeps your text: the box writes a comment on the file from then on, or on the Conversation, the text goes to a file the status bar names.
 
 ## Code host reviews

@@ -989,6 +989,21 @@ mod tests {
         assert!(differ.is_empty(), "{differ:#?}");
     }
 
+    /// A conflict's key needs its exact chord, as a thread's does.
+    #[test]
+    fn conflict_keybinds_take_their_prefix() {
+        let mut keys = Keys::default();
+        for value in ["conflict:o=unbind", "conflict:O=keep_current"] {
+            keys.bind(value)
+                .unwrap_or_else(|e| panic!("{value}: {e:?}"));
+        }
+        let conflict = |c| keys.conflict_action(Key::Char(c), Mods::NONE);
+        assert_eq!(
+            (conflict('O'), conflict('o'), conflict('t')),
+            (Some(Action::KeepCurrent), None, Some(Action::TakeIncoming))
+        );
+    }
+
     /// Within a table, no key means two things.
     #[test]
     fn no_key_is_bound_twice_in_a_table() {
@@ -1073,11 +1088,6 @@ mod tests {
             keys.thread_action(Key::Char('x'), none),
             Some(Action::Resolve)
         );
-        assert_eq!(
-            keys.conflict_action(Key::Char('O'), none),
-            Some(Action::KeepCurrent)
-        );
-        assert_eq!(keys.conflict_action(Key::Char('o'), none), None);
         assert_eq!(leader("@"), None);
         assert_eq!(action(true, Key::Char('x'), none), Some(Action::MarkViewed));
         assert_eq!(action(false, Key::Char('x'), none), Some(Action::Expand));

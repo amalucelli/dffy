@@ -946,7 +946,7 @@ fn the_review_command_is_the_plugins() {
 /// status; the command panel's "Show whole pull request" shows the PR's
 /// base against the working tree, and goes back.
 #[test]
-fn plain_dffy_attaches_the_branchs_pr() {
+fn plain_dffy_attaches_the_pr_of_the_branch() {
     let pull = Pull::new();
     std::fs::write(
         pull.repo.path().join("README.md"),
@@ -993,7 +993,7 @@ fn plain_dffy_attaches_the_branchs_pr() {
 const NO_REVIEW: &str = r#"{"jsonrpc":"2.0","id":@ID@,"result":{"review":null}}"#;
 
 #[test]
-fn plain_dffy_asks_only_a_described_plugin_for_the_branchs_review() {
+fn plain_dffy_asks_only_a_described_plugin_for_the_review_of_the_branch() {
     let pull = Pull::new();
     std::fs::remove_file(pull.stub.path().join("initialize.out")).expect("no answer");
     pull.verb("detect", &[NO_REVIEW]);
@@ -2693,20 +2693,20 @@ fn dragging_over_code_copies_exactly_the_text_under_it() {
     assert!(term.wait_exit().success());
 }
 
-/// `M` in the command panel turns the terminal's mouse reports off, for
+/// `$` in the command panel turns the terminal's mouse reports off, for
 /// its own selection, and back on.
 #[test]
-fn m_hands_the_mouse_to_the_terminal_and_back() {
+fn the_panel_hands_the_mouse_to_the_terminal_and_back() {
     let repo = repo();
     let mut term = Term::spawn(repo.path(), 100, 20, &[]);
     term.wait_for("the diffs", |t| t.contains(" +3 -3"));
     let before = term.output().len();
-    term.send(" M");
+    term.send(" $");
     assert!(sent(&term, before, b"\x1b[?1006l\x1b[?1002l\x1b[?1000l"));
     term.send("\x1b");
-    term.wait_for("the note", |t| t.status().contains("mouse off (space M)"));
+    term.wait_for("the note", |t| t.status().contains("mouse off (space $)"));
     let before = term.output().len();
-    term.send(" M");
+    term.send(" $");
     assert!(sent(&term, before, b"\x1b[?1000h\x1b[?1002h\x1b[?1006h"));
     assert!(!term.status().contains("mouse off"), "{}", term.status());
     term.send("\x1b");
@@ -3324,7 +3324,7 @@ fn status_shows(term: &mut Term, text: &str) {
 
 /// The command panel: `space` opens it, a row's key runs it and keeps it
 /// open for another, `esc` closes it; `s` from it cycles the layout and
-/// `i` the indicators; a remapped entry runs.
+/// `K` the indicators; a remapped entry runs.
 #[test]
 fn the_command_panel_runs_entries_by_key() {
     let repo = repo();
@@ -3347,7 +3347,7 @@ fn the_command_panel_runs_entries_by_key() {
     term.send("s");
     status_shows(&mut term, "layout: auto (split at this width)");
     assert!(term.contains("─ commands ─"), "toggles keep it open");
-    term.send("i");
+    term.send("K");
     assert!(
         term.contains("Indicators ‹ classic ›"),
         "{}",
@@ -3663,7 +3663,7 @@ fn whole_files_whitespace_and_watch_are_remembered() {
     let mut term = launch(&[]);
     term.send("X");
     status_shows(&mut term, " full");
-    term.send(" W\x1b");
+    term.send(" I\x1b");
     term.send("w");
     status_shows(&mut term, " watch");
     term.send("q");

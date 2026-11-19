@@ -1669,9 +1669,11 @@ impl App {
         }
         // A conflict's keys come after a thread's; a search going on keeps
         // `n` and `N` for its matches.
-        let conflict = (self.pane == Pane::Diff && self.search.is_none() && self.has_conflicts())
+        let stepping = |a: &Act| matches!(a, Act::NextConflict | Act::PrevConflict);
+        let conflict = (self.pane == Pane::Diff && self.has_conflicts())
             .then(|| self.keys.conflict_action(key, mods))
-            .flatten();
+            .flatten()
+            .filter(|a| self.search.is_none() || !stepping(a));
         if let Some(action) = conflict
             && let ControlFlow::Break(done) = self.conflict_act(action)
         {

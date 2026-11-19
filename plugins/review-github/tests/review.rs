@@ -2616,7 +2616,7 @@ fn a_post_with_nothing_new_submits_the_pending_review() {
 /// no PR, or a detached HEAD, with none. A partial clone's remote, which
 /// git lists with its filter, is found as any other.
 #[test]
-fn detect_finds_the_branchs_pr_from_its_session_else_by_one_query() {
+fn detect_finds_the_pr_of_the_branch_from_its_session_else_by_one_query() {
     let f = Fixture::new();
     git(&f.work(), &["checkout", "-q", "-b", "five"]);
     git(&f.work(), &["config", "remote.origin.promisor", "true"]);
@@ -2852,7 +2852,7 @@ fn the_repository_is_upstream_or_the_remote_gh_resolved() {
 }
 
 #[test]
-fn list_shows_prs_waiting_on_you_yours_and_the_current_branchs_in_one_query() {
+fn list_shows_prs_waiting_on_you_yours_and_the_current_branches_in_one_query() {
     let f = Fixture::new();
     f.reply("List", None, "list.json");
     let run = f.run(&["list"]);

@@ -3326,6 +3326,28 @@ fn ctrl_g_continues_the_box_in_the_editor() {
     );
     app.composed(Some("Edited".to_owned()));
     assert_eq!(read_comments(&path).comments[0].text, "Edited");
+    // The diff's `E` is the same entry.
+    screen(&mut app);
+    assert_eq!(
+        press(&mut app, Key::Char('E')),
+        Some(Action::Compose("Edited".to_owned()))
+    );
+}
+
+/// The diff's `O` and `R` are the command panel's: open a review from the
+/// list, and the range since your last review.
+#[test]
+fn the_diffs_review_keys_are_the_panels() {
+    let mut app = app(100, 20);
+    app.reviewing.plugin = Some("test".to_owned());
+    let (_, request) = plugin_run(press(&mut app, Key::Char('O')));
+    assert_eq!(request, Request::List);
+    assert_eq!(press(&mut app, Key::Char('R')), None);
+    assert!(
+        status(&mut app).contains("not on a review"),
+        "{}",
+        status(&mut app)
+    );
 }
 
 /// When saving the text box fails, it opens again with the text, and a
@@ -6919,7 +6941,7 @@ fn local_threads_keep_to_their_branch() {
 /// A checkout moves the comments shown to the new branch's, and new
 /// ones go on it.
 #[test]
-fn a_checkout_shows_the_new_branchs_threads() {
+fn a_checkout_shows_the_threads_of_the_new_branch() {
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().join("comments.json");
     let thread = |id: &str, text: &str, branch: &str| {
@@ -7160,7 +7182,7 @@ fn an_update_names_the_new_threads_and_m_goes_to_them() {
 /// A plugin's words are escaped where they're drawn: the status bar shows
 /// a control character as `^[`, and the terminal's report carries none.
 #[test]
-fn a_plugins_words_are_escaped_where_theyre_drawn() {
+fn a_plugins_words_are_escaped_where_they_are_drawn() {
     let dir = tempfile::tempdir().expect("tempdir");
     let (mut app, _) = commented(&dir);
     app.resize(160, 20);
@@ -7189,13 +7211,25 @@ fn a_reply_whose_thread_goes_keeps_its_text() {
     assert_eq!(app.doc.focused().map(|t| t.root.as_str()), Some("d1"));
     key(&mut app, 'r');
     typed(&mut app, "Keep me");
+    let other = Op::Add {
+        comment: Box::new(review::Comment {
+            text: "Meanwhile".to_owned(),
+            ..review::Comment::default()
+        }),
+        reply_to: Some(Target::Id("p1".to_owned())),
+    };
+    review::apply(&path, vec![other]).expect("added");
+    app.event(Event::Comments);
+    let writes = |app: &App| {
+        app.doc
+            .writing()
+            .map(|w| (w.at.clone(), w.text.text().to_owned()))
+    };
+    let replying = Some((Writes::Reply("d1".to_owned()), "Keep me".to_owned()));
+    assert_eq!(writes(&app), replying, "another thread changing leaves it");
     review::apply(&path, vec![Op::Rm(Target::Id("d1".to_owned()))]).expect("removed");
     app.event(Event::Comments);
-    let writes = app
-        .doc
-        .writing()
-        .map(|w| (w.at.clone(), w.text.text().to_owned()));
-    assert_eq!(writes, Some((Writes::File, "Keep me".to_owned())));
+    assert_eq!(writes(&app), Some((Writes::File, "Keep me".to_owned())));
     let shown = screen(&mut app);
     assert!(shown.contains("Keep me"), "{shown}");
     assert!(shown.contains("is gone"), "{shown}");

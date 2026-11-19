@@ -6,7 +6,7 @@ dffy keeps review comments in a JSON file: comments on lines of a diff, replies 
 
 - A running viewer reads the file again whenever another program writes it, so a comment written elsewhere shows up in it:
   - It watches the file's directory with the OS's file watcher (FSEvents on macOS, inotify on Linux), so a write that renames a new file over the old one, as `dffy comments apply` does, counts. Nothing is polled while the file is unchanged; on Linux, when the inotify watch limit is reached, the file is checked once a second instead.
-  - It also reads the file when a review plugin it runs reports progress, hands over a review, or answers: what a plugin sends is written as it comes.
+  - It also reads the file when a review plugin it runs reports progress, hands over a review, or answers: what a plugin sends is written as it comes. While a plugin runs, its progress and the file's own changes are read at most four times a second, and the end of the run at once.
   - A burst of writes is read once, and a file that hasn't changed since the last read, as after the viewer's own writes, isn't read again.
 - Only dffy writes it: the viewer, and `dffy comments apply` for everyone else. An integration sends [operations](#writing-dffy-comments-apply) and dffy applies them under a lock, so two writers never lose each other's changes. A review plugin sends its operations over its session with dffy, which applies them the same way.
 - dffy never talks to the network. Posting comments to a host and pulling them back is the integration's job.

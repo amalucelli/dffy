@@ -912,8 +912,32 @@ impl Session<'_> {
         Ok(())
     }
 
+    /// What the app left for the loop once a frame is out: work for the
+    /// pool, settings to remember, and whether you're idle, for the plugin.
+    fn hand_off(&self, app: &mut App) {
+        if let Some(files) = app.take_count_pass() {
+            self.pool.count(files);
+        }
+        let languages = app.take_languages();
+        if !languages.is_empty() {
+            self.pool.prepare(languages);
+        }
+        let remembered = app.take_remembered(false);
+        if !remembered.is_empty() {
+            state::write(&remembered);
+        }
+        state::stage(app.pending_remembered());
+        if let (Some(idle), Some(plugin)) = (app.take_idle(), &self.plugin) {
+            plugin.idle(idle);
+        }
+    }
+
     fn run(&mut self, app: &mut App, rx: &mpsc::Receiver<Event>) -> io::Result<()> {
         loop {
+            // Before the frame, which then says where it went.
+            if let Some(text) = app.take_orphaned() {
+                keep_text(app, &text);
+            }
             self.paint(app)?;
             if self.unread.is_some()
                 || self.describe
@@ -925,24 +949,7 @@ impl Session<'_> {
                 // before the loop waits.
                 continue;
             }
-            if let Some(files) = app.take_count_pass() {
-                self.pool.count(files);
-            }
-            let languages = app.take_languages();
-            if !languages.is_empty() {
-                self.pool.prepare(languages);
-            }
-            let remembered = app.take_remembered(false);
-            if !remembered.is_empty() {
-                state::write(&remembered);
-            }
-            state::stage(app.pending_remembered());
-            if let (Some(idle), Some(plugin)) = (app.take_idle(), &self.plugin) {
-                plugin.idle(idle);
-            }
-            if let Some(text) = app.take_orphaned() {
-                keep_text(app, &text);
-            }
+            self.hand_off(app);
             let first = match app.deadline() {
                 Some(at) => match rx.recv_timeout(at.saturating_duration_since(Instant::now())) {
                     Ok(event) => event,

@@ -17,6 +17,7 @@ expression: "shown(&mut help, &keys, 100, 20)"
        │ /                 filter tree           Files                                     │
        │                                                                                   │
        │                                                                                   │
+       │                                                                                   │
        │ more settings: space · all keys: docs/keys.md                                     │
        │ /file▏ · esc clear                                                                │
        └───────────────────────────────────────────────────────────────────────────────────┘

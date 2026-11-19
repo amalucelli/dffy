@@ -54,57 +54,27 @@ pub(crate) fn keys() -> String {
             );
         }
     }
-    out.push_str(
+    section(
+        &mut out,
         "\n## In the tree\n\nWhile the file tree has focus, these keys come first; \
-         every other key does what it does in the diff.\n\n\
-         | Keys | Action | Description |\n|---|---|---|\n",
+         every other key does what it does in the diff.\n\n",
+        |action| spans(keys.chords(true, action)),
     );
-    for &action in Action::ALL {
-        let tree = spans(keys.chords(true, action));
-        if !tree.is_empty() {
-            let _ = writeln!(
-                out,
-                "| {tree} | `{}` | {} |",
-                action.name(),
-                cell(&capitalize(action.doc()))
-            );
-        }
-    }
-    out.push_str(
+    section(
+        &mut out,
         "\n## On a thread\n\nWhile a comment thread is focused in the diff, or selected in the \
          comments panel, these keys come first and act on it; every other key does what it \
-         does without one. `esc` takes the focus off the thread.\n\n\
-         | Keys | Action | Description |\n|---|---|---|\n",
+         does without one. `esc` takes the focus off the thread.\n\n",
+        |action| spans(keys.thread_chords(action)),
     );
-    for &action in Action::ALL {
-        let thread = spans(keys.thread_chords(action));
-        if !thread.is_empty() {
-            let _ = writeln!(
-                out,
-                "| {thread} | `{}` | {} |",
-                action.name(),
-                cell(&capitalize(action.doc()))
-            );
-        }
-    }
-    out.push_str(
+    section(
+        &mut out,
         "\n## In a conflicted file\n\nWhile the file at the cursor has conflicts to resolve, \
          these keys come after a thread's and before every other; the rest do what they do \
          elsewhere. While a search goes on, `n` and `N` keep stepping through its matches, \
-         and past the last conflict that way they go on to the next change.\n\n\
-         | Keys | Action | Description |\n|---|---|---|\n",
+         and past the last conflict that way they go on to the next change.\n\n",
+        |action| spans(keys.conflict_chords(action)),
     );
-    for &action in Action::ALL {
-        let conflict = spans(keys.conflict_chords(action));
-        if !conflict.is_empty() {
-            let _ = writeln!(
-                out,
-                "| {conflict} | `{}` | {} |",
-                action.name(),
-                cell(&capitalize(action.doc()))
-            );
-        }
-    }
     out.push_str(
         "\n## Command panel\n\n`space` opens the panel. These keys run its entries, \
          in the order the panel lists them. On a setting with values (`Layout ‹ auto ›`), \
@@ -123,6 +93,23 @@ pub(crate) fn keys() -> String {
         );
     }
     out
+}
+
+/// `intro`, then a table of every action `keys` gives keys.
+fn section(out: &mut String, intro: &str, keys: impl Fn(Action) -> String) {
+    out.push_str(intro);
+    out.push_str("| Keys | Action | Description |\n|---|---|---|\n");
+    for &action in Action::ALL {
+        let shown = keys(action);
+        if !shown.is_empty() {
+            let _ = writeln!(
+                out,
+                "| {shown} | `{}` | {} |",
+                action.name(),
+                cell(&capitalize(action.doc()))
+            );
+        }
+    }
 }
 
 const KEYS_INTRO: &str = "\

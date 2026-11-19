@@ -727,10 +727,12 @@ impl Places {
             ids: HashMap::with_capacity(comments.len()),
             refs: HashMap::with_capacity(comments.len()),
         };
+        // The first of a repeated id or ref, as a scan from the start
+        // would find, in a file written by hand.
         for (i, c) in comments.iter().enumerate() {
-            places.ids.insert(c.id.clone(), i);
+            places.ids.entry(c.id.clone()).or_insert(i);
             if let Some(reference) = &c.reference {
-                places.refs.insert(reference.clone(), i);
+                places.refs.entry(reference.clone()).or_insert(i);
             }
         }
         places

@@ -2741,7 +2741,10 @@ fn host_text_in_a_box_is_escaped_where_its_drawn() {
                 kind: Some("review".to_owned()),
                 label: Some("\x1b]0;approved".to_owned()),
             },
-            vec![thread_comment("c", "ana", "09:00", "Fine", false)],
+            vec![ThreadComment {
+                created: "\x1b[5mlate".to_owned(),
+                ..thread_comment("c", "an\x1b[1ma", "09:00", "Fine", false)
+            }],
         ),
     ];
     let mut doc = doc(layout(false, false), 200);
@@ -2749,7 +2752,13 @@ fn host_text_in_a_box_is_escaped_where_its_drawn() {
     doc.set_threads(0, threads.into());
     let rows = tall_rows(&mut doc).join("\n");
     assert!(!rows.contains('\x1b'), "{rows}");
-    for shown in ["^[[2Jgone", "^[[31m1;", "^[]0;approved"] {
+    for shown in [
+        "^[[2Jgone",
+        "^[[31m1;",
+        "^[]0;approved",
+        "an^[[1ma",
+        "^[[5mlate",
+    ] {
         assert!(rows.contains(shown), "{shown} in {rows}");
     }
 }

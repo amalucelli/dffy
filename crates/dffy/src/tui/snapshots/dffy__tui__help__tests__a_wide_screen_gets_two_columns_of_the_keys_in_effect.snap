@@ -17,6 +17,7 @@ expression: "shown(&mut help, &keys, 100, 20)"
        │                                                                                   │
        │                                                                                   │
        │                                                                                   │
+       │                                                                                   │
        │ more settings: space · all keys: docs/keys.md                                     │
        │ tab section · / search · esc close                                                │
        └───────────────────────────────────────────────────────────────────────────────────┘

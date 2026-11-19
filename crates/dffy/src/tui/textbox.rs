@@ -306,20 +306,20 @@ mod tests {
     /// either side.
     #[test]
     fn typing_wraps_and_edits_at_the_cursor() {
-        let mut b = typed("one two three");
-        assert_eq!(shown(&mut b, 8), ["one two ", "three|"]);
+        let mut b = typed("one two threes");
+        assert_eq!(shown(&mut b, 8), ["one two ", "threes|"]);
         b.key(Key::Enter, Mods::NONE);
         b.key(Key::Char('x'), Mods::NONE);
-        assert_eq!(b.text(), "one two three\nx");
+        assert_eq!(b.text(), "one two threes\nx");
         for key in [Key::Left, Key::Left, Key::Backspace] {
             b.key(key, Mods::NONE);
         }
-        assert_eq!(b.text(), "one two thre\nx");
+        assert_eq!(b.text(), "one two three\nx");
         b.key(Key::Delete, Mods::NONE);
-        assert_eq!(shown(&mut b, 8), ["one two ", "thre|x"]);
+        assert_eq!(shown(&mut b, 8), ["one two ", "three|x"]);
         b.key(Key::Char('x'), Mods::CTRL);
         b.key(Key::Char('x'), Mods::ALT);
-        assert_eq!(b.text(), "one two threx", "ctrl and alt keys don't type");
+        assert_eq!(b.text(), "one two threex", "ctrl and alt keys don't type");
     }
 
     fn at(text: &str, cursor: usize) -> TextBox {

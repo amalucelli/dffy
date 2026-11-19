@@ -654,12 +654,21 @@ mod tests {
             full.extend(args.iter().map(OsString::from));
             parses_review(&Cli::command(), &full)
         };
-        for args in [&["-C", "repo", "pr", "7"][..], &["--help"], &["help"]] {
+        for args in [
+            &["-C", "repo", "pr", "7"][..],
+            &["--help"],
+            &["help"],
+            &["main"],
+        ] {
             assert!(parses(args), "{args:?}");
         }
         for args in [
             &[][..],
+            &["--no-cache"],
             &["main..HEAD"],
+            &["HEAD~3"],
+            &["src/lib.rs"],
+            &["--", "readme"],
             &["--stat"],
             &["diff", "pr"],
             &["comments", "apply"],

@@ -82,6 +82,9 @@ pub(crate) enum Event {
     /// How many commits a review's update moved its head by, when git
     /// could tell.
     ReviewMoved(Option<usize>),
+    /// The review plugin's description, asked for after the first frame;
+    /// `None` when it can't describe itself.
+    Described(Option<review::Described>),
     /// Nothing happened before the app's deadline.
     Tick,
 }
@@ -128,9 +131,10 @@ pub(crate) enum ReviewStart {
         plugin: String,
         reviews: Vec<Listed>,
     },
-    /// Plain `dffy` on a branch: `plugin` looks for its review, whose
-    /// comments and status join what the viewer shows, if there's one.
-    Detect { plugin: String },
+    /// Plain `dffy` on a branch: the review plugin, once it has described
+    /// itself, looks for the branch's review, whose comments and status
+    /// join what the viewer shows, if there's one.
+    Detect,
 }
 
 /// Runs the viewer on `tty` for `plan` until the user quits. An empty diff
@@ -192,7 +196,7 @@ pub(crate) fn run(
                 // A commit without changes still has its header to show.
                 let opened = start
                     .as_ref()
-                    .is_some_and(|p| !matches!(p, ReviewStart::Detect { .. }));
+                    .is_some_and(|p| !matches!(p, ReviewStart::Detect));
                 if watch || commit.is_some() || opened {
                     break None;
                 }
@@ -220,8 +224,13 @@ pub(crate) fn run(
     );
     prepare(&mut app, ctx);
     // Not in `prepare`: a piped diff has no review, so the plugin isn't
-    // asked to describe itself for one.
-    app.set_naming(ctx.described().map(|d| d.naming.clone()));
+    // asked to describe itself for one. Unless parsing needed the
+    // description, it's asked for once the first frame is out, as an
+    // uncached `describe` runs the plugin.
+    let described = ctx.review.get();
+    if let Some(described) = described {
+        app.set_naming(described.as_ref().ok().map(|d| d.naming.clone()));
+    }
     app.set_selected(selected, ctx.config.default_diff);
     app.set_repository(
         repo.workdir()
@@ -261,8 +270,13 @@ pub(crate) fn run(
     app.set_local_comments(local);
     let mut review_run = None;
     let mut detect = None;
+    let mut detect_described = false;
     match start {
-        Some(ReviewStart::Detect { plugin }) => detect = Some(app.detect_review(plugin)),
+        Some(ReviewStart::Detect) => match described {
+            Some(Ok(d)) => detect = Some(app.detect_review(d.program.name.clone())),
+            Some(Err(_)) => {}
+            None => detect_described = true,
+        },
         Some(ReviewStart::Open {
             plugin,
             session,
@@ -292,7 +306,11 @@ pub(crate) fn run(
     let mut session = Session {
         watching: None,
         unread: comments,
+        describe: (ctx.review_name.clone())
+            .filter(|_| described.is_none())
+            .map(|name| (name, ctx.cache.clone())),
         detect,
+        detect_described,
         review_run,
         tty,
         reader: None,
@@ -381,7 +399,9 @@ pub(crate) fn run_piped(tty: &Tty, stdin: Stdin, ctx: &Ctx) -> Result<ExitCode, 
     let mut session = Session {
         watching: None,
         unread: None,
+        describe: None,
         detect: None,
+        detect_described: false,
         review_run: None,
         tty,
         reader: None,
@@ -582,9 +602,15 @@ struct Session<'a> {
     /// The comments file, read and watched only once the first frame is
     /// out: its parse and the watch thread aren't the first frame's.
     unread: Option<PathBuf>,
+    /// The review plugin and the cache, for its description, asked for on
+    /// a thread once the first frame is out; see [`Event::Described`].
+    describe: Option<(String, Option<dffy_core::cache::Cache>)>,
     /// The `detect` run for the branch's review, started once the first
     /// frame is out: spawning the plugin takes a fork and exec.
     detect: Option<Action>,
+    /// Plain `dffy` on a branch waits for the description to `detect`: a
+    /// plugin that can't describe itself isn't asked.
+    detect_described: bool,
     /// The last `prepare`, `pull` or `post` started.
     review_run: Option<review::Run>,
     tty: &'a Tty,
@@ -712,28 +738,44 @@ impl Session<'_> {
         self.events.send(Event::Watch(ready)).ok();
     }
 
+    /// Starts what waits for a frame to be out: the review plugin's
+    /// description, the comments file and its watch, and `detect`.
+    fn start_deferred(&mut self, app: &mut App) -> io::Result<()> {
+        if let Some((name, cache)) = self.describe.take() {
+            let events = self.events.clone();
+            std::thread::Builder::new()
+                .name("dffy-review-describe".into())
+                .spawn(move || {
+                    let described = crate::describe_review(&name, cache.as_ref());
+                    events.send(Event::Described(described.ok())).ok();
+                })?;
+        }
+        if let Some(path) = self.unread.take() {
+            // HEAD is read here, after the first frame, once.
+            app.set_branch(self.files.as_ref().and_then(crate::review::current_branch));
+            let files = app.comment_files(path.clone());
+            app.set_comments(path);
+            self.watching = watch_comments(files, self.events.clone());
+            self.point_session(app);
+        }
+        if let Some(Action::Plugin {
+            id,
+            plugin,
+            args,
+            comments,
+            summary,
+        }) = self.detect.take()
+        {
+            self.plugin(id, &plugin, args, comments.as_deref(), summary);
+        }
+        Ok(())
+    }
+
     fn run(&mut self, app: &mut App, rx: &mpsc::Receiver<Event>) -> io::Result<()> {
         loop {
             self.paint(app)?;
-            if self.unread.is_some() || self.detect.is_some() {
-                if let Some(path) = self.unread.take() {
-                    // HEAD is read here, after the first frame, once.
-                    app.set_branch(self.files.as_ref().and_then(crate::review::current_branch));
-                    let files = app.comment_files(path.clone());
-                    app.set_comments(path);
-                    self.watching = watch_comments(files, self.events.clone());
-                    self.point_session(app);
-                }
-                if let Some(Action::Plugin {
-                    id,
-                    plugin,
-                    args,
-                    comments,
-                    summary,
-                }) = self.detect.take()
-                {
-                    self.plugin(id, &plugin, args, comments.as_deref(), summary);
-                }
+            if self.unread.is_some() || self.describe.is_some() || self.detect.is_some() {
+                self.start_deferred(app)?;
                 // The threads they placed and the jobs they want go out
                 // before the loop waits.
                 continue;
@@ -776,6 +818,13 @@ impl Session<'_> {
                         stop(app, rx);
                         return Ok(());
                     }
+                    Event::Described(Some(described)) => {
+                        app.set_naming(Some(described.naming));
+                        if std::mem::take(&mut self.detect_described) {
+                            self.detect = Some(app.detect_review(described.program.name));
+                        }
+                    }
+                    Event::Described(None) => {}
                     event => match app.event(event) {
                         Some(Action::Quit) => return Ok(()),
                         Some(Action::Edit { path, line }) => self.edit(app, &path, line)?,

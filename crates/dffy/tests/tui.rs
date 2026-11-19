@@ -819,6 +819,25 @@ fn plain_dffy_asks_only_a_described_plugin_for_the_branchs_review() {
     assert_eq!(pull.calls(), "", "no verb ran");
 }
 
+/// Plain `dffy` draws before the plugin has described itself, and asks
+/// for the branch's review once it has: with `describe` held, the first
+/// frame is out and `detect` waits for the answer.
+#[test]
+fn plain_dffy_draws_before_the_plugin_describes_itself() {
+    let pull = Pull::new();
+    pull.verb("detect", &[r#"{"version":1,"review":null}"#], 0);
+    std::fs::write(pull.repo.path().join("README.md"), "# demo\n\nLocal.\n").expect("write");
+    let gate = pull.gate("describe");
+    let mut term = pull.spawn(&[]);
+    term.wait_for("the working tree's diff", |t| t.contains("Local."));
+    assert_eq!(pull.calls(), "", "detect waits for describe");
+    // `describe` has two seconds to answer; the frame came well before.
+    std::fs::remove_file(&gate).expect("open the gate");
+    term.wait_for("detect", |_| pull.calls().starts_with("detect\n"));
+    term.send("q");
+    assert!(term.wait_exit().success());
+}
+
 /// What the plugin says went wrong before the PR's commits are here ends
 /// `dffy pr` with it; a verb it doesn't know is worded.
 #[test]

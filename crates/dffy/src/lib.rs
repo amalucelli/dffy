@@ -1115,8 +1115,8 @@ fn open_review(
 }
 
 /// Plain `dffy` (no revisions or paths) on a branch, with a review plugin
-/// that describes itself: the viewer asks the plugin for the branch's
-/// review as it starts.
+/// set: the viewer asks the plugin for the branch's review once it has
+/// described itself.
 fn detect_review(args: &DiffArgs, plan: &print::Plan, ctx: &Ctx) -> Option<tui::ReviewStart> {
     let unnamed = args.revs.is_empty()
         && !(args.staged || args.unstaged || args.merge_base || args.common.view.reverse)
@@ -1127,13 +1127,7 @@ fn detect_review(args: &DiffArgs, plan: &print::Plan, ctx: &Ctx) -> Option<tui::
             .and_then(|dir| std::fs::read(dir.join("HEAD")).ok())
             .is_some_and(|head| head.starts_with(b"ref: refs/heads/"))
     };
-    let plugin = ctx
-        .described()
-        .filter(|_| unnamed && on_branch())?
-        .program
-        .name
-        .clone();
-    Some(tui::ReviewStart::Detect { plugin })
+    (ctx.review_name.is_some() && unnamed && on_branch()).then_some(tui::ReviewStart::Detect)
 }
 
 /// The first line on `said` that `pick` takes; `Err` with the run's

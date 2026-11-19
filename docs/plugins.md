@@ -271,7 +271,7 @@ A review plugin connects the [review comments](comments.md) to a code host: GitH
 The plugin names the command: `dffy pr` is dffy-review-github's, and a GitLab plugin could name it `mr`. dffy asks it with `describe` and adds that command only while a review plugin is set and describes one; otherwise there's no such command, `dffy pr` reads `pr` as a revision, and plain `dffy` doesn't ask for the branch's review. The plugin's words go where dffy names what it reviews: the noun ("pull request", "pull requests") in the command's help, the command panel and the picker; the short form and id prefix in labels (`PR #7`); its events in the post dialog. Everything else, from opening a review to posting it, is dffy's.
 
 - dffy refuses a command that isn't lowercase letters, digits and `-` starting with a letter, or that's one of its own subcommands or their aliases (`diff`, `show`, `config`, `doctor`, `help`…). `dffy doctor` says why there's no command.
-- dffy runs `describe` before it reads its arguments when they could name the command (help, or a first word that isn't one of dffy's subcommands and could be a command name), and otherwise only when the run uses the plugin. The answer is kept in the disk cache (`cache`), keyed by the plugin program's path, modification time and size: replacing the program asks again. A `describe` that fails or takes over 2 seconds isn't kept; that run has no command, the error names the plugin when its command was then read as a revision, and the next run asks again.
+- dffy runs `describe` before it reads its arguments when they could name the command (help, or a first word that isn't one of dffy's subcommands and could be a command name). Otherwise the viewer asks once its first frame is out, without waiting for the answer, and other runs ask only when they use the plugin. The answer is kept in the disk cache (`cache`), keyed by the plugin program's path, modification time and size: replacing the program asks again. A `describe` that fails or takes over 2 seconds isn't kept; that run has no command, the error names the plugin when its command was then read as a revision, and the next run asks again.
 
 ### dffy-review-github
 
@@ -330,10 +330,10 @@ The protocol is experimental, and may change while it is. It knows nothing of an
 
 | Verb | When |
 |---|---|
-| `describe` | Before dffy reads arguments that could name the command, else on the plugin's first use, when the disk cache has no answer for the program as installed ([The review command](#the-review-command)) |
+| `describe` | Before dffy reads arguments that could name the command, else after the viewer's first frame or on the plugin's first use, when the disk cache has no answer for the program as installed ([The review command](#the-review-command)) |
 | `doctor` | `dffy doctor`; never cached |
 | `list` | The review command without an id, and "Open review…" in the command panel |
-| `detect` | Plain `dffy`, without revisions or paths, on a branch, as the viewer starts, when the plugin describes itself; it doesn't wait for the answer |
+| `detect` | Plain `dffy`, without revisions or paths, on a branch, as the viewer starts, once the plugin has described itself; it doesn't wait for the answer |
 | `prepare <id>` | The review command with an id, and a review picked from the list |
 | `check <id>` | Every 60 seconds while a review is open, unless `prepare` or `pull` is running; not after 10 minutes without a key, until the next one |
 | `pull <id>` | `p` |

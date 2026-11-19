@@ -638,8 +638,10 @@ impl App {
         self.color = color;
     }
 
+    /// Redraws: the naming can arrive with the command panel open.
     pub(crate) fn set_naming(&mut self, naming: Option<Naming>) {
         self.naming = naming;
+        self.dirty = true;
     }
 
     /// Shows the first-run tip until a key or about 8 seconds pass.
@@ -1101,8 +1103,9 @@ impl App {
             }
             Event::Review { id, said } => return self.review_event(id, said),
             Event::ReviewMoved(count) => self.review_updated(count),
-            // The loop handles these; they need the terminal.
-            Event::Resize | Event::Interrupt => {}
+            // The loop handles these: they need the terminal, or may start
+            // the plugin's `detect`.
+            Event::Resize | Event::Interrupt | Event::Described(_) => {}
         }
         None
     }

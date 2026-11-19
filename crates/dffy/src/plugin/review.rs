@@ -43,8 +43,9 @@ pub(crate) fn exec_detached(mut args: impl Iterator<Item = OsString>) -> ExitCod
     ExitCode::from(127)
 }
 
-/// How long `describe` may take. It runs before dffy parses its arguments,
-/// until its answer is cached, so a hung plugin can't hold every start.
+/// How long `describe` may take. Until its answer is cached it runs before
+/// dffy parses arguments that could name the review command, so a hung
+/// plugin can't hold every such start.
 const DESCRIBE_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// How long the plugin's `doctor` may take: its checks may ask the host.

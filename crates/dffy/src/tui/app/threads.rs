@@ -13,7 +13,8 @@ use dffy_core::document::{Side, Source, State};
 use super::{Action, App, POSTING, Pane, Seek, WHEEL_ROWS};
 use crate::keys::Action as Act;
 use crate::render::escape;
-use crate::review::model::{self, Comments, Compose};
+use crate::review::model::compose::Compose;
+use crate::review::model::{self, Comments};
 use crate::review::{Change, Op, Target, session};
 use crate::term::{Input, Key, Mods};
 use crate::tui::comments::{self, Panel, Writes, Writing};
@@ -43,7 +44,7 @@ impl App {
         );
         comments.set_highlight(self.highlight);
         self.comments = Some(comments);
-        self.reload_comments(model::Check::Stat);
+        self.reload_comments(model::reload::Check::Stat);
         // A file with no comments reads as unchanged, yet replaces one that
         // may have had a conversation.
         self.sync_conversation();
@@ -81,7 +82,7 @@ impl App {
 
     /// Reads the comments file again, if it changed since the last read,
     /// as the review session says (see [`Reviewing::reload`]).
-    pub(super) fn reload_comments(&mut self, check: model::Check) {
+    pub(super) fn reload_comments(&mut self, check: model::reload::Check) {
         let Some(comments) = &mut self.comments else {
             return;
         };
@@ -488,7 +489,7 @@ impl App {
         let entry = self.doc.document.files().get(self.doc.document.pos.file);
         let draft = entry
             .filter(|e| !e.is_commit())
-            .map(|e| model::file_draft(e.change()));
+            .map(|e| model::compose::file_draft(e.change()));
         if let Some(Ok(comment)) = draft {
             let comment = self.on_branch(comment);
             self.open_box(Compose::New(Box::new(comment)), Writes::File, &text);
@@ -543,7 +544,7 @@ impl App {
             self.message("no line of code here to comment on");
             return None;
         };
-        match model::draft(
+        match model::compose::draft(
             entry.change(),
             model::line_diff(loaded),
             side,
@@ -589,7 +590,7 @@ impl App {
             .as_ref()
             .map(|a| a.lines.join("\n"))
             .unwrap_or_default();
-        let text = model::with_suggestion("", Some(&lines));
+        let text = model::compose::with_suggestion("", Some(&lines));
         self.doc.set_focus(None);
         self.open_box(compose, at, &format!("\n\n{text}"));
         self.doc.edit_writing(|w| w.text.rewind());
@@ -612,7 +613,7 @@ impl App {
             });
             return;
         }
-        match model::file_draft(entry.change()) {
+        match model::compose::file_draft(entry.change()) {
             Ok(comment) => {
                 // The box is in the diff, which a tree over it would hide.
                 if self.pane == Pane::Tree {
@@ -648,7 +649,7 @@ impl App {
             (
                 t.root.clone(),
                 draft.map(|n| {
-                    let text = model::with_suggestion(&n.text, n.suggestion.as_deref());
+                    let text = model::compose::with_suggestion(&n.text, n.suggestion.as_deref());
                     (n.id.clone(), text)
                 }),
             )
@@ -737,7 +738,10 @@ impl App {
             }
             Act::EditDraft => match draft {
                 Some(comment) => {
-                    let text = model::with_suggestion(&comment.text, comment.suggestion.as_deref());
+                    let text = model::compose::with_suggestion(
+                        &comment.text,
+                        comment.suggestion.as_deref(),
+                    );
                     done = self.write_in(
                         &thread.root,
                         Compose::Edit {
@@ -794,7 +798,7 @@ impl App {
                 }
             },
             Act::OpenOnHost => match thread.url {
-                Some(url) if model::is_web(&url) => return Ok(Some(Action::Browse(url))),
+                Some(url) if model::text::is_web(&url) => return Ok(Some(Action::Browse(url))),
                 Some(_) => self.message("this thread's link isn't a web address"),
                 None => self.message("this thread has no link: it isn't posted"),
             },

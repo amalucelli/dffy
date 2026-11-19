@@ -316,7 +316,7 @@ impl App {
         let loaded = entry
             .file()
             .ok_or_else(|| failed("its diff isn't loaded"))?;
-        let mut draft = model::draft(
+        let mut draft = model::compose::draft(
             entry.change(),
             model::line_diff(loaded),
             side,

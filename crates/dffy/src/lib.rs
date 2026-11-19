@@ -1434,7 +1434,7 @@ fn shown_comments(
     plan: &print::Plan,
     common: &CommonArgs,
     ctx: &Ctx,
-) -> Result<Option<review::model::Snapshot>, Error> {
+) -> Result<Option<review::model::snapshot::Snapshot>, Error> {
     if !common.show_comments {
         return Ok(None);
     }
@@ -1473,7 +1473,9 @@ fn shown_comments(
     } else {
         review::Branches::All
     };
-    Ok(Some(review::model::Snapshot::new(&comments, branches)))
+    Ok(Some(review::model::snapshot::Snapshot::new(
+        &comments, branches,
+    )))
 }
 
 /// The paths printed output is limited to. In print mode --focus narrows

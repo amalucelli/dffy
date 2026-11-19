@@ -245,7 +245,7 @@ impl App {
         ];
         // The conversation is read-only, and never folds.
         if matches!(thread.at, model::At::Conversation { .. }) {
-            return (thread.url.as_deref().is_some_and(model::is_web))
+            return (thread.url.as_deref().is_some_and(model::text::is_web))
                 .then(|| key("Open on host", Act::OpenOnHost))
                 .into_iter()
                 .chain(copies)
@@ -274,7 +274,7 @@ impl App {
             };
             entries.push(self.menu_entry(false, fold, Act::ToggleThread));
         }
-        if thread.url.as_deref().is_some_and(model::is_web) {
+        if thread.url.as_deref().is_some_and(model::text::is_web) {
             entries.push(key("Open on host", Act::OpenOnHost));
         }
         entries.extend(copies);

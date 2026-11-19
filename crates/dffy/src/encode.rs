@@ -21,7 +21,8 @@ use dffy_core::view::{Heading, Spans, line_bytes};
 use crate::config::Context;
 use crate::plugin::json::{Value, string};
 use crate::print::{FileOutput, Plan};
-use crate::review::model::{At, Hung, Snapshot};
+use crate::review::model::At;
+use crate::review::model::snapshot::{Hung, Snapshot};
 use crate::{Error, review};
 
 /// The schema's version, in the header.

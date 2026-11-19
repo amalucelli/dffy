@@ -167,7 +167,7 @@ impl App {
             || self.posting.is_some()
             || self.menu.is_some();
         self.sync_threads();
-        self.doc.now = model::now();
+        self.doc.now = model::text::now();
         let sending = (self.posting.as_ref())
             .map(|d| (self.sending(d.with_local()), self.reviewing.checked()));
         let (tree_top, tree_rows) = self.tree_rows();

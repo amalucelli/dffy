@@ -23,7 +23,8 @@ use unicode_width::{UnicodeWidthChar as _, UnicodeWidthStr as _};
 
 use super::view::rendered::language;
 use crate::render::{Canvas, plain};
-use crate::review::model::{checkbox, markdown_options as options, pieces, uncomment};
+use crate::review::model::snippet::pieces;
+use crate::review::model::text::{checkbox, markdown_options as options, uncomment};
 use crate::theme::{Ink, Role};
 
 #[cfg(test)]

@@ -29,7 +29,9 @@ use crate::output::Output;
 use crate::pager::text_role;
 use crate::render::stat::{self, StatEntry};
 use crate::render::{Canvas, escape, plain};
-use crate::review::model::{self, At, Hung, Snapshot, age};
+use crate::review::model::snapshot::{Hung, Snapshot};
+use crate::review::model::text::age;
+use crate::review::model::{self, At};
 use crate::review::who;
 use crate::theme::{Ink, Role};
 use crate::{Ctx, Error};
@@ -750,7 +752,7 @@ impl Plan {
             parsing: std::sync::atomic::AtomicUsize::new(0),
             prepared: std::sync::Mutex::new(Vec::new()),
             comments: self.comments.as_ref().map(|c| (c, self.reverse)),
-            now: model::now(),
+            now: model::text::now(),
         };
         self.stream(ctx, out, &render)
     }
@@ -1398,7 +1400,7 @@ fn thread_box(hung: &Hung, (width, apart): (usize, bool), now: u64, c: &mut Canv
     let width = width.max(24);
     let inner = width - 4;
     let snippet = (hung.at == At::Lost)
-        .then(|| model::snippet(root, None))
+        .then(|| model::snippet::snippet(root, None))
         .flatten();
     let mut tags: Vec<(Role, String)> = Vec::new();
     if root.resolved {
@@ -1462,7 +1464,7 @@ fn thread_box(hung: &Hung, (width, apart): (usize, bool), now: u64, c: &mut Canv
             body(c, &[]);
             body(c, &spans);
         }
-        for line in model::plain_text(&comment.text) {
+        for line in model::text::plain_text(&comment.text) {
             for part in wrap(&line, inner) {
                 body(c, &[(Role::Plain.into(), part)]);
             }

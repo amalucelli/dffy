@@ -20,8 +20,9 @@ use super::view::paint;
 use crate::keys::{Action as Act, Keys};
 use crate::render::{Canvas, escape, plain};
 use crate::review::listing::{List, Listing, Row};
+use crate::review::model::text::{age, epoch};
 use crate::review::model::{
-    self, At, Comments, Look, Posting, Snippet, Standing, Thread, ThreadComment, age, epoch,
+    self, At, Comments, Look, Posting, Snippet, Standing, Thread, ThreadComment,
 };
 use crate::review::who;
 use crate::term::{Grid, Key, Mods};

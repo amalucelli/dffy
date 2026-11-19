@@ -1201,7 +1201,7 @@ fn thread_comment(id: &str, author: &str, at: &str, text: &str, draft: bool) -> 
         author: author.to_owned(),
         created: format!("2026-11-17T{at}:00Z"),
         text: text.to_owned(),
-        summary: model::summary(text),
+        summary: model::text::summary(text),
         suggestion: None,
         standing: if draft {
             model::Standing::Draft
@@ -1349,7 +1349,7 @@ fn lost() -> Arc<[Thread]> {
         url: None,
         comments: vec![thread_comment(root, "ana", "09:00", text, false)],
         lines: Vec::new(),
-        snippet: model::painted_snippet(&comment),
+        snippet: model::snippet::painted_snippet(&comment),
         local: false,
         branch: None,
     };
@@ -1466,9 +1466,9 @@ fn heights_count_the_rows_of_snippets() {
 /// highlighted when its thread is placed.
 #[test]
 fn snippets_are_highlighted_once() {
-    let before = model::painted_count();
+    let before = model::snippet::painted_count();
     let threads = lost();
-    assert_eq!(model::painted_count(), before + 2);
+    assert_eq!(model::snippet::painted_count(), before + 2);
     let code = &threads[0].snippet.as_ref().expect("a snippet").rows[2];
     assert!(
         code.pieces.iter().any(|(syntax, _)| syntax.is_some()),
@@ -1482,7 +1482,7 @@ fn snippets_are_highlighted_once() {
         grid_rows(&mut doc, &theme);
         doc.scroll(1);
     }
-    assert_eq!(model::painted_count(), before + 2);
+    assert_eq!(model::snippet::painted_count(), before + 2);
 }
 
 /// A bot's review, as a host sends it: state kept in HTML comments, then
@@ -2732,7 +2732,7 @@ fn host_text_in_a_box_is_escaped_where_its_drawn() {
     };
     let threads = vec![
         Thread {
-            snippet: model::painted_snippet(&comment),
+            snippet: model::snippet::painted_snippet(&comment),
             ..thread("e", At::Lost, vec![refused])
         },
         thread(

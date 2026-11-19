@@ -18,7 +18,8 @@ use std::time::{Duration, Instant};
 use dffy_core::bstr::BString;
 use dffy_core::git::Revisions;
 
-use super::model::{self, Check, Comments, Hint, Part, Posting, Written};
+use super::model::reload::{Check, Written};
+use super::model::{self, Comments, Hint, Part, Posting};
 use crate::plugin::review::{
     self, Listed, Naming, Plan, Push, Reason, Request, ReviewEvent, ReviewLabel, Said, Session,
     State,
@@ -172,7 +173,7 @@ impl Mode {
             outcome: None,
             moved: None,
             comments_moved: false,
-            started: model::now(),
+            started: model::text::now(),
             plans: Plans::default(),
         }
     }
@@ -1321,7 +1322,7 @@ impl Reviewing {
                 ..
             } => {
                 running.posted = Some((posted, failed));
-                self.link = url.filter(|u| model::is_web(u));
+                self.link = url.filter(|u| model::text::is_web(u));
                 // The plugin's to record: it says what it recorded.
                 if let Some(mode) = &mut self.mode {
                     if let Some(head) = last_reviewed_head {

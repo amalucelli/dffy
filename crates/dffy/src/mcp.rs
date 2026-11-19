@@ -29,7 +29,8 @@ use crate::encode::{self, Compared, Detail, Files, Window};
 use crate::plugin::json::{Value, parse, string, write};
 use crate::print::{Plan, Summary, Target};
 use crate::render::Canvas;
-use crate::review::model::{At, Snapshot};
+use crate::review::model::At;
+use crate::review::model::snapshot::Snapshot;
 use crate::{Ctx, Error, control, review};
 
 /// The revision with per-request metadata.

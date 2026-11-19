@@ -2,7 +2,7 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
 
-use dffy_core::diff::{Options, hunks};
+use dffy_core::diff::{Options, Text, hunks};
 use dffy_core::git::Repo;
 
 use super::*;
@@ -23,6 +23,99 @@ fn file_in(dir: &tempfile::TempDir) -> PathBuf {
 /// Applies `ops`, given as the JSON `dffy comments apply` reads, to `c`.
 fn ops(c: &mut Review, input: &str) -> Result<Vec<Option<String>>, String> {
     c.apply(parse_ops(input.as_bytes(), None)?, now())
+}
+
+/// Any review id is one file name in its plugin's directory, and two ids
+/// are never one file.
+#[test]
+fn a_reviews_file_is_named_by_its_id() {
+    let dir = Path::new("/r");
+    let name = |id: &str| {
+        review_file(dir, id)
+            .strip_prefix(dir)
+            .expect("in the directory")
+            .to_str()
+            .expect("utf-8")
+            .to_owned()
+    };
+    assert_eq!(name("7"), "7.json");
+    assert_eq!(name("i8f2c-1_v2.3"), "i8f2c-1_v2.3.json");
+    assert_eq!(name("I8f2c"), "%498f2c.json");
+    assert_eq!(name("../x"), "%2E.%2Fx.json");
+    assert_eq!(name("a/b c"), "a%2Fb%20c.json");
+    assert_ne!(name("a%2Fb"), name("a/b"));
+    // A file system that ignores case, as macOS's, keeps them apart.
+    assert_ne!(
+        name("Ab").to_lowercase(),
+        name("aB").to_lowercase(),
+        "{} {}",
+        name("Ab"),
+        name("aB")
+    );
+}
+
+/// An id too long for a file name, escaped, is cut, the id's digest
+/// keeping two cut the same apart; the file and its lock can be written,
+/// for an id that only just fits without its lock too.
+#[test]
+fn a_long_review_id_is_still_one_file() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let long = "Ab/".repeat(60);
+    let (one, two) = (
+        review_file(dir.path(), &long),
+        review_file(dir.path(), &format!("{long}x")),
+    );
+    assert_ne!(one, two);
+    assert_eq!(review_file(dir.path(), &long), one, "the same each time");
+    let fits = "a".repeat(253 - ".json".len());
+    for file in [one, two, review_file(dir.path(), &fits)] {
+        let ops = format!("[{LINE_COMMENT}]");
+        apply_json(&file, ops.as_bytes(), None).expect("written");
+    }
+}
+
+/// Another comments file comes in, drafts and all, each comment with its
+/// id: what the file has already, by id or by `ref`, stays as it is, a
+/// reply joins its thread wherever the file has it, and importing again
+/// adds nothing. A file of another version isn't taken.
+#[test]
+fn another_comments_file_is_imported_once() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (old, new) = (dir.path().join("old.json"), dir.path().join("r/7.json"));
+    fs::write(
+        &old,
+        r#"{"version":1,"comments":[
+{"id":"d1","path":"a.rs","text":"Draft","author":"","created":"2026-11-17T10:00:00Z"},
+{"id":"h1","path":"a.rs","text":"Old words","author":"octocat","created":"2026-11-17T10:00:00Z","ref":"x:1"},
+{"id":"d2","path":"a.rs","text":"My reply","author":"","created":"2026-11-17T10:00:00Z","in_reply_to":"h1"}
+]}"#,
+    )
+    .expect("write");
+    fs::create_dir_all(dir.path().join("r")).expect("mkdir");
+    fs::write(
+        &new,
+        r#"{"version":1,"comments":[{"id":"n1","path":"a.rs","text":"Host words","author":"octocat","created":"2026-11-17T10:00:00Z","ref":"x:1"}]}"#,
+    )
+    .expect("write");
+    assert_eq!(import(&old, &new).expect("imported"), 2);
+    let got = read(&new).expect("read").comments;
+    let summary: Vec<(&str, &str, Option<&str>)> = got
+        .iter()
+        .map(|c| (c.id.as_str(), c.text.as_str(), c.in_reply_to.as_deref()))
+        .collect();
+    assert_eq!(
+        summary,
+        [
+            ("n1", "Host words", None),
+            ("d1", "Draft", None),
+            ("d2", "My reply", Some("n1")),
+        ]
+    );
+    assert_eq!(import(&old, &new).expect("again"), 0, "once");
+    assert_eq!(read(&new).expect("read").comments, got);
+    fs::write(&old, "{\"version\":2,\"comments\":[]}").expect("write");
+    assert!(import(&old, &new).is_err());
+    assert!(import(&dir.path().join("none.json"), &new).is_err());
 }
 
 /// A writer that knows the branch gives it to the threads `add` starts
@@ -64,8 +157,8 @@ fn added(c: &mut Review, input: &str) -> String {
 const LINE_COMMENT: &str = r#"{"op":"add","comment":{"path":"src/lib.rs","side":"new","start":{"old":2,"new":2},"end":{"old":null,"new":3},"text":"Why?","anchor":{"before":["a"],"lines":["b","c"],"after":["d","e"]}}}"#;
 
 const EVERY_FIELD: &str = r#"{"version":1,"notice":"as of 10:42","summary":"Two nits.","tool":{"pr":7},"comments":[
-{"id":"a1","path":"new.rs","old_path":"old.rs","side":"new","start_side":"old","start":{"old":3,"new":null},"end":{"old":null,"new":5},"text":"Use \"checked_add\".\nIt\twraps.","suggestion":"x.checked_add(y)","author":"octocat","created":"2026-11-17T10:42:00Z","resolved":true,"ref":"github:PRRC_1","anchor":{"before":["fn f() {"],"lines":["    x + y","é \r"],"after":[]},"distance":2,"url":"https://github.com/o/r/pull/7#discussion_r1","outdated":true,"branch":"feature/x","pending":true,"post_error":"line 5 isn't in the diff","github_thread":"PRRT_1","github_draft":[1,{"a":null}]},
-{"id":"a2","path":"new.rs","text":"Agreed.","author":"","created":"2026-11-17T11:00:00Z","in_reply_to":"a1","resolved":false}
+{"id":"a1","path":"new.rs","old_path":"old.rs","side":"new","start_side":"old","start":{"old":3,"new":null},"end":{"old":null,"new":5},"text":"Use \"checked_add\".\nIt\twraps.","suggestion":"x.checked_add(y)","author":"octocat","created":"2026-11-17T10:42:00Z","resolved":true,"ref":"github:PRRC_1","anchor":{"before":["fn f() {"],"lines":["    x + y","é \r"],"after":[]},"distance":2,"url":"https://github.com/o/r/pull/7#discussion_r1","outdated":true,"branch":"feature/x","pending":true,"post_error":"line 5 isn't in the diff","host_resolved":false,"github_thread":"PRRT_1","github_draft":[1,{"a":null}]},
+{"id":"a2","path":"new.rs","text":"Agreed.","author":"","created":"2026-11-17T11:00:00Z","in_reply_to":"a1","resolved":false,"moved_from":"l9"}
 ]}
 "#;
 
@@ -132,8 +225,14 @@ fn the_file_roundtrips_through_the_reader_and_writer_with_unknown_fields() {
             false
         )
     );
+    assert_eq!(
+        (first.host_resolved, read_back.comments[1].host_resolved),
+        (Some(false), None)
+    );
     assert_eq!(read_back.summary.as_deref(), Some("Two nits."));
     assert_eq!(read_back.extra[0].0, "tool");
+    assert_eq!(read_back.comments[1].moved_from.as_deref(), Some("l9"));
+    assert!(read_back.comments[1].extra.is_empty(), "a field dffy knows");
 
     // A write through `apply` keeps everything it didn't change.
     apply(&path, vec![Op::Notice(Some("refreshed".to_owned()))]).expect("applies");
@@ -323,7 +422,7 @@ fn set_changes_fields_by_id_or_ref() {
 }
 
 /// A comment with a ref is posted: its text is the host's, and only
-/// `resolved`, `ref` and `anchor` may change.
+/// `resolved` and `anchor` may change, and `ref` only to none.
 #[test]
 fn a_posted_comments_text_is_read_only() {
     let mut c = Review::default();
@@ -342,7 +441,7 @@ fn a_posted_comments_text_is_read_only() {
     assert_eq!(c.comments[0].text, "Why?");
     ops(
         &mut c,
-        r#"[{"op":"set","ref":"github:1","fields":{"resolved":true,"anchor":{"lines":["y"]},"ref":"github:2"}}]"#,
+        r#"[{"op":"set","ref":"github:1","fields":{"resolved":true,"anchor":{"lines":["y"]}}}]"#,
     )
     .expect("the others change");
 }
@@ -573,8 +672,8 @@ fn listing_heads_general_comments_as_the_conversation() {
 ]}"#,
     )
     .expect("parses");
-    let mut c = Canvas::default();
-    render(&threads(&review.comments), None, &mut c);
+    let mut c = crate::render::Canvas::default();
+    crate::print::comments(&threads(&review.comments), None, &[], &mut c);
     let mut out = Vec::new();
     c.write_to(&mut out, None).expect("writes");
     insta::assert_snapshot!(String::from_utf8(out).expect("utf-8"), @r"
@@ -1043,44 +1142,6 @@ fn apply_answers_an_id_per_operation() {
     assert!(path.with_file_name("comments.json.lock").exists());
 }
 
-#[test]
-fn anchors_take_two_lines_of_context_without_terminators() {
-    let t = text("one\ntwo\r\nthree\nfour\nfive\nsix");
-    assert_eq!(
-        Anchor::new(&t, 2..4),
-        Anchor {
-            before: vec!["one".to_owned(), "two\r".to_owned()],
-            lines: vec!["three".to_owned(), "four".to_owned()],
-            after: vec!["five".to_owned(), "six".to_owned()],
-        }
-    );
-    let edge = Anchor::new(&t, 0..1);
-    assert_eq!(edge.before, [""; 0]);
-    assert_eq!(edge.after, ["two\r", "three"]);
-    let lossy = Anchor::new(&Text::new(b"a\xff\n".to_vec()), 0..1);
-    assert_eq!(lossy.lines, ["a\u{fffd}"]);
-    assert_eq!(lossy.place(&Text::new(b"a\xff\n".to_vec()), 0), Some(0..1));
-}
-
-#[test]
-fn comments_are_placed_where_their_anchor_is() {
-    let original = text("a\nb\nx\ny\nc\nd\n");
-    let anchor = Anchor::new(&original, 2..4);
-
-    assert_eq!(anchor.place(&original, 2), Some(2..4), "exact");
-    let moved = text("new\nnew\na\nb\nx\ny\nc\nd\n");
-    assert_eq!(anchor.place(&moved, 2), Some(4..6), "moved, found once");
-    let twice = text("a\nb\nx\ny\nc\nd\nz\na\nb\nx\ny\nc\nd\n");
-    assert_eq!(anchor.place(&twice, 2), Some(2..4), "exact wins");
-    assert_eq!(anchor.place(&twice, 3), None, "ambiguous");
-    let edited = text("a\nb\nx\nY\nc\nd\n");
-    assert_eq!(anchor.place(&edited, 2), None, "missing");
-    let mut far = "pad\n".repeat(NEARBY + 10);
-    far.push_str("a\nb\nx\ny\nc\nd\n");
-    assert_eq!(anchor.place(&text(&far), 2), None, "too far away");
-    assert_eq!(anchor.place(&text("a\n"), 5), None, "past the end");
-}
-
 /// GitHub's hunks have 3 lines of context, so distance decides whether a
 /// host takes a comment on its lines.
 #[test]
@@ -1192,8 +1253,8 @@ fn listing_heads_every_thread() {
 ]}"#,
     )
     .expect("parses");
-    let mut c = Canvas::default();
-    render(&threads(&review.comments), Some("main"), &mut c);
+    let mut c = crate::render::Canvas::default();
+    crate::print::comments(&threads(&review.comments), Some("main"), &[], &mut c);
     let mut out = Vec::new();
     c.write_to(&mut out, None).expect("writes");
     insta::assert_snapshot!(String::from_utf8(out).expect("utf-8"), @r"
@@ -1308,4 +1369,271 @@ fn moved_threads_leave_their_file_only_once_the_other_has_them() {
         "the review's now, on no branch"
     );
     assert_eq!(got[0].id, "pr1", "what was there stays");
+}
+
+/// `gone` says the host no longer has the comments with those refs. A
+/// thread goes whole when every comment in it is gone; a gone reply goes
+/// alone. A first comment, a general one too, whose thread still holds
+/// replies that aren't gone, such as your drafts, stays as what they
+/// answer: posted no longer, without the host's fields, and it can still
+/// be resolved. Refs the file doesn't have are passed over.
+#[test]
+fn gone_removes_what_the_host_no_longer_has() {
+    let mut c = Review::default();
+    let comment = |reference: &str, extra: &str| {
+        format!(
+            r#"{{"op":"upsert","comment":{{"ref":"{reference}","path":"a.rs","text":"{reference}","author":"octocat","url":"https://x/{reference}","outdated":true,"pending":true,"host_resolved":true{extra}}}}}"#
+        )
+    };
+    let reply = |reference: &str, root: &str| {
+        format!(
+            r#"{{"op":"upsert","comment":{{"ref":"{reference}","in_reply_to_ref":"{root}","text":"{reference}","author":"octocat"}}}}"#
+        )
+    };
+    let input = [
+        comment("x:whole", r#","x_thread":"T1""#),
+        reply("x:whole-reply", "x:whole"),
+        comment("x:kept", r#","x_thread":"T2""#),
+        reply("x:kept-reply", "x:kept"),
+        comment("x:drafted", r#","x_thread":"T3""#),
+        r#"{"op":"upsert","comment":{"ref":"x:general","text":"general","author":"octocat"}}"#
+            .to_owned(),
+        reply("x:stays", "x:kept"),
+    ]
+    .join(",");
+    ops(&mut c, &format!("[{input}]")).expect("applies");
+    let drafted = c.comments[4].id.clone();
+    let general = c.comments[5].id.clone();
+    ops(
+        &mut c,
+        &format!(
+            r#"[{{"op":"add","comment":{{"in_reply_to":"{drafted}","text":"My draft"}}}},{{"op":"add","comment":{{"in_reply_to":"{general}","text":"Also mine"}}}}]"#
+        ),
+    )
+    .expect("drafts added");
+
+    let ids = ops(
+        &mut c,
+        r#"[{"op":"gone","refs":["x:whole","x:whole-reply","x:kept-reply","x:drafted","x:general","x:never"]}]"#,
+    )
+    .expect("applies");
+    assert_eq!(ids, [None]);
+    let left: Vec<(&str, Option<&str>)> = c
+        .comments
+        .iter()
+        .map(|c| (c.text.as_str(), c.reference.as_deref()))
+        .collect();
+    assert_eq!(
+        left,
+        [
+            ("x:kept", Some("x:kept")),
+            ("x:drafted", None),
+            ("general", None),
+            ("x:stays", Some("x:stays")),
+            ("My draft", None),
+            ("Also mine", None),
+        ]
+    );
+    ops(
+        &mut c,
+        &format!(r#"[{{"op":"set","id":"{general}","fields":{{"resolved":true}}}}]"#),
+    )
+    .expect("a general comment kept without its ref is still one");
+    assert!(
+        ops(&mut c, r#"[{"op":"add","comment":{"text":"new"}}]"#).is_err(),
+        "a new one still needs a ref"
+    );
+    let unposted = &c.comments[1];
+    assert_eq!(
+        (
+            unposted.url.as_deref(),
+            unposted.outdated,
+            unposted.pending,
+            unposted.host_resolved,
+            unposted.extra.is_empty(),
+            unposted.author.as_str(),
+        ),
+        (None, false, false, None, true, "octocat"),
+        "posted no longer: the host's fields go, the words stay"
+    );
+    assert_eq!(
+        c.comments[0].extra.len(),
+        1,
+        "a comment still there keeps its own"
+    );
+    assert!(
+        ops(&mut c, r#"[{"op":"gone","refs":"x:kept"}]"#).is_err(),
+        "refs is a list"
+    );
+}
+
+/// A resolve or reopen not sent yet is yours: an import, which may have
+/// read the thread before it, changes only what the host says of it. Once
+/// the host has it, the host's word is the thread's again.
+#[test]
+fn an_unsent_resolve_outlasts_an_import() {
+    let mut c = Review::default();
+    let host = |resolved: bool| {
+        format!(
+            r#"[{{"op":"upsert","comment":{{"ref":"x:1","path":"a.rs","text":"Hm","author":"octocat","resolved":{resolved},"host_resolved":{resolved}}}}}]"#
+        )
+    };
+    ops(&mut c, &host(false)).expect("imports");
+    ops(
+        &mut c,
+        r#"[{"op":"set","ref":"x:1","fields":{"resolved":true}}]"#,
+    )
+    .expect("resolves");
+    ops(&mut c, &host(false)).expect("imports again");
+    assert_eq!(
+        (c.comments[0].resolved, c.comments[0].host_resolved),
+        (true, Some(false)),
+        "still to send"
+    );
+    ops(&mut c, &host(true)).expect("the host has it");
+    assert!(!c.comments[0].resolve_unsent());
+    ops(&mut c, &host(false)).expect("reopened on the host");
+    assert_eq!(
+        (c.comments[0].resolved, c.comments[0].host_resolved),
+        (false, Some(false)),
+        "the host's again"
+    );
+}
+
+/// A posted comment keeps its ref: another one for it is refused, as it
+/// would leave the first on the host unknown here. Unposted, it takes one
+/// again.
+#[test]
+fn a_posted_comment_keeps_its_ref() {
+    let mut c = Review::default();
+    let id = added(&mut c, &format!("[{LINE_COMMENT}]"));
+    let set =
+        |reference: &str| format!(r#"[{{"op":"set","id":"{id}","fields":{{"ref":{reference}}}}}]"#);
+    ops(&mut c, &set(r#""x:1""#)).expect("posted");
+    ops(&mut c, &set(r#""x:1""#)).expect("the same again");
+    let refused = ops(&mut c, &set(r#""x:2""#)).expect_err("another");
+    assert!(refused.contains("x:1"), "{refused}");
+    ops(&mut c, &set("null")).expect("unposted");
+    ops(&mut c, &set(r#""x:2""#)).expect("posted anew");
+}
+
+/// A thread of yours the host deleted, kept for a draft reply of yours in
+/// it, says so as a draft the host refused: posting it again would start
+/// a new thread, which the post dialog warns of first. Someone else's
+/// stays theirs, which posting leaves.
+#[test]
+fn a_thread_of_yours_gone_from_the_host_says_so() {
+    let mut c = Review::default();
+    ops(
+        &mut c,
+        r#"[{"op":"upsert","comment":{"ref":"x:mine","path":"a.rs","text":"Mine","author":""}},{"op":"upsert","comment":{"ref":"x:theirs","path":"a.rs","text":"Theirs","author":"octocat"}}]"#,
+    )
+    .expect("imports");
+    let (mine, theirs) = (c.comments[0].id.clone(), c.comments[1].id.clone());
+    for root in [&mine, &theirs] {
+        ops(
+            &mut c,
+            &format!(r#"[{{"op":"add","comment":{{"in_reply_to":"{root}","text":"Draft"}}}}]"#),
+        )
+        .expect("replies");
+    }
+    ops(&mut c, r#"[{"op":"gone","refs":["x:mine","x:theirs"]}]"#).expect("gone");
+    let said: Vec<(&str, Option<&str>, Option<&str>)> = (c.comments.iter())
+        .map(|c| {
+            (
+                c.text.as_str(),
+                c.reference.as_deref(),
+                c.post_error.as_deref(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        said,
+        [
+            ("Mine", None, Some("deleted on the host")),
+            ("Theirs", None, None),
+            ("Draft", None, None),
+            ("Draft", None, None),
+        ]
+    );
+}
+
+/// A move cut short, the other file holding the threads while the first
+/// still does, moves nothing twice the next time: each copy carries the
+/// id it was moved from.
+#[test]
+fn a_move_cut_short_isnt_repeated() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (from, to) = (dir.path().join("local.json"), dir.path().join("pr.json"));
+    let ops = parse_ops(format!("[{LINE_COMMENT}]").as_bytes(), None).expect("ops");
+    let root = apply(&from, ops).expect("applies")[0].clone().expect("id");
+    let reply = apply(
+        &from,
+        vec![Op::Add {
+            comment: Box::new(Comment {
+                text: "And this.".to_owned(),
+                ..Comment::default()
+            }),
+            reply_to: Some(Target::Id(root.clone())),
+        }],
+    )
+    .expect("replies")[0]
+        .clone()
+        .expect("id");
+    // The first file can't be written back: its temporary file's name is
+    // taken.
+    let blocked = sibling(&from, ".tmp");
+    fs::create_dir(&blocked).expect("mkdir");
+    assert!(move_threads(&from, &to, std::slice::from_ref(&root)).is_err());
+    assert_eq!(read(&from).expect("reads").comments.len(), 2, "still there");
+    let copied = read(&to).expect("reads").comments;
+    assert_eq!(
+        (copied.iter())
+            .map(|c| c.moved_from.as_deref())
+            .collect::<Vec<_>>(),
+        [Some(root.as_str()), Some(reply.as_str())]
+    );
+    fs::remove_dir(&blocked).expect("rmdir");
+    assert_eq!(move_threads(&from, &to, std::slice::from_ref(&root)), Ok(2));
+    assert_eq!(read(&from).expect("reads").comments.len(), 0);
+    assert_eq!(read(&to).expect("reads").comments, copied, "nothing twice");
+}
+
+/// An import brings the summary when the file has none. A comment whose
+/// id the file has for another comment comes in under a new id, and its
+/// replies with it, wherever they are in the file; importing again still
+/// adds nothing.
+#[test]
+fn an_import_keeps_other_comments_apart() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (old, new) = (dir.path().join("old.json"), dir.path().join("7.json"));
+    fs::write(
+        &old,
+        r#"{"version":1,"summary":"From before","comments":[
+{"id":"r1","path":"a.rs","text":"Reply","author":"","created":"2026-11-17T11:00:00Z","in_reply_to":"a1"},
+{"id":"a1","path":"a.rs","text":"Old","author":"","created":"2026-11-17T10:00:00Z"}
+]}"#,
+    )
+    .expect("write");
+    fs::write(
+        &new,
+        r#"{"version":1,"comments":[{"id":"a1","path":"b.rs","text":"Other","author":"","created":"2026-11-18T10:00:00Z"}]}"#,
+    )
+    .expect("write");
+    assert_eq!(import(&old, &new).expect("imported"), 2);
+    let got = read(&new).expect("read");
+    assert_eq!(got.summary.as_deref(), Some("From before"));
+    let (other, came, reply) = (&got.comments[0], &got.comments[1], &got.comments[2]);
+    assert_eq!((other.id.as_str(), other.text.as_str()), ("a1", "Other"));
+    assert_ne!(came.id, "a1", "a new id");
+    assert_eq!(
+        (came.text.as_str(), came.moved_from.as_deref()),
+        ("Old", Some("a1"))
+    );
+    assert_eq!(
+        (reply.text.as_str(), reply.in_reply_to.as_ref()),
+        ("Reply", Some(&came.id))
+    );
+    assert_eq!(import(&old, &new).expect("again"), 0, "once");
+    assert_eq!(read(&new).expect("read"), got);
 }

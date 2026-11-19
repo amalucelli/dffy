@@ -431,6 +431,7 @@ dependencies = [
  "dffy-core",
  "divan",
  "insta",
+ "nix",
  "portable-pty",
  "proptest",
  "pulldown-cmark",
@@ -1679,6 +1680,7 @@ dependencies = [
  "cfg-if",
  "cfg_aliases 0.1.1",
  "libc",
+ "memoffset",
 ]
 
 [[package]]

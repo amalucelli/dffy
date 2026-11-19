@@ -591,8 +591,6 @@ fn parse_files(pages: &[u8]) -> Option<HashMap<String, Vec<git::Hunk>>> {
 /// comment's ref.
 #[derive(Default)]
 pub(crate) struct Known {
-    /// Resolved or reopened here and not posted yet: `resolved` stays.
-    pub toggled: HashSet<String>,
     /// On their lines already. A re-import that can't read them leaves
     /// them there, so their original commit is never needed again.
     pub anchored: HashSet<String>,
@@ -639,10 +637,9 @@ pub(crate) fn upserts(
         known.pending(root, &root_ref, &mut comment);
         comment.insert("path".to_owned(), thread["path"].clone());
         comment.insert("github_thread".to_owned(), thread["id"].clone());
-        comment.insert("github_resolved".to_owned(), thread["isResolved"].clone());
-        if !known.toggled.contains(&root_ref) {
-            comment.insert("resolved".to_owned(), thread["isResolved"].clone());
-        }
+        // dffy keeps a resolve or reopen not sent through this.
+        comment.insert("host_resolved".to_owned(), thread["isResolved"].clone());
+        comment.insert("resolved".to_owned(), thread["isResolved"].clone());
         // Only when true: an upsert that adds a comment keeps a null field.
         if thread["isOutdated"] == true {
             comment.insert("outdated".to_owned(), json!(true));

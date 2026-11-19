@@ -9,6 +9,7 @@ use std::sync::{Arc, OnceLock};
 use gix::bstr::ByteSlice;
 
 use super::Compiled;
+use super::scope::ScopeQuery;
 use crate::git::ObjectId;
 
 /// A list of words or query parts: borrowed for text compiled into the
@@ -36,6 +37,10 @@ pub struct Grammar {
     /// tree-sitter's own highlighter), so a query extending another's goes
     /// after it.
     pub highlights: Words,
+    /// The scope query, as parts concatenated in order: what counts as a
+    /// definition, for where a line is (see [`super::Scopes`]). Empty
+    /// for a language without one.
+    pub scopes: Words,
     /// A line's indentation is syntax: changing it can move code into or
     /// out of a block with the same tokens in the same order, so the
     /// syntax diff never calls such a change only reformatting.
@@ -66,6 +71,7 @@ struct Entry {
     /// The grammar of a [`LanguageSource::Fn`], once loaded.
     loaded: OnceLock<tree_sitter::Language>,
     compiled: OnceLock<Option<Compiled>>,
+    scopes: OnceLock<Option<ScopeQuery>>,
     identity: OnceLock<ObjectId>,
     #[cfg(test)]
     compiles: std::sync::atomic::AtomicUsize,
@@ -91,6 +97,7 @@ impl Language {
             grammar,
             loaded: OnceLock::new(),
             compiled: OnceLock::new(),
+            scopes: OnceLock::new(),
             identity: OnceLock::new(),
             #[cfg(test)]
             compiles: std::sync::atomic::AtomicUsize::new(0),
@@ -133,7 +140,7 @@ impl Language {
             number(&mut hasher, ts.node_kind_count());
             number(&mut hasher, ts.parse_state_count());
             number(&mut hasher, ts.field_count());
-            for part in g.highlights.iter() {
+            for part in g.highlights.iter().chain(g.scopes.iter()) {
                 number(&mut hasher, part.len());
                 hasher.update(part.as_bytes());
             }
@@ -168,6 +175,12 @@ impl Language {
         self.compiled();
     }
 
+    /// [`Language::prepare`] for the scope query, which only
+    /// [`super::FileSyntax`] uses: up to about 20ms (C++'s).
+    pub fn prepare_scopes(&self) {
+        self.scope_query();
+    }
+
     /// The compiled highlight query, compiling it on first use. `None` if
     /// the query doesn't compile against the grammar.
     pub(super) fn compiled(&self) -> Option<&Compiled> {
@@ -179,6 +192,24 @@ impl Language {
                     .compiles
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 Compiled::new(self.grammar(), &self.0.grammar.highlights.concat())
+            })
+            .as_ref()
+    }
+
+    /// Whether [`Grammar::scopes`] has a query.
+    pub(super) fn has_scopes(&self) -> bool {
+        !self.0.grammar.scopes.is_empty()
+    }
+
+    /// The compiled scope query, compiling it on first use. `None` for a
+    /// language without one, or if it doesn't compile.
+    pub(super) fn scope_query(&self) -> Option<&ScopeQuery> {
+        self.0
+            .scopes
+            .get_or_init(|| {
+                self.has_scopes()
+                    .then(|| ScopeQuery::new(self.grammar(), &self.0.grammar.scopes.concat()))
+                    .flatten()
             })
             .as_ref()
     }
@@ -299,6 +330,7 @@ fn builtin() -> [Grammar; 30] {
         interpreters: words![],
         language: LanguageSource::Fn(language),
         highlights: words![],
+        scopes: words![],
         indentation_is_syntax: false,
     };
     [
@@ -323,6 +355,7 @@ fn builtin() -> [Grammar; 30] {
         Grammar {
             extensions: words!["c", "h"],
             highlights: words![tree_sitter_c::HIGHLIGHT_QUERY],
+            scopes: words![include_str!("queries/c/scopes.scm")],
             ..grammar("c", || tree_sitter_c::LANGUAGE.into())
         },
         Grammar {
@@ -332,6 +365,10 @@ fn builtin() -> [Grammar; 30] {
             highlights: words![
                 tree_sitter_c::HIGHLIGHT_QUERY,
                 tree_sitter_cpp::HIGHLIGHT_QUERY,
+            ],
+            scopes: words![
+                include_str!("queries/c/scopes.scm"),
+                include_str!("queries/cpp/scopes.scm")
             ],
             ..grammar("cpp", || tree_sitter_cpp::LANGUAGE.into())
         },
@@ -360,6 +397,7 @@ fn builtin() -> [Grammar; 30] {
         Grammar {
             extensions: words!["go"],
             highlights: words![tree_sitter_go::HIGHLIGHTS_QUERY],
+            scopes: words![include_str!("queries/go/scopes.scm")],
             ..grammar("go", || tree_sitter_go::LANGUAGE.into())
         },
         Grammar {
@@ -375,6 +413,7 @@ fn builtin() -> [Grammar; 30] {
         Grammar {
             extensions: words!["java"],
             highlights: words![tree_sitter_java::HIGHLIGHTS_QUERY],
+            scopes: words![include_str!("queries/java/scopes.scm")],
             ..grammar("java", || tree_sitter_java::LANGUAGE.into())
         },
         Grammar {
@@ -384,6 +423,7 @@ fn builtin() -> [Grammar; 30] {
                 tree_sitter_javascript::HIGHLIGHT_QUERY,
                 tree_sitter_javascript::JSX_HIGHLIGHT_QUERY,
             ],
+            scopes: words![include_str!("queries/javascript/scopes.scm")],
             ..grammar("javascript", || tree_sitter_javascript::LANGUAGE.into())
         },
         Grammar {
@@ -394,6 +434,7 @@ fn builtin() -> [Grammar; 30] {
         Grammar {
             extensions: words!["kt", "kts"],
             highlights: words![tree_sitter_kotlin_sg::HIGHLIGHTS_QUERY, KOTLIN_JUMPS],
+            scopes: words![include_str!("queries/kotlin/scopes.scm")],
             ..grammar("kotlin", || tree_sitter_kotlin_sg::LANGUAGE.into())
         },
         Grammar {
@@ -425,6 +466,7 @@ fn builtin() -> [Grammar; 30] {
             interpreters: words!["python", "pypy"],
             highlights: words![tree_sitter_python::HIGHLIGHTS_QUERY],
             indentation_is_syntax: true,
+            scopes: words![include_str!("queries/python/scopes.scm")],
             ..grammar("python", || tree_sitter_python::LANGUAGE.into())
         },
         Grammar {
@@ -437,6 +479,7 @@ fn builtin() -> [Grammar; 30] {
         Grammar {
             extensions: words!["rs"],
             highlights: words![tree_sitter_rust::HIGHLIGHTS_QUERY],
+            scopes: words![include_str!("queries/rust/scopes.scm")],
             ..grammar("rust", || tree_sitter_rust::LANGUAGE.into())
         },
         Grammar {
@@ -453,6 +496,7 @@ fn builtin() -> [Grammar; 30] {
         Grammar {
             extensions: words!["swift"],
             highlights: words![tree_sitter_swift::HIGHLIGHTS_QUERY],
+            scopes: words![include_str!("queries/swift/scopes.scm")],
             ..grammar("swift", || tree_sitter_swift::LANGUAGE.into())
         },
         Grammar {
@@ -468,6 +512,10 @@ fn builtin() -> [Grammar; 30] {
                 tree_sitter_javascript::JSX_HIGHLIGHT_QUERY,
                 tree_sitter_typescript::HIGHLIGHTS_QUERY,
             ],
+            scopes: words![
+                include_str!("queries/javascript/scopes.scm"),
+                include_str!("queries/typescript/scopes.scm")
+            ],
             ..grammar("tsx", || tree_sitter_typescript::LANGUAGE_TSX.into())
         },
         Grammar {
@@ -475,6 +523,10 @@ fn builtin() -> [Grammar; 30] {
             highlights: words![
                 tree_sitter_javascript::HIGHLIGHT_QUERY,
                 tree_sitter_typescript::HIGHLIGHTS_QUERY,
+            ],
+            scopes: words![
+                include_str!("queries/javascript/scopes.scm"),
+                include_str!("queries/typescript/scopes.scm")
             ],
             ..grammar("typescript", || {
                 tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into()

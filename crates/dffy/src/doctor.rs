@@ -659,7 +659,7 @@ impl Facts {
             Ok(None) => checks.push(Check::new(
                 Mark::Info,
                 label,
-                "not running; the first dffy --watch starts it",
+                "not running; the first viewer starts it",
             )),
             Ok(Some(report)) => {
                 let subscribers: u32 = report.roots.iter().map(|root| root.subscribers).sum();
@@ -885,18 +885,17 @@ impl Facts {
     }
 }
 
-/// The review plugin `name`: the command it describes, and its own
-/// checks, run now.
+/// The review plugin `name`: the command it describes and its own checks,
+/// both asked now. What it describes replaces the cached answer, so a
+/// failure kept from before is asked again.
 fn review(name: &str, ctx: &Ctx) -> ReviewFacts {
     let found = crate::plugin::find(crate::plugin::REVIEW_PREFIX, name);
-    let command = ctx.review().map(|r| {
-        r.as_ref()
-            .map(|d| d.naming.command.clone())
-            .map_err(Clone::clone)
-    });
+    let command = found
+        .as_ref()
+        .map(|_| crate::describe_review(name, ctx.cache.as_ref(), true).map(|d| d.naming.command));
     ReviewFacts {
         name: name.to_owned(),
-        command: found.as_ref().and(command),
+        command,
         checks: found.as_ref().map(crate::plugin::review::doctor),
         path: found.map(|p| p.path),
     }

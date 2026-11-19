@@ -2,23 +2,24 @@
 
 **Experimental.** The file format and the operations may change.
 
-dffy keeps review comments in a JSON file: comments on lines of a diff, replies to them, and whether a thread is resolved. The viewer draws them, and integrations such as a [review plugin](plugins.md#review-plugins) keep the file in step with a code host.
+dffy keeps review comments in a JSON file: comments on lines of a diff, replies to them, and whether a thread is resolved. The viewer draws them, printed output and `--json` show them with `--show-comments` ([usage.md](usage.md#review-comments-in-printed-output)), and integrations such as a [review plugin](plugins.md#review-plugins) keep the file in step with a code host.
 
 - A running viewer reads the file again whenever another program writes it, so a comment written elsewhere shows up in it:
   - It watches the file's directory with the OS's file watcher (FSEvents on macOS, inotify on Linux), so a write that renames a new file over the old one, as `dffy comments apply` does, counts. Nothing is polled while the file is unchanged; on Linux, when the inotify watch limit is reached, the file is checked once a second instead.
-  - It also reads the file when a review plugin it runs reports progress, hands over a review, or exits: plugins write as they go.
-  - A burst of writes is read once, and a file that stat says hasn't changed since the last read, as after the viewer's own writes, isn't read again.
-- Only dffy writes it: the viewer, and `dffy comments apply` for everyone else. An integration sends [operations](#writing-dffy-comments-apply) and dffy applies them under a lock, so two writers never lose each other's changes.
+  - It also reads the file when a review plugin it runs reports progress, hands over a review, or answers: what a plugin sends is written as it comes.
+  - A burst of writes is read once, and a file that hasn't changed since the last read, as after the viewer's own writes, isn't read again.
+- Only dffy writes it: the viewer, and `dffy comments apply` for everyone else. An integration sends [operations](#writing-dffy-comments-apply) and dffy applies them under a lock, so two writers never lose each other's changes. A review plugin sends its operations over its session with dffy, which applies them the same way.
 - dffy never talks to the network. Posting comments to a host and pulling them back is the integration's job.
 
 ## Where the file is
 
-- `--comments <file>` picks the file, for every subcommand. An integration keeps one per review in its own storage and passes it when it starts dffy. A relative path is relative to the directory dffy runs in, which `-C` sets.
+- `--comments <file>` picks the file, for every subcommand. A relative path is relative to the directory dffy runs in, which `-C` sets.
 - Without it, the file is `dffy/comments.json` in the git directory every worktree of the repository shares (`.git/dffy/comments.json`, from a linked worktree too), for reviewing your own changes. Outside a repository there's no default, and `dffy comments` fails until `--comments` names a file.
+- A code host's review, which a [review plugin](plugins.md#review-plugins) keeps in step, has a file of its own: `dffy/reviews/<plugin>/<id>.json` in the same shared git directory, `<plugin>` the plugin's name and `<id>` its id for the review, every byte but lowercase ASCII letters, digits, `-`, `_` and a `.` not first written `%XX` (`.git/dffy/reviews/github/7.json` for dffy-review-github's PR #7), so ids that differ only in case are two files where the file system ignores case, as macOS's does. A name that would be longer than a file name can be is cut to its first 150 bytes, then `-` and 16 hex digits of the id's SHA-1. It outlives the worktrees, as the local file does. Comments kept elsewhere, as a plugin kept a review's before dffy did, come in with [`dffy comments import`](#importing-dffy-comments-import).
 - `dffy comments --session` reads the file of the review session the viewer has open, which the [session pointer](#the-session-pointer) names.
-- On a code host's review ([viewer.md](viewer.md#code-host-reviews)), the viewer shows the integration's file and, beside it, your drafts in the file plain `dffy` uses (your comments without a `ref`, with their replies) that place on the review's diff. Changes to those drafts go to their own file, and so do new comments on the review plain `dffy` found for the branch, which are the working tree's until posted. Posting them (the post dialog's `l`) moves them into the integration's file first: each is added there as a new comment, with a new `id`, its replies after it, and its `branch` dropped, and removed from its own file once the other has it.
+- On a code host's review ([viewer.md](viewer.md#code-host-reviews)), the viewer shows the review's file and, beside it, your drafts in the file plain `dffy` uses (your comments without a `ref`, with their replies) that place on the review's diff. Changes to those drafts go to their own file, and so do new comments on the review plain `dffy` found for the branch, which are the working tree's until posted. Posting them (the post dialog's `l`) moves them into the review's file first: each is added there as a new comment, with a new `id`, its replies after it, and its `branch` dropped, and removed from its own file once the other has it.
 - A file that doesn't exist reads as no comments. The first write creates it, and its directory. The viewer creates the directory when it starts, to watch it.
-- A diff piped to dffy has no comments.
+- A diff piped to dffy has no comments: it has only its hunks, not the files' text a thread is placed on, so `--show-comments` reads the repository instead.
 
 ### Branches
 
@@ -39,7 +40,7 @@ Before branches, a linked worktree kept its own file, `dffy/comments.json` in it
 `dffy/session` in the shared git directory names the review session the viewer has open, so that `dffy comments --session` and agents ([mcp.md](mcp.md#list_comments)) find its comments without asking the host. The viewer writes it when it opens or finds a review, and it stays after the viewer exits, until another session replaces it:
 
 ```json
-{"version":1,"comments":"/home/ada/.local/state/dffy-review-github/acme/widgets/7.json","review":"7","branch":"feature/x","head":"e4f5a6b"}
+{"version":1,"comments":"/home/ada/src/widgets/.git/dffy/reviews/github/7.json","review":"7","branch":"feature/x","head":"e4f5a6b8c1d2e3f4a5b6c7d8e9f0a1b2c3d4e5f6"}
 ```
 
 | Field | Meaning |
@@ -48,7 +49,7 @@ Before branches, a linked worktree kept its own file, `dffy/comments.json` in it
 | `comments` | The session's comments file, an absolute path. |
 | `review` | The review plugin's id for the review. |
 | `branch` | The [current branch](#branches) when it was opened; `null` on a detached HEAD. |
-| `head` | The review's head commit. |
+| `head` | The review's head commit, a full id. |
 
 Without one, `dffy comments --session` fails and says so; a pointer that isn't this shape is an error, not an empty session.
 
@@ -56,7 +57,9 @@ Without one, `dffy comments --session` fails and says so; a pointer that isn't t
 
 A **draft** is a comment of yours (an empty `author`) without a `ref`, in a review session's file, the one a review plugin keeps for a review; `P` posts it. Elsewhere nothing is posted, so the viewer shows no drafts there and doesn't count any.
 
-A comment without a `ref` whose `author` isn't empty, such as one an agent wrote, is never a draft: posting it would put it out under your name. In a review session it shows `not posted`, stays out of the counts and of what `P` sends, and a review plugin's `post` leaves it alone. You can still edit or delete it, or make it yours with `set` and an empty `author` (`a` on its thread in the viewer), which makes it a draft.
+A comment without a `ref` whose `author` isn't empty, such as one an agent wrote, is never a draft: posting it would put it out under your name. A comment added through the [control API](control.md) is the client's, by the name its hello gives (`dffy ctl` for `dffy ctl`, `dffy mcp` for the MCP server's tools, `dffy ctl` too for a client that gives none), so it's one of these. In a review session it shows `not posted`, stays out of the counts and of what `P` sends, and a review plugin's `post` leaves it alone. You can still edit or delete it, or make it yours with `set` and an empty `author` (`a` on its thread in the viewer), which makes it a draft.
+
+A thread of yours the host deleted while it holds a draft reply of yours stays for the reply ([`gone`](#gone)), as a draft again, with `deleted on the host` in its `post_error`: posting it would start a new thread, so the post dialog warns of it, as of any draft the host refused, before it goes.
 
 ## The file, version 1
 
@@ -92,7 +95,7 @@ A comment:
 | `created` | When it was written, RFC 3339 (`2026-11-17T10:42:00Z`). dffy writes UTC; integrations give their host's timestamp. |
 | `in_reply_to` | For a reply, the `id` of its thread's first comment. |
 | `resolved` | Whether the thread is resolved. It's read from the thread's first comment. |
-| `ref` | Opaque, owned by an integration: the comment's identity on a host, such as dffy-review-github's `github:<node id>`. A comment with a `ref` has been posted. Each `ref` is on one comment at most. |
+| `ref` | Opaque, owned by an integration: the comment's identity on a host, such as dffy-review-github's `github:<node id>`. A comment with a `ref` has been posted. Each `ref` is on one comment at most, and a comment keeps its `ref` until it's cleared: `set` refuses another, as two posts of one draft would give it. |
 | `anchor` | The text of the commented lines, with up to 2 lines of context on each side. See [Anchors](#anchors). |
 | `distance` | How many lines the commented lines are from the nearest change on their side, 0 when they include one, in the diff the comment was written on. A hint for hosts that accept a comment on lines only near a change, whose diff may not be that one. Left out when it isn't known. See [Distance](#distance). |
 | `url` | The comment on its host, set by an integration. `o` on a focused thread in the viewer opens it; only `http` and `https` links open. |
@@ -101,7 +104,9 @@ A comment:
 | `label` | Optional, for a general comment: a word the integration gives it, such as a review's verdict (`approved`). dffy shows it as given. |
 | `branch` | Optional, for a local comment: the [branch](#branches) it was written on. It's the thread's: read from its first comment, and a reply added to a thread takes it. Left out for a thread that shows on every branch. |
 | `pending` | `true` when the comment is on the host but visible only to you, as in a review not submitted yet. Set by an integration; left out when false. |
-| `post_error` | Optional: why the host refused the comment when it was posted, set by an integration and cleared when a post goes through. `dffy comments` shows it under the comment. |
+| `post_error` | Optional: why the host refused the comment when it was posted, set by an integration and cleared when a post goes through; dffy sets `deleted on the host` on a thread of yours that [`gone`](#gone) keeps. `dffy comments` shows it under the comment. |
+| `host_resolved` | Optional, on a posted thread's first comment: whether the host has the thread resolved, as an integration last saw it. A `resolved` that differs is a resolve or reopen not sent yet, which a review plugin's `post` sends; while it differs, an `upsert`'s `resolved` is ignored, so an import doesn't undo it. Left out for a thread the host doesn't resolve, or that no integration said of. |
+| `moved_from` | Optional: the `id` the comment had in the file it came from, when moving the local review's drafts to a review's file, or importing another file over an id this one uses, gave it a new one. A move or import run again after one cut short finds it by this and doesn't copy it twice. |
 
 - `id`, `text`, `author`, `created` and `resolved` are always present, and so is `path` on every comment but a general one. dffy leaves out the other fields when they don't apply; a reader treats a field that's `null` as left out.
 - **Kinds of comment:**
@@ -109,6 +114,10 @@ A comment:
   - A **file comment** has none of them.
   - A **general comment** has no `path` either.
   - A **reply** has `in_reply_to`, and its thread's `path` and `old_path`; its place is its thread's. It has no lines or anchor of its own.
+- **Designed for.** The fields are checked against these hosts' review models before one is added or changed, and none is one host's ([plugins.md](plugins.md#the-review-protocol-version-1) checks the protocol the same way):
+  - **GitLab merge requests.** A discussion is a thread, its first note the first comment; a note on the merge request itself, or a system note, is a general comment. A draft note is `pending` once on the host, and a draft here before. A discussion is resolved as a whole, which is `resolved` and `host_resolved` on its first comment; a draft reply that resolves it is a reply here plus a resolve the plugin sends from `resolves`. A locked discussion takes no reply: the plugin's plan skips one, with why. An approval is an event, not a field. A note's position (its commits, line codes) is the plugin's own fields.
+  - **Gerrit changes.** A patch set's commit is the head; a comment on its parent is on the `old` side. A comment written on an earlier patch set is placed by its anchor, taken from that patch set's file, and is `outdated` when the plugin says the lines changed since. A thread's state is the last comment's in Gerrit; the plugin gives it as `resolved` on the first. Drafts on the server are `pending`. A comment on part of a line keeps the whole lines here, its character range in the plugin's fields. Votes are the session's `labels`; the change's messages, votes included, are general comments of kind `review`, the vote as their `label`.
+  - **A review with no host**, kept in the repository: posting gives each comment a `ref` of the plugin's own, and nothing is `pending` or has a `url`.
 - **Text:** a line of `anchor` is the line without its `\n`; a `\r` before it stays. A line that isn't valid UTF-8 has each invalid sequence replaced by U+FFFD, and an anchor taken from it only matches the same replaced text.
 
 ### General comments
@@ -120,7 +129,7 @@ A general comment is on the review as a whole, not on a file: a pull request's d
 ```
 
 - It has no `path`, `old_path`, `side`, lines or anchor.
-- Only an integration adds one, importing it from a host, so it has a `ref`: `add` and `upsert` refuse a comment without a `path` and without a `ref`, and one without a `path` that has lines. dffy doesn't write general comments yet.
+- Only an integration adds one, importing it from a host, so it has a `ref`: `add` and `upsert` refuse a comment without a `path` and without a `ref`, and one without a `path` that has lines, and `set` won't remove its `ref`. dffy doesn't write general comments yet. One the host deleted while your replies hang off it stays without its `ref` ([`gone`](#gone)).
 - `kind` says what it is, in words that aren't any host's: `description` for the review's own description, `review` for the summary of a submitted review, `comment` for any other. A reader shows a kind it doesn't know as a comment.
 - `label` is the integration's word for it, shown as given; dffy-review-github gives a review's state, such as `approved` or `changes requested`.
 - A reader that doesn't know general comments reads one as a comment on no file, and keeps its `kind` and `label` as fields it doesn't know.
@@ -141,7 +150,7 @@ Line numbers alone go stale: a host moves a thread to a newer commit, and a loca
 
 1. **Exact:** the lines at `start` to `end` are the anchor's `lines`. The comment stays there.
 2. **Moved:** the anchor's `before`, `lines` and `after`, in a row, appear exactly once within 1000 lines of `start`. The comment goes to that copy of `lines`.
-3. **Unplaced:** otherwise. The viewer shows the comment under its file's last row, headed with the lines `start` and `end` name on `side`, over the anchor's lines and context as they were; a commented line shows as unchanged when the comment numbers it on both sides. `i`'s list has it apart, with its file.
+3. **Unplaced:** otherwise. The viewer shows the comment under its file's last row, headed with the lines `start` and `end` name on `side`, over the anchor's lines and context as they were; a commented line shows as unchanged when the comment numbers it on both sides. `i`'s list has it apart, with its file. Printed output with `--show-comments` shows it the same way at the end of its file; `--json` and MCP say `lost` ([json.md](json.md#annotations)).
 
 A range whose first line is on the other side (`start_side` isn't `side`, as when it runs from removed lines to added ones) is anchored and placed by its lines on `side`: from `start`'s number on `side` when it has one, else `end` alone.
 
@@ -158,7 +167,7 @@ The viewer writes it when you add a comment, from the diff on screen, which may 
 
 ### Versions
 
-- A reader ignores fields it doesn't know, at the top level and in a comment, and dffy keeps them when it rewrites the file. Only those two levels: unknown fields inside `start`, `end` or `anchor` are dropped. An integration can store its own fields there; prefix them with its name (`github_thread`) to keep clear of fields dffy may add.
+- A reader ignores fields it doesn't know, at the top level and in a comment, and dffy keeps them when it rewrites the file. Only those two levels: unknown fields inside `start`, `end` or `anchor` are dropped. An integration can store its own fields there; prefix them with its name (`github_thread`) to keep clear of fields dffy may add. dffy hands a review plugin its fields back with the comment's `ref` ([plugins.md](plugins.md#comments)).
 - New fields keep the version. Removing or renaming a field, or changing its type or meaning, bumps it.
 - dffy refuses a file of a version it doesn't know, and never rewrites one.
 
@@ -209,7 +218,7 @@ src/lib.rs:12-14
 
 `comments` is a subcommand, so a revision named `comments` needs the explicit form: `dffy diff comments`.
 
-Agents read the same comments through the MCP tool `list_comments` ([mcp.md](mcp.md#list_comments)).
+Agents read the same comments through the MCP tool `list_comments` ([mcp.md](mcp.md#list_comments)), with where each thread is now in a diff when asked, and with `comments: true` on `file_diff` and `diff`, beside the lines they're on. To read them under their lines in a diff, print it with `--show-comments` ([usage.md](usage.md#review-comments-in-printed-output)).
 
 ## Writing: `dffy comments apply`
 
@@ -227,6 +236,8 @@ echo '[{"op":"add","comment":{"path":"README.md","text":"Typo in the title."}}]'
 
 The operations are all or nothing: when one fails, nothing is written. Batch everything one change needs into one call, such as a page of imported threads, so other writers see it whole.
 
+A `set` of a comment's `text` or `suggestion` is refused while the review is being posted, as the post read its drafts already: the post holds `<file>.post` beside the file from reading them until it ends, and a batch with such a `set` holds it too while it writes.
+
 ### Operations
 
 | Operation | Does |
@@ -235,6 +246,7 @@ The operations are all or nothing: when one fails, nothing is written. Batch eve
 | `{"op":"set","id":"…","fields":{…}}` | Changes some fields of the comment with that `id`. `"ref":"…"` instead of `"id"` picks the comment with that `ref`. |
 | `{"op":"upsert","comment":{…}}` | For imports: updates the comment with the given comment's `ref`, or adds it when there's none. |
 | `{"op":"rm","id":"…"}` | Removes the comment with that `id` (or `"ref":"…"`), and its replies when it starts a thread. |
+| `{"op":"gone","refs":["…"]}` | For imports: the host no longer has the comments with these refs. See [`gone`](#gone). |
 | `{"op":"notice","notice":"…"}` | Sets the file's `notice`; `null` removes it. |
 | `{"op":"summary","summary":"…"}` | Sets the file's `summary`; `null` removes it. |
 
@@ -258,7 +270,7 @@ A line comment needs `start`, `end` and an `anchor` with at least one line; `sta
 | `suggestion` | The suggestion; `null` removes it. Refused on a comment with a `ref`, as `text` is. |
 | `author` | Only `""`: the comment becomes yours, as when you adopt one an agent wrote, which makes it a [draft](#drafts) in a review session. Refused on a comment with a `ref`, as `text` is. |
 | `resolved` | Whether the thread is resolved; set it on the thread's first comment. |
-| `ref` | The `ref`, after posting the comment; `null` removes it. |
+| `ref` | The `ref`, after posting the comment; `null` removes it. A comment that has a `ref` takes no other. |
 | `anchor` | The anchor, for a comment placed again on newer text. |
 | `branch` | The thread's [branch](#branches), whichever of its comments the `set` names: it moves the whole thread there, or with `null` to no branch. |
 | `pending` | Whether it's on the host only for you. |
@@ -266,8 +278,18 @@ A line comment needs `start`, `end` and an `anchor` with at least one line; `sta
 
 **`upsert`.** The comment needs a `ref` and has no `id`, and can name its thread with `in_reply_to` or `in_reply_to_ref` as in `add`. A comment read from the file is upserted back without its `id`.
 
-- When a comment has that `ref`, the fields given replace its own, `text` included; the fields left out keep their values, and so do its `id` and the fields dffy doesn't know. A field given as `null` is removed.
+- When a comment has that `ref`, the fields given replace its own, `text` included; the fields left out keep their values, and so do its `id` and the fields dffy doesn't know. A field given as `null` is removed. A `resolved` is passed over while the thread holds a resolve or reopen not sent (its `host_resolved` differs from its `resolved`): that's yours until it's sent.
 - Otherwise it's added, as by `add`.
+
+### `gone`
+
+An integration that read every comment the host has says which of those it imported before are gone, deleted on the host. dffy removes them so that nothing of yours is lost with them:
+
+- A thread whose comments are all gone goes whole.
+- A reply goes alone.
+- The first comment of a thread, a general comment's too, that still holds replies not gone, such as your drafts, stays as what they answer, posted no longer: its `ref`, `url`, `outdated`, `pending`, `host_resolved` and the fields dffy doesn't know go. One of yours gets `deleted on the host` as its `post_error`, since it's a draft again. Its replies stay drafts; an integration can't post them in a thread the host no longer has.
+
+A ref no comment has is passed over.
 
 ### The answer
 
@@ -277,7 +299,7 @@ On success, dffy prints one JSON object on stdout:
 {"ids":["e2a05d7c1f9b4836",null,"9f3c2a71b04e5d18"]}
 ```
 
-`ids` has an entry per operation, in order: the `id` of the comment it added, changed or removed, or `null` for `notice` and `summary`.
+`ids` has an entry per operation, in order: the `id` of the comment it added, changed or removed, or `null` for `gone`, `notice` and `summary`.
 
 On failure, dffy prints the error on stderr and exits with status 128, and the file is unchanged. The message starts with the failing operation's position in the list, from 0:
 
@@ -289,6 +311,17 @@ An operation fails when:
 
 - it's malformed: an unknown `op`, a field of the wrong type, or a comment missing what it needs;
 - the comment it names doesn't exist;
-- it would give a `ref` to a second comment;
+- it would give a `ref` to a second comment, or another `ref` to a comment that has one;
 - it sets `text`, `suggestion` or `author` on a comment with a `ref`, or `author` to anything but `""`;
+- it removes a general comment's `ref`;
 - the file is of a version dffy doesn't know, or isn't valid JSON.
+
+## Importing: `dffy comments import`
+
+```sh
+dffy comments --session import ~/.local/share/dffy-review-github/github.com/acme/widgets/7/comments.json
+```
+
+`dffy comments import <file>` adds to the comments file, under its lock, the comments of another comments file that it doesn't have: drafts and all, each with its `id`. A comment the file has already, by `ref` as when the host's import brought it, by `id` on the same `path` and `created`, or by an earlier import's `moved_from`, stays as the file has it. One whose `id` the file has for another comment comes under a new `id`, its `moved_from` the old one. A reply joins its thread whichever way the file has it, wherever it is in `<file>`. The `summary` comes too when the file has none. Importing the same file again adds nothing. `<file>` stays as it is, and a file of a version dffy doesn't know is refused. It prints how many comments came: `imported 3 comments`.
+
+It's for comments kept outside dffy's files, such as those dffy-review-github kept for a PR before dffy kept them ([review-github.md](review-github.md#storage)). A resolve or reopen not sent that such a file kept as a field of its own, rather than as `host_resolved`, doesn't come with it: resolve the thread again.

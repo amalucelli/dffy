@@ -275,11 +275,18 @@ pub(crate) enum Command {
     #[command(
         long_about = "Serve diffs to coding agents over the Model Context Protocol.\n\n\
         Speaks MCP on stdin and stdout for the repository at -C or the current \
-        directory, with four tools: changed_files, file_diff and diff return the \
-        objects of dffy --json, and list_comments the review comments, a page at a time. Register it with an agent, as \
-        in: claude mcp add dffy -- dffy mcp. See docs/mcp.md."
+        directory. changed_files, file_diff and diff return the objects of dffy --json, \
+        and list_comments the review comments, a page at a time; open_in_viewer, \
+        focus_thread and viewer_selection drive the viewer running there. Register it \
+        with an agent, as in: claude mcp add dffy -- dffy mcp. See docs/mcp.md."
     )]
     Mcp,
+    /// Drive a running viewer: show a file at a line, focus a thread, read the selection
+    #[command(long_about = "Drive a running viewer through dffyd's control API.\n\n\
+        Each command goes to the viewer running in this working tree (or -C <path>'s), \
+        or to --view <id>. Paths are relative to the current directory. --json prints \
+        the protocol's result. See docs/control.md.")]
+    Ctl(CtlArgs),
     /// Print a shell completion script
     Completions {
         #[arg(value_enum)]
@@ -355,6 +362,12 @@ pub(crate) struct BranchArgs {
 pub(crate) enum CommentsAction {
     /// Apply a JSON list of operations from stdin, all or none, and print the ids they touched
     Apply,
+    /// Add the comments of another comments file that this one doesn't have, by id or ref
+    Import {
+        /// The comments file to take them from
+        #[arg(value_name = "file")]
+        from: PathBuf,
+    },
     /// Remove the resolved threads, with their replies, of the current branch and of none
     Rm {
         /// Remove the resolved threads; required
@@ -363,6 +376,48 @@ pub(crate) enum CommentsAction {
         #[command(flatten)]
         branches: BranchArgs,
     },
+}
+
+#[derive(Debug, Args)]
+pub(crate) struct CtlArgs {
+    /// The view to drive, by the id dffy ctl views lists; else the one viewer in this working tree
+    #[arg(long, value_name = "id", global = true)]
+    pub view: Option<u64>,
+    /// Print the protocol's JSON result instead of text
+    #[arg(long, global = true)]
+    pub json: bool,
+    #[command(subcommand)]
+    pub action: CtlAction,
+}
+
+#[derive(Debug, Clone, Subcommand)]
+pub(crate) enum CtlAction {
+    /// List the running viewers
+    Views,
+    /// Show a file of the diff, at a new-side line or, with :old, an old-side one
+    Open {
+        #[arg(value_name = "path[:line[:old]]")]
+        at: String,
+    },
+    /// Show and focus a comment thread, named by any of its comments' ids
+    Focus {
+        #[arg(value_name = "thread")]
+        thread: String,
+    },
+    /// Print the lines selected in the viewer, after their place
+    Selection,
+    /// Print the file shown, its top line and what the viewer compares
+    State,
+    /// Add a comment on a line, as c in the viewer would
+    Comment {
+        #[arg(value_name = "path:line[:old]")]
+        at: String,
+        /// The comment, its words joined with spaces
+        #[arg(required = true, value_name = "text")]
+        text: Vec<String>,
+    },
+    /// Print the protocol's JSON Schema
+    Schema,
 }
 
 #[derive(Debug, Clone, Subcommand)]
@@ -427,7 +482,7 @@ pub(crate) struct DiffArgs {
         conflicts_with_all = [
             "staged", "unstaged", "merge_base", "exit_code", "watch", "stat", "name_only",
             "name_status",
-            "focus", "paths",
+            "focus", "paths", "show_comments",
         ]
     )]
     pub color_only: bool,
@@ -452,6 +507,7 @@ pub(crate) struct ShowArgs {
 
 /// Arguments shared by `diff` and `show`.
 #[derive(Debug, Args, Default)]
+#[expect(clippy::struct_excessive_bools, reason = "each flag is its own switch")]
 pub(crate) struct CommonArgs {
     /// Only show files under this path
     #[arg(long, value_name = "path")]
@@ -465,6 +521,12 @@ pub(crate) struct CommonArgs {
     /// Show the names and status letters of changed files
     #[arg(long, group = "summary")]
     pub name_status: bool,
+    /// Print each review comment thread under the line it's on; with --json, add each file's annotations. The threads of --comments <file>, or the repository's on the current branch (docs/comments.md)
+    #[arg(long, conflicts_with = "summary")]
+    pub show_comments: bool,
+    /// With --show-comments, the threads of the review session the viewer has open instead of the local ones
+    #[arg(long, requires = "show_comments")]
+    pub session: bool,
     #[command(flatten)]
     pub view: ViewArgs,
     /// Limit the diff to these paths, relative to the current directory
@@ -569,10 +631,10 @@ mod tests {
     }
 
     fn merge_request() -> Naming {
-        Naming::decode(
-            br#"{"version":1,"command":"mr","noun":"merge request","nouns":"merge requests"}"#,
-        )
-        .expect("a describe answer")
+        let answer =
+            br#"{"protocol":1,"command":"mr","noun":"merge request","nouns":"merge requests"}"#;
+        Naming::decode(&crate::plugin::json::parse(answer).expect("JSON"))
+            .expect("an initialize answer")
     }
 
     /// With a review plugin that describes `mr`, `mr` is a subcommand that

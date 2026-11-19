@@ -20,10 +20,11 @@ use dffy_core::document::Counts;
 use dffy_core::view::Attributes;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-use super::comments::Comments;
+use super::comments::look_role;
 use super::fuzzy;
 use super::view::Entry;
 use crate::render::{escape, stat};
+use crate::review::model::Comments;
 use crate::term::Grid;
 use crate::theme::{Role, Style, Theme};
 
@@ -438,7 +439,7 @@ impl Tree {
                 continue;
             }
             let path = escape(&raw);
-            let Some((_, at)) = fuzzy::score(&self.filter, &path) else {
+            let Some((_, at)) = crate::fuzzy::score(&self.filter, &path) else {
                 continue;
             };
             let name_start = path.len() - escape(&self.nodes[leaf].name).len();
@@ -937,7 +938,7 @@ impl Tree {
                     let tag = n.to_string();
                     let at = stats_x.saturating_sub(tag.width() + 1);
                     if at > x {
-                        grid.put_str(at, line, stats_x, &tag, style(look.role(), false));
+                        grid.put_str(at, line, stats_x, &tag, style(look_role(look), false));
                         stats_x = at;
                     }
                 }

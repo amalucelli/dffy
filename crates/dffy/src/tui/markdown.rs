@@ -18,17 +18,13 @@ use std::ops::Range;
 use dffy_core::diff::Text;
 use dffy_core::highlight;
 use dffy_core::view::{Attributes, Syntax};
-use pulldown_cmark::{Alignment, CodeBlockKind, Event, Options, Parser, Tag, TagEnd};
+use pulldown_cmark::{Alignment, CodeBlockKind, Event, Parser, Tag, TagEnd};
 use unicode_width::{UnicodeWidthChar as _, UnicodeWidthStr as _};
 
-use super::comments::{pieces, plain};
 use super::view::rendered::language;
-use crate::render::Canvas;
+use crate::render::{Canvas, plain};
+use crate::review::model::{checkbox, markdown_options as options, pieces, uncomment};
 use crate::theme::{Ink, Role};
-
-fn options() -> Options {
-    Options::ENABLE_TABLES | Options::ENABLE_STRIKETHROUGH | Options::ENABLE_TASKLISTS
-}
 
 #[cfg(test)]
 thread_local! {
@@ -123,6 +119,12 @@ impl SourceMap {
             }
         }
         span
+    }
+
+    /// The row of the first glyph drawn from byte `at` of the source or a
+    /// later one; `None` when none is.
+    pub(crate) fn row_of(&self, at: usize) -> Option<usize> {
+        self.glyphs.iter().find(|g| g.src.end > at).map(|g| g.row)
     }
 
     /// The columns of row `row`'s glyphs drawn from bytes of `range`.
@@ -232,54 +234,6 @@ pub(crate) fn render(text: &str, width: usize, highlight: bool) -> Body {
         rows: writer.c,
         map: writer.map,
     }
-}
-
-/// What a folded thread and the comments panel show of a comment: the
-/// first line of its text as rendered, without styles; escaped.
-pub(crate) fn summary(text: &str) -> String {
-    let mut out = String::new();
-    // A block's comment may run over several of its lines.
-    let mut html = String::new();
-    for event in Parser::new_ext(text, options()) {
-        match &event {
-            Event::Text(t) | Event::Code(t) => out.push_str(t),
-            Event::InlineHtml(h) => out.push_str(&uncomment(h)),
-            Event::Html(h) => html.push_str(h),
-            Event::End(TagEnd::HtmlBlock) => out.push_str(&uncomment(&std::mem::take(&mut html))),
-            Event::TaskListMarker(done) => out.push_str(checkbox(*done)),
-            Event::SoftBreak
-            | Event::HardBreak
-            | Event::End(
-                TagEnd::Paragraph
-                | TagEnd::Heading(_)
-                | TagEnd::Item
-                | TagEnd::CodeBlock
-                | TagEnd::TableCell,
-            ) => out.push('\n'),
-            _ => {}
-        }
-        if let Some((first, _)) = out.trim_start().split_once('\n') {
-            return plain(first.trim());
-        }
-    }
-    plain(out.trim())
-}
-
-fn checkbox(done: bool) -> &'static str {
-    if done { "☑ " } else { "☐ " }
-}
-
-/// `html` less its comments, an unclosed one to the end.
-fn uncomment(html: &str) -> String {
-    let mut out = String::new();
-    let mut rest = html;
-    while let Some(start) = rest.find("<!--") {
-        out.push_str(&rest[..start]);
-        let after = &rest[start + 4..];
-        rest = after.find("-->").map_or("", |end| &after[end + 3..]);
-    }
-    out.push_str(rest);
-    out
 }
 
 /// An inline style that's open.
@@ -785,7 +739,16 @@ impl Writer<'_> {
             let mut lead = self.lead();
             push(&mut lead, PLAIN, "  ");
             let row = match &spans {
-                Some(spans) => pieces(line, Some(spans.line(i))),
+                Some(spans) => pieces(line, Some(spans.line(i)))
+                    .into_iter()
+                    .map(|(syntax, text)| {
+                        let ink = Ink {
+                            syntax,
+                            ..Role::Plain.into()
+                        };
+                        (ink, plain(&text))
+                    })
+                    .collect(),
                 None => vec![(ink(&[], true), plain(line))],
             };
             self.row(&lead, &row, &line_src);

@@ -1,10 +1,15 @@
 #!/bin/sh
 # The `gh` on review.rs's PATH: it replays the fixtures a test put in
 # $STUB/gh and logs each request. Each event records how many lines the
-# plugin had printed by then, which orders the plugin's output against its
-# requests without sleeps. GraphQL requests go to `requests` and `events`,
-# REST ones to `rest`, and every `gh api` names its host first, which goes
-# to `hostnames`.
+# plugin had printed by then, past its answer to `initialize` and but what
+# it said to write, which orders the plugin's output against its requests
+# without sleeps. GraphQL requests go to `requests` and `events`, REST ones
+# to `rest`, and every `gh api` names its host first, which goes to
+# `hostnames`.
+printed() {
+  n=$(grep -cv '"comments/apply"' "$STUB/out")
+  echo $((n > 0 ? n - 1 : 0))
+}
 case "$1" in
   --version) echo 'gh version 2.0.0 (stub)'; exit 0 ;;
   auth)
@@ -45,9 +50,9 @@ if [ "$1" != graphql ]; then
   n=$(grep -cx "$op" "$STUB/rest-ops")
   if [ -f "$STUB/gh/$op.hold" ]; then
     i=0
-    while [ "$(wc -l < "$STUB/out")" -lt 1 ] && [ $i -lt 30 ]; do sleep 0.1; i=$((i + 1)); done
+    while [ "$(printed)" -lt 1 ] && [ $i -lt 30 ]; do sleep 0.1; i=$((i + 1)); done
   fi
-  printf '%s after %s\n' "$all" "$(wc -l < "$STUB/out" | tr -d ' ')" >> "$STUB/rest"
+  printf '%s after %s\n' "$all" "$(printed)" >> "$STUB/rest"
   for f in "$STUB/gh/$op.$n" "$STUB/gh/$op"; do
     if [ -f "$f.json" ]; then cat "$f.json"; exit 0; fi
     if [ -f "$f.http" ]; then
@@ -63,8 +68,10 @@ if [ "$1" != graphql ]; then
 fi
 op=$(printf '%s' "$body" | sed -n 's/.*"operationName":"\([A-Za-z]*\)".*/\1/p')
 printf '%s\n' "$body" >> "$STUB/requests"
-printf 'gh %s after %s\n' "$op" "$(wc -l < "$STUB/out" | tr -d ' ')" >> "$STUB/events"
+printf 'gh %s after %s\n' "$op" "$(printed)" >> "$STUB/events"
 n=$(grep -c "\"operationName\":\"$op\"" "$STUB/requests")
+# The answer waits while a `.gate` for it exists.
+while [ -f "$STUB/gh/$op.$n.gate" ]; do sleep 0.02; done
 # Comment ops another dffy applies to the comments file at $STUB_COMMENTS
 # while this request is in flight.
 if [ -f "$STUB/gh/$op.$n.apply.json" ]; then

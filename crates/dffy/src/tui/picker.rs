@@ -9,8 +9,8 @@
 use dffy_core::document::Source;
 use unicode_width::UnicodeWidthStr;
 
-use super::fuzzy::score;
 use super::view::Entry;
+use crate::fuzzy::score;
 use crate::render::{Canvas, escape, stat, thousands};
 use crate::theme::Role;
 

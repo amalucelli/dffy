@@ -11,22 +11,27 @@ use std::path::{Component, Path, PathBuf};
 
 use dffy_core::bstr::{BString, ByteSlice};
 use dffy_core::cache::Cache;
-use dffy_core::diff::{self, Hunk, Options, Text, emphasize_with};
+use dffy_core::diff::{self, Hunk, LineKind, Options, Text, emphasize_with};
 use dffy_core::document::{
-    self, File, NO_NEWLINE_LINE, diff_line, file_header, hunk_header, structural_note,
+    self, File, NO_NEWLINE_LINE, Side, diff_line, file_header, hunk_header, structural_note,
 };
 use dffy_core::git::{CommitInfo, DiffSpec, FileChange, FileDiff, Repo, Revisions, Status};
 use dffy_core::highlight::{Highlighter, HunkSyntax, Language, PARALLEL_PARSE_BYTES, Source};
 use dffy_core::patch::TextKind;
 use dffy_core::structural::{Structural, Unavailable};
-use dffy_core::view::{self, Arrangement, Heading, LineState, Row, Staging, no_newline};
+use dffy_core::view::{
+    self, Arrangement, Attributes, Heading, LineState, Row, Staging, no_newline,
+};
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::config::DefaultDiff;
 use crate::output::Output;
 use crate::pager::text_role;
 use crate::render::stat::{self, StatEntry};
-use crate::render::{Canvas, escape};
-use crate::theme::Role;
+use crate::render::{Canvas, escape, plain};
+use crate::review::model::{self, At, Hung, Snapshot, age};
+use crate::review::who;
+use crate::theme::{Ink, Role};
 use crate::{Ctx, Error};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -50,6 +55,8 @@ pub(crate) struct Plan {
     pub paths: Vec<BString>,
     pub summary: Summary,
     pub reverse: bool,
+    /// The threads `--show-comments` shows on each file's diff.
+    pub comments: Option<Snapshot>,
     /// The directory pathspecs are relative to.
     base: PathBuf,
 }
@@ -101,6 +108,7 @@ impl Plan {
             paths,
             summary,
             reverse,
+            comments: None,
             base,
         })
     }
@@ -115,6 +123,7 @@ impl Plan {
             paths: Vec::new(),
             summary,
             reverse,
+            comments: None,
             base: base.to_owned(),
         }
     }
@@ -436,6 +445,11 @@ struct Renderer<'a> {
     /// Languages whose query compile has been started ahead of their first
     /// file.
     prepared: std::sync::Mutex<Vec<Language>>,
+    /// The threads drawn under their lines, and whether the sides are
+    /// swapped (`-R`).
+    comments: Option<(&'a Snapshot, bool)>,
+    /// Seconds since 1970, for the threads' ages.
+    now: u64,
 }
 
 impl Renderer<'_> {
@@ -482,6 +496,12 @@ impl FileOutput for Renderer<'_> {
         if document::whitespace_only(&fd, self.options.whitespace) {
             return Ok(false);
         }
+        let threads = match self.comments {
+            Some((comments, reverse)) if comments.has(&fd.change, reverse) => {
+                comments.on(&fd.change, &fd, reverse)
+            }
+            _ => Vec::new(),
+        };
         std::thread::scope(|s| {
             let pending = self.highlight.then(|| {
                 let shown = |range: fn(&Hunk) -> Range<usize>| -> Vec<_> {
@@ -564,7 +584,7 @@ impl FileOutput for Renderer<'_> {
                     })
                     .collect::<Vec<_>>()
             });
-            self.lay_out(&fd, syntax, structural, &mut plain, emit)
+            self.lay_out(&fd, syntax, structural, &mut plain, &threads, emit)
                 .map(|()| true)
         })
     }
@@ -609,6 +629,7 @@ impl Renderer<'_> {
         syntax: Option<Vec<HunkSyntax>>,
         structural: Option<Result<Structural, Unavailable>>,
         plain: &mut [Vec<diff::Emphasis>],
+        threads: &[Hung],
         emit: &mut dyn FnMut(Vec<u8>) -> Result<(), Error>,
     ) -> Result<(), Error> {
         let (mut c, mut emitted) = (Canvas::default(), Ok(()));
@@ -631,8 +652,8 @@ impl Renderer<'_> {
             syntax.as_deref(),
             structural.as_ref(),
             plain,
-            &mut c,
-            &mut flush,
+            (threads, self.now),
+            (&mut c, &mut flush),
         );
         drop((syntax, structural));
         flush(&mut c);
@@ -728,6 +749,8 @@ impl Plan {
             cores: cores(),
             parsing: std::sync::atomic::AtomicUsize::new(0),
             prepared: std::sync::Mutex::new(Vec::new()),
+            comments: self.comments.as_ref().map(|c| (c, self.reverse)),
+            now: model::now(),
         };
         self.stream(ctx, out, &render)
     }
@@ -1019,7 +1042,15 @@ pub(crate) fn file(
     structural: Option<&Result<Structural, Unavailable>>,
     c: &mut Canvas,
 ) {
-    file_parts(layout, fd, syntax, structural, &mut [], c, &mut |_| {});
+    file_parts(
+        layout,
+        fd,
+        syntax,
+        structural,
+        &mut [],
+        (&[], 0),
+        (c, &mut |_| {}),
+    );
 }
 
 /// Rows laid out before [`file_parts`] hands the canvas over.
@@ -1033,14 +1064,20 @@ const PART_ROWS: usize = 1024;
 /// hunks without syntax spans. Every [`PART_ROWS`] rows or so, always
 /// between rows, `flush` gets the canvas, so a long file needn't be laid out
 /// whole; it may clear the canvas, and whatever it leaves is drawn on.
+/// `threads` (placed on `fd`, with the time `now` their ages are from) are
+/// drawn as boxes where [`hang`] puts them.
+#[expect(
+    clippy::too_many_lines,
+    reason = "a file's rows in order, with its threads' boxes among them"
+)]
 fn file_parts(
     layout: &crate::render::Layout,
     fd: &FileDiff,
     syntax: Option<&[HunkSyntax]>,
     structural: Option<&Result<Structural, Unavailable>>,
     plain: &mut [Vec<diff::Emphasis>],
-    c: &mut Canvas,
-    flush: &mut dyn FnMut(&mut Canvas),
+    (threads, now): (&[Hung], u64),
+    (c, flush): (&mut Canvas, &mut dyn FnMut(&mut Canvas)),
 ) {
     let structural_note = structural.and_then(structural_note);
     let header_note = document::note(fd)
@@ -1048,11 +1085,31 @@ fn file_parts(
         .or(structural_note.as_deref());
     let header = file_header(&fd.change, header_note);
     layout.file_header(&header, c);
+    let width = layout.width.unwrap_or(BOX_WIDTH);
     let layout = layout.for_file(header.status, fd.old.len().max(fd.new.len()));
     let (hunks, precomputed) = match structural {
         Some(Ok(s)) => (&s.hunks, true),
         _ => (&fd.hunks, false),
     };
+    let hangs: Vec<Hang> = threads.iter().map(|t| hang(&t.at, hunks)).collect();
+    // The threads not under a row of their lines, old side's first, as the
+    // viewer hangs them, each side in thread order; their lines aren't on
+    // screen, so their boxes say which.
+    let boxes = |at: Hang, c: &mut Canvas| {
+        for side in [Side::Old, Side::New] {
+            for (t, _) in (threads.iter().zip(&hangs))
+                .filter(|(t, h)| **h == at && matches!(t.at, At::Line { side: s, .. } if s == side))
+            {
+                thread_box(t, (width, true), now, c);
+            }
+        }
+        for (t, _) in (threads.iter().zip(&hangs))
+            .filter(|(t, h)| **h == at && !matches!(t.at, At::Line { .. }))
+        {
+            thread_box(t, (width, true), now, c);
+        }
+    };
+    boxes(Hang::Top, c);
     let mut heading = Heading::default();
     let mut shown_to = 0;
     for (i, hunk) in hunks.iter().enumerate() {
@@ -1101,8 +1158,45 @@ fn file_parts(
             None => NO_NEWLINE_LINE,
         };
         let len = hunk.lines.len() + markers.len();
+        // This hunk's threads on its lines, old side's first.
+        let mut here: Vec<(Side, usize, &Hung)> = (threads.iter().zip(&hangs))
+            .filter(|(_, h)| **h == Hang::Hunk(i))
+            .filter_map(|(t, _)| match &t.at {
+                At::Line { side, lines } => Some((*side, lines.end - 1, t)),
+                _ => None,
+            })
+            .collect();
+        here.sort_by_key(|&(side, ..)| side == Side::New);
+        // Whether row index `i` shows line `last` of `side`.
+        let shows = |i: Option<usize>, side: Side, last: usize| {
+            i.and_then(line_at).is_some_and(|l| {
+                let line = &hunk.lines[l];
+                match side {
+                    Side::Old => line.kind != LineKind::Added && line.old == last,
+                    Side::New => line.kind != LineKind::Removed && line.new == last,
+                }
+            })
+        };
         let mut draw = |row| {
             layout.hunk_row(&header, row, row_line, c);
+            match row {
+                Row::Header => boxes(Hang::Gap(i), c),
+                Row::Line(a) | Row::Pair(Some(a), None) | Row::Pair(None, Some(a)) => {
+                    for &(side, last, t) in &here {
+                        if shows(Some(a), side, last) {
+                            thread_box(t, (width, false), now, c);
+                        }
+                    }
+                }
+                Row::Pair(a, b) => {
+                    for &(side, last, t) in &here {
+                        if shows(a, side, last) || shows(b, side, last) {
+                            thread_box(t, (width, false), now, c);
+                        }
+                    }
+                }
+                Row::Marker => {}
+            }
             if c.len() >= PART_ROWS {
                 flush(c);
             }
@@ -1129,6 +1223,320 @@ fn file_parts(
     if !hunks.is_empty() && shown_to < fd.old.len() {
         layout.separator(fd.old.len() - shown_to, None, false, c);
     }
+    boxes(Hang::End, c);
+    boxes(Hang::Lost, c);
+}
+
+/// Where printed output draws a thread placed on a file's diff.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Hang {
+    /// Under the file's header: a comment on the whole file.
+    Top,
+    /// Under the row of hunk `k` that shows its last line.
+    Hunk(usize),
+    /// Under hunk `k`'s header: its last line is in the gap above it.
+    Gap(usize),
+    /// After the file's last row: its last line is below the last hunk,
+    /// or the file has no hunks.
+    End,
+    /// After those: its lines weren't found.
+    Lost,
+}
+
+/// Where a thread `at` its place goes among the rows of `hunks`. A line
+/// that no hunk shows hangs under the separator of the gap that hides it,
+/// as a block does in the viewer.
+fn hang(at: &At, hunks: &[Hunk]) -> Hang {
+    let At::Line { side, lines } = at else {
+        return if *at == At::File {
+            Hang::Top
+        } else {
+            Hang::Lost
+        };
+    };
+    let last = lines.end - 1;
+    let range = |h: &Hunk| match side {
+        Side::Old => h.old_start..h.old_start + h.old_len,
+        Side::New => h.new_start..h.new_start + h.new_len,
+    };
+    match hunks.iter().position(|h| range(h).end > last) {
+        Some(k) if range(&hunks[k]).start <= last => Hang::Hunk(k),
+        Some(k) => Hang::Gap(k),
+        None => Hang::End,
+    }
+}
+
+/// Columns a thread's box takes in output without a width.
+const BOX_WIDTH: usize = 80;
+
+const AUTHOR: Ink = Ink {
+    role: Role::Plain,
+    syntax: None,
+    attributes: Attributes::BOLD,
+};
+
+/// Writes `comments`, in [`crate::review::threads`] order, for reading
+/// (`dffy comments`, and MCP's text): a heading with each thread's place,
+/// and its branch when it isn't `here`, then each comment's id, author and
+/// time over its text. A reply not under its thread's first comment, as on
+/// a page that starts mid-thread, is headed by its thread's id. A thread
+/// `placed` has, by its first comment's id, says where its lines are now.
+pub(crate) fn comments(
+    comments: &[&crate::review::Comment],
+    here: Option<&str>,
+    placed: &[(String, At)],
+    c: &mut Canvas,
+) {
+    let place = |side: Side, lines: &Range<usize>| {
+        let (first, last) = (lines.start + 1, lines.end);
+        let mut place = if first == last {
+            format!(":{first}")
+        } else {
+            format!(":{first}-{last}")
+        };
+        if side == Side::Old {
+            place.push_str(" (old side)");
+        }
+        place
+    };
+    let text = |c: &mut Canvas, indent: usize, text: &str| {
+        for line in text.lines() {
+            c.spaces(Role::Plain, indent);
+            c.line(Role::Plain, &escape(line.as_bytes()));
+        }
+    };
+    let placed: std::collections::HashMap<&str, &At> =
+        placed.iter().map(|(id, at)| (id.as_str(), at)).collect();
+    let mut thread = None;
+    for (i, comment) in comments.iter().enumerate() {
+        if comment.in_reply_to.is_none() || comment.in_reply_to.as_deref() != thread {
+            thread = Some(comment.in_reply_to.as_deref().unwrap_or(&comment.id));
+            if i > 0 {
+                c.end_line();
+            }
+            if comment.path.is_empty() {
+                c.push(Role::FileHeader, "conversation");
+                for word in [&comment.kind, &comment.label].into_iter().flatten() {
+                    c.push(Role::Dim, &format!(", {}", escape(word.as_bytes())));
+                }
+            } else {
+                c.push(Role::FileHeader, &escape(comment.path.as_bytes()));
+            }
+            match (&comment.in_reply_to, comment.range()) {
+                (Some(root), _) => c.push(
+                    Role::Dim,
+                    &format!(", reply in thread {}", escape(root.as_bytes())),
+                ),
+                (None, Some((side, lines))) => {
+                    let side = match side {
+                        crate::review::Side::Old => Side::Old,
+                        crate::review::Side::New => Side::New,
+                    };
+                    c.push(Role::FileHeader, &place(side, &lines));
+                }
+                (None, None) => {}
+            }
+            match placed.get(comment.id.as_str()) {
+                Some(At::Line { side, lines }) => {
+                    c.push(Role::Dim, &format!(", now {}", place(*side, lines)));
+                }
+                Some(At::Lost) => c.push(Role::Warn, ", lines not found"),
+                _ => {}
+            }
+            if let Some(branch) = comment.branch.as_deref().filter(|b| Some(*b) != here) {
+                c.push(
+                    Role::Dim,
+                    &format!(", branch {}", escape(branch.as_bytes())),
+                );
+            }
+            if comment.resolved {
+                c.push(Role::Dim, ", resolved");
+            }
+            c.end_line();
+        }
+        c.spaces(Role::Plain, 2);
+        c.push(Role::Dim, &escape(comment.id.as_bytes()));
+        c.push(Role::Plain, " ");
+        c.push(Role::Plain, &escape(who(&comment.author).as_bytes()));
+        c.push(
+            Role::Dim,
+            &format!(", {}", escape(comment.created.as_bytes())),
+        );
+        if comment.reference.is_some() {
+            c.push(Role::Dim, ", posted");
+        }
+        if comment.pending {
+            c.push(Role::Dim, ", pending");
+        }
+        c.end_line();
+        text(c, 4, &comment.text);
+        if let Some(suggestion) = &comment.suggestion {
+            c.spaces(Role::Plain, 4);
+            c.line(Role::Dim, "suggestion:");
+            text(c, 6, suggestion);
+        }
+        if let Some(error) = &comment.post_error {
+            c.spaces(Role::Plain, 4);
+            c.line(
+                Role::Warn,
+                &format!("not posted: {}", escape(error.as_bytes())),
+            );
+        }
+    }
+}
+
+/// Writes `hung`'s box, `width` columns wide: the first comment's author,
+/// age and the thread's state in its top border; each comment as plain
+/// text wrapped to fit, a reply under a blank row with a heading of its
+/// own; a suggested change after its comment; and for a thread whose lines
+/// are gone, the lines it was on, numbered as they were. With `apart`, the
+/// box isn't under its lines, so its border names them.
+fn thread_box(hung: &Hung, (width, apart): (usize, bool), now: u64, c: &mut Canvas) {
+    let Some(root) = hung.thread.first() else {
+        return;
+    };
+    let width = width.max(24);
+    let inner = width - 4;
+    let snippet = (hung.at == At::Lost)
+        .then(|| model::snippet(root, None))
+        .flatten();
+    let mut tags: Vec<(Role, String)> = Vec::new();
+    if root.resolved {
+        tags.push((Role::Dim, "resolved".to_owned()));
+    }
+    if root.outdated {
+        tags.push((Role::Warn, "outdated".to_owned()));
+    }
+    match (&hung.at, &snippet) {
+        (At::File, _) => tags.push((Role::Dim, "on the file".to_owned())),
+        (At::Lost, Some(s)) => tags.push((Role::Warn, s.heading.clone())),
+        (At::Lost, None) => tags.push((Role::Warn, "lines not found".to_owned())),
+        (At::Line { side, lines }, _) if apart => {
+            let old = if *side == Side::Old { "old " } else { "" };
+            let (first, last) = (lines.start + 1, lines.end);
+            tags.push((
+                Role::Dim,
+                if first == last {
+                    format!("{old}line {first}")
+                } else {
+                    format!("{old}lines {first}–{last}")
+                },
+            ));
+        }
+        _ => {}
+    }
+    let body = |c: &mut Canvas, spans: &[(Ink, &str)]| {
+        c.push(Role::Dim, "│ ");
+        let used = cut(c, spans, inner);
+        c.spaces(Role::Plain, inner - used + 1);
+        c.line(Role::Dim, "│");
+    };
+    for (i, comment) in hung.thread.iter().enumerate() {
+        let author = escape(who(&comment.author).as_bytes());
+        let when = format!(" · {}", escape(age(&comment.created, now).as_bytes()));
+        let mut spans: Vec<(Ink, &str)> = vec![(AUTHOR, &author), (Role::Dim.into(), &when)];
+        let own = comment.pending.then_some((Role::Hint, "pending"));
+        let words = (i == 0).then_some(&tags).into_iter().flatten();
+        for (role, word) in own.into_iter().chain(words.map(|(r, w)| (*r, w.as_str()))) {
+            spans.extend([(Role::Dim.into(), " · "), (role.into(), word)]);
+        }
+        if i == 0 {
+            c.push(Role::Dim, "┌ ");
+            let used = cut(c, &spans, width - 4);
+            c.push(Role::Plain, " ");
+            c.push(Role::Dim, &"─".repeat(width - 4 - used));
+            c.line(Role::Dim, "┐");
+            if let Some(snippet) = &snippet {
+                let digits = (snippet.rows.iter().map(|r| r.number).max())
+                    .map_or(1, |n| n.to_string().len());
+                for row in &snippet.rows {
+                    let number = format!("{:>digits$} {} ", row.number, row.sign);
+                    let role = if row.context { Role::Dim } else { Role::Plain };
+                    let text: String = row.pieces.iter().map(|(_, text)| text.as_str()).collect();
+                    let text = plain(&text);
+                    body(c, &[(Role::Dim.into(), &number), (role.into(), &text)]);
+                }
+                body(c, &[]);
+            }
+        } else {
+            body(c, &[]);
+            body(c, &spans);
+        }
+        for line in model::plain_text(&comment.text) {
+            for part in wrap(&line, inner) {
+                body(c, &[(Role::Plain.into(), part)]);
+            }
+        }
+        if let Some(suggestion) = &comment.suggestion {
+            body(c, &[(Role::Dim.into(), "suggested change:")]);
+            let old = (root.anchor.iter().flat_map(|a| &a.lines))
+                .map(|l| (Role::Removed, "- ", plain(l)));
+            let new = (suggestion.lines()).map(|l| (Role::Added, "+ ", plain(l)));
+            for (role, sign, text) in old.chain(new) {
+                body(c, &[(role.into(), sign), (role.into(), &text)]);
+            }
+        }
+    }
+    c.push(Role::Dim, "└");
+    c.push(Role::Dim, &"─".repeat(width - 2));
+    c.line(Role::Dim, "┘");
+}
+
+/// Pushes `spans`, cut to `width` columns with `…` when they're longer.
+/// Returns the columns they took.
+fn cut(c: &mut Canvas, spans: &[(Ink, &str)], width: usize) -> usize {
+    let mut used = 0;
+    let total: usize = spans.iter().map(|(_, t)| UnicodeWidthStr::width(*t)).sum();
+    let room = if total > width {
+        width.saturating_sub(1)
+    } else {
+        width
+    };
+    for &(ink, text) in spans {
+        let mut piece = String::new();
+        for ch in text.chars() {
+            let w = ch.width().unwrap_or(0);
+            if used + w > room {
+                break;
+            }
+            used += w;
+            piece.push(ch);
+        }
+        c.push_ink(ink, &piece);
+    }
+    if total > width && width > 0 {
+        c.push(Role::Dim, "…");
+        used += 1;
+    }
+    used
+}
+
+/// `line` in pieces of at most `width` columns, broken after a space when
+/// there's one to break at.
+fn wrap(line: &str, width: usize) -> Vec<&str> {
+    let mut out = Vec::new();
+    let mut rest = line;
+    while UnicodeWidthStr::width(rest) > width {
+        let (mut at, mut space, mut used) = (0, None, 0);
+        for (i, ch) in rest.char_indices() {
+            let w = ch.width().unwrap_or(0);
+            if used + w > width {
+                break;
+            }
+            used += w;
+            at = i + ch.len_utf8();
+            if ch == ' ' {
+                space = Some(at);
+            }
+        }
+        let first = rest.chars().next().map_or(1, char::len_utf8);
+        let at = space.unwrap_or(at).max(first);
+        let (piece, tail) = rest.split_at(at);
+        out.push(piece.trim_end());
+        rest = tail;
+    }
+    out.push(rest);
+    out
 }
 
 /// A commit's header as `git show` prints it, a line at a time.
@@ -1197,6 +1605,47 @@ mod tests {
             "files share the budget up to its limit, never past it"
         );
         assert!(beside_large > 0, "files keep starting beside a large one");
+    }
+
+    /// A thread hangs under the row of its last line when a hunk shows
+    /// it, under the header of the gap that hides it, or at the file's end
+    /// below the last hunk or without hunks; a side a hunk has no lines of,
+    /// as an insertion's old side, doesn't hold it.
+    #[test]
+    fn a_thread_hangs_where_its_last_line_shows() {
+        let hunk = |old: (usize, usize), new: (usize, usize)| Hunk {
+            old_start: old.0,
+            old_len: old.1,
+            new_start: new.0,
+            new_len: new.1,
+            lines: Vec::new(),
+        };
+        // Lines 2–4 and 20–22 of the new side shown; an insertion at old 20.
+        let hunks = [hunk((2, 3), (2, 3)), hunk((20, 0), (20, 3))];
+        let on = |side, lines: Range<usize>| hang(&At::Line { side, lines }, &hunks);
+        assert_eq!(on(Side::New, 3..5), Hang::Hunk(0));
+        assert_eq!(on(Side::New, 0..1), Hang::Gap(0));
+        assert_eq!(on(Side::New, 10..11), Hang::Gap(1));
+        assert_eq!(on(Side::New, 21..22), Hang::Hunk(1));
+        assert_eq!(on(Side::New, 30..31), Hang::End);
+        assert_eq!(on(Side::Old, 19..20), Hang::Gap(1));
+        assert_eq!(
+            on(Side::Old, 20..21),
+            Hang::End,
+            "the insertion has no old lines"
+        );
+        assert_eq!(
+            hang(
+                &At::Line {
+                    side: Side::New,
+                    lines: 0..1
+                },
+                &[]
+            ),
+            Hang::End
+        );
+        assert_eq!(hang(&At::File, &hunks), Hang::Top);
+        assert_eq!(hang(&At::Lost, &hunks), Hang::Lost);
     }
 
     #[test]

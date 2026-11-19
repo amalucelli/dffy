@@ -59,6 +59,12 @@ pub(crate) enum Input {
         x: u16,
         y: u16,
     },
+    /// A left-button press with shift held, from terminals that report it
+    /// rather than keep it for their own selection.
+    ShiftClick {
+        x: u16,
+        y: u16,
+    },
     /// The pointer moved with the left button held.
     Drag {
         x: u16,
@@ -443,11 +449,13 @@ fn x10_mouse(b: &[u8]) -> Parsed {
 
 fn mouse(button: u16, x: u16, y: u16, press: bool) -> Option<Input> {
     // Bit 6 marks wheel buttons, bit 5 motion; the low bits pick the button,
-    // and the bits between them, masked off, the modifiers. The legacy
-    // encoding reports any release as button 3.
+    // and the bits between them the modifiers: 4 shift, 8 meta, 16 ctrl.
+    // The legacy encoding reports any release as button 3.
+    let shift = button & 0b0001_1100 == 4;
     match (button & 0b1110_0011, press) {
         (64, true) => Some(Input::Scroll { delta: -1, x, y }),
         (65, true) => Some(Input::Scroll { delta: 1, x, y }),
+        (0, true) if shift => Some(Input::ShiftClick { x, y }),
         (0, true) => Some(Input::Click { x, y }),
         (2, true) => Some(Input::RightClick { x, y }),
         (32, true) => Some(Input::Drag { x, y }),
@@ -576,7 +584,9 @@ mod tests {
     #[test]
     fn mouse_wheel_and_click() {
         assert_eq!(
-            parse_all(&[b"\x1b[<64;10;5M\x1b[<65;1;1M\x1b[<0;3;4M\x1b[<32;3;6M\x1b[<0;3;6m"]),
+            parse_all(&[
+                b"\x1b[<64;10;5M\x1b[<65;1;1M\x1b[<0;3;4M\x1b[<32;3;6M\x1b[<0;3;6m\x1b[<4;7;8M"
+            ]),
             [
                 Input::Scroll {
                     delta: -1,
@@ -591,6 +601,7 @@ mod tests {
                 Input::Click { x: 2, y: 3 },
                 Input::Drag { x: 2, y: 5 },
                 Input::Release { x: 2, y: 5 },
+                Input::ShiftClick { x: 6, y: 7 },
             ]
         );
         assert_eq!(

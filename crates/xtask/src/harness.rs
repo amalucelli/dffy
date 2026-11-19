@@ -284,7 +284,7 @@ fn pty_run(sandbox: &Sandbox, argv: &[&str], matched: &str, refusal: &str) -> Re
     let mut cmd = CommandBuilder::new(argv[0]);
     cmd.args(&argv[1..]);
     cmd.env_clear();
-    for (var, value) in sandbox.vars() {
+    for (var, value) in sandbox.vars(argv[0].as_ref()) {
         cmd.env(var, value);
     }
     cmd.cwd(&sandbox.repo);
@@ -373,7 +373,7 @@ fn pty_run(sandbox: &Sandbox, argv: &[&str], matched: &str, refusal: &str) -> Re
 
 /// Quits a viewer that showed its frame with `q`, as a user would, and
 /// ends its group if it's still running 5s later; kills one that didn't.
-fn end(
+pub(crate) fn end(
     child: &mut dyn portable_pty::Child,
     writer: &mut dyn std::io::Write,
     received: &mpsc::Receiver<(Instant, Vec<u8>)>,
@@ -416,7 +416,7 @@ const REPLIES: [(&[u8], &[u8]); 13] = [
 
 /// The replies to the queries in `data`. A query split across two reads
 /// goes unanswered.
-fn replies(data: &[u8]) -> Vec<Vec<u8>> {
+pub(crate) fn replies(data: &[u8]) -> Vec<Vec<u8>> {
     let mut out = Vec::new();
     for (i, _) in data.iter().enumerate().filter(|&(_, &b)| b == 0x1b) {
         let rest = &data[i..];

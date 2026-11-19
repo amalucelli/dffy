@@ -168,7 +168,7 @@ Span styles are names:
 
 - Both the request and the answer carry `version`.
 - dffy refuses an answer of a version it doesn't speak and shows the lines with a note. A renderer should answer a request of a version it doesn't speak with an error.
-- A change that would break existing renderers bumps the version; new optional fields and new style names don't.
+- The protocol isn't experimental, unlike the review protocol: renderers are written outside this repository, so it doesn't change in place ([design.md](design.md#protocols)). A change that would break existing renderers bumps the version; new optional fields and new style names don't.
 
 ## Writing your own
 
@@ -227,7 +227,7 @@ The Mermaid plugin in `plugins/mermaid` lays out graphs itself, with no dependen
 
 ### The viewer never waits
 
-- A renderer runs on dffy's worker threads; the file's lines show until its rendering arrives.
+- A renderer runs in the background; the file's lines show until its rendering arrives.
 - Moving to another file, pressing `r` again or quitting stops a renderer still running, with every process it started.
 
 ### Timeouts and failures
@@ -254,7 +254,7 @@ Answers are kept in dffy's disk cache (`cache`), so reopening a file doesn't run
 
 ## Review plugins
 
-A review plugin connects the [review comments](comments.md) to a code host: GitHub, GitLab, Gerrit, or anything else that holds reviews. dffy never touches the network. It runs the plugin in the background and reads its answers as JSON lines; the plugin talks to the host and writes the comments file with `dffy comments apply`. The plugin has no screen of its own: it never prompts or draws, and dffy shows its progress and errors.
+A review plugin connects the [review comments](comments.md) to a code host: GitHub, GitLab, Gerrit, or anything else that holds reviews. dffy never touches the network. It runs the plugin in the background, one process for as long as it shows the repository, and talks to it over its stdin and stdout ([the protocol](#the-review-protocol-version-1)). The plugin talks to the host; dffy keeps the review's comments file, sends each request what it needs of the comments, and writes what the plugin sends back. The plugin has no screen of its own: it never prompts or draws, and dffy shows its progress and errors.
 
 ### Enabling one
 
@@ -268,180 +268,199 @@ A review plugin connects the [review comments](comments.md) to a code host: GitH
 
 ### The review command
 
-The plugin names the command: `dffy pr` is dffy-review-github's, and a GitLab plugin could name it `mr`. dffy asks it with `describe` and adds that command only while a review plugin is set and describes one; otherwise there's no such command, `dffy pr` reads `pr` as a revision, and plain `dffy` doesn't ask for the branch's review. The plugin's words go where dffy names what it reviews: the noun ("pull request", "pull requests") in the command's help, the command panel and the picker; the short form and id prefix in labels (`PR #7`); its events in the post dialog. Everything else, from opening a review to posting it, is dffy's.
+The plugin names the command: `dffy pr` is dffy-review-github's, and a GitLab plugin could name it `mr`. dffy asks it with `initialize` and adds that command only while a review plugin is set and names one; otherwise there's no such command, `dffy pr` reads `pr` as a revision, and plain `dffy` doesn't ask for the branch's review. The plugin's words go where dffy names what it reviews: the noun ("pull request", "pull requests") in the command's help, the command panel and the picker; the short form and id prefix in labels (`PR #7`); its events in the post dialog. Everything else, from opening a review to posting it, is dffy's.
 
 - dffy refuses a command that isn't lowercase letters, digits and `-` starting with a letter, or that's one of its own subcommands or their aliases (`diff`, `show`, `config`, `doctor`, `help`…). `dffy doctor` says why there's no command.
-- dffy runs `describe` before it reads its arguments when they could name the command (help, or a first word that isn't one of dffy's subcommands and could be a command name). Otherwise the viewer asks once its first frame is out, without waiting for the answer, and other runs ask only when they use the plugin. The answer is kept in the disk cache (`cache`), keyed by the plugin program's path, modification time and size: replacing the program asks again. A `describe` that fails or takes over 2 seconds isn't kept; that run has no command, the error names the plugin when its command was then read as a revision, and the next run asks again.
+- dffy starts the plugin for its `initialize` before it reads its arguments when they could name the command (help, or a first word that isn't one of dffy's subcommands and could be a command name), and stops it once answered. Otherwise the viewer asks once its first frame is out, without waiting for the answer, and other runs ask only when they use the plugin. The answer is kept in the disk cache (`cache`), keyed by the plugin program's path, modification time and size: replacing the program asks again, and every `initialize` dffy sends keeps its answer. One that fails or takes over 2 seconds is kept too, as why there's no command: those runs have none, and the error names the plugin when its command was then read as a revision. `dffy doctor` always asks again, and keeps what it's told.
 
 ### dffy-review-github
 
-It reviews a GitHub pull request in dffy. Run it in a clone with a remote on GitHub.
-
-- **The repository.** It takes the remote `gh` takes: the one `gh repo set-default` marked (`remote.<name>.gh-resolved`), else `upstream` when it's on a GitHub host, as in a fork's clone, else `origin`. URLs are read as git rewrites them (`url.<base>.insteadOf`). That remote is the one fetched from, and its URL names the host, owner and repository.
-- **Hosts.** A host is GitHub's when it's github.com, `GH_HOST`, or one `gh auth status --hostname <host>` lists, which gh answers without asking a host it has no login for. The answer is kept beside the repository's PRs (`host.json`) for a day, or until gh's program or its `hosts.yml` changes. Every `gh api` call names the host with `--hostname`. In a repository without such a remote, `detect` answers `{"review":null}` without asking anything of the network, and the other verbs fail saying which remote and host they found.
-- **`gh`.** It reaches GitHub only through the [GitHub CLI](https://cli.github.com), logged in to the repository's host, which its `doctor` checks (gh's own host, `GH_HOST` or github.com, outside a repository). Without `gh` on `PATH`, a verb that asks GitHub fails with `dffy-review-github needs the GitHub CLI (gh): https://cli.github.com`; logged out, or with a token GitHub refuses, with ``gh isn't logged in to github.com; run `gh auth login` ``. Neither costs a call of its own: the first request tells. A `prepare` that has to ask GitHub then prints no session; one answered from its session still opens, with the error after it.
-- **Rate limits.** When GitHub's rate limit is used up, the error says when it resets (`resets at 14:05 UTC`), read from the answer's `X-RateLimit-Reset`, or for GraphQL from the `rate_limit` endpoint, which costs no rate limit. A secondary limit's message is GitHub's alone.
-
-- **Storage.** It keeps a comments file per PR, drafts included, the PR's session, GitHub's hunks of the PR at the session's head, and `check`'s last answer, under `$XDG_DATA_HOME/dffy-review-github/<repository>/<pr>`. It names that file in the session and doesn't read `DFFY_COMMENTS`. Beside the PRs' directories, per repository: `host.json`, `detect.json` (the branch `detect` last found no PR for) and `pruned` (when `prune` last ran).
-- **Opening.** The code comes only through `git fetch`, as the ref `refs/dffy/pull/<pr>`.
-  - A PR prepared before, whose commits are still in the clone, answers from its session before asking GitHub anything. Its threads are downloaded after that. When GitHub's first page has another head than the session's, it prints `{"head":"<commit>","moved":true}` before the progress lines.
-  - The session's head stays the one dffy shows until a `pull`, even when the PR has moved on. `check` says when it has.
-  - When GitHub can't be reached, the code still opens on the fetched head, with the base the session had or the default branch's tip, and the threads are left as they were.
-- **Threads.** Threads are merged into the file by `ref`, and drafts are never touched. A thread you resolved or reopened in dffy keeps your state until it's posted. Each comment gets its `url`, and a thread GitHub marks outdated gets `outdated`. A thread's lines and anchor are those it was written on, read from its original commit (at that commit's merge base with the base, for the old side), outdated or not: GitHub's own placement on the current head is ignored, and dffy places the thread by its anchor's text.
-  - An original commit a force-push left on no ref isn't brought by the head's fetch. After the last page, the original commits the clone doesn't have are fetched by oid in one `git fetch`, onto no ref, and their threads are placed then. Until then, and for good when GitHub no longer has the commit, the thread is a file comment with `"github_unplaced":"original commit not available"`. A commit GitHub lacks fails the whole fetch, so it's fetched again without the one git names.
-  - Once placed, a thread keeps its lines even when its commit later goes from the clone, so the commit is never fetched again for it. One GitHub has dropped is asked for again on each `prepare` or `pull`, after the session line.
-  - A comment in your pending review on GitHub, posted by `post --event pending` or on GitHub's site, comes in with `"pending":true`, which goes once the review is submitted.
-  - A comment GitHub no longer has goes from the file once every page is read. Your pending review's comments count as there, every page of them.
-- **Conversation.** The PR's [general comments](comments.md#general-comments) come with its threads, in the same requests, a page of each list at a time: a later page asks only for the lists that have more. They're merged by `ref` too, each with its `url`, and the viewer shows them as the review's [Conversation](viewer.md#conversation).
-  - The PR's description, `"kind":"description"`, written by the PR's author when the PR was opened. An empty description is left out.
-  - Each comment in the PR's conversation, `"kind":"comment"`.
-  - The summary of each review submitted, `"kind":"review"`, dated when it was submitted, with its state as its `label`: `approved`, `changes requested`, `commented` or `dismissed`. A review submitted without a summary, as one with comments on lines only, is left out, and so is your pending review: its summary isn't sent yet.
-  - Progress lines count threads only.
-  - One GitHub no longer has, or whose text was emptied, goes from the file once every page is read, as deleted threads do.
-- **Posting.**
-  - Each comment is its own request, paced to stay under GitHub's limit, and its `ref` is written back as soon as it's posted, so posting again never sends one twice.
-  - Comments are posted against the session's head, even when the PR has moved on.
-  - Before sending, each draft is planned from git and the hunks `prepare` or `pull` kept, without asking GitHub; `post --dry-run` prints the same plan without sending anything:
-    - A draft goes on the lines its anchor has in the file at that head (at its merge base with the base, for the old side), not on the line numbers it was written at: a draft written on the working tree, with lines added above it, moves to where its lines are. One whose lines aren't at the head is skipped: `lines not in the PR head (unpushed changes?)`.
-    - A draft on a file the PR doesn't change is skipped: `file not in the PR`.
-    - A line comment goes on its lines only when its first and last line, where they are at the head, are in one hunk of GitHub's diff of the PR; else it becomes a file comment that quotes the lines, since GitHub refuses it on them. `prepare` and `pull` ask GitHub for the PR's files beside its threads and keep their hunks for the head the session is on.
-    - Where GitHub's hunks aren't kept for the session's head, or GitHub left a file's patch out (too large, or past the 3000 files it lists), git's diff of the PR (`base...head`, 3 lines of context, two hunks one line apart joined into one as GitHub joins them) decides instead, and the draft line says `"unsure":true`: git can still draw a hunk's edges where GitHub doesn't. The draft's `distance` was measured on the diff it was written on, so it's used only when git can't diff the PR either.
-    - A reply goes in its thread when the thread is on GitHub, or its first comment is planned to post before it; else it's skipped: `its thread isn't posted`.
-  - Only your drafts are posted: a comment without a `ref` whose `author` isn't empty, such as an agent's, is left alone, neither planned nor counted.
-  - Each comment posted goes in your pending review, marked `"pending":true` until the review is submitted.
-  - A skipped draft stays a draft, its reason in its draft line, and the review is still submitted with the event: dffy showed the skips before you sent.
-  - A draft GitHub refuses while posting stays a draft too, with GitHub's reason in its `post_error`, which goes once it's posted. The review is still submitted with the event, without it.
-  - Only GitHub no longer answering stops a post: the event isn't applied, the error says so, and the next post sends the rest. The file's `notice` holds only what's about the whole run: a stop, a failed submit, resolves GitHub refused.
-  - A post holds `post.lock` in the PR's directory while it runs; a second one fails with `already posting #7 in another run`.
-- **Detecting.** `detect` keeps the PR's branch in its session, and answers from the newest session kept for the branch checked out without asking GitHub. Else it asks for the repository's open PR from that branch, in one query. When GitHub has none, that's kept (`detect.json`) for 10 minutes, or until the branch's commit or the branch changes, and `detect` answers `{"review":null}` from it without asking.
-- **Last reviewed head.** A `post` that finishes, having posted a comment or submitted the review, records the session's head, the one it posted against, as `last_reviewed_head`; `pull` leaves it. Until a post records one, it's the commit of your last review submitted on GitHub (among the PR's last 20), when the clone has that commit. "Since last review" compares with it, however many updates came since.
-- **Checking.** `check` asks GitHub's REST API for the PR, never git, sending the `ETag` of its last answer as `If-None-Match`: GitHub answers 304 when nothing changed, which doesn't count against the rate limit. `comments_moved` is `true` when the PR's `updated_at` differs from what the last `prepare` or `pull` imported, as a new comment makes it; a push, an edit of the PR or your own post changes it too.
-- **`dffy-review-github prefetch`** is yours to run, not dffy's. It fetches the heads of the PRs `list` shows, so preparing one later waits only for its threads, and prints `{"fetched":[7,9]}`.
-- **`dffy-review-github prune [--days <n>]`** is yours to run too. It drops the sessions of PRs GitHub last said were merged or closed and that weren't prepared or pulled for `n` days (30 without `--days`), with their `refs/dffy/pull/<pr>`, and prints `{"pruned":[3,5]}`. A session whose comments file holds anything GitHub doesn't have stays: a comment without a `ref`, yours or an agent's, or a resolve not sent. `list` and `detect` run it after their line, at most once a day. A PR merged since it was last prepared still reads as open, and stays.
-- **Its words.** It describes `dffy pr`, "pull request", `PR #7` (its ids are PR numbers, and its labels left out), the events `p` pending (`"submits":false`), `c` comment, `a` approve and `r` request changes, and the warning that GitHub collapses outdated threads, so a reply there is easy to miss. Its `list` groups by `current_branch`, `review_requested` and `mine`.
+`dffy-review-github` reviews a GitHub pull request in dffy, through `gh` and git. [review-github.md](review-github.md) has how it opens, imports, posts and watches a PR, and what it keeps.
 
 ### The review protocol, version 1
 
-The protocol is experimental, and may change while it is. It knows nothing of any host: the plugin names its reviews, its events and its groups, and dffy draws them.
+The protocol is experimental, and may change while it is. It knows nothing of any host: the plugin names its reviews, its events, labels and groups, and dffy draws them.
+
+**Designed for.** Each message is checked against these before it's added or changed:
+
+- GitHub pull requests, through `gh`: a pending review that a submitting event sends, threads resolved by id.
+- GitLab merge requests, through `glab`: draft notes, which a submitting event publishes together; discussions resolved by id; an approval as an event.
+- Gerrit changes: a patch set as the session's head, a newer one as `head/moved`; drafts published with a reply; comments ported from older patch sets, placed by their anchors; votes on several labels, which a session names and a `post`'s answer says again once it changed one; a thread resolved by a reply that says so, which the plugin sends from `resolves`.
+- A review with no host, kept in the repository: no `url`, no `watch`, and its own `detect` and `list`.
 
 **Program.** A review plugin is an executable named `dffy-review-<name>`, found on `PATH` the way renderers are: names are lowercase letters, digits, `-` and `_`, and relative or empty `PATH` entries are skipped.
 
-**When dffy runs each verb.**
+**Framing.** [JSON-RPC 2.0](https://www.jsonrpc.org/specification) over the plugin's stdin and stdout, one message a line: a JSON object, its line breaks escaped as JSON escapes them in strings, then `\n`. Lines rather than `Content-Length` headers, because a plugin in any language reads them with its line reader, a shell script included. Requests carry an `id` (dffy's are numbers) and get one answer each, a `result` or an `error`; notifications carry none and get none. stderr isn't shown: when the process exits, its last line of stderr goes in the message about it.
 
-| Verb | When |
+**Lifecycle.**
+
+- **One process a repository.** The viewer starts the plugin on first use, after its first frame: to look for the branch's review, to open one, or for "Open review…". `dffy pr` starts it before the viewer, which takes it over: opening a review costs one process start, however many requests come after.
+- **No terminal.** dffy starts it in the root of the working tree, in a session of its own: a prompt for a passphrase or a password fails instead of reaching the screen. The session is its process group too, which dffy kills, with everything in it, when it quits.
+- **`initialize` first.** Requests made before its answer wait for it. A plugin that answers it with an error, or writes something that isn't a JSON object before answering, is refused: its requests fail saying why, and it isn't started again.
+- **Crashes.** A process that exits otherwise ends the requests it hadn't answered with how it exited, and is started again after 1 second, then 2, 4, 8 and 16 for crashes in a row; one that ran a minute starts the count over, and after 5 in a row it isn't started again. The new one is told again which review dffy shows and whether you're idle. A request it was running isn't sent again: a `post` resumes at the next `P`.
+- **Quitting.** dffy sends `shutdown` and `exit`, then kills the process group without waiting. While a `post` runs, it cancels the post and waits for it to end first, up to 30 seconds, after a signal as after the second quit: the plugin stops between drafts, so what it posted until then gets its refs.
+- **Short sessions.** dffy also starts the plugin to answer `initialize` alone, when it needs the naming and the cache has none ([The review command](#the-review-command)), and for `doctor` (`dffy doctor`); these run where dffy runs, in a repository or not, and are killed once answered or past their time (2 and 10 seconds).
+
+**Environment.** dffy passes its own environment on, with `DFFY` set to the path of the dffy that started the plugin.
+
+**Messages.**
+
+| Message | Kind | When |
+|---|---|---|
+| `initialize {protocol, client}` | request | First. `client` is `{"name":"dffy","version":"…"}`. |
+| `list` | request | The review command without an id, and "Open review…" in the command panel. |
+| `detect` | request | Plain `dffy`, without revisions or paths, on a branch, once the plugin has initialized; the viewer doesn't wait for the answer. |
+| `prepare {id, known}` | request | The review command with an id, and a review picked from the list. |
+| `pull {id, known}` | request | `p`. |
+| `dryRun {id, drafts, resolves}` | request | A moment after your drafts change, and after a `prepare`, `pull` or `post` ends, while there are drafts and no post runs; and as the dialog `P` opens when the last answer is older than the drafts. |
+| `post {id, event, labels, summary, drafts, resolves}` | request | `enter` in that dialog, once dffy moved the local review's drafts shown on the review into its comments file, when they go. |
+| `doctor` | request | `dffy doctor`; never cached. |
+| `shutdown` | request | On quit. The answer, `null`, comes once every request running is answered. |
+| `exit` | notification | After `shutdown`: the plugin exits. |
+| `$/cancelRequest {id}` | notification | Opening another review or updating cancels a `prepare` or `pull` still running, and the quit or signal that stops a `post` cancels it. dffy also sends it for a request it ends before the plugin's answer: one whose `session` it can't take, whose operations it can't write, or whose words nothing waits for any more. |
+| `watch {id}` | notification | To a plugin that watches: the review dffy shows, `null` for none; again to a process started after a crash. |
+| `idle/changed {idle}` | notification | To a plugin that watches: `true` after 10 minutes without a key on a review, `false` at the next key. |
+| `session {request, session}` | from the plugin | `prepare` or `pull`: the review's [session](#the-session), as soon as its commits are in the clone. dffy opens it at once. |
+| `progress {request, progress}` | from the plugin | How far a request got, done of all: `100/312`. The status bar shows it. |
+| `comments/apply {request, ops}` | from the plugin | Operations for the review's comments file ([Comments](#comments)), applied until the plugin answers `request`, even after dffy ended it, and ignored after. |
+| `head/moved {id, head}` | from the plugin | The review's head on the host, when it isn't the session's, or no longer: dffy says there are new commits, `p` to update. |
+| `comments/changed {id}` | from the plugin | The review changed on the host since its comments were imported: dffy says there are new comments, `p` to update. |
+| `log {message}` | from the plugin | Words for the status bar, such as why watching failed. |
+
+dffy drops a push about a review it doesn't show. Of `prepare`, `pull` and `post`, one runs at a time, beside `list`, `detect` and `dryRun`: a `prepare` or `pull` replaces the one running, cancelling it, but nothing starts while a `post` runs, and a `post` is refused while a `prepare` or `pull` runs, as both write the review's comments. dffy holds a lock on the review from reading a `post`'s drafts until it ends, so a second viewer's `post` of the same review is refused before it reaches its plugin; a plugin should still refuse a `post` while another runs for the same review, as dffy-review-github does. A plugin should answer requests on threads of its own, so a `dryRun` answers while a `prepare` downloads, and stop a cancelled one where it can, answering it with error `-32800`.
+
+**Answers.** The examples are dffy-review-github's.
+
+| Request | Result |
 |---|---|
-| `describe` | Before dffy reads arguments that could name the command, else after the viewer's first frame or on the plugin's first use, when the disk cache has no answer for the program as installed ([The review command](#the-review-command)) |
-| `doctor` | `dffy doctor`; never cached |
-| `list` | The review command without an id, and "Open review…" in the command panel |
-| `detect` | Plain `dffy`, without revisions or paths, on a branch, as the viewer starts, once the plugin has described itself; it doesn't wait for the answer |
-| `prepare <id>` | The review command with an id, and a review picked from the list |
-| `check <id>` | Every 60 seconds while a review is open, unless `prepare` or `pull` is running; not after 10 minutes without a key, until the next one |
-| `pull <id>` | `p` |
-| `post <id> --dry-run [--drafts <file>]` | A moment after your drafts change, and after a `prepare`, `pull` or `post` ends, while there are drafts and no post runs; and as the dialog `P` opens when the last answer is older than the drafts. `--drafts` names the local review's file when there's one |
-| `post <id> --event <event>` | `enter` in that dialog, once dffy moved the local review's drafts shown on the review into the comments file, when they go |
+| `initialize` | [The description](#the-description), with `protocol` and `capabilities`. It should answer at once, from nothing but the plugin itself. |
+| `list` | `{"reviews":[{"id":"7","title":"Spell out five","author":"octocat","url":"https://github.com/acme/widgets/pull/7","head_ref":"five","reason":"current_branch"}]}`. Each review has an `id` and an optional `label`, as a session does. `reason` is `current_branch`, `review_requested` or `mine`, which dffy titles and lists first, in that order; a review listed for another reason may carry a `group`, the title it's listed under, groups in the order they first come (`Other` without one). Each review should be listed once. dffy counts your drafts in each review's comments file itself. |
+| `detect` | `{"review":{…}}`, the open review of what's checked out, a session, or `{"review":null}`: the review of the branch, or whichever the host ties to the commit, as Gerrit does by its Change-Id. It should answer from what it keeps when it can, since it runs on every start of `dffy`. When it names a review, dffy prepares it and keeps showing what plain `dffy` shows, with the review's comments and status; the whole review (`--merge-base <base>` against the working tree) is a command away. |
+| `prepare` | `{}`, once the threads are in, after a `session` notification and `progress` for each page of threads written: threads so far, of all of them. A session answered from what was kept whose head turns out not to be the host's pushes `head/moved`. |
+| `pull` | As `prepare`, after fetching the head: a session with the new head. |
+| `dryRun` | `{"drafts":[…]}`: a [plan](#a-plan) for each draft, in the order they came. dffy counts them, and what's pending on the host and the resolves waiting, itself. It shouldn't send or write anything. |
+| `post` | `{"unposted":[…],"posted":9,"failed":3,"pending":4,"url":"https://github.com/acme/widgets/pull/7#pullrequestreview-2001","last_reviewed_head":"<commit>"}`, after `progress` for each draft: a plan for each draft not posted, all `skip`, then the counts, and the review's `labels` when the post changed a vote. With no drafts and an event that `submits`, it submits what's pending on the host. |
+| `doctor` | `{"checks":[{"name":"gh","ok":true,"detail":"gh version 2.62.0"},{"name":"auth","ok":false,"detail":"not logged in"}]}`: what the plugin needs, each with a short `name`, whether it's fine, and a line saying what was found. |
 
-**Running.**
+**Errors.** A request that fails answers with JSON-RPC's `error`: `{"code":…,"message":"…","data":…}`. dffy shows the message; for `-32601`, a method the plugin doesn't have, it says the plugin doesn't know the request and may be older than dffy. `-32602` is a request the plugin can't take (an unknown event, an id that isn't one of its own), `-32800` one cancelled. `data`, when there is one, says what was done before the failure, in the result's shape: a `post` stopped midway says what it posted. An error after a `session` notification leaves the session good, since the code is in the clone; it says what's missing, such as the threads, and the viewer stays open. Before one, the review command exits with it.
 
-- dffy runs the program in the root of the working tree, with stdin closed, in a session of its own, so it has no terminal: a prompt for a passphrase or a password fails instead of reaching the screen. The session is its process group too, which dffy kills, with everything in it, when it quits.
-- stderr isn't shown. When the plugin fails without an error line, its last line of stderr goes in the message.
-- `describe` and `doctor` are the exceptions: they run where dffy runs, in a repository or not, with stderr discarded, and are killed past their time (2 and 10 seconds).
-- At most one `prepare`, `pull` or `post` runs at a time, beside `check` on its own timer, `list`, `detect` and `post --dry-run`. Opening another review or updating stops a `prepare` or `pull` still running; none of the three starts while `post` runs.
-- `post` can't be cancelled midway, but a second run resumes it. A plugin should refuse a `post` while another runs for the same review, as dffy-review-github does.
+#### Comments
 
-**Environment.** dffy passes its own environment on, with these set:
+dffy keeps each review's comments file ([comments.md](comments.md#where-the-file-is)); the plugin never reads or writes it. A request carries only what it needs of the file, as dffy read it when it sent the request.
 
-| Variable | Value |
-|---|---|
-| `DFFY_REVIEW_PROTOCOL` | `1`. A plugin that speaks another protocol fails with exit status 2. Unset when you run the plugin yourself. |
-| `DFFY` | The path of the dffy that runs the plugin: the one to run for `dffy comments`, so the comments file is written by the same version that reads it. |
-| `DFFY_COMMENTS` | For `check`, `pull` and `post`: the comments file the viewer shows, the session's, as an absolute path. Unset for `describe`, `doctor`, `list`, `detect` and `prepare`. |
+**The plugin's fields.** A comment from a host may hold fields of the plugin's own beside dffy's, prefixed with its name, such as dffy-review-github's `github_thread`. dffy keeps them, and hands them back wherever a request names that comment: in `known`, in a reply's `in_reply_to`, and in `resolves`.
 
-**Output.** The plugin prints one JSON object per line on stdout, and each carries `"version": 1`. dffy reads each line as it comes: the viewer opens on the first session line, and progress shows in the status bar.
-
-The examples are dffy-review-github's.
-
-| Verb | Lines |
-|---|---|
-| `describe` | One line, [the description](#the-description). It runs anywhere, not only in a repository, and should answer at once, from nothing but the plugin itself. |
-| `doctor` | One line: `{"checks":[{"name":"gh","ok":true,"detail":"gh version 2.62.0"},{"name":"auth","ok":false,"detail":"not logged in"}]}`, what the plugin needs, each with a short `name`, whether it's fine, and a line saying what was found. It exits 0 whatever the checks find; dffy waits up to 10 seconds for it. |
-| `list` | One line: `{"reviews":[{"id":"7","title":"Spell out five","author":"octocat","url":"https://github.com/acme/widgets/pull/7","head_ref":"five","reason":"current_branch"}]}`. Each review has an `id` and an optional `label`, as in a session line. `reason` is `current_branch`, `review_requested` or `mine`, which dffy titles and lists first, in that order; a review listed for another reason may carry a `group`, the title it's listed under, groups in the order they first come (`Other` without one). Each review should be listed once. A review may carry `drafts`, how many of your drafts its comments file holds, left out when there are none. |
-| `detect` | One line: `{"review":{…}}`, the open review whose branch is the one checked out, with the fields of a session line, or `{"review":null}`. It should answer from what it keeps when it can, since it runs on every start of `dffy`. When it names a review, dffy runs `prepare` on it and keeps showing what plain `dffy` shows, with the review's comments file and status; the whole review (`--merge-base <base>` against the working tree) is a command away. |
-| `prepare <id>` | First, as soon as the review's commits are in the clone, a session line. When the session was answered from what was kept and the host's head turns out to be another, `{"head":"<commit>","moved":true}`, as `check` says it. Then `{"progress":"100/312"}` as each page of threads is written: threads written so far, of all of them. dffy doesn't wait for it to exit. |
-| `check <id>` | One line: `{"head":"<commit>","moved":true,"comments_moved":false}`, the review's head on the host, whether it differs from the session's, and whether the review changed on the host since the last `prepare` or `pull` imported it, as new comments change it (optional, `false` when left out). It should be cheap; dffy runs it every 60 seconds. |
-| `pull <id>` | Fetches the head and the threads. Then, as for `prepare`, a session line with the new head, followed by progress lines. |
-| `post <id> --dry-run [--drafts <file>]` | One draft line per draft, in the comments file's order, saying what `post` would do with it, then `{"planned":{"line":9,"file":1,"skip":2,"pending":4,"resolves":1}}`: `pending` counts the comments already in your pending review on the host, which a submitting event sends with the drafts, and `resolves` the threads resolved or reopened and not sent yet. With `--drafts`, the drafts of that comments file, such as the local review's not moved into the review's yet, are planned after the review's own, with the same draft lines and in the same counts. It shouldn't send or write anything, either file included. |
-| `post <id> --event <event> [--summary-file <file>]` | `{"progress":"3/12"}` after each draft, then a draft line for each draft not posted, then `{"posted":9,"failed":3,"pending":4,"url":"https://github.com/acme/widgets/pull/7#pullrequestreview-2001"}`. With no drafts and an event that `submits`, it submits what's pending on the host. |
-
-#### The description
+**`known`**, in `prepare` and `pull`: an entry for each comment that has a `ref`, for the plugin to merge what it imports; empty while dffy has no file for the review.
 
 ```json
-{"command":"pr","noun":"pull request","nouns":"pull requests","short":"PR","id_prefix":"#","events":[{"id":"pending","key":"p","label":"pending: on GitHub, for you only","done":"review pending","submits":false},{"id":"approve","key":"a","label":"approve","done":"approved"}],"outdated_reply_warning":"GitHub collapses this thread, so a reply there is easy to miss","version":1}
+{"ref":"github:PRRC_kwDOA","anchored":true,"pending":true,"github_thread":"PRRT_kwDOA"}
 ```
 
 | Field | Meaning |
 |---|---|
+| `ref` | The comment's. |
+| `anchored` | `true` when it has its lines and anchor: an import that can't read its lines again can leave them as they are. |
+| `pending` | `true` while it's marked `pending`. |
+| others | The plugin's fields. |
+
+An import sends each thread's `resolved` as the host has it, with `host_resolved`. dffy keeps a resolve or reopen made in dffy and not sent through it, even one made after the request went: only `host_resolved` changes then.
+
+**`drafts`**, in `dryRun` and `post`: your [drafts](comments.md#drafts), in the file's order; a dry run's then those of the local review's file shown on the review, its threads on other branches left out. A comment by someone else, such as an agent, is never sent: it would go out under your name.
+
+```json
+{"id":"9f3c2a71b04e5d18","path":"src/lib.rs","side":"new","start":{"old":12,"new":12},"end":{"old":null,"new":14},"text":"This can overflow.","anchor":{"before":["…"],"lines":["…"],"after":["…"]},"distance":0}
+{"id":"1b7e94c0d25a6f03","path":"src/lib.rs","text":"Same here?","in_reply_to":{"ref":"github:PRRC_kwDOA","github_thread":"PRRT_kwDOA"}}
+```
+
+A draft has the comments file's `id`, `path`, `old_path`, `side`, `start_side`, `start`, `end`, `anchor`, `distance`, `text` and `suggestion` that it holds, and:
+
+| Field | Meaning |
+|---|---|
+| `resolved` | `true` on a thread's first comment resolved before it's posted: it's posted, then resolved. |
+| `in_reply_to` | For a reply, its thread's first comment: `{"ref":…}` with the plugin's fields when that's posted, else `{"id":…}`, a draft earlier in the list. |
+
+**`resolves`**, in `dryRun` and `post`: the posted threads resolved or reopened in dffy and not sent, each its first comment's `ref`, the state to send, where it is for words about it, and the plugin's fields: `{"ref":"github:PRRC_kwDOA","resolved":true,"path":"src/lib.rs","side":"new","end":{"old":null,"new":14},"github_thread":"PRRT_kwDOA"}`.
+
+**Out.** What the plugin would change it sends as `comments/apply`: a list of [`dffy comments apply`'s operations](comments.md#operations), which dffy applies to the review's file, all or none, under its lock, as they come, and before it reads anything the request says after them.
+
+- `upsert` by `ref` merges a host's comment field by field, the plugin's fields included; `set` and `rm` name a comment by `id` or `ref`.
+- `host_resolved` on a thread's first comment says whether the host has it resolved, as the plugin last saw: an import sets it, and so does sending a resolve. It's how dffy knows what's in `resolves`.
+- `gone` names the refs of `known` the host no longer has, once the plugin read every comment; dffy removes them by its rules, keeping a thread that holds your drafts.
+- A `set` can't give a comment that has a `ref` another one; clearing it first can.
+- When dffy can't apply some, as when a `set` names a draft that's gone, it cancels the request, which ends saying why; what the plugin sends until it answers is still applied, so a post's refs aren't lost. The same holds for a request dffy ended for another reason, and for one cut short by the plugin exiting: what it sent before is in the file, and the next `post` doesn't send those drafts again. Operations for a request the plugin has answered are ignored. The viewer doesn't change the comments while a `post` runs, so what it sent is what the plugin writes back about.
+
+**Posting.** A `post` sends each draft's `ref`, `url` and `pending` as soon as the host has it, so a second `post` never sends it again; and a draft the host refused gets why in its `post_error`, which goes once it's posted. Once a `post` with an event that `submits` ends well, dffy clears every `pending` itself.
+
+**Whole runs.** A message about a whole run that should outlast the status bar goes in the file's `notice` (`{"op":"notice","notice":"…"}`), which dffy shows when it reads the file: why a post stopped, for example.
+
+#### The description
+
+```json
+{"protocol":1,"command":"pr","noun":"pull request","nouns":"pull requests","short":"PR","id_prefix":"#","events":[{"id":"pending","key":"p","label":"pending: on GitHub, for you only","done":"review pending","submits":false},{"id":"approve","key":"a","label":"approve","done":"approved"}],"outdated_reply_warning":"GitHub collapses this thread, so a reply there is easy to miss","capabilities":{"watch":true}}
+```
+
+| Field | Meaning |
+|---|---|
+| `protocol` | `1`, the protocol it speaks. dffy refuses another, and says which it speaks. |
 | `command` | The subcommand dffy adds: lowercase letters, digits and `-`, starting with a letter. |
 | `noun`, `nouns` | What it reviews, singular and plural, up to 40 printable characters each. |
 | `short` | Optional: what goes before a review's id in labels, `PR` in `PR #7`. The noun when left out. |
 | `id_prefix` | Optional: what goes right before the id, `#` in `PR #7`, up to 8 characters. Nothing when left out. |
-| `events` | Optional: the post dialog's choices, in order, 1 to 9. `id` goes to `post --event`, lowercase letters, digits, `_` and `-`, starting with a letter; `key` is one letter or digit that picks it, other than `j`, `k`, `l`, `s` and `v`, which the dialog takes; `label` is shown beside it, and `done` in the status bar once it went (`approved`). `submits` is `false` for an event that leaves the review open on the host, such as a pending review; it's `true` when left out. No ids or keys repeat. Without `events`, there's one: `{"id":"post","key":"p","label":"post","done":"posted"}`. |
+| `events` | Optional: the post dialog's choices, in order, 1 to 9. `id` goes to `post`'s `event`, lowercase letters, digits, `_` and `-`, starting with a letter; `key` is one letter or digit that picks it, other than `j`, `k`, `l`, `s` and `v`, which the dialog takes; `label` is shown beside it, and `done` in the status bar once it went (`approved`). `submits` is `false` for an event that leaves the review open on the host, such as a pending review; it's `true` when left out. No ids or keys repeat. Without `events`, there's one: `{"id":"post","key":"p","label":"post","done":"posted"}`. |
 | `outdated_reply_warning` | Optional: what dffy says, once, before you reply to a thread the host marks outdated. Nothing when left out. |
+| `capabilities` | Optional: `{"watch":true}` for a plugin that watches the review dffy names in `watch`, pushing `head/moved` and `comments/changed`, and pauses while you're idle. dffy sends `watch` and `idle/changed` only to such a plugin, and never asks about a review on a timer of its own. |
 
 dffy refuses a description that breaks these, and `dffy doctor` says why.
 
-A draft line:
+#### The session
 
 ```json
-{"draft":{"id":"9f3c2a71b04e5d18","path":"src/lib.rs","plan":"line","line":13,"side":"new"},"version":1}
+{"id":"7","title":"Spell out five","url":"https://github.com/acme/widgets/pull/7","base":"<commit>","head":"<commit>","last_reviewed_head":null,"state":"open"}
+```
+
+| Field | Meaning |
+|---|---|
+| `id` | The review, as the plugin's requests take it: a string, one printable line, not starting with `-`. It names the review's comments file too. |
+| `label` | Optional: what to show for the id when it isn't the id itself, such as a change number for a long change id. Labels read `<short> <id_prefix><label or id>`. |
+| `title`, `url` | The review's. `null` when the host couldn't be reached and nothing was kept from before, or when there's no host to link to. |
+| `base`, `head` | Commits in the clone, as full ids: 40 hex digits, or 64 in a SHA-256 repository. dffy shows `<base>...<head>`. |
+| `last_reviewed_head` | The head of your last review, a full id, or `null`. The plugin keeps it, and says when a `post` changed it. "Since last review" shows `<last_reviewed_head>..<head>`. |
+| `state` | Optional: `open`, `closed` or `merged`, as the host last said. |
+| `labels` | Optional: the labels this review is voted on beside the event, up to 9, for a host whose verdict is more than one choice, as a Gerrit change's Code-Review and Verified. They're the review's, so a session names them, not `initialize`: each review may have its own, and your votes on it. Each is `{"name":"Code-Review","values":[{"value":-1,"label":"I would prefer not"},{"value":0,"label":"No score"},{"value":1,"label":"Looks good to me"}],"vote":0}`: a `name` of up to 40 printable characters, 1 to 9 `values` in the order offered, each a whole number with words, and your `vote` on the host now, one of them (the neutral value when you haven't voted). No names or values repeat. The post dialog shows each under the events, starting on your vote, j/k going to it and ←/→ changing it. None when left out. |
+
+dffy refuses a session whose `base`, `head` or `last_reviewed_head` isn't a full commit id, or whose labels break these.
+
+#### A plan
+
+```json
+{"id":"9f3c2a71b04e5d18","path":"src/lib.rs","plan":"line","line":13,"side":"new"}
 ```
 
 | Field | Meaning |
 |---|---|
 | `id` | The draft's `id` in the comments file. |
 | `path` | Its file. |
-| `plan` | `line`: on its lines, or a reply in its thread. `file`: a comment on the whole file. `skip`: not posted; it stays a draft. A `post` prints draft lines only for drafts it didn't post, all `skip`. The viewer heads a draft planned `file` with `posts as file comment`, and one planned `skip` with `not in the PR yet` in the plugin's short word, as dffy-review-github skips only drafts whose lines, file or thread aren't on the host yet. |
+| `plan` | `line`: on its lines, or a reply in its thread. `file`: a comment on the whole file. `skip`: not posted; it stays a draft. A dry run skips only a draft that can't be posted yet, as what it's on isn't on the host yet: its lines, its file, or its thread's first comment. One the host would refuse for another reason is planned, refused while posting, and gets a `post_error`; `post`'s `unposted` lists it as `skip` too, with the host's reason. The viewer heads a draft planned `file` with `posts as file comment`, and one planned `skip` with its `reason`, or `not in the review yet` without one. |
 | `line`, `side` | Where it goes at the review's head, when it has lines: the last line, on the `old` or `new` side. |
 | `unsure` | `true` when the plugin chose `line` or `file` without the host's own diff of the file, so the host may disagree: a line comment may be refused, or a file comment may have fit on its lines. Left out otherwise. dffy doesn't read it yet. |
 | `reason` | For `skip`: why, as the user reads it. |
 
-A session line:
-
-```json
-{"session":{"id":"7","title":"Spell out five","url":"https://github.com/acme/widgets/pull/7","base":"<commit>","head":"<commit>","last_reviewed_head":null,"state":"open","comments":"/home/ada/.local/share/dffy-review-github/github.com_acme_widgets/7/comments.json"},"version":1}
-```
-
-| Field | Meaning |
-|---|---|
-| `id` | The review, as the plugin's verbs take it: a string, one printable line, not starting with `-`. |
-| `label` | Optional: what to show for the id when it isn't the id itself, such as a change number for a long change id. Labels read `<short> <id_prefix><label or id>`. |
-| `title`, `url` | The review's. `null` when the host couldn't be reached and nothing was kept from before. |
-| `base`, `head` | Commits in the clone, as full ids. dffy shows `<base>...<head>`. |
-| `last_reviewed_head` | The head of your last review, or `null`. "Since last review" shows `<last_reviewed_head>..<head>`. |
-| `state` | Optional: `open`, `closed` or `merged`, as the host last said. |
-| `comments` | The comments file, as an absolute path. |
-
-dffy refuses a session whose `base`, `head` or `last_reviewed_head` isn't a commit id, or whose `comments` isn't absolute.
-
 For `post`:
 
-- `<event>` is the `id` of one of the described events, `post` without any.
-- It posts drafts only: comments without a `ref` whose `author` is empty. A comment without a `ref` by someone else, such as an agent, would go out under your name, so `post` and its dry run leave it alone, and don't count it.
-- `--summary-file` names a file holding the review's summary. dffy writes it for the run and removes it after; without a summary, there's no flag. dffy keeps the summary being written in the comments file's `summary`, and removes it once a post with an event that `submits` ends well.
-- `failed` counts the drafts that weren't posted: skipped by the plan, or refused by the host. Neither holds the event back; the review goes without them. A refused draft stays a draft with the host's reason in its `post_error`, which the plugin clears once the draft posts.
+- `event` is the `id` of one of the described events, `post` without any; `summary` the review's summary, left out without one. dffy keeps the summary being written in the comments file's `summary`, and removes it once a post with an event that `submits` ends well.
+- `labels` holds the votes the dialog has otherwise than the session's `vote`, by name: `{"Code-Review":1}`. A label left on your vote isn't sent, so the vote given before stays; without a change there's no `labels`.
+- It posts the `drafts` it's sent, and sends the `resolves`.
+- `failed` counts the drafts that weren't posted: skipped by the plan, or refused by the host. Neither holds the event back; the review goes without them.
 - `pending` counts the comments your pending review on the host had before the run, which a submitting event sent with the drafts.
 - A posted comment is marked `"pending":true` while it's in your pending review, and the mark goes once the review is submitted.
 - `url` is the review's link; dffy opens it with `o`.
-- After a `post` that exits 0 and posted a comment, or applied an event that `submits`, dffy takes the session's head as `last_reviewed_head`, and the plugin's next session line should say the same.
-- When the run ends, dffy reads the comments file, and its `notice`, if any, shows over dffy's own words for how the post went.
-
-**Errors.** A failure ends with `{"error":"…"}` as the last line and a non-zero exit status: 2 for a verb, event or argument the plugin doesn't take, or a protocol it doesn't speak, and 1 for anything else. dffy shows the error line's message, over the exit status. An error after a session line leaves the session good, since the code is in the clone; it says what's missing, such as the threads, and the viewer stays open. Before a session line, the review command exits with it.
-
-**Writing.** A plugin changes the comments file only through `dffy comments apply` ([comments.md](comments.md)), which holds the file's lock. A message about a whole run that should outlast the status bar goes in the file's `notice`, which dffy shows when it reads the file: why a post stopped, for example. Why one comment wasn't posted goes on that comment, in its `post_error`.
+- `last_reviewed_head`, a full id, when the post recorded a new head as reviewed, as one that posted a comment or applied an event that `submits` should: dffy takes it from there, and the plugin's next session should say the same. dffy never works it out itself. Left out when the post recorded none.
+- `labels`, in the session's shape, when the post changed a vote: the review's labels with your votes as the host has them now. dffy takes them as the session's, so the next dialog starts on them and doesn't send a vote that's already given. Left out, the session's stay as they were.
+- When it ends, dffy reads the comments file, and its `notice`, if any, shows over dffy's own words for how the post went.
 
 **Compatibility.**
 
-- A plugin fails with exit status 2, or an error line, for a verb or event it doesn't support.
-- dffy stops a run at the first line that names another `version`, and says which it speaks.
-- Both sides ignore fields they don't know.
-- A plugin without `describe` adds no command and isn't asked for the branch's review, and `dffy doctor` says so; one without `doctor` shows no checks of its own.
+- `initialize` names the protocol both ways; dffy refuses a plugin of another, and dffy-review-github one of another dffy, each saying which it speaks.
+- Both sides ignore fields and notifications they don't know. A request a plugin doesn't have answers `-32601`.
+- A plugin that can't initialize adds no command and isn't asked for the branch's review, and `dffy doctor` says so; one without `doctor` shows no checks of its own.
 - While the protocol is experimental, it changes in place, without a new version number, and dffy and the plugins from this repository change with it.

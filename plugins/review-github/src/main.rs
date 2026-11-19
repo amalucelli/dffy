@@ -1,13 +1,16 @@
 //! `dffy-review-github`, an experimental review plugin for dffy: it keeps
 //! dffy's review comments file for a GitHub pull request in step with the
 //! PR's review threads, and posts your drafts. dffy runs it in the
-//! background (review plugin protocol 1) and reads JSON lines from its
-//! stdout; it never prompts or draws. GitHub is reached only through `gh`,
-//! the code only through git, and the comments file is read and written
-//! only through `dffy comments`, which owns its format and lock.
+//! background for as long as it shows the repository, speaking review
+//! plugin protocol 1 on its stdin and stdout (see [`server`]); it never
+//! prompts or draws. GitHub is reached only through `gh`, the code only
+//! through git. dffy owns the comments file: a request carries what it
+//! needs of the comments, and what the plugin would change goes back as
+//! operations dffy applies.
 
 mod git;
 mod github;
+mod server;
 
 use std::cell::OnceCell;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -16,6 +19,7 @@ use std::io::Write as _;
 use std::os::unix::fs::OpenOptionsExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -23,14 +27,12 @@ use serde_json::{Value, json};
 
 use crate::git::{Head, Remote, Source};
 use crate::github::{Error, Page};
+use crate::server::{Failure, Looked, Out};
 
-const USAGE: &str = "usage: dffy-review-github describe | doctor | list | detect | prepare <pr> \
-                     | check <pr> | pull <pr> \
-                     | post <pr> --event pending|comment|approve|request_changes [--summary-file <file>] \
-                     | post <pr> --dry-run [--drafts <file>] \
-                     | prefetch | prune [--days <n>]";
+const USAGE: &str = "usage: dffy-review-github [prefetch | prune [--days <n>] | --version]; \
+                     without arguments it serves dffy on stdin and stdout";
 
-/// What `describe` says: the command, the words for a PR, and the events
+/// What `initialize` says: the command, the words for a PR, and the events
 /// the post dialog offers, `pending` leaving the review open on GitHub.
 fn description() -> Value {
     let event = |id: &str, key: &str, label: &str, done: &str| json!({"id": id, "key": key, "label": label, "done": done});
@@ -57,151 +59,106 @@ fn description() -> Value {
     })
 }
 
-const VERBS: [&str; 10] = [
-    "describe", "doctor", "list", "detect", "prepare", "check", "pull", "post", "prefetch", "prune",
-];
-
-/// The review plugin protocol this speaks. dffy names the one it wants in
-/// `DFFY_REVIEW_PROTOCOL`, and every line printed carries this one.
-const PROTOCOL: u64 = 1;
-
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let args: Vec<&str> = args.iter().map(String::as_str).collect();
-    if args == ["--version"] {
-        println!("dffy-review-github {}", env!("CARGO_PKG_VERSION"));
-        return ExitCode::SUCCESS;
-    }
-    // Unset when you run a verb yourself.
-    if let Some(asked) = std::env::var_os("DFFY_REVIEW_PROTOCOL")
-        .filter(|v| v.to_str().and_then(|v| v.parse().ok()) != Some(PROTOCOL))
-    {
-        return fail(
-            2,
-            &format!(
-                "dffy-review-github speaks review protocol {PROTOCOL}, and dffy asked for {}; \
-                 install the dffy-review-github that matches your dffy",
-                asked.to_string_lossy()
-            ),
-        );
-    }
-    let pr = args
-        .get(1)
-        .and_then(|n| n.trim_start_matches('#').parse().ok());
-    let result = match (args.as_slice(), pr) {
-        (["describe"], _) => {
-            emit(description());
-            Ok(())
+    let said = match args.as_slice() {
+        [] => {
+            server::serve(description, handle, look);
+            return ExitCode::SUCCESS;
         }
-        (["doctor"], _) => {
-            doctor();
-            Ok(())
+        ["--version"] => {
+            println!("dffy-review-github {}", env!("CARGO_PKG_VERSION"));
+            return ExitCode::SUCCESS;
         }
-        (["list"], _) => list(),
-        (["detect"], _) => detect(),
-        (["prefetch"], _) => prefetch(),
-        (["prune"], _) => prune(PRUNE_DAYS),
-        (["prune", "--days", days], _) => match days.parse() {
-            Ok(days) => prune(days),
-            Err(_) => return fail(2, &format!("--days takes a number of days, not {days}")),
-        },
-        (["prepare", _], Some(pr)) => prepare(pr),
-        (["check", _], Some(pr)) => check(pr),
-        (["pull", _], Some(pr)) => Review::new(pr).and_then(|review| pull(&review)),
-        (["post", _, flags @ ..], Some(pr)) => match post_args(flags) {
-            Ok((PostMode::Post(event), summary)) => post(pr, event, summary),
-            Ok((PostMode::DryRun(drafts), _)) => dry_run(pr, drafts),
-            Err(e) => return fail(2, &e),
-        },
-        ([verb, ..], _) if !VERBS.contains(verb) => {
-            return fail(2, &format!("unknown verb {verb}; {USAGE}"));
+        ["prefetch"] => prefetch(),
+        ["prune"] => prune(PRUNE_DAYS),
+        ["prune", "--days", days] => {
+            let Ok(days) = days.parse() else {
+                eprintln!("--days takes a number of days, not {days}");
+                return ExitCode::from(2);
+            };
+            prune(days)
         }
-        _ => return fail(2, USAGE),
+        _ => {
+            eprintln!("{USAGE}");
+            return ExitCode::from(2);
+        }
     };
-    match result {
-        Ok(()) => ExitCode::SUCCESS,
-        Err(e) => fail(1, &e),
+    match said {
+        Ok(said) => {
+            println!("{said}");
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("dffy-review-github: {e}");
+            ExitCode::FAILURE
+        }
     }
 }
 
-/// Prints one line of the protocol.
-fn emit(mut line: Value) {
-    line["version"] = json!(PROTOCOL);
-    // dffy may stop reading after the first line, and the work goes on.
-    writeln!(std::io::stdout(), "{line}").ok();
+/// A request's PR, from its `id`: a number, `#` before it or not.
+fn pr_of(params: &Value) -> Result<u64, Failure> {
+    params["id"]
+        .as_str()
+        .and_then(|id| id.trim_start_matches('#').parse().ok())
+        .ok_or_else(|| Failure::params("the request's id isn't a pull request's number"))
 }
 
-fn fail(code: u8, message: &str) -> ExitCode {
-    emit(json!({"error": message}));
-    ExitCode::from(code)
+/// Answers a request of dffy's; `None` for a method it doesn't have. A
+/// review's request carries what it needs of the comments dffy keeps:
+/// `prepare` and `pull` the comments GitHub has, `known`; `dryRun` and
+/// `post` your drafts and the resolves not sent.
+fn handle(method: &str, params: &Value, out: &Out) -> Option<Result<Value, Failure>> {
+    let done = |result: Result<(), String>| result.map(|()| json!({})).map_err(Failure::from);
+    let carries = |key: &str| params[key].as_array().map_or(&[][..], Vec::as_slice);
+    let known = carries("known");
+    Some(match method {
+        "doctor" => Ok(doctor()),
+        "list" => list(out).map_err(Failure::from),
+        "detect" => detect(out).map_err(Failure::from),
+        "prune" => {
+            let days = params["days"].as_u64().unwrap_or(PRUNE_DAYS);
+            prune(days).map_err(Failure::from)
+        }
+        "prepare" => pr_of(params).and_then(|pr| {
+            let _importing = server::importing();
+            done(prepare(pr, known, out))
+        }),
+        "pull" => pr_of(params).and_then(|pr| {
+            let _importing = server::importing();
+            done(Review::new(pr).and_then(|review| pull(&review, known, out)))
+        }),
+        "dryRun" => {
+            pr_of(params).and_then(|pr| dry_run(pr, carries("drafts"), out).map_err(Failure::from))
+        }
+        "post" => pr_of(params).and_then(|pr| {
+            let event = match params["event"].as_str() {
+                Some("pending") => Event::Pending,
+                Some("comment") => Event::Submit("COMMENT"),
+                Some("approve") => Event::Submit("APPROVE"),
+                Some("request_changes") => Event::Submit("REQUEST_CHANGES"),
+                other => {
+                    return Err(Failure::params(format!(
+                        "unknown event {}; pending, comment, approve or request_changes",
+                        other.unwrap_or("none")
+                    )));
+                }
+            };
+            let _alone = server::exclusive();
+            post(
+                pr,
+                (event, params["summary"].as_str().unwrap_or_default()),
+                (carries("drafts"), carries("resolves")),
+                out,
+            )
+        }),
+        _ => return None,
+    })
 }
 
-/// The dffy that ran the plugin writes its comments: it names itself in
-/// `DFFY`, which a run by hand doesn't have.
-fn dffy_comments(file: &Path) -> Command {
-    let dffy = std::env::var_os("DFFY")
-        .filter(|d| !d.is_empty())
-        .unwrap_or_else(|| "dffy".into());
-    let mut cmd = Command::new(dffy);
-    cmd.arg("--comments").arg(file).arg("comments");
-    cmd
-}
-
-/// The comments file as `dffy comments --json` prints it.
-fn read(file: &Path) -> Result<Value, String> {
-    let out = dffy_comments(file)
-        .arg("--json")
-        .stdin(Stdio::null())
-        .output()
-        .map_err(|e| format!("can't run dffy: {e}"))?;
-    if !out.status.success() {
-        return Err(format!(
-            "dffy comments: {}",
-            String::from_utf8_lossy(&out.stderr).trim()
-        ));
-    }
-    serde_json::from_slice(&out.stdout).map_err(|e| format!("dffy comments --json: {e}"))
-}
-
-fn comments(file: &Value) -> &[Value] {
-    file["comments"].as_array().map_or(&[], Vec::as_slice)
-}
-
-/// Writes `ops` with `dffy comments apply`, all or none.
-fn apply(file: &Path, ops: &[Value]) -> Result<(), String> {
-    let mut child = dffy_comments(file)
-        .arg("apply")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|e| format!("can't run dffy: {e}"))?;
-    if let Some(mut stdin) = child.stdin.take() {
-        stdin
-            .write_all(Value::from(ops).to_string().as_bytes())
-            .map_err(|e| format!("can't write to dffy: {e}"))?;
-    }
-    let out = child.wait_with_output().map_err(|e| format!("dffy: {e}"))?;
-    if out.status.success() {
-        Ok(())
-    } else {
-        Err(format!(
-            "dffy comments apply: {}",
-            String::from_utf8_lossy(&out.stderr).trim()
-        ))
-    }
-}
-
-fn notice(file: &Path, notice: Option<&str>) -> Result<(), String> {
-    apply(file, &[json!({"op": "notice", "notice": notice})])
-}
-
-/// A thread resolved or reopened in dffy and not sent yet: its `resolved`
-/// differs from GitHub's as last seen.
-fn toggled(comment: &Value) -> bool {
-    comment["github_thread"].is_string()
-        && comment["resolved"].as_bool().unwrap_or_default()
-            != comment["github_resolved"].as_bool().unwrap_or_default()
+fn notice(notice: Option<&str>) -> Value {
+    json!({"op": "notice", "notice": notice})
 }
 
 /// What a session keeps of [`Page::about`] and doesn't print: what
@@ -215,10 +172,10 @@ const KEPT: [&str; 5] = [
     "updated_at",
 ];
 
-/// A PR under review, and what's kept for it: the comments file, drafts
-/// included, the session dffy was last given, and GitHub's hunks of a
-/// base and head for `post` to plan with. Kept in the data directory, not the state
-/// or cache one: the drafts are your writing.
+/// A PR under review, and what's kept for it: the session dffy was last
+/// given, and GitHub's hunks of a base and head for `post` to plan with.
+/// A comments file the plugin kept itself before dffy kept them stays
+/// there until you import it into dffy's and remove it.
 struct Review {
     remote: Remote,
     pr: u64,
@@ -243,11 +200,17 @@ fn read_json(path: &Path) -> Option<Value> {
 }
 
 fn write_json(dir: &Path, name: &str, value: &Value) -> Result<(), String> {
+    static WRITES: AtomicU64 = AtomicU64::new(0);
     let path = dir.join(name);
-    // One per process, as nothing locks the directory and a `prepare`
-    // and a `post` both save the session. One left by a crash is
-    // removed, and `create_new` won't follow a link put in its place.
-    let tmp = dir.join(format!("{name}.{}.tmp", std::process::id()));
+    // One per write, as nothing locks the directory and requests running
+    // side by side, or in two processes, save the session. One left by a
+    // crash is removed, and `create_new` won't follow a link put in its
+    // place.
+    let tmp = dir.join(format!(
+        "{name}.{}.{}.tmp",
+        std::process::id(),
+        WRITES.fetch_add(1, Ordering::Relaxed)
+    ));
     fs::create_dir_all(dir)
         .and_then(|()| {
             fs::remove_file(&tmp).ok();
@@ -363,20 +326,22 @@ impl Review {
         })
     }
 
-    fn file(&self) -> PathBuf {
+    /// The comments file the plugin kept itself before dffy kept them,
+    /// which `dffy comments --session import` brings into dffy's.
+    fn old_file(&self) -> PathBuf {
         self.dir.join("comments.json")
     }
 
-    /// The session line's `session`, without `comments`, as last printed,
-    /// with [`KEPT`] as GitHub last said. A session saved before `state`,
-    /// `cross_repository` and `head_owner` were kept has none of them, and
-    /// is taken as open and the repository's own.
+    /// The session as last sent, with [`KEPT`] as GitHub last said. A
+    /// session saved before `state`, `cross_repository` and `head_owner`
+    /// were kept has none of them, and is taken as open and the
+    /// repository's own.
     fn session(&self) -> Option<Value> {
         read_json(&self.dir.join("session.json"))
     }
 
     /// `session` as dffy reads it: the PR's number as its id, its state
-    /// lowercase, with the comments file, without the rest of [`KEPT`].
+    /// lowercase, without the rest of [`KEPT`].
     fn printed(&self, session: &Value) -> Value {
         let mut session = session.clone();
         let state = session["state"].as_str().map(str::to_lowercase);
@@ -389,12 +354,10 @@ impl Review {
             session["state"] = json!(state);
         }
         session["id"] = json!(self.pr.to_string());
-        session["comments"] = json!(self.file().to_string_lossy());
+        if let Some(fields) = session.as_object_mut() {
+            fields.remove("comments");
+        }
         session
-    }
-
-    fn emit_session(&self, session: &Value) {
-        emit(json!({ "session": self.printed(session) }));
     }
 
     fn save(&self, session: &Value) -> Result<(), String> {
@@ -500,24 +463,25 @@ impl Review {
     }
 
     /// Records the session's head, the one drafts are posted against, as
-    /// the head last reviewed.
-    fn reviewed(&self) -> Result<(), String> {
+    /// the head last reviewed, and returns it.
+    fn reviewed(&self) -> Result<Value, String> {
         let Some(mut session) = self.session() else {
-            return Ok(());
+            return Ok(Value::Null);
         };
         session["last_reviewed_head"] = session["head"].clone();
-        self.save(&session)
+        self.save(&session)?;
+        Ok(session["head"].clone())
     }
 
-    /// Saves and prints the session on `head` with what it keeps of the PR,
+    /// Saves and sends the session on `head` with what it keeps of the PR,
     /// `about` (see [`Page::about`]), keeping the head `post` last
     /// reviewed, else taking `reviewed`'s, your last review's on GitHub.
     fn start(
         &self,
         saved: Option<&Value>,
         (base, head): (&str, &str),
-        about: &Value,
-        reviewed: Option<&str>,
+        (about, reviewed): (&Value, Option<&str>),
+        out: &Out,
     ) -> Result<(), String> {
         let mut session = about.clone();
         session["number"] = json!(self.pr);
@@ -528,37 +492,36 @@ impl Review {
             .filter(Value::is_string)
             .unwrap_or_else(|| json!(reviewed));
         self.save(&session)?;
-        self.emit_session(&session);
+        out.session(&self.printed(&session));
         Ok(())
     }
 }
 
 /// Writes `page`, and the pages after it as they arrive, into the comments
-/// file, threads and general comments, with a progress line for each page
-/// of threads. Then fetches the original commits
-/// git didn't have, which a force-push left off the PR's head, and places
-/// the threads written on them. The fetched commits get no ref: once
-/// placed, a thread's lines are in the file, and a re-import that can't
-/// read them leaves them. Once every page is written, the comments of
-/// `before` GitHub no longer has go, as [`sweep`] says; not after a page
-/// that failed, which stops the import, nor when fewer threads came than
-/// GitHub counted. Your pending review's comments, every page of them,
-/// count as there.
+/// file, threads and general comments, merged with what dffy has of them,
+/// `carried`, with progress for each page of threads, stopping between
+/// pages once dffy cancels. Then fetches the original commits git didn't
+/// have, which a force-push left off the PR's head, and places the threads
+/// written on them. The fetched commits get no ref: once placed, a
+/// thread's lines are in the file, and a re-import that can't read them
+/// leaves them. Once every page is written, dffy is told which comments of
+/// `before` GitHub no longer has, and goes by its rules for them; not
+/// after a page that failed, which stops the import, nor when fewer
+/// threads came than GitHub counted. Your pending review's comments, every
+/// page of them, count as there.
 fn import(
     review: &Review,
-    mut page: Page,
-    source: &mut Source,
-    before: &HashSet<String>,
+    (mut page, carried): (Page, &[Value]),
+    (source, before): (&mut Source, &HashSet<String>),
+    out: &Out,
 ) -> Result<(), String> {
-    let file = review.file();
     let mut known = github::Known::default();
-    for c in comments(&read(&file)?) {
+    for c in carried {
         let Some(reference) = c["ref"].as_str() else {
             continue;
         };
         for (set, has) in [
-            (&mut known.toggled, toggled(c)),
-            (&mut known.anchored, c["anchor"].is_object()),
+            (&mut known.anchored, c["anchored"] == true),
             (&mut known.unplaced, c["github_unplaced"].is_string()),
             (&mut known.pending, c["pending"] == true),
         ] {
@@ -579,6 +542,7 @@ fn import(
     // A page after the first may carry only the conversation's lists.
     let mut with_threads = true;
     loop {
+        out.go_on()?;
         for thread in &mut page.threads {
             github::rest_of_thread(thread)?;
         }
@@ -593,13 +557,11 @@ fn import(
             seen.extend(comment["ref"].as_str().map(str::to_owned));
             ops.push(json!({"op": "upsert", "comment": comment}));
         }
-        if !ops.is_empty() {
-            apply(&file, &ops)?;
-        }
+        out.apply(&ops);
         waiting.extend(missing);
         written += page.threads.len();
         if with_threads {
-            emit(json!({"progress": format!("{written}/{total}")}));
+            out.progress(&format!("{written}/{total}"));
         }
         let Some(after) = page.next.take() else {
             break;
@@ -607,8 +569,10 @@ fn import(
         with_threads = after.threads.is_some();
         page = github::page(&review.remote, review.pr, Some(&after))?;
     }
-    if u64::try_from(written) == Ok(total) {
-        sweep(&file, before, &seen)?;
+    if u64::try_from(written) == Ok(total) && !before.is_subset(&seen) {
+        let mut gone: Vec<&String> = before.difference(&seen).collect();
+        gone.sort_unstable();
+        out.apply(&[json!({"op": "gone", "refs": gone})]);
     }
     let mut commits: Vec<&str> = waiting.iter().filter_map(github::original_commit).collect();
     commits.sort_unstable();
@@ -619,75 +583,22 @@ fn import(
     }
     // A fresh source: the first one keeps its misses.
     let (ops, _) = github::upserts(&waiting, &page.base, &mut Source::default(), &mut known);
-    apply(&file, &ops)
+    out.apply(&ops);
+    Ok(())
 }
 
-/// The refs of the comments the file has from GitHub, read before asking
-/// GitHub for the first page: a `post` while that's on its way writes a
-/// ref the page can't have, and it mustn't look gone. Empty when the file
-/// can't be read, which `import`'s own read reports.
-fn on_github(file: &Path) -> HashSet<String> {
-    read(file)
-        .map(|f| {
-            comments(&f)
-                .iter()
-                .filter_map(|c| c["ref"].as_str().filter(|r| r.starts_with("github:")))
-                .map(str::to_owned)
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
-/// Of the comments GitHub had before its first page was asked for, by ref
-/// in `before`, removes those it no longer has, not in `seen`, whoever
-/// wrote them: only their author can delete a comment or discard a pending
-/// review, and posting yours again would undo that. A first comment on a
-/// line or a file whose thread still holds replies not posted, or not
-/// gone, stays as what they answer, posted no longer, so they aren't lost
-/// with it; a general comment goes with its replies.
-fn sweep(file: &Path, before: &HashSet<String>, seen: &HashSet<String>) -> Result<(), String> {
-    if before.is_subset(seen) {
-        return Ok(());
-    }
-    let current = read(file)?;
-    let all = comments(&current);
-    let gone = |c: &Value| {
-        c["ref"]
-            .as_str()
-            .is_some_and(|r| before.contains(r) && !seen.contains(r))
-    };
-    // Removing a first comment removes its thread's replies with it. A
-    // general comment goes with replies not posted too: GitHub can't take
-    // a reply to one, and without its ref it isn't one the file can hold.
-    let removed = |root: &Value| {
-        gone(root)
-            && (root["path"].as_str().is_none_or(str::is_empty)
-                || all
-                    .iter()
-                    .filter(|c| c["in_reply_to"] == root["id"])
-                    .all(gone))
-    };
-    let mut ops = Vec::new();
-    for c in all.iter().filter(|c| gone(c)) {
-        if c["in_reply_to"].is_null() && !removed(c) {
-            // Without these `post` would take it for posted, or its thread.
-            ops.push(
-                json!({"op": "upsert", "comment": {"ref": c["ref"], "url": null,
-                "outdated": null, "github_thread": null, "github_resolved": null,
-                "github_unplaced": null}}),
-            );
-            ops.push(json!({"op": "set", "id": c["id"], "fields": {"ref": null}}));
-        } else if !all
-            .iter()
-            .any(|root| root["id"] == c["in_reply_to"] && removed(root))
-        {
-            ops.push(json!({"op": "rm", "id": c["id"]}));
-        }
-    }
-    if ops.is_empty() {
-        return Ok(());
-    }
-    apply(file, &ops)
+/// The refs of the comments dffy has from GitHub, as the request carried
+/// them, before GitHub was asked for the first page: a `post` while that's
+/// on its way writes a ref the page can't have, and it mustn't look gone.
+/// Whoever wrote them, those GitHub no longer has go: only their author
+/// can delete a comment or discard a pending review, and posting yours
+/// again would undo that.
+fn on_github(carried: &[Value]) -> HashSet<String> {
+    carried
+        .iter()
+        .filter_map(|c| c["ref"].as_str().filter(|r| r.starts_with("github:")))
+        .map(str::to_owned)
+        .collect()
 }
 
 /// GitHub's hunks of the PR, by path.
@@ -705,13 +616,13 @@ fn fetch_files(review: &Review) -> JoinHandle<Option<Files>> {
 /// time.
 fn import_with_files(
     review: &Review,
-    (page, before): (Page, &HashSet<String>),
-    files: Option<JoinHandle<Option<Files>>>,
-    session_head: &str,
+    (page, carried, before): (Page, &[Value], &HashSet<String>),
+    (files, session_head): (Option<JoinHandle<Option<Files>>>, &str),
     source: &mut Source,
+    out: &Out,
 ) -> Result<(), String> {
     let (base, head) = (page.base.clone(), page.head.clone());
-    let imported = import(review, page, source, before);
+    let imported = import(review, (page, carried), (source, before), out);
     if let (true, Some(Ok(Some(hunks)))) = (head == session_head, files.map(JoinHandle::join)) {
         review.keep_hunks(&base, &head, &hunks)?;
     }
@@ -720,7 +631,7 @@ fn import_with_files(
 
 /// A PR prepared before, with its commits still here, answers from the
 /// session at once; the head stays the one dffy shows until `pull`.
-fn prepare(pr: u64) -> Result<(), String> {
+fn prepare(pr: u64, carried: &[Value], out: &Out) -> Result<(), String> {
     let review = Review::new(pr)?;
     let mut source = Source::default();
     // A session without a url was saved with GitHub down, on a guessed base.
@@ -730,17 +641,17 @@ fn prepare(pr: u64) -> Result<(), String> {
                 .iter()
                 .all(|oid| oid.as_str().is_some_and(|oid| source.has_commit(oid)))
     }) else {
-        return pull(&review);
+        return pull(&review, carried, out);
     };
-    review.emit_session(&session);
+    out.session(&review.printed(&session));
     let head = session["head"].as_str().unwrap_or_default();
     // GitHub's hunks of a base and head don't change; `pull` asks again.
     let kept_base = review.hunks_base(head);
     let mut files = kept_base.is_none().then(|| fetch_files(&review));
-    let before = on_github(&review.file());
+    let before = on_github(carried);
     let page = github::page(&review.remote, pr, None)?;
     if page.head != head {
-        emit(json!({"head": page.head, "moved": true}));
+        server::moved(pr, &page.head);
     }
     // Kept for another base: the PR was retargeted, or the one below it
     // merged. Asked for only now, as GitHub's base comes with the page.
@@ -768,17 +679,24 @@ fn prepare(pr: u64) -> Result<(), String> {
     if !source.has_commit(&page.head) {
         git::fetch_pulls(&review.remote, &[pr])?;
     }
-    import_with_files(&review, (page, &before), files, head, &mut source)
+    out.go_on()?;
+    import_with_files(
+        &review,
+        (page, carried, &before),
+        (files, head),
+        &mut source,
+        out,
+    )
 }
 
 /// Fetches the head, the first page of threads and the PR's files
-/// together, prints the session once both commits are here, then writes
+/// together, sends the session once both commits are here, then writes
 /// every page.
-fn pull(review: &Review) -> Result<(), String> {
+fn pull(review: &Review, carried: &[Value], out: &Out) -> Result<(), String> {
     let pr = review.pr;
     let saved = review.session();
     let files = fetch_files(review);
-    let before = on_github(&review.file());
+    let before = on_github(carried);
     let (fetched, first) = std::thread::scope(|s| {
         let fetch = s.spawn(|| git::fetch_pulls(&review.remote, &[pr]));
         let first = github::page(&review.remote, pr, None);
@@ -806,8 +724,8 @@ fn pull(review: &Review) -> Result<(), String> {
             review.start(
                 saved.as_ref(),
                 (&base, &head),
-                saved.as_ref().unwrap_or(&Value::Null),
-                None,
+                (saved.as_ref().unwrap_or(&Value::Null), None),
+                out,
             )?;
             return Err(format!("couldn't reach GitHub, comments may be stale: {e}"));
         }
@@ -838,18 +756,26 @@ fn pull(review: &Review) -> Result<(), String> {
     review.start(
         saved.as_ref(),
         (&page.base, &page.head),
-        &page.about,
-        reviewed,
+        (&page.about, reviewed),
+        out,
     )?;
     let head = page.head.clone();
-    import_with_files(review, (page, &before), Some(files), &head, &mut source)
+    out.go_on()?;
+    import_with_files(
+        review,
+        (page, carried, &before),
+        (Some(files), &head),
+        &mut source,
+        out,
+    )
 }
 
-/// Whether the PR's head on GitHub is still the session's, and whether the
-/// PR changed since it was last imported, which new comments change it
-/// by. Asked with the `ETag` of the last answer, kept in `check.json`:
-/// GitHub doesn't count an unchanged answer against the rate limit.
-fn check(pr: u64) -> Result<(), String> {
+/// The watcher's question: whether the PR's head on GitHub is still the
+/// session's, and whether the PR changed since it was last imported, which
+/// new comments change it by. Asked with the `ETag` of the last answer,
+/// kept in `check.json`: GitHub doesn't count an unchanged answer against
+/// the rate limit.
+fn look(pr: u64) -> Result<Looked, String> {
     let review = Review::new(pr)?;
     let session = review
         .session()
@@ -867,12 +793,13 @@ fn check(pr: u64) -> Result<(), String> {
     if !head.is_empty() {
         review.saw_head(head)?;
     }
-    emit(json!({
-        "head": head,
-        "moved": session["head"] != head,
-        "comments_moved": session["updated_at"].as_str().is_some_and(|u| now["updated_at"] != u),
-    }));
-    Ok(())
+    Ok(Looked {
+        head: head.to_owned(),
+        moved: session["head"] != head,
+        changed: session["updated_at"]
+            .as_str()
+            .is_some_and(|u| now["updated_at"] != u),
+    })
 }
 
 /// How long `detect` keeps having found no PR for a branch at a commit.
@@ -884,20 +811,20 @@ const NO_PR_TTL: u64 = 600;
 /// one query. `{"review": null}` without one, on a detached HEAD, or
 /// without a remote on a GitHub host, which asks GitHub nothing; nor does
 /// a branch GitHub had no PR for in the last 10 minutes, at the same
-/// commit. Then sessions of PRs long closed go, at most once a day.
-fn detect() -> Result<(), String> {
+/// commit. Then, once answered, sessions of PRs long closed go, at most
+/// once a day.
+fn detect(out: &Out) -> Result<Value, String> {
+    let none = json!({ "review": null });
     let Ok(branch) = git::git(&["symbolic-ref", "--quiet", "--short", "HEAD"]) else {
-        emit(json!({ "review": null }));
-        return Ok(());
+        return Ok(none);
     };
     let Ok(remote) = remote() else {
-        emit(json!({ "review": null }));
-        return Ok(());
+        return Ok(none);
     };
-    let found = detected(&remote, &branch)?;
-    emit(json!({ "review": found }));
+    let found = json!({ "review": detected(&remote, &branch)? });
+    out.answer(&found);
     prune_daily(&remote);
-    Ok(())
+    Ok(found)
 }
 
 fn detected(remote: &Remote, branch: &str) -> Result<Value, String> {
@@ -1001,32 +928,19 @@ fn open_prs() -> Result<(Remote, Vec<Value>), String> {
     Ok((remote, prs))
 }
 
-/// The PRs to pick from, each with how many of your drafts its session's
-/// comments file holds, when there are any.
-fn list() -> Result<(), String> {
-    let (remote, mut prs) = open_prs()?;
-    for pr in &mut prs {
-        let Some(review) = pr["id"]
-            .as_str()
-            .and_then(|id| id.parse().ok())
-            .and_then(|n| Review::of(remote.clone(), n).ok())
-            .filter(|r| r.file().exists())
-        else {
-            continue;
-        };
-        let count = read(&review.file()).map_or(0, |f| drafts(&f).len());
-        if count > 0 {
-            pr["drafts"] = json!(count);
-        }
-    }
-    emit(json!({ "reviews": prs }));
+/// The PRs to pick from; then, once answered, sessions of PRs long closed
+/// go, at most once a day.
+fn list(out: &Out) -> Result<Value, String> {
+    let (remote, prs) = open_prs()?;
+    let listed = json!({ "reviews": prs });
+    out.answer(&listed);
     prune_daily(&remote);
-    Ok(())
+    Ok(listed)
 }
 
 /// Fetches the heads of the PRs `list` shows, so preparing one later only
 /// has to ask GitHub for its threads.
-fn prefetch() -> Result<(), String> {
+fn prefetch() -> Result<Value, String> {
     let (remote, prs) = open_prs()?;
     let prs: Vec<u64> = prs
         .iter()
@@ -1035,8 +949,7 @@ fn prefetch() -> Result<(), String> {
     if !prs.is_empty() {
         git::fetch_pulls(&remote, &prs)?;
     }
-    emit(json!({ "fetched": prs }));
-    Ok(())
+    Ok(json!({ "fetched": prs }))
 }
 
 /// Days a closed or merged PR's session is kept untouched before `prune`
@@ -1045,13 +958,13 @@ const PRUNE_DAYS: u64 = 30;
 
 /// Drops the sessions of PRs GitHub last said were closed or merged, not
 /// prepared or pulled for `days` days, with their `refs/dffy/pull/<pr>`,
-/// and prints `{"pruned":[…]}`. One whose comments file holds anything not
-/// on GitHub stays: a comment without a `ref`, yours or an agent's, or a
-/// resolve not sent.
-fn prune(days: u64) -> Result<(), String> {
+/// and says `{"pruned":[…]}`; their comments are dffy's, and stay. One
+/// whose old comments file, from before dffy kept them, holds a comment
+/// without a `ref`, or can't be read, stays too: it goes once you've
+/// imported that file and removed it.
+fn prune(days: u64) -> Result<Value, String> {
     let pruned = prune_sessions(&remote()?, days)?;
-    emit(json!({ "pruned": pruned }));
-    Ok(())
+    Ok(json!({ "pruned": pruned }))
 }
 
 fn prune_sessions(remote: &Remote, days: u64) -> Result<Vec<u64>, String> {
@@ -1073,13 +986,14 @@ fn prune_sessions(remote: &Remote, days: u64) -> Result<Vec<u64>, String> {
             .is_some_and(|age| age >= old);
         let closed =
             read_json(&session).is_some_and(|s| s["state"] == "CLOSED" || s["state"] == "MERGED");
-        if !untouched || !closed {
-            continue;
-        }
-        let unsent = |c: &Value| c["ref"].is_null() || toggled(c);
-        if review.file().exists()
-            && !read(&review.file()).is_ok_and(|f| !comments(&f).iter().any(unsent))
-        {
+        // Everything posted is GitHub's, and comes back with a pull.
+        let unposted = |file: Value| {
+            file["comments"]
+                .as_array()
+                .is_none_or(|c| c.iter().any(|c| c["ref"].is_null()))
+        };
+        let old = review.old_file();
+        if !untouched || !closed || (old.exists() && read_json(&old).is_none_or(unposted)) {
             continue;
         }
         fs::remove_dir_all(&review.dir)
@@ -1115,9 +1029,9 @@ fn prune_daily(remote: &Remote) {
 
 /// For `dffy doctor`: whether gh is installed, and logged in to the host
 /// the API calls go to, the repository's, else gh's own. `gh auth status`
-/// asks that host, so it isn't free; no other verb runs it for a host
+/// asks that host, so it isn't free; no other request runs it for a host
 /// known to be GitHub's, they read the same from their first call.
-fn doctor() {
+fn doctor() -> Value {
     let check =
         |name: &str, ok: bool, detail: &str| json!({"name": name, "ok": ok, "detail": detail});
     let first_line = |bytes: &[u8]| {
@@ -1167,7 +1081,7 @@ fn doctor() {
             ]
         }
     };
-    emit(json!({ "checks": checks }));
+    json!({ "checks": checks })
 }
 
 /// GitHub allows 80 content-creating requests a minute; this stays under
@@ -1195,55 +1109,6 @@ enum Event {
     Pending,
     /// GitHub's review event.
     Submit(&'static str),
-}
-
-enum PostMode<'a> {
-    Post(Event),
-    /// Says what `post` would do with each draft, without asking GitHub,
-    /// and with those of another comments file.
-    DryRun(Option<&'a str>),
-}
-
-/// `--dry-run` alone or with `--drafts`, or `--event` and `--summary-file`
-/// in either order.
-fn post_args<'a>(flags: &[&'a str]) -> Result<(PostMode<'a>, Option<&'a str>), String> {
-    match flags {
-        ["--dry-run"] => return Ok((PostMode::DryRun(None), None)),
-        ["--dry-run", "--drafts", file] | ["--drafts", file, "--dry-run"] => {
-            return Ok((PostMode::DryRun(Some(file)), None));
-        }
-        _ => {}
-    }
-    let (mut event, mut summary) = (None, None);
-    let mut flags = flags.iter();
-    while let Some(flag) = flags.next() {
-        match (*flag, flags.next()) {
-            ("--event", Some(name)) => {
-                event = Some(match *name {
-                    "pending" => Event::Pending,
-                    "comment" => Event::Submit("COMMENT"),
-                    "approve" => Event::Submit("APPROVE"),
-                    "request_changes" => Event::Submit("REQUEST_CHANGES"),
-                    _ => {
-                        return Err(format!(
-                            "unknown event {name}; pending, comment, approve or request_changes"
-                        ));
-                    }
-                });
-            }
-            ("--summary-file", Some(file)) => summary = Some(*file),
-            _ => return Err(USAGE.to_owned()),
-        }
-    }
-    let event = event.ok_or(USAGE)?;
-    Ok((PostMode::Post(event), summary))
-}
-
-fn read_summary(file: Option<&str>) -> Result<String, String> {
-    Ok(file
-        .map(|f| fs::read_to_string(f).map_err(|e| format!("can't read {f}: {e}")))
-        .transpose()?
-        .unwrap_or_default())
 }
 
 fn location(comment: &Value) -> String {
@@ -1352,7 +1217,7 @@ fn at_head(
 }
 
 /// What `post` does with a draft, decided from git and the hunks `prepare`
-/// or `pull` kept before anything is sent; `--dry-run` prints it. `unsure`
+/// or `pull` kept before anything is sent; `dryRun` says it. `unsure`
 /// says line or file was decided by git's diff of the PR, not GitHub's.
 enum Plan {
     /// On its lines at the PR's head, or a reply in its thread.
@@ -1364,7 +1229,7 @@ enum Plan {
 }
 
 impl Plan {
-    /// The protocol's line saying what happens to `draft`.
+    /// What the protocol says happens to `draft`.
     fn line(&self, draft: &Value) -> Value {
         let mut out = json!({"id": draft["id"], "path": draft["path"]});
         match self {
@@ -1389,7 +1254,7 @@ impl Plan {
                 out["reason"] = json!(why);
             }
         }
-        json!({ "draft": out })
+        out
     }
 }
 
@@ -1406,13 +1271,19 @@ struct Planner {
     /// git's hunks of the PR by path, for files GitHub's don't cover: read
     /// on the first such file, `None` when git couldn't diff it.
     local: OnceCell<Option<HashMap<String, Vec<git::Hunk>>>>,
-    /// Roots with a thread on GitHub, or planned to get one.
+    /// Drafts planned to start a thread, by id.
     threads: HashSet<String>,
     source: Source,
 }
 
+/// A reply's thread on GitHub, when its first comment is posted: dffy
+/// sends that comment's fields with its ref.
+fn posted_thread(draft: &Value) -> Option<&str> {
+    draft["in_reply_to"]["github_thread"].as_str()
+}
+
 impl Planner {
-    fn new(review: &Review, file: &Value) -> Self {
+    fn new(review: &Review) -> Self {
         let commits = review.session().and_then(|s| {
             Some((
                 s["base"].as_str()?.to_owned(),
@@ -1423,24 +1294,22 @@ impl Planner {
             .as_ref()
             .and_then(|(_, head)| review.hunks(head))
             .unwrap_or_default();
-        let threads = comments(file)
-            .iter()
-            .filter(|c| c["github_thread"].is_string())
-            .filter_map(|c| c["id"].as_str().map(str::to_owned))
-            .collect();
         Self {
             commits,
             changed: OnceCell::new(),
             github,
             local: OnceCell::new(),
-            threads,
+            threads: HashSet::new(),
             source: Source::default(),
         }
     }
 
     fn plan(&mut self, draft: &Value) -> Plan {
-        if let Some(root) = draft["in_reply_to"].as_str() {
-            return if self.threads.contains(root) {
+        if draft["in_reply_to"].is_object() {
+            let root = draft["in_reply_to"]["id"].as_str();
+            return if posted_thread(draft).is_some()
+                || root.is_some_and(|root| self.threads.contains(root))
+            {
                 Plan::Line {
                     placed: draft.clone(),
                     unsure: false,
@@ -1506,74 +1375,49 @@ impl Planner {
     }
 }
 
-/// What `post` posts: your comments not posted yet. One with an author is
-/// someone else's, an agent's, and would go out under your name.
-fn drafts(file: &Value) -> Vec<&Value> {
-    comments(file)
-        .iter()
-        .filter(|c| c["ref"].is_null() && c["author"].as_str().unwrap_or_default().is_empty())
-        .collect()
-}
-
-/// Prints each draft's plan, then how many go each way, how many comments
-/// are in your pending review on GitHub already, as last imported, and how
-/// many resolves and reopens wait to be sent. The drafts of `extra`, a
-/// comments file of drafts not moved into the PR's yet, are planned after
-/// the PR's own. It reads git, the comments files and the kept hunks, and
-/// writes nothing.
-fn dry_run(pr: u64, extra: Option<&str>) -> Result<(), String> {
+/// Each draft's plan, in the order dffy sent them. It reads git and the
+/// kept hunks, and writes nothing.
+fn dry_run(pr: u64, drafts: &[Value], out: &Out) -> Result<Value, String> {
     let review = Review::new(pr)?;
     if review.session().is_none() {
         return Err(format!("#{pr} isn't prepared; run prepare {pr} first"));
     }
-    let current = read(&review.file())?;
-    let extra = extra.map(|f| read(Path::new(f))).transpose()?;
-    let mut planner = Planner::new(&review, &current);
-    let (mut line, mut file, mut skip) = (0, 0, 0);
-    let all = drafts(&current)
-        .into_iter()
-        .chain(extra.as_ref().map(drafts).unwrap_or_default());
-    for draft in all {
-        let plan = planner.plan(draft);
-        *match plan {
-            Plan::Line { .. } => &mut line,
-            Plan::File { .. } => &mut file,
-            Plan::Skip(_) => &mut skip,
-        } += 1;
-        emit(plan.line(draft));
+    let mut planner = Planner::new(&review);
+    let mut plans = Vec::with_capacity(drafts.len());
+    for draft in drafts {
+        out.go_on()?;
+        plans.push(planner.plan(draft).line(draft));
     }
-    let count = |has: fn(&Value) -> bool| comments(&current).iter().filter(|c| has(c)).count();
-    emit(json!({"planned": {"line": line, "file": file, "skip": skip,
-        "pending": count(|c| c["pending"] == true), "resolves": count(toggled)}}));
-    Ok(())
+    Ok(json!({ "drafts": plans }))
 }
 
 /// Posts the drafts into your pending review, sends the resolves and
 /// reopens, then applies `event`. Drafts left out, planned so or refused by
 /// GitHub, don't hold the event back; one GitHub refused says why in its
 /// `post_error`. Only a stop, GitHub no longer answering, does: the rest
-/// are posted by the next run.
-fn post(pr: u64, event: Event, summary: Option<&str>) -> Result<(), String> {
-    let summary = read_summary(summary)?;
+/// are posted by the next run, and the failure's data says what this one
+/// did. Each draft posted is written as it goes, `ref` and all, so a
+/// retry skips it.
+fn post(
+    pr: u64,
+    (event, summary): (Event, &str),
+    (drafts, resolves): (&[Value], &[Value]),
+    out: &Out,
+) -> Result<Value, Failure> {
     let review = Review::new(pr)?;
     let _lock = review.lock()?;
-    let file = review.file();
-    let current = read(&file)?;
-    let drafts = drafts(&current);
     let state = match github::post_state(&review.remote, pr) {
         Ok(state) => state,
         Err(e) => {
-            notice(
-                &file,
-                Some(&format!("post failed, nothing was posted: {e}")),
-            )?;
-            return Err(e.into());
+            let said = format!("post failed, nothing was posted: {e}");
+            out.apply(&[notice(Some(&said))]);
+            return Err(e.to_string().into());
         }
     };
-    let mut post = Post::new(&review, &file, state, &current);
-    post.drafts(&drafts, &mut Planner::new(&review, &current))?;
+    let mut post = Post::new(&review, out, state, resolves);
+    post.drafts(drafts, &mut Planner::new(&review));
     if post.stopped.is_none() {
-        post.resolves()?;
+        post.resolves();
     }
     let failure = if let Some(m) = &post.stopped {
         Some(format!(
@@ -1590,40 +1434,49 @@ fn post(pr: u64, event: Event, summary: Option<&str>) -> Result<(), String> {
         .map(|why| format!("not resolved or reopened: {why}"))
         .collect();
     notes.extend(failure.clone());
-    notice(
-        &file,
-        (!notes.is_empty()).then(|| notes.join("; ")).as_deref(),
-    )?;
+    let said = (!notes.is_empty()).then(|| notes.join("; "));
+    out.apply(&[notice(said.as_deref())]);
     let submitted = matches!(event, Event::Submit(_)) && failure.is_none();
-    if submitted {
-        post.submitted()?;
-    }
     // A pending review with nothing in it reviewed nothing.
-    if failure.is_none() && (post.posted > 0 || submitted) {
-        review.reviewed()?;
-    }
-    for left in &post.left {
-        emit(left.clone());
-    }
-    emit(json!({
+    let reviewed = if failure.is_none() && (post.posted > 0 || submitted) {
+        review.reviewed()?
+    } else {
+        Value::Null
+    };
+    let mut posted = json!({
+        "unposted": post.left,
         "posted": post.posted,
         "failed": drafts.len() - post.posted,
         "pending": post.pending_before,
         "url": post.url(),
-    }));
-    failure.map_or(Ok(()), Err)
+    });
+    if !reviewed.is_null() {
+        posted["last_reviewed_head"] = reviewed;
+    }
+    match failure {
+        None => Ok(posted),
+        Some(message) => Err(Failure {
+            message,
+            data: Some(posted),
+            code: 1,
+        }),
+    }
 }
 
 /// A run of `post`: what it sent, and what it couldn't.
 struct Post<'a> {
-    file: &'a Path,
+    /// Where what it writes goes.
+    out: &'a Out,
     pr_id: String,
     pr_url: String,
     /// The head the comments were made on.
     shown: Option<String>,
     review: Option<github::Review>,
-    /// Thread ids by the id of their first comment.
+    /// The threads of the drafts posted, by the draft's id.
     threads: HashMap<String, String>,
+    /// The threads resolved or reopened and not sent: dffy's, then those of
+    /// drafts posted resolved.
+    toggled: Vec<Value>,
     pace: Pace,
     posted: usize,
     /// The comments your pending review had before this run.
@@ -1637,9 +1490,10 @@ struct Post<'a> {
 }
 
 impl<'a> Post<'a> {
-    fn new(review: &Review, file: &'a Path, state: github::PostState, current: &Value) -> Self {
+    fn new(review: &Review, out: &'a Out, state: github::PostState, resolves: &[Value]) -> Self {
         Self {
-            file,
+            out,
+            toggled: resolves.to_vec(),
             pr_id: state.pr_id,
             pr_url: state.url,
             // The drafts' lines are the session head's, whatever GitHub's is
@@ -1648,15 +1502,7 @@ impl<'a> Post<'a> {
                 .session()
                 .and_then(|s| s["head"].as_str().map(str::to_owned)),
             review: state.pending,
-            threads: comments(current)
-                .iter()
-                .filter_map(|c| {
-                    Some((
-                        c["id"].as_str()?.to_owned(),
-                        c["github_thread"].as_str()?.to_owned(),
-                    ))
-                })
-                .collect(),
+            threads: HashMap::new(),
             pace: Pace::default(),
             posted: 0,
             pending_before: state.pending_comments,
@@ -1675,19 +1521,6 @@ impl<'a> Post<'a> {
         self.left.push(Plan::Skip(why).line(draft));
     }
 
-    /// Clears `pending` once the review it marked is submitted.
-    fn submitted(&self) -> Result<(), String> {
-        let ops: Vec<Value> = comments(&read(self.file)?)
-            .iter()
-            .filter(|c| c["pending"] == true)
-            .map(|c| json!({"op": "upsert", "comment": {"ref": c["ref"], "pending": null}}))
-            .collect();
-        if ops.is_empty() {
-            return Ok(());
-        }
-        apply(self.file, &ops)
-    }
-
     /// Your pending review, started on the first comment that needs it.
     fn review_id(&mut self) -> Result<String, Error> {
         if let Some((id, _)) = &self.review {
@@ -1698,35 +1531,39 @@ impl<'a> Post<'a> {
         Ok(self.review.insert(review).0.clone())
     }
 
-    /// Posts each draft as `planner` plans it, with a progress line for
-    /// each, until GitHub stops answering.
-    fn drafts(&mut self, drafts: &[&Value], planner: &mut Planner) -> Result<(), String> {
+    /// Posts each draft as `planner` plans it, with progress for each, until
+    /// GitHub stops answering, or dffy cancels, as when it couldn't write
+    /// what was posted: a draft posted then would go unrecorded.
+    fn drafts(&mut self, drafts: &[Value], planner: &mut Planner) {
         for (i, draft) in drafts.iter().enumerate() {
+            if let Err(e) = self.out.go_on() {
+                self.stopped.get_or_insert(e);
+            }
             if self.stopped.is_some() {
                 break;
             }
             match planner.plan(draft) {
-                Plan::Line { placed, .. } => self.draft(&placed, false)?,
-                Plan::File { placed, .. } => self.draft(&placed, true)?,
+                Plan::Line { placed, .. } => self.draft(&placed, false),
+                Plan::File { placed, .. } => self.draft(&placed, true),
                 Plan::Skip(why) => self.leave(draft, why),
             }
-            emit(json!({"progress": format!("{}/{}", i + 1, drafts.len())}));
+            self.out.progress(&format!("{}/{}", i + 1, drafts.len()));
         }
-        Ok(())
     }
 
-    /// Posts one draft, `on_file` or on its lines, and writes its `ref`
-    /// back right away, so a retry skips it, marked `pending` in your
+    /// Posts one draft, `on_file` or on its lines, and has its `ref`
+    /// written right away, so a retry skips it, marked `pending` in your
     /// pending review until that's submitted. One GitHub refuses gets why
-    /// in its `post_error`, which goes once it's posted. Fails only when a
-    /// write does.
-    fn draft(&mut self, comment: &Value, on_file: bool) -> Result<(), String> {
+    /// in its `post_error`, which goes once it's posted.
+    fn draft(&mut self, comment: &Value, on_file: bool) {
         let id = comment["id"].as_str().unwrap_or_default();
-        let thread = if let Some(root) = comment["in_reply_to"].as_str() {
+        let thread = if comment["in_reply_to"].is_object() {
+            let posted = posted_thread(comment).map(str::to_owned);
+            let root = comment["in_reply_to"]["id"].as_str();
             // Its root was planned, then refused.
-            let Some(thread) = self.threads.get(root).cloned() else {
+            let Some(thread) = posted.or_else(|| self.threads.get(root?).cloned()) else {
                 self.leave(comment, "its thread isn't posted".to_owned());
-                return Ok(());
+                return;
             };
             Some(thread)
         } else {
@@ -1737,7 +1574,7 @@ impl<'a> Post<'a> {
             Ok(review) => review,
             Err(e) => {
                 self.stopped = Some(format!("starting a review: {e}"));
-                return Ok(());
+                return;
             }
         };
         self.pace.wait();
@@ -1753,53 +1590,49 @@ impl<'a> Post<'a> {
                 let mut fields = json!({"ref": reference, "url": posted.url, "pending": true});
                 if let Some(thread) = new_thread {
                     fields["github_thread"] = json!(thread);
-                    fields["github_resolved"] = json!(false);
+                    fields["host_resolved"] = json!(false);
+                    // A thread resolved before it was posted is sent
+                    // resolved.
+                    if comment["resolved"] == true {
+                        let mut toggle = comment.clone();
+                        toggle["ref"] = json!(reference);
+                        toggle["github_thread"] = json!(thread);
+                        self.toggled.push(toggle);
+                    }
                     self.threads.insert(id.to_owned(), thread);
                 }
-                apply(
-                    self.file,
-                    &[
-                        json!({"op": "set", "id": id,
-                            "fields": {"ref": reference, "post_error": null}}),
-                        json!({"op": "upsert", "comment": fields}),
-                    ],
-                )
-                .map_err(|e| {
-                    format!(
-                        "posted {} but couldn't record it, so a retry would post it again: {e}",
-                        location(comment)
-                    )
-                })?;
+                self.out.apply(&[
+                    json!({"op": "set", "id": id,
+                        "fields": {"ref": reference, "post_error": null}}),
+                    json!({"op": "upsert", "comment": fields}),
+                ]);
                 self.posted += 1;
             }
             Err(Error::Rejected(m)) => {
-                apply(
-                    self.file,
-                    &[json!({"op": "set", "id": id, "fields": {"post_error": m}})],
-                )?;
+                self.out
+                    .apply(&[json!({"op": "set", "id": id, "fields": {"post_error": m}})]);
                 self.leave(comment, m);
             }
             Err(Error::Failed(m) | Error::Setup(m)) => self.stopped = Some(m),
         }
-        Ok(())
     }
 
     /// Sends the resolves and reopens made in dffy.
-    fn resolves(&mut self) -> Result<(), String> {
-        // Read again: a thread posted just now may be resolved too.
-        for comment in comments(&read(self.file)?).iter().filter(|c| toggled(c)) {
+    fn resolves(&mut self) {
+        for comment in std::mem::take(&mut self.toggled) {
+            if let Err(e) = self.out.go_on() {
+                self.stopped = Some(e);
+                break;
+            }
             let to = comment["resolved"] == true;
             let thread = comment["github_thread"].as_str().unwrap_or_default();
             match github::resolve(thread, to) {
-                Ok(()) => apply(
-                    self.file,
-                    &[
-                        json!({"op": "upsert", "comment": {"ref": comment["ref"], "github_resolved": to}}),
-                    ],
-                )?,
+                Ok(()) => self.out.apply(&[
+                    json!({"op": "upsert", "comment": {"ref": comment["ref"], "host_resolved": to}}),
+                ]),
                 Err(Error::Rejected(m)) => {
                     self.resolves_refused
-                        .push(format!("{}: {m}", location(comment)));
+                        .push(format!("{}: {m}", location(&comment)));
                 }
                 Err(Error::Failed(m) | Error::Setup(m)) => {
                     self.stopped = Some(m);
@@ -1807,7 +1640,6 @@ impl<'a> Post<'a> {
                 }
             }
         }
-        Ok(())
     }
 
     /// Submits the review, or sets a pending one's summary. A submit with

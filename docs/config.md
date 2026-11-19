@@ -118,4 +118,4 @@ The sources are `default`, `config`, `last used` and `flag`. They're comments, s
 | `$XDG_CONFIG_HOME/dffy/themes/` | Your themes. |
 | `$XDG_STATE_HOME/dffy/state` | Remembered viewer settings, and whether the first-run tip was shown. |
 | `$XDG_CACHE_HOME/dffy/` | Results that are slow to compute: rename passes, and highlighting and syntax diffs of large files. Shared by every dffy process, trimmed to `cache-size`. Safe to delete. |
-| `$XDG_RUNTIME_DIR/dffy/` | The [watch broker's](watch.md#dffyd) socket. |
+| `$XDG_RUNTIME_DIR/dffy/` | dffyd's sockets: the [watch broker's](watch.md#dffyd) and the [control API's](control.md). |

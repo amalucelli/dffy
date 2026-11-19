@@ -1,6 +1,6 @@
 # Architecture
 
-For contributors and coding agents.
+For contributors and coding agents. [design.md](design.md) is the approach a change follows: where code goes, ownership, protocols, performance and testing.
 
 - **Priorities, in order:** performance, usability, developer experience.
 - **Reference workload:** the Linux kernel repository (97,000 files; `v6.0..v6.1` changes 13,168 of them).
@@ -16,7 +16,7 @@ The workspace has four kinds of crate:
 
 ### `dffy-core`
 
-The engine: git access, the line and intra-line diff, the syntax diff, highlighting, patch parsing, and the document a frontend shows (files, rows, line states, positions, navigation, search). It has no terminal code and doesn't assume which process hosts it.
+The engine: git access, the line and intra-line diff, the syntax diff, highlighting, patch parsing, the document a frontend shows (files, rows, line states, positions, navigation, search), and annotations placed on its files' lines. It has no terminal code and doesn't assume which process hosts it.
 
 **Core decides, the host draws.** Core decides which lines changed, what each line is (modified, moved, reformatted), the rows of each arrangement, where a position is and where navigation goes, and what a search matches. The host supplies the executor, text measurement (widths, wrapping), colors and drawing. Core has no thread pool or event loop: the host runs the work `Document::missing` names on threads of its own. Some calls fork scoped threads for one job and join them before returning (two sides parsed at once, the status scan, rename scoring); the watcher and the cache's trimming run threads of their own.
 
@@ -24,10 +24,10 @@ The engine: git access, the line and intra-line diff, the syntax diff, highlight
 
 | Layer | Modules | Built on |
 |---|---|---|
-| 0 | `diff`, `patch`, `view` | memchr and rustc-hash. No git, no tree-sitter, no I/O or threads. |
+| 0 | `diff`, `patch`, `view`, `conflict` | memchr and rustc-hash. No git, no tree-sitter, no I/O or threads. |
 | 1 | `highlight`, `structural` | tree-sitter |
 | 2 | `git`, `watch`, `cache` | gix and the filesystem |
-| 3 | `document` | Everything below |
+| 3 | `document`, `annotation` | Everything below |
 
 Layer 1 is the exception: `highlight` and `structural` store results through `cache` and name blobs by `git::ObjectId`, and the grammar registry hashes grammar identities with gix. `suggest` imports nothing; `git` uses it.
 
@@ -39,16 +39,20 @@ Layer 1 is the exception: `highlight` and `structural` store results through `ca
 | `patch` | Unified diffs read as text (`git diff`, `git log -p`, `diff -u`): the line-at-a-time parser and its events, what text lines and combined-diff lines are, and the builder that collects events into commits and files. No I/O: the host reads the input and stores what it keeps. |
 | `highlight` | tree-sitter highlighting of the requested lines, and a file's two sides prepared for it. The grammar registry (`Registry`) is a value the host builds and passes in, with the 30 bundled grammars as `Registry::builtin`. Matching a file to a language reads only names and extensions; a grammar is loaded on its language's first parse or query compile. Each grammar has an identity that goes into cache keys. |
 | `structural` | The syntax-aware diff: anchoring, per-region matching, the result cache. |
+| `conflict` | Merge conflicts in a conflicted file: the marker rule, the regions the markers bound (settled by the index's sides where they read two ways), a choice per region, the text choices resolve the file to, and the preview's hunks. |
 | `git` | Revision resolution (through gix), streaming change enumeration, content loading. |
 | `git::spec` | `git diff`-style arguments resolved to the two sides of a diff. |
 | `git::tree` | Tree-to-tree and tree-to-index diffs as ordered merge-joins that skip equal subtrees. |
 | `git::status` | The working-tree side: a parallel stat scan of the index in index order, and the untracked walk. |
 | `git::rename` | Rename detection after enumeration, following git's diffcore-rename so pairs and scores match `git diff -M`. |
 | `git::changes` | A diff's file list kept current for watch mode, with the parsed index kept loaded. |
+| `git::conflict` | A conflicted file's conflicts as the index (stages 1 to 3) and the working tree have them, why one can't be resolved by region, and writing a resolution. |
 | `git::paths` | Two files or folders compared outside git, behind the same `Repo` handle. Walks both trees in step; a worker per core stats and compares files, and results come back in path order. |
 | `watch` | The file watcher: inotify and FSEvents backends, coalescing, ignore rules, polling. |
 | `cache` | The content-addressed disk cache shared by every dffy process. |
-| `document` | A diff as a frontend shows it, one file at a time. `Document` holds every entry (files, and a piped log's commits) with its diff once prepared, revealed lines, counts, version, saved position and rendered view; the position, and navigation by row, change and file; the syntax-diff, full-text and rendered toggles; eviction of least recently shown diffs; the search's matches; and `Document::missing`, the work the rows about to be shown still lack. Moves that need the host's screen come back as a `Settle` the host finishes. `File` is one entry's diff: its parts (hunks and gaps of unchanged lines), rows per arrangement, gap reveal, the overview's marks, search, and rendered views' mapping to their source. `File::prepare` is the per-file work, split per file, hunk and gap so a host runs only what it draws. It reads no files other than the cache's and starts no threads of its own: the host fetches content and schedules the work. |
+| `document` | A diff as a frontend shows it, one file at a time. `Document` holds every entry (files, and a piped log's commits) with its diff once prepared, revealed lines, counts, version, saved position and rendered view; the position, and navigation by row, change and file; the syntax-diff, full-text and rendered toggles; the choices made on a conflicted file's regions, which its diff then previews; eviction of least recently shown diffs; the search's matches; and `Document::missing`, the work the rows about to be shown still lack. Moves that need the host's screen come back as a `Settle` the host finishes. `File` is one entry's diff: its parts (hunks and gaps of unchanged lines), rows per arrangement, gap reveal, the overview's marks, search, and rendered views' mapping to their source. `File::prepare` is the per-file work, split per file, hunk and gap so a host runs only what it draws. It reads no files other than the cache's and starts no threads of its own: the host fetches content and schedules the work. |
+| `document::blocks` | Blocks: rows a host inserts among a file's, each an id, where it hangs (under the first row, under the row showing a line of one side, or under the last row) and plain text. They're rows of the row model: a part's rows are its own (code, separators, headers) with its blocks placed between them, blocks hung at one place parted by the blank rows `Arrange::parting` asks for, so `Pos`, moving, `Document::missing`, revealing and the full-text toggle count them, and positions on them stay put when rows change around them. A block on a hidden line hangs under its gap's separator. Heights come from the host through `Arrange::measure`, asked only for the parts a call touches and kept per block and width until the host calls `Document::remeasure`; `Document::relayout` keeps the position on the line or block row it showed when the host lays rows out anew. Search reads their text as a second list of matches placed among the lines' (`Matches::get` goes through both in order), and `Document::step_block` walks them across files. What a block shows is the host's. |
+| `annotation` | Ranges of a file's lines that something outside the diff holds on to (the viewer's comments are one source), each recorded with its side, its lines and the text around them, and where they land on a version of the file: at their recorded lines when the text still matches, else where their lines and context appear once within 1,000 lines, else lost. `AnnotationSet` stamps each path with the generation its annotations last changed at, so a placement made before a change is told apart and a change to one path re-places that path alone. Placement reads only the diff's two sides, so the host runs it off its main thread; `Document::reveal_annotations` then opens the gap lines around each placed one. What an annotation says is the host's. |
 | `suggest` | Closest-name suggestions for "did you mean" hints. |
 
 ### `dffy`
@@ -60,20 +64,24 @@ The `dffy` binary: CLI, printed output, pager mode, the viewer, the MCP server a
 | `cli` | clap definitions; inserts the default `diff` subcommand. |
 | `config` | The config file, every key with its default, value sources. |
 | `state` | Remembered viewer settings in `$XDG_STATE_HOME/dffy/state`. |
-| `keys` | Named actions and the three key tables. |
+| `keys` | Named actions and the key tables: the main one, the tree's, a thread's and the command panel's. |
 | `docs` | The generated reference pages (`dffy config --markdown`). |
 | `theme` | Roles, themes and tints. |
 | `output` | Terminal facts, color decisions, stdout or a pager process. |
 | `print` | Printed output from the repository, streamed file by file: the threads and output budget around the core's per-file steps, and laying each file out. |
-| `json` | `--json`: the header, file and end objects of [json.md](json.md), written by hand from the core's per-file steps and streamed through `print`'s writer. A file object can also hold a window of its hunks, for hosts that page. |
-| `mcp` | `dffy mcp`: the Model Context Protocol server ([mcp.md](mcp.md)). Hand-written JSON-RPC over stdio on the `plugin` module's JSON, both protocol eras, the three tools, cursors and the text rendering. |
+| `encode` | The core model as JSON, the one encoding `--json`, MCP and the control API share: the header, file and end objects of [json.md](json.md) with their hunks, lines and annotations, written by hand from the core's per-file steps, and where a thread is placed. A file object can also hold a window of its hunks, for hosts that page. |
+| `json` | `--json`: `encode`'s objects as JSON Lines, streamed through `print`'s writer. |
+| `mcp` | `dffy mcp`: the Model Context Protocol server ([mcp.md](mcp.md)). Hand-written JSON-RPC over stdio on the `plugin` module's JSON, both protocol eras, the tools (their file objects and placements `encode`'s), cursors and the text rendering. The viewer tools go through `control::client`. |
+| `control` | The control API ([control.md](control.md)): its newline-delimited JSON on the `plugin` module's JSON, the handshake, capabilities and schema. `control::server` is dffyd's side: the registered views, requests handed to their viewers and answers back, subscriptions. `control::viewer` is a viewer's registration, its connection held on threads of its own, turning requests into commands for the viewer's loop, and the encoding of what a view answers. `control::client` connects from outside and finds the view a command means, for `dffy ctl` and the MCP server. |
 | `no_index` | When two arguments are paths to compare rather than revisions, and what the comparison is called (`git difftool`'s temporary copies included). |
 | `pager` | Pager mode: the stdin reader and line splitting, streaming the core's `patch` events into rendered rows, and `--color-only`. |
-| `plugin` | Renderer plugins: the `render` setting, finding `dffy-render-<name>` on `PATH`, running one with a timeout, the protocol's JSON. `plugin::review`: review plugins (`dffy-review-<name>`), run in the background in a session of their own (through `dffy __review-plugin`, since std starts one only from unsafe code), their JSON lines read on a thread and handed to the viewer as events. |
+| `plugin` | Renderer plugins: the `render` setting, finding `dffy-render-<name>` on `PATH`, running one with a timeout, the protocol's JSON. `plugin::review`: review plugins (`dffy-review-<name>`), one long-lived process per repository speaking JSON-RPC over stdio, started in a session of its own (through `dffy __review-plugin`, since std starts one only from unsafe code) and restarted when it crashes. A thread writes requests, reading the review's comments file into them; another reads answers, applies the comment operations the plugin sends, and hands the rest to the viewer as events. |
+| `review` | Review comments: the comments file's format and the operations that write it under a lock. `review::model` makes the threads from the file (the local review's drafts merged in, other branches' kept apart), hands its line comments to the core as annotations, and makes each file's threads from where the core placed them, at once again when only their text changed; `review::listing` is the comments panel's list (groups, order, filters, search, selection); `review::session` is the review session with a review plugin as a state machine: it takes intents, the plugin's answers and pushes, and returns effects the frontend carries out (ask the plugin, show a range, place threads again, say something). Nothing in it draws or reads keys: words that point to an action carry a `Hint`, which the frontend says with the key it binds. |
+| `fuzzy` | Fzf-style matching for the picker's, the panels' and the lists' filters. |
 | `render` | Turning the core's `view` rows into cells (split, unified, stat): widths, wrapping, the role for each line's state, and escaping, shared by printed output and the viewer. It decides nothing about what a line is. |
 | `term` | The terminal layer: cell grid, raw mode, input parsing, OSC 52, OSC 7501. |
 | `tui` | The viewer (submodules below). |
-| `daemon` | `dffyd`: the broker, its client, and the socket protocol. |
+| `daemon` | `dffyd`: the broker, its client, and the socket protocol; the process also serves `control`'s socket. |
 | `doctor` | `dffy doctor`. |
 | `bench` | Entry points for the benchmarks. |
 
@@ -81,9 +89,10 @@ The viewer's submodules, under `tui`:
 
 | Submodule | What it owns |
 |---|---|
-| `app` | State and event handling. `app::pr` is review mode: the code host's review shown, the review plugin's run, the review picker and the post dialog, every word naming the host's kind of review the plugin's. A review's update or another review goes through the change-set thread as a new range, the way watch mode's refreshes do. |
-| `view` | The screen layer over the core's `Document`: rows' heights when wrapping, scrolling and keeping the screen full, opening a file a few rows above its first change, drawing, the overview column, selections and the mouse. It reports what `Document::missing` names for the rows drawn in the last frame. `view::rendered` turns a renderer's blocks into a rendered `File`. |
-| `worker` | The change-set thread, and the pool that runs diffs, renderings and the core's `File::prepare` steps off the UI thread. `app` turns the screen's `missing()` into the pool's jobs. |
+| `app` | State and event handling: input reaches the overlays, the panels and the key tables in a fixed order, and each action is dispatched from here. `app::threads` is the comment threads (the comments file, placing threads, writing comments, the thread's keys, the comments panel), `app::search` the diff's search, `app::mouse` clicks, drags and the right-click menu, `app::command_panel` the leader key's panel, and `app::draw` a frame's chrome and status bar. `app::review` is review mode's keys and overlays, the review picker and the post dialog, over `review::session`, whose effects it carries out. A review's update or another review goes through the change-set thread as a new range, the way watch mode's refreshes do. `app::control` carries out the control API's commands, which arrive as `Event::Control`, answers those waiting for a file's diff once it's in, and pushes the events subscribed to. |
+| `comments` | Drawing comment threads' boxes, and the comments panel over `review::listing`'s list. |
+| `view` | The screen layer over the core's `Document`: rows' heights when wrapping, scrolling and keeping the screen full, opening a file a few rows above its first change, drawing, the overview column, selections and the mouse. The threads of the file shown and the text box are the core's blocks there: `view::Boxes` measures each box by width (folded or not, with the text box in it) for the core and draws it a row at a time, so frames are copied with boxes on screen until an age on one reads differently. It reports what `Document::missing` names for the rows drawn in the last frame. `view::select` is the selections: lines, text in a comment, what's under the pointer, and copies. `view::rendered` turns a renderer's blocks into a rendered `File`. |
+| `worker` | The change-set thread, and the pool that runs diffs, annotation placement, renderings and the core's `File::prepare` steps off the UI thread. `app` turns the screen's `missing()` into the pool's jobs. |
 | `tree`, `picker`, `commands`, `help` | The file tree, the file picker, the command panel, the key list. |
 | `chrome` | The frame. |
 | `piped` | Diffs from a pipe: the reader thread, its backpressure, and the spill file that keeps patches out of memory until drawn. |
@@ -108,7 +117,7 @@ Each module draws once, at the narrowest label wrap that fits the width; sizes a
 
 ### `plugins/review-github`
 
-`dffy-review-github`, the GitHub review plugin ([plugins.md](plugins.md#review-plugins)). It reaches GitHub only through `gh api`, fetches code only with git, and reads and writes the comments file only through `dffy comments`, so the lock and the format stay dffy's. `github` holds the GraphQL requests and turns review threads into comment operations; `git` holds the fetches and the anchors read from the PR's commits.
+`dffy-review-github`, the GitHub review plugin ([plugins.md](plugins.md#review-plugins)). It reaches GitHub only through `gh api` and fetches code only with git. It never touches the comments file: dffy sends the comments with each request and applies the operations the plugin sends back, so the file, its lock and its format stay dffy's. `server` holds the JSON-RPC loop, the request threads and the watcher; `github` holds the GraphQL requests and turns review threads into comment operations; `git` holds the fetches and the anchors read from the PR's commits.
 
 ### `xtask`
 
@@ -121,7 +130,9 @@ The viewer never waits for the whole diff.
 1. A change-set thread lists changed files in git's path order and sends them as they're found. For a range that's a tree merge-join; for the working tree, a parallel stat scan of the index, then the untracked walk. The first files paint before the scan finishes.
 2. Once the list is complete, the rename pass pairs deletions with additions and updates the list in place.
 3. A worker pool diffs a file when it's about to be drawn, then computes emphasis and highlighting for the hunks on screen only, as the core's `Document::missing` names them for the rows drawn and through the same `File::prepare` steps printed output uses. The syntax diff, when on, runs on the files on screen after the line diff has painted. When idle, the pool compiles the highlight queries of the languages in the list, then counts every file's lines for the tree: the files on the tree's screen first, then those a screen above and below it, again from wherever the tree scrolls to. Counting takes a thread per core, the UI's included. The threads beyond the pool's own count only while no job waits or runs, and every counting thread stops between files when a job waits. Counts of contents counted before come from the disk cache.
-4. Rendering touches only the rows drawn. A view's position is anchored to a row of a hunk instead of a screen row, so loading a diff, resizing or switching layout never measures a whole file.
+
+   A file with comments has them placed on its diff in the same job, so its threads show with its first frame. When the comments change on a file already loaded, its threads are made again at once from where they were placed, and a placement job runs only when its line comments changed; a placement made before a later change, or on a diff since replaced, is dropped.
+4. Rendering touches only the rows drawn. A view's position is anchored to a row of a hunk instead of a screen row, so loading a diff, resizing or switching layout never measures a whole file; resizing, switching layout or the syntax diff keeps the line at the top there.
 5. Renderer plugins run last, and only when asked. With the rendered view on, a worker sends the file shown to its renderer once its line diff is loaded. The answer's blocks are diffed as units (`diff::unit_hunks`) into an ordinary `document::File` (built by `view::rendered`) that takes the line diff's place. Without a `render` setting, nothing about renderers happens.
 
 ### Printed output
@@ -177,6 +188,7 @@ dffy's own pass, following git 2.43's diffcore-rename:
 - **Highlighting:** a file side is parsed once, and the highlight query runs only over the lines asked for. Queries compile once per language (under 0.1ms to 140ms, Swift's; about 430ms for all), in the background once a file of the language appears in the change list: in the viewer when the pool is idle, one at a time; in print mode when the file is queued, while a core isn't parsing. A parse that comes first compiles the query beside it, as does one of a file known by its `#!` line alone. When both sides are 32KB or more they parse on two threads at once, in print mode only while cores are free. Otherwise they parse one after the other, and the new side is parsed from the old side's tree, so only the lines the diff changed are parsed again; not when either tree has a parse error, as tree-sitter's error recovery can then come out different from a parse from scratch. Sides over 512KB, or whose parse takes over 200ms, stay plain.
 - **Grammars:** Bash, C, C++, C#, CSS, Dockerfile, Elixir, Go, HCL (Terraform), HTML, Java, JavaScript, JSON, Kotlin, Lua, Make, Markdown, PHP, Python, Ruby, Rust, Scala, SQL, Swift, TOML, TSX, TypeScript, XML, YAML and Zig (tree-sitter, bundled). They're about 52MB of the 57MB binary; SQL's alone is about 13MB.
 - **Queries:** each grammar's own highlight query, except HCL's, which dffy writes itself (`crates/dffy-core/src/highlight/queries/hcl/`) as the grammar crate ships none, and Kotlin's, which gets a few patterns appended. Queries written for Neovim compile as they are: `#lua-match?` is read as `#match?`, and `@spell` is ignored.
+- **Scopes:** the viewer's scope line comes from a scope query dffy writes per language (`crates/dffy-core/src/highlight/queries/<language>/scopes.scm`). When a side is parsed for highlighting, one walk of its tree finds its definitions, entering only nodes that span several lines (2 to 7% of the parse's time on Rust), and keeps them sorted by line; each frame looks the top line up by binary search. A side whose spans come from the disk cache has its definitions stored beside them. Scope queries compile in the background with the highlight query, 0.3ms (Go) to 20ms (C++).
 
 ### git access
 
@@ -196,9 +208,18 @@ dffy's own pass, following git 2.43's diffcore-rename:
 `dffyd` shares one watcher per repository between every view, so inotify use depends on how many repositories are watched, whatever the number of views. Each view still runs its own engine.
 
 - **Versions:** the socket name carries the protocol version, so brokers of different versions never talk to each other. Any change to the frame format bumps it.
-- **Lifetime:** the broker exits 60 seconds after its last subscriber, and takes a lock so only one runs per version.
+- **Lifetime:** dffyd exits 60 seconds after its last subscriber and registered view leave, waiting on a condition variable rather than a timer while anyone is there. Each socket has a lock, so one dffyd serves it per version; a dffyd started while another holds one serves the other alone.
 - **Slow subscribers:** each gets its own write queue and is dropped after a one-second stall, so it can't hold up the others or the watcher.
 - **Fallback:** a client that can't reach the broker watches by itself. Printed output and the pager never use it.
+
+### The control API
+
+- **One socket per user**, `control-v<N>.sock`, mode `0600` in the private runtime directory; on Linux each connection's user is checked too.
+- **A view's registration is its connection**, made after the viewer's first frame: closing it, or the viewer dying, unregisters it. dffyd hands requests to the view with ids of its own and passes answers back, adding the view's id.
+- **The viewer's loop** gets each request as `Event::Control`, already parsed, and answers through a writer thread, so it never waits on the socket. A request on a file not diffed yet shows the file and waits for its diff. Comments it's asked to add go through the comments file's write under its lock, as typed ones do.
+- **Subscriptions:** dffyd tells the viewer which events anyone subscribes to. With none, the viewer does nothing per event; with some, it pushes what's there at once, then compares the selection and the top row after each event and pushes 50ms after they stop changing, through the loop's own deadline.
+
+[control.md](control.md) has the protocol.
 
 [watch.md](watch.md) has the user-facing side.
 
@@ -267,12 +288,12 @@ A change that could affect speed or memory is gated A/B against a build of anoth
 
 - **Tiers:** `task perf:quick` counts instructions and allocations only, on every change (Linux). `task perf` adds timing and peak memory, for hot paths or when the quick tier fails. `task perf:full` runs every group before a release.
 - **Baseline:** the commit given with `--rev`, `HEAD~1` unless given, built fresh by every run from a git worktree of that commit. The candidate is the checkout, uncommitted changes included. Each run removes its builds afterwards, keeping only `target/perf/runs/` and `target/perf/layout.tsv`.
-- **What runs:** the divan benchmarks, the `first_frame`, `count_pass` and `first_paint` examples, and dffy printing the kernel range and reading its patch as a pager; the quick tier prints and pages a 421-file subset of the range. Both builds run in every round, alternating which goes first.
+- **What runs:** the divan benchmarks, the `first_frame`, `count_pass` and `first_paint` examples, dffy printing the kernel range and reading its patch as a pager, and the viewer on the range with 300 review threads, timed through `m` and page down; the quick tier prints and pages a 421-file subset of the range, without the viewer timings. Both builds run in every round, alternating which goes first.
 - **Groups:** `perf:quick` and `perf:full` measure every group; `task perf` does too unless `--only` narrows it, e.g. `task perf -- --only frame,print`.
 - **Timing and peak memory:** a metric fails when the candidate is worse consistently across rounds and by more than 1% or the metric's layout band, whichever is larger, or when its instruction count fails.
 - **Instruction counts:** on Linux, user-space instructions are counted too, and a count more than 0.5% above the baseline's fails.
 - **Allocations:** allocation counts and bytes per iteration fail on any increase.
-- **Layout bands:** how far each metric moves between builds with different code layouts, kept in `target/perf/layout.tsv` for every baseline and measured again by `perf:full` when missing or more than 30 days old. `perf` and `perf:quick` never calibrate.
+- **Layout bands:** how far each metric moves between builds with different code layouts, kept in `target/perf/layout.tsv` for every baseline and measured again by `perf:full` when missing or more than 30 days old, or for a group alone when the file has no band for it. `perf` and `perf:quick` never calibrate.
 - **Results:** every run, and `task bench:compare`, writes `results.json` and a summary to `target/perf/runs/<time>/`; `cargo xtask report <run-dir>` prints its tables as markdown.
 
 Published numbers come from the Linux VM above. Layout bands hold only for the machine that measured them.
@@ -324,7 +345,7 @@ A dependency must be an established crate, added only when a few lines can't do 
 | Crate | Direct dependencies |
 |---|---|
 | dffy-core | gix, tree-sitter with 30 grammars, ignore, memchr, rustc-hash, thiserror, objc2 (macOS), rustix (Linux) |
-| dffy | dffy-core, clap (with clap_complete and clap_mangen), rustix, signal-hook, unicode-width |
+| dffy | dffy-core, clap (with clap_complete and clap_mangen), rustix, signal-hook, unicode-width, nix (macOS) |
 | `plugins/markdown` | dffy-render-mermaid, pulldown-cmark, serde_json, unicode-width |
 | `plugins/mermaid` | serde_json, unicode-width |
 | `xtask` | serde_json, portable-pty, vt100 |

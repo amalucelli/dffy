@@ -51,7 +51,7 @@ fn tab(group: Group) -> usize {
         Group::Files => FILES,
         Group::View => 2,
         Group::Copy => 3,
-        Group::Modes | Group::Other => 4,
+        Group::Changes | Group::Modes | Group::Other => 4,
     }
 }
 
@@ -92,7 +92,12 @@ fn rows(keys: &Keys) -> Vec<Row> {
         .iter()
         .flat_map(|&action| {
             [false, true].into_iter().filter_map(move |tree| {
-                let mut chords = keys.chords(tree, action);
+                // A thread's keys and a conflict's show with the diff's:
+                // both are in it.
+                let thread = (keys.thread_chords(action))
+                    .chain(keys.conflict_chords(action))
+                    .filter(move |_| !tree);
+                let mut chords = keys.chords(tree, action).chain(thread);
                 let first = chords.next()?;
                 Some(Row {
                     action,
@@ -303,7 +308,7 @@ impl Help {
         let mut scored: Vec<(i64, Line<'a>)> = rows
             .iter()
             .filter_map(|row| {
-                let on = |text: &str| fuzzy::score_close(&self.filter, text);
+                let on = |text: &str| crate::fuzzy::score_close(&self.filter, text);
                 let typed = [Some(&row.key), row.alias.as_ref()]
                     .into_iter()
                     .flatten()
@@ -591,6 +596,18 @@ mod tests {
         let mut help = Help::default();
         press(&mut help, &keys, "2");
         insta::assert_snapshot!(shown(&mut help, &keys, 100, 20));
+    }
+
+    /// Moving a thread to this branch is a key of its own, listed as any
+    /// other, not one that a focused thread takes over.
+    #[test]
+    fn moving_a_thread_here_is_listed_with_its_key() {
+        let keys = Keys::default();
+        let mut help = Help::default();
+        press(&mut help, &keys, "/move thread");
+        let text = shown(&mut help, &keys, 100, 20);
+        let row = text.lines().find(|l| l.contains("move thread here"));
+        assert!(row.is_some_and(|r| r.contains("V ")), "{text}");
     }
 
     #[test]

@@ -398,11 +398,10 @@ fn reap(child: &mut Child) -> std::io::Result<Option<ExitStatus>> {
     Ok(status)
 }
 
-/// Runs `command`, a plugin, on `input` within `timeout`, and returns what
-/// it printed and how it exited. `command` puts the plugin in a process
-/// group of its own, which is killed with it: a renderer through
-/// `process_group`, a review plugin through `setsid`, which a process
-/// already leading a group can't call.
+/// Runs `command`, a renderer, on `input` within `timeout`, and returns
+/// what it printed and how it exited. `command` puts the renderer in a
+/// process group of its own, through `process_group`, which is killed with
+/// it.
 fn run(
     mut command: Command,
     input: Vec<u8>,

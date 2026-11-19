@@ -36,9 +36,9 @@ Two files or folders compared outside git (`dffy old/ new/`, see [usage.md](usag
 
 ## dffyd
 
-Every dffy viewer that watches the same repository shares one watcher, held by a per-user process called `dffyd` (the same binary, run as `dffy daemon run`). A repository then costs one set of [inotify watches](#linux-the-inotify-limit) however many views watch it.
+Every dffy viewer that watches the same repository shares one watcher, held by a per-user process called `dffyd` (the same binary, run as `dffy daemon run`). A repository then costs one set of [inotify watches](#linux-the-inotify-limit) however many views watch it. dffyd also serves the [control API](control.md), which every viewer registers with.
 
-- The first watching viewer starts it, with nothing to set up. It exits a minute after its last viewer stops watching.
+- The first viewer starts it, with nothing to set up. It exits a minute after its last viewer stops watching and exits.
 - **Socket:** `$XDG_RUNTIME_DIR/dffy/broker-v<N>.sock`, or `$TMPDIR/dffy-<uid>/` when `XDG_RUNTIME_DIR` isn't set. The directory must belong to you and be closed to everyone else (mode `0700`). If it isn't, for instance because another user created `/tmp/dffy-<uid>` first, dffy doesn't use the broker: each viewer watches by itself and the status bar says why.
 - **Versions:** `<N>` is the protocol version, so dffy only talks to a broker that speaks its protocol. After an upgrade, old and new brokers run side by side until the old one goes idle.
 - **Fallback:** if the broker can't be started or reached, or goes away, each viewer watches by itself, with a note in the status bar. A viewer the broker can't keep up with is dropped and watches by itself too.
@@ -55,7 +55,7 @@ $ dffy daemon stop
 stopped dffyd (pid 2048555)
 ```
 
-`dffy daemon stop` is for debugging. Viewers that were watching through it carry on by themselves, and the next watching viewer starts a new broker.
+`dffy daemon stop` is for debugging. Viewers that were watching through it carry on by themselves, and the next watching viewer starts a new broker. Viewers registered with the control API before can't be driven until they're started again.
 
 `dffy doctor` also reports:
 

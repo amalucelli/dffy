@@ -1,0 +1,17 @@
+---
+source: crates/dffy/tests/mcp.rs
+expression: "snapshot(&[file.raw_structured(), file.text().to_owned()])"
+---
+{"header":{"type":"header","version":1,"old":{"kind":"tree","id":"3c7dcae4d2474c9ab3cca259da3f74f76e7cc041"},"new":{"kind":"tree","id":"999d2ed097b841160702f909a1516b735d182f99"},"untracked":false,"revisions":["main~1","main"],"paths":[],"options":{"context":3,"whitespace":"exact","syntax":false,"renames":true,"highlights":false,"summary":false}},"file":{"type":"file","path":"lib.rs","old_path":"lib.rs","status":"modified","similarity":null,"old_mode":"100644","new_mode":"100644","binary":false,"too_large":false,"language":"rust","added":1,"removed":1,"syntax":null,"classification":null,"note":null,"annotations":[{"id":"a1","source":"comments","side":"new","start":1,"end":1,"lost":false,"thread":[{"id":"a1","path":"lib.rs","side":"new","start":{"old":null,"new":1},"end":{"old":null,"new":1},"text":"Why i64?","author":"ada","created":"2024-03-01T12:00:00Z","resolved":false,"anchor":{"before":[],"lines":["pub fn add(a: i64, b: i64) -> i64 {"],"after":[]}},{"id":"a2","path":"lib.rs","text":"It overflowed.\nTwice.","author":"","created":"2024-03-02T12:00:00Z","in_reply_to":"a1","resolved":false}]}],"hunks":[{"old_start":1,"old_lines":3,"new_start":1,"new_lines":3,"heading":null,"lines":[{"kind":"removed","mark":"modified","old":1,"new":null,"text":"pub fn add(a: i32, b: i32) -> i32 {","emphasis":[[14,17],[22,25],[30,33]]},{"kind":"added","mark":"modified","old":null,"new":1,"text":"pub fn add(a: i64, b: i64) -> i64 {","emphasis":[[14,17],[22,25],[30,33]]},{"kind":"context","old":2,"new":2,"text":"    a + b"},{"kind":"context","old":3,"new":3,"text":"}"}]}]},"truncated":false,"remaining_lines":0,"next_cursor":null}
+--
+M lib.rs +1 -1
+@@ -1,3 +1,3 @@
+- pub fn add(a: i32, b: i32) -> i32 {
++ pub fn add(a: i64, b: i64) -> i64 {
+      a + b
+  }
+comments:
+  a1 on new line 1:
+    ada, 2024-03-01T12:00:00Z: Why i64?
+    you, 2024-03-02T12:00:00Z: It overflowed.
+      Twice.

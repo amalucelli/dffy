@@ -17,7 +17,7 @@
 ✓ theme       default
 ✓ pager       less -RFX
 ✓ cache       /home/me/.cache/dffy: 12.0MB in 40 entries, trimmed at 256.0MB
-· dffyd       not running; the first dffy --watch starts it
+· dffyd       not running; the first viewer starts it
 ```
 
 | Mark | Meaning |
@@ -78,14 +78,14 @@ A broker outlives rebuilds and reinstalls, so an old one keeps running old code.
 - **Terminals:** some ask before letting a program write the clipboard, some turn it off by default and some don't support it. Look for a clipboard or OSC 52 setting in the terminal's configuration.
 - **Size:** terminals cap the sequence at different lengths, so dffy refuses copies over 75KB with a note instead of cutting them short.
 
-Copies hold the code only. `copy-decorations = true` (or `D` in the command panel) adds line numbers and `+`/`-` signs.
+Copies hold the code only. `copy-decorations = true` (or `G` in the command panel) adds line numbers and `+`/`-` signs.
 
 ## Mouse or native selection
 
 dffy takes mouse input for clicks, the wheel, and drags that select and copy code. While it does, the terminal's own selection doesn't work. To get it back:
 
 - Hold `shift` while dragging. Many terminals select natively then, whatever the program asks for.
-- Press `space` then `M` to hand the mouse to the terminal, and the same again to take it back. `mouse = false` in the config starts with it off.
+- Press `space` then `$` to hand the mouse to the terminal, and the same again to take it back. `mouse = false` in the config starts with it off.
 
 ## Colors
 

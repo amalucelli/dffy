@@ -13,6 +13,7 @@
 //! dropping patterns dffy doesn't draw saves little.
 
 mod lang;
+mod scope;
 
 use std::ops::{ControlFlow, Range};
 use std::time::{Duration, Instant};
@@ -21,6 +22,7 @@ use rustc_hash::FxHashMap;
 use tree_sitter::{InputEdit, Parser, Point, Query, QueryCursor, StreamingIterator, Tree};
 
 pub use lang::{Grammar, Language, LanguageSource, Registry, Words};
+pub use scope::Scopes;
 
 use crate::cache::{self, Cache};
 use crate::diff::{Emphasis, Hunk, LineKind, Text, emphasize_with};
@@ -314,6 +316,13 @@ impl Parsed {
 }
 
 impl Parsed {
+    /// The definitions of `text`, the text this was parsed from; `None`
+    /// when its language has no scope query.
+    #[must_use]
+    pub fn scopes(&self, text: &Text) -> Option<Scopes> {
+        Some(scope::extract(self.lang.scope_query()?, &self.tree, text))
+    }
+
     /// Syntax runs and leaf tokens for `lines` of `text`, which must be the
     /// text this was parsed from.
     #[must_use]
@@ -530,12 +539,15 @@ pub struct Source<'a> {
 ///
 /// Whole-file spans are cached for sides of at least [`CACHE_MIN_BYTES`]
 /// with a known blob id: below that the parse is cheap, and computing the
-/// whole file to store it would cost more than the visible lines.
+/// whole file to store it would cost more than the visible lines. The
+/// side's definitions are cached with them, as there's no tree to find
+/// them in after a hit.
 pub enum Highlighter {
     /// Parsed now; each request queries only the lines it asks for.
     Tree(Parsed),
-    /// Every line's spans, from the cache or computed to store there.
-    Cached(Spans),
+    /// Every line's spans, from the cache or computed to store there, and
+    /// the definitions (see [`Parsed::scopes`]).
+    Cached(Spans, Option<Scopes>),
 }
 
 impl Highlighter {
@@ -552,7 +564,7 @@ impl Highlighter {
         store: bool,
     ) -> Option<Self> {
         match Self::lookup(lang, text, id, cache)? {
-            Lookup::Hit(spans) => Some(Self::Cached(spans)),
+            Lookup::Hit(spans, scopes) => Some(Self::Cached(spans, scopes)),
             Lookup::Miss(key) => Some(Self::finish(parse(lang, text.bytes())?, text, key, store)),
         }
     }
@@ -573,12 +585,12 @@ impl Highlighter {
             .filter(|_| bytes.len() >= CACHE_MIN_BYTES)
             .and_then(|id| Some((cache?, cache_key(lang, id))));
         if let Some((cache, key)) = &key
-            && let Some(spans) = cache
+            && let Some((spans, scopes)) = cache
                 .get(cache::Kind::Highlight, key)
-                .and_then(|b| Spans::decode(&b))
+                .and_then(|b| decode_entry(&b))
             && spans.lines() == (0..text.len())
         {
-            return Some(Lookup::Hit(spans));
+            return Some(Lookup::Hit(spans, scopes));
         }
         Some(Lookup::Miss(key))
     }
@@ -589,8 +601,13 @@ impl Highlighter {
         match key {
             Some((cache, key)) if store => {
                 let spans = parsed.spans(text, 0..text.len());
-                cache.put(cache::Kind::Highlight, &key, &spans.encode());
-                Self::Cached(spans)
+                let scopes = parsed.scopes(text);
+                cache.put(
+                    cache::Kind::Highlight,
+                    &key,
+                    &encode_entry(&spans, scopes.as_ref()),
+                );
+                Self::Cached(spans, scopes)
             }
             _ => Self::Tree(parsed),
         }
@@ -628,7 +645,7 @@ impl Highlighter {
             return None;
         }
         let key = match Self::lookup(lang, new.text, new.id, cache)? {
-            Lookup::Hit(spans) => return Some(Self::Cached(spans)),
+            Lookup::Hit(spans, scopes) => return Some(Self::Cached(spans, scopes)),
             Lookup::Miss(key) => key,
         };
         let parsed = match old {
@@ -654,23 +671,49 @@ impl Highlighter {
     pub fn spans(&self, text: &Text, lines: Range<usize>) -> Spans {
         match self {
             Self::Tree(parsed) => parsed.spans(text, lines),
-            Self::Cached(spans) => spans.slice(text, lines),
+            Self::Cached(spans, _) => spans.slice(text, lines),
         }
     }
 }
 
-/// A side's whole-file spans from the cache, or on a miss the entry a
-/// parse may fill.
+/// A side's whole-file spans and definitions from the cache, or on a miss
+/// the entry a parse may fill.
 enum Lookup<'c> {
-    Hit(Spans),
+    Hit(Spans, Option<Scopes>),
     Miss(Option<(&'c Cache, Vec<u8>)>),
 }
 
 /// The version of what cached spans mean: bump it when [`role`] maps
-/// names differently, [`Compiled::new`] reads queries differently or
-/// [`Spans`] change shape. Renumbering [`Syntax`] changes the key by
-/// itself.
-const SPANS_VERSION: u8 = 2;
+/// names differently, [`Compiled::new`] reads queries differently, or
+/// [`Spans`], [`Scopes`] or labels change shape. Renumbering [`Syntax`]
+/// changes the key by itself.
+const SPANS_VERSION: u8 = 3;
+
+/// A cache entry: the spans' length and form, then the definitions' form
+/// when the language has a scope query.
+fn encode_entry(spans: &Spans, scopes: Option<&Scopes>) -> Vec<u8> {
+    let spans = spans.encode();
+    let mut out = Vec::with_capacity(spans.len() + 8);
+    cache::put_varint(&mut out, spans.len() as u64);
+    out.extend_from_slice(&spans);
+    if let Some(scopes) = scopes {
+        scopes.encode(&mut out);
+    }
+    out
+}
+
+/// Reads [`encode_entry`]'s form; `None` if it's malformed.
+fn decode_entry(bytes: &[u8]) -> Option<(Spans, Option<Scopes>)> {
+    let mut input = bytes;
+    let len = usize::try_from(cache::get_varint(&mut input)?).ok()?;
+    let spans = Spans::decode(input.get(..len)?)?;
+    let mut rest = &input[len..];
+    if rest.is_empty() {
+        return Some((spans, None));
+    }
+    let scopes = Scopes::decode(&mut rest)?;
+    rest.is_empty().then_some((spans, Some(scopes)))
+}
 
 /// What a cached whole-file highlight depends on: the content, the
 /// language's [`Language::identity`], and how captures become [`Syntax`]
@@ -688,10 +731,20 @@ fn cache_key(lang: &Language, id: ObjectId) -> Vec<u8> {
 }
 
 /// The two sides of a file, prepared for highlighting where its language
-/// is known and each side is small enough.
+/// is known and each side is small enough, with each side's definitions
+/// where its language has a scope query.
 pub struct FileSyntax {
     old: Option<Highlighter>,
     new: Option<Highlighter>,
+    scopes: [Option<Scopes>; 2],
+}
+
+/// `h`'s definitions, taken out of it when they came from the cache.
+fn take_scopes(h: Option<&mut Highlighter>, text: &Text) -> Option<Scopes> {
+    match h? {
+        Highlighter::Tree(parsed) => parsed.scopes(text),
+        Highlighter::Cached(_, scopes) => scopes.take(),
+    }
 }
 
 impl FileSyntax {
@@ -700,7 +753,8 @@ impl FileSyntax {
     /// [`PARALLEL_PARSE_BYTES`], otherwise one after the other, the new
     /// side from the old side's tree (see [`Highlighter::after`]; `hunks`
     /// are the line diff's). With `store`, large sides' spans go to `cache`
-    /// (see [`Highlighter::prepare`]).
+    /// (see [`Highlighter::prepare`]). Each side's definitions are found
+    /// in its tree right after its parse, or come with its cached spans.
     #[must_use]
     pub fn new(
         grammars: &Registry,
@@ -710,25 +764,47 @@ impl FileSyntax {
         store: bool,
     ) -> Self {
         if old.text.bytes().len().min(new.text.bytes().len()) < PARALLEL_PARSE_BYTES {
-            let old_h = Highlighter::for_side(grammars, old, cache, store);
+            let mut old_h = Highlighter::for_side(grammars, old, cache, store);
             let seed = old_h.as_ref().map(|h| (h, old.text, hunks));
-            let new = Highlighter::after(grammars, new, seed, cache, store);
-            return Self { old: old_h, new };
+            let mut new_h = Highlighter::after(grammars, new, seed, cache, store);
+            let scopes = [
+                take_scopes(old_h.as_mut(), old.text),
+                take_scopes(new_h.as_mut(), new.text),
+            ];
+            return Self {
+                old: old_h,
+                new: new_h,
+                scopes,
+            };
         }
-        let old = || Highlighter::for_side(grammars, old, cache, store);
-        let new = || Highlighter::for_side(grammars, new, cache, store);
+        let side = |side: Source| {
+            let mut h = Highlighter::for_side(grammars, side, cache, store);
+            let scopes = take_scopes(h.as_mut(), side.text);
+            (h, scopes)
+        };
         std::thread::scope(|s| {
-            let spawned = std::thread::Builder::new().spawn_scoped(s, old);
-            let new = new();
-            let old = match spawned {
+            let spawned = std::thread::Builder::new().spawn_scoped(s, || side(old));
+            let (new, new_scopes) = side(new);
+            let (old, old_scopes) = match spawned {
                 Ok(spawned) => spawned
                     .join()
                     .unwrap_or_else(|e| std::panic::resume_unwind(e)),
                 // Out of threads: parse here, as `Scope::spawn` would panic.
-                Err(_) => old(),
+                Err(_) => side(old),
             };
-            Self { old, new }
+            Self {
+                old,
+                new,
+                scopes: [old_scopes, new_scopes],
+            }
         })
+    }
+
+    /// The old and new side's definitions, for a side whose language has
+    /// a scope query.
+    #[must_use]
+    pub fn scopes(&self) -> [Option<&Scopes>; 2] {
+        [self.scopes[0].as_ref(), self.scopes[1].as_ref()]
     }
 
     /// Neither side is highlighted.

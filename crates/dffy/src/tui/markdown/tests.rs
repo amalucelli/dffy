@@ -184,22 +184,6 @@ fn a_box_narrower_than_its_indentation_still_wraps() {
     assert_eq!(rows[1], "│ │     e");
 }
 
-/// A folded thread's line: the first line of text, past HTML comments and
-/// without its markup.
-#[test]
-fn summaries_are_the_first_line_of_text() {
-    assert_eq!(
-        summary("<!-- cr-status -->\n<!-- cr-state\n{} -->\n\n@ana **Needs changes** at x.\nmore"),
-        "@ana Needs changes at x."
-    );
-    assert_eq!(summary("## Title\n\nbody"), "Title");
-    assert_eq!(summary("- [x] Feature\n- [ ] Bug"), "☑ Feature");
-    assert_eq!(summary("```rust\nfn main() {}\n```"), "fn main() {}");
-    assert_eq!(summary("plain\r\nsecond"), "plain");
-    assert_eq!(summary("a\u{1b}[31m"), "a^[[31m");
-    assert_eq!(summary("<!-- nothing else -->"), "");
-}
-
 const REVIEW: &str = "<!-- cr-status -->\n\n## Needs changes\n\n\
 @ana **two blockers** at `03f1ba`, see [the guide](https://example.com/guide):\n\n\
 - [x] tests pass\n- [ ] `scope.ts:382` reads every project\n\n\

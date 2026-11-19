@@ -34,11 +34,14 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use dffy_core::bstr::{BString, ByteSlice};
+use dffy_core::conflict::Choices;
 use dffy_core::diff::Options;
-use dffy_core::git::{ChangeSet, FileChange, Repo, Revisions, Update};
+use dffy_core::git::{
+    Applied, ChangeSet, DiffSpec, Edit, FileChange, FileDiff, Picked, Repo, Revisions, Update,
+};
 use dffy_core::watch::{Change, Notice, Plain, Root, Watcher};
 
-pub(crate) use app::{Action, App};
+pub(crate) use app::{Action, App, Uncommitted};
 pub(crate) use worker::Done;
 
 use crate::daemon::client::{self, Subscription};
@@ -50,6 +53,7 @@ use crate::state;
 use crate::term::{self, Input, Reader, Signal, Tty};
 use crate::theme::{BUILTIN, Role, Theme};
 use crate::{Ctx, Error};
+use dffy_core::cache::Cache;
 use worker::Request;
 
 pub(crate) enum Event {
@@ -74,17 +78,46 @@ pub(crate) enum Event {
     Others(Option<print::Others>),
     /// A comments file may have changed on disk.
     Comments,
-    /// A review plugin's run `id` said this.
+    /// The branch comments are written on now, as read when git's state
+    /// changed: HEAD moved to another, or detached (`None`).
+    Branch(Option<String>),
+    /// Lines were staged, unstaged or discarded, or a file added, as the
+    /// note says, or why not.
+    Edited(Result<String, String>),
+    /// What discarding `picked` lines of `diff` would take, or why it
+    /// can't.
+    Planned {
+        diff: Arc<FileDiff>,
+        picked: Picked,
+        result: Result<Applied, String>,
+    },
+    /// The conflicted file `path` was written as its choices resolve it,
+    /// with how many conflicts kept their markers, or why not.
+    Resolved {
+        path: BString,
+        result: Result<usize, String>,
+    },
+    /// The review plugin's request `id` said this.
     Review {
         id: u64,
         said: Said,
     },
+    /// The review plugin said this on its own.
+    ReviewPush(review::Push),
     /// How many commits a review's update moved its head by, when git
     /// could tell.
     ReviewMoved(Option<usize>),
-    /// The review plugin's description, asked for after the first frame;
-    /// `None` when it can't describe itself.
+    /// Git says the head of your last review, `last`, isn't an ancestor of
+    /// the review's `head`, as after a rebase.
+    ReviewRebased {
+        last: String,
+        head: String,
+    },
+    /// The review plugin's naming, asked for after the first frame; `None`
+    /// when it can't initialize.
     Described(Option<review::Described>),
+    /// A request from the control API, or what's subscribed to now.
+    Control(crate::control::viewer::Inbound),
     /// Nothing happened before the app's deadline.
     Tick,
 }
@@ -92,6 +125,9 @@ pub(crate) enum Event {
 /// Events handled in one go before drawing, at most; a burst (thousands
 /// of files from the enumeration) still gets frames out.
 const BATCH_TIME: Duration = Duration::from_millis(8);
+
+/// Why a git operation on the working tree can't run.
+const NO_WORKTREE: &str = "there's no working tree to change";
 
 /// The theme the TUI draws with: attributes only when color is off, since
 /// the grid has no "plain" mode the way print output does.
@@ -118,22 +154,24 @@ fn prepare(app: &mut App, ctx: &Ctx) {
 
 /// How the review plugin's command (`dffy pr`) starts the viewer.
 pub(crate) enum ReviewStart {
-    /// On the review whose `prepare` printed `session` and goes on as
-    /// `run`, saying the rest on `rest`.
+    /// On the review whose `prepare`, a request of `client`'s, named
+    /// `session` and goes on as `run`, saying the rest on `rest`.
     Open {
         plugin: String,
-        session: review::Session,
+        client: review::Plugin,
+        session: Box<review::Session>,
         run: review::Run,
         rest: mpsc::Receiver<Said>,
     },
     /// With the picker of `reviews` open, for a branch without a review.
     Pick {
         plugin: String,
+        client: review::Plugin,
         reviews: Vec<Listed>,
     },
-    /// Plain `dffy` on a branch: the review plugin, once it has described
-    /// itself, looks for the branch's review, whose comments and status
-    /// join what the viewer shows, if there's one.
+    /// Plain `dffy` on a branch: the review plugin, once it has initialized,
+    /// looks for the branch's review, whose comments and status join what
+    /// the viewer shows, if there's one.
     Detect,
 }
 
@@ -175,6 +213,17 @@ pub(crate) fn run(
         ))
     });
     let (repo, selected, paths) = (plan.repo.clone(), revisions.clone(), plan.paths.clone());
+    // A view of a working tree registers for the control API; one of paths
+    // compared outside git has no repository to be found by.
+    let register = repo
+        .workdir()
+        .zip(repo.common_dir())
+        .map(|(worktree, shared)| crate::control::viewer::Info {
+            worktree: worktree.to_owned(),
+            repository: shared.to_owned(),
+            diff: description.clone(),
+        });
+    let uncommitted = uncommitted(&plan.spec, &revisions, plan.reverse);
     let mut set = ChangeSet::new(plan.repo, plan.spec, revisions, &plan.paths, plan.reverse);
     if ctx.config.renames {
         set = set.with_renames(ctx.cache.clone());
@@ -232,6 +281,7 @@ pub(crate) fn run(
         app.set_naming(described.as_ref().ok().map(|d| d.naming.clone()));
     }
     app.set_selected(selected, ctx.config.default_diff);
+    app.set_uncommitted(uncommitted);
     app.set_repository(
         repo.workdir()
             .and_then(Path::file_name)
@@ -249,28 +299,14 @@ pub(crate) fn run(
     if let Some(focus) = focus {
         app.focus(focus);
     }
-    // Absolute: review plugins get it, and run from the working tree's root.
-    let absolute = |path: PathBuf| std::path::absolute(&path).unwrap_or(path);
-    // A local file that can't be had, as when moving an old one failed,
-    // leaves the viewer without it rather than without the diff.
-    let default = crate::review::local_file(&repo).unwrap_or_else(|e| {
-        app.message(format!("no local comments: {e}"));
-        None
-    });
-    let comments = ctx
-        .comments
-        .clone()
-        .or_else(|| default.clone())
-        .map(absolute);
-    // `dffy pr` reads the review's file; plain `dffy`'s is the local review's.
-    let local = match &start {
-        Some(ReviewStart::Open { .. }) => default.map(absolute),
-        _ => comments.clone(),
+    let unread = Unread {
+        given: ctx.comments.clone(),
+        review: matches!(start, Some(ReviewStart::Open { .. })),
     };
-    app.set_local_comments(local);
     let mut review_run = None;
     let mut detect = None;
     let mut detect_described = false;
+    let mut client = None;
     match start {
         Some(ReviewStart::Detect) => match described {
             Some(Ok(d)) => detect = Some(app.detect_review(d.program.name.clone())),
@@ -279,11 +315,14 @@ pub(crate) fn run(
         },
         Some(ReviewStart::Open {
             plugin,
+            client: running,
             session,
             run,
             rest,
         }) => {
-            let id = app.start_review(plugin, session);
+            running.watch(Some(&session.id));
+            client = Some(running);
+            let id = app.start_review(plugin, *session);
             let events = tx.clone();
             std::thread::Builder::new()
                 .name("dffy-review-rest".into())
@@ -296,8 +335,19 @@ pub(crate) fn run(
                 })?;
             review_run = Some(run);
         }
-        Some(ReviewStart::Pick { plugin, reviews }) => app.pick_review(plugin, reviews),
+        Some(ReviewStart::Pick {
+            plugin,
+            client: running,
+            reviews,
+        }) => {
+            client = Some(running);
+            app.pick_review(plugin, reviews);
+        }
         None => {}
+    }
+    if let Some(client) = &client {
+        let events = tx.clone();
+        client.on_push(move |push| events.send(Event::ReviewPush(push)).is_ok());
     }
 
     state::flush_on_panic();
@@ -305,13 +355,14 @@ pub(crate) fn run(
     term::install_panic_hook();
     let mut session = Session {
         watching: None,
-        unread: comments,
-        describe: (ctx.review_name.clone())
-            .filter(|_| described.is_none())
-            .map(|name| (name, ctx.cache.clone())),
+        unread: Some(unread),
+        describe: described.is_none() && ctx.review_name.is_some(),
         detect,
         detect_described,
         review_run,
+        plugin: client,
+        review_name: ctx.review_name.clone(),
+        cache: ctx.cache.clone(),
         tty,
         reader: None,
         pool: &pool,
@@ -325,6 +376,8 @@ pub(crate) fn run(
         watch: None,
         tmux_clipboard: std::cell::OnceCell::new(),
         gate: None,
+        register,
+        control: None,
     };
     if watch {
         app.set_watching(true);
@@ -334,7 +387,7 @@ pub(crate) fn run(
     term::restore();
     // Off the alternate screen, so it stays once the viewer is gone.
     if let Some(note) = app.unposted_note() {
-        eprintln!("{note}");
+        eprintln!("{}", escape(note.as_bytes()));
     }
     result?;
     Ok(ExitCode::SUCCESS)
@@ -359,6 +412,20 @@ fn open_comments(repo: &Repo) -> Option<String> {
     (open > 0).then(|| {
         format!(" · {open} open comment{s} · dffy comments lists them, dffy HEAD~1.. shows them")
     })
+}
+
+/// Which uncommitted changes `spec` lists, if it lists them as plain `dffy`,
+/// `--staged` or `--unstaged` do: the diffs whose lines can be staged.
+fn uncommitted(spec: &DiffSpec, revisions: &Revisions, reverse: bool) -> Option<Uncommitted> {
+    if reverse || !revisions.revs.is_empty() || revisions.merge_base {
+        return None;
+    }
+    match spec {
+        DiffSpec::Uncommitted { .. } => Some(Uncommitted::Plain),
+        DiffSpec::IndexToWorktree { .. } => Some(Uncommitted::Unstaged),
+        DiffSpec::TreeToIndex { .. } => Some(Uncommitted::Staged),
+        DiffSpec::TreeToWorktree { .. } | DiffSpec::TreeToTree { .. } | DiffSpec::Paths => None,
+    }
 }
 
 /// Runs the viewer on `tty` for the diff arriving on `stdin`, read only as
@@ -399,10 +466,13 @@ pub(crate) fn run_piped(tty: &Tty, stdin: Stdin, ctx: &Ctx) -> Result<ExitCode, 
     let mut session = Session {
         watching: None,
         unread: None,
-        describe: None,
+        describe: false,
         detect: None,
         detect_described: false,
         review_run: None,
+        plugin: None,
+        review_name: None,
+        cache: None,
         tty,
         reader: None,
         pool: &pool,
@@ -416,6 +486,8 @@ pub(crate) fn run_piped(tty: &Tty, stdin: Stdin, ctx: &Ctx) -> Result<ExitCode, 
         watch: None,
         tmux_clipboard: std::cell::OnceCell::new(),
         gate: Some(gate),
+        register: None,
+        control: None,
     };
     let result = session.interact(&mut app, tx, &rx);
     term::restore();
@@ -465,12 +537,23 @@ fn watch_comments(
 /// it leaves the review half sent until the next post.
 const POST_GRACE: Duration = Duration::from_secs(30);
 
-/// A signal or the terminal going away stops the viewer: the text box's
-/// text is saved, and a post running may end first, for up to
-/// [`POST_GRACE`], taking only what review plugins say. The terminal may
-/// be gone, so nothing is drawn.
-fn stop(app: &mut App, rx: &mpsc::Receiver<Event>) {
+/// A signal or the terminal going away stops the viewer: a post running
+/// is cancelled, as the second `q` does, and may end first (see
+/// [`finish_post`]); then the text box's text and the post dialog's
+/// summary are saved. The terminal may be gone, so nothing is drawn.
+fn stop(app: &mut App, run: Option<&review::Run>, rx: &mpsc::Receiver<Event>) {
+    if app.posting_now()
+        && let Some(run) = run
+    {
+        run.cancel();
+    }
+    finish_post(app, rx);
     app.interrupted();
+}
+
+/// Waits for the post running, if any, to end, for up to [`POST_GRACE`],
+/// taking only what review plugins say: its refs are written as it ends.
+fn finish_post(app: &mut App, rx: &mpsc::Receiver<Event>) {
     let until = Instant::now() + POST_GRACE;
     while app.posting_now() {
         match rx.recv_timeout(until.saturating_duration_since(Instant::now())) {
@@ -594,25 +677,42 @@ fn route_compared(
     requests.send(request).is_ok()
 }
 
+/// What the viewer's comments files are found from.
+struct Unread {
+    /// `--comments`.
+    given: Option<PathBuf>,
+    /// The viewer opens on a review, whose file it reads instead, the
+    /// local review's showing its drafts on it.
+    review: bool,
+}
+
 struct Session<'a> {
     /// The comments files' watches, one per file, as the thread starting
     /// them returns them; see [`watch_comments`]. Never joined: dropping the
     /// handle drops the watches once the thread ends, which stops them.
     watching: Option<JoinHandle<Vec<Watcher>>>,
-    /// The comments file, read and watched only once the first frame is
-    /// out: its parse and the watch thread aren't the first frame's.
-    unread: Option<PathBuf>,
-    /// The review plugin and the cache, for its description, asked for on
-    /// a thread once the first frame is out; see [`Event::Described`].
-    describe: Option<(String, Option<dffy_core::cache::Cache>)>,
-    /// The `detect` run for the branch's review, started once the first
-    /// frame is out: spawning the plugin takes a fork and exec.
+    /// What the comments files are found from, found, read and watched
+    /// only once the first frame is out: finding the local review's file
+    /// may move it, and its parse and the watch thread aren't the first
+    /// frame's either.
+    unread: Option<Unread>,
+    /// The review plugin's naming is still to be asked for, once the first
+    /// frame is out; see [`Event::Described`].
+    describe: bool,
+    /// The `detect` request for the branch's review, made once the first
+    /// frame is out: starting the plugin takes a fork and exec.
     detect: Option<Action>,
-    /// Plain `dffy` on a branch waits for the description to `detect`: a
-    /// plugin that can't describe itself isn't asked.
+    /// Plain `dffy` on a branch waits for the plugin to initialize to
+    /// `detect`: a plugin that can't isn't asked.
     detect_described: bool,
-    /// The last `prepare`, `pull` or `post` started.
+    /// The last `prepare`, `pull` or `post` made.
     review_run: Option<review::Run>,
+    /// The review plugin's process, started on first use, for the viewer's
+    /// life.
+    plugin: Option<review::Plugin>,
+    /// The review plugin set, and the cache its naming goes in.
+    review_name: Option<String>,
+    cache: Option<Cache>,
     tty: &'a Tty,
     reader: Option<Reader>,
     pool: &'a worker::Pool,
@@ -635,6 +735,11 @@ struct Session<'a> {
     tmux_clipboard: std::cell::OnceCell<Option<String>>,
     /// How far a piped diff's parser may read.
     gate: Option<Arc<piped::Gate>>,
+    /// What the view registers as for the control API, once the first
+    /// frame is out; `None` once it did, and for a view that doesn't.
+    register: Option<crate::control::viewer::Info>,
+    /// The registration, for the viewer's life.
+    control: Option<crate::control::viewer::Registration>,
 }
 
 impl Session<'_> {
@@ -670,6 +775,9 @@ impl Session<'_> {
             Signal::Interrupt => tx.send(Event::Interrupt).is_ok(),
         })?;
         let result = self.run(app, rx);
+        if let Some(plugin) = &self.plugin {
+            plugin.close();
+        }
         crate::plugin::stop_all();
         let remembered = app.take_remembered(true);
         if !remembered.is_empty() {
@@ -739,34 +847,67 @@ impl Session<'_> {
     }
 
     /// Starts what waits for a frame to be out: the review plugin's
-    /// description, the comments file and its watch, and `detect`.
+    /// naming, the comments file and its watch, `detect`, and the control
+    /// API's registration.
     fn start_deferred(&mut self, app: &mut App) -> io::Result<()> {
-        if let Some((name, cache)) = self.describe.take() {
+        if let Some(info) = self.register.take() {
             let events = self.events.clone();
-            std::thread::Builder::new()
-                .name("dffy-review-describe".into())
-                .spawn(move || {
-                    let described = crate::describe_review(&name, cache.as_ref());
-                    events.send(Event::Described(described.ok())).ok();
-                })?;
+            let registered = crate::control::viewer::register(info, move |inbound| {
+                events.send(Event::Control(inbound)).is_ok()
+            });
+            match registered {
+                Ok(registration) => self.control = Some(registration),
+                Err(e) => app.message(format!("dffy ctl can't reach this viewer: {e}")),
+            }
         }
-        if let Some(path) = self.unread.take() {
-            // HEAD is read here, after the first frame, once.
-            app.set_branch(self.files.as_ref().and_then(crate::review::current_branch));
-            let files = app.comment_files(path.clone());
-            app.set_comments(path);
-            self.watching = watch_comments(files, self.events.clone());
-            self.point_session(app);
+        if std::mem::take(&mut self.describe) {
+            // `detect` needs the plugin running anyway, so it's the one
+            // asked; otherwise the cache, else a plugin started for it
+            // alone, answers.
+            if self.detect_described {
+                self.plugin().ok();
+            } else if let Some(name) = self.review_name.clone() {
+                let (events, cache) = (self.events.clone(), self.cache.clone());
+                std::thread::Builder::new()
+                    .name("dffy-review-describe".into())
+                    .spawn(move || {
+                        let described = crate::describe_review(&name, cache.as_ref(), false);
+                        events.send(Event::Described(described.ok())).ok();
+                    })?;
+            }
         }
-        if let Some(Action::Plugin {
-            id,
-            plugin,
-            args,
-            comments,
-            summary,
-        }) = self.detect.take()
-        {
-            self.plugin(id, &plugin, args, comments.as_deref(), summary);
+        if let Some(unread) = self.unread.take() {
+            // A local file that can't be had, as when moving an old one
+            // failed, leaves the viewer without it rather than without the
+            // diff.
+            let default = match self.files.as_ref().map(crate::review::local_file) {
+                Some(Ok(file)) => file,
+                Some(Err(e)) => {
+                    app.message(format!("no local comments: {e}"));
+                    None
+                }
+                None => None,
+            };
+            // Absolute: review plugins get it, and run from the working
+            // tree's root.
+            let absolute = |path: PathBuf| std::path::absolute(&path).unwrap_or(path);
+            let comments = unread.given.or_else(|| default.clone()).map(absolute);
+            app.set_local_comments(if unread.review {
+                default.map(absolute)
+            } else {
+                comments.clone()
+            });
+            if let Some(path) = comments {
+                // HEAD is read here, after the first frame, once.
+                app.set_branch(self.files.as_ref().and_then(crate::review::current_branch));
+                let files = app.comment_files(path.clone());
+                app.set_comments(path);
+                self.watching = watch_comments(files, self.events.clone());
+                self.point_session(app);
+            }
+        }
+        if let Some(Action::Review { id, request }) = self.detect.take() {
+            self.request(id, &request);
         }
         Ok(())
     }
@@ -774,7 +915,11 @@ impl Session<'_> {
     fn run(&mut self, app: &mut App, rx: &mpsc::Receiver<Event>) -> io::Result<()> {
         loop {
             self.paint(app)?;
-            if self.unread.is_some() || self.describe.is_some() || self.detect.is_some() {
+            if self.unread.is_some()
+                || self.describe
+                || self.detect.is_some()
+                || self.register.is_some()
+            {
                 self.start_deferred(app)?;
                 // The threads they placed and the jobs they want go out
                 // before the loop waits.
@@ -792,6 +937,12 @@ impl Session<'_> {
                 state::write(&remembered);
             }
             state::stage(app.pending_remembered());
+            if let (Some(idle), Some(plugin)) = (app.take_idle(), &self.plugin) {
+                plugin.idle(idle);
+            }
+            if let Some(text) = app.take_orphaned() {
+                keep_text(app, &text);
+            }
             let first = match app.deadline() {
                 Some(at) => match rx.recv_timeout(at.saturating_duration_since(Instant::now())) {
                     Ok(event) => event,
@@ -815,7 +966,7 @@ impl Session<'_> {
                         app.resize(width, height);
                     }
                     Event::Interrupt => {
-                        stop(app, rx);
+                        stop(app, self.review_run.as_ref(), rx);
                         return Ok(());
                     }
                     Event::Described(Some(described)) => {
@@ -826,17 +977,11 @@ impl Session<'_> {
                     }
                     Event::Described(None) => {}
                     event => match app.event(event) {
-                        Some(Action::Quit) => return Ok(()),
+                        Some(Action::Quit) => return self.quit(app, rx),
                         Some(Action::Edit { path, line }) => self.edit(app, &path, line)?,
                         Some(Action::Compose(text)) => self.compose(app, &text)?,
                         Some(Action::Browse(url)) => browse(app, &url),
-                        Some(Action::Plugin {
-                            id,
-                            plugin,
-                            args,
-                            comments,
-                            summary,
-                        }) => self.plugin(id, &plugin, args, comments.as_deref(), summary),
+                        Some(Action::Review { id, request }) => self.request(id, &request),
                         Some(Action::Retarget {
                             revisions,
                             comments,
@@ -853,6 +998,16 @@ impl Session<'_> {
                         }) => self.pool.set(highlight, whitespace),
                         Some(Action::Copy { text, note }) => self.copy(app, &text, note)?,
                         Some(Action::CopyFullPath(path)) => self.copy_full_path(app, &path)?,
+                        Some(Action::EditLines { diff, picked, edit }) => {
+                            self.edit_lines(diff, picked, edit);
+                        }
+                        Some(Action::PlanDiscard { diff, picked }) => {
+                            self.plan_discard(diff, picked);
+                        }
+                        Some(Action::WriteResolution { path, choices }) => {
+                            self.write_resolution(path, choices);
+                        }
+                        Some(Action::GitAdd(path)) => self.git_add(path),
                         None => {}
                     },
                 }
@@ -868,6 +1023,10 @@ impl Session<'_> {
     /// A frame when something changed, with the program status if that
     /// did, and the work the new frame wants.
     fn paint(&mut self, app: &mut App) -> io::Result<()> {
+        // Before the frame: a diff in flight places what changed.
+        if let Some(annotations) = app.take_annotations() {
+            self.pool.annotate(annotations);
+        }
         let Some(frame) = app.draw() else {
             return Ok(());
         };
@@ -907,6 +1066,148 @@ impl Session<'_> {
         let full = std::path::absolute(&full).unwrap_or(full);
         let bytes = full.as_os_str().as_bytes();
         self.copy(app, bytes, format!("copied {}", escape(bytes)))
+    }
+
+    /// Stages, unstages or discards `picked` lines of `diff` on a thread of
+    /// their own, as `git apply` takes a process start; then the list is
+    /// read again, index and all, which watch mode may not be on to do.
+    fn edit_lines(&self, diff: Arc<FileDiff>, picked: Picked, edit: Edit) {
+        let Some(repo) = self.files.as_ref().map(Repo::without_object_cache) else {
+            self.events
+                .send(Event::Edited(Err(NO_WORKTREE.to_owned())))
+                .ok();
+            return;
+        };
+        let (events, requests) = (self.events.clone(), self.requests.clone());
+        let started = std::thread::Builder::new()
+            .name("dffy-stage".into())
+            .spawn(move || {
+                let said = match repo.apply_lines(&diff, &picked, edit) {
+                    Ok(done) if done.deleted => {
+                        Ok(format!("deleted {}", escape(&diff.change.path)))
+                    }
+                    Ok(done) => {
+                        let s = if done.lines == 1 { "" } else { "s" };
+                        Ok(format!("{} {} line{s}", edit.done(), done.lines))
+                    }
+                    Err(e) => Err(e.to_string()),
+                };
+                if said.is_ok() {
+                    requests.send(Request::Rescan).ok();
+                }
+                events.send(Event::Edited(said)).ok();
+            });
+        if let Err(e) = started {
+            self.events
+                .send(Event::Edited(Err(format!("couldn't {}: {e}", edit.verb()))))
+                .ok();
+        }
+    }
+
+    /// Works out what discarding `picked` lines of `diff` takes, on a
+    /// thread of its own, as it reads the index and the file.
+    fn plan_discard(&self, diff: Arc<FileDiff>, picked: Picked) {
+        let Some(repo) = self.files.as_ref().map(Repo::without_object_cache) else {
+            self.events
+                .send(Event::Edited(Err(NO_WORKTREE.to_owned())))
+                .ok();
+            return;
+        };
+        let events = self.events.clone();
+        let started = std::thread::Builder::new()
+            .name("dffy-stage".into())
+            .spawn(move || {
+                let result = repo
+                    .plan_lines(&diff, &picked, Edit::Discard)
+                    .map_err(|e| e.to_string());
+                events
+                    .send(Event::Planned {
+                        diff,
+                        picked,
+                        result,
+                    })
+                    .ok();
+            });
+        if let Err(e) = started {
+            self.events
+                .send(Event::Edited(Err(format!("couldn't discard: {e}"))))
+                .ok();
+        }
+    }
+
+    /// Writes what `choices` resolve the conflicted file `path` to, on a
+    /// thread of its own; then the list is read again, as for
+    /// [`Self::edit_lines`].
+    fn write_resolution(&self, path: BString, choices: Arc<Choices>) {
+        let Some(repo) = self.files.as_ref().map(Repo::without_object_cache) else {
+            self.events
+                .send(Event::Edited(Err(NO_WORKTREE.to_owned())))
+                .ok();
+            return;
+        };
+        let (events, requests) = (self.events.clone(), self.requests.clone());
+        let thread = std::thread::Builder::new()
+            .name("dffy-resolve".into())
+            .spawn(move || {
+                let result = repo
+                    .write_resolution(path.as_bstr(), &choices)
+                    .map_err(|e| e.to_string());
+                if result.is_ok() {
+                    requests.send(Request::Rescan).ok();
+                }
+                events.send(Event::Resolved { path, result }).ok();
+            });
+        if let Err(e) = thread {
+            self.events
+                .send(Event::Edited(Err(format!("couldn't write the file: {e}"))))
+                .ok();
+        }
+    }
+
+    /// `git add`s `path`, marking its conflict resolved, on a thread of its
+    /// own; then the list is read again.
+    fn git_add(&self, path: BString) {
+        let Some(root) = self
+            .files
+            .as_ref()
+            .and_then(|r| r.workdir())
+            .map(Path::to_owned)
+        else {
+            self.events
+                .send(Event::Edited(Err(NO_WORKTREE.to_owned())))
+                .ok();
+            return;
+        };
+        let (events, requests) = (self.events.clone(), self.requests.clone());
+        let thread = std::thread::Builder::new()
+            .name("dffy-add".into())
+            .spawn(move || {
+                let shown = escape(&path);
+                let out = Command::new("git")
+                    .current_dir(&root)
+                    .args(["--literal-pathspecs", "add", "--"])
+                    .arg(std::ffi::OsStr::from_bytes(&path))
+                    .stdin(std::process::Stdio::null())
+                    .output();
+                let said = match out {
+                    Ok(out) if out.status.success() => {
+                        requests.send(Request::Rescan).ok();
+                        Ok(format!("added {shown}: its conflict is resolved"))
+                    }
+                    Ok(out) => {
+                        let said = String::from_utf8_lossy(&out.stderr);
+                        let first = said.lines().next().unwrap_or("it failed").to_owned();
+                        Err(format!("git add {shown}: {first}"))
+                    }
+                    Err(e) => Err(format!("couldn't run git: {e}")),
+                };
+                events.send(Event::Edited(said)).ok();
+            });
+        if let Err(e) = thread {
+            self.events
+                .send(Event::Edited(Err(format!("couldn't run git: {e}"))))
+                .ok();
+        }
     }
 
     /// Hands the terminal to the editor and takes it back.
@@ -966,65 +1267,87 @@ impl Session<'_> {
         })
     }
 
-    /// Starts `dffy-review-<plugin> <args>` in the background, in the
-    /// working tree's root, as run `id`; a summary goes in a file of its
-    /// own, removed once the run is over. A `prepare`, `pull` or `post`
-    /// kills the one before it. A run that can't start says why as its end.
-    fn plugin(
-        &mut self,
-        id: u64,
-        plugin: &str,
-        mut args: Vec<String>,
-        comments: Option<&Path>,
-        summary: Option<String>,
-    ) {
-        let name = format!("{}{plugin}", crate::plugin::REVIEW_PREFIX);
-        let events = self.events.clone();
-        let fail = |why: String| {
-            events
-                .send(Event::Review {
+    /// The review plugin's process, started in the working tree's root on
+    /// first use, or why there's none. Its naming, once it has initialized,
+    /// comes back as [`Event::Described`].
+    fn plugin(&mut self) -> Result<&review::Plugin, String> {
+        if self.plugin.is_none() {
+            let name = self.review_name.clone().ok_or("no review plugin set")?;
+            let full = format!("{}{name}", crate::plugin::REVIEW_PREFIX);
+            let root = (self.files.as_ref().and_then(Repo::workdir))
+                .ok_or("there's no working tree to run the review plugin in")?;
+            let program = crate::plugin::find(crate::plugin::REVIEW_PREFIX, &name)
+                .ok_or_else(|| format!("{full} isn't on PATH (see docs/plugins.md)"))?;
+            let reviews =
+                (self.files.as_ref()).and_then(|repo| crate::review::reviews_dir(repo, &name));
+            let plugin = review::Plugin::start(&program, (Some(root), reviews), self.cache.clone())
+                .map_err(|e| format!("couldn't start {full}: {e}"))?;
+            let events = self.events.clone();
+            plugin.on_ready(move |naming| {
+                let described = naming
+                    .ok()
+                    .map(|naming| review::Described { program, naming });
+                events.send(Event::Described(described)).ok();
+            });
+            let events = self.events.clone();
+            plugin.on_push(move |push| events.send(Event::ReviewPush(push)).is_ok());
+            self.plugin = Some(plugin);
+        }
+        self.plugin.as_ref().ok_or_else(String::new)
+    }
+
+    /// Asks the review plugin `request` as request `id`, what it says
+    /// coming back as [`Event::Review`]. A `prepare`, `pull` or `post`
+    /// cancels the one before it. A request that can't be made says why as
+    /// its end.
+    fn request(&mut self, id: u64, request: &review::Request) {
+        if request.exclusive()
+            && let Some(old) = self.review_run.take()
+        {
+            old.cancel();
+        }
+        let sink = self.events.clone();
+        let run = match self.plugin() {
+            Ok(plugin) => plugin.request(request, move |said| {
+                sink.send(Event::Review { id, said }).is_ok()
+            }),
+            Err(why) => {
+                sink.send(Event::Review {
                     id,
                     said: Said::Done(Err(why)),
                 })
                 .ok();
+                return;
+            }
         };
-        let Some(root) = self.files.as_ref().and_then(Repo::workdir) else {
-            return fail("there's no working tree to run the review plugin in".to_owned());
-        };
-        let Some(program) = crate::plugin::find(crate::plugin::REVIEW_PREFIX, plugin) else {
-            return fail(format!("{name} isn't on PATH (see docs/plugins.md)"));
-        };
-        let summary = summary.map(|text| {
-            let path = std::env::temp_dir().join(format!("dffy-summary-{}.md", std::process::id()));
-            write_private(&path, &text).map(|()| path)
-        });
-        let summary = match summary.transpose() {
-            Ok(file) => file,
-            Err(e) => return fail(format!("couldn't write the summary: {e}")),
-        };
-        if let Some(file) = &summary {
-            args.extend(["--summary-file".to_owned(), file.display().to_string()]);
+        if request.exclusive() {
+            self.review_run = Some(run);
         }
-        let verb = args.first().cloned().unwrap_or_default();
-        // `check`, `list`, `detect` and `post --dry-run` run beside these.
-        let one_at_a_time = matches!(verb.as_str(), "prepare" | "pull" | "post")
-            && !args.iter().any(|a| a == "--dry-run");
-        if one_at_a_time && let Some(old) = self.review_run.take() {
-            old.kill();
+    }
+
+    /// The quit. One that stops a post running asks the plugin to stop it
+    /// and waits for its end, as killing it mid-request could leave what it
+    /// posted without its refs, posted again next time; what's being
+    /// written is saved after.
+    fn quit(&mut self, app: &mut App, rx: &mpsc::Receiver<Event>) -> io::Result<()> {
+        if !app.posting_now() {
+            return Ok(());
         }
-        let sink = self.events.clone();
-        let started = review::command(&program.path, &args, root, comments).and_then(|command| {
-            review::start(command, &name, &verb, move |said| {
-                if let (Said::Done(_), Some(file)) = (&said, &summary) {
-                    std::fs::remove_file(file).ok();
-                }
-                sink.send(Event::Review { id, said }).is_ok()
-            })
-        });
-        match started {
-            Ok(run) if one_at_a_time => self.review_run = Some(run),
-            Ok(_) => {}
-            Err(e) => fail(format!("couldn't start {name}: {e}")),
+        if let Some(run) = &self.review_run {
+            run.cancel();
+        }
+        app.message("stopping the post…");
+        self.paint(app)?;
+        finish_post(app, rx);
+        app.interrupted();
+        Ok(())
+    }
+
+    /// Tells the review plugin which review the viewer shows, for it to
+    /// watch.
+    fn watch_review(&self, app: &App) {
+        if let Some(plugin) = &self.plugin {
+            plugin.watch(app.session_pointer().map(|(_, id, _)| id).as_deref());
         }
     }
 
@@ -1047,11 +1370,17 @@ impl Session<'_> {
                     if let Some(whole) = app.reviewed_head_missing() {
                         revisions = whole;
                     }
-                } else if repo
-                    .workdir()
-                    .is_some_and(|root| rewritten(root, &last, &head))
-                {
-                    app.reviewed_head_rebased();
+                } else if let Some(root) = repo.workdir() {
+                    let (root, events) = (root.to_owned(), self.events.clone());
+                    // A git process, which the loop spends drawing instead.
+                    std::thread::Builder::new()
+                        .name("dffy-review-rebased".into())
+                        .spawn(move || {
+                            if rewritten(&root, &last, &head) {
+                                events.send(Event::ReviewRebased { last, head }).ok();
+                            }
+                        })
+                        .ok();
                 }
             }
             self.requests.send(Request::Retarget(revisions)).ok();
@@ -1091,7 +1420,8 @@ impl Session<'_> {
     /// Writes a comment in the editor, from `text`, on a temporary file
     /// removed after; what's written goes to [`App::composed`]. Text that
     /// couldn't be saved, nor go back in the box, stays in a file of its
-    /// own, which the status bar names.
+    /// own, which the status bar names; so does what an editor that failed
+    /// wrote, as the box only gets back what it handed over.
     fn compose(&self, app: &mut App, text: &str) -> io::Result<()> {
         let Some(reader) = &self.reader else {
             app.composed(None);
@@ -1103,24 +1433,21 @@ impl Session<'_> {
             app.composed(None);
             return Ok(());
         }
-        let written = if self.in_editor(app, reader, &path, 1)? {
-            std::fs::read_to_string(&path).ok()
-        } else {
-            None
-        };
-        if app.composed(written).is_some() {
-            let kept = path.with_file_name(format!(
-                "dffy-comment-{}-{}.md",
-                std::process::id(),
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map_or(0, |d| d.as_millis())
-            ));
-            let note = match std::fs::rename(&path, &kept) {
-                Ok(()) => format!("not saved; the text is in {}", kept.display()),
-                Err(_) => format!("not saved; the text is in {}", path.display()),
-            };
-            app.message(note);
+        let clean = self.in_editor(app, reader, &path, 1)?;
+        let written = std::fs::read_to_string(&path).ok();
+        if !clean {
+            app.composed(None);
+            if written.is_some_and(|w| w != text) {
+                let kept = keep(&path);
+                app.message(format!(
+                    "the editor failed; what it wrote is in {}",
+                    kept.display()
+                ));
+                return Ok(());
+            }
+        } else if app.composed(written).is_some() {
+            let kept = keep(&path);
+            app.message(format!("not saved; the text is in {}", kept.display()));
             return Ok(());
         }
         std::fs::remove_file(&path).ok();
@@ -1128,9 +1455,11 @@ impl Session<'_> {
     }
 
     /// Points the session pointer at the review session shown, for `dffy
-    /// comments --session` and agents. It stays when the viewer exits;
-    /// the next session replaces it.
+    /// comments --session` and agents, and the review plugin at it, for it
+    /// to watch. The pointer stays when the viewer exits; the next session
+    /// replaces it.
     fn point_session(&self, app: &mut App) {
+        self.watch_review(app);
         let (Some(repo), Some((comments, review, head))) = (&self.files, app.session_pointer())
         else {
             return;
@@ -1144,6 +1473,40 @@ impl Session<'_> {
         if let Err(e) = crate::review::write_session(repo, &pointer) {
             app.message(format!("the session pointer isn't written: {e}"));
         }
+    }
+}
+
+/// Keeps `text`, a box's whose thread is gone, in a file of its own that
+/// the status bar names.
+fn keep_text(app: &mut App, text: &str) {
+    let path = std::env::temp_dir().join(format!("dffy-comment-{}.md", std::process::id()));
+    match write_private(&path, text) {
+        Ok(()) => {
+            let kept = keep(&path);
+            app.message(format!(
+                "the thread you were writing in is gone; your text is in {}",
+                kept.display()
+            ));
+        }
+        Err(e) => app.message(format!(
+            "the thread you were writing in is gone, and its text couldn't be kept: {e}"
+        )),
+    }
+}
+
+/// Keeps the comment's file at `path` under a name of its own, which the
+/// next comment's doesn't take; where it is now.
+fn keep(path: &Path) -> PathBuf {
+    let kept = path.with_file_name(format!(
+        "dffy-comment-{}-{}.md",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_millis())
+    ));
+    match std::fs::rename(path, &kept) {
+        Ok(()) => kept,
+        Err(_) => path.to_owned(),
     }
 }
 

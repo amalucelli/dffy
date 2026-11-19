@@ -23,10 +23,17 @@
 //! syntax diff's hunks cover the same lines as the line diff's, so a
 //! position also survives that toggle.
 //!
+//! A host may insert blocks of rows among a file's (see [`Block`]): each
+//! part's rows are its own (code, separators, headers) with the blocks
+//! hung in it placed between them. Positions, moving and search count
+//! block rows like any other.
+//!
 //! This is the top layer of the core: it uses [`crate::git`],
 //! [`crate::highlight`], [`crate::structural`] and [`crate::cache`], and none
 //! of them use it.
 
+mod blocks;
+mod conflicted;
 mod entries;
 mod prepare;
 mod rendered;
@@ -37,10 +44,16 @@ use std::sync::Arc;
 
 use gix::bstr::{BString, ByteSlice};
 
-pub use entries::{Document, Entry, Found, Missing, Piped, Render, Settle, Source, State};
+pub use blocks::{Arrange, Attach, Block, BlockId};
+pub use conflicted::Conflicted;
+pub use entries::{
+    BlockStep, Document, Entry, Found, Missing, Piped, Render, Settle, Source, State,
+};
 pub use prepare::{Prepare, SyntaxSlot, pair};
 pub use rendered::{Origin, Rendered};
-pub use search::{Match, Matches, Needle, find, word};
+pub use search::{BlockMatch, Hit, Match, Matches, Needle, find, find_blocks, word};
+
+use blocks::{At, Blocks, Key, Placed, order};
 
 use crate::diff::{self, Emphasis, Hunk, LineKind, Whitespace};
 use crate::git::{FileChange, FileDiff, Mode, ObjectId, Side as GitSide, Status};
@@ -141,7 +154,8 @@ pub enum Segment {
 
 /// How much of a gap shows: lines from its top edge, lines from its bottom
 /// edge, windows of lines between, and a separator row for each stretch
-/// still hidden around them.
+/// still hidden around them. Its rows are the gap's own: blocks hung in the
+/// gap add theirs between them (see [`Block`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Shown<'a> {
     /// Lines shown from the gap's top.
@@ -301,8 +315,9 @@ impl Reveal {
 }
 
 /// How a file is shown, which decides its parts' rows: the syntax diff or
-/// the line diff, how much of each gap is revealed, and each hunk's
-/// arrangement. Queries that never build a hunk's rows take any `A`.
+/// the line diff, how much of each gap is revealed, each hunk's
+/// arrangement and the blocks among the rows. Queries that never build a
+/// hunk's rows take any `A`.
 struct Shape<'a, A> {
     /// Show the syntax diff where the file has one.
     structural: bool,
@@ -310,8 +325,44 @@ struct Shape<'a, A> {
     full: bool,
     /// What's revealed of each gap, by gap; gaps past its end show nothing.
     reveal: &'a [Reveal],
-    /// Each hunk's arrangement, from its numbers (and no heading).
-    arrange: A,
+    /// Each hunk's arrangement, from its numbers (and no heading), and the
+    /// blocks' heights.
+    arrange: &'a A,
+    /// The entry's blocks, when it has any.
+    blocks: Option<&'a Blocks>,
+}
+
+/// What a row shows, to find it again once the rows around it change.
+#[derive(Debug, Clone, Copy)]
+enum Anchor {
+    /// A part's own row, which stays where it is: a hunk's, a header.
+    Own(usize),
+    /// A gap's line; a separator counts as the first line it hides.
+    Line(usize),
+    /// Row `line` of a block, hung under `after` of its part's own rows.
+    Block {
+        id: BlockId,
+        line: usize,
+        after: usize,
+    },
+}
+
+/// The entry's blocks as one [`File`] places them.
+struct FileBlocks {
+    /// The [`Blocks::generation`] they're of.
+    generation: u64,
+    /// The blocks on lines, as indices into the list, by side: by the line
+    /// of this file (a rendered view's line drawn from theirs), then index.
+    lines: [Vec<(usize, u32)>; 2],
+    /// By part, once placed.
+    parts: Vec<Placed>,
+}
+
+/// The blocks of `lines` on lines in `range`.
+fn lines_in(lines: &[(usize, u32)], range: Range<usize>) -> &[(usize, u32)] {
+    let from = lines.partition_point(|&(l, _)| l < range.start);
+    let to = lines.partition_point(|&(l, _)| l < range.end);
+    &lines[from..to.max(from)]
 }
 
 /// A changed line in the overview, most visible last.
@@ -360,6 +411,11 @@ pub struct File {
     /// would say nothing a title doesn't.
     whole: bool,
     rendered: Option<Box<Rendered>>,
+    /// A conflicted file's conflicts, for a diff whose new side is its
+    /// working-tree file.
+    conflicted: Option<Box<Conflicted>>,
+    /// Set once a part of an entry with blocks is placed.
+    blocks: Option<Box<FileBlocks>>,
 }
 
 /// A file's syntax diff as displayed. Its hunks cover the same lines as
@@ -552,6 +608,8 @@ impl File {
             headings: None,
             whole,
             rendered: None,
+            conflicted: None,
+            blocks: None,
         }
     }
 
@@ -590,6 +648,21 @@ impl File {
     #[must_use]
     pub fn syntax(&self) -> Option<&SyntaxSlot> {
         self.syntax.as_ref()
+    }
+
+    /// The labels of the definitions around `line` (0-based) of `side`,
+    /// outermost first, such as `["impl Error", "fn fatal"]`; empty at
+    /// the top level. `None` until the file's highlighting is prepared
+    /// (see [`Prepare::emphasis`]), and when that side has no definitions
+    /// to look in: its language has no scope query, it isn't highlighted,
+    /// or the file shows rendered. Never waits or parses.
+    #[must_use]
+    pub fn scopes(&self, side: Side, line: usize) -> Option<Vec<&str>> {
+        if self.rendered.is_some() {
+            return None;
+        }
+        let syntax = self.syntax.as_ref()?.get()?;
+        Some(syntax.scopes()[side.index()]?.at(line))
     }
 
     /// Its added and removed lines. A rendered view counts the source
@@ -666,6 +739,7 @@ impl File {
             && !self.diff.hunks.is_empty()
             && !self.is_partial()
             && self.rendered.is_none()
+            && !self.is_resolution()
     }
 
     /// What to say about the syntax diff of this file, if anything.
@@ -902,14 +976,10 @@ impl File {
     /// Builds hunk `h`'s rows and block starts in the arrangement `shape`
     /// picks, unless it has them; a second arrangement's count toward
     /// [`File::bytes`].
-    fn ensure_rows(
-        &mut self,
-        shape: &Shape<'_, impl Fn(&HunkHeader<'_>) -> Arrangement>,
-        h: usize,
-    ) {
+    fn ensure_rows(&mut self, shape: &Shape<'_, impl Arrange>, h: usize) {
         let (cores, views) = self.shown_hunks_mut(shape.structural);
         let (core, view) = (&cores[h], &mut views[h]);
-        let arrangement = (shape.arrange)(&hunk_header(core, b""));
+        let arrangement = shape.arrange.arrangement(&hunk_header(core, b""));
         match (view.arrangement, &mut view.other) {
             (Some(shown), _) if shown == arrangement => return,
             (Some(_), Some(other)) => {
@@ -960,12 +1030,21 @@ impl File {
         }
     }
 
-    /// Rows in part `part`.
-    fn part_rows(
-        &mut self,
-        shape: &Shape<'_, impl Fn(&HunkHeader<'_>) -> Arrangement>,
-        part: usize,
-    ) -> usize {
+    /// Rows in part `part`, its blocks' included.
+    #[inline]
+    fn part_rows(&mut self, shape: &Shape<'_, impl Arrange>, part: usize) -> usize {
+        if shape.blocks.is_some() {
+            self.ensure_blocks(shape, part);
+            if let Some(placed) = self.placed(shape, part) {
+                return placed.rows();
+            }
+        }
+        self.own_rows(shape, part)
+    }
+
+    /// Part `part`'s own rows, without blocks.
+    #[inline]
+    fn own_rows(&mut self, shape: &Shape<'_, impl Arrange>, part: usize) -> usize {
         match self.segment(part) {
             Some(Segment::Hunk(h)) => {
                 self.ensure_rows(shape, h);
@@ -976,13 +1055,253 @@ impl File {
         }
     }
 
+    /// Part `part`'s blocks as last placed for `shape`; `None` while the
+    /// entry has none.
+    #[inline]
+    fn placed<A>(&self, shape: &Shape<'_, A>, part: usize) -> Option<&Placed> {
+        let generation = shape.blocks?.generation;
+        let blocks = self
+            .blocks
+            .as_deref()
+            .filter(|b| b.generation == generation)?;
+        blocks.parts.get(part).filter(|p| p.key.is_some())
+    }
+
+    /// What part `part`'s row `row` shows, once its blocks are placed.
+    #[inline]
+    fn at<A>(&self, shape: &Shape<'_, A>, part: usize, row: usize) -> At {
+        self.placed(shape, part).map_or(At::Own(row), |p| p.at(row))
+    }
+
+    /// The row of part `part` showing its own row `own`, once its blocks are
+    /// placed.
+    #[inline]
+    fn row_at<A>(&self, shape: &Shape<'_, A>, part: usize, own: usize) -> usize {
+        self.placed(shape, part).map_or(own, |p| p.row(own))
+    }
+
+    /// The line of this file that `line` of the line diff's `side` is: a
+    /// rendered view's last line drawn from it.
+    fn shown_line(&self, side: Side, line: usize) -> Option<usize> {
+        match &self.rendered {
+            Some(rendered) => rendered.shown_line(side, line),
+            None => Some(line),
+        }
+    }
+
+    /// The part showing line `line` of `side` of this file; `None` when no
+    /// part does.
+    fn line_part(&self, structural: bool, side: Side, line: usize) -> Option<usize> {
+        // Gaps and hunks run down the file in order on both sides.
+        let gap = |g: &Gap| match side {
+            Side::Old => g.old..g.old + g.len,
+            Side::New => g.new..g.new + g.len,
+        };
+        let g = self.gaps.partition_point(|g| gap(g).end <= line);
+        if self.gaps.get(g).is_some_and(|g| gap(g).contains(&line)) {
+            return self.gap_part(g);
+        }
+        let (cores, _) = self.shown_hunks(structural);
+        let hunk = |h: &Hunk| match side {
+            Side::Old => h.old_start..h.old_start + h.old_len,
+            Side::New => h.new_start..h.new_start + h.new_len,
+        };
+        let h = cores.partition_point(|h| hunk(h).end <= line);
+        cores.get(h).filter(|h| hunk(h).contains(&line))?;
+        self.segment_part(Segment::Hunk(h))
+    }
+
+    /// Places the entry's blocks in part `part` as `shape` shows it, unless
+    /// they are.
+    #[inline]
+    fn ensure_blocks(&mut self, shape: &Shape<'_, impl Arrange>, part: usize) {
+        // Inlined so an entry without blocks pays a branch: every row query
+        // comes through here.
+        if shape.blocks.is_some() {
+            self.place_blocks(shape, part);
+        }
+    }
+
+    fn place_blocks(&mut self, shape: &Shape<'_, impl Arrange>, part: usize) {
+        let Some(blocks) = shape.blocks else {
+            return;
+        };
+        if part >= self.parts() {
+            return;
+        }
+        if (self.blocks.as_ref()).is_none_or(|b| b.generation != blocks.generation) {
+            self.blocks = Some(Box::new(self.index_blocks(blocks)));
+        }
+        let own = self.own_rows(shape, part);
+        let key = Key {
+            width: shape.arrange.width(),
+            structural: self.uses_structural(shape.structural),
+            arrangement: match self.segment(part) {
+                Some(Segment::Hunk(h)) => self.shown_hunks(shape.structural).1[h].arrangement,
+                _ => None,
+            },
+            gap: None,
+        };
+        let gap = match self.segment(part) {
+            Some(Segment::Gap(g)) => Some(self.shown(shape, g)),
+            _ => None,
+        };
+        let fits = |held: &Key| {
+            (held.width, held.structural, held.arrangement)
+                == (key.width, key.structural, key.arrangement)
+                && match (&held.gap, gap) {
+                    (Some((top, bottom, windows)), Some(shown)) => {
+                        (*top, *bottom, &windows[..]) == (shown.top, shown.bottom, shown.windows)
+                    }
+                    (None, None) => true,
+                    _ => false,
+                }
+        };
+        let Some(index) = self.blocks.as_deref() else {
+            return;
+        };
+        if (index.parts.get(part))
+            .and_then(|p| p.key.as_ref())
+            .is_some_and(fits)
+        {
+            return;
+        }
+        let hanging = self.hanging(shape, part, own, blocks, index);
+        let mut placed = Placed::new(own, hanging, blocks, shape.arrange);
+        if let Some(Segment::Hunk(h)) = self.segment(part) {
+            let starts = &self.shown_hunks(shape.structural).1[h].starts;
+            placed.starts = starts.iter().map(|&s| placed.row(s)).collect();
+        }
+        placed.key = Some(Key {
+            gap: gap.map(|s| (s.top, s.bottom, s.windows.to_vec())),
+            ..key
+        });
+        let parts = self.parts();
+        let Some(index) = self.blocks.as_deref_mut() else {
+            return;
+        };
+        if index.parts.len() <= part {
+            index.parts.resize_with(parts, Placed::default);
+        }
+        index.parts[part] = placed;
+    }
+
+    /// `blocks` on this file's lines (see [`FileBlocks::lines`]).
+    fn index_blocks(&self, blocks: &Blocks) -> FileBlocks {
+        let mut lines = [Vec::new(), Vec::new()];
+        for (b, i) in blocks.list.iter().zip(0u32..) {
+            if let Attach::Line { side, line } = b.at
+                && let Some(line) = self.shown_line(side, line)
+            {
+                lines[side.index()].push((line, i));
+            }
+        }
+        for side in &mut lines {
+            side.sort_unstable();
+        }
+        FileBlocks {
+            generation: blocks.generation,
+            lines,
+            parts: Vec::new(),
+        }
+    }
+
+    /// The blocks hung in part `part` of `own` rows, for [`Placed::new`]:
+    /// under its first row when it's the file's first part, under the rows
+    /// showing their lines, under its last row when it's the last part.
+    fn hanging<A>(
+        &self,
+        shape: &Shape<'_, A>,
+        part: usize,
+        own: usize,
+        blocks: &Blocks,
+        index: &FileBlocks,
+    ) -> Vec<(usize, (u8, u32), BlockId)> {
+        let (first, last) = (part == self.first_part(), part + 1 == self.parts());
+        let mut hanging: Vec<_> = (blocks.list.iter().zip(0u32..))
+            .filter_map(|(b, i)| match b.at {
+                Attach::Start if first => Some((own.min(1), order(b.at, i), b.id)),
+                Attach::End if last => Some((own, order(b.at, i), b.id)),
+                _ => None,
+            })
+            .collect();
+        let mut hang = |after: usize, i: u32| {
+            let block = &blocks.list[i as usize];
+            hanging.push((after, order(block.at, i), block.id));
+        };
+        match self.segment(part) {
+            Some(Segment::Gap(g)) => {
+                let (span, shown) = (self.gaps[g], self.shown(shape, g));
+                for (side, start) in [(Side::Old, span.old), (Side::New, span.new)] {
+                    let on = &index.lines[side.index()];
+                    for &(line, i) in lines_in(on, start..start + span.len) {
+                        hang(shown.row(line - start) + 1, i);
+                    }
+                }
+            }
+            Some(Segment::Hunk(h)) => {
+                let core = &self.shown_hunks(shape.structural).0[h];
+                for side in [Side::Old, Side::New] {
+                    let range = match side {
+                        Side::Old => core.old_start..core.old_start + core.old_len,
+                        Side::New => core.new_start..core.new_start + core.new_len,
+                    };
+                    let wanted = lines_in(&index.lines[side.index()], range);
+                    if wanted.is_empty() {
+                        continue;
+                    }
+                    let rows = self.line_rows(shape.structural, h, side);
+                    for &(line, i) in wanted {
+                        let at = rows.partition_point(|&(l, _)| l < line);
+                        if let Some(&(l, r)) = rows.get(at)
+                            && l == line
+                        {
+                            hang(r + 1, i);
+                        }
+                    }
+                }
+            }
+            Some(Segment::Start) | None => {}
+        }
+        hanging
+    }
+
+    /// Each line of `side` hunk `h` shows, with the row showing it, by line.
+    fn line_rows(&self, structural: bool, h: usize, side: Side) -> Vec<(usize, usize)> {
+        let (cores, views) = self.shown_hunks(structural);
+        let (core, view) = (&cores[h], &views[h]);
+        let mut rows = Vec::new();
+        for (r, row) in view.rows.iter().enumerate() {
+            let shows = match *row {
+                Row::Line(i) => [Some(i), None],
+                Row::Pair(old, new) => [old, new],
+                Row::Header | Row::Marker => [None, None],
+            };
+            for i in shows.into_iter().flatten() {
+                let body = view.body[i];
+                if body.state == LineState::NoNewline {
+                    continue;
+                }
+                let l = &core.lines[body.line as usize];
+                match (side, l.kind) {
+                    (Side::Old, LineKind::Added) | (Side::New, LineKind::Removed) => {}
+                    (Side::Old, _) => rows.push((l.old, r)),
+                    (Side::New, _) => rows.push((l.new, r)),
+                }
+            }
+        }
+        rows.sort_unstable();
+        rows
+    }
+
+    /// Whether the syntax diff's hunks show for `structural`.
+    fn uses_structural(&self, structural: bool) -> bool {
+        matches!(&self.structural, Some(s) if structural && s.hunks.len() == self.hunks.len())
+    }
+
     /// The arrangement of part `part`'s rows; `None` for a part that isn't
     /// a hunk.
-    fn arrangement(
-        &mut self,
-        shape: &Shape<'_, impl Fn(&HunkHeader<'_>) -> Arrangement>,
-        part: usize,
-    ) -> Option<Arrangement> {
+    fn arrangement(&mut self, shape: &Shape<'_, impl Arrange>, part: usize) -> Option<Arrangement> {
         let Some(Segment::Hunk(h)) = self.segment(part) else {
             return None;
         };
@@ -991,11 +1310,7 @@ impl File {
     }
 
     /// Moves `pos` to the next row, offset 0; false at the file's end.
-    fn next_row(
-        &mut self,
-        shape: &Shape<'_, impl Fn(&HunkHeader<'_>) -> Arrangement>,
-        pos: &mut Pos,
-    ) -> bool {
+    fn next_row(&mut self, shape: &Shape<'_, impl Arrange>, pos: &mut Pos) -> bool {
         let mut next = Pos { offset: 0, ..*pos };
         if next.row + 1 < self.part_rows(shape, next.part) {
             next.row += 1;
@@ -1011,11 +1326,7 @@ impl File {
 
     /// Moves `pos` to the previous row, offset 0; false at the file's
     /// first.
-    fn prev_row(
-        &mut self,
-        shape: &Shape<'_, impl Fn(&HunkHeader<'_>) -> Arrangement>,
-        pos: &mut Pos,
-    ) -> bool {
+    fn prev_row(&mut self, shape: &Shape<'_, impl Arrange>, pos: &mut Pos) -> bool {
         let mut prev = Pos { offset: 0, ..*pos };
         if prev.row > 0 {
             prev.row -= 1;
@@ -1031,24 +1342,20 @@ impl File {
 
     /// The rows of part `part` that start a block of changed lines; none
     /// for a part that isn't a hunk.
-    fn starts(
-        &mut self,
-        shape: &Shape<'_, impl Fn(&HunkHeader<'_>) -> Arrangement>,
-        part: usize,
-    ) -> &[usize] {
+    fn starts(&mut self, shape: &Shape<'_, impl Arrange>, part: usize) -> &[usize] {
         let Some(Segment::Hunk(h)) = self.segment(part) else {
             return &[];
         };
         self.ensure_rows(shape, h);
+        self.ensure_blocks(shape, part);
+        if let Some(placed) = self.placed(shape, part) {
+            return &placed.starts;
+        }
         &self.shown_hunks(shape.structural).1[h].starts
     }
 
     /// The first start of a block of changes after `from`.
-    fn next_change(
-        &mut self,
-        shape: &Shape<'_, impl Fn(&HunkHeader<'_>) -> Arrangement>,
-        from: Pos,
-    ) -> Option<Pos> {
+    fn next_change(&mut self, shape: &Shape<'_, impl Arrange>, from: Pos) -> Option<Pos> {
         for part in from.part.max(1)..self.parts() {
             let at = |row| Pos {
                 file: from.file,
@@ -1065,11 +1372,7 @@ impl File {
 
     /// The last start of a block of changes before `from`: with an offset
     /// past 0, its own row's start counts as before it.
-    fn prev_change(
-        &mut self,
-        shape: &Shape<'_, impl Fn(&HunkHeader<'_>) -> Arrangement>,
-        from: Pos,
-    ) -> Option<Pos> {
+    fn prev_change(&mut self, shape: &Shape<'_, impl Arrange>, from: Pos) -> Option<Pos> {
         for part in (1..=from.part).rev() {
             let at = |row| Pos {
                 file: from.file,
@@ -1090,12 +1393,7 @@ impl File {
     }
 
     /// The first (or `last`) start of a block of changes.
-    fn edge(
-        &mut self,
-        shape: &Shape<'_, impl Fn(&HunkHeader<'_>) -> Arrangement>,
-        file: usize,
-        last: bool,
-    ) -> Option<Pos> {
+    fn edge(&mut self, shape: &Shape<'_, impl Arrange>, file: usize, last: bool) -> Option<Pos> {
         let parts = self.parts();
         let mut edge = |p: usize| {
             let starts = self.starts(shape, p);
@@ -1119,7 +1417,7 @@ impl File {
     /// the last start.
     fn change_after(
         &mut self,
-        shape: &Shape<'_, impl Fn(&HunkHeader<'_>) -> Arrangement>,
+        shape: &Shape<'_, impl Arrange>,
         file: usize,
         line: usize,
     ) -> Option<Pos> {
@@ -1129,16 +1427,17 @@ impl File {
                 continue;
             };
             self.ensure_rows(shape, h);
+            self.ensure_blocks(shape, part);
             let (_, views) = self.shown_hunks(shape.structural);
-            for &row in &views[h].starts {
+            for &own in &views[h].starts {
                 let pos = Pos {
                     file,
                     part,
-                    row,
+                    row: self.row_at(shape, part, own),
                     offset: 0,
                 };
                 best = Some(pos);
-                if self.hunk_line(shape.structural, h, row) > line {
+                if self.hunk_line(shape.structural, h, own) > line {
                     return best;
                 }
             }
@@ -1160,16 +1459,13 @@ impl File {
     }
 
     /// The new-side line number (1-based) the row at `pos` shows, or the
-    /// first after it.
-    fn line_of(
-        &mut self,
-        shape: &Shape<'_, impl Fn(&HunkHeader<'_>) -> Arrangement>,
-        pos: Pos,
-    ) -> usize {
+    /// first after it; a block's row counts as the row it hangs under.
+    fn line_of(&mut self, shape: &Shape<'_, impl Arrange>, pos: Pos) -> usize {
         let (part, from) = if pos.part == 0 {
             (1, 0)
         } else {
-            (pos.part, pos.row)
+            self.ensure_blocks(shape, pos.part);
+            (pos.part, self.at(shape, pos.part, pos.row).own())
         };
         match self.segment(part) {
             Some(Segment::Gap(g)) => self.gaps[g].new + self.shown(shape, g).line_at(from) + 1,
@@ -1198,19 +1494,68 @@ impl File {
             .map_or(1, |b| core.lines[b.line as usize].new + 1)
     }
 
-    /// The gap `pos` is in and the gap line its row shows; a separator
-    /// counts as the first line it hides.
-    #[must_use]
-    fn gap_anchor<A>(&self, shape: &Shape<'_, A>, pos: Pos) -> Option<(usize, usize)> {
-        let Some(Segment::Gap(gap)) = self.segment(pos.part) else {
-            return None;
+    /// What the row at `pos` shows, to find it again after rows changed
+    /// around it (see [`File::unanchor`]).
+    fn anchor(&mut self, shape: &Shape<'_, impl Arrange>, pos: Pos) -> Anchor {
+        self.ensure_blocks(shape, pos.part);
+        match self.at(shape, pos.part, pos.row) {
+            At::Block { id, line, after } => Anchor::Block { id, line, after },
+            At::Parting { id, after } => Anchor::Block { id, line: 0, after },
+            At::Own(own) => match self.segment(pos.part) {
+                Some(Segment::Gap(g)) => Anchor::Line(self.shown(shape, g).line_at(own)),
+                _ => Anchor::Own(own),
+            },
+        }
+    }
+
+    /// `pos` moved to the row of its part showing `anchor` now; a gap's
+    /// line found on another row starts at its first screen row.
+    fn unanchor(&mut self, shape: &Shape<'_, impl Arrange>, pos: Pos, anchor: Anchor) -> Pos {
+        self.ensure_blocks(shape, pos.part);
+        let own = match anchor {
+            Anchor::Own(own) => own,
+            Anchor::Line(line) => {
+                let Some(Segment::Gap(g)) = self.segment(pos.part) else {
+                    return pos;
+                };
+                let own = self.shown(shape, g).row(line);
+                let row = self.row_at(shape, pos.part, own);
+                let offset = if row == pos.row { pos.offset } else { 0 };
+                return Pos { row, offset, ..pos };
+            }
+            Anchor::Block { id, line, after } => {
+                match self.placed(shape, pos.part).and_then(|p| p.block(id)) {
+                    Some(block) => {
+                        return Pos {
+                            row: block.top + line.min(block.rows - 1),
+                            ..pos
+                        };
+                    }
+                    None => after.saturating_sub(1),
+                }
+            }
         };
-        Some((gap, self.shown(shape, gap).line_at(pos.row)))
+        Pos {
+            row: self.row_at(shape, pos.part, own),
+            ..pos
+        }
     }
 
     /// The part showing gap `gap`.
     fn gap_part(&self, gap: usize) -> Option<usize> {
-        Some(1 + self.segments.iter().position(|s| *s == Segment::Gap(gap))?)
+        self.segment_part(Segment::Gap(gap))
+    }
+
+    /// The part showing `segment`.
+    fn segment_part(&self, segment: Segment) -> Option<usize> {
+        // Gap `n` (or the start, in its place) comes before hunk `n`.
+        let rank = |s: &Segment| match *s {
+            Segment::Start => 0,
+            Segment::Gap(g) => 2 * g,
+            Segment::Hunk(h) => 2 * h + 1,
+        };
+        let i = (self.segments).partition_point(|s| rank(s) < rank(&segment));
+        (self.segments.get(i) == Some(&segment)).then_some(1 + i)
     }
 
     /// What gap `gap` shows after one more reveal: lines from its edges,
@@ -1304,21 +1649,25 @@ impl File {
     /// The row showing match `m`.
     fn match_pos(
         &mut self,
-        shape: &Shape<'_, impl Fn(&HunkHeader<'_>) -> Arrangement>,
+        shape: &Shape<'_, impl Arrange>,
         file: usize,
         m: &Match,
     ) -> Option<Pos> {
         let line = m.line as usize;
-        if m.side == Side::New
-            && let Some(g) = self
-                .gaps
-                .iter()
-                .position(|g| (g.new..g.new + g.len).contains(&line))
+        let start = |g: &Gap| match m.side {
+            Side::Old => g.old,
+            Side::New => g.new,
+        };
+        if let Some(g) =
+            (self.gaps.iter()).position(|g| (start(g)..start(g) + g.len).contains(&line))
         {
+            let part = self.gap_part(g)?;
+            let own = self.shown(shape, g).row(line - start(&self.gaps[g]));
+            self.ensure_blocks(shape, part);
             return Some(Pos {
                 file,
-                part: self.gap_part(g)?,
-                row: self.shown(shape, g).row(line - self.gaps[g].new),
+                part,
+                row: self.row_at(shape, part, own),
                 offset: 0,
             });
         }
@@ -1335,30 +1684,32 @@ impl File {
             let l = &core.lines[b.line as usize];
             b.state != LineState::NoNewline
                 && match m.side {
-                    Side::Old => l.kind == LineKind::Removed && l.old == line,
+                    Side::Old => l.kind != LineKind::Added && l.old == line,
                     Side::New => l.kind != LineKind::Removed && l.new == line,
                 }
         })?;
-        let row = view.rows.iter().position(|r| match *r {
+        let own = view.rows.iter().position(|r| match *r {
             Row::Line(i) => i == body,
             Row::Pair(old, new) => old == Some(body) || new == Some(body),
             Row::Header | Row::Marker => false,
         })?;
+        self.ensure_blocks(shape, part);
         Some(Pos {
             file,
             part,
-            row,
+            row: self.row_at(shape, part, own),
             offset: 0,
         })
     }
 
     /// The old and new lines (0-based) the row at `pos` shows; `None` on a
-    /// side without one, and on rows that aren't code.
-    fn row_lines(
-        &mut self,
-        shape: &Shape<'_, impl Fn(&HunkHeader<'_>) -> Arrangement>,
-        pos: Pos,
-    ) -> [Option<usize>; 2] {
+    /// side without one, and on rows that aren't code, a block's included.
+    fn row_lines(&mut self, shape: &Shape<'_, impl Arrange>, pos: Pos) -> [Option<usize>; 2] {
+        self.ensure_blocks(shape, pos.part);
+        let At::Own(row) = self.at(shape, pos.part, pos.row) else {
+            return [None, None];
+        };
+        let pos = Pos { row, ..pos };
         match self.segment(pos.part) {
             Some(Segment::Hunk(h)) => {
                 self.ensure_rows(shape, h);
@@ -1409,22 +1760,24 @@ impl File {
     }
 
     /// Builds part `part`'s rows in the arrangement `shape` picks, when
-    /// it's a hunk without them (see [`File::row`]).
+    /// it's a hunk without them, and places its blocks (see [`File::row`]).
     #[inline]
-    fn ensure_part(
-        &mut self,
-        shape: &Shape<'_, impl Fn(&HunkHeader<'_>) -> Arrangement>,
-        part: usize,
-    ) {
+    fn ensure_part(&mut self, shape: &Shape<'_, impl Arrange>, part: usize) {
         if let Some(Segment::Hunk(h)) = self.segment(part) {
             self.ensure_rows(shape, h);
         }
+        self.ensure_blocks(shape, part);
     }
 
     /// What the row at `pos` shows, once [`File::ensure_part`] built its
-    /// part's rows; `None` for part 0 and past the last part. Its offset is
-    /// ignored.
+    /// part's rows; `None` past the last part. Its offset is ignored.
     fn row<A>(&self, shape: &Shape<'_, A>, pos: Pos) -> Option<Content<'_>> {
+        let pos = match self.at(shape, pos.part, pos.row) {
+            At::Block { id, line, .. } => return Some(Content::Block { id, line }),
+            At::Parting { id, .. } => return Some(Content::Parting { id }),
+            At::Own(row) if pos.part == 0 => return Some(Content::Sheet(row)),
+            At::Own(row) => Pos { row, ..pos },
+        };
         let segment = self.segment(pos.part)?;
         let (cores, views) = self.shown_hunks(shape.structural);
         Some(match segment {
@@ -1480,7 +1833,8 @@ impl File {
     /// unchanged lines the heading above them, else the hunk above. `None`
     /// before the first hunk and for a whole added or deleted file.
     /// `headings` keeps the last heading search going while positions move
-    /// down.
+    /// down. A block's row is where the row it hangs under is; its blocks
+    /// are placed first ([`File::ensure_part`]).
     fn context<A>(
         &self,
         shape: &Shape<'_, A>,
@@ -1496,7 +1850,7 @@ impl File {
             Segment::Gap(g) => {
                 let shown = self.shown(shape, g);
                 let line = shown
-                    .line(pos.row)
+                    .line(self.at(shape, pos.part, pos.row).own())
                     .and_then(|offset| headings.above(&self.diff, self.gaps[g].old + offset));
                 if let Some(line) = line {
                     return Some(Context::Heading(heading_text(&self.diff.old, line)));
@@ -1543,6 +1897,22 @@ pub enum Content<'a> {
         /// source's).
         line: Line<'a>,
     },
+    /// Row `line` of a block the host inserted (see [`Block`]).
+    Block {
+        /// The block.
+        id: BlockId,
+        /// Its row, from 0.
+        line: usize,
+    },
+    /// A blank row parting block `id` from the block above it, both hung
+    /// at one place (see [`super::Arrange::parting`]). It's neither's.
+    Parting {
+        /// The block below it.
+        id: BlockId,
+    },
+    /// Row `n` of part 0: a sheet's row (see [`Entry::is_sheet`]), or the
+    /// blank row of a file without segments. The host draws it.
+    Sheet(usize),
 }
 
 /// The lines of a hunk as shown, each with its state, emphasis (once set)

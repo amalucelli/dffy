@@ -1330,6 +1330,36 @@ mod tests {
         let copied = doc.selected(false).expect("a copy");
         assert_eq!(copied.text, b"The quick red fox.\n\nFresh words entirely.");
         assert_eq!(copied.lines, 3);
+        // A box above it keeps the selection on its lines.
+        let comment = crate::review::model::ThreadComment {
+            id: "f".to_owned(),
+            author: String::new(),
+            created: "2026-11-17T10:00:00Z".to_owned(),
+            text: "On the file".to_owned(),
+            summary: "On the file".to_owned(),
+            suggestion: None,
+            standing: crate::review::model::Standing::Kept,
+            pending: false,
+            posting: None,
+        };
+        let thread = crate::review::model::Thread {
+            root: "f".to_owned(),
+            at: crate::review::model::At::File,
+            look: crate::review::model::Look::Open,
+            resolved: false,
+            outdated: false,
+            url: None,
+            comments: vec![comment],
+            lines: Vec::new(),
+            snippet: None,
+            local: false,
+            branch: None,
+        };
+        doc.set_threads(0, vec![thread].into());
+        assert_eq!(
+            doc.selected(false).expect("still selected").text,
+            copied.text
+        );
         doc.set_rendered_mode(false);
         assert!(!rendered(&doc));
         assert!(Arc::ptr_eq(doc.document.diff_of(0).expect("loaded"), &diff));

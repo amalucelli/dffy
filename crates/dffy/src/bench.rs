@@ -77,6 +77,7 @@ impl Frame {
             file: 0,
             version,
             result: Ok(Box::new(loaded)),
+            placed: None,
         }));
         for (hunk, (emphasis, syntax)) in hunks.into_iter().enumerate() {
             app.event(Event::Diffed(Done::Emphasis {
@@ -152,6 +153,7 @@ impl Frame {
             file,
             version,
             result: Ok(Box::new(prepare().file(diff, Whitespace::Exact, false))),
+            placed: None,
         }));
         for _ in 0..file {
             app.event(Event::Input(Input::Key(Key::Char('f'), Mods::NONE)));
@@ -225,7 +227,7 @@ impl Frame {
     #[must_use]
     pub fn search(diff: &FileDiff, pattern: &str) -> usize {
         let needle = document::Needle::new(pattern);
-        document::find(diff, None, &needle, || false).map_or(0, |m| m.list.len())
+        document::find(diff, None, &[], &needle, || false).map_or(0, |m| m.list.len())
     }
 
     /// Does the diff search's scan of the file shown on this thread, as a
@@ -237,18 +239,22 @@ impl Frame {
                 version,
                 diff,
                 hidden,
+                blocks,
+                blocks_version,
                 needle,
                 id,
                 ..
             } = job
             {
-                let matches = document::find(&diff, Some(&hidden), &needle, || false);
+                let matches =
+                    crate::tui::worker::find(diff.as_deref(), &hidden, &blocks, &needle, || false);
                 self.app.event(Event::Diffed(Done::Found {
                     file,
                     version,
                     id,
                     diff,
                     hidden,
+                    blocks_version,
                     matches,
                 }));
             }

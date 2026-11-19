@@ -3,9 +3,12 @@
 
 mod cli;
 mod config;
+mod control;
 mod daemon;
 mod docs;
 mod doctor;
+mod encode;
+mod fuzzy;
 mod json;
 mod keys;
 mod mcp;
@@ -183,7 +186,7 @@ impl Ctx {
         let name = self.review_name.as_deref()?;
         Some(
             self.review
-                .get_or_init(|| describe_review(name, self.cache.as_ref())),
+                .get_or_init(|| describe_review(name, self.cache.as_ref(), false)),
         )
     }
 
@@ -312,7 +315,7 @@ pub fn main() -> ExitCode {
     if let Some(name) = &review_name
         && cli::parses_review(&builtin, &raw)
     {
-        review.get_or_init(|| describe_review(name, cache.as_ref()));
+        review.get_or_init(|| describe_review(name, cache.as_ref(), false));
     }
     let described = review.get().and_then(|r: &Result<_, _>| r.as_ref().ok());
     let mut command = cli::with_review(builtin, described.map(|d| &d.naming));
@@ -397,12 +400,18 @@ pub fn main() -> ExitCode {
     }
 }
 
-fn describe_review(name: &str, cache: Option<&Cache>) -> Result<plugin::review::Described, String> {
+/// The review plugin `name`, described from the cache unless `fresh`; see
+/// [`plugin::review::describe`].
+fn describe_review(
+    name: &str,
+    cache: Option<&Cache>,
+    fresh: bool,
+) -> Result<plugin::review::Described, String> {
     let program = plugin::find(plugin::REVIEW_PREFIX, name)
         .ok_or_else(|| format!("{}{name} isn't on PATH", plugin::REVIEW_PREFIX))?;
     let builtin = Cli::command();
     let reserved = |command: &str| cli::is_subcommand(&builtin, command);
-    let naming = plugin::review::describe(&program, cache, reserved)?;
+    let naming = plugin::review::describe(&program, cache, fresh, reserved)?;
     Ok(plugin::review::Described { program, naming })
 }
 
@@ -609,7 +618,10 @@ fn comments(
     }
     // An integration's `apply` on its own file, each batch, needs neither
     // the repository nor the branch.
-    let branchless = matches!(args.action, Some(CommentsAction::Apply)) || args.json;
+    let branchless = matches!(
+        args.action,
+        Some(CommentsAction::Apply | CommentsAction::Import { .. })
+    ) || args.json;
     let repo = if file.is_some() && branchless {
         None
     } else {
@@ -675,8 +687,15 @@ fn comments(
                 .filter(|_| file.is_none() && !args.session)
                 .and_then(review::current_branch);
             let answer =
-                review::apply_json(&path, &input, branch.as_deref()).map_err(Error::fatal)?;
+                review::apply_given(&path, &input, branch.as_deref()).map_err(Error::fatal)?;
             io::stdout().lock().write_all(answer.as_bytes())?;
+            Ok(ExitCode::SUCCESS)
+        }
+        Some(CommentsAction::Import { from }) => {
+            let from = base_dir(dir)?.join(from);
+            let came = review::import(&from, &path).map_err(Error::fatal)?;
+            let s = if came == 1 { "" } else { "s" };
+            writeln!(io::stdout().lock(), "imported {came} comment{s}")?;
             Ok(ExitCode::SUCCESS)
         }
         None => list_comments(&path, &args, scope(&args.branches), current.as_deref(), ctx),
@@ -737,7 +756,7 @@ fn list_comments(
         review::Branches::On(branch) => branch,
         review::Branches::All => current,
     };
-    review::render(&listed, here, &mut c);
+    print::comments(&listed, here, &[], &mut c);
     if branches != review::Branches::All {
         let everywhere = review::Select {
             branches: review::Branches::All,
@@ -860,6 +879,7 @@ fn run(cli: Cli, ctx: &Ctx) -> Result<ExitCode, Error> {
             mcp::serve(dir, cli.global.comments.as_deref(), ctx)?;
             Ok(ExitCode::SUCCESS)
         }
+        Some(Command::Ctl(args)) => control::client::ctl(dir, &args),
         Some(Command::Completions { shell }) => {
             let mut buf = Vec::new();
             let mut command = cli::command(ctx.described().map(|d| &d.naming));
@@ -916,6 +936,16 @@ fn diff(dir: Option<&Path>, args: &DiffArgs, ctx: &Ctx) -> Result<ExitCode, Erro
         [] => !selects_from_repo(args) && stdin_has_diff(),
         _ => false,
     };
+    // Only `-` reads stdin with it: `--show-comments` selects from the
+    // repository.
+    if reads_stdin && args.common.show_comments {
+        return Err(Error::Fatal {
+            message: "--show-comments places comments on the repository's files; a diff read \
+                from stdin doesn't have them"
+                .into(),
+            hint: Some("name the revisions instead, as in: dffy --show-comments main..HEAD".into()),
+        });
+    }
     if reads_stdin {
         if ctx.term.stdout_tty {
             return piped(ctx);
@@ -934,8 +964,9 @@ fn diff(dir: Option<&Path>, args: &DiffArgs, ctx: &Ctx) -> Result<ExitCode, Erro
     let c = &args.common;
     if args.json {
         let paths = printed_paths(c);
-        let plan = print::prepare(dir, &target, paths, print::Summary::Diff, c.view.reverse)?;
-        let compared = json::Compared {
+        let mut plan = print::prepare(dir, &target, paths, print::Summary::Diff, c.view.reverse)?;
+        plan.comments = shown_comments(&plan, c, ctx)?;
+        let compared = encode::Compared {
             revisions: &args.revs,
             operands: None,
         };
@@ -1004,6 +1035,10 @@ enum Phase {
     Viewing,
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "the review command in order: plugin, listing or prepare, viewer"
+)]
 fn open_review(
     dir: Option<&Path>,
     id: Option<String>,
@@ -1028,14 +1063,15 @@ fn open_review(
     let repo = git::Repo::discover(&dir.map_or_else(|| cwd.clone(), |dir| cwd.join(dir)))?;
     let root = repo.workdir().ok_or(git::Error::NoWorktree)?;
     let program_name = format!("{}{plugin}", plugin::REVIEW_PREFIX);
-    let start = |args: &[String]| -> Result<_, Error> {
-        let (tx, rx) = std::sync::mpsc::channel();
-        let command = review::command(&program.path, args, root, None)?;
-        let run = review::start(command, &program_name, &args[0], move |said| {
-            tx.send(said).is_ok()
-        })
+    // One process for the listing, the review's `prepare` and the viewer's
+    // requests after: the viewer takes it over.
+    let reviews = crate::review::reviews_dir(&repo, &plugin);
+    let client = review::Plugin::start(program, (Some(root), reviews), ctx.cache.clone())
         .map_err(|e| Error::fatal(format!("couldn't start {program_name}: {e}")))?;
-        Ok((run, rx))
+    let start = |request: &review::Request| {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let run = client.request(request, move |said| tx.send(said).is_ok());
+        (run, rx)
     };
     // Until the viewer takes the screen.
     let say = |text: &str| {
@@ -1067,7 +1103,7 @@ fn open_review(
         (naming.label(&id), id)
     } else {
         say(&format!("listing {}…", naming.nouns));
-        let (_, rx) = start(&["list".to_owned()])?;
+        let (_, rx) = start(&review::Request::List);
         let reviews = first_said(&rx, |said| match said {
             Said::Listed(reviews) => Some(reviews),
             _ => None,
@@ -1084,12 +1120,16 @@ fn open_review(
                 ..git::Revisions::default()
             };
             let description = describe(&revisions, false);
-            let pick = tui::ReviewStart::Pick { plugin, reviews };
+            let pick = tui::ReviewStart::Pick {
+                plugin,
+                client,
+                reviews,
+            };
             return viewer(revisions, description, pick, &ctx.viewer());
         }
     };
     say(&format!("fetching {label}…"));
-    let (run, rx) = start(&["prepare".to_owned(), id])?;
+    let (run, rx) = start(&review::Request::Prepare { id });
     let session = first_said(&rx, |said| match said {
         Said::Session(session) => Some(session),
         _ => None,
@@ -1107,7 +1147,8 @@ fn open_review(
     ctx.comments = Some(session.comments.clone());
     let open = tui::ReviewStart::Open {
         plugin,
-        session,
+        client,
+        session: Box::new(session),
         run,
         rest: rx,
     };
@@ -1165,7 +1206,8 @@ fn compare(
         if let Some(focus) = &c.focus {
             plan.paths = vec![plan.relative(focus)?];
         }
-        let compared = json::Compared {
+        plan.comments = shown_comments(&plan, c, ctx)?;
+        let compared = encode::Compared {
             revisions: &[],
             operands: Some(operands),
         };
@@ -1195,6 +1237,7 @@ fn compare(
     if let Some(focus) = &c.focus {
         plan.paths = vec![plan.relative(focus)?];
     }
+    plan.comments = shown_comments(&plan, c, ctx)?;
     print_plan(&plan, args.exit_code, ctx)
 }
 
@@ -1376,8 +1419,61 @@ fn run_print(
     ctx: &Ctx,
 ) -> Result<ExitCode, Error> {
     let paths = printed_paths(common);
-    let plan = print::prepare(dir, target, paths, summary(common), common.view.reverse)?;
+    let mut plan = print::prepare(dir, target, paths, summary(common), common.view.reverse)?;
+    plan.comments = shown_comments(&plan, common, ctx)?;
     print_plan(&plan, exit_code, ctx)
+}
+
+/// The threads printed with `plan` with `--show-comments`: those of
+/// `--comments`'s file, or with `--session` of the review session the
+/// viewer has open, else of the repository's local file, read where it is
+/// now (this never moves it), on the current branch and on none. Two files
+/// or folders compared outside git have no branch, nor a file unless
+/// `--comments` names one.
+fn shown_comments(
+    plan: &print::Plan,
+    common: &CommonArgs,
+    ctx: &Ctx,
+) -> Result<Option<review::model::Snapshot>, Error> {
+    if !common.show_comments {
+        return Ok(None);
+    }
+    let in_git = !matches!(plan.spec, git::DiffSpec::Paths);
+    let file = match (&ctx.comments, common.session) {
+        (Some(_), true) => {
+            return Err(Error::fatal(
+                "--comments and --session both name the comments file; give one",
+            ));
+        }
+        (Some(file), false) => file.clone(),
+        (None, true) => review::read_session(&plan.repo)
+            .map_err(Error::fatal)?
+            .filter(|_| in_git)
+            .map(|pointer| pointer.comments)
+            .ok_or_else(|| Error::Fatal {
+                message: "no review session: the viewer hasn't opened one in this repository"
+                    .into(),
+                hint: Some(
+                    "open a review with the review plugin's command, as in dffy pr, then try again"
+                        .into(),
+                ),
+            })?,
+        (None, false) => (in_git
+            .then(|| review::local_file_read_only(&plan.repo))
+            .flatten())
+        .ok_or_else(|| Error::Fatal {
+            message: "two paths compared outside git have no comments file".into(),
+            hint: Some("name one with --comments <file>".into()),
+        })?,
+    };
+    let comments = review::read(&file).map_err(Error::fatal)?;
+    let current = in_git.then(|| review::current_branch(&plan.repo)).flatten();
+    let branches = if in_git {
+        review::Branches::On(current.as_deref())
+    } else {
+        review::Branches::All
+    };
+    Ok(Some(review::model::Snapshot::new(&comments, branches)))
 }
 
 /// The paths printed output is limited to. In print mode --focus narrows
@@ -1393,16 +1489,16 @@ fn printed_paths(common: &CommonArgs) -> &[PathBuf] {
 /// `--json`: straight to stdout, never paged.
 fn json_diff(
     plan: &print::Plan,
-    compared: &json::Compared,
+    compared: &encode::Compared,
     args: &DiffArgs,
     ctx: &Ctx,
 ) -> Result<ExitCode, Error> {
     let detail = if summary(&args.common) != print::Summary::Diff {
-        json::Detail::Summary
+        encode::Detail::Summary
     } else if args.highlight_spans {
-        json::Detail::Highlights
+        encode::Detail::Highlights
     } else {
-        json::Detail::Hunks
+        encode::Detail::Hunks
     };
     let mut out = Output::stdout();
     let result = json::write(plan, compared, detail, ctx, &mut out);
@@ -1454,6 +1550,7 @@ fn selects_from_repo(args: &DiffArgs) -> bool {
         || c.stat
         || c.name_only
         || c.name_status
+        || c.show_comments
         || c.focus.is_some()
         || !c.paths.is_empty()
 }

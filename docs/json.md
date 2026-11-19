@@ -19,7 +19,7 @@ This page is the schema, version 1.
 ## Command line
 
 ```
-dffy --json [--syntax] [--highlight-spans] [-w | -b] [-U<n>] [--no-renames] [-R] [<rev>...] [-- <path>...]
+dffy --json [--syntax] [--highlight-spans] [--show-comments [--session]] [-w | -b] [-U<n>] [--no-renames] [-R] [<rev>...] [-- <path>...]
 dffy --json --stat | --name-only | --name-status [--syntax] [options] [<rev>...] [-- <path>...]
 dffy --json [options] <path> <path>
 ```
@@ -32,18 +32,19 @@ dffy --json [options] <path> <path>
   - `--no-renames` lists renamed files as a deletion and an addition.
   - `-R` swaps the sides.
   - `--highlight-spans` adds syntax highlighting to each line (see [Highlighting](#highlighting)).
+  - `--show-comments` adds each file's review comment threads, placed on its lines (see [Annotations](#annotations)).
   - `--stat`, `--name-only` or `--name-status` gives a [summary](#summaries): file objects without hunks. All three give the same objects.
 - **Settings:** the config file's `context`, `ignore-all-space`, `ignore-space-change`, `renames` and `syntax-diff` apply as for printed output. The header records the values in effect.
 - **Never applies:** colors, themes, paging, layout and width settings. The output always goes straight to stdout.
 - **Exit status:** 0, or with `--exit-code` 1 when any file differs. A file that `-w` or `-b` found unchanged gets an object but doesn't count as a difference. On an error, dffy writes it to stderr and exits with 128. The end object is then missing.
-- **Not supported:** a diff read from stdin (`dffy --json -`), `show` (use `dffy --json <rev>^!`), `--color-only`, `--watch`, and `--highlight-spans` with a summary.
+- **Not supported:** a diff read from stdin (`dffy --json -`), `show` (use `dffy --json <rev>^!`), `--color-only`, `--watch`, and `--highlight-spans` or `--show-comments` with a summary.
 
 ## Conventions
 
 - Every object has a `type`: `header`, `file` or `end`.
 - Field names are `snake_case`. Values that name something (statuses, kinds, marks) are lowercase words with `_`.
 - Line numbers are 1-based, as in git's hunk headers.
-- **Fields that are always present:** every field of the header, the file, the hunk and the end object, and a line's `kind`, `old`, `new` and `text`. They're `null` when they don't apply.
+- **Fields that are always present:** every field of the header, the file (but `annotations`, there only with `--show-comments`), the hunk and the end object, and a line's `kind`, `old`, `new` and `text`. They're `null` when they don't apply.
 - **Fields that are left out:** a line's other fields when they're false or empty. This keeps context lines small.
 - Text is described in [Text and encoding](#text-and-encoding).
 
@@ -103,6 +104,7 @@ A side is one of:
 | `syntax` | The syntax diff's outcome. `null` when it's off, or for a file with no lines to diff (binary, too large, only a mode change). See below. |
 | `classification` | What the change amounts to, when dffy can tell; `null` otherwise. See below. |
 | `note` | Why the diff may differ from git's, or is missing: the file couldn't be read, or its clean filter failed and the file is compared as read from disk. `null` normally. |
+| `annotations` | With `--show-comments` only, which a summary doesn't take: the file's review comment threads on lines, where they are in this diff (see [Annotations](#annotations)). Empty for a file without any. Left out otherwise. |
 | `hunks` | The changes, in order (see [Hunks](#hunks)). Empty for a binary or too-large file, a change of mode only, and a file `-w` or `-b` found unchanged. `null` in a summary. |
 
 The `syntax` values:
@@ -212,6 +214,28 @@ The roles are the names themes style, after their `syntax-` prefix ([themes.md](
 - A file with no bundled grammar, or a side over 512KB or that takes too long to parse, has no `highlights` on that side's lines.
 - `--highlight-spans` makes the output much larger and dffy slower, since every side is parsed. It's off by default.
 - It doesn't change `emphasis`.
+
+## Annotations
+
+With `--show-comments`, each file object has `annotations` before `hunks`: the review comment threads on the file's lines ([comments.md](comments.md)), each placed on this diff as the viewer places it, by its anchor.
+
+```json
+{"id":"9f3c2a71b04e5d18","source":"comments","side":"new","start":13,"end":15,"lost":false,"thread":[{"id":"9f3c2a71b04e5d18","path":"src/lib.rs","side":"new",…,"text":"This can overflow.",…},{"id":"1b7e94c0d25a6f03","path":"src/lib.rs","text":"Fixed, thanks.",…,"in_reply_to":"9f3c2a71b04e5d18"}]}
+```
+
+| Field | Meaning |
+|---|---|
+| `id` | The `id` of the thread's first comment. |
+| `source` | What the annotation comes from: `comments`, the review comments, the one source so far. A consumer should skip an annotation of a source it doesn't know. |
+| `side` | `old` or `new`: the side its lines are on in this diff. With `-R` that's the other side from the one it was written on. |
+| `start`, `end` | Its first and last lines on `side`, 1-based, where they are now: they move with the code when the file changed since the thread was written. `null` when it's lost. |
+| `lost` | True when its lines weren't found in this version of the file, or were found more than once; `side` is then the side it was written on. |
+| `thread` | The thread's comments as the comments file holds them ([comments.md](comments.md#the-file-version-1)), unknown fields included: its first comment, then its replies in the order they were added. Their own `start` and `end` are the lines as written, not as placed. |
+
+- **Which threads:** those of `--comments <file>`, or with `--session` of the review session the viewer has open, else of the repository's local file, on the current branch or on none ([comments.md](comments.md#branches)), in thread order: by the first line they were written on.
+- **Which files:** a thread is on the file its `path` names. A thread on a renamed file's old side is on the rename, or, when the diff lists the rename as a deletion and an addition, on the deletion.
+- **Not annotations:** comments on a whole file and general comments, which have no lines; `dffy comments --json` has them.
+- **Without `--show-comments`** no object has `annotations`, and no comments file is read.
 
 ## Text and encoding
 

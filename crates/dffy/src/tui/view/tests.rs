@@ -7,9 +7,8 @@ use dffy_core::git::{FileChange, FileDiff, Mode, Side, Status};
 use super::*;
 use crate::config::Indicators;
 use crate::print;
-use crate::review;
+use crate::review::{self, model};
 use crate::theme::Role;
-use crate::tui::markdown;
 use crate::tui::textbox::TextBox;
 
 const OLD: &str = "fn main() {\n    let total = count + 1;\n    println!(\"{total}\");\n}\n\
@@ -151,7 +150,7 @@ fn rows_are_kept_for_each_arrangement() {
         let (layout, shown) = (doc.file_layout(0), doc.document.pos);
         doc.document.top();
         let mut starts = Vec::new();
-        while let Some(Settle::Land(at)) = doc.document.next_change(arrange(&layout)) {
+        while let Some(Settle::Land(at)) = doc.document.next_change(arrange(&layout, &doc.boxes)) {
             doc.document.pos = at;
             doc.document.landed(at);
             starts.push(at);
@@ -419,7 +418,7 @@ fn scrolling_stops_at_the_edges_of_the_file_shown() {
             ..Pos::default()
         }
     );
-    // A file without hunks yet shows its note in the middle of the pane,
+    // A file without hunks yet shows its comment in the middle of the pane,
     // and nothing else.
     let (_, rows) = grid_rows(&mut doc, &Theme::default_theme());
     assert_eq!(rows, ["", "", "                          loading…", ""]);
@@ -815,7 +814,7 @@ fn comment_marks_go_after_the_line_numbers_of_their_side() {
         resolved: false,
         outdated: false,
         url: None,
-        notes: vec![note("x", "", "11:00", "Hm", true)],
+        comments: vec![thread_comment("x", "", "11:00", "Hm", true)],
         lines: Vec::new(),
         snippet: None,
         local: false,
@@ -827,7 +826,7 @@ fn comment_marks_go_after_the_line_numbers_of_their_side() {
     ]);
     let mut split = doc(layout(true, false), 6);
     split.set_threads(0, Arc::clone(&markers));
-    split.fold.toggle_all();
+    split.toggle_folds();
     let (_, rows) = grid_rows(&mut split, &Theme::default_theme());
     insta::assert_snapshot!(rows.join("\n"), @r#"
     @@ -1,5 +1,6 @@
@@ -844,7 +843,7 @@ fn comment_marks_go_after_the_line_numbers_of_their_side() {
     theme.tint(crate::theme::DARK_BACKGROUND);
     let mut unified = doc(layout, 7);
     unified.set_threads(0, markers);
-    unified.fold.toggle_all();
+    unified.toggle_folds();
     let mut grid = Grid::new(60, 7);
     unified.draw(&mut grid, None, (0, 60, 0), &theme, 1);
     let tints = backgrounds(&grid, 1..6);
@@ -1196,18 +1195,18 @@ fn the_file_shown_in_place_of_one_gone_keeps_its_place_on_reload() {
 /// Noon on 2026-11-17, UTC: what the threads' ages count from.
 const NOW: u64 = 1_794_916_800;
 
-fn note(id: &str, author: &str, at: &str, text: &str, draft: bool) -> comments::Note {
-    comments::Note {
+fn thread_comment(id: &str, author: &str, at: &str, text: &str, draft: bool) -> ThreadComment {
+    ThreadComment {
         id: id.to_owned(),
         author: author.to_owned(),
         created: format!("2026-11-17T{at}:00Z"),
         text: text.to_owned(),
-        summary: markdown::summary(text),
+        summary: model::summary(text),
         suggestion: None,
         standing: if draft {
-            comments::Standing::Draft
+            model::Standing::Draft
         } else {
-            comments::Standing::Posted
+            model::Standing::Posted
         },
         pending: false,
         posting: None,
@@ -1219,20 +1218,20 @@ fn note(id: &str, author: &str, at: &str, text: &str, draft: bool) -> comments::
 /// suggestion and your draft reply; and an outdated one with a reply whose
 /// lines are gone. The resolved one and the lost one start folded.
 fn threads() -> Arc<[Thread]> {
-    let thread = |root: &str, at: At, look: Look, notes: Vec<comments::Note>| Thread {
+    let thread = |root: &str, at: At, look: Look, comments: Vec<ThreadComment>| Thread {
         root: root.to_owned(),
         at,
         look,
         resolved: look == Look::Resolved,
         outdated: false,
         url: None,
-        notes,
+        comments,
         lines: Vec::new(),
         snippet: None,
         local: false,
         branch: None,
     };
-    let mut asked = note(
+    let mut asked = thread_comment(
         "n",
         "octocat",
         "10:00",
@@ -1245,7 +1244,7 @@ fn threads() -> Arc<[Thread]> {
             "f",
             At::File,
             Look::Draft,
-            vec![note("f", "", "11:59", "On the whole file", true)],
+            vec![thread_comment("f", "", "11:59", "On the whole file", true)],
         ),
         thread(
             "o",
@@ -1254,7 +1253,13 @@ fn threads() -> Arc<[Thread]> {
                 lines: 1..2,
             },
             Look::Resolved,
-            vec![note("o", "ana", "09:00", "Was count right?", false)],
+            vec![thread_comment(
+                "o",
+                "ana",
+                "09:00",
+                "Was count right?",
+                false,
+            )],
         ),
         Thread {
             outdated: true,
@@ -1266,7 +1271,7 @@ fn threads() -> Arc<[Thread]> {
                     lines: 1..2,
                 },
                 Look::Draft,
-                vec![asked, note("r", "", "11:30", "Simpler.", true)],
+                vec![asked, thread_comment("r", "", "11:30", "Simpler.", true)],
             )
         },
         Thread {
@@ -1276,8 +1281,8 @@ fn threads() -> Arc<[Thread]> {
                 At::Lost,
                 Look::Open,
                 vec![
-                    note("l", "ana", "08:00", "Moved away", false),
-                    note("l2", "octocat", "08:30", "It did", false),
+                    thread_comment("l", "ana", "08:00", "Moved away", false),
+                    thread_comment("l2", "octocat", "08:30", "It did", false),
                 ],
             )
         },
@@ -1342,9 +1347,9 @@ fn lost() -> Arc<[Thread]> {
         resolved: false,
         outdated: comment.side == review::Side::Old,
         url: None,
-        notes: vec![note(root, "ana", "09:00", text, false)],
+        comments: vec![thread_comment(root, "ana", "09:00", text, false)],
         lines: Vec::new(),
-        snippet: comments::snippet(&comment, true),
+        snippet: model::painted_snippet(&comment),
         local: false,
         branch: None,
     };
@@ -1358,7 +1363,7 @@ fn lost() -> Arc<[Thread]> {
             old: None,
             new: Some(144),
         }),
-        anchor: Some(review::Anchor {
+        anchor: Some(dffy_core::annotation::Anchor {
             before: lines(&["let request = Request {", "\turl,"]),
             lines: lines(&[
                 "    headers: vec![(\"accept\", \"application/json\"), (\"x-trace\", id)],",
@@ -1378,7 +1383,7 @@ fn lost() -> Arc<[Thread]> {
             old: Some(140),
             new: None,
         }),
-        anchor: Some(review::Anchor {
+        anchor: Some(dffy_core::annotation::Anchor {
             before: lines(&["fn count(items: &[u8]) -> usize {"]),
             lines: lines(&["    let n = items.len();", "    n"]),
             after: Vec::new(),
@@ -1409,7 +1414,7 @@ fn lost_threads_show_the_code_they_were_on() {
         doc.now = NOW;
         doc.set_threads(0, lost());
         let folded = tall_rows(&mut doc);
-        doc.fold.toggle("b");
+        doc.toggle_fold("b");
         doc.refit();
         let rows = tall_rows(&mut doc);
         let from = rows
@@ -1439,7 +1444,7 @@ fn heights_count_the_rows_of_snippets() {
         };
         let mut doc = doc(layout, 200);
         doc.set_threads(0, lost());
-        doc.fold.toggle("b");
+        doc.toggle_fold("b");
         doc.scroll(-1000);
         let mut pos = Pos {
             offset: 0,
@@ -1461,23 +1466,23 @@ fn heights_count_the_rows_of_snippets() {
 /// highlighted when its thread is placed.
 #[test]
 fn snippets_are_highlighted_once() {
-    let before = comments::painted_count();
+    let before = model::painted_count();
     let threads = lost();
-    assert_eq!(comments::painted_count(), before + 2);
+    assert_eq!(model::painted_count(), before + 2);
     let code = &threads[0].snippet.as_ref().expect("a snippet").rows[2];
     assert!(
-        code.pieces.iter().any(|(ink, _)| ink.syntax.is_some()),
+        code.pieces.iter().any(|(syntax, _)| syntax.is_some()),
         "{code:?}"
     );
     let theme = Theme::default_theme();
     let mut doc = doc(layout(false, false), 6);
     doc.set_threads(0, threads);
-    doc.fold.toggle("b");
+    doc.toggle_fold("b");
     for _ in 0..40 {
         grid_rows(&mut doc, &theme);
         doc.scroll(1);
     }
-    assert_eq!(comments::painted_count(), before + 2);
+    assert_eq!(model::painted_count(), before + 2);
 }
 
 /// A bot's review, as a host sends it: state kept in HTML comments, then
@@ -1498,9 +1503,9 @@ fn marked_down() -> Arc<[Thread]> {
         resolved: false,
         outdated: false,
         url: None,
-        notes: vec![
-            note("m", "bot", "09:00", review, false),
-            note("m2", "ana", "10:00", table, false),
+        comments: vec![
+            thread_comment("m", "bot", "09:00", review, false),
+            thread_comment("m2", "ana", "10:00", table, false),
         ],
         lines: Vec::new(),
         snippet: None,
@@ -1551,7 +1556,7 @@ fn comments_show_as_markdown() {
 fn a_folded_thread_shows_its_first_line_of_text() {
     let mut doc = commented(layout(false, false), 200);
     doc.set_threads(0, marked_down());
-    doc.fold.toggle("m");
+    doc.toggle_fold("m");
     doc.refit();
     let rows = tall_rows(&mut doc);
     let card = rows.iter().find(|r| r.contains("▸ bot")).expect("the card");
@@ -1646,33 +1651,33 @@ fn cells_of_a_comment_map_to_its_source() {
     let threads = marked_down();
     let mut doc = marked_doc(72);
     let rows = tall_rows(&mut doc);
-    let source = |note: usize, hit: Option<Hit>| match hit {
-        Some(Hit::Note {
+    let source = |comment: usize, hit: Option<Hit>| match hit {
+        Some(Hit::Comment {
             thread: 0,
-            note: n,
+            comment: n,
             bytes,
-        }) if n == note => threads[0].notes[note].text[bytes].to_owned(),
+        }) if n == comment => threads[0].comments[comment].text[bytes].to_owned(),
         other => panic!("{other:?}"),
     };
     let (y, x) = cell_in(&rows, "two blockers");
-    assert_eq!(source(0, doc.note_hit(y, x, None)), "t");
+    assert_eq!(source(0, doc.comment_hit(y, x, None)), "t");
     let (ry, rx) = cell_in(&rows, "chats.go");
-    assert_eq!(source(1, doc.note_hit(ry, rx, None)), "c");
+    assert_eq!(source(1, doc.comment_hit(ry, rx, None)), "c");
     let (hy, hx) = cell_in(&rows, "▾ bot");
-    assert_eq!(doc.note_hit(hy, hx + 3, None), None, "the heading");
+    assert_eq!(doc.comment_hit(hy, hx + 3, None), None, "the heading");
     let left = rows[hy].find('┌').map(|b| rows[hy][..b].chars().count());
     assert_eq!(
-        doc.note_hit(y, left.expect("a box"), None),
+        doc.comment_hit(y, left.expect("a box"), None),
         None,
         "its side"
     );
-    assert_eq!(doc.note_hit(y, left.expect("a box") + 1, None), None);
+    assert_eq!(doc.comment_hit(y, left.expect("a box") + 1, None), None);
 
-    let review = &threads[0].notes[0].text;
+    let review = &threads[0].comments[0].text;
     let start = review.find("Needs").expect("its heading");
     let end = review.find("Own;").expect("its code") + "Own;".len();
-    let held = |doc: &mut Doc, y: usize| match doc.note_hit(y, 0, Some((0, 0))) {
-        Some(Hit::Note { bytes, .. }) => bytes,
+    let held = |doc: &mut Doc, y: usize| match doc.comment_hit(y, 0, Some((0, 0))) {
+        Some(Hit::Comment { bytes, .. }) => bytes,
         other => panic!("{other:?}"),
     };
     assert_eq!(held(&mut doc, 0), start..start, "above");
@@ -1693,7 +1698,7 @@ fn cells_of_a_comment_map_to_its_source() {
     let rows = tall_rows(&mut split);
     let (y, x) = cell_in(&rows, "two blockers");
     assert!(x > 60, "{x}");
-    assert_eq!(source(0, split.note_hit(y, x, None)), "t");
+    assert_eq!(source(0, split.comment_hit(y, x, None)), "t");
 }
 
 /// The rows of the thread's box, the cells reversed in `[…]`.
@@ -1732,19 +1737,19 @@ fn a_selection_in_a_comment_shows_reversed() {
     let rows = tall_rows(&mut doc);
     let (ay, ax) = cell_in(&rows, "two");
     let (by, bx) = cell_in(&rows, "tests pass");
-    let anchor = doc.note_hit(ay, ax, None).expect("a cell of text");
+    let anchor = doc.comment_hit(ay, ax, None).expect("a cell of text");
     doc.select_hit(&anchor);
-    let cursor = doc.note_hit(by, bx + 3, Some((0, 0))).expect("held");
+    let cursor = doc.comment_hit(by, bx + 3, Some((0, 0))).expect("held");
     doc.select_to_hit(&cursor);
     insta::assert_snapshot!("comment_selection", reversed_box(&mut doc));
-    doc.note_selection = None;
+    doc.comment_selection = None;
     assert!(!reversed_box(&mut doc).contains('['));
 }
 
 /// A posted thread on new line 2 with two replies, then another on the
 /// same line.
 fn conversation() -> Arc<[Thread]> {
-    let on_line_2 = |root: &str, notes| Thread {
+    let on_line_2 = |root: &str, comments| Thread {
         root: root.to_owned(),
         at: At::Line {
             side: document::Side::New,
@@ -1754,7 +1759,7 @@ fn conversation() -> Arc<[Thread]> {
         resolved: false,
         outdated: false,
         url: None,
-        notes,
+        comments,
         lines: Vec::new(),
         snippet: None,
         local: false,
@@ -1764,20 +1769,20 @@ fn conversation() -> Arc<[Thread]> {
         on_line_2(
             "a",
             vec![
-                note(
+                thread_comment(
                     "a",
                     "ana",
                     "09:00",
                     "Should this count the items as they arrive, rather than call len() once at the end?",
                     false,
                 ),
-                note("a2", "octocat", "10:00", "It could, but the list is short.", false),
-                note("a3", "ana", "11:30", "Fair, leaving it.", false),
+                thread_comment("a2", "octocat", "10:00", "It could, but the list is short.", false),
+                thread_comment("a3", "ana", "11:30", "Fair, leaving it.", false),
             ],
         ),
         on_line_2(
             "b",
-            vec![note("b", "octocat", "10:30", "Name it count?", false)],
+            vec![thread_comment("b", "octocat", "10:30", "Name it count?", false)],
         ),
     ]
     .into()
@@ -1896,7 +1901,7 @@ fn a_reloaded_threads_rows_count_its_new_text() {
         .map(|t| {
             let mut t = t.clone();
             if t.root == "n" {
-                t.notes[0].text = t.notes[0].text.repeat(3);
+                t.comments[0].text = t.comments[0].text.repeat(3);
             }
             t
         })
@@ -1927,7 +1932,7 @@ fn folded_threads_take_one_row() {
     let theme = Theme::default_theme();
     let mut doc = commented(layout(false, false), 40);
     let full = grid_rows(&mut doc, &theme).1;
-    doc.fold.toggle("n");
+    doc.toggle_fold("n");
     doc.refit();
     let folded = grid_rows(&mut doc, &theme).1;
     let summary = folded
@@ -1939,21 +1944,24 @@ fn folded_threads_take_one_row() {
         folded.iter().filter(|r| !r.is_empty()).count() + 9,
         full.iter().filter(|r| !r.is_empty()).count()
     );
-    doc.fold.toggle("o");
+    doc.toggle_fold("o");
     doc.refit();
     assert!(screen(&mut doc).contains("│ Was count right?"));
-    assert!(doc.fold.toggle_all());
+    assert!(doc.toggle_folds());
     let all = grid_rows(&mut doc, &theme).1;
     assert_eq!(
         all.iter().filter(|r| r.contains('▸')).count(),
         4,
         "{all:#?}"
     );
-    assert!(!doc.fold.toggle_all(), "folded already: all unfold");
-    assert!(!doc.fold.collapsed("o"), "resolved, unfolded with the rest");
+    assert!(!doc.toggle_folds(), "folded already: all unfold");
+    assert!(
+        !doc.fold().collapsed("o"),
+        "resolved, unfolded with the rest"
+    );
     let mut doc = commented(layout(false, false), 4);
     doc.bottom();
-    doc.fold.toggle_all();
+    doc.toggle_folds();
     doc.refit();
     assert_eq!(doc.document.pos.offset, 0);
 }
@@ -1963,9 +1971,9 @@ fn folded_threads_take_one_row() {
 #[test]
 fn folds_outlive_reloads_of_the_comments_file() {
     let mut doc = commented(layout(false, false), 40);
-    assert!(doc.fold.collapsed("o") && doc.fold.collapsed("l"));
-    assert!(!doc.fold.collapsed("n") && !doc.fold.collapsed("f"));
-    doc.fold.toggle("o");
+    assert!(doc.fold().collapsed("o") && doc.fold().collapsed("l"));
+    assert!(!doc.fold().collapsed("n") && !doc.fold().collapsed("f"));
+    doc.toggle_fold("o");
     // Reopened, and no longer outdated on the host.
     let open: Vec<Thread> = threads()
         .iter()
@@ -1977,10 +1985,10 @@ fn folds_outlive_reloads_of_the_comments_file() {
         })
         .collect();
     doc.set_threads(0, open.into());
-    assert!(!doc.fold.collapsed("o") && !doc.fold.collapsed("l"));
+    assert!(!doc.fold().collapsed("o") && !doc.fold().collapsed("l"));
     doc.set_threads(0, threads());
-    assert!(!doc.fold.collapsed("o"), "unfolded by z, resolved again");
-    assert!(doc.fold.collapsed("l"), "outdated again");
+    assert!(!doc.fold().collapsed("o"), "unfolded by z, resolved again");
+    assert!(doc.fold().collapsed("l"), "outdated again");
     // A local review's comments are all drafts: resolving still folds.
     let local: Vec<Thread> = threads()
         .iter()
@@ -1990,7 +1998,7 @@ fn folds_outlive_reloads_of_the_comments_file() {
         })
         .collect();
     doc.set_threads(0, local.into());
-    assert!(doc.fold.collapsed("f"));
+    assert!(doc.fold().collapsed("f"));
     let rows = tall_rows(&mut doc);
     assert!(
         rows.iter().any(|r| r.contains("│ Was count right?")),
@@ -2004,7 +2012,7 @@ fn folds_outlive_reloads_of_the_comments_file() {
 fn a_focused_threads_border_is_heavy() {
     let theme = Theme::default_theme();
     let mut doc = commented(layout(false, false), 40);
-    doc.fold.toggle("o");
+    doc.toggle_fold("o");
     doc.set_focus(Some("o".to_owned()));
     let (grid, rows) = grid_rows(&mut doc, &theme);
     let at = rows
@@ -2044,7 +2052,7 @@ fn a_focused_threads_border_is_heavy() {
 fn a_folded_thread_is_a_card_of_one_row() {
     let cards = |layout: Layout, focus: Option<&str>| {
         let mut doc = commented(layout, 200);
-        doc.fold.toggle_all();
+        doc.toggle_folds();
         doc.refit();
         doc.set_focus(focus.map(str::to_owned));
         let rows = tall_rows(&mut doc);
@@ -2139,7 +2147,7 @@ fn a_folded_thread_is_tinted_inside_its_sides() {
     let mut split = doc(layout(true, false), 8);
     split.now = NOW;
     split.set_threads(0, conversation());
-    split.fold.toggle_all();
+    split.toggle_folds();
     split.refit();
     let mut grid = Grid::new(65, 8);
     split.draw(&mut grid, None, (5, 65, 0), &theme, 1);
@@ -2175,7 +2183,7 @@ fn the_text_box_is_boxed_where_the_thread_sits() {
         text: TextBox::new("New"),
     };
     let mut doc = commented(layout(false, false), 40);
-    doc.writing = Some(Writing {
+    doc.write(Writing {
         at: Writes::Reply("n".to_owned()),
         text: TextBox::new("Sure, and a reply long enough to wrap in its box"),
     });
@@ -2193,7 +2201,7 @@ fn the_text_box_is_boxed_where_the_thread_sits() {
          │  ┃ box▏                                            ┃
          │  ┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛
     ");
-    doc.writing = Some(new_box());
+    doc.write(new_box());
     doc.refit();
     let rows = tall_rows(&mut doc);
     let at = rows
@@ -2207,7 +2215,7 @@ fn the_text_box_is_boxed_where_the_thread_sits() {
          │  ┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛
     ");
     let mut doc = commented(layout(false, false), 4);
-    doc.writing = Some(new_box());
+    doc.write(new_box());
     doc.reveal_block(Block::New, true);
     let shown = screen(&mut doc);
     assert!(shown.contains("New▏"), "{shown}");
@@ -2224,9 +2232,11 @@ fn frames_with_threads_on_screen_are_copied_while_they_show_the_same() {
     let mut doc = commented(layout(false, false), 6);
     let mut before = Grid::new(60, 6);
     doc.draw(&mut before, None, (0, 60, 0), &theme, 1);
-    let changes: [(Change, bool); 3] = [
+    let changes: [(Change, bool); 4] = [
         (|_| {}, true),
         (|doc| doc.set_focus(Some("f".to_owned())), false),
+        // A second on, every age reads the same.
+        (|doc| doc.now += 1, true),
         (|doc| doc.now += 3600, false),
     ];
     for (change, copied) in changes {
@@ -2248,6 +2258,94 @@ fn frames_with_threads_on_screen_are_copied_while_they_show_the_same() {
     let mut after = Grid::new(60, 3);
     let (_, scrolled) = plain.draw(&mut after, Some(&before), (0, 60, 0), &theme, 2);
     assert!(scrolled.is_some());
+}
+
+/// Another width, the other arrangement or wrapping keeps the line at the
+/// top on top, though the boxes above it take other heights now.
+#[test]
+fn the_top_line_stays_on_top_when_the_layout_changes() {
+    let top = |doc: &mut Doc| screen(doc).lines().next().unwrap_or_default().to_owned();
+    let mut doc = commented(layout(false, false), 6);
+    while !top(&mut doc).contains("println!") {
+        doc.scroll(1);
+    }
+    let narrow = Layout {
+        width: Some(40),
+        ..layout(false, false)
+    };
+    for layout in [
+        narrow,
+        layout(true, false),
+        layout(false, true),
+        layout(false, false),
+    ] {
+        doc.set_layout(layout);
+        let shown = screen(&mut doc);
+        assert!(top(&mut doc).contains("println!"), "{layout:?}:\n{shown}");
+    }
+}
+
+/// `/` finds the comments' text too: a match in a box lands on the row of
+/// the box showing it, among the code's in the order the rows show them,
+/// and is painted there as one in code is, the current one in its own
+/// color.
+#[test]
+fn search_finds_the_text_of_comments() {
+    let theme = Theme::default_theme();
+    let mut doc = commented(layout(false, false), 40);
+    let diff = Arc::clone(doc.document.diff_of(0).expect("loaded"));
+    let hidden = doc.document.hidden_lines(0).expect("loaded");
+    let blocks = doc.document.search_blocks(0);
+    let found = document::find(
+        &diff,
+        Some(&hidden),
+        &blocks,
+        &document::Needle::new("count"),
+        || false,
+    )
+    .expect("not cancelled");
+    assert!(!found.blocks.is_empty() && !found.list.is_empty());
+    let mut last = None;
+    for i in 0..found.len() {
+        let hit = found.get(i).expect("in range");
+        let pos = doc.hit_pos(0, &hit).expect("shown");
+        assert!(last <= Some(pos), "{hit:?} at {pos:?} after {last:?}");
+        last = Some(pos);
+    }
+    let (in_box, hit) = (0..found.len())
+        .find_map(|i| match found.get(i) {
+            Some(hit @ document::Hit::Block(m)) if m.line == 0 && m.start > 20 => Some((i, hit)),
+            _ => None,
+        })
+        .expect("“running count” in a box");
+    doc.document.search = Some(document::Found {
+        file: 0,
+        hidden,
+        blocks_version: doc.document.blocks_version(0),
+        matches: Arc::new(found),
+        current: Some(in_box),
+    });
+    let pos = doc.hit_pos(0, &hit).expect("shown");
+    doc.goto_match(pos);
+    let (grid, rows) = grid_rows(&mut doc, &theme);
+    let y = rows
+        .iter()
+        .position(|r| r.contains("running count"))
+        .expect("the match's row");
+    assert_eq!(doc.row_at(y), Some(pos));
+    let x = rows[y][..rows[y].find("running count").expect("there")]
+        .chars()
+        .count()
+        + 8;
+    assert_eq!(grid.row(y)[x].style(), theme.style(Role::SearchCurrent));
+    let code = rows
+        .iter()
+        .position(|r| r.contains("= count + 1"))
+        .expect("a match in code");
+    let x = rows[code][..rows[code].find("count").expect("there")]
+        .chars()
+        .count();
+    assert_eq!(grid.row(code)[x].style(), theme.style(Role::SearchMatch));
 }
 
 #[test]
@@ -2276,22 +2374,35 @@ fn a_thread_row_is_found_by_row_and_never_hits_code() {
 fn threads_are_stepped_through_in_order() {
     let mut doc = commented(layout(false, false), 8);
     let mut seen = Vec::new();
-    while doc.step_thread(true) {
+    let step = |doc: &mut Doc, forward| matches!(doc.step_thread(forward), Stepped::Thread(_));
+    while step(&mut doc, true) {
         let focused = doc.focused().expect("focused").root.clone();
         let shown = screen(&mut doc);
         assert!(shown.contains(['┏', '┃']), "{focused} on screen:\n{shown}");
         seen.push(focused);
     }
     assert_eq!(seen, ["f", "o", "n", "l"]);
-    assert!(doc.step_thread(false));
+    assert!(step(&mut doc, false));
     assert_eq!(doc.focused().map(|t| t.root.as_str()), Some("n"));
     doc.set_focus(None);
     doc.document.top();
-    assert!(!doc.step_thread(false), "none above the top");
+    assert_eq!(
+        doc.step_thread(false),
+        Stepped::Nowhere,
+        "none above the top"
+    );
     assert!(doc.edge_thread(true));
     assert_eq!(doc.focused().map(|t| t.root.as_str()), Some("l"));
     assert!(doc.go_to_thread("o"));
     assert_eq!(doc.focused().map(|t| t.root.as_str()), Some("o"));
+}
+
+/// The first row of the file, the one a document opens on at its top.
+fn first_row(doc: &Doc) -> Pos {
+    Pos {
+        part: doc.document.first_part(0),
+        ..Pos::default()
+    }
 }
 
 /// An added file of `n` lines, `line 1` to `line n`, with an open thread
@@ -2319,7 +2430,13 @@ fn long_commented(n: usize, on: &[usize], height: usize) -> Doc {
             resolved: false,
             outdated: false,
             url: None,
-            notes: vec![note(&line.to_string(), "ana", "09:00", "Here?", false)],
+            comments: vec![thread_comment(
+                &line.to_string(),
+                "ana",
+                "09:00",
+                "Here?",
+                false,
+            )],
             lines: Vec::new(),
             snippet: None,
             local: false,
@@ -2336,7 +2453,7 @@ fn long_commented(n: usize, on: &[usize], height: usize) -> Doc {
 #[test]
 fn a_thread_gone_to_lands_a_third_from_the_top() {
     let mut doc = long_commented(100, &[6, 50, 54, 99], 30);
-    let top = doc.first_row(0);
+    let top = first_row(&doc);
     assert_eq!(doc.document.pos, top);
     assert!(doc.go_to_thread("6"));
     assert_eq!(doc.document.pos, top, "on screen already");
@@ -2357,7 +2474,7 @@ fn a_thread_gone_to_lands_a_third_from_the_top() {
     // A box too tall for a third goes higher to fit, its line above it.
     let mut doc = long_commented(100, &[50], 12);
     let mut threads = doc.threads().to_vec();
-    threads[0].notes[0].text = "a\nb\nc\nd\ne\nf\ng\nh".to_owned();
+    threads[0].comments[0].text = "a\nb\nc\nd\ne\nf\ng\nh".to_owned();
     doc.set_threads(0, threads.into());
     assert!(doc.go_to_thread("50"));
     let rows = grid_rows(&mut doc, &Theme::default_theme()).1;
@@ -2374,7 +2491,7 @@ fn a_peeked_thread_shows_whole_until_the_peek_moves_on() {
     let mut doc = commented(layout(false, false), 200);
     let heights = |doc: &mut Doc| {
         let layout = doc.file_layout(0);
-        let mut pos = doc.first_row(0);
+        let mut pos = first_row(doc);
         loop {
             let mut c = Canvas::default();
             doc.render(pos, &layout, &mut c);
@@ -2384,23 +2501,23 @@ fn a_peeked_thread_shows_whole_until_the_peek_moves_on() {
             }
         }
     };
-    assert!(doc.fold.collapsed("o") && doc.fold.collapsed("l"));
+    assert!(doc.fold().collapsed("o") && doc.fold().collapsed("l"));
     heights(&mut doc);
     doc.peek(Some("o"));
-    assert!(!doc.fold.collapsed("o"));
+    assert!(!doc.fold().collapsed("o"));
     heights(&mut doc);
     doc.peek(Some("l"));
-    assert!(doc.fold.collapsed("o") && !doc.fold.collapsed("l"));
+    assert!(doc.fold().collapsed("o") && !doc.fold().collapsed("l"));
     heights(&mut doc);
     doc.peek(None);
-    assert!(doc.fold.collapsed("l"));
+    assert!(doc.fold().collapsed("l"));
     heights(&mut doc);
     // A tap focusing another thread ends the peek; one on it keeps it.
     doc.peek(Some("o"));
     doc.set_focus(Some("o".to_owned()));
-    assert!(!doc.fold.collapsed("o"));
+    assert!(!doc.fold().collapsed("o"));
     doc.set_focus(Some("n".to_owned()));
-    assert!(doc.fold.collapsed("o"));
+    assert!(doc.fold().collapsed("o"));
 }
 
 /// `z` on a peeked thread folds it for good, as on any other, and a thread
@@ -2410,20 +2527,271 @@ fn a_peeked_thread_shows_whole_until_the_peek_moves_on() {
 fn z_on_a_peeked_thread_is_the_users_choice() {
     let mut doc = commented(layout(false, false), 40);
     doc.peek(Some("o"));
-    doc.fold.toggle("o");
-    assert!(doc.fold.collapsed("o"));
+    doc.toggle_fold("o");
+    assert!(doc.fold().collapsed("o"));
     doc.peek(Some("l"));
     doc.peek(Some("o"));
-    assert!(doc.fold.collapsed("o"), "folded by z");
+    assert!(doc.fold().collapsed("o"), "folded by z");
     doc.peek(None);
-    doc.fold.toggle("l");
+    doc.toggle_fold("l");
     doc.peek(Some("l"));
     doc.peek(None);
-    assert!(!doc.fold.collapsed("l"), "unfolded by z");
+    assert!(!doc.fold().collapsed("l"), "unfolded by z");
     let mut doc = commented(layout(false, false), 40);
     doc.peek(Some("o"));
-    assert!(doc.fold.toggle_all());
-    assert!(doc.fold.collapsed("o"), "Z ended the peek");
+    assert!(doc.toggle_folds());
+    assert!(doc.fold().collapsed("o"), "Z ended the peek");
     doc.peek(Some("o"));
-    assert!(!doc.fold.toggle_all(), "the peeked one doesn't count");
+    assert!(!doc.toggle_folds(), "the peeked one doesn't count");
+}
+
+const SCOPE_OLD: &str = "impl Error {
+    fn fatal(&self) -> bool {
+        let a = 1;
+        let b = 2;
+        a == b
+    }
+
+    fn gone(&self) {
+        drop(self);
+    }
+}
+
+fn after() {
+    let c = 1;
+    let d = 4;
+    let e = 5;
+}
+";
+const SCOPE_NEW: &str = "impl Error {
+    fn severe(&self) -> bool {
+        let a = 1;
+        let b = 3;
+        a == b
+    }
+}
+
+fn after() {
+    let c = 2;
+    let d = 4;
+    let e = 5;
+}
+";
+
+/// A document showing `fd` loaded with highlighting, its syntax prepared
+/// as the first emphasis job does.
+fn scoped_doc(fd: FileDiff, layout: Layout, height: usize) -> Doc {
+    let prepare = File::prepare(crate::grammars(), None);
+    let loaded = prepare.file(fd, Whitespace::Exact, true);
+    let slot = loaded.syntax().cloned();
+    let diff = Arc::clone(loaded.diff());
+    let mut doc = Doc::new(layout, height);
+    doc.document.push(diff.change.clone(), Source::Repo);
+    assert!(doc.load(0, Ok(Box::new(loaded))));
+    if let Some(slot) = slot {
+        slot.get_or_init(|| prepare.syntax(&diff, false));
+    }
+    doc
+}
+
+/// Scrolls until the top row shows `needle`.
+fn top_at(doc: &mut Doc, needle: &str) {
+    doc.document.top();
+    for _ in 0..30 {
+        let shown = screen(doc);
+        if shown.lines().next().is_some_and(|top| top.contains(needle)) {
+            return;
+        }
+        doc.scroll(1);
+    }
+    panic!("no row shows {needle:?}:\n{}", screen(doc));
+}
+
+fn scope(doc: &mut Doc) -> Option<String> {
+    doc.scope().map(|s| s.join(" › "))
+}
+
+/// The scope line is the definitions around the top row's code: its new
+/// line, or its old line on a row with only that. A hunk's header stands
+/// for the line under it.
+#[test]
+fn the_scope_is_of_the_top_rows_code_new_side_first() {
+    for split in [false, true] {
+        let fd = file_diff("src/error.rs", SCOPE_OLD, SCOPE_NEW);
+        let mut doc = scoped_doc(fd, layout(split, false), 4);
+        doc.document.top();
+        assert!(screen(&mut doc).starts_with("@@"), "{}", screen(&mut doc));
+        assert_eq!(
+            scope(&mut doc).as_deref(),
+            Some("impl Error"),
+            "split {split}"
+        );
+        // Both sides, renamed on the new one: the new side's name.
+        top_at(&mut doc, "let a = 1;");
+        assert_eq!(
+            scope(&mut doc).as_deref(),
+            Some("impl Error › fn severe"),
+            "split {split}"
+        );
+        // Only on the old side: the new side has no `fn gone`.
+        top_at(&mut doc, "drop(self);");
+        assert_eq!(
+            scope(&mut doc).as_deref(),
+            Some("impl Error › fn gone"),
+            "split {split}"
+        );
+        top_at(&mut doc, "fn after() {");
+        assert_eq!(
+            scope(&mut doc).as_deref(),
+            Some("fn after"),
+            "split {split}"
+        );
+    }
+}
+
+/// A box at the top stands for the line it hangs under: here the end of
+/// `fn severe`, the line under the box being outside it.
+#[test]
+fn a_box_at_the_top_takes_the_scope_of_its_line() {
+    let fd = file_diff("src/error.rs", SCOPE_OLD, SCOPE_NEW);
+    let mut doc = scoped_doc(fd, layout(false, false), 4);
+    doc.now = NOW;
+    let thread = Thread {
+        root: "s".to_owned(),
+        at: At::Line {
+            side: document::Side::New,
+            lines: 5..6,
+        },
+        look: Look::Open,
+        resolved: false,
+        outdated: false,
+        url: None,
+        comments: vec![thread_comment("s", "ana", "09:00", "Three?", false)],
+        lines: Vec::new(),
+        snippet: None,
+        local: false,
+        branch: None,
+    };
+    doc.set_threads(0, vec![thread].into());
+    top_at(&mut doc, "Three?");
+    assert_eq!(scope(&mut doc).as_deref(), Some("impl Error › fn severe"));
+}
+
+/// A selection held while a box above it folds stays on its lines.
+#[test]
+fn a_selection_keeps_its_lines_when_a_box_above_it_folds() {
+    let mut doc = commented(layout(false, false), 40);
+    let rows = tall_rows(&mut doc);
+    let y = rows
+        .iter()
+        .position(|r| r.contains("println!"))
+        .expect("the line");
+    let pos = doc.row_at(y).expect("drawn");
+    assert!(doc.select(Some((pos, document::Side::New))));
+    doc.toggle_fold("n");
+    let (_, picked) = doc.edit_target(None).expect("its lines");
+    assert_eq!(picked.new, [2]);
+}
+
+/// What a host wrote reaches the screen escaped where a box draws it, as
+/// the model keeps it: why it refused a post, a general comment's label
+/// and the code of a lost thread.
+#[test]
+fn host_text_in_a_box_is_escaped_where_its_drawn() {
+    let mut refused = thread_comment("e", "", "09:00", "Mine", true);
+    refused.posting = Some(model::Posting {
+        warn: true,
+        words: "refused: \x1b[2Jgone".to_owned(),
+    });
+    let on = Some(review::LineNumbers {
+        old: None,
+        new: Some(40),
+    });
+    let comment = review::Comment {
+        path: "src/main.rs".to_owned(),
+        start: on,
+        end: on,
+        anchor: Some(dffy_core::annotation::Anchor {
+            lines: vec!["let x = \x1b[31m1;".to_owned()],
+            ..dffy_core::annotation::Anchor::default()
+        }),
+        ..review::Comment::default()
+    };
+    let thread = |root: &str, at: At, comments: Vec<ThreadComment>| Thread {
+        root: root.to_owned(),
+        at,
+        look: Look::Open,
+        resolved: false,
+        outdated: false,
+        url: None,
+        comments,
+        lines: Vec::new(),
+        snippet: None,
+        local: false,
+        branch: None,
+    };
+    let threads = vec![
+        Thread {
+            snippet: model::painted_snippet(&comment),
+            ..thread("e", At::Lost, vec![refused])
+        },
+        thread(
+            "c",
+            At::Conversation {
+                kind: Some("review".to_owned()),
+                label: Some("\x1b]0;approved".to_owned()),
+            },
+            vec![thread_comment("c", "ana", "09:00", "Fine", false)],
+        ),
+    ];
+    let mut doc = doc(layout(false, false), 200);
+    doc.now = NOW;
+    doc.set_threads(0, threads.into());
+    let rows = tall_rows(&mut doc).join("\n");
+    assert!(!rows.contains('\x1b'), "{rows}");
+    for shown in ["^[[2Jgone", "^[[31m1;", "^[]0;approved"] {
+        assert!(rows.contains(shown), "{shown} in {rows}");
+    }
+}
+
+/// An old-side selection over context lines stays on them when boxes
+/// arrive above it, and staging takes the same lines.
+#[test]
+fn an_old_side_selection_on_context_lines_keeps_them_when_boxes_arrive_above() {
+    let mut doc = doc(layout(false, false), 40);
+    doc.now = NOW;
+    let rows = tall_rows(&mut doc);
+    let y = rows
+        .iter()
+        .position(|r| r.contains("println!"))
+        .expect("the line");
+    let pos = doc.row_at(y).expect("drawn");
+    assert!(doc.select(Some((pos, document::Side::Old))));
+    doc.select_by(1);
+    let (_, before) = doc.edit_target(None).expect("its lines");
+    assert_eq!(
+        (&before.old[..], &before.new[..]),
+        (&[2, 3][..], &[2, 3, 4][..])
+    );
+    doc.set_threads(0, threads());
+    let (_, after) = doc.edit_target(None).expect("its lines");
+    assert_eq!(after, before);
+}
+
+/// Before the highlighting is ready, and for a language without a scope
+/// query, there's no scope line: the title keeps the hunk's heading.
+#[test]
+fn without_scopes_the_title_keeps_the_heading() {
+    let fd = file_diff("src/error.rs", SCOPE_OLD, SCOPE_NEW);
+    let mut doc = doc_of(fd, layout(false, false), 4);
+    assert_eq!(scope(&mut doc), None);
+    let toml = file_diff("Cargo.toml", "[a]\nb = 1\n", "[a]\nb = 2\n");
+    let mut doc = scoped_doc(toml, layout(false, false), 4);
+    assert!(
+        doc.document
+            .file(0)
+            .and_then(File::syntax)
+            .is_some_and(|s| s.get().is_some())
+    );
+    assert_eq!(scope(&mut doc), None);
 }

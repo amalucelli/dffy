@@ -1,0 +1,23 @@
+{
+"prepare": {"id":"7","known":[
+  {"ref":"x:1","anchored":true,"x_thread":"T1"},
+  {"ref":"x:2","pending":true},
+  {"ref":"x:3","x_unplaced":"original commit not available"},
+  {"ref":"x:4"}
+]},
+"dryRun": {"id":"7","drafts":[
+  {"id":"d1","path":"src/new.rs","old_path":"src/old.rs","side":"old","start_side":"old","start":{"old":3,"new":null},"end":{"old":4,"new":null},"text":"Why?","suggestion":"x.checked_add(y)","resolved":true,"anchor":{"before":[],"lines":["x + y","y"],"after":["z"]},"distance":2},
+  {"id":"d2","path":"src/lib.rs","text":"Agreed","in_reply_to":{"ref":"x:1","x_thread":"T1"}},
+  {"id":"d3","path":"src/new.rs","old_path":"src/old.rs","text":"And this","in_reply_to":{"id":"d1"}},
+  {"id":"l1","path":"b.rs","text":"A local draft on the file"}
+],"resolves":[
+  {"ref":"x:1","resolved":true,"path":"src/lib.rs","side":"new","end":{"old":null,"new":14},"x_thread":"T1"}
+]},
+"post": {"id":"7","event":"approve","labels":{"Code-Review":-1},"summary":"Ship it","drafts":[
+  {"id":"d1","path":"src/new.rs","old_path":"src/old.rs","side":"old","start_side":"old","start":{"old":3,"new":null},"end":{"old":4,"new":null},"text":"Why?","suggestion":"x.checked_add(y)","resolved":true,"anchor":{"before":[],"lines":["x + y","y"],"after":["z"]},"distance":2},
+  {"id":"d2","path":"src/lib.rs","text":"Agreed","in_reply_to":{"ref":"x:1","x_thread":"T1"}},
+  {"id":"d3","path":"src/new.rs","old_path":"src/old.rs","text":"And this","in_reply_to":{"id":"d1"}}
+],"resolves":[
+  {"ref":"x:1","resolved":true,"path":"src/lib.rs","side":"new","end":{"old":null,"new":14},"x_thread":"T1"}
+]}
+}

@@ -1,0 +1,10 @@
+{"version":1,"summary":"Kept for later","comments":[
+{"id":"r1","path":"src/lib.rs","side":"new","start":{"old":12,"new":12},"end":{"old":null,"new":14},"text":"Posted, resolved here since","author":"octocat","created":"2026-11-17T10:42:00Z","resolved":true,"ref":"x:1","anchor":{"before":["a"],"lines":["b","c","d"],"after":["e"]},"url":"https://example.com/1","outdated":true,"host_resolved":false,"x_thread":"T1"},
+{"id":"r2","path":"src/lib.rs","text":"A reply in your pending review","author":"","created":"2026-11-17T10:43:00Z","in_reply_to":"r1","resolved":false,"ref":"x:2","pending":true},
+{"id":"r3","path":"a.rs","text":"On the file","author":"hubot","created":"2026-11-17T10:44:00Z","resolved":false,"ref":"x:3","host_resolved":false,"x_unplaced":"original commit not available"},
+{"id":"g1","text":"Looks good","author":"hubot","created":"2026-11-17T10:45:00Z","resolved":false,"ref":"x:4","kind":"review","label":"approved"},
+{"id":"d1","path":"src/new.rs","old_path":"src/old.rs","side":"old","start_side":"old","start":{"old":3,"new":null},"end":{"old":4,"new":null},"text":"Why?","suggestion":"x.checked_add(y)","author":"","created":"2026-11-17T11:00:00Z","resolved":true,"anchor":{"before":[],"lines":["x + y","y"],"after":["z"]},"distance":2,"post_error":"refused before"},
+{"id":"d2","path":"src/lib.rs","text":"Agreed","author":"","created":"2026-11-17T11:01:00Z","in_reply_to":"r1","resolved":false},
+{"id":"d3","path":"src/new.rs","old_path":"src/old.rs","text":"And this","author":"","created":"2026-11-17T11:02:00Z","in_reply_to":"d1","resolved":false},
+{"id":"a1","path":"src/lib.rs","text":"An agent's, never sent","author":"claude","created":"2026-11-17T11:03:00Z","resolved":false}
+]}

@@ -598,7 +598,7 @@ fn highlight_timings() {
     // budget) parses and doesn't count as a hit.
     let hit = best(
         &mut || match Highlighter::prepare(c, text, id, Some(&cache), false) {
-            Some(h @ Highlighter::Cached(_)) => {
+            Some(h @ Highlighter::Cached(..)) => {
                 drop(h.spans(text, screen.clone()));
                 true
             }

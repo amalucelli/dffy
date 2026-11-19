@@ -169,6 +169,8 @@ As git's pager, `dffy` streams the whole 48MB patch in 3.1MB of its own memory, 
 - 🌊 [Streamed input and output](docs/architecture.md#data-flow), so the first screen doesn't wait for the whole diff.
 - 🛰️ [One shared watcher per repository](docs/architecture.md#watcher-and-broker), however many views are open.
 
+[docs/design.md](docs/design.md) has the approach a change follows, for contributors and coding agents.
+
 ## Docs
 
 The [documentation](docs/README.md) covers every key, flag and setting: [installation](docs/install.md), [usage](docs/usage.md), [the viewer](docs/viewer.md), [keys](docs/keys.md), [configuration](docs/config.md), [themes](docs/themes.md), [git integration](docs/git.md), [watch mode](docs/watch.md), [review comments](docs/comments.md), [plugins](docs/plugins.md), [JSON output](docs/json.md), [the MCP server](docs/mcp.md), [troubleshooting](docs/troubleshooting.md), [architecture](docs/architecture.md) and [benchmarks](docs/benchmarks.md).

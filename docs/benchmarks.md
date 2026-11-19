@@ -3,7 +3,7 @@
 ## What's measured
 
 - **dffy next to other tools.** `delta`, `diff-so-fancy`, `difftastic`, `hunk`, `lumen`, git and GNU diff on the Linux kernel: how long each takes, how much memory it uses, and what each one does. The tables under [Setup](#setup) are the output of `cargo xtask compare` ([`crates/xtask`](../crates/xtask/src/compare.rs)), with tool and temporary paths shortened.
-- **dffy against an earlier commit of itself.** `cargo xtask perf` ([`crates/xtask`](../crates/xtask/src/perf.rs)) builds the checkout and a baseline commit, runs both on the same machine, and fails when the checkout does more work, allocates more, is slower or uses more memory. It runs seven groups:
+- **dffy against an earlier commit of itself.** `cargo xtask perf` ([`crates/xtask`](../crates/xtask/src/perf.rs)) builds the checkout and a baseline commit, runs both on the same machine, and fails when the checkout does more work, allocates more, is slower or uses more memory. It runs eight groups:
 
   | Group | Runs |
   |---|---|
@@ -14,6 +14,7 @@
   | `paint` | the `first_paint` example: the first and last change found in the range and the working tree |
   | `print` | dffy printing the range, highlighted and not, one file, and the file list |
   | `pager` | dffy reading the range's patch as a pager |
+  | `comments` | the viewer on the range with 300 review threads, then `m` and page down through them ([below](#the-comments-group)) |
 
   dffy's own budgets are in [architecture.md](architecture.md#performance).
 
@@ -53,11 +54,11 @@ task perf -- --rev main
 | `task perf` | timing, peak memory, instructions and allocations | 10 | for changes to hot paths, or when `perf:quick` fails |
 | `task perf:full` | the same, with fresh layout bands | 10 | before a release |
 
-`perf:quick` and `perf:full` measure every group. `task perf` does too, unless `ONLY=` narrows it to a comma-separated list of groups from the table above, such as `ONLY=frame,print`.
+`perf:quick` measures every group. `task perf` and `task perf:full` do too, unless `--only` narrows them to a comma-separated list of groups from the table above, as in `task perf -- --only frame,print`.
 
 **Baselines.** Every run builds its baseline fresh: a temporary git worktree of the commit under `target/perf/worktree/`, built from that commit's sources into `target/perf/build/`, and its executables copied to `target/perf/baseline/`. When the run ends, whether it passed, failed or was interrupted with Ctrl-C, it removes its builds, keeping only `target/perf/runs/` and `target/perf/layout.tsv`, and prints what it removed and about how much space that freed.
 
-**Layout bands.** Timings are held to the layout bands in `target/perf/layout.tsv`: per metric, how far its median moved between builds of one commit with different code layouts. One file serves every baseline, and its first line names the commit and date it was measured on. `perf:full` measures it again when it's missing or more than 30 days old, and says so: the baseline's commit built four times with shuffled code layouts and each compared with the first, about three times as long as the comparison. Without the file the bands are 0. `perf` and `perf:quick` never calibrate.
+**Layout bands.** Timings are held to the layout bands in `target/perf/layout.tsv`: per metric, how far its median moved between builds of one commit with different code layouts. One file serves every baseline, and its first line names the commit and date it was measured on. `perf:full` measures it again when it's missing or more than 30 days old, and says so: the baseline's commit built four times with shuffled code layouts and each compared with the first, about three times as long as the comparison. When the file is current but has no band for a group being measured, such as a group added since, `perf:full` measures that group's bands alone, adds them and leaves the file's age as it was. Without the file the bands are 0. `perf` and `perf:quick` never calibrate.
 
 **The rules.** Every round runs both builds, alternating which goes first, and a metric's value is its median over the rounds.
 
@@ -66,9 +67,45 @@ task perf -- --rev main
 - Allocation counts and bytes per iteration, from divan's allocation profiler, fail on any increase of the median.
 - `count_pass` finding files whose count differs from their diff fails. A metric the baseline has and the candidate lacks fails; one only the candidate has is listed.
 
-**The quick tier** keeps only the deterministic metrics, so 3 rounds are enough. Each round runs each divan benchmark alone twice, with the same number of samples, and divides the difference in instructions by the iterations the second run adds: the power of two nearest to 200ms of the benchmark's time per iteration, at most 8 more per sample. With equal sample counts, divan's per-sample work cancels in the difference, and a sample holds at most 10 iterations' inputs and outputs. Print and pager run on a fixed subset of the range: 421 changed files under ten directories, with C sources and headers, Makefiles and Kconfig, Rust, docs, YAML, JSON, renames and the largest file, in rows named `print/subset` and `pager/subset`. There are no timings, peak memory or `pty` group. The summary ends with the largest spread of an instruction count over one side's rounds.
+**The quick tier** keeps only the deterministic metrics, so 3 rounds are enough. Each round runs each divan benchmark alone twice, with the same number of samples, and divides the difference in instructions by the iterations the second run adds: the power of two nearest to 200ms of the benchmark's time per iteration, at most 8 more per sample. With equal sample counts, divan's per-sample work cancels in the difference, and a sample holds at most 10 iterations' inputs and outputs. Print and pager run on a fixed subset of the range: 421 changed files under ten directories, with C sources and headers, Makefiles and Kconfig, Rust, docs, YAML, JSON, renames and the largest file, in rows named `print/subset` and `pager/subset`. There are no timings, peak memory, `pty` or `comments` group. The summary ends with the largest spread of an instruction count over one side's rounds.
 
 Every command runs in the kernel clone with only `PATH` from the environment, an empty home and XDG directories, git with no global or system config, and `TERM=xterm-256color`. Peak memory needs `/usr/bin/time` (GNU time on Linux). Layout bands hold only for the machine that measured them. Advanced: `cargo xtask bench-baseline`, `bench-ab`, `bench-noise` and `bench-layouts` run the steps above on a directory of executables, and `bench-noise` writes a `noise.tsv` beside them that lets an allocation metric pass within its band; `cargo xtask` prints their usage.
+
+### The comments group
+
+The `comments` group ([`crates/xtask`](../crates/xtask/src/comments.rs)) times the viewer with a large review open: `dffy --comments <file> v6.0..v6.1` in a 200×60 pseudo-terminal.
+
+**The comments file.** At the start of a run, the checkout's own `dffy comments apply` writes it into the run's temporary directory, and both builds open that same file. It's made from the range's diff and the files' text at `v6.1`, so it's the same on every run:
+
+- 300 threads: one on `.clang-format`'s changed line, so the first screen shows one; 250 over `mm/vmscan.c`'s added lines; 49 over `net/core/filter.c`'s.
+- Every third thread covers up to three lines, every fifth is resolved, and every tenth is unplaced, because its anchor's lines aren't in the file.
+- Thread `i` has `i % 4` replies, 450 in all.
+- The texts range from one line to a paragraph that wraps, or a list with a code block.
+
+**One run.** Each round runs it three times per build and keeps each metric's median:
+
+| Metric | Measures |
+|---|---|
+| `comments/first frame` | Time from the start to the end of the first frame. |
+| `comments/first thread` | Time to the `.clang-format` thread's text on screen. |
+| `comments/settled` | Time to the last output before a second of silence. |
+| `comments/next thread` | 16 presses of `m`: the first focuses the `.clang-format` thread, the second goes to `mm/vmscan.c`. The median time from a press to the end of the frame it draws. |
+| `comments/page down` | Then 16 presses of page down in `mm/vmscan.c`: the median time from a press to the end of the frame it draws. |
+
+- **Between presses.** The harness waits for 150ms of silence before the next press, so a late repaint isn't taken for the next key's frame.
+- **Failures.** A run fails if a key draws no frame within 10 seconds, or if no thread's text is on screen after an `m`. It also fails if the last `m` doesn't land on the `mm/vmscan.c` thread it should. `m` walks the placed threads first and the unplaced ones after them, so the 16th press lands on thread 16.
+
+These are timings only, held to the timing rule and to their layout bands, so `perf:quick` leaves the group out. The next `perf:full` adds their bands to `layout.tsv`.
+
+**Baselines without comments.** A baseline from before `--comments`, such as any commit before the review-comments work, can't open the file, so the group would compare nothing: the run fails, saying so, rather than pass a gate it didn't check. Name a baseline that has comments to gate the comments path, leave the group out with `--only`, or pass `--allow-missing-baseline` (to `perf` or `bench-ab`) to run it on the checkout alone, its rows listed as "only in B". A checkout that can't open the file always fails.
+
+```sh
+task perf:full -- --rev <commit-with-comments> --only comments   # first time: also measures the group's layout bands
+task perf -- --rev <commit-with-comments> --only comments
+task perf -- --rev main --allow-missing-baseline                  # main from before comments: the group on B alone
+```
+
+The group needs the kernel clone. Its files and line numbers are the range's, and it fails when `DFFY_BENCH_REPO` has fewer added lines in them than threads.
 
 ### Comparing with other tools
 

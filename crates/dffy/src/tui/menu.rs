@@ -19,8 +19,8 @@ pub(super) enum Run {
     Action(Act),
     /// `v` then `y` on the line aimed at.
     CopyLine,
-    /// A key of the focused thread.
-    Thread(char),
+    /// An action of the thread's table, on the thread aimed at.
+    Thread(Act),
     /// `x`, on this separator rather than the first on screen.
     Reveal(Pos),
 }

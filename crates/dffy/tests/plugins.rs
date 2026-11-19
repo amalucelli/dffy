@@ -26,6 +26,8 @@ struct Term {
     output: Arc<Mutex<Vec<u8>>>,
     vt: vt100::Parser,
     seen: usize,
+    /// The viewer's dffyd's, so it never registers with the user's.
+    _runtime: tempfile::TempDir,
 }
 
 impl Term {
@@ -60,6 +62,9 @@ impl Term {
         cmd.env("XDG_CONFIG_HOME", git.join("cfg"));
         cmd.env("XDG_CACHE_HOME", git.join("cache"));
         cmd.env("XDG_STATE_HOME", git.join("state"));
+        let runtime = tempfile::tempdir().expect("tempdir");
+        cmd.env("XDG_RUNTIME_DIR", runtime.path());
+        cmd.env("DFFY_DAEMON_IDLE_SECS", "1");
         let path = std::env::var("PATH").unwrap_or_default();
         cmd.env("PATH", format!("{}:{path}", bin.display()));
         for name in [
@@ -97,6 +102,7 @@ impl Term {
             output,
             vt: vt100::Parser::new(rows, cols, 0),
             seen: 0,
+            _runtime: runtime,
         }
     }
 

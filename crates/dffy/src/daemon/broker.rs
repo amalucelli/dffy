@@ -1,6 +1,7 @@
 //! The broker process, `dffy daemon run`: one [`Watcher`] per subscribed
-//! repository, its notices fanned out to every subscriber, and an exit once
-//! nobody has subscribed for a while.
+//! repository, its notices fanned out to every subscriber, the control
+//! API's socket, and an exit once nobody has subscribed or registered for a
+//! while.
 //!
 //! Each connection gets a thread reading it (to notice the hang-up) and,
 //! for subscribers, a thread writing to it from an unbounded queue, so a
@@ -12,10 +13,11 @@ use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::ops::Range;
+use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Sender};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -39,17 +41,41 @@ const ACCEPT_BACKOFF: Range<Duration> = Duration::from_millis(10)..Duration::fro
 
 struct Broker {
     started: Instant,
-    socket: PathBuf,
+    /// The sockets this dffyd serves, removed when it exits.
+    sockets: Vec<PathBuf>,
     idle: Duration,
     state: Mutex<State>,
+    /// Signalled when dffyd becomes idle or busy, so the exit's wait
+    /// follows: it's timed only while idle.
+    idled: Condvar,
 }
 
 #[derive(Default)]
 struct State {
     roots: HashMap<PathBuf, Watched>,
-    /// Since when nobody is subscribed; `None` while somebody is.
+    /// Views registered with the control API.
+    views: usize,
+    /// Since when nobody is subscribed or registered; `None` while
+    /// somebody is.
     idle_since: Option<Instant>,
     next_id: u64,
+}
+
+impl State {
+    /// Starts the idle wait if nobody is left.
+    fn left(&mut self, idled: &Condvar) {
+        if self.roots.is_empty() && self.views == 0 && self.idle_since.is_none() {
+            self.idle_since = Some(Instant::now());
+            idled.notify_all();
+        }
+    }
+
+    /// Ends the idle wait: somebody came.
+    fn came(&mut self, idled: &Condvar) {
+        if self.idle_since.take().is_some() {
+            idled.notify_all();
+        }
+    }
 }
 
 struct Watched {
@@ -58,67 +84,108 @@ struct Watched {
     polling: Option<String>,
 }
 
-/// Runs the broker until it's idle or told to stop. Returns quietly when
-/// another broker already runs.
+/// Runs dffyd until it's idle or told to stop: the broker and the control
+/// API, each when no other dffyd serves it. Returns quietly when others
+/// serve both.
 ///
 /// # Errors
 ///
-/// When the runtime directory or socket can't be set up.
+/// When the runtime directory or a socket can't be set up.
 pub(crate) fn run() -> io::Result<()> {
     // Leave the terminal's session, so closing it doesn't take us along.
     let _ = rustix::process::setsid();
     let dir = super::runtime_dir()?;
-    let lock = OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(false)
-        .open(dir.join(format!("broker-v{VERSION}.lock")))?;
-    if !take_lock(&lock) {
+    let open = |path: PathBuf| {
+        OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .open(path)
+    };
+    // Whatever socket is there belongs to a dffyd that's gone, since the
+    // lock is ours.
+    let bind = |socket: &Path| {
+        fs::remove_file(socket).ok();
+        let listener = UnixListener::bind(socket)?;
+        fs::set_permissions(socket, fs::Permissions::from_mode(0o600))?;
+        Ok::<_, io::Error>(listener)
+    };
+    let mut sockets = Vec::new();
+    // The control socket first: a viewer that started this dffyd waits for
+    // it less long than a lock another dffyd holds is waited for.
+    let control_lock = open(crate::control::lock_path(&dir))?;
+    let control_listener = if take_lock(&control_lock) {
+        sockets.push(crate::control::socket_path(&dir));
+        Some(bind(&crate::control::socket_path(&dir))?)
+    } else {
+        None
+    };
+    let broker_lock = open(dir.join(format!("broker-v{VERSION}.lock")))?;
+    let broker_listener = if take_lock(&broker_lock) {
+        sockets.push(super::socket_path(&dir));
+        Some(bind(&super::socket_path(&dir))?)
+    } else {
+        None
+    };
+    if sockets.is_empty() {
         return Ok(());
     }
-    // Whatever socket is there belongs to a broker that's gone, since the
-    // lock is ours.
-    let socket = super::socket_path(&dir);
-    fs::remove_file(&socket).ok();
-    let listener = UnixListener::bind(&socket)?;
     let idle = std::env::var("DFFY_DAEMON_IDLE_SECS")
         .ok()
         .and_then(|s| s.parse().ok())
         .map_or(IDLE, Duration::from_secs);
     let broker = Arc::new(Broker {
         started: Instant::now(),
-        socket,
+        sockets,
         idle,
         state: Mutex::new(State {
             idle_since: Some(Instant::now()),
             ..State::default()
         }),
+        idled: Condvar::new(),
     });
-    let watchdog = Arc::clone(&broker);
-    thread::Builder::new()
-        .name("dffyd-idle".into())
-        .spawn(move || watchdog.exit_when_idle())?;
-    let mut backoff = ACCEPT_BACKOFF.start;
-    for stream in listener.incoming() {
-        let Ok(stream) = stream else {
-            // Out of descriptors, most likely: retrying at once would spin
-            // until a connection closes.
-            thread::sleep(backoff);
-            backoff = (backoff * 2).min(ACCEPT_BACKOFF.end);
-            continue;
-        };
-        backoff = ACCEPT_BACKOFF.start;
-        let broker = Arc::clone(&broker);
-        // A connection that can't get a thread is dropped; its client
-        // watches by itself.
-        drop(
-            thread::Builder::new()
-                .name("dffyd-conn".into())
-                .spawn(move || broker.serve(stream)),
-        );
+    if let Some(listener) = control_listener {
+        let counted = Arc::clone(&broker);
+        let owner = rustix::process::getuid().as_raw();
+        thread::Builder::new()
+            .name("dffyd-control-accept".into())
+            .spawn(move || {
+                crate::control::server::serve(&listener, owner, move |views| {
+                    counted.set_views(views);
+                });
+            })?;
     }
-    drop(lock);
-    Ok(())
+    if let Some(listener) = broker_listener {
+        let serving = Arc::clone(&broker);
+        thread::Builder::new()
+            .name("dffyd-accept".into())
+            .spawn(move || serving.accept(&listener))?;
+    }
+    broker.exit_when_idle();
+}
+
+impl Broker {
+    fn accept(self: &Arc<Self>, listener: &UnixListener) {
+        let mut backoff = ACCEPT_BACKOFF.start;
+        for stream in listener.incoming() {
+            let Ok(stream) = stream else {
+                // Out of descriptors, most likely: retrying at once would spin
+                // until a connection closes.
+                thread::sleep(backoff);
+                backoff = (backoff * 2).min(ACCEPT_BACKOFF.end);
+                continue;
+            };
+            backoff = ACCEPT_BACKOFF.start;
+            let broker = Arc::clone(self);
+            // A connection that can't get a thread is dropped; its client
+            // watches by itself.
+            drop(
+                thread::Builder::new()
+                    .name("dffyd-conn".into())
+                    .spawn(move || broker.serve(stream)),
+            );
+        }
+    }
 }
 
 fn take_lock(lock: &File) -> bool {
@@ -139,19 +206,43 @@ impl Broker {
         self.state.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    fn exit_when_idle(&self) {
+    /// Exits once nobody has subscribed or registered for [`Broker::idle`].
+    /// It waits without waking while somebody is there.
+    fn exit_when_idle(&self) -> ! {
+        let mut state = self.state();
         loop {
-            thread::sleep(Duration::from_millis(200));
-            let state = self.state();
-            if state.idle_since.is_some_and(|at| at.elapsed() >= self.idle) {
-                // Exiting under the lock: no subscription can slip in.
-                self.exit();
-            }
+            state = match state.idle_since {
+                None => self
+                    .idled
+                    .wait(state)
+                    .unwrap_or_else(PoisonError::into_inner),
+                Some(at) => match self.idle.checked_sub(at.elapsed()) {
+                    // Exiting under the lock: no subscription can slip in.
+                    None | Some(Duration::ZERO) => self.exit(),
+                    Some(left) => {
+                        (self.idled.wait_timeout(state, left))
+                            .unwrap_or_else(PoisonError::into_inner)
+                            .0
+                    }
+                },
+            };
+        }
+    }
+
+    fn set_views(&self, views: usize) {
+        let mut state = self.state();
+        state.views = views;
+        if views > 0 {
+            state.came(&self.idled);
+        } else {
+            state.left(&self.idled);
         }
     }
 
     fn exit(&self) -> ! {
-        fs::remove_file(&self.socket).ok();
+        for socket in &self.sockets {
+            fs::remove_file(socket).ok();
+        }
         std::process::exit(0);
     }
 
@@ -225,7 +316,7 @@ impl Broker {
             let mut state = self.state();
             // Nobody is subscribed while the watches are set up, but the
             // broker mustn't exit under this subscriber.
-            state.idle_since = None;
+            state.came(&self.idled);
             if !state.roots.contains_key(&key) {
                 let Some(watcher) = started.take() else {
                     drop(state);
@@ -236,11 +327,7 @@ impl Broker {
                     }) {
                         Ok(watcher) => started = Some(watcher),
                         Err(e) => {
-                            let mut state = self.state();
-                            if state.roots.is_empty() {
-                                state.idle_since = Some(Instant::now());
-                            }
-                            drop(state);
+                            self.state().left(&self.idled);
                             stream
                                 .write_all(&Message::Error(e.to_string()).encode())
                                 .ok();
@@ -309,9 +396,7 @@ impl Broker {
         watched.subscribers.retain(|(i, _)| *i != id);
         if watched.subscribers.is_empty() {
             let gone = state.roots.remove(key);
-            if state.roots.is_empty() {
-                state.idle_since = Some(Instant::now());
-            }
+            state.left(&self.idled);
             drop(state);
             drop(gone);
         }

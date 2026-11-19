@@ -1,6 +1,6 @@
 # MCP server
 
-`dffy mcp` is a [Model Context Protocol](https://modelcontextprotocol.io) server for coding agents such as Claude Code, Cursor and Zed's agent. It lets an agent ask which files a diff changes and read the diffs it needs, a page at a time. The results are the header and file objects of `dffy --json` ([json.md](json.md)), so a long change doesn't land in the agent's context all at once. It also lists the review comments left on the code ([comments.md](comments.md)).
+`dffy mcp` is a [Model Context Protocol](https://modelcontextprotocol.io) server for coding agents such as Claude Code, Cursor and Zed's agent. It lets an agent ask which files a diff changes and read the diffs it needs, a page at a time. The results are the header and file objects of `dffy --json` ([json.md](json.md)), so a long change doesn't land in the agent's context all at once. It also lists the review comments left on the code ([comments.md](comments.md)), and drives the viewer the user has open: it shows them a line or a thread and reads their selection ([Viewer tools](#viewer-tools)).
 
 It runs over stdio: the agent starts `dffy mcp` and talks to it on stdin and stdout. It serves the repository of the directory it starts in, or the one `-C <path>` names, and the comments file `--comments <file>` names, or the repository's.
 
@@ -52,6 +52,7 @@ In Claude Code, MCP tools can be deferred until the agent searches for them. Tha
 | `file_diff` | One file object with its hunks and lines. | Next, for each file that matters. |
 | `diff` | Several file objects with hunks, in path order. | For a small change, or everything under a few paths. |
 | `list_comments` | Review comments, thread by thread. | To read what reviewers said about the code, or a local review's notes. |
+| `open_in_viewer`, `focus_thread`, `viewer_selection` | What the viewer the user has open shows, or did. | To show the user a line or a thread, or to read what they selected. See [Viewer tools](#viewer-tools). |
 
 With `syntax: true`, a file whose changes are only formatting gets `classification: "formatting_only"`, and one whose changes are only moved code gets `"moved_only"`. Its lines are marked `reformatted` or `moved`. An agent can skip such files, or read them knowing nothing was edited. [json.md](json.md#files) defines both.
 
@@ -92,6 +93,8 @@ The result:
 | `syntax` | `false` | Diff by syntax: `moved` and `reformatted` marks, emphasis on changed tokens only, and the classification. |
 | `context` | 3 | Unchanged lines around each change, 0 to 10000. |
 | `max_lines` | 400 | Lines per result, across hunks, 1 to 20000. |
+| `comments` | `false` | Add the file's review comment threads as `annotations`: the threads `list_comments` lists without arguments, each with the lines it's on in this diff, or `lost` ([json.md](json.md#annotations)). A file cut short has them all in its first part; the parts after have none. |
+| `session` | `false` | With `comments`, the threads of the review session the viewer has open, as `list_comments` with `session` lists them. |
 | `cursor` | | The previous result's `next_cursor`. |
 
 The result:
@@ -112,6 +115,7 @@ A path that names a directory, or a file the diff doesn't change, is a tool erro
 | `context` | 3 | As for `file_diff`. |
 | `max_files` | 20 | Files per page, 1 to 200. |
 | `max_lines_per_file` | 100 | Lines per file, across its hunks, 1 to 20000. |
+| `comments`, `session` | `false` | As for `file_diff`. |
 | `cursor` | | The previous page's `next_cursor`. |
 
 The result:
@@ -120,7 +124,7 @@ The result:
 {"header":{…},"files":[…],"truncated_files":[{"path":"big.c","remaining_lines":840,"cursor":"77aa…"}],"total_files":31,"next_cursor":"0d4e…"}
 ```
 
-`truncated_files` lists the files of this page cut short. Each entry's `cursor` continues that file with `file_diff`, given the same `path`, `range`, `syntax` and `context`.
+`truncated_files` lists the files of this page cut short. Each entry's `cursor` continues that file with `file_diff`, given the same `path`, `range`, `syntax`, `context`, `comments` and `session`.
 
 ### `list_comments`
 
@@ -128,6 +132,8 @@ Read-only: it reads the comments file on every call and never writes it. Writing
 
 | Input | Default | Meaning |
 |---|---|---|
+| `range` | | The diff each thread is placed on, for `placed`, as for the diff tools. Given, `placed` is filled. |
+| `placed` | `false` | `true` fills `placed` on the uncommitted changes when `range` is left out. |
 | `path` | all | Only the comments on this file, relative to the repository root. A renamed file's old path finds them too. |
 | `open` | all | `true` for open threads only, `false` for resolved ones. |
 | `resolved` | all | `true` for resolved threads only, `false` for open ones. Given with `open`, the two must agree. |
@@ -142,14 +148,27 @@ Each filter judges a thread by its first comment, so a thread is in or out whole
 The result:
 
 ```json
-{"notice":null,"comments":[{"id":"9f3c2a71b04e5d18","path":"src/lib.rs","side":"new",…},…],"total_comments":14,"next_cursor":null}
+{"notice":null,"comments":[{"id":"9f3c2a71b04e5d18","path":"src/lib.rs","side":"new",…},…],"placed":{"9f3c2a71b04e5d18":{"side":"new","start":15,"end":17,"lost":false}},"total_comments":14,"next_cursor":null}
 ```
 
+- **`placed`:** where each line thread starting on this page is in `range`'s diff, by its first comment's `id`, as an annotation of `dffy --json --show-comments` gives it ([json.md](json.md#annotations)): the side and 1-based lines its anchor finds now, or `lost: true` with null lines when its lines are gone. A thread whose file the diff doesn't change, a comment on a whole file and a reply have no entry. It's filled only with `range`, or with `placed: true` on the uncommitted changes; otherwise it's empty and nothing is diffed. It costs a diff per file on the page with line threads: only the threads' files are listed and diffed. It's empty outside a repository, and with `placed: true` when the uncommitted changes can't be diffed, as without a worktree; a `range` given that can't be diffed is an error. It's kept apart from `comments`, whose objects are as the file holds them.
 - **`comments`:** each comment as the file holds it ([comments.md](comments.md#the-file-version-1)), unknown fields included, in thread order: a thread's first comment, then its replies in the order they were added. [General comments](comments.md#general-comments), which have no `path`, come first; then threads by path and first line, file comments first. With `path`, general comments are left out. A page may end inside a thread; the next page continues it.
 - **`notice`:** the file's `notice`, set by the integration that keeps the comments, such as that they're stale; null without one.
 - **`total_comments`:** the number of comments the filters select, on every page.
 - A missing comments file has no comments. Outside a repository, without `--comments`, the tool returns an error.
 - In a linked worktree whose comments file hasn't [moved to the shared place](comments.md#moving-from-the-worktrees-file) yet, it reads the worktree's own file: it never moves or writes one.
+
+### Viewer tools
+
+These drive the dffy viewer the user has open in the repository's working tree, through the [control API](control.md). When no viewer runs there, each returns a tool error that says so (`No dffy viewer is running in /path/to/repo: ask the user to open dffy there; …`); with several there, one that lists them. They never start a viewer.
+
+| Tool | Input | The result |
+|---|---|---|
+| `open_in_viewer` | `path` (required), `line` (1-based), `side` (`new` or `old`, default `new`) | `{"view","path","line","side"}` once the file shows, at the line when given. A file not in the viewer's diff, or a line it doesn't have, is a tool error. |
+| `focus_thread` | `id`, any comment's id from `list_comments` | `{"view","thread","path","focused"}`: the thread's first comment and its file; `focused` is false while its place is on its way, and it's focused once there. |
+| `viewer_selection` | none | `{"view","selection"}`: `selection` is `{"path","side","start","end","text"}`, or null when nothing is selected. |
+
+The text says what happened (`The viewer shows src/lib.rs at line 42.`) or, for `viewer_selection`, gives the place and the selected lines.
 
 ## Results
 
@@ -177,7 +196,9 @@ M long.txt +12 -12
 [truncated: 30 more lines; next_cursor: … (pass it as cursor, with the same arguments)]
 ```
 
-For `list_comments`, the text is the listing of `dffy comments` ([comments.md](comments.md#reading-dffy-comments)) under a count of the comments.
+With `comments: true`, a file's text ends with its threads: each annotation's place (`a1 on new line 1:`, or `lines not found`), then its comments' authors, times and text.
+
+For `list_comments`, the text is the listing of `dffy comments` ([comments.md](comments.md#reading-dffy-comments)) under a count of the comments, each thread in `placed` headed with where it is now (`src/lib.rs:12-14, now :15-17`, or `lines not found`).
 
 ## Paging and truncation
 

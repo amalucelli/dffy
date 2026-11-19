@@ -87,7 +87,7 @@ fn missing_names_the_work_for_the_rows_shown() {
     assert_eq!(missing(&doc, top, bottom), [Missing::Emphasis(1)]);
 
     // Ten lines each side of the separator: rows 0..10, 10, 11..21.
-    assert!(doc.expand(0, 1));
+    assert!(doc.expand(0, 1, unified));
     assert_eq!(doc.shown(0, 1).map(Shown::rows), Some(21));
     assert_eq!(
         missing(&doc, at(0, 3, 10), at(0, 3, 10)),
@@ -131,8 +131,11 @@ fn lines_revealed_inside_a_gap_show_between_two_separators() {
     };
     // Gap 1 holds lines 7 to 56; line 30 is its 24th, so offset 23.
     doc.pos = at(0, 3, 0);
-    assert!(doc.reveal_lines(0, Side::New, 29..30, 2));
-    assert!(!doc.reveal_lines(0, Side::New, 29..30, 2), "already shown");
+    assert!(doc.reveal_lines(0, Side::New, 29..30, 2, unified));
+    assert!(
+        !doc.reveal_lines(0, Side::New, 29..30, 2, unified),
+        "already shown"
+    );
     let shown = doc.shown(0, 1).expect("loaded");
     let lines: Vec<Option<usize>> = (0..shown.rows()).map(|r| shown.line(r)).collect();
     assert_eq!(
@@ -151,29 +154,46 @@ fn lines_revealed_inside_a_gap_show_between_two_separators() {
 
     // On line 24 of the gap, then lines next to the top edge join it.
     doc.pos = at(0, 3, 4);
-    assert!(doc.reveal_lines(0, Side::Old, 7..8, 2));
+    assert!(doc.reveal_lines(0, Side::Old, 7..8, 2, unified));
     let shown = doc.shown(0, 1).expect("loaded");
     assert_eq!((shown.top, shown.rows()), (4, 4 + 1 + 5 + 1));
     assert_eq!(doc.pos, at(0, 3, 4 + 1 + 3), "on the same line");
 
     // 41 hidden lines: `x` reveals 20 from the edges.
-    assert!(doc.expand(0, 1));
+    assert!(doc.expand(0, 1, unified));
     assert_eq!(doc.shown(0, 1).map(Shown::hidden), Some(21));
     assert_eq!(doc.pos, at(0, 3, 14 + 1 + 3));
 
     // Left for another file, then lines just above the window join it.
     let _ = doc.goto_file(1);
-    assert!(doc.reveal_lines(0, Side::New, 24..25, 2));
+    assert!(doc.reveal_lines(0, Side::New, 24..25, 2, unified));
     assert_eq!(doc.goto_file(0), Some(Settle::Keep));
     assert_eq!(doc.pos, at(0, 3, 14 + 1 + 8));
 
     // 16 hidden lines: `x` opens them whole.
-    assert!(doc.expand(0, 1));
+    assert!(doc.expand(0, 1, unified));
     assert_eq!(
         doc.shown(0, 1).map(|s| (s.hidden(), s.rows())),
         Some((0, 50))
     );
     assert_eq!(doc.pos, at(0, 3, 24));
+}
+
+/// Revealing one gap leaves a position in another where it was, down to
+/// the screen row inside its line.
+#[test]
+fn revealing_a_gap_keeps_a_position_in_another() {
+    let mut doc = Document::<()>::default();
+    doc.push(long_diff("long.c").change, Source::Repo);
+    let _ = doc.load(0, Ok(prepared(long_diff("long.c"))));
+    assert!(doc.expand(0, 1, unified));
+    let on_a_line = Pos {
+        offset: 2,
+        ..at(0, 3, 2)
+    };
+    doc.pos = on_a_line;
+    assert!(doc.expand(0, 2, unified));
+    assert_eq!(doc.pos, on_a_line);
 }
 
 #[test]
@@ -182,8 +202,8 @@ fn an_edge_revealed_past_a_window_keeps_its_lines() {
     doc.push(long_diff("long.c").change, Source::Repo);
     let _ = doc.load(0, Ok(prepared(long_diff("long.c"))));
     // Line 53, the gap's 47th: 49 lines stay hidden, so ten from each edge.
-    assert!(doc.reveal_lines(0, Side::New, 52..53, 0));
-    assert!(doc.expand(0, 1));
+    assert!(doc.reveal_lines(0, Side::New, 52..53, 0, unified));
+    assert!(doc.expand(0, 1, unified));
     let shown = doc.shown(0, 1).expect("loaded");
     assert_eq!((shown.top, shown.bottom, shown.windows), (10, 10, &[][..]));
 }
@@ -196,9 +216,12 @@ fn a_view_swap_keeps_only_the_lines_the_host_revealed() {
     doc.push(long_diff("long.md").change, Source::Repo);
     let _ = doc.load(0, Ok(prepared(long_diff("long.md"))));
     // Ten lines from each edge of gap 1, which holds lines 7 to 56.
-    assert!(doc.expand(0, 1));
-    assert!(!doc.reveal_lines(0, Side::New, 9..10, 0), "in the top edge");
-    assert!(doc.reveal_lines(0, Side::New, 29..30, 0));
+    assert!(doc.expand(0, 1, unified));
+    assert!(
+        !doc.reveal_lines(0, Side::New, 9..10, 0, unified),
+        "in the top edge"
+    );
+    assert!(doc.reveal_lines(0, Side::New, 29..30, 0, unified));
     let diff = Arc::clone(doc.diff_of(0).expect("loaded"));
     let _ = doc.set_rendered(0, &diff, Ok(prepared(long_diff("long.md"))));
     let _ = doc.set_rendered_mode(true);
@@ -231,7 +254,7 @@ fn lines_revealed_under_the_rendered_view_show_in_the_line_diff() {
     let diff = Arc::clone(doc.diff_of(0).expect("loaded"));
     let _ = doc.set_rendered_mode(true);
     let _ = doc.set_rendered(0, &diff, Ok(prepared(long_diff("long.md"))));
-    assert!(!doc.reveal_lines(0, Side::New, 29..30, 0));
+    assert!(!doc.reveal_lines(0, Side::New, 29..30, 0, unified));
     assert_eq!(doc.shown(0, 1).map(|s| s.windows.len()), Some(0));
     let _ = doc.set_rendered_mode(false);
     assert_eq!(
@@ -250,7 +273,7 @@ fn a_saved_place_follows_a_reveal_after_the_list_moved() {
     doc.push(long_diff("b.c").change, Source::Repo);
     let _ = doc.load(0, Ok(prepared(long_diff("a.c"))));
     doc.open(0, unified);
-    assert!(doc.expand(0, 1));
+    assert!(doc.expand(0, 1, unified));
     // Gap line 44, in the bottom edge.
     doc.pos = at(0, 3, 15);
     let _ = doc.goto_file(1);
@@ -262,7 +285,7 @@ fn a_saved_place_follows_a_reveal_after_the_list_moved() {
         staging: None,
     };
     assert_eq!(doc.set_page(Some((page, 1))), 1);
-    assert!(doc.reveal_lines(1, Side::New, 29..30, 2));
+    assert!(doc.reveal_lines(1, Side::New, 29..30, 2, unified));
     let _ = doc.goto_file(1);
     // Below a window of five lines and its separator.
     assert_eq!(doc.pos, at(1, 3, 15 + 6));

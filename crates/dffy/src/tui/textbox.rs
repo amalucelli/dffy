@@ -8,7 +8,7 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::term::{Key, Mods};
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub(crate) struct TextBox {
     text: String,
     /// A byte offset into `text`, on a character boundary.

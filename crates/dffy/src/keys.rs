@@ -2,10 +2,16 @@
 //! defaults are here; `keybind = <key>=<action>` lines in the config file
 //! change them, Ghostty-style, and `<key>=unbind` frees a key.
 //!
-//! There are two tables. Keys pressed while the file tree has focus look
-//! in the tree's table first (`keybind = tree:<key>=<action>`), then in the
-//! main one, so `v` marks a file viewed in the tree and selects lines in the
-//! diff.
+//! Keys pressed while the file tree has focus look in the tree's table
+//! first (`keybind = tree:<key>=<action>`), then in the main one, so `v`
+//! marks a file viewed in the tree and selects lines in the diff. The same
+//! goes for the thread's table (`thread:`) while a comment thread has the
+//! keys, so `r` replies there and toggles the rendered view elsewhere, and
+//! for the conflict's table (`conflict:`) while the file at the cursor has
+//! conflicts to resolve, so `o` keeps the current side there and finds a
+//! file elsewhere. A thread's keys come before a conflict's. The command
+//! panel has a table of its own (`leader:`), whose keys mean what they mean
+//! in the diff wherever the diff binds them too.
 
 use crate::config::Invalid;
 use crate::render::Canvas;
@@ -99,6 +105,16 @@ actions! {
     ToggleWatch "toggle_watch" "toggle watch" "watch for changes",
     ToggleMouse "toggle_mouse" "toggle mouse" "take mouse input, or leave it to the terminal's own selection (many terminals select natively with shift held while dragging)",
     ToggleCopyDecorations "toggle_copy_decorations" "copy decorations" "copies include line numbers and +/- signs, or only the code",
+    Stage "stage" "stage lines" "stage the selected lines, else the hunk of the line last tapped or the first on screen: their working-tree version goes in the index (uncommitted changes only)",
+    Unstage "unstage" "unstage lines" "unstage the selected lines, else the hunk of the line last tapped or the first on screen: their HEAD version goes back in the index (uncommitted changes only)",
+    Discard "discard" "discard lines" "discard the selected lines' unstaged changes, else the hunk's, after a y/n: the working tree gets back the index's version, and an untracked file is deleted (uncommitted changes only)",
+    NextConflict "next_conflict" "next conflict" "in a conflicted file, the next conflict",
+    PrevConflict "prev_conflict" "prev conflict" "in a conflicted file, the previous conflict",
+    KeepCurrent "keep_current" "keep current" "resolve the conflict last gone to, else the first on screen, to the current side (ours); again takes the choice back. Choices show as a preview until written",
+    TakeIncoming "take_incoming" "take incoming" "resolve the conflict to the incoming side (theirs); again takes the choice back",
+    KeepBoth "keep_both" "keep both" "resolve the conflict to both sides, the current one first; again takes the choice back",
+    TakeBase "take_base" "take base" "resolve the conflict to the common ancestor's lines, when git wrote them (merge.conflictStyle diff3 or zdiff3); again takes the choice back",
+    WriteResolution "write_resolution" "write resolved" "write the conflicted file as the choices resolve it, asking first when some conflicts have none; then git add it after a y/n",
     Edit "edit" "open in editor" "open the file in $EDITOR at the line last tapped, else the top line",
     Comment "comment" "comment on lines" "comment on the selected lines, or the line v would start on, in a text box under them; esc saves it",
     SuggestChange "suggest_change" "suggest change" "suggest a change to the selected lines, or the line v would start on: a comment's text box holding them, to edit into what they should be; esc saves it",
@@ -108,6 +124,13 @@ actions! {
     PrevThread "prev_thread" "prev thread" "previous comment thread, back into the previous file with comments",
     ToggleThread "toggle_thread" "fold thread" "fold or unfold the focused comment thread, or the first on screen",
     ToggleThreads "toggle_threads" "fold all threads" "fold every comment thread to one row, or unfold them all",
+    MoveThread "move_thread" "move thread here" "move the focused thread, or the comments panel's selected one, from the branch it was written on to the current branch",
+    Reply "reply" "reply to thread" "on a thread: reply in a text box under it; esc saves it",
+    EditDraft "edit_draft" "edit thread draft" "on a thread: edit your last draft in it, in a text box; esc saves it",
+    DeleteDraft "delete_draft" "delete thread draft" "on a thread: delete your last draft in it, the whole thread when that's its first comment, once the key comes again",
+    Resolve "resolve" "resolve thread" "on a thread: resolve it, or reopen it",
+    Adopt "adopt" "make thread yours" "on a thread: someone else's comments in it not posted, as an agent's, become your drafts, which posting sends under your name",
+    OpenOnHost "open_on_host" "open thread on host" "on a thread: open it on its code host, in the browser",
     CommentInEditor "comment_in_editor" "comment in $EDITOR" "write in $EDITOR: your draft in the focused thread, else a reply to it, else a comment on the line; ctrl+g does it from the text box",
     CommentedFiles "commented_files" "files with comments" "the tree shows only the files with comments, or every file; f/F and n/N keep to them",
     ReviewPull "review_pull" "update the review" "on a review a review plugin opened, fetch its new commits and threads and show them in place (experimental, see review)",
@@ -126,21 +149,33 @@ actions! {
 pub(crate) enum Table {
     Main,
     Tree,
+    Thread,
+    Conflict,
     Leader,
 }
 
 impl Table {
+    const ALL: [Self; 5] = [
+        Self::Main,
+        Self::Tree,
+        Self::Thread,
+        Self::Conflict,
+        Self::Leader,
+    ];
+
     /// The prefix of its keys in `keybind` lines.
     fn prefix(self) -> &'static str {
         match self {
             Self::Main => "",
             Self::Tree => "tree:",
+            Self::Thread => "thread:",
+            Self::Conflict => "conflict:",
             Self::Leader => "leader:",
         }
     }
 }
 
-use Table::{Leader as L, Main as M, Tree as T};
+use Table::{Conflict as Cf, Leader as L, Main as M, Thread as Th, Tree as T};
 
 /// The defaults: `(table, key, action)`. The leader's are in the order its
 /// menu shows them, grouped by [`Group`].
@@ -212,6 +247,16 @@ const DEFAULTS: &[(Table, &str, Action)] = &[
     (M, "d", Action::ToggleSyntax),
     (M, "r", Action::ToggleRendered),
     (M, "w", Action::ToggleWatch),
+    (M, "A", Action::Stage),
+    (M, "U", Action::Unstage),
+    (M, "D", Action::Discard),
+    (Cf, "n", Action::NextConflict),
+    (Cf, "N", Action::PrevConflict),
+    (Cf, "o", Action::KeepCurrent),
+    (Cf, "t", Action::TakeIncoming),
+    (Cf, "b", Action::KeepBoth),
+    (Cf, "a", Action::TakeBase),
+    (Cf, "w", Action::WriteResolution),
     (M, "e", Action::Edit),
     (M, "c", Action::Comment),
     (M, "S", Action::SuggestChange),
@@ -221,45 +266,60 @@ const DEFAULTS: &[(Table, &str, Action)] = &[
     (M, "M", Action::PrevThread),
     (M, "z", Action::ToggleThread),
     (M, "Z", Action::ToggleThreads),
+    (M, "V", Action::MoveThread),
+    (M, "E", Action::CommentInEditor),
+    (Th, "r", Action::Reply),
+    (Th, "e", Action::EditDraft),
+    (Th, "d", Action::DeleteDraft),
+    (Th, "x", Action::Resolve),
+    (Th, "a", Action::Adopt),
+    (Th, "o", Action::OpenOnHost),
     (T, "c", Action::CommentedFiles),
     (M, "p", Action::ReviewPull),
     (M, "P", Action::ReviewPost),
+    (M, "O", Action::OpenReview),
+    (M, "R", Action::SinceLastReview),
     (M, "?", Action::Help),
     (M, "q", Action::Quit),
     (M, "ctrl+c", Action::Quit),
+    // A key here that the diff binds too means what it means there
+    // (`a_leader_key_that_main_binds_runs_mains_action`); the rest take
+    // keys the diff leaves free, a symbol when no letter is. Not `h`/`l`:
+    // the panel steps values with those; not `/`: it filters its rows with
+    // that, so searching is the diff's `/`.
     (L, "s", Action::CycleLayout),
-    (L, "w", Action::ToggleWrap),
+    (L, "W", Action::ToggleWrap),
     (L, "d", Action::ToggleSyntax),
     (L, "r", Action::ToggleRendered),
     (L, "x", Action::Expand),
     (L, "X", Action::ToggleFull),
-    (L, "i", Action::CycleIndicators),
-    (L, "e", Action::CycleModifiedLines),
-    // Not `h`/`l`: the panel steps values with those.
-    (L, "H", Action::ToggleHighlight),
-    (L, "W", Action::ToggleWhitespace),
-    (L, "L", Action::ToggleLineNumbers),
-    (L, "m", Action::ToggleHunkHeaders),
-    (L, "b", Action::ToggleStatusBar),
+    (L, "K", Action::CycleIndicators),
+    (L, "%", Action::CycleModifiedLines),
+    (L, "*", Action::ToggleHighlight),
+    (L, "I", Action::ToggleWhitespace),
+    (L, "#", Action::ToggleLineNumbers),
+    (L, "@", Action::ToggleHunkHeaders),
+    (L, "B", Action::ToggleStatusBar),
     (L, "o", Action::OpenPicker),
-    (L, "f", Action::FilterTree),
-    (L, "C", Action::CommentedFiles),
-    // Not `/`: the panel filters its rows with that.
-    (L, "S", Action::Search),
+    (L, "|", Action::FilterTree),
+    (L, "!", Action::CommentedFiles),
     (L, "t", Action::ToggleTree),
-    (L, "n", Action::NextFile),
-    (L, "p", Action::PrevFile),
+    (L, "f", Action::NextFile),
+    (L, "F", Action::PrevFile),
     (L, "y", Action::Copy),
     (L, "Y", Action::CopyPath),
-    (L, "D", Action::ToggleCopyDecorations),
-    (L, "M", Action::ToggleMouse),
-    (L, "a", Action::ToggleWatch),
-    (L, "c", Action::CycleTheme),
+    (L, "J", Action::ToggleCopyDecorations),
+    (L, "A", Action::Stage),
+    (L, "U", Action::Unstage),
+    (L, "D", Action::Discard),
+    (L, "$", Action::ToggleMouse),
+    (L, "w", Action::ToggleWatch),
+    (L, "a", Action::CycleTheme),
     (L, "E", Action::CommentInEditor),
-    (L, "g", Action::SuggestChange),
-    (L, "P", Action::OpenReview),
+    (L, "S", Action::SuggestChange),
+    (L, "O", Action::OpenReview),
     (L, "R", Action::SinceLastReview),
-    (L, "A", Action::WholeReview),
+    (L, "Q", Action::WholeReview),
     (L, "?", Action::Help),
 ];
 
@@ -270,16 +330,18 @@ pub(crate) enum Group {
     Files,
     View,
     Copy,
+    Changes,
     Modes,
     Other,
 }
 
 impl Group {
-    pub(crate) const ALL: [Self; 6] = [
+    pub(crate) const ALL: [Self; 7] = [
         Self::Navigation,
         Self::Files,
         Self::View,
         Self::Copy,
+        Self::Changes,
         Self::Modes,
         Self::Other,
     ];
@@ -290,6 +352,7 @@ impl Group {
             Self::Files => "files/tree",
             Self::View => "view",
             Self::Copy => "selection & copy",
+            Self::Changes => "stage, discard & resolve",
             Self::Modes => "watch & modes",
             Self::Other => "other",
         }
@@ -352,6 +415,16 @@ impl Action {
             | Self::CopyThread
             | Self::Cancel
             | Self::ToggleCopyDecorations => Group::Copy,
+            Self::Stage
+            | Self::Unstage
+            | Self::Discard
+            | Self::NextConflict
+            | Self::PrevConflict
+            | Self::KeepCurrent
+            | Self::TakeIncoming
+            | Self::KeepBoth
+            | Self::TakeBase
+            | Self::WriteResolution => Group::Changes,
             Self::ToggleWatch | Self::ToggleMouse => Group::Modes,
             Self::Leader
             | Self::Edit
@@ -360,6 +433,13 @@ impl Action {
             | Self::CommentFile
             | Self::Comments
             | Self::CommentInEditor
+            | Self::MoveThread
+            | Self::Reply
+            | Self::EditDraft
+            | Self::DeleteDraft
+            | Self::Resolve
+            | Self::Adopt
+            | Self::OpenOnHost
             | Self::ReviewPull
             | Self::ReviewPost
             | Self::OpenReview
@@ -400,6 +480,16 @@ impl Action {
             Self::CopyComment => "Copy comment",
             Self::CopyThread => "Copy thread",
             Self::ToggleCopyDecorations => "Copy with line numbers and signs",
+            Self::Stage => "Stage lines",
+            Self::Unstage => "Unstage lines",
+            Self::Discard => "Discard lines…",
+            Self::NextConflict => "Next conflict",
+            Self::PrevConflict => "Previous conflict",
+            Self::KeepCurrent => "Keep current (ours)",
+            Self::TakeIncoming => "Take incoming (theirs)",
+            Self::KeepBoth => "Keep both",
+            Self::TakeBase => "Take base",
+            Self::WriteResolution => "Write resolved file…",
             Self::ToggleMouse => "Mouse selection",
             Self::ToggleWatch => "Watch for changes",
             Self::CommentInEditor => "Continue in editor",
@@ -408,6 +498,7 @@ impl Action {
             Self::OpenReview => "Open review…",
             Self::SinceLastReview => "Since last review",
             Self::WholeReview => "Show whole review",
+            Self::MoveThread => "Move thread to this branch",
             Self::Help => "All keys",
             other => other.label(),
         }
@@ -467,6 +558,16 @@ impl Action {
             Self::ToggleWatch => "watch",
             Self::ToggleMouse => "mouse",
             Self::ToggleCopyDecorations => "copy decorations",
+            Self::Stage => "stage",
+            Self::Unstage => "unstage",
+            Self::Discard => "discard",
+            Self::NextConflict => "next conflict",
+            Self::PrevConflict => "previous conflict",
+            Self::KeepCurrent => "keep current",
+            Self::TakeIncoming => "take incoming",
+            Self::KeepBoth => "keep both",
+            Self::TakeBase => "take base",
+            Self::WriteResolution => "write resolved file",
             Self::Edit => "edit",
             Self::Comment => "comment",
             Self::SuggestChange => "suggest change",
@@ -476,6 +577,13 @@ impl Action {
             Self::PrevThread => "previous thread",
             Self::ToggleThread => "fold thread",
             Self::ToggleThreads => "fold threads",
+            Self::MoveThread => "move thread here",
+            Self::Reply => "reply",
+            Self::EditDraft => "edit draft",
+            Self::DeleteDraft => "delete draft",
+            Self::Resolve => "resolve",
+            Self::Adopt => "make it yours",
+            Self::OpenOnHost => "open on host",
             Self::CommentInEditor => "comment in editor",
             Self::CommentedFiles => "files with comments",
             Self::ReviewPull => "update review",
@@ -621,6 +729,8 @@ fn unknown_key(name: &str) -> Invalid {
 pub(crate) struct Keys {
     main: Vec<(Chord, Action)>,
     tree: Vec<(Chord, Action)>,
+    thread: Vec<(Chord, Action)>,
+    conflict: Vec<(Chord, Action)>,
     leader: Vec<(Chord, Action)>,
 }
 
@@ -633,6 +743,8 @@ impl Default for Keys {
         let mut keys = Self {
             main: Vec::new(),
             tree: Vec::new(),
+            thread: Vec::new(),
+            conflict: Vec::new(),
             leader: Vec::new(),
         };
         for &(table, key, action) in DEFAULTS {
@@ -648,6 +760,8 @@ impl Keys {
         match table {
             Table::Main => &mut self.main,
             Table::Tree => &mut self.tree,
+            Table::Thread => &mut self.thread,
+            Table::Conflict => &mut self.conflict,
             Table::Leader => &mut self.leader,
         }
     }
@@ -656,6 +770,8 @@ impl Keys {
         match table {
             Table::Main => &self.main,
             Table::Tree => &self.tree,
+            Table::Thread => &self.thread,
+            Table::Conflict => &self.conflict,
             Table::Leader => &self.leader,
         }
     }
@@ -666,8 +782,9 @@ impl Keys {
     }
 
     /// Applies a `keybind` value: `<key>=<action>`, `<key>=unbind`, either
-    /// with `tree:` before the key for the tree's table or `leader:` for
-    /// the command panel.
+    /// with `tree:` before the key for the tree's table, `thread:` for the
+    /// thread's, `conflict:` for the conflict's or `leader:` for the command
+    /// panel.
     pub(crate) fn bind(&mut self, value: &str) -> Result<(), Invalid> {
         // At the last `=`, so `==` binds the `=` key.
         let Some((key, action)) = value.rsplit_once('=').filter(|(k, _)| !k.is_empty()) else {
@@ -676,11 +793,10 @@ impl Keys {
                 hint: Some("for example: keybind = ctrl+d=half_page_down".to_owned()),
             });
         };
-        let (table, key) = match (key.strip_prefix("tree:"), key.strip_prefix("leader:")) {
-            (Some(key), _) if !key.is_empty() => (Table::Tree, key),
-            (_, Some(key)) if !key.is_empty() => (Table::Leader, key),
-            _ => (Table::Main, key),
-        };
+        let (table, key) = [Table::Tree, Table::Thread, Table::Conflict, Table::Leader]
+            .into_iter()
+            .find_map(|t| Some((t, key.strip_prefix(t.prefix()).filter(|k| !k.is_empty())?)))
+            .unwrap_or((Table::Main, key));
         let chord = Chord::parse(key.trim())?;
         let action = action.trim();
         let action = match Action::ALL.iter().find(|a| a.name() == action) {
@@ -731,9 +847,42 @@ impl Keys {
         })
     }
 
+    /// The action of `key` with `mods` while a thread has the keys, which
+    /// takes the key before [`Keys::action`]: only a key bound exactly.
+    pub(crate) fn thread_action(&self, key: Key, mods: Mods) -> Option<Action> {
+        let chord = Chord { key, mods };
+        (self.thread.iter())
+            .find(|(c, _)| *c == chord)
+            .map(|&(_, a)| a)
+    }
+
     /// The keys bound to `action`, in the main table or the tree's.
     pub(crate) fn chords(&self, tree: bool, action: Action) -> impl Iterator<Item = Chord> + '_ {
-        self.table(if tree { Table::Tree } else { Table::Main })
+        self.in_table(if tree { Table::Tree } else { Table::Main }, action)
+    }
+
+    /// The keys bound to `action` while a thread has the keys.
+    pub(crate) fn thread_chords(&self, action: Action) -> impl Iterator<Item = Chord> + '_ {
+        self.in_table(Table::Thread, action)
+    }
+
+    /// The action of `key` with `mods` while the file at the cursor has
+    /// conflicts to resolve, which takes the key after a thread's and
+    /// before [`Keys::action`]: only a key bound exactly.
+    pub(crate) fn conflict_action(&self, key: Key, mods: Mods) -> Option<Action> {
+        let chord = Chord { key, mods };
+        (self.conflict.iter())
+            .find(|(c, _)| *c == chord)
+            .map(|&(_, a)| a)
+    }
+
+    /// The keys bound to `action` in a file with conflicts to resolve.
+    pub(crate) fn conflict_chords(&self, action: Action) -> impl Iterator<Item = Chord> + '_ {
+        self.in_table(Table::Conflict, action)
+    }
+
+    fn in_table(&self, table: Table, action: Action) -> impl Iterator<Item = Chord> + '_ {
+        self.table(table)
             .iter()
             .filter(move |(_, a)| *a == action)
             .map(|&(c, _)| c)
@@ -742,7 +891,7 @@ impl Keys {
     /// `keybind` lines that turn the defaults into these bindings.
     pub(crate) fn render_changes(&self, c: &mut Canvas) {
         let defaults = Self::default();
-        for table in [Table::Main, Table::Tree, Table::Leader] {
+        for table in Table::ALL {
             let (ours, theirs) = (self.table(table), defaults.table(table));
             for (chord, _) in theirs {
                 if !ours.iter().any(|(c, _)| c == chord) {
@@ -776,16 +925,18 @@ pub(crate) fn render_defaults(c: &mut Canvas) {
          A key is a character as typed (n, N, <, ?) or a name (space, enter, tab, shift+tab, \
          esc, backspace, up, down, left, right, home, end, page_up, page_down, insert, delete, \
          f1 to f12), with ctrl+ or alt+ before it. Keys pressed in the file tree look in its \
-         own table first, set with tree: before the key (keybind = tree:v=mark_viewed). The \
-         command panel the leader key opens has its own table too, set with leader: \
-         (keybind = leader:z=toggle_wrap); the menu lists its entries in this order.",
+         own table first, set with tree: before the key (keybind = tree:v=mark_viewed), and so \
+         do keys pressed while a comment thread is focused, in the thread's table (thread:), \
+         then while the file at the cursor has conflicts to resolve, in the conflict's table \
+         (conflict:). The command panel the leader key opens has its own table too, set with \
+         leader: (keybind = leader:z=toggle_wrap); the menu lists its entries in this order.",
     );
     let defaults = Keys::default();
     for &action in Action::ALL {
         c.end_line();
         c.line(Role::Dim, &format!("# {}: {}", action.name(), action.doc()));
         let mut any = false;
-        for table in [Table::Main, Table::Tree, Table::Leader] {
+        for table in Table::ALL {
             for &(chord, a) in defaults.table(table) {
                 if a == action {
                     line(c, table, chord, action.name());
@@ -806,10 +957,53 @@ mod tests {
     #[test]
     fn every_default_key_reads_back_from_its_name() {
         let keys = Keys::default();
-        for (chord, _) in keys.main.iter().chain(&keys.tree).chain(&keys.leader) {
+        for (chord, _) in (keys.main.iter())
+            .chain(&keys.tree)
+            .chain(&keys.thread)
+            .chain(&keys.conflict)
+            .chain(&keys.leader)
+        {
             assert_eq!(Chord::parse(&chord.name()).ok(), Some(*chord), "{chord:?}");
         }
         assert_eq!(keys.chords(false, Action::Quit).count(), 2);
+    }
+
+    /// A key of the command panel that the diff binds too runs the same
+    /// action in both, so a key learnt in one means the same in the other.
+    #[test]
+    fn a_leader_key_that_main_binds_runs_mains_action() {
+        let keys = Keys::default();
+        let differ: Vec<String> = (keys.leader.iter())
+            .filter_map(|&(chord, action)| {
+                let (_, main) = keys.main.iter().find(|(c, _)| *c == chord)?;
+                (*main != action).then(|| {
+                    format!(
+                        "{}: {} here, {} in the diff",
+                        chord.name(),
+                        action.name(),
+                        main.name()
+                    )
+                })
+            })
+            .collect();
+        assert!(differ.is_empty(), "{differ:#?}");
+    }
+
+    /// Within a table, no key means two things.
+    #[test]
+    fn no_key_is_bound_twice_in_a_table() {
+        let keys = Keys::default();
+        for table in Table::ALL {
+            let chords = keys.table(table);
+            for (i, (chord, _)) in chords.iter().enumerate() {
+                assert!(
+                    !chords[..i].iter().any(|(c, _)| c == chord),
+                    "{}{} twice",
+                    table.prefix(),
+                    chord.name()
+                );
+            }
+        }
     }
 
     /// The `?` overlay fits two columns of key and label in about 90
@@ -842,7 +1036,11 @@ mod tests {
             "alt+j=bottom",
             "pgdn=bottom",
             "leader:z=toggle_wrap",
-            "leader:m=unbind",
+            "leader:@=unbind",
+            "thread:r=unbind",
+            "thread:R=reply",
+            "conflict:o=unbind",
+            "conflict:O=keep_current",
         ] {
             keys.bind(value)
                 .unwrap_or_else(|e| panic!("{value}: {e:?}"));
@@ -864,7 +1062,23 @@ mod tests {
                 .map(|&(_, a)| a)
         };
         assert_eq!(leader("z"), Some(Action::ToggleWrap));
-        assert_eq!(leader("m"), None);
+        // A thread's key needs its exact chord, and falls through when unbound.
+        assert_eq!(
+            keys.thread_action(Key::Char('R'), none),
+            Some(Action::Reply)
+        );
+        assert_eq!(keys.thread_action(Key::Char('r'), none), None);
+        assert_eq!(keys.thread_action(Key::Char('x'), Mods::ALT), None);
+        assert_eq!(
+            keys.thread_action(Key::Char('x'), none),
+            Some(Action::Resolve)
+        );
+        assert_eq!(
+            keys.conflict_action(Key::Char('O'), none),
+            Some(Action::KeepCurrent)
+        );
+        assert_eq!(keys.conflict_action(Key::Char('o'), none), None);
+        assert_eq!(leader("@"), None);
         assert_eq!(action(true, Key::Char('x'), none), Some(Action::MarkViewed));
         assert_eq!(action(false, Key::Char('x'), none), Some(Action::Expand));
         assert_eq!(action(false, Key::Char('='), none), Some(Action::Help));
@@ -908,7 +1122,11 @@ mod tests {
         <hint>keybind</><dim> = </>page_down=bottom
         <hint>keybind</><dim> = </>tree:v=unbind
         <hint>keybind</><dim> = </>tree:x=mark_viewed
-        <hint>keybind</><dim> = </>leader:m=unbind
+        <hint>keybind</><dim> = </>thread:r=unbind
+        <hint>keybind</><dim> = </>thread:R=reply
+        <hint>keybind</><dim> = </>conflict:o=unbind
+        <hint>keybind</><dim> = </>conflict:O=keep_current
+        <hint>keybind</><dim> = </>leader:@=unbind
         <hint>keybind</><dim> = </>leader:z=toggle_wrap
         ");
     }

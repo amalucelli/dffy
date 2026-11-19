@@ -1,8 +1,12 @@
-//! The built binary end to end, as dffy runs it: stdin closed,
-//! `DFFY_REVIEW_PROTOCOL=1`, JSON lines on stdout. A real git repository
-//! whose `origin` is a local bare repository holding the PR's ref, a stub
-//! `gh` on PATH that replays fixtures in GitHub's GraphQL shape and logs
-//! each request, and the dffy built with the workspace for `dffy comments`.
+//! The built binary end to end, as dffy runs it: a session over stdin and
+//! stdout, JSON-RPC a line, its stdout kept in a file. A real git
+//! repository whose `origin` is a local bare repository holding the PR's
+//! ref, a stub `gh` on PATH that replays fixtures in GitHub's GraphQL shape
+//! and logs each request, and the dffy built with the workspace for `dffy
+//! comments`.
+//!
+//! Most tests ask one request a session through [`Fixture::run`], which
+//! reads what the request said back as the lines [`said`] makes of it.
 #![expect(
     clippy::expect_used,
     clippy::panic,
@@ -13,8 +17,8 @@ use std::fs;
 use std::io::Write as _;
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
-use std::time::{Duration, SystemTime};
+use std::process::{Child, ChildStdin, Command, Stdio};
+use std::time::{Duration, Instant, SystemTime};
 
 use serde_json::{Value, json};
 
@@ -78,23 +82,473 @@ fn numbered(lines: impl IntoIterator<Item = String>) -> String {
     lines.into_iter().map(|l| l + "\n").collect()
 }
 
-/// The plugin's stdout: one JSON object a line, each with the protocol's
-/// `version`, which is taken out so tests compare the rest.
-fn lines(stdout: &[u8]) -> Vec<Value> {
-    String::from_utf8_lossy(stdout)
-        .lines()
-        .map(|l| {
-            let mut line: Value = serde_json::from_str(l).expect("a line is JSON");
-            let object = line.as_object_mut().expect("a line is an object");
-            assert_eq!(object.remove("version"), Some(json!(1)), "{l}");
-            line
+const WAIT: Duration = Duration::from_secs(30);
+
+/// A session with the plugin, its stdout going to `out`.
+struct Session {
+    child: Child,
+    stdin: ChildStdin,
+    out: PathBuf,
+    /// Lines of `out` read so far.
+    read: usize,
+    /// The dffy that writes what the plugin says to write, and the
+    /// comments file it goes to, as dffy keeps one.
+    writer: Option<(PathBuf, PathBuf)>,
+}
+
+/// A comments file as dffy reads it: what it holds, `null` when there's
+/// none yet.
+fn carried(file: &Path) -> Value {
+    fs::read(file).map_or(Value::Null, |bytes| {
+        serde_json::from_slice(&bytes).expect("a comments file")
+    })
+}
+
+/// What dffy carries of a review's comments file in each request about
+/// the review, as docs/plugins.md has it, the way these tests make dffy's
+/// requests. [`the_harness_carries_what_dffy_carries`] holds it to dffy's
+/// own requests for the same file.
+mod carry {
+    use serde_json::{Map, Value, json};
+
+    /// The fields of a comment dffy knows; the others are the
+    /// integration's.
+    const DFFY: [&str; 25] = [
+        "id",
+        "path",
+        "old_path",
+        "side",
+        "start_side",
+        "start",
+        "end",
+        "text",
+        "suggestion",
+        "author",
+        "created",
+        "in_reply_to",
+        "resolved",
+        "ref",
+        "anchor",
+        "distance",
+        "url",
+        "outdated",
+        "kind",
+        "label",
+        "branch",
+        "pending",
+        "post_error",
+        "host_resolved",
+        "moved_from",
+    ];
+
+    fn comments(file: &Value) -> &[Value] {
+        file["comments"].as_array().map_or(&[], Vec::as_slice)
+    }
+
+    fn integration(c: &Value) -> impl Iterator<Item = (&String, &Value)> {
+        c.as_object()
+            .into_iter()
+            .flatten()
+            .filter(|(k, _)| !DFFY.contains(&k.as_str()))
+    }
+
+    fn unsent(c: &Value) -> bool {
+        c["ref"].is_string()
+            && c["in_reply_to"].is_null()
+            && c["host_resolved"].is_boolean()
+            && c["host_resolved"] != c["resolved"].as_bool().unwrap_or_default()
+    }
+
+    /// `prepare`'s and `pull`'s `known`.
+    pub(crate) fn known(file: &Value) -> Value {
+        let known = comments(file).iter().filter(|c| c["ref"].is_string());
+        Value::Array(
+            known
+                .map(|c| {
+                    let mut entry = json!({"ref": c["ref"]});
+                    if c["anchor"].is_object() {
+                        entry["anchored"] = json!(true);
+                    }
+                    if c["pending"] == true {
+                        entry["pending"] = json!(true);
+                    }
+                    for (k, v) in integration(c) {
+                        entry[k] = v.clone();
+                    }
+                    entry
+                })
+                .collect(),
+        )
+    }
+
+    /// `dryRun`'s and `post`'s `drafts`.
+    pub(crate) fn drafts(file: &Value) -> Vec<Value> {
+        let all = comments(file);
+        let drafts = all
+            .iter()
+            .filter(|c| c["ref"].is_null() && c["author"].as_str().unwrap_or_default().is_empty());
+        drafts
+            .map(|c| {
+                let mut draft = Map::new();
+                for key in [
+                    "id",
+                    "path",
+                    "old_path",
+                    "start_side",
+                    "start",
+                    "end",
+                    "text",
+                    "suggestion",
+                    "anchor",
+                    "distance",
+                ] {
+                    if !c[key].is_null() {
+                        draft.insert(key.to_owned(), c[key].clone());
+                    }
+                }
+                if !c["end"].is_null() {
+                    draft.insert(
+                        "side".to_owned(),
+                        json!(c["side"].as_str().unwrap_or("new")),
+                    );
+                }
+                if let Some(root) = c["in_reply_to"].as_str() {
+                    let root = all.iter().find(|r| r["id"] == root);
+                    let to = match root.filter(|r| r["ref"].is_string()) {
+                        Some(root) => {
+                            let mut to = json!({"ref": root["ref"]});
+                            for (k, v) in integration(root) {
+                                to[k] = v.clone();
+                            }
+                            to
+                        }
+                        None => json!({"id": c["in_reply_to"]}),
+                    };
+                    draft.insert("in_reply_to".to_owned(), to);
+                } else if c["resolved"] == true {
+                    draft.insert("resolved".to_owned(), json!(true));
+                }
+                Value::Object(draft)
+            })
+            .collect()
+    }
+
+    /// `dryRun`'s and `post`'s `resolves`.
+    pub(crate) fn resolves(file: &Value) -> Vec<Value> {
+        comments(file)
+            .iter()
+            .filter(|c| unsent(c))
+            .map(|c| {
+                let mut entry =
+                    json!({"ref": c["ref"], "resolved": c["resolved"], "path": c["path"]});
+                if !c["end"].is_null() {
+                    entry["side"] = json!(c["side"].as_str().unwrap_or("new"));
+                    entry["end"] = c["end"].clone();
+                }
+                for (k, v) in integration(c) {
+                    entry[k] = v.clone();
+                }
+                entry
+            })
+            .collect()
+    }
+}
+
+/// The harness speaks for dffy, so it must carry what dffy carries: for
+/// the comments file in dffy's protocol fixtures, each request is the one
+/// dffy's own test holds dffy's requests to.
+#[test]
+fn the_harness_carries_what_dffy_carries() {
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../crates/dffy/tests/fixtures/review-protocol");
+    let read = |name: &str| carried(&dir.join(name));
+    let (file, local, expected) = (
+        read("review.json"),
+        read("local.json"),
+        read("requests.json"),
+    );
+    assert_eq!(
+        json!({"id": "7", "known": carry::known(&file)}),
+        expected["prepare"]
+    );
+    let mut drafts = carry::drafts(&file);
+    assert_eq!(
+        json!({"id": "7", "event": "approve", "labels": {"Code-Review": -1}, "summary": "Ship it",
+            "drafts": drafts, "resolves": carry::resolves(&file)}),
+        expected["post"]
+    );
+    drafts.extend(carry::drafts(&local));
+    assert_eq!(
+        json!({"id": "7", "drafts": drafts, "resolves": carry::resolves(&file)}),
+        expected["dryRun"]
+    );
+}
+
+impl Session {
+    /// Starts `command` and initializes it.
+    fn start(command: &mut Command, out: PathBuf) -> Self {
+        let file = fs::File::create(&out).expect("stdout file");
+        let mut child = command
+            .stdin(Stdio::piped())
+            .stdout(file)
+            .spawn()
+            .expect("runs");
+        let stdin = child.stdin.take().expect("stdin");
+        let mut session = Self {
+            child,
+            stdin,
+            out,
+            read: 0,
+            writer: None,
+        };
+        let (_, init) = session.call(
+            0,
+            "initialize",
+            &json!({"protocol": 1, "client": {"name": "test"}}),
+        );
+        let init = init.expect("initialized");
+        assert_eq!(init["protocol"], 1);
+        session
+    }
+
+    fn send(&mut self, message: &Value) {
+        writeln!(self.stdin, "{message}").expect("sent");
+    }
+
+    /// The next line the plugin wrote but what it says to write, which is
+    /// written, as dffy does.
+    fn said(&mut self) -> Value {
+        loop {
+            let message = self.next();
+            if message["method"] != "comments/apply" {
+                return message;
+            }
+            self.write(&message["params"]["ops"]);
+        }
+    }
+
+    /// Writes `ops` to the comments file with `dffy comments apply`.
+    fn write(&self, ops: &Value) {
+        let (dffy, file) = self.writer.as_ref().expect("a comments file to write");
+        let mut child = Command::new(dffy)
+            .arg("--comments")
+            .arg(file)
+            .args(["comments", "apply"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .spawn()
+            .expect("dffy runs");
+        child
+            .stdin
+            .take()
+            .expect("stdin")
+            .write_all(ops.to_string().as_bytes())
+            .expect("ops written");
+        assert!(child.wait().expect("dffy exits").success(), "{ops}");
+    }
+
+    fn notify(&mut self, method: &str, params: &Value) {
+        self.send(&json!({"jsonrpc": "2.0", "method": method, "params": params}));
+    }
+
+    /// The next line the plugin wrote.
+    fn next(&mut self) -> Value {
+        let start = Instant::now();
+        loop {
+            let text = fs::read_to_string(&self.out).expect("stdout");
+            let mut lines = text.lines().skip(self.read);
+            if let Some(line) = lines
+                .next()
+                .filter(|_| text.ends_with('\n') || lines.next().is_some())
+            {
+                self.read += 1;
+                return serde_json::from_str(line).expect("a message is JSON");
+            }
+            assert!(start.elapsed() < WAIT, "no answer: {text}");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    /// Asks `method`, and returns the notifications that came before its
+    /// answer, then the answer: its result, or its error. What it says to
+    /// write is written as it comes, as dffy writes it, and isn't returned.
+    fn call(
+        &mut self,
+        id: u64,
+        method: &str,
+        params: &Value,
+    ) -> (Vec<Value>, Result<Value, Value>) {
+        self.send(&json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params}));
+        let mut notes = Vec::new();
+        loop {
+            let message = self.said();
+            if message["id"] == id {
+                return (
+                    notes,
+                    match message.get("error") {
+                        Some(error) => Err(error.clone()),
+                        None => Ok(message["result"].clone()),
+                    },
+                );
+            }
+            notes.push(message);
+        }
+    }
+
+    /// Shuts the plugin down: it answers once what it runs is done, and
+    /// exits.
+    fn close(mut self) {
+        let (_, done) = self.call(u64::MAX, "shutdown", &Value::Null);
+        assert_eq!(done, Ok(Value::Null));
+        self.notify("exit", &Value::Null);
+        assert!(self.child.wait().expect("exits").success());
+    }
+}
+
+/// What a request said, as lines: each notification, then its result's
+/// parts, then its error as `{"error": …}`. A session or progress
+/// notification is `{"session": …}` or `{"progress": …}`, a moved head
+/// `{"head": …, "moved": true}`; a dry run's result is a `{"draft": …}`
+/// for each draft, a post's a draft for each left unposted then its
+/// counts; others are their result, `{}` none.
+fn said(method: &str, notes: Vec<Value>, answer: Result<Value, Value>) -> Run {
+    let mut lines: Vec<Value> = notes
+        .into_iter()
+        .map(|note| {
+            let params = &note["params"];
+            match note["method"].as_str() {
+                Some("session") => json!({"session": params["session"]}),
+                Some("progress") => json!({"progress": params["progress"]}),
+                Some("head/moved") => json!({"head": params["head"], "moved": true}),
+                _ => note,
+            }
         })
-        .collect()
+        .collect();
+    let mut result = |result: Value| match method {
+        "dryRun" => {
+            assert_eq!(
+                result.as_object().map(serde_json::Map::len),
+                Some(1),
+                "drafts alone: {result}"
+            );
+            let drafts = result["drafts"].as_array().into_iter().flatten();
+            lines.extend(drafts.map(|d| json!({"draft": d})));
+        }
+        "post" => {
+            let mut result = result;
+            let unposted = result["unposted"].take();
+            lines.extend(
+                unposted
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .map(|d| json!({"draft": d})),
+            );
+            result
+                .as_object_mut()
+                .expect("an object")
+                .remove("unposted");
+            lines.push(result);
+        }
+        "prepare" | "pull" => assert_eq!(result, json!({})),
+        _ => lines.push(result),
+    };
+    let code = match answer {
+        Ok(answer) => {
+            result(answer);
+            0
+        }
+        Err(error) => {
+            if let Some(data) = error.get("data") {
+                result(data.clone());
+            }
+            lines.push(json!({"error": error["message"]}));
+            1
+        }
+    };
+    Run {
+        code: Some(code),
+        lines,
+    }
+}
+
+/// The request dffy sends for what the one-shot verbs were: `prepare 7`,
+/// `post 7 --dry-run [--drafts <file>]`, `post 7 --event <event>
+/// --summary-file <file>`, `prune [--days <n>]`.
+fn request(args: &[&str]) -> (&'static str, Value) {
+    match args {
+        ["doctor"] => ("doctor", json!({})),
+        ["list"] => ("list", json!({})),
+        ["detect"] => ("detect", json!({})),
+        ["prune"] => ("prune", json!({})),
+        ["prune", "--days", days] => ("prune", json!({"days": days.parse::<u64>().expect("days")})),
+        ["prepare", pr] => ("prepare", json!({"id": pr})),
+        ["pull", pr] => ("pull", json!({"id": pr})),
+        ["post", pr, "--dry-run"] => ("dryRun", json!({"id": pr})),
+        ["post", pr, "--dry-run", "--drafts", file] => (
+            "dryRun",
+            json!({"id": pr, "drafts": carry::drafts(&carried(Path::new(file)))}),
+        ),
+        ["post", pr, "--event", event, "--summary-file", file] => (
+            "post",
+            json!({"id": pr, "event": event,
+                "summary": fs::read_to_string(file).expect("the summary")}),
+        ),
+        other => panic!("no request for {other:?}"),
+    }
 }
 
 struct Run {
     code: Option<i32>,
     lines: Vec<Value>,
+}
+
+/// A session watching the PR, which a test makes ask GitHub now.
+struct Watching {
+    session: Session,
+    /// GitHub's REST requests logged so far.
+    asked: usize,
+    rest: PathBuf,
+}
+
+impl Watching {
+    /// Back from idle: the plugin asks GitHub about the PR at once. Returns
+    /// once it has, with what it pushed for the look before.
+    fn look(&mut self) {
+        self.session.notify("idle/changed", &json!({"idle": true}));
+        self.session.notify("idle/changed", &json!({"idle": false}));
+        self.asked += 1;
+        let start = Instant::now();
+        while fs::read_to_string(&self.rest)
+            .unwrap_or_default()
+            .lines()
+            .count()
+            < self.asked
+        {
+            assert!(start.elapsed() < WAIT, "it didn't ask");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    /// The next thing pushed.
+    fn pushed(&mut self) -> Value {
+        let push = self.session.next();
+        json!({"method": push["method"], "params": push["params"]})
+    }
+
+    /// What it pushed until it asked GitHub again: nothing, once the look
+    /// before is done.
+    fn settled(mut self) -> Vec<Value> {
+        self.look();
+        let mut pushed = Vec::new();
+        let text = fs::read_to_string(&self.session.out).expect("stdout");
+        let unread = text.lines().count() - self.session.read;
+        for _ in 0..unread {
+            pushed.push(self.pushed());
+        }
+        self.session.close();
+        pushed
+    }
 }
 
 impl Run {
@@ -324,15 +778,21 @@ impl Fixture {
         fs::write(self.path("stub/gh/logged-out"), "").expect("write");
     }
 
-    /// A verb as dffy runs it, with stdout written to a file the `gh` stub
-    /// counts lines in.
+    /// A request as dffy makes it, in a session of its own, from the
+    /// verb's words (see [`request`]), with stdout written to a file the
+    /// `gh` stub counts lines in; `prefetch`, yours to run, runs as you
+    /// would.
     fn run(&self, args: &[&str]) -> Run {
-        let path = std::env::var("PATH").unwrap_or_default();
-        self.run_on(args, &format!("{}:{path}", self.path("stub/bin").display()))
+        self.finish(&mut self.command(&self.stub_path()), args)
     }
 
-    /// A verb run with nothing on PATH but git and dffy: a `gh` installed
-    /// beside git, as on CI, would otherwise be found.
+    fn stub_path(&self) -> String {
+        let path = std::env::var("PATH").unwrap_or_default();
+        format!("{}:{path}", self.path("stub/bin").display())
+    }
+
+    /// A request made with nothing on PATH but git and dffy: a `gh`
+    /// installed beside git, as on CI, would otherwise be found.
     fn run_without_gh(&self, args: &[&str]) -> Run {
         let bin = self.path("nogh");
         if !bin.exists() {
@@ -340,24 +800,19 @@ impl Fixture {
             std::os::unix::fs::symlink(real_git(), bin.join("git")).expect("git");
             std::os::unix::fs::symlink(&self.real_dffy, bin.join("dffy")).expect("dffy");
         }
-        self.run_on(args, &bin.display().to_string())
+        self.finish(&mut self.command(&bin.display().to_string()), args)
     }
 
-    /// A verb run with `DFFY` naming the workspace's dffy, as dffy runs it.
+    /// A request made with `DFFY` naming the workspace's dffy, as dffy
+    /// starts the plugin.
     fn run_as_dffy(&self, args: &[&str]) -> Run {
-        let path = std::env::var("PATH").unwrap_or_default();
-        let mut cmd = self.command(args, &format!("{}:{path}", self.path("stub/bin").display()));
-        self.finish(cmd.env("DFFY", &self.real_dffy))
+        let mut cmd = self.command(&self.stub_path());
+        self.finish(cmd.env("DFFY", &self.real_dffy), args)
     }
 
-    fn run_on(&self, args: &[&str], path: &str) -> Run {
-        self.finish(&mut self.command(args, path))
-    }
-
-    fn command(&self, args: &[&str], path: &str) -> Command {
+    fn command(&self, path: &str) -> Command {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_dffy-review-github"));
         cmd.current_dir(self.work())
-            .args(args)
             .env("PATH", path)
             .env_remove("DFFY")
             .env_remove("GH_HOST")
@@ -367,28 +822,83 @@ impl Fixture {
             .env("GIT_SSH_COMMAND", self.path("stub/ssh"))
             .env("GIT_SSH_VARIANT", "simple")
             .env_remove("GH_CONFIG_DIR")
-            .env("DFFY_REVIEW_PROTOCOL", "1")
             .env("XDG_DATA_HOME", self.path("data"))
             .env("XDG_CONFIG_HOME", self.path("config"))
             .env("GIT_CONFIG_GLOBAL", "/dev/null")
-            .env("GIT_CONFIG_NOSYSTEM", "1")
-            .stdin(Stdio::null());
+            .env("GIT_CONFIG_NOSYSTEM", "1");
         cmd
     }
 
-    fn finish(&self, cmd: &mut Command) -> Run {
-        let out = self.path("stub/out");
-        let file = fs::File::create(&out).expect("stdout file");
-        let status = cmd.stdout(file).status().expect("runs");
-        Run {
-            code: status.code(),
-            lines: lines(&fs::read(out).expect("stdout")),
+    /// A session of `cmd`'s, its stdout where the `gh` stub counts it, what
+    /// it says to write going to [`Fixture::comments_file`].
+    fn session(&self, cmd: &mut Command) -> Session {
+        let mut session = Session::start(cmd, self.path("stub/out"));
+        session.writer = Some((self.real_dffy.clone(), self.comments_file()));
+        session
+    }
+
+    fn finish(&self, cmd: &mut Command, args: &[&str]) -> Run {
+        if args == ["prefetch"] {
+            let out = cmd.args(args).stdin(Stdio::null()).output().expect("runs");
+            let line = serde_json::from_slice(&out.stdout).expect("JSON");
+            return Run {
+                code: out.status.code(),
+                lines: vec![line],
+            };
+        }
+        let (method, mut params) = request(args);
+        let file = carried(&self.comments_file());
+        match method {
+            "prepare" | "pull" => params["known"] = carry::known(&file),
+            "dryRun" | "post" => {
+                // A dry run plans the review's drafts, then the other file's.
+                let mut drafts = carry::drafts(&file);
+                drafts.extend(params["drafts"].as_array().into_iter().flatten().cloned());
+                params["drafts"] = json!(drafts);
+                params["resolves"] = json!(carry::resolves(&file));
+            }
+            _ => {}
+        }
+        let mut session = self.session(cmd);
+        let (notes, answer) = session.call(1, method, &params);
+        session.close();
+        // As dffy does once a post with an event that submits ends well.
+        if method == "post" && answer.is_ok() && params["event"] != "pending" {
+            let pending: Vec<Value> = carried(&self.comments_file())["comments"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter(|c| c["pending"] == true)
+                .map(|c| json!({"op": "upsert", "comment": {"ref": c["ref"], "pending": null}}))
+                .collect();
+            if !pending.is_empty() {
+                self.apply(&json!(pending));
+            }
+        }
+        said(method, notes, answer)
+    }
+
+    /// A session watching the PR, for [`Watching::look`].
+    fn watch(&self) -> Watching {
+        let mut session = self.session(&mut self.command(&self.stub_path()));
+        session.notify("watch", &json!({"id": PR}));
+        Watching {
+            session,
+            asked: self.rest().len(),
+            rest: self.path("stub/rest"),
         }
     }
 
-    /// The comments file the plugin keeps for the PR: under the data
-    /// directory, one directory per repository and PR.
+    /// The PR's comments file, which the test keeps as dffy does: requests
+    /// carry what [`carry`] takes of it, and what the plugin says to write
+    /// goes in it.
     fn comments_file(&self) -> PathBuf {
+        self.path("dffy/7.json")
+    }
+
+    /// What the plugin keeps for the PR, `name` in its directory: under the
+    /// data directory, one directory per repository and PR.
+    fn kept(&self, name: &str) -> PathBuf {
         let sessions = self.path("data/dffy-review-github");
         let repo = fs::read_dir(&sessions)
             .expect("a session")
@@ -396,17 +906,17 @@ impl Fixture {
             .expect("one repository")
             .expect("entry")
             .path();
-        repo.join(PR).join("comments.json")
+        repo.join(PR).join(name)
     }
 
-    /// The session as the plugin keeps it, beside the comments file.
+    /// The session as the plugin keeps it.
     fn saved_session(&self) -> Value {
-        let path = self.comments_file().with_file_name("session.json");
+        let path = self.kept("session.json");
         serde_json::from_slice(&fs::read(path).expect("a session")).expect("JSON")
     }
 
     fn save_session(&self, session: &Value) {
-        let path = self.comments_file().with_file_name("session.json");
+        let path = self.kept("session.json");
         fs::write(path, session.to_string()).expect("a session written");
     }
 
@@ -672,25 +1182,20 @@ impl Fixture {
     }
 }
 
-/// `describe` names the command dffy adds, the words its screens use, a
+/// `initialize` names the command dffy adds, the words its screens use, a
 /// PR as `PR #7`, and the events the post dialog offers: `pending` leaves
-/// the review open, the others submit it. dffy runs it from anywhere, so
-/// it needs no repository, git or gh.
+/// the review open, the others submit it. It watches. dffy starts it from
+/// anywhere, so it needs no repository, git or gh to answer.
 #[test]
-fn describe_names_the_command_from_nothing_but_itself() {
+fn initialize_names_the_command_from_nothing_but_itself() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let out = Command::new(env!("CARGO_BIN_EXE_dffy-review-github"))
-        .current_dir(dir.path())
-        .arg("describe")
-        .env("PATH", "")
-        .env("DFFY_REVIEW_PROTOCOL", "1")
-        .stdin(Stdio::null())
-        .output()
-        .expect("runs");
-    assert!(out.status.success(), "{out:?}");
-    let [described] = &lines(&out.stdout)[..] else {
-        panic!("one line: {out:?}");
-    };
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_dffy-review-github"));
+    cmd.current_dir(dir.path()).env("PATH", "");
+    let mut session = Session::start(&mut cmd, dir.path().join("out"));
+    let (_, described) = session.call(1, "initialize", &json!({"protocol": 1}));
+    let described = described.expect("an answer");
+    session.close();
+    assert_eq!(described["capabilities"], json!({"watch": true}));
     assert_eq!(
         [
             &described["command"],
@@ -797,7 +1302,7 @@ fn prepare_prints_the_session_once_the_head_is_local_then_imports_the_rest() {
         [
             json!({"session": {"id": "7", "title": "Spell out five", "url": URL,
                 "base": f.base, "head": f.head, "last_reviewed_head": null,
-                "state": "open", "comments": f.comments_file()}}),
+                "state": "open"}}),
             json!({"progress": "1/4"}),
             json!({"progress": "4/4"}),
         ]
@@ -908,13 +1413,14 @@ fn a_warm_prepare_on_a_new_base_asks_for_the_files_again() {
     assert_eq!(f.rest().len(), 2, "{:?}", f.rest());
 }
 
-/// `check` asks GitHub's REST API for the PR, with the `ETag` of its last
-/// answer: a 304, which costs no rate limit, answers from what the last
-/// 200 said. `comments_moved` says the PR changed since the last import,
-/// as a new comment changes it; `moved`, that its head did. It runs no
-/// git fetch, ls-remote or ssh, and no GraphQL.
+/// Watching the PR dffy shows asks GitHub's REST API for it, with the
+/// `ETag` of its last answer: a 304, which costs no rate limit, answers
+/// from what the last 200 said. It pushes `comments/changed` once the PR
+/// changed since the last import, as a new comment changes it, and
+/// `head/moved` once its head did, each once. It runs no git fetch,
+/// ls-remote or ssh, and no GraphQL.
 #[test]
-fn check_asks_github_by_etag_and_never_git() {
+fn watching_asks_github_by_etag_and_never_git() {
     let f = Fixture::new();
     f.prepare();
     f.log_git();
@@ -937,21 +1443,26 @@ fn check_asks_github_by_etag_and_never_git() {
         "",
     );
     f.pull_answer(Some(5), "\"three\"", &f.head2, "2026-11-17T09:00:00Z");
-    let check = |head: &str, moved: bool, comments_moved: bool| {
-        let run = f.run(&["check", PR]);
-        run.ok();
-        assert_eq!(
-            run.lines,
-            [json!({"head": head, "moved": moved, "comments_moved": comments_moved})]
-        );
-    };
-    check(&f.head, false, false);
-    check(&f.head, false, false);
-    check(&f.head, false, true);
-    check(&f.head, false, true);
-    check(&f.head2, true, true);
+    f.http(
+        "pull",
+        Some(6),
+        "304 Not Modified",
+        &[("Etag", "\"three\"")],
+        "",
+    );
+    let mut watching = f.watch();
+    for _ in 0..5 {
+        watching.look();
+    }
+    assert_eq!(
+        watching.settled(),
+        [
+            json!({"method": "comments/changed", "params": {"id": PR}}),
+            json!({"method": "head/moved", "params": {"id": PR, "head": f.head2}}),
+        ]
+    );
 
-    let sent: Vec<String> = f.rest()[1..].to_vec();
+    let sent: Vec<String> = f.rest()[1..6].to_vec();
     let path = format!("api --hostname github.com repos/acme/widgets/pulls/{PR} --include");
     assert_eq!(
         sent.iter()
@@ -993,13 +1504,16 @@ fn a_used_up_rate_limit_says_when_it_resets() {
         ],
         r#"{"message":"API rate limit exceeded"}"#,
     );
-    let run = f.run(&["check", PR]);
-    assert_eq!(run.code, Some(1));
+    let mut watching = f.watch();
+    watching.look();
+    let said = watching.pushed();
+    assert_eq!(said["method"], "log");
+    let said = said["params"]["message"].as_str().expect("words");
     assert!(
-        run.error().contains("resets at 14:05 UTC"),
-        "{}",
-        run.error()
+        said.starts_with("checking #7 failed: ") && said.contains("resets at 14:05 UTC"),
+        "{said}"
     );
+    assert_eq!(watching.settled(), [] as [Value; 0], "said once");
 
     let limited = json!({"data": null, "errors": [{"type": "RATE_LIMITED",
         "message": "API rate limit exceeded for user ID 1."}]});
@@ -1032,17 +1546,15 @@ fn pull_moves_the_session_to_the_new_head_and_leaves_the_last_reviewed_one() {
         [
             json!({"session": {"id": "7", "title": "Spell out five", "url": URL,
                 "base": f.base, "head": f.head2, "last_reviewed_head": null,
-                "state": "open", "comments": f.comments_file()}}),
+                "state": "open"}}),
             json!({"progress": "0/0"}),
         ]
     );
-    // What the pull imported is what GitHub has.
+    // What the pull imported is what GitHub has: nothing to push.
     f.pull_answer(None, "\"moved\"", &f.head2, "2026-11-17T08:00:00Z");
-    let check = f.run(&["check", PR]);
-    assert_eq!(
-        check.lines,
-        [json!({"head": f.head2, "moved": false, "comments_moved": false})]
-    );
+    let mut watching = f.watch();
+    watching.look();
+    assert_eq!(watching.settled(), [] as [Value; 0]);
     assert_eq!(f.run(&["prepare", PR]).session(), run.session());
 }
 
@@ -1130,7 +1642,7 @@ fn post_sends_drafts_replies_and_resolves_once_and_a_second_post_sends_nothing()
             json!({"progress": "1/3"}),
             json!({"progress": "2/3"}),
             json!({"progress": "3/3"}),
-            json!({"posted": 3, "failed": 0, "pending": 0,
+            json!({"last_reviewed_head": f.head, "posted": 3, "failed": 0, "pending": 0,
                 "url": format!("{URL}#pullrequestreview-2001")}),
         ]
     );
@@ -1186,7 +1698,7 @@ fn post_sends_drafts_replies_and_resolves_once_and_a_second_post_sends_nothing()
     assert_eq!(f.draft(&ids[1])["url"], format!("{URL}#discussion_r1103"));
     assert_eq!(f.draft(&ids[2])["ref"], "github:PRRC_kwDOAAAAB84AAAC2");
     assert_eq!(
-        f.comment("github:PRRC_kwDOAAAAB84AAAB1")["github_resolved"],
+        f.comment("github:PRRC_kwDOAAAAB84AAAB1")["host_resolved"],
         true
     );
 
@@ -1229,7 +1741,7 @@ fn a_refused_comment_stays_a_draft_saying_why_and_the_review_goes_without_it() {
         [
             json!({"draft": {"id": ids[0], "path": "src/lib.rs", "plan": "skip",
                 "reason": "Line could not be resolved"}}),
-            json!({"posted": 2, "failed": 1, "pending": 0,
+            json!({"last_reviewed_head": f.head, "posted": 2, "failed": 1, "pending": 0,
                 "url": format!("{URL}#pullrequestreview-2001")}),
         ]
     );
@@ -1252,7 +1764,7 @@ fn a_refused_comment_stays_a_draft_saying_why_and_the_review_goes_without_it() {
     run.ok();
     assert_eq!(
         *run.last(),
-        json!({"posted": 1, "failed": 0, "pending": 0,
+        json!({"last_reviewed_head": f.head, "posted": 1, "failed": 0, "pending": 0,
             "url": format!("{URL}#pullrequestreview-2001")})
     );
     let posted = f.draft(&ids[0]);
@@ -1297,7 +1809,7 @@ fn a_post_stopped_midway_fails_and_a_retry_resumes_without_posting_twice() {
     run.ok();
     assert_eq!(
         *run.last(),
-        json!({"posted": 1, "failed": 0, "pending": 2,
+        json!({"last_reviewed_head": f.head, "posted": 1, "failed": 0, "pending": 2,
             "url": format!("{URL}#pullrequestreview-2001")})
     );
     assert!(f.draft(&ids[0]).get("pending").is_none(), "submitted");
@@ -1340,7 +1852,7 @@ fn an_api_failure_keeps_every_comment_and_says_why() {
     f.run(&["pull", PR]).ok();
     let root = f.comment("github:PRRC_kwDOAAAAB84AAAB1");
     assert_eq!(root["resolved"], true);
-    assert_eq!(root["github_resolved"], false);
+    assert_eq!(root["host_resolved"], false);
     let after = f.comments();
     let drafts = |c: &Value| -> Vec<Value> {
         c.as_array()
@@ -1420,7 +1932,7 @@ fn post_places_drafts_by_their_anchor_at_the_pr_head() {
         [
             json!({"draft": {"id": local, "path": "src/lib.rs", "plan": "skip",
                 "reason": "lines not in the PR head (unpushed changes?)"}}),
-            json!({"posted": 1, "failed": 1, "pending": 0,
+            json!({"last_reviewed_head": f.head, "posted": 1, "failed": 1, "pending": 0,
                 "url": format!("{URL}#pullrequestreview-2001")}),
         ]
     );
@@ -1454,8 +1966,7 @@ fn post_places_drafts_by_their_anchor_at_the_pr_head() {
 
 /// `--dry-run` says what `post` would do with each draft, from git and
 /// what `prepare` kept: on its line at the PR's head, as a file comment, or
-/// not at all and why, then the counts. Nothing is asked of GitHub and
-/// nothing is written.
+/// not at all and why. Nothing is asked of GitHub and nothing is written.
 #[test]
 fn a_dry_run_plans_each_draft_without_asking_github() {
     let f = Fixture::new();
@@ -1492,19 +2003,16 @@ fn a_dry_run_plans_each_draft_without_asking_github() {
                 6,
                 json!({"plan": "skip", "reason": "its thread isn't posted"})
             ),
-            json!({"planned": {"line": 2, "file": 2, "skip": 3, "pending": 0, "resolves": 0}}),
         ]
     );
     assert_eq!((f.requests().len(), f.rest().len(), f.comments()), before);
 }
 
-/// The dry run counts the comments already in your pending review on
-/// GitHub, which a submitting event sends with the drafts, and the
-/// resolves and reopens waiting. `--drafts` plans another comments file's
-/// drafts after the PR's own, as `post` would once they're moved in,
-/// writing neither file.
+/// `--drafts` plans another comments file's drafts after the PR's own, as
+/// `post` would once they're moved in, writing neither file; what's
+/// pending and the resolves waiting don't change a plan.
 #[test]
-fn a_dry_run_counts_whats_pending_and_plans_drafts_from_another_file() {
+fn a_dry_run_plans_drafts_from_another_file() {
     let f = Fixture::new();
     f.prepare();
     f.apply(&json!([
@@ -1550,7 +2058,6 @@ fn a_dry_run_counts_whats_pending_and_plans_drafts_from_another_file() {
         run.lines,
         [
             json!({"draft": {"id": id, "path": "src/lib.rs", "plan": "line", "line": 13, "side": "new"}}),
-            json!({"planned": {"line": 1, "file": 0, "skip": 0, "pending": 1, "resolves": 1}}),
         ]
     );
     assert_eq!(
@@ -1619,7 +2126,7 @@ fn post_follows_the_dry_runs_plan() {
     assert_eq!(replies, 1);
     assert_eq!(
         *run.last(),
-        json!({"posted": 4, "failed": 3, "pending": 0,
+        json!({"last_reviewed_head": f.head, "posted": 4, "failed": 3, "pending": 0,
             "url": format!("{URL}#pullrequestreview-2001")})
     );
     assert_eq!(
@@ -1951,7 +2458,6 @@ fn drafts_are_planned_by_githubs_hunks_and_by_gits_where_github_left_the_patch_o
             json!({"draft": {"id": id(2), "path": "src/lib.rs", "plan": "line", "line": 13, "side": "new",
                 "unsure": true}}),
             json!({"draft": {"id": id(3), "path": "src/lib.rs", "plan": "file"}}),
-            json!({"planned": {"line": 3, "file": 1, "skip": 0, "pending": 0, "resolves": 0}}),
         ]
     );
 }
@@ -2004,13 +2510,43 @@ fn prepare_prints_the_session_without_waiting_for_the_prs_files() {
     assert!(printed >= 1, "answered before the session line: {rest:?}");
 }
 
-/// The session and hunks sit beside your drafts, and are as private.
+/// The comments file the plugin kept itself before dffy kept them plays no
+/// part in a request: the session doesn't name it, and dffy's file is the
+/// one written. `dffy comments --session import` brings it in.
+#[test]
+fn the_comments_file_kept_before_is_left_for_an_import() {
+    let f = Fixture::new();
+    f.prepare();
+    let old = f.kept("comments.json");
+    fs::write(
+        &old,
+        r#"{"version":1,"comments":[{"id":"d1","path":"src/lib.rs","text":"Old draft","author":"","created":"2026-11-17T10:00:00Z"}]}"#,
+    )
+    .expect("write");
+    f.reply("PullRequest", Some(3), "pull_request_page_1.json");
+    f.reply("PullRequest", Some(4), "pull_request_page_2.json");
+    let run = f.run(&["prepare", PR]);
+    run.ok();
+    assert_eq!(run.session().get("comments_from"), None);
+    assert!(
+        !f.comments()["comments"]
+            .as_array()
+            .expect("comments")
+            .iter()
+            .any(|c| c["text"] == "Old draft")
+    );
+    assert!(old.exists(), "left as it was");
+}
+
+/// The session and hunks say what you review, and are as private as your
+/// drafts; the drafts themselves are dffy's to keep, not the plugin's.
 #[test]
 fn what_prepare_keeps_is_readable_by_you_alone() {
     let f = Fixture::new();
     f.prepare();
-    for name in ["comments.json", "session.json", "hunks.json"] {
-        let path = f.comments_file().with_file_name(name);
+    assert!(!f.kept("comments.json").exists());
+    for name in ["session.json", "hunks.json"] {
+        let path = f.kept(name);
         let mode = fs::metadata(&path).expect("kept").permissions().mode();
         assert_eq!(mode & 0o777, 0o600, "{name}");
     }
@@ -2059,8 +2595,10 @@ fn a_post_with_nothing_new_submits_the_pending_review() {
     run.ok();
     assert_eq!(
         run.lines,
-        [json!({"posted": 0, "failed": 0, "pending": 2,
-            "url": format!("{URL}#pullrequestreview-2001")})]
+        [
+            json!({"last_reviewed_head": f.head, "posted": 0, "failed": 0, "pending": 2,
+            "url": format!("{URL}#pullrequestreview-2001")})
+        ]
     );
     assert_eq!(
         f.operations()[before..],
@@ -2089,20 +2627,14 @@ fn detect_finds_the_branchs_pr_from_its_session_else_by_one_query() {
     f.reply("Detect", None, "detect.json");
     let run = f.run(&["detect"]);
     run.ok();
-    let mut queried = run.lines[0]["review"].clone();
-    let comments = queried
-        .as_object_mut()
-        .and_then(|pr| pr.remove("comments"))
-        .expect("the comments file");
     assert_eq!(
-        queried,
+        run.lines[0]["review"],
         json!({"id": "7", "title": "Spell out five", "url": URL,
             "base": f.base, "head": f.head, "last_reviewed_head": null, "state": "open"})
     );
     assert_eq!(f.operations(), ["Detect"]);
 
     let prepared = f.prepare();
-    assert_eq!(comments, json!(f.comments_file()));
     let before = f.operations().len();
     let run = f.run(&["detect"]);
     run.ok();
@@ -2369,49 +2901,111 @@ fn prefetch_fetches_the_heads_of_the_prs_list_shows() {
     assert_eq!(git(&f.work(), &["rev-parse", "refs/dffy/pull/11"]), f.base);
 }
 
-/// Unknown verbs and events, missing arguments, and a dffy speaking another
-/// protocol get exit 2 and an error line, before anything is read or sent.
+/// Methods it doesn't have, a request without its review's number, an
+/// unknown event and a dffy speaking another protocol get JSON-RPC's
+/// errors, before anything is read or sent; the session goes on. On the
+/// command line, anything but its own commands is refused with exit 2.
 #[test]
-fn what_the_plugin_doesnt_speak_exits_2_with_an_error_line() {
-    for (args, protocol, says) in [
-        (&["frobnicate"][..], "1", "unknown verb frobnicate"),
-        (&["open", PR], "1", "unknown verb open"),
-        (&["prepare"], "1", "usage"),
+fn what_the_plugin_doesnt_speak_is_refused() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_dffy-review-github"));
+    cmd.current_dir(dir.path()).env("PATH", "/nonexistent");
+    let mut session = Session::start(&mut cmd, dir.path().join("out"));
+    for (id, (method, params, code, says)) in [
+        ("frobnicate", json!({}), -32601, "has no frobnicate"),
+        ("check", json!({"id": PR}), -32601, "has no check"),
         (
-            &["post", PR, "--event", "merge"],
-            "1",
+            "prepare",
+            json!({}),
+            -32602,
+            "isn't a pull request's number",
+        ),
+        (
+            "pull",
+            json!({"id": "seven"}),
+            -32602,
+            "isn't a pull request's number",
+        ),
+        (
+            "post",
+            json!({"id": PR, "event": "merge"}),
+            -32602,
             "unknown event merge",
         ),
-        (&["post", PR], "1", "usage"),
         (
-            &["post", PR, "--apply-event", "--event", "approve"],
-            "1",
-            "usage",
-        ),
-        (
-            &["post", PR, "--dry-run", "--event", "comment"],
-            "1",
-            "usage",
-        ),
-        (
-            &["list"],
-            "2",
+            "initialize",
+            json!({"protocol": 2}),
+            -32602,
             "speaks review protocol 1, and dffy asked for 2",
         ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let (notes, answer) = session.call(id as u64 + 1, method, &params);
+        assert_eq!(notes, [] as [Value; 0], "{method}");
+        let error = answer.expect_err(method);
+        assert_eq!(error["code"], code, "{method}");
+        let message = error["message"].as_str().expect("words");
+        assert!(message.contains(says), "{method}: {message}");
+    }
+    session.close();
+
+    for args in [
+        &["frobnicate"][..],
+        &["prepare", PR],
+        &["prune", "--days", "x"],
     ] {
         let out = Command::new(env!("CARGO_BIN_EXE_dffy-review-github"))
             .args(args)
-            .env("DFFY_REVIEW_PROTOCOL", protocol)
             .env("PATH", "/nonexistent")
             .stdin(Stdio::null())
             .output()
             .expect("runs");
         assert_eq!(out.status.code(), Some(2), "{args:?}");
-        let lines = lines(&out.stdout);
-        assert_eq!(lines.len(), 1, "{args:?}: {lines:?}");
-        let error = lines[0]["error"].as_str().expect("an error line");
-        assert!(error.contains(says), "{args:?}: {error}");
+        assert!(out.stdout.is_empty(), "{args:?}");
     }
+}
+
+/// Requests run side by side: a dry run answers while a `prepare` waits on
+/// GitHub. Cancelled, the `prepare` stops before its next page, writing
+/// none of it and removing nothing, and says it was cancelled.
+#[test]
+fn a_dry_run_answers_beside_a_prepare_which_stops_when_cancelled() {
+    let f = Fixture::new();
+    f.prepare();
+    let before = f.comments()["comments"].clone();
+    let mut page = f.answer("PullRequest.2.json");
+    page["data"]["repository"]["pullRequest"]["reviewThreads"]["nodes"][0]["comments"]["nodes"]
+        [0]["body"] = json!("Changed meanwhile.");
+    fs::write(f.path("stub/gh/PullRequest.4.json"), page.to_string()).expect("fixture");
+    f.reply("PullRequest", Some(3), "pull_request_page_1.json");
+    let gate = f.path("stub/gh/PullRequest.4.gate");
+    fs::write(&gate, "").expect("gate");
+
+    let mut session = f.session(&mut f.command(&f.stub_path()));
+    let file = carried(&f.comments_file());
+    session.send(&json!({"jsonrpc": "2.0", "id": 1, "method": "prepare",
+        "params": {"id": PR, "known": carry::known(&file)}}));
+    assert_eq!(session.said()["method"], "session");
+    assert_eq!(session.said()["params"]["progress"], "1/4");
+    let dry_run =
+        json!({"id": PR, "drafts": carry::drafts(&file), "resolves": carry::resolves(&file)});
+    let (_, planned) = session.call(2, "dryRun", &dry_run);
+    assert!(planned.is_ok(), "{planned:?}");
+    session.notify("$/cancelRequest", &json!({"id": 1}));
+    // Asked for before the cancel came.
+    let start = Instant::now();
+    while f.events().len() < 4 {
+        assert!(start.elapsed() < WAIT, "{:?}", f.events());
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    fs::remove_file(&gate).expect("open the gate");
+    let answer = session.said();
+    assert_eq!(answer["id"], 1);
+    assert_eq!(answer["error"]["code"], -32800, "{answer}");
+    session.close();
+    assert_eq!(f.comments()["comments"], before);
 }
 
 #[test]
@@ -2453,7 +3047,6 @@ fn a_comment_by_someone_else_is_never_posted() {
         run.lines,
         [
             json!({"draft": {"id": yours, "path": "src/lib.rs", "plan": "line", "line": 13, "side": "new"}}),
-            json!({"planned": {"line": 1, "file": 0, "skip": 0, "pending": 0, "resolves": 0}}),
         ]
     );
 
@@ -2587,14 +3180,7 @@ fn detect_passes_over_forks_and_prs_no_longer_open() {
     f.save_session(&fork);
     // That GitHub had none for the branch was kept.
     assert_eq!(detect(), (vec![json!({"review": null})], 0));
-    fs::remove_file(
-        f.comments_file()
-            .parent()
-            .and_then(Path::parent)
-            .expect("a repository")
-            .join("detect.json"),
-    )
-    .expect("kept");
+    fs::remove_file(f.kept("../detect.json")).expect("kept");
     assert_eq!(detect(), (vec![json!({"review": null})], 1));
 
     let mut old = session;
@@ -2855,7 +3441,7 @@ fn an_import_removes_what_github_dropped_but_keeps_a_thread_for_your_drafts() {
     let posted = |n: &str, text: &str| {
         json!({"op": "upsert", "comment": {"ref": format!("github:PRRC_{n}"), "path": "src/lib.rs",
             "text": text, "author": "", "url": URL, "github_thread": format!("PRRT_{n}"),
-            "github_resolved": false}})
+            "host_resolved": false}})
     };
     let answer = f.apply(&json!([
         {"op": "add", "comment": {"in_reply_to_ref": "github:PRRC_kwDOAAAAB84AAAB5", "text": "Adding one."}},
@@ -2893,7 +3479,7 @@ fn an_import_removes_what_github_dropped_but_keeps_a_thread_for_your_drafts() {
         ]
     );
     let kept = f.draft(file_thread["id"].as_str().expect("an id"));
-    for field in ["ref", "url", "github_thread", "github_resolved"] {
+    for field in ["ref", "url", "github_thread", "host_resolved"] {
         assert!(kept.get(field).is_none(), "{field}: {kept}");
     }
     assert_eq!(kept["author"], "octocat");
@@ -2909,7 +3495,6 @@ fn an_import_removes_what_github_dropped_but_keeps_a_thread_for_your_drafts() {
         [
             json!({"draft": {"id": id(0), "path": "notes.txt", "plan": "skip",
                 "reason": "its thread isn't posted"}}),
-            json!({"planned": {"line": 0, "file": 0, "skip": 1, "pending": 0, "resolves": 0}}),
         ]
     );
 }
@@ -2943,7 +3528,7 @@ fn a_comment_posted_during_an_import_stays_posted() {
     f.prepare();
     let posted = json!([{"op": "upsert", "comment": {"ref": "github:PRRC_racing",
         "path": "src/lib.rs", "text": "Posted meanwhile.", "author": "",
-        "github_thread": "PRRT_racing", "github_resolved": false}}]);
+        "github_thread": "PRRT_racing", "host_resolved": false}}]);
     fs::write(
         f.path("stub/gh/PullRequest.3.apply.json"),
         posted.to_string(),
@@ -2951,21 +3536,21 @@ fn a_comment_posted_during_an_import_stays_posted() {
     .expect("hook");
     f.reply("PullRequest", Some(3), "pull_request_page_1.json");
     f.reply("PullRequest", Some(4), "pull_request_page_2.json");
-    let path = std::env::var("PATH").unwrap_or_default();
-    let mut cmd = f.command(
+    let mut cmd = f.command(&f.stub_path());
+    f.finish(
+        cmd.env("STUB_COMMENTS", f.comments_file()),
         &["prepare", PR],
-        &format!("{}:{path}", f.path("stub/bin").display()),
-    );
-    f.finish(cmd.env("STUB_COMMENTS", f.comments_file())).ok();
+    )
+    .ok();
     assert_eq!(f.comment("github:PRRC_racing")["text"], "Posted meanwhile.");
 }
 
-/// A conversation comment GitHub no longer has goes with the replies
-/// drafted under it, which GitHub can't thread there: kept without its
-/// ref, it would be a general comment the comments file can't hold, and
-/// the pull would fail.
+/// A conversation comment GitHub no longer has stays while you have a
+/// draft reply under it, posted no longer, so the draft isn't lost; the
+/// draft isn't posted, as its thread isn't on GitHub, and the next pull
+/// goes as well as ever.
 #[test]
-fn a_general_comment_gone_from_github_goes_with_its_draft_replies() {
+fn a_general_comment_gone_from_github_stays_for_its_draft_replies() {
     let f = Fixture::new();
     f.reply("PullRequest", Some(1), "pull_request_conversation_1.json");
     f.reply("PullRequest", Some(2), "pull_request_conversation_2.json");
@@ -2984,9 +3569,34 @@ fn a_general_comment_gone_from_github_goes_with_its_draft_replies() {
     assert!(
         !comments
             .iter()
-            .any(|c| c["ref"] == "github:IC_kwDOAAAAB84AAAC1" || c["text"] == "Agreed."),
+            .any(|c| c["ref"] == "github:IC_kwDOAAAAB84AAAC1"),
         "{comments:?}"
     );
+    let reply = comments
+        .iter()
+        .find(|c| c["text"] == "Agreed.")
+        .expect("the draft stays");
+    let root = comments
+        .iter()
+        .find(|c| c["id"] == reply["in_reply_to"])
+        .expect("with what it answers");
+    assert!(
+        root.get("ref").is_none() && root.get("path").is_none(),
+        "{root}"
+    );
+
+    let run = f.run(&["post", PR, "--dry-run"]);
+    run.ok();
+    let planned: Vec<&Value> = run.lines.iter().map(|l| &l["draft"]).collect();
+    assert!(
+        planned
+            .iter()
+            .any(|d| d["id"] == reply["id"] && d["reason"] == "its thread isn't posted"),
+        "{planned:?}"
+    );
+    f.reply("PullRequest", Some(5), "pull_request_conversation_1.json");
+    f.reply("PullRequest", Some(6), "pull_request_conversation_2.json");
+    f.run(&["pull", PR]).ok();
 }
 
 /// The comments without a path: general comments.
@@ -3153,7 +3763,7 @@ fn an_import_reads_every_page_of_your_pending_review() {
     let posted = |n: &str| {
         json!({"op": "upsert", "comment": {"ref": format!("github:PRRC_{n}"), "path": "src/lib.rs",
             "text": "Mine.", "author": "", "url": URL, "github_thread": format!("PRRT_{n}"),
-            "github_resolved": false}})
+            "host_resolved": false}})
     };
     f.apply(&json!([posted("later"), posted("dropped")]));
     f.reply("PullRequest", Some(3), "pull_request_page_1.json");
@@ -3193,7 +3803,7 @@ fn a_second_post_while_one_runs_fails_and_sends_nothing() {
     let f = Fixture::new();
     f.prepare();
     f.add_drafts();
-    let lock = fs::File::create(f.comments_file().with_file_name("post.lock")).expect("lock file");
+    let lock = fs::File::create(f.kept("post.lock")).expect("lock file");
     lock.lock().expect("locked");
     let before = (f.operations().len(), f.comments());
     let run = f.post("comment", "");
@@ -3215,7 +3825,7 @@ fn a_second_post_while_one_runs_fails_and_sends_nothing() {
 fn age_session(f: &Fixture, days: u64) {
     fs::File::options()
         .write(true)
-        .open(f.comments_file().with_file_name("session.json"))
+        .open(f.kept("session.json"))
         .and_then(|s| s.set_modified(SystemTime::now() - Duration::from_secs(days * 86_400)))
         .expect("aged");
 }
@@ -3234,14 +3844,17 @@ fn has_pull_ref(f: &Fixture) -> bool {
         .is_ok_and(|s| s.success())
 }
 
-/// `prune` drops the session of a PR GitHub last said was merged or
+/// `prune` drops what it keeps of a PR GitHub last said was merged or
 /// closed, untouched for the days given (30 without), with its fetched
-/// ref; not one holding anything GitHub doesn't have: a draft, yours or
-/// an agent's, or a resolve not sent.
+/// ref; the PR's comments are dffy's, and stay. The comments file it kept
+/// itself before dffy kept them stays, with the PR's session, while it
+/// holds a comment without a ref or can't be read, until you've imported
+/// it and removed it.
 #[test]
-fn prune_drops_sessions_of_prs_long_closed_without_drafts() {
+fn prune_drops_what_it_keeps_of_prs_long_closed() {
     let f = Fixture::new();
     f.prepare();
+    f.add_drafts();
     let mut session = f.saved_session();
     session["state"] = json!("MERGED");
     f.save_session(&session);
@@ -3254,73 +3867,61 @@ fn prune_drops_sessions_of_prs_long_closed_without_drafts() {
     };
     age_session(&f, 10);
     assert_eq!(prune(&[]), [json!({"pruned": []})]);
-    let mut ids = f.add_drafts();
-    let agent = f.apply(&json!([{"op": "add", "comment": {"path": "src/lib.rs",
-        "text": "Off by one?", "author": "claude"}}]));
-    ids.push(agent["ids"][0].as_str().expect("an id").to_owned());
-    for keeps in ids.iter().rev() {
-        assert_eq!(prune(&["--days", "5"]), [json!({"pruned": []})], "{keeps}");
-        f.apply(&json!([{"op": "rm", "id": keeps}]));
+    let old = f.kept("comments.json");
+    for (kept, why) in [
+        (
+            r#"{"version":1,"comments":[{"id":"d","path":"a.rs","text":"Draft","author":"","created":"t"}]}"#,
+            "a draft",
+        ),
+        ("not JSON", "a file it can't read"),
+    ] {
+        fs::write(&old, kept).expect("write");
+        assert_eq!(prune(&["--days", "5"]), [json!({"pruned": []})], "{why}");
     }
-    f.apply(&json!([{"op": "set", "ref": "github:PRRC_kwDOAAAAB84AAAB1", "fields": {"resolved": true}}]));
-    assert_eq!(
-        prune(&["--days", "5"]),
-        [json!({"pruned": []})],
-        "a resolve"
-    );
-    f.apply(&json!([{"op": "set", "ref": "github:PRRC_kwDOAAAAB84AAAB1", "fields": {"resolved": false}}]));
+    // Only what GitHub has: it comes back with a pull.
+    fs::write(
+        &old,
+        r#"{"version":1,"comments":[{"id":"a","path":"a.rs","text":"Done","author":"","created":"t","ref":"github:1"}]}"#,
+    )
+    .expect("write");
     age_session(&f, 40);
     assert!(has_pull_ref(&f));
     assert_eq!(prune(&[]), [json!({"pruned": [7]})]);
-    assert!(!f.comments_file().parent().expect("a PR directory").exists());
+    assert!(!f.kept("").exists());
     assert!(!has_pull_ref(&f));
+    assert_eq!(f.comments()["comments"].as_array().map(Vec::len), Some(8));
 }
 
-/// `list` gives each PR with a session the count of your drafts in it,
-/// then prunes, at most once a day.
+/// `list` leaves counting your drafts to dffy, which keeps them; after
+/// answering it prunes, at most once a day.
 #[test]
-fn list_counts_your_drafts_and_prunes_once_a_day() {
+fn list_prunes_once_a_day() {
     let f = Fixture::new();
     f.prepare();
     f.add_drafts();
     f.reply("List", None, "list.json");
     let run = f.run(&["list"]);
     run.ok();
-    let drafts: Vec<&Value> = run.lines[0]["reviews"]
-        .as_array()
-        .expect("reviews")
-        .iter()
-        .map(|r| &r["drafts"])
-        .collect();
-    assert_eq!(drafts, [&json!(3), &Value::Null, &Value::Null]);
+    let reviews = run.lines[0]["reviews"].as_array().expect("reviews").clone();
+    assert!(
+        reviews.iter().all(|r| r.get("drafts").is_none()),
+        "{reviews:?}"
+    );
 
     // Pruned today already, so not again.
-    let rm: Vec<Value> = f.comments()["comments"]
-        .as_array()
-        .expect("comments")
-        .iter()
-        .filter(|c| c.get("ref").is_none())
-        .map(|c| json!({"op": "rm", "id": c["id"]}))
-        .collect();
-    f.apply(&json!(rm));
     let mut session = f.saved_session();
     session["state"] = json!("CLOSED");
     f.save_session(&session);
     age_session(&f, 40);
     f.run(&["list"]).ok();
-    assert!(f.comments_file().exists(), "kept until tomorrow");
+    assert!(f.kept("session.json").exists(), "kept until tomorrow");
 
-    let stamp = f
-        .comments_file()
-        .parent()
-        .and_then(Path::parent)
-        .expect("a repository")
-        .join("pruned");
+    let stamp = f.kept("../pruned");
     fs::File::options()
         .write(true)
         .open(&stamp)
         .and_then(|s| s.set_modified(SystemTime::now() - Duration::from_secs(2 * 86_400)))
         .expect("a day later");
     f.run(&["list"]).ok();
-    assert!(!f.comments_file().parent().expect("a PR directory").exists());
+    assert!(!f.kept("").exists());
 }

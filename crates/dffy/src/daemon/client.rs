@@ -4,6 +4,7 @@
 
 use std::io::{self, Write};
 use std::os::unix::net::UnixStream;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
@@ -105,7 +106,7 @@ pub(crate) fn subscribe(
 /// Subscribes through the broker and relays its events until the
 /// connection ends. `Ok` when it ended after the subscription was live.
 fn through_broker(root: &Root, shared: &Shared, sink: &Arc<Sink>) -> io::Result<()> {
-    let mut stream = connect_or_spawn()?;
+    let mut stream = connect_or_spawn(super::socket_path)?;
     stream.set_read_timeout(Some(HANDSHAKE))?;
     stream.write_all(&Message::Subscribe(root.worktree.clone()).encode())?;
     let ready = match Message::read(&mut stream)? {
@@ -133,10 +134,12 @@ fn through_broker(root: &Root, shared: &Shared, sink: &Arc<Sink>) -> io::Result<
     }
 }
 
-/// Connects to the broker, starting it when none runs.
-fn connect_or_spawn() -> io::Result<UnixStream> {
-    let dir = super::runtime_dir()?;
-    if let Ok(stream) = super::connect(&dir) {
+/// Connects to dffyd's socket that `socket` names in the runtime
+/// directory, the broker's or the control API's, starting dffyd when none
+/// serves it.
+pub(crate) fn connect_or_spawn(socket: fn(&Path) -> PathBuf) -> io::Result<UnixStream> {
+    let path = socket(&super::runtime_dir()?);
+    if let Ok(stream) = super::connect(&path) {
         return Ok(stream);
     }
     let mut child = Command::new(std::env::current_exe()?)
@@ -155,7 +158,7 @@ fn connect_or_spawn() -> io::Result<UnixStream> {
     let mut wait = Duration::from_millis(2);
     loop {
         thread::sleep(wait);
-        match super::connect(&dir) {
+        match super::connect(&path) {
             Ok(stream) => return Ok(stream),
             Err(e) if start.elapsed() >= SPAWN_WAIT => return Err(e),
             Err(_) => wait = (wait * 2).min(Duration::from_millis(40)),

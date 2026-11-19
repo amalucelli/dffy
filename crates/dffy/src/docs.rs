@@ -27,13 +27,17 @@ pub(crate) fn keys() -> String {
         let _ = writeln!(out, "\n### {}\n", capitalize(group.name()));
         out.push_str("| Action | Keys | Command panel | Description |\n|---|---|---|---|\n");
         for &action in Action::ALL.iter().filter(|a| a.group() == group) {
-            let main = spans(keys.chords(false, action));
-            let tree = spans(keys.chords(true, action));
-            let shown = match (main.is_empty(), tree.is_empty()) {
-                (_, true) => main,
-                (true, false) => format!("{tree} in the tree"),
-                (false, false) => format!("{main}; {tree} in the tree"),
-            };
+            let shown: Vec<String> = [
+                (spans(keys.chords(false, action)), ""),
+                (spans(keys.chords(true, action)), " in the tree"),
+                (spans(keys.thread_chords(action)), " on a thread"),
+                (spans(keys.conflict_chords(action)), " in a conflicted file"),
+            ]
+            .into_iter()
+            .filter(|(keys, _)| !keys.is_empty())
+            .map(|(keys, table)| format!("{keys}{table}"))
+            .collect();
+            let shown = shown.join("; ");
             let leader = spans(
                 keys.leader_entries()
                     .iter()
@@ -61,6 +65,41 @@ pub(crate) fn keys() -> String {
             let _ = writeln!(
                 out,
                 "| {tree} | `{}` | {} |",
+                action.name(),
+                cell(&capitalize(action.doc()))
+            );
+        }
+    }
+    out.push_str(
+        "\n## On a thread\n\nWhile a comment thread is focused in the diff, or selected in the \
+         comments panel, these keys come first and act on it; every other key does what it \
+         does without one. `esc` takes the focus off the thread.\n\n\
+         | Keys | Action | Description |\n|---|---|---|\n",
+    );
+    for &action in Action::ALL {
+        let thread = spans(keys.thread_chords(action));
+        if !thread.is_empty() {
+            let _ = writeln!(
+                out,
+                "| {thread} | `{}` | {} |",
+                action.name(),
+                cell(&capitalize(action.doc()))
+            );
+        }
+    }
+    out.push_str(
+        "\n## In a conflicted file\n\nWhile the file at the cursor has conflicts to resolve, \
+         these keys come after a thread's and before every other; the rest do what they do \
+         elsewhere. While a search goes on, `n` and `N` keep stepping through its matches, \
+         and past the last conflict that way they go on to the next change.\n\n\
+         | Keys | Action | Description |\n|---|---|---|\n",
+    );
+    for &action in Action::ALL {
+        let conflict = spans(keys.conflict_chords(action));
+        if !conflict.is_empty() {
+            let _ = writeln!(
+                out,
+                "| {conflict} | `{}` | {} |",
                 action.name(),
                 cell(&capitalize(action.doc()))
             );
@@ -105,6 +144,10 @@ keybind = ctrl+d=page_down
 keybind = q=unbind
 # Only while the file tree has focus
 keybind = tree:x=mark_viewed
+# Only on a focused comment thread
+keybind = thread:R=reply
+# Only in a file with conflicts to resolve
+keybind = conflict:O=keep_current
 # A key in the command panel
 keybind = leader:z=toggle_wrap
 ```
@@ -114,9 +157,12 @@ keybind = leader:z=toggle_wrap
 `page_down`, `insert`, `delete`, `f1` to `f12`. `ctrl+` and `alt+` go before the key. \
 `shift+` works with letters (`shift+n` is `N`) and `tab`; for other characters, bind the \
 shifted character itself.
-- **Tables:** there are three. Keys pressed while the tree has focus look in the tree's \
-table (`tree:`) first, then in the main one. The command panel has its own table \
-(`leader:`); rebinding a key there keeps the entry's place in the panel.
+- **Tables:** there are five. Keys pressed while the tree has focus look in the tree's \
+table (`tree:`) first, then in the main one. Keys pressed on a comment thread look in the \
+thread's table (`thread:`) first, then, in a file with conflicts to resolve, in the \
+conflict's (`conflict:`). The command panel has its own table (`leader:`); rebinding a key \
+there keeps the entry's place in the panel. By default a panel key the main table binds \
+too does the same thing there.
 - **Fallbacks:** a key pressed with `alt` or `shift` that has no binding of its own acts \
 as the plain key.
 - **`esc`:** it always backs out first (closes a panel, ends a search or filter, cancels \

@@ -5,6 +5,7 @@
 //! Nothing here knows about the viewer.
 
 use std::collections::{HashMap, HashSet};
+use std::fmt::Write as _;
 use std::fs::{self, File};
 use std::hash::{BuildHasher as _, RandomState};
 use std::io::{self, Write as _};
@@ -14,6 +15,7 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use dffy_core::diff::{Hunk, LineKind, Text};
+use dffy_core::git::{Head, Repo};
 
 use crate::plugin::json::{self, Value};
 use crate::render::{Canvas, escape};
@@ -111,6 +113,15 @@ pub(crate) struct Comment {
     /// A word the integration gives a general comment, shown as given,
     /// such as a review's verdict.
     pub label: Option<String>,
+    /// The branch a local comment was written on; the thread's, on its
+    /// first comment and copied to its replies. `None` shows on every
+    /// branch.
+    pub branch: Option<String>,
+    /// Set by an integration: on the host, visible only to you until the
+    /// review is submitted.
+    pub pending: bool,
+    /// Set by an integration: why the host refused to take the comment.
+    pub post_error: Option<String>,
     /// Fields dffy doesn't know, in file order, written back as read.
     pub extra: Fields,
 }
@@ -119,6 +130,8 @@ pub(crate) struct Comment {
 #[derive(Debug, Clone, PartialEq, Default)]
 pub(crate) struct Review {
     pub notice: Option<String>,
+    /// The review's summary as you're writing it, before it's posted.
+    pub summary: Option<String>,
     pub comments: Vec<Comment>,
     /// Top-level fields dffy doesn't know, written back as read.
     pub extra: Fields,
@@ -131,18 +144,25 @@ pub(crate) enum Target {
     Ref(String),
 }
 
-/// What a `set` changes; `None` leaves a field alone.
+/// What a `set` changes; `None` leaves a field alone, and `Some(None)`
+/// removes an optional one.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[expect(
+    clippy::option_option,
+    reason = "the JSON's three states: left out, null, and a value"
+)]
 pub(crate) struct Change {
     pub text: Option<String>,
     pub resolved: Option<bool>,
-    /// `Some(None)` removes the ref.
-    #[expect(
-        clippy::option_option,
-        reason = "the JSON's three states: left out, null, and a ref"
-    )]
     pub reference: Option<Option<String>>,
     pub anchor: Option<Anchor>,
+    /// Only to empty: the comment becomes yours.
+    pub author: Option<String>,
+    pub suggestion: Option<Option<String>>,
+    /// The whole thread's, whichever of its comments is named.
+    pub branch: Option<Option<String>>,
+    pub pending: Option<bool>,
+    pub post_error: Option<Option<String>>,
 }
 
 /// One of `dffy comments apply`'s operations.
@@ -168,6 +188,7 @@ pub(crate) enum Op {
     },
     Rm(Target),
     Notice(Option<String>),
+    Summary(Option<String>),
 }
 
 impl Op {
@@ -178,14 +199,149 @@ impl Op {
             Self::Upsert { .. } => "upsert",
             Self::Rm(_) => "rm",
             Self::Notice(_) => "notice",
+            Self::Summary(_) => "summary",
         }
     }
 }
 
-/// The file for local reviews, in the repository's (per-worktree) git
-/// directory.
-pub(crate) fn default_path(git_dir: &Path) -> PathBuf {
-    git_dir.join("dffy").join("comments.json")
+/// The local review's file, and the session pointer's, under the git
+/// directory every worktree shares.
+const LOCAL: &str = "dffy/comments.json";
+const SESSION: &str = "dffy/session";
+
+/// The git directory every worktree shares, canonical: in a linked
+/// worktree git gives it relative to the worktree's own.
+fn shared_dir(repo: &Repo) -> Option<PathBuf> {
+    let dir = repo.common_dir()?;
+    Some(dir.canonicalize().unwrap_or_else(|_| dir.to_owned()))
+}
+
+/// The local review's file, in the git directory every worktree shares;
+/// each comment's `branch` keeps branches apart. A linked worktree's file
+/// from when it was in the worktree's own git directory moves there first,
+/// once, when the shared one doesn't exist yet; when it does, the old one
+/// is left where it is. `None` for paths compared outside git.
+pub(crate) fn local_file(repo: &Repo) -> Result<Option<PathBuf>, String> {
+    let Some(file) = shared_dir(repo).map(|dir| dir.join(LOCAL)) else {
+        return Ok(None);
+    };
+    if let Some(old) = unmoved(repo, &file) {
+        let _lock = lock(&file)?;
+        if !file.exists() && old.exists() {
+            fs::rename(&old, &file)
+                .map_err(|e| format!("can't move {} to {}: {e}", old.display(), file.display()))?;
+        }
+    }
+    Ok(Some(file))
+}
+
+/// [`local_file`] for readers that never write: the worktree's old file
+/// while it hasn't moved.
+pub(crate) fn local_file_read_only(repo: &Repo) -> Option<PathBuf> {
+    let file = shared_dir(repo)?.join(LOCAL);
+    Some(unmoved(repo, &file).unwrap_or(file))
+}
+
+/// The worktree's own old file, when it's to move to `file`.
+fn unmoved(repo: &Repo, file: &Path) -> Option<PathBuf> {
+    let old = repo.git_dir()?.canonicalize().ok()?.join(LOCAL);
+    (old != file && old.exists() && !file.exists()).then_some(old)
+}
+
+/// The branch comments written now belong to: HEAD's, or while a rebase
+/// stops, the branch being rebased. `None` on a detached HEAD, whatever
+/// commit or range is shown.
+pub(crate) fn current_branch(repo: &Repo) -> Option<String> {
+    match repo.head().ok()? {
+        Head::Branch(name) | Head::Unborn(name) => Some(name),
+        Head::Detached(_) => {
+            let git_dir = repo.git_dir()?;
+            ["rebase-merge", "rebase-apply"].iter().find_map(|state| {
+                let name = fs::read_to_string(git_dir.join(state).join("head-name")).ok()?;
+                // A rebase of a detached HEAD writes `detached HEAD`.
+                name.trim_end()
+                    .strip_prefix("refs/heads/")
+                    .map(str::to_owned)
+            })
+        }
+    }
+}
+
+/// The review session the viewer has open, as the session pointer names
+/// it: where `dffy comments --session` and agents find its comments.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Pointer {
+    /// The session's comments file, absolute.
+    pub comments: PathBuf,
+    /// The review plugin's id for the review.
+    pub review: String,
+    /// The branch it was opened on; `None` on a detached HEAD.
+    pub branch: Option<String>,
+    /// The review's head commit.
+    pub head: String,
+}
+
+/// Replaces the session pointer, in the git directory every worktree
+/// shares. A comments path that isn't UTF-8 can't be written.
+pub(crate) fn write_session(repo: &Repo, pointer: &Pointer) -> Result<(), String> {
+    let path = shared_dir(repo)
+        .ok_or("paths compared outside git have no review session")?
+        .join(SESSION);
+    let comments = pointer
+        .comments
+        .to_str()
+        .ok_or_else(|| format!("{} isn't UTF-8", pointer.comments.display()))?;
+    let mut out = format!("{{\"version\":{VERSION},\"comments\":");
+    json::string(&mut out, comments);
+    out.push_str(",\"review\":");
+    json::string(&mut out, &pointer.review);
+    out.push_str(",\"branch\":");
+    match &pointer.branch {
+        Some(branch) => json::string(&mut out, branch),
+        None => out.push_str("null"),
+    }
+    out.push_str(",\"head\":");
+    json::string(&mut out, &pointer.head);
+    out.push_str("}\n");
+    let _lock = lock(&path)?;
+    replace(&path, out.as_bytes())
+}
+
+/// The session pointer, `None` when no session was opened.
+pub(crate) fn read_session(repo: &Repo) -> Result<Option<Pointer>, String> {
+    let Some(path) = shared_dir(repo).map(|dir| dir.join(SESSION)) else {
+        return Ok(None);
+    };
+    let bytes = match fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(format!("can't read {}: {e}", path.display())),
+    };
+    let bad = |what: &str| format!("{}: {what}", path.display());
+    let value = json::parse(&bytes).map_err(|e| bad(&e))?;
+    if value.get("version").and_then(Value::as_usize) != Some(VERSION) {
+        return Err(bad(&format!("not a version {VERSION} session pointer")));
+    }
+    let text = |key: &str| {
+        value
+            .get(key)
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+            .ok_or_else(|| bad(&format!("`{key}` must be a string")))
+    };
+    let comments = PathBuf::from(text("comments")?);
+    if !comments.is_absolute() {
+        return Err(bad("`comments` must be an absolute path"));
+    }
+    Ok(Some(Pointer {
+        comments,
+        review: text("review")?,
+        branch: match value.get("branch") {
+            None | Some(Value::Null) => None,
+            Some(_) => Some(text("branch")?),
+        },
+        head: text("head")?,
+    }))
 }
 
 /// Reads the file without locking: dffy replaces it whole by a rename, so a
@@ -211,7 +367,8 @@ pub(crate) fn apply(path: &Path, ops: Vec<Op>) -> Result<Vec<Option<String>>, St
 /// `from` are skipped. `from` loses them only once `to` holds them: when
 /// anything before writing `to` fails, neither file changes, and when
 /// writing `from` after fails, they're in both. Locks `from`, then `to`.
-/// Returns how many comments moved.
+/// They lose their `branch`: they're the review's now. Returns how many
+/// comments moved.
 pub(crate) fn move_threads(from: &Path, to: &Path, roots: &[String]) -> Result<usize, String> {
     update(from, |source| {
         let now = SystemTime::now();
@@ -220,7 +377,10 @@ pub(crate) fn move_threads(from: &Path, to: &Path, roots: &[String]) -> Result<u
             .comments
             .iter()
             .filter(|c| moving(c))
-            .cloned()
+            .map(|c| Comment {
+                branch: None,
+                ..c.clone()
+            })
             .collect();
         if moved.is_empty() {
             return Ok(0);
@@ -249,10 +409,37 @@ fn update<T>(
     path: &Path,
     change: impl FnOnce(&mut Review) -> Result<T, String>,
 ) -> Result<T, String> {
-    let failed =
-        |what: &str, at: &Path, e: io::Error| format!("can't {what} {}: {e}", at.display());
+    let lock = lock(path)?;
+    let mut comments = read(path)?;
+    let out = change(&mut comments)?;
+    replace(path, comments.encode().as_bytes())?;
+    drop(lock);
+    Ok(out)
+}
+
+/// Removes the threads `select` keeps from the file, under its lock, and
+/// returns how many comments went.
+pub(crate) fn remove_threads(path: &Path, select: &Select) -> Result<usize, String> {
+    update(path, |review| {
+        let gone: HashSet<String> = review
+            .selected(select)
+            .iter()
+            .map(|c| c.id.clone())
+            .collect();
+        review.comments.retain(|c| !gone.contains(&c.id));
+        Ok(gone.len())
+    })
+}
+
+fn failed(what: &str, at: &Path, e: &io::Error) -> String {
+    format!("can't {what} {}: {e}", at.display())
+}
+
+/// Takes `path`'s lock, waiting while another writer holds it, and creates
+/// `path`'s directory on first use.
+fn lock(path: &Path) -> Result<File, String> {
     if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
-        fs::create_dir_all(dir).map_err(|e| failed("create", dir, e))?;
+        fs::create_dir_all(dir).map_err(|e| failed("create", dir, &e))?;
     }
     // Never removed: deleting a lock file lets a waiting writer lock the
     // old one while a new writer locks a new one.
@@ -262,10 +449,14 @@ fn update<T>(
         .truncate(false)
         .write(true)
         .open(&lock_path)
-        .map_err(|e| failed("open", &lock_path, e))?;
-    lock.lock().map_err(|e| failed("lock", &lock_path, e))?;
-    let mut comments = read(path)?;
-    let out = change(&mut comments)?;
+        .map_err(|e| failed("open", &lock_path, &e))?;
+    lock.lock().map_err(|e| failed("lock", &lock_path, &e))?;
+    Ok(lock)
+}
+
+/// Writes `bytes` over `path` by a rename, so readers see one version or
+/// the next; the caller holds `path`'s lock.
+fn replace(path: &Path, bytes: &[u8]) -> Result<(), String> {
     // One fixed name is enough: only the lock's holder writes it. One left
     // by a crash is removed, and `create_new` won't follow a link put in
     // its place.
@@ -276,18 +467,22 @@ fn update<T>(
         .create_new(true)
         .mode(0o600)
         .open(&tmp)
-        .map_err(|e| failed("create", &tmp, e))?;
-    file.write_all(comments.encode().as_bytes())
+        .map_err(|e| failed("create", &tmp, &e))?;
+    file.write_all(bytes)
         .and_then(|()| file.sync_all())
-        .map_err(|e| failed("write", &tmp, e))?;
-    fs::rename(&tmp, path).map_err(|e| failed("replace", path, e))?;
-    drop(lock);
-    Ok(out)
+        .map_err(|e| failed("write", &tmp, &e))?;
+    fs::rename(&tmp, path).map_err(|e| failed("replace", path, &e))
 }
 
 /// `dffy comments apply`: the operations' JSON in, the answer's out.
-pub(crate) fn apply_json(path: &Path, input: &[u8]) -> Result<String, String> {
-    let ids = apply(path, parse_ops(input)?)?;
+/// `branch`, for the local review's file, goes to each thread `add` starts
+/// without one.
+pub(crate) fn apply_json(
+    path: &Path,
+    input: &[u8],
+    branch: Option<&str>,
+) -> Result<String, String> {
+    let ids = apply(path, parse_ops(input, branch)?)?;
     let mut out = String::from("{\"ids\":[");
     for (i, id) in ids.iter().enumerate() {
         if i > 0 {
@@ -340,6 +535,7 @@ impl Review {
             match key.as_str() {
                 "version" => {}
                 "notice" => out.notice = string(&key, value)?,
+                "summary" => out.summary = string(&key, value)?,
                 "comments" => {
                     let Value::Array(items) = value else {
                         return Err("`comments` must be a list".to_owned());
@@ -372,6 +568,10 @@ impl Review {
         if let Some(notice) = &self.notice {
             out.push_str(",\"notice\":");
             json::string(&mut out, notice);
+        }
+        if let Some(summary) = &self.summary {
+            out.push_str(",\"summary\":");
+            json::string(&mut out, summary);
         }
         for (key, value) in &self.extra {
             out.push(',');
@@ -414,35 +614,7 @@ impl Review {
             Op::Add { comment, reply_to } => {
                 self.insert(*comment, reply_to.as_ref(), now).map(Some)
             }
-            Op::Set { target, change } => {
-                let i = self.find(&target)?;
-                if let Some(Some(reference)) = &change.reference {
-                    self.check_ref(reference, Some(i))?;
-                }
-                if change.anchor.as_ref().is_some_and(|a| a.lines.is_empty()) {
-                    return Err("an anchor needs at least one line".to_owned());
-                }
-                let comment = &mut self.comments[i];
-                if let Some(text) = change.text {
-                    if comment.reference.is_some() && change.reference != Some(None) {
-                        return Err(format!(
-                            "comment {} is posted (it has a ref), so its text is the host's",
-                            comment.id
-                        ));
-                    }
-                    comment.text = text;
-                }
-                if let Some(resolved) = change.resolved {
-                    comment.resolved = resolved;
-                }
-                if let Some(reference) = change.reference {
-                    comment.reference = reference;
-                }
-                if let Some(anchor) = change.anchor {
-                    comment.anchor = Some(anchor);
-                }
-                Ok(Some(comment.id.clone()))
-            }
+            Op::Set { target, change } => self.set(&target, change).map(Some),
             Op::Upsert { fields, reply_to } => {
                 if fields.iter().any(|(k, _)| k == "id") {
                     return Err("dffy assigns the id".to_owned());
@@ -473,6 +645,20 @@ impl Review {
                 let mut comment = Comment::from_new_fields(merged)?;
                 if let Some(target) = &reply_to {
                     self.join_thread(&mut comment, target)?;
+                    let id = &comment.id;
+                    if comment.in_reply_to.as_ref() == Some(id) {
+                        return Err(format!("comment {id} can't reply in its own thread"));
+                    }
+                    // Replies hang off the first comment alone.
+                    if self
+                        .comments
+                        .iter()
+                        .any(|c| c.in_reply_to.as_ref() == Some(id))
+                    {
+                        return Err(format!(
+                            "comment {id} has replies, so it can't become a reply itself"
+                        ));
+                    }
                 }
                 self.check(&comment, Some(i))?;
                 self.comments[i] = comment;
@@ -488,7 +674,73 @@ impl Review {
                 self.notice = notice;
                 Ok(None)
             }
+            Op::Summary(summary) => {
+                self.summary = summary;
+                Ok(None)
+            }
         }
+    }
+
+    /// [`Op::Set`]: returns the id of the comment changed.
+    fn set(&mut self, target: &Target, change: Change) -> Result<String, String> {
+        let i = self.find(target)?;
+        if change.anchor.as_ref().is_some_and(|a| a.lines.is_empty()) {
+            return Err("an anchor needs at least one line".to_owned());
+        }
+        if change.author.as_ref().is_some_and(|a| !a.is_empty()) {
+            return Err(
+                "`author` can only be set to \"\", which makes the comment yours".to_owned(),
+            );
+        }
+        if let Some(branch) = change.branch {
+            let named = &self.comments[i];
+            let root = named.in_reply_to.as_ref().unwrap_or(&named.id).clone();
+            for c in &mut self.comments {
+                if c.id == root || c.in_reply_to.as_ref() == Some(&root) {
+                    c.branch.clone_from(&branch);
+                }
+            }
+        }
+        let comment = &mut self.comments[i];
+        let posted = comment.reference.is_some() && change.reference != Some(None);
+        for (field, given) in [
+            ("text", change.text.is_some()),
+            ("suggestion", change.suggestion.is_some()),
+            ("author", change.author.is_some()),
+        ] {
+            if given && posted {
+                return Err(format!(
+                    "comment {} is posted (it has a ref), so its {field} is the host's",
+                    comment.id
+                ));
+            }
+        }
+        if let Some(text) = change.text {
+            comment.text = text;
+        }
+        if let Some(suggestion) = change.suggestion {
+            comment.suggestion = suggestion;
+        }
+        if let Some(author) = change.author {
+            comment.author = author;
+        }
+        if let Some(resolved) = change.resolved {
+            comment.resolved = resolved;
+        }
+        if let Some(reference) = change.reference {
+            comment.reference = reference;
+        }
+        if let Some(anchor) = change.anchor {
+            comment.anchor = Some(anchor);
+        }
+        if let Some(pending) = change.pending {
+            comment.pending = pending;
+        }
+        if let Some(post_error) = change.post_error {
+            comment.post_error = post_error;
+        }
+        self.check(&self.comments[i], Some(i))?;
+        Ok(self.comments[i].id.clone())
     }
 
     fn insert(
@@ -517,7 +769,7 @@ impl Review {
     }
 
     /// Makes `comment` a reply in `target`'s thread: it takes the thread's
-    /// place and has none of its own.
+    /// place and branch and has none of its own.
     fn join_thread(&self, comment: &mut Comment, target: &Target) -> Result<(), String> {
         let parent = &self.comments[self.find(target)?];
         let root_id = parent.in_reply_to.as_ref().unwrap_or(&parent.id);
@@ -529,6 +781,7 @@ impl Review {
         *comment = Comment {
             path: root.path.clone(),
             old_path: root.old_path.clone(),
+            branch: root.branch.clone(),
             in_reply_to: Some(root_id.clone()),
             side: Side::default(),
             start_side: None,
@@ -546,6 +799,9 @@ impl Review {
     fn check(&self, comment: &Comment, at: Option<usize>) -> Result<(), String> {
         if let Some(reference) = &comment.reference {
             self.check_ref(reference, at)?;
+        }
+        if comment.anchor.is_some() && (comment.in_reply_to.is_some() || comment.end.is_none()) {
+            return Err("only a line comment has an anchor".to_owned());
         }
         if comment.in_reply_to.is_some() {
             return Ok(());
@@ -609,6 +865,58 @@ impl Review {
                 .ok_or_else(|| format!("no comment has ref {reference}")),
         }
     }
+
+    /// The comments of the threads `select` keeps, in file order.
+    pub(crate) fn selected(&self, select: &Select) -> Vec<&Comment> {
+        let by_id: HashMap<&str, &Comment> =
+            self.comments.iter().map(|c| (c.id.as_str(), c)).collect();
+        self.comments
+            .iter()
+            .filter(|c| {
+                let root = c
+                    .in_reply_to
+                    .as_deref()
+                    .and_then(|id| by_id.get(id).copied())
+                    .unwrap_or(c);
+                select.keeps(root)
+            })
+            .collect()
+    }
+}
+
+/// Which threads a listing or a removal takes, each judged by its first
+/// comment: a reply is open or resolved, on a file and on a branch as its
+/// thread is. The default takes every thread.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct Select<'a> {
+    /// `Some(true)` takes resolved threads only, `Some(false)` open ones.
+    pub resolved: Option<bool>,
+    /// The threads on this file, by its path or its old one; general
+    /// comments are on none.
+    pub path: Option<&'a str>,
+    pub branches: Branches<'a>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub(crate) enum Branches<'a> {
+    #[default]
+    All,
+    /// The threads on this branch and those on none; `On(None)`, for a
+    /// detached HEAD, only those on none.
+    On(Option<&'a str>),
+}
+
+impl Select<'_> {
+    fn keeps(&self, root: &Comment) -> bool {
+        self.resolved.is_none_or(|r| root.resolved == r)
+            && self
+                .path
+                .is_none_or(|p| root.path == p || root.old_path.as_deref() == Some(p))
+            && match self.branches {
+                Branches::All => true,
+                Branches::On(branch) => root.on_branch(branch),
+            }
+    }
 }
 
 impl Comment {
@@ -622,6 +930,12 @@ impl Comment {
             .and_then(|s| s.on(self.side))
             .map_or(end, |s| s.min(end));
         Some((self.side, start..end + 1))
+    }
+
+    /// Whether it shows on `branch`, `None` for a detached HEAD: a comment
+    /// on no branch shows on every one. For a thread, ask its first comment.
+    pub(crate) fn on_branch(&self, branch: Option<&str>) -> bool {
+        self.branch.is_none() || self.branch.as_deref() == branch
     }
 
     /// A comment from an operation, whose text must be given.
@@ -664,12 +978,19 @@ impl Comment {
                 "url" => c.url = string(&key, value)?,
                 "kind" => c.kind = string(&key, value)?,
                 "label" => c.label = string(&key, value)?,
-                "outdated" => {
-                    c.outdated = match value {
+                "branch" => c.branch = string(&key, value)?,
+                "post_error" => c.post_error = string(&key, value)?,
+                "outdated" | "pending" => {
+                    let flag = match value {
                         Value::Null => false,
                         Value::Bool(b) => b,
-                        _ => return Err("`outdated` must be true or false".to_owned()),
+                        _ => return Err(format!("`{key}` must be true or false")),
                     };
+                    if key == "outdated" {
+                        c.outdated = flag;
+                    } else {
+                        c.pending = flag;
+                    }
                 }
                 "distance" => {
                     c.distance = match value {
@@ -740,6 +1061,9 @@ impl Comment {
         );
         put(&mut f, "kind", self.kind.as_deref().map(text));
         put(&mut f, "label", self.label.as_deref().map(text));
+        put(&mut f, "branch", self.branch.as_deref().map(text));
+        put(&mut f, "pending", self.pending.then_some(Value::Bool(true)));
+        put(&mut f, "post_error", self.post_error.as_deref().map(text));
         f.extend(self.extra.iter().cloned());
         f
     }
@@ -834,8 +1158,10 @@ fn anchor(value: Value) -> Result<Option<Anchor>, String> {
     Ok(Some(anchor))
 }
 
-/// Parses `dffy comments apply`'s input, a JSON list of operations.
-pub(crate) fn parse_ops(input: &[u8]) -> Result<Vec<Op>, String> {
+/// Parses `dffy comments apply`'s input, a JSON list of operations. A
+/// thread `add` starts without a `branch` field gets `branch`; one given
+/// as `null` stays on no branch.
+pub(crate) fn parse_ops(input: &[u8], branch: Option<&str>) -> Result<Vec<Op>, String> {
     let Value::Array(items) = json::parse(input)? else {
         return Err("the operations must be a JSON list".to_owned());
     };
@@ -848,20 +1174,25 @@ pub(crate) fn parse_ops(input: &[u8]) -> Result<Vec<Op>, String> {
                 .and_then(Value::as_str)
                 .unwrap_or("?")
                 .to_owned();
-            parse_op(item).map_err(|e| format!("operation {i} ({name}): {e}"))
+            parse_op(item, branch).map_err(|e| format!("operation {i} ({name}): {e}"))
         })
         .collect()
 }
 
-fn parse_op(item: Value) -> Result<Op, String> {
+fn parse_op(item: Value, branch: Option<&str>) -> Result<Op, String> {
     let Value::Object(mut fields) = item else {
         return Err("not an object".to_owned());
     };
     match take(&mut fields, "op").as_ref().and_then(Value::as_str) {
         Some("add") => {
-            let (fields, reply_to) = comment_fields(take(&mut fields, "comment"))?;
+            let (mut fields, reply_to) = comment_fields(take(&mut fields, "comment"))?;
             if fields.iter().any(|(k, _)| k == "id") {
                 return Err("dffy assigns the id".to_owned());
+            }
+            if let Some(branch) = branch.filter(|_| reply_to.is_none())
+                && !fields.iter().any(|(k, _)| k == "branch")
+            {
+                fields.push(("branch".to_owned(), Value::String(branch.to_owned())));
             }
             Ok(Op::Add {
                 comment: Box::new(Comment::from_new_fields(fields)?),
@@ -883,6 +1214,10 @@ fn parse_op(item: Value) -> Result<Op, String> {
         Some("notice") => match take(&mut fields, "notice") {
             Some(value) => Ok(Op::Notice(string("notice", value)?)),
             None => Err("needs a notice, a string or null".to_owned()),
+        },
+        Some("summary") => match take(&mut fields, "summary") {
+            Some(value) => Ok(Op::Summary(string("summary", value)?)),
+            None => Err("needs a summary, a string or null".to_owned()),
         },
         Some(other) => Err(format!("unknown op {other}")),
         None => Err("needs an op".to_owned()),
@@ -926,18 +1261,25 @@ fn change(value: Option<Value>) -> Result<Change, String> {
         return Err("needs a fields object".to_owned());
     };
     let mut change = Change::default();
+    let flag = |key: &str, value| match value {
+        Value::Bool(b) => Ok(Some(b)),
+        _ => Err(format!("`{key}` must be true or false")),
+    };
     for (key, value) in fields {
         match key.as_str() {
             "text" => change.text = Some(string(&key, value)?.ok_or("`text` can't be null")?),
-            "resolved" => match value {
-                Value::Bool(b) => change.resolved = Some(b),
-                _ => return Err("`resolved` must be true or false".to_owned()),
-            },
+            "resolved" => change.resolved = flag(&key, value)?,
             "ref" => change.reference = Some(string(&key, value)?),
             "anchor" => change.anchor = Some(anchor(value)?.ok_or("`anchor` can't be null")?),
+            "author" => change.author = Some(string(&key, value)?.ok_or("`author` can't be null")?),
+            "suggestion" => change.suggestion = Some(string(&key, value)?),
+            "branch" => change.branch = Some(string(&key, value)?),
+            "pending" => change.pending = flag(&key, value)?,
+            "post_error" => change.post_error = Some(string(&key, value)?),
             _ => {
                 return Err(format!(
-                    "`{key}` can't be set; set changes text, resolved, ref and anchor"
+                    "`{key}` can't be set; set changes text, resolved, ref, anchor, author, \
+                     suggestion, branch, pending and post_error"
                 ));
             }
         }
@@ -1059,11 +1401,21 @@ pub(crate) fn threads<'a>(comments: impl IntoIterator<Item = &'a Comment>) -> Ve
         .collect()
 }
 
+/// A comment's author as shown: `you` for an empty one, the rest escaped.
+pub(crate) fn who(author: &str) -> String {
+    if author.is_empty() {
+        "you".to_owned()
+    } else {
+        escape(author.as_bytes())
+    }
+}
+
 /// Writes `comments`, in [`threads`] order, for reading: a heading with
-/// each thread's place, then each comment's id, author and time over its
-/// text. A reply not under its thread's first comment, as on a page that
-/// starts mid-thread, is headed by its thread's id.
-pub(crate) fn render(comments: &[&Comment], c: &mut Canvas) {
+/// each thread's place, and its branch when it isn't `here`, then each
+/// comment's id, author and time over its text. A reply not under its
+/// thread's first comment, as on a page that starts mid-thread, is headed
+/// by its thread's id.
+pub(crate) fn render(comments: &[&Comment], here: Option<&str>, c: &mut Canvas) {
     let text = |c: &mut Canvas, indent: usize, text: &str| {
         for line in text.lines() {
             c.spaces(Role::Plain, indent);
@@ -1104,6 +1456,12 @@ pub(crate) fn render(comments: &[&Comment], c: &mut Canvas) {
                 }
                 (None, None) => {}
             }
+            if let Some(branch) = comment.branch.as_deref().filter(|b| Some(*b) != here) {
+                c.push(
+                    Role::Dim,
+                    &format!(", branch {}", escape(branch.as_bytes())),
+                );
+            }
             if comment.resolved {
                 c.push(Role::Dim, ", resolved");
             }
@@ -1112,18 +1470,16 @@ pub(crate) fn render(comments: &[&Comment], c: &mut Canvas) {
         c.spaces(Role::Plain, 2);
         c.push(Role::Dim, &escape(comment.id.as_bytes()));
         c.push(Role::Plain, " ");
-        let author = if comment.author.is_empty() {
-            "you"
-        } else {
-            &comment.author
-        };
-        c.push(Role::Plain, &escape(author.as_bytes()));
+        c.push(Role::Plain, &who(&comment.author));
         c.push(
             Role::Dim,
             &format!(", {}", escape(comment.created.as_bytes())),
         );
         if comment.reference.is_some() {
             c.push(Role::Dim, ", posted");
+        }
+        if comment.pending {
+            c.push(Role::Dim, ", pending");
         }
         c.end_line();
         text(c, 4, &comment.text);
@@ -1132,7 +1488,105 @@ pub(crate) fn render(comments: &[&Comment], c: &mut Canvas) {
             c.line(Role::Dim, "suggestion:");
             text(c, 6, suggestion);
         }
+        if let Some(error) = &comment.post_error {
+            c.spaces(Role::Plain, 4);
+            c.line(
+                Role::Warn,
+                &format!("not posted: {}", escape(error.as_bytes())),
+            );
+        }
     }
+}
+
+/// `comments`, in [`threads`] order, as Markdown: `summary` first when
+/// there's one, then a heading per thread with its place, the commented
+/// lines as they were in a code block, and each comment's author and time
+/// over its text, which is Markdown already.
+pub(crate) fn markdown(comments: &[&Comment], summary: Option<&str>) -> String {
+    let mut out = String::new();
+    if let Some(summary) = summary {
+        out.push_str("## Summary\n\n");
+        out.push_str(summary.trim_end());
+        out.push_str("\n\n");
+    }
+    let mut thread = None;
+    for comment in comments {
+        if comment.in_reply_to.is_none() || comment.in_reply_to.as_deref() != thread {
+            thread = Some(comment.in_reply_to.as_deref().unwrap_or(&comment.id));
+            out.push_str("## ");
+            if comment.path.is_empty() {
+                out.push_str("Conversation");
+                for word in [&comment.kind, &comment.label].into_iter().flatten() {
+                    out.push_str(", ");
+                    out.push_str(word);
+                }
+            } else {
+                let ticks = fence(&comment.path, 1);
+                let pad = if comment.path.starts_with('`') || comment.path.ends_with('`') {
+                    " "
+                } else {
+                    ""
+                };
+                let _ = write!(out, "{ticks}{pad}{}{pad}{ticks}", comment.path);
+            }
+            match (&comment.in_reply_to, comment.range()) {
+                (Some(root), _) => {
+                    let _ = write!(out, ", reply in thread {root}");
+                }
+                (None, Some((side, lines))) => {
+                    let (first, last) = (lines.start + 1, lines.end);
+                    let _ = if first == last {
+                        write!(out, ", line {first}")
+                    } else {
+                        write!(out, ", lines {first}-{last}")
+                    };
+                    if side == Side::Old {
+                        out.push_str(" (old side)");
+                    }
+                }
+                (None, None) => {}
+            }
+            if comment.resolved {
+                out.push_str(", resolved");
+            }
+            out.push_str("\n\n");
+            if comment.in_reply_to.is_none()
+                && let Some(anchor) = &comment.anchor
+            {
+                code_block(&mut out, &anchor.lines.join("\n"));
+            }
+        }
+        let author = if comment.author.is_empty() {
+            "you"
+        } else {
+            &comment.author
+        };
+        let _ = write!(out, "**{author}**, {}\n\n", comment.created);
+        out.push_str(comment.text.trim_end());
+        out.push_str("\n\n");
+        if let Some(suggestion) = &comment.suggestion {
+            out.push_str("Suggested change:\n\n");
+            code_block(&mut out, suggestion);
+        }
+    }
+    out.truncate(out.trim_end().len());
+    if !out.is_empty() {
+        out.push('\n');
+    }
+    out
+}
+
+/// A fenced code block of `text`, its fence longer than any run of
+/// backticks in it.
+fn code_block(out: &mut String, text: &str) {
+    let ticks = fence(text, 3);
+    let _ = write!(out, "{ticks}\n{text}\n{ticks}\n\n");
+}
+
+/// Backticks, at least `min` and one more than the longest run in `text`.
+fn fence(text: &str, min: usize) -> String {
+    let longest = text.split(|c| c != '`').map(str::len).max().unwrap_or(0);
+    "`".repeat((longest + 1).max(min))
 }
 
 /// `t` in RFC 3339, UTC, to the second.

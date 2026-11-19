@@ -64,8 +64,6 @@ pub(crate) enum State {
     Working,
     /// A result the user hasn't seen yet.
     Done,
-    /// Waiting on the user to approve something.
-    Blocked,
     Error,
 }
 
@@ -75,7 +73,6 @@ impl Status {
             State::Idle => "idle",
             State::Working => "working",
             State::Done => "done",
-            State::Blocked => "blocked:kind=permission",
             State::Error => "error",
         };
         let mut out = format!("\x1b]7501;state={state}:app=dffy").into_bytes();
@@ -177,10 +174,6 @@ mod tests {
         assert_eq!(
             status(State::Error, "listing\nchanges").report(),
             b"\x1b]7501;state=error:app=dffy:msg=bGlzdGluZyBjaGFuZ2Vz\x1b\\"
-        );
-        assert_eq!(
-            status(State::Blocked, "a").report(),
-            b"\x1b]7501;state=blocked:kind=permission:app=dffy:msg=YQ==\x1b\\"
         );
         assert_eq!(
             Status {

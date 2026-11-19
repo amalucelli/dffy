@@ -188,6 +188,86 @@ fn an_edge_revealed_past_a_window_keeps_its_lines() {
     assert_eq!((shown.top, shown.bottom, shown.windows), (10, 10, &[][..]));
 }
 
+/// Swapping to the rendered view and back drops what the user revealed and
+/// keeps the lines the host revealed, those that showed already included.
+#[test]
+fn a_view_swap_keeps_only_the_lines_the_host_revealed() {
+    let mut doc = Document::<()>::default();
+    doc.push(long_diff("long.md").change, Source::Repo);
+    let _ = doc.load(0, Ok(prepared(long_diff("long.md"))));
+    // Ten lines from each edge of gap 1, which holds lines 7 to 56.
+    assert!(doc.expand(0, 1));
+    assert!(!doc.reveal_lines(0, Side::New, 9..10, 0), "in the top edge");
+    assert!(doc.reveal_lines(0, Side::New, 29..30, 0));
+    let diff = Arc::clone(doc.diff_of(0).expect("loaded"));
+    let _ = doc.set_rendered(0, &diff, Ok(prepared(long_diff("long.md"))));
+    let _ = doc.set_rendered_mode(true);
+    let _ = doc.set_rendered_mode(false);
+    let shown = doc.shown(0, 1).expect("loaded");
+    assert_eq!(
+        (shown.top, shown.bottom, shown.windows),
+        (0, 0, &[3..4, 23..24][..])
+    );
+
+    // A diff cut into other gaps drops them, swapped in or not.
+    doc.restale();
+    let mut fd = long_diff("long.md");
+    fd.hunks.pop();
+    let _ = doc.load(0, Ok(prepared(fd)));
+    let diff = Arc::clone(doc.diff_of(0).expect("loaded"));
+    let _ = doc.set_rendered(0, &diff, Ok(prepared(long_diff("long.md"))));
+    let _ = doc.set_rendered_mode(true);
+    let _ = doc.set_rendered_mode(false);
+    assert_eq!(doc.shown(0, 1).map(|s| s.windows.len()), Some(0));
+}
+
+/// Lines revealed while the rendered view shows leave it as it is and show
+/// once the line diff is back.
+#[test]
+fn lines_revealed_under_the_rendered_view_show_in_the_line_diff() {
+    let mut doc = Document::<()>::default();
+    doc.push(long_diff("long.md").change, Source::Repo);
+    let _ = doc.load(0, Ok(prepared(long_diff("long.md"))));
+    let diff = Arc::clone(doc.diff_of(0).expect("loaded"));
+    let _ = doc.set_rendered_mode(true);
+    let _ = doc.set_rendered(0, &diff, Ok(prepared(long_diff("long.md"))));
+    assert!(!doc.reveal_lines(0, Side::New, 29..30, 0));
+    assert_eq!(doc.shown(0, 1).map(|s| s.windows.len()), Some(0));
+    let _ = doc.set_rendered_mode(false);
+    assert_eq!(
+        doc.shown(0, 1)
+            .map(|s| (s.windows.len(), s.windows.first().cloned())),
+        Some((1, Some(23..24)))
+    );
+}
+
+/// The place a file was left at stays on its gap line when lines are
+/// revealed there after the list moved under it.
+#[test]
+fn a_saved_place_follows_a_reveal_after_the_list_moved() {
+    let mut doc = Document::<()>::default();
+    doc.push(long_diff("a.c").change, Source::Repo);
+    doc.push(long_diff("b.c").change, Source::Repo);
+    let _ = doc.load(0, Ok(prepared(long_diff("a.c"))));
+    doc.open(0, unified);
+    assert!(doc.expand(0, 1));
+    // Gap line 44, in the bottom edge.
+    doc.pos = at(0, 3, 15);
+    let _ = doc.goto_file(1);
+    let page = FileChange {
+        path: "".into(),
+        status: Status::Modified,
+        old: None,
+        new: None,
+        staging: None,
+    };
+    assert_eq!(doc.set_page(Some((page, 1))), 1);
+    assert!(doc.reveal_lines(1, Side::New, 29..30, 2));
+    let _ = doc.goto_file(1);
+    // Below a window of five lines and its separator.
+    assert_eq!(doc.pos, at(1, 3, 15 + 6));
+}
+
 /// `n` lands on each change of the file shown, then shows the next file;
 /// one not diffed yet waits, and opens landing on its first change once
 /// its diff is loaded. Each file keeps the place it was left at.

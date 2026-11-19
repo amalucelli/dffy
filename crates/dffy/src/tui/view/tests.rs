@@ -819,6 +819,7 @@ fn comment_marks_go_after_the_line_numbers_of_their_side() {
         lines: Vec::new(),
         snippet: None,
         local: false,
+        branch: None,
     };
     let markers: Arc<[_]> = Arc::new([
         marker(document::Side::New, 1, Look::Draft),
@@ -1208,6 +1209,8 @@ fn note(id: &str, author: &str, at: &str, text: &str, draft: bool) -> comments::
         } else {
             comments::Standing::Posted
         },
+        pending: false,
+        posting: None,
     }
 }
 
@@ -1227,6 +1230,7 @@ fn threads() -> Arc<[Thread]> {
         lines: Vec::new(),
         snippet: None,
         local: false,
+        branch: None,
     };
     let mut asked = note(
         "n",
@@ -1342,6 +1346,7 @@ fn lost() -> Arc<[Thread]> {
         lines: Vec::new(),
         snippet: comments::snippet(&comment, true),
         local: false,
+        branch: None,
     };
     let added = review::Comment {
         path: "src/main.rs".to_owned(),
@@ -1500,6 +1505,7 @@ fn marked_down() -> Arc<[Thread]> {
         lines: Vec::new(),
         snippet: None,
         local: false,
+        branch: None,
     }]
     .into()
 }
@@ -1752,6 +1758,7 @@ fn conversation() -> Arc<[Thread]> {
         lines: Vec::new(),
         snippet: None,
         local: false,
+        branch: None,
     };
     vec![
         on_line_2(
@@ -2316,6 +2323,7 @@ fn long_commented(n: usize, on: &[usize], height: usize) -> Doc {
             lines: Vec::new(),
             snippet: None,
             local: false,
+            branch: None,
         })
         .collect();
     doc.set_threads(0, threads.into());

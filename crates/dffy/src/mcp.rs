@@ -159,11 +159,16 @@ const TOOLS: &str = r#"[
 {
   "name": "list_comments",
   "title": "Review comments",
-  "description": "List the review comments on the code: comments people left on lines or files of the diff, with their replies and whether each thread is resolved. Comments come in threads, each thread's first comment then its replies, threads in path and line order. Each comment has id, path, the side (old or new) and start and end lines it's on (1-based; none for a comment on a whole file or a reply), text, author (empty means the user), created, in_reply_to for a reply, resolved, and anchor, the commented lines' text. Read-only. Paged: when next_cursor isn't null, call again with it as cursor and the same arguments.",
+  "description": "List the review comments on the code: comments people left on lines or files of the diff, with their replies and whether each thread is resolved. By default the user's local comments on the current branch, and those on no branch; session: true lists the code review the user has open in the viewer instead. Comments come in threads, each thread's first comment then its replies, threads in path and line order. Each comment has id, path, the side (old or new) and start and end lines it's on (1-based; none for a comment on a whole file or a reply), text, author (empty means the user), created, in_reply_to for a reply, resolved, and anchor, the commented lines' text. Read-only. Paged: when next_cursor isn't null, call again with it as cursor and the same arguments.",
   "inputSchema": {
     "type": "object",
     "properties": {
       "path": {"type": "string", "description": "Only the comments on this file, relative to the repository root. A renamed file's old path works too."},
+      "open": {"type": "boolean", "description": "true for open threads only, false for resolved ones."},
+      "resolved": {"type": "boolean", "description": "true for resolved threads only, false for open ones."},
+      "branch": {"type": "string", "description": "The threads of this branch, and those on no branch, instead of the current branch's."},
+      "all_branches": {"type": "boolean", "default": false, "description": "Every branch's threads."},
+      "session": {"type": "boolean", "default": false, "description": "The comments of the review session the user has open in the viewer, such as a pull request's, instead of the local ones."},
       "limit": {"type": "integer", "minimum": 1, "maximum": 1000, "default": 100, "description": "Comments per page."},
       "cursor": {"type": "string", "description": "next_cursor from the previous page."}
     },
@@ -530,9 +535,14 @@ impl Args<'_> {
     }
 
     fn bool(&self, key: &str, default: bool) -> Result<bool, String> {
+        Ok(self.flag(key)?.unwrap_or(default))
+    }
+
+    /// A boolean, `None` when it's left out.
+    fn flag(&self, key: &str) -> Result<Option<bool>, String> {
         match self.get(key) {
-            None => Ok(default),
-            Some(Value::Bool(b)) => Ok(*b),
+            None => Ok(None),
+            Some(Value::Bool(b)) => Ok(Some(*b)),
             Some(_) => Err(format!("{key} must be true or false")),
         }
     }
@@ -953,29 +963,74 @@ impl Server<'_> {
         Ok(Output { structured, text })
     }
 
+    /// The comments file `list_comments` reads: the review session's with
+    /// `session`, else `--comments`, else the local review's, where it
+    /// is now: this never moves it.
+    fn comments_file(&mut self, session: bool) -> Result<PathBuf, String> {
+        if session {
+            return review::read_session(&self.repo()?)?
+                .map(|pointer| pointer.comments)
+                .ok_or_else(|| {
+                    "no review session: the viewer hasn't opened one in this repository; \
+                     the user opens one with the review plugin's command, as in dffy pr"
+                        .to_owned()
+                });
+        }
+        if let Some(file) = &self.comments {
+            return Ok(file.clone());
+        }
+        review::local_file_read_only(&self.repo()?)
+            .ok_or_else(|| "the repository has no git directory for a comments file".to_owned())
+    }
+
     fn list_comments(&mut self, args: &Args) -> Result<Output, String> {
-        args.only(&["path", "limit", "cursor"])?;
+        args.only(&[
+            "path",
+            "open",
+            "resolved",
+            "branch",
+            "all_branches",
+            "session",
+            "limit",
+            "cursor",
+        ])?;
         let path = args.string("path")?;
+        let resolved = match (args.flag("open")?, args.flag("resolved")?) {
+            (Some(open), Some(resolved)) if open == resolved => {
+                return Err("open and resolved contradict each other; give one".to_owned());
+            }
+            (Some(open), _) => Some(!open),
+            (None, resolved) => resolved,
+        };
+        let branch = args.string("branch")?;
+        let all_branches = args.bool("all_branches", false)?;
+        if branch.is_some() && all_branches {
+            return Err("branch and all_branches contradict each other; give one".to_owned());
+        }
+        let session = args.bool("session", false)?;
         let limit = args.number("limit", 100, [1, 1000])?;
         let cursor = args.cursor()?;
-        let file = if let Some(file) = &self.comments {
-            file.clone()
-        } else {
-            let repo = self.repo()?;
-            let git_dir = repo
-                .git_dir()
-                .ok_or("the repository has no git directory for a comments file")?;
-            review::default_path(git_dir)
+        let file = review::read(&self.comments_file(session)?)?;
+        let repo = self.repo().ok();
+        let current = repo.as_ref().and_then(review::current_branch);
+        // Outside a repository there's no branch to keep apart.
+        let branches = match (branch, all_branches) {
+            (Some(branch), false) => review::Branches::On(Some(branch)),
+            (None, false) if repo.is_some() => review::Branches::On(current.as_deref()),
+            _ => review::Branches::All,
         };
-        let file = review::read(&file)?;
-        let listed = review::threads(
-            file.comments
-                .iter()
-                .filter(|c| path.is_none_or(|p| c.path == p || c.old_path.as_deref() == Some(p))),
-        );
+        let listed = review::threads(file.selected(&review::Select {
+            resolved,
+            path,
+            branches,
+        }));
+        let here = match branches {
+            review::Branches::On(branch) => branch,
+            review::Branches::All => current.as_deref(),
+        };
         let mut h = DefaultHasher::new();
         "list_comments".hash(&mut h);
-        path.hash(&mut h);
+        (path, resolved, branches, session).hash(&mut h);
         for comment in &listed {
             comment.id.hash(&mut h);
         }
@@ -1018,7 +1073,7 @@ impl Server<'_> {
             let _ = writeln!(text, "notice: {notice}");
         }
         let mut canvas = Canvas::default();
-        review::render(page, &mut canvas);
+        review::render(page, here, &mut canvas);
         let mut bytes = Vec::new();
         canvas
             .write_to(&mut bytes, None)

@@ -304,10 +304,14 @@ expression: text
 <dim># comment: comment on the selected lines, or the line v would start on, in a text box under them; esc saves it</>
 <hint>keybind</><dim> = </>c=comment
 
+<dim># suggest_change: suggest a change to the selected lines, or the line v would start on: a comment's text box holding them, to edit into what they should be; esc saves it</>
+<hint>keybind</><dim> = </>S=suggest_change
+<hint>keybind</><dim> = </>leader:g=suggest_change
+
 <dim># comment_file: comment on the whole file shown, in a text box under its first row; esc saves it</>
 <hint>keybind</><dim> = </>C=comment_file
 
-<dim># comments: the left panel lists every comment thread in place of the files, or the files again; moving through the threads shows each in the diff, enter or tab goes to it</>
+<dim># comments: the left panel lists every comment thread in place of the files, or the files again; moving through the threads shows each in the diff, enter or tab goes to it; r, e, x, d and o act on the selected thread</>
 <hint>keybind</><dim> = </>i=comments
 
 <dim># next_thread: next comment thread, on into the next file with comments; it takes the focus, where r replies, e edits, x resolves, d deletes and o opens it on its host</>

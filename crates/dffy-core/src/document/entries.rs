@@ -115,6 +115,10 @@ pub struct Entry<P> {
     /// What's revealed of each gap, by gap. Gaps past its end show nothing,
     /// so a file nothing was revealed in holds none.
     reveal: Vec<Reveal>,
+    /// What [`Document::reveal_lines`] revealed of each of the line diff's
+    /// gaps, kept apart from `reveal`: a swap back to the line diff shows
+    /// these again without what the user revealed.
+    host_reveal: Vec<Reveal>,
     /// Where the file was left when another was shown.
     saved: Option<Pos>,
     /// Shown with a diff since it arrived: opened at its first change, or
@@ -148,6 +152,7 @@ impl<P> Entry<P> {
             recount: false,
             viewed: false,
             reveal: Vec::new(),
+            host_reveal: Vec::new(),
             saved: None,
             placed: false,
             last_shown: 0,
@@ -315,7 +320,10 @@ impl<P> Entry<P> {
             (render, _) => render,
         }));
         if matches!(self.state, State::Loaded(_)) {
-            self.reveal.clear();
+            match self.render.as_deref() {
+                Some(Render::Hidden(_)) => self.reveal.clone_from(&self.host_reveal),
+                _ => self.reveal.clear(),
+            }
         }
         self.saved = None;
         self.placed = false;
@@ -708,6 +716,7 @@ impl<P> Document<P> {
         }
         if !keep_reveal {
             entry.reveal.clear();
+            entry.host_reveal.clear();
         }
         entry.stale = false;
         entry.recount = false;
@@ -715,10 +724,12 @@ impl<P> Document<P> {
             Ok(loaded) => {
                 self.loaded_bytes += loaded.bytes();
                 entry.counts = Some(loaded.counts());
-                entry.reveal.truncate(loaded.gaps().len());
                 // A diff of the same file may cut its gaps differently.
-                for (reveal, gap) in entry.reveal.iter_mut().zip(loaded.gaps()) {
-                    reveal.settle(gap.len);
+                for reveal in [&mut entry.reveal, &mut entry.host_reveal] {
+                    reveal.truncate(loaded.gaps().len());
+                    for (reveal, gap) in reveal.iter_mut().zip(loaded.gaps()) {
+                        reveal.settle(gap.len);
+                    }
                 }
                 State::Loaded(loaded)
             }
@@ -1478,7 +1489,9 @@ impl<P> Document<P> {
     /// Stores `reveal` for gap `gap` of `file`, keeping the position and
     /// the file's saved place on their lines of the gap.
     fn set_reveal(&mut self, file: usize, gap: usize, gaps: usize, reveal: Reveal) {
-        let saved = self.files[file].saved;
+        // The saved place's index is stale once the list moved under it
+        // (a page put first, a re-sort).
+        let saved = self.files[file].saved.map(|p| Pos { file, ..p });
         let anchors = (
             self.gap_anchor(file, gap, self.pos),
             saved.and_then(|p| self.gap_anchor(file, gap, p)),
@@ -1511,9 +1524,12 @@ impl<P> Document<P> {
     /// Reveals the lines of `side` in `lines` (0-based) of `file` that its
     /// gaps hide, with `context` lines around them, leaving the rest of
     /// each gap hidden. Positions in the gaps stay on their lines, as with
-    /// [`Document::expand`]. Hunks, piped files and rendered views are left
-    /// as they are. Returns whether any line was hidden; the host then
-    /// normalizes the position.
+    /// [`Document::expand`]. Hunks and piped files are left as they are.
+    /// While the rendered view shows, the lines are kept for the line diff
+    /// behind it and the view is left as it is. They show whenever the line
+    /// diff comes back from the rendered view, which drops what
+    /// [`Document::expand`] revealed. Returns whether any line was hidden
+    /// in the view shown; the host then normalizes the position.
     pub fn reveal_lines(
         &mut self,
         file: usize,
@@ -1521,27 +1537,35 @@ impl<P> Document<P> {
         lines: Range<usize>,
         context: usize,
     ) -> bool {
-        let Some(entry) = self
-            .files
-            .get(file)
-            .filter(|e| !matches!(e.render.as_deref(), Some(Render::Shown(_))))
-        else {
+        let Some(entry) = self.files.get(file) else {
             return false;
         };
-        let State::Loaded(loaded) = &entry.state else {
-            return false;
+        let (loaded, on_lines) = match (&entry.state, entry.render.as_deref()) {
+            (State::Loaded(_), Some(Render::Shown(line))) => (line, false),
+            (State::Loaded(loaded), _) => (loaded, true),
+            (State::Pending | State::Failed(_), _) => return false,
         };
         let gaps = loaded.gaps().len();
         let revealed: Vec<_> = (0..gaps)
             .filter_map(|g| {
-                loaded
-                    .reveal_lines(entry.reveal.get(g), g, side, &lines, context)
-                    .map(|reveal| (g, reveal))
+                let host = loaded.reveal_lines(entry.host_reveal.get(g), g, side, &lines, context);
+                let shown = on_lines
+                    .then(|| loaded.reveal_lines(entry.reveal.get(g), g, side, &lines, context))
+                    .flatten();
+                (host.is_some() || shown.is_some()).then_some((g, host, shown))
             })
             .collect();
-        let any = !revealed.is_empty();
-        for (gap, reveal) in revealed {
-            self.set_reveal(file, gap, gaps, reveal);
+        let mut any = false;
+        for (gap, host, shown) in revealed {
+            if let Some(host) = host {
+                let entry = &mut self.files[file];
+                entry.host_reveal.resize(gaps, Reveal::default());
+                entry.host_reveal[gap] = host;
+            }
+            if let Some(shown) = shown {
+                self.set_reveal(file, gap, gaps, shown);
+                any = true;
+            }
         }
         any
     }

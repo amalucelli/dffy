@@ -27,14 +27,17 @@ pub mod bench;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use std::sync::{Arc, LazyLock, Mutex, PoisonError};
+use std::sync::{Arc, LazyLock, Mutex, OnceLock, PoisonError};
 
 use clap::{ColorChoice, CommandFactory};
 use dffy_core::cache::Cache;
 use dffy_core::git;
 use dffy_core::highlight::Registry;
 
-use cli::{Cli, Command, CommentsAction, CommonArgs, DaemonAction, DiffArgs, ShowArgs, ViewArgs};
+use cli::{
+    BranchArgs, Cli, Command, CommentsAction, CommentsArgs, CommonArgs, DaemonAction, DiffArgs,
+    ShowArgs, ViewArgs,
+};
 use config::{Config, DefaultDiff, Indicators, ModifiedLines, Paging, View, Warning};
 use output::{Output, Term};
 use render::{Canvas, Layout};
@@ -149,9 +152,11 @@ pub(crate) struct Ctx {
     pub color_err: bool,
     /// `None` when the cache is off or there's nowhere to put it.
     pub cache: Option<Cache>,
-    /// The review plugin set, described: `None` without one, `Err` with
-    /// why it adds no command.
-    pub review: Option<Result<plugin::review::Described, String>>,
+    /// The review plugin set; `None` without one.
+    pub review_name: Option<String>,
+    /// Its description, once [`Ctx::review`] asked for it, or once parsing
+    /// needed its command.
+    pub review: OnceLock<Result<plugin::review::Described, String>>,
     /// `--comments`, resolved; the viewer defaults to the repository's.
     pub comments: Option<PathBuf>,
 }
@@ -171,8 +176,19 @@ impl Ctx {
         self.color_err.then_some(&self.theme)
     }
 
+    /// The review plugin set, described: `None` without one, `Err` with
+    /// why it adds no command. Described on first use, as most runs never
+    /// ask and describing can wait on the plugin.
+    pub(crate) fn review(&self) -> Option<&Result<plugin::review::Described, String>> {
+        let name = self.review_name.as_deref()?;
+        Some(
+            self.review
+                .get_or_init(|| describe_review(name, self.cache.as_ref())),
+        )
+    }
+
     pub(crate) fn described(&self) -> Option<&plugin::review::Described> {
-        self.review.as_ref()?.as_ref().ok()
+        self.review()?.as_ref().ok()
     }
 
     /// The diff layout for this terminal. Off a terminal, unified lines are
@@ -291,17 +307,14 @@ pub fn main() -> ExitCode {
         .flatten()
         .map(|dir| Cache::new(dir, loaded.config.cache_size));
     let builtin = Cli::command();
-    let review = review_flag
-        .or_else(|| loaded.config.review.clone())
-        .filter(|_| cli::needs_review(&raw))
-        .map(|name| {
-            let program = plugin::find(plugin::REVIEW_PREFIX, &name)
-                .ok_or_else(|| format!("{}{name} isn't on PATH", plugin::REVIEW_PREFIX))?;
-            let reserved = |command: &str| cli::is_subcommand(&builtin, command);
-            let naming = plugin::review::describe(&program, cache.as_ref(), reserved)?;
-            Ok(plugin::review::Described { program, naming })
-        });
-    let described = review.as_ref().and_then(|r| r.as_ref().ok());
+    let review_name = review_flag.or_else(|| loaded.config.review.clone());
+    let review = OnceLock::new();
+    if let Some(name) = &review_name
+        && cli::parses_review(&builtin, &raw)
+    {
+        review.get_or_init(|| describe_review(name, cache.as_ref()));
+    }
+    let described = review.get().and_then(|r: &Result<_, _>| r.as_ref().ok());
     let mut command = cli::with_review(builtin, described.map(|d| &d.naming));
     let args = cli::with_default_subcommand(&command, raw);
     if let Some(choice) = color_flag(&args) {
@@ -341,6 +354,7 @@ pub fn main() -> ExitCode {
         color_out,
         color_err: output::use_color(config.color, term.stderr_tty),
         cache,
+        review_name,
         review,
         context_lines: config.context.hunk_lines(true),
         config,
@@ -355,7 +369,7 @@ pub fn main() -> ExitCode {
             .global
             .comments
             .as_deref()
-            .and_then(|file| comments_file(cli.global.dir.as_deref(), Some(file)).ok()),
+            .and_then(|file| comments_file(cli.global.dir.as_deref(), Some(file), None).ok()),
     };
     let mut canvas = Canvas::default();
     for warning in &ctx.config_warnings {
@@ -381,6 +395,15 @@ pub fn main() -> ExitCode {
             ExitCode::from(FATAL)
         }
     }
+}
+
+fn describe_review(name: &str, cache: Option<&Cache>) -> Result<plugin::review::Described, String> {
+    let program = plugin::find(plugin::REVIEW_PREFIX, name)
+        .ok_or_else(|| format!("{}{name} isn't on PATH", plugin::REVIEW_PREFIX))?;
+    let builtin = Cli::command();
+    let reserved = |command: &str| cli::is_subcommand(&builtin, command);
+    let naming = plugin::review::describe(&program, cache, reserved)?;
+    Ok(plugin::review::Described { program, naming })
 }
 
 /// `--color` decides clap's own colors too, so it is read before parsing.
@@ -519,16 +542,30 @@ fn doctor(ctx: &Ctx, dir: Option<&Path>, json: bool) -> Result<ExitCode, Error> 
     })
 }
 
-/// The comments file: `file` (`--comments`) relative to where dffy runs
-/// (`-C`), or the default in the repository's git directory.
-fn comments_file(dir: Option<&Path>, file: Option<&Path>) -> Result<PathBuf, Error> {
+/// Where dffy runs: the current directory, or `-C`'s relative to it.
+fn base_dir(dir: Option<&Path>) -> Result<PathBuf, Error> {
     let cwd = std::env::current_dir()
         .map_err(|e| Error::fatal(format!("can't read the current directory: {e}")))?;
-    let base = dir.map_or_else(|| cwd.clone(), |dir| cwd.join(dir));
+    Ok(dir.map_or_else(|| cwd.clone(), |dir| cwd.join(dir)))
+}
+
+/// The comments file: `file` (`--comments`) relative to where dffy runs
+/// (`-C`), or the local review's in `repo`'s shared git directory, moved
+/// there first from the worktree's when it was there.
+fn comments_file(
+    dir: Option<&Path>,
+    file: Option<&Path>,
+    repo: Option<&git::Repo>,
+) -> Result<PathBuf, Error> {
+    let base = base_dir(dir)?;
     if let Some(file) = file {
         return Ok(base.join(file));
     }
-    let not_found = || Error::Fatal {
+    let local = match repo {
+        Some(repo) => review::local_file(repo).map_err(Error::fatal)?,
+        None => None,
+    };
+    local.ok_or_else(|| Error::Fatal {
         message: format!(
             "{} isn't in a git repository, so it has no comments file",
             base.display()
@@ -537,20 +574,86 @@ fn comments_file(dir: Option<&Path>, file: Option<&Path>) -> Result<PathBuf, Err
             "name one with --comments <file>, or run dffy inside a repository or with -C <path>"
                 .to_owned(),
         ),
-    };
-    let repo = git::Repo::discover(&base).map_err(|_| not_found())?;
-    let git_dir = repo.git_dir().ok_or_else(not_found)?;
-    Ok(review::default_path(git_dir))
+    })
 }
 
-/// `dffy comments`: the file listed, printed as JSON, or written by `apply`.
+/// The branches `args` names, by default `current`'s and none; outside a
+/// repository there's no branch to keep apart.
+fn branch_scope<'a>(
+    args: &'a BranchArgs,
+    current: Option<&'a str>,
+    in_repo: bool,
+) -> review::Branches<'a> {
+    match (&args.branch, args.all_branches) {
+        (Some(branch), false) => review::Branches::On(Some(branch)),
+        (None, false) if in_repo => review::Branches::On(current),
+        _ => review::Branches::All,
+    }
+}
+
+/// `dffy comments`: the threads listed, the file printed as JSON or
+/// Markdown, or written by `apply` and `rm`.
 fn comments(
-    path: &Path,
-    json: bool,
-    action: Option<CommentsAction>,
+    dir: Option<&Path>,
+    file: Option<&Path>,
+    args: CommentsArgs,
     ctx: &Ctx,
 ) -> Result<ExitCode, Error> {
-    match action {
+    if args.action.is_some() && args.lists() {
+        return Err(Error::Fatal {
+            message: "--json, --markdown, --open, --resolved, --path, --branch and \
+                --all-branches are for listing, not for apply or rm"
+                .to_owned(),
+            hint: Some("rm takes --resolved, --branch and --all-branches after it".to_owned()),
+        });
+    }
+    // An integration's `apply` on its own file, each batch, needs neither
+    // the repository nor the branch.
+    let branchless = matches!(args.action, Some(CommentsAction::Apply)) || args.json;
+    let repo = if file.is_some() && branchless {
+        None
+    } else {
+        git::Repo::discover(&base_dir(dir)?).ok()
+    };
+    let path = match (file, args.session) {
+        (Some(_), true) => {
+            return Err(Error::fatal(
+                "--comments and --session both name the comments file; give one",
+            ));
+        }
+        (_, false) => comments_file(dir, file, repo.as_ref())?,
+        (None, true) => {
+            let pointer = match &repo {
+                Some(repo) => review::read_session(repo).map_err(Error::fatal)?,
+                None => None,
+            };
+            pointer.map(|p| p.comments).ok_or_else(|| Error::Fatal {
+                message: "no review session: the viewer hasn't opened one in this repository"
+                    .to_owned(),
+                hint: Some(
+                    "open a review with the review plugin's command, as in dffy pr, then try again"
+                        .to_owned(),
+                ),
+            })?
+        }
+    };
+    let current = repo
+        .as_ref()
+        .filter(|_| !branchless)
+        .and_then(review::current_branch);
+    let scope = |branches| branch_scope(branches, current.as_deref(), repo.is_some());
+    match args.action {
+        Some(CommentsAction::Rm { branches, .. }) => {
+            let select = review::Select {
+                resolved: Some(true),
+                branches: scope(&branches),
+                ..review::Select::default()
+            };
+            let removed = review::remove_threads(&path, &select).map_err(Error::fatal)?;
+            let s = if removed == 1 { "" } else { "s" };
+            writeln!(io::stdout().lock(), "removed {removed} comment{s}")?;
+            Ok(ExitCode::SUCCESS)
+        }
         Some(CommentsAction::Apply) => {
             use std::io::{IsTerminal, Read};
             if io::stdin().is_terminal() {
@@ -565,31 +668,109 @@ fn comments(
             }
             let mut input = Vec::new();
             io::stdin().lock().read_to_end(&mut input)?;
-            let answer = review::apply_json(path, &input).map_err(Error::fatal)?;
+            // Only the local review's file keeps branches apart; an
+            // integration's file is one review's, on no branch.
+            let branch = repo
+                .as_ref()
+                .filter(|_| file.is_none() && !args.session)
+                .and_then(review::current_branch);
+            let answer =
+                review::apply_json(&path, &input, branch.as_deref()).map_err(Error::fatal)?;
             io::stdout().lock().write_all(answer.as_bytes())?;
             Ok(ExitCode::SUCCESS)
         }
-        None => {
-            let file = review::read(path).map_err(Error::fatal)?;
-            if json {
-                io::stdout().lock().write_all(file.encode().as_bytes())?;
-                return Ok(ExitCode::SUCCESS);
-            }
-            let mut c = Canvas::default();
-            if let Some(notice) = &file.notice {
-                c.push(Role::Warn, "notice:");
-                c.line(
-                    Role::Plain,
-                    &format!(" {}", render::escape(notice.as_bytes())),
-                );
-                c.end_line();
-            }
-            if file.comments.is_empty() {
-                c.line(Role::Dim, "no comments");
-            }
-            review::render(&review::threads(&file.comments), &mut c);
-            write_stdout(ctx, &c)
+        None => list_comments(&path, &args, scope(&args.branches), current.as_deref(), ctx),
+    }
+}
+
+/// `dffy comments` without an action: the threads of `branches` that
+/// `args` picks, for reading or as Markdown, or the whole file as JSON.
+/// `current` is the current branch.
+fn list_comments(
+    path: &Path,
+    args: &CommentsArgs,
+    branches: review::Branches,
+    current: Option<&str>,
+    ctx: &Ctx,
+) -> Result<ExitCode, Error> {
+    let file = review::read(path).map_err(Error::fatal)?;
+    if args.json {
+        io::stdout().lock().write_all(file.encode().as_bytes())?;
+        return Ok(ExitCode::SUCCESS);
+    }
+    let select = review::Select {
+        resolved: match (args.open, args.resolved) {
+            (true, _) => Some(false),
+            (_, true) => Some(true),
+            _ => None,
+        },
+        path: args.path.as_deref(),
+        branches,
+    };
+    let listed = review::threads(file.selected(&select));
+    if args.markdown {
+        let text = review::markdown(&listed, file.summary.as_deref());
+        io::stdout().lock().write_all(text.as_bytes())?;
+        return Ok(ExitCode::SUCCESS);
+    }
+    let mut c = Canvas::default();
+    if let Some(notice) = &file.notice {
+        c.push(Role::Warn, "notice:");
+        c.line(
+            Role::Plain,
+            &format!(" {}", render::escape(notice.as_bytes())),
+        );
+        c.end_line();
+    }
+    if let Some(summary) = &file.summary {
+        c.line(Role::FileHeader, "summary, not posted yet");
+        for line in summary.lines() {
+            c.spaces(Role::Plain, 4);
+            c.line(Role::Plain, &render::escape(line.as_bytes()));
         }
+        c.end_line();
+    }
+    if listed.is_empty() {
+        c.line(Role::Dim, "no comments");
+    }
+    let here = match branches {
+        review::Branches::On(branch) => branch,
+        review::Branches::All => current,
+    };
+    review::render(&listed, here, &mut c);
+    if branches != review::Branches::All {
+        let everywhere = review::Select {
+            branches: review::Branches::All,
+            ..select
+        };
+        let elsewhere = file.selected(&everywhere).len() - listed.len();
+        if elsewhere > 0 {
+            c.end_line();
+            c.line(
+                Role::Dim,
+                &format!("{elsewhere} more on other branches; --all-branches lists them"),
+            );
+        }
+    }
+    write_stdout(ctx, &c)
+}
+
+/// `e` with why the review plugin's command is missing, when its first
+/// revision was asked about as that command and became a revision because
+/// the plugin couldn't describe itself.
+fn without_review_command(e: Error, args: &DiffArgs, ctx: &Ctx) -> Error {
+    let why = ctx.review.get().and_then(|r| r.as_ref().err());
+    match (e, args.revs.first(), why, ctx.review_name.as_deref()) {
+        (Error::Fatal { message, hint }, Some(first), Some(why), Some(name))
+            if message == format!("unknown revision '{first}'") =>
+        {
+            let ours = format!("{}{name} adds no command: {why}", plugin::REVIEW_PREFIX);
+            Error::Fatal {
+                message,
+                hint: Some(hint.map_or_else(|| ours.clone(), |h| format!("{ours}\n{h}"))),
+            }
+        }
+        (e, ..) => e,
     }
 }
 
@@ -597,12 +778,11 @@ fn run(cli: Cli, ctx: &Ctx) -> Result<ExitCode, Error> {
     let dir = cli.global.dir.as_deref();
     match cli.command {
         None => diff(dir, &DiffArgs::default(), ctx),
-        Some(Command::Diff(args)) => diff(dir, &args, ctx),
-        Some(Command::Show(args)) => show(dir, &args, ctx),
-        Some(Command::Comments { json, action }) => {
-            let path = comments_file(dir, cli.global.comments.as_deref())?;
-            comments(&path, json, action, ctx)
+        Some(Command::Diff(args)) => {
+            diff(dir, &args, ctx).map_err(|e| without_review_command(e, &args, ctx))
         }
+        Some(Command::Show(args)) => show(dir, &args, ctx),
+        Some(Command::Comments(args)) => comments(dir, cli.global.comments.as_deref(), args, ctx),
         Some(Command::Config {
             markdown: Some(page),
             ..

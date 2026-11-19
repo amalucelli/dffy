@@ -3,6 +3,7 @@ use std::thread;
 use std::time::Duration;
 
 use dffy_core::diff::{Options, hunks};
+use dffy_core::git::Repo;
 
 use super::*;
 
@@ -21,7 +22,39 @@ fn file_in(dir: &tempfile::TempDir) -> PathBuf {
 
 /// Applies `ops`, given as the JSON `dffy comments apply` reads, to `c`.
 fn ops(c: &mut Review, input: &str) -> Result<Vec<Option<String>>, String> {
-    c.apply(parse_ops(input.as_bytes())?, now())
+    c.apply(parse_ops(input.as_bytes(), None)?, now())
+}
+
+/// A writer that knows the branch gives it to the threads `add` starts
+/// without one; `null` keeps a thread on no branch, and a reply takes its
+/// thread's whatever it's given.
+#[test]
+fn add_takes_the_branch_given_for_threads_without_one() {
+    let mut c = Review::default();
+    let input = format!(
+        r#"[{LINE_COMMENT},{{"op":"add","comment":{{"path":"a.rs","text":"x","branch":null}}}},{{"op":"add","comment":{{"path":"a.rs","text":"y","branch":"other"}}}},{{"op":"add","comment":{{"text":"z","in_reply_to":"none-yet"}}}}]"#
+    );
+    let parsed = parse_ops(input.as_bytes(), Some("feature/x")).expect("parses");
+    let branches: Vec<Option<&str>> = parsed
+        .iter()
+        .map(|op| match op {
+            Op::Add { comment, .. } => comment.branch.as_deref(),
+            _ => panic!("an add"),
+        })
+        .collect();
+    assert_eq!(
+        branches,
+        [Some("feature/x"), None, Some("other"), None],
+        "a reply isn't given one: it takes its thread's"
+    );
+    let root = added(&mut c, &format!("[{LINE_COMMENT}]"));
+    let reply = format!(r#"[{{"op":"add","comment":{{"text":"r","in_reply_to":"{root}"}}}}]"#);
+    c.apply(
+        parse_ops(reply.as_bytes(), Some("feature/x")).expect("parses"),
+        now(),
+    )
+    .expect("applies");
+    assert_eq!(c.comments[1].branch, None, "the thread's");
 }
 
 fn added(c: &mut Review, input: &str) -> String {
@@ -30,8 +63,8 @@ fn added(c: &mut Review, input: &str) -> String {
 
 const LINE_COMMENT: &str = r#"{"op":"add","comment":{"path":"src/lib.rs","side":"new","start":{"old":2,"new":2},"end":{"old":null,"new":3},"text":"Why?","anchor":{"before":["a"],"lines":["b","c"],"after":["d","e"]}}}"#;
 
-const EVERY_FIELD: &str = r#"{"version":1,"notice":"as of 10:42","tool":{"pr":7},"comments":[
-{"id":"a1","path":"new.rs","old_path":"old.rs","side":"new","start_side":"old","start":{"old":3,"new":null},"end":{"old":null,"new":5},"text":"Use \"checked_add\".\nIt\twraps.","suggestion":"x.checked_add(y)","author":"octocat","created":"2026-11-17T10:42:00Z","resolved":true,"ref":"github:PRRC_1","anchor":{"before":["fn f() {"],"lines":["    x + y","é \r"],"after":[]},"distance":2,"url":"https://github.com/o/r/pull/7#discussion_r1","outdated":true,"github_thread":"PRRT_1","pending":[1,{"a":null}]},
+const EVERY_FIELD: &str = r#"{"version":1,"notice":"as of 10:42","summary":"Two nits.","tool":{"pr":7},"comments":[
+{"id":"a1","path":"new.rs","old_path":"old.rs","side":"new","start_side":"old","start":{"old":3,"new":null},"end":{"old":null,"new":5},"text":"Use \"checked_add\".\nIt\twraps.","suggestion":"x.checked_add(y)","author":"octocat","created":"2026-11-17T10:42:00Z","resolved":true,"ref":"github:PRRC_1","anchor":{"before":["fn f() {"],"lines":["    x + y","é \r"],"after":[]},"distance":2,"url":"https://github.com/o/r/pull/7#discussion_r1","outdated":true,"branch":"feature/x","pending":true,"post_error":"line 5 isn't in the diff","github_thread":"PRRT_1","github_draft":[1,{"a":null}]},
 {"id":"a2","path":"new.rs","text":"Agreed.","author":"","created":"2026-11-17T11:00:00Z","in_reply_to":"a1","resolved":false}
 ]}
 "#;
@@ -83,8 +116,23 @@ fn the_file_roundtrips_through_the_reader_and_writer_with_unknown_fields() {
             .iter()
             .map(|(k, _)| k.as_str())
             .collect::<Vec<_>>(),
-        ["github_thread", "pending"]
+        ["github_thread", "github_draft"]
     );
+    assert_eq!(
+        (
+            first.branch.as_deref(),
+            first.pending,
+            first.post_error.as_deref(),
+            read_back.comments[1].pending
+        ),
+        (
+            Some("feature/x"),
+            true,
+            Some("line 5 isn't in the diff"),
+            false
+        )
+    );
+    assert_eq!(read_back.summary.as_deref(), Some("Two nits."));
     assert_eq!(read_back.extra[0].0, "tool");
 
     // A write through `apply` keeps everything it didn't change.
@@ -93,6 +141,7 @@ fn the_file_roundtrips_through_the_reader_and_writer_with_unknown_fields() {
     assert_eq!(rewritten.notice.as_deref(), Some("refreshed"));
     assert_eq!(rewritten.comments, read_back.comments);
     assert_eq!(rewritten.extra, read_back.extra);
+    assert_eq!(rewritten.summary, read_back.summary);
 
     let bytes = fs::read(&path).expect("read");
     let value = json::parse(&bytes).expect("valid JSON");
@@ -101,7 +150,7 @@ fn the_file_roundtrips_through_the_reader_and_writer_with_unknown_fields() {
         .and_then(Value::as_array)
         .expect("comments");
     assert_eq!(
-        comments[0].get("pending"),
+        comments[0].get("github_draft"),
         Some(&Value::Array(vec![
             Value::Number(1.0),
             Value::Object(vec![("a".to_owned(), Value::Null)])
@@ -117,6 +166,7 @@ fn the_file_roundtrips_through_the_reader_and_writer_with_unknown_fields() {
         "fields that don't apply are left out"
     );
     assert_eq!(comments[1].get("outdated"), None, "false is left out");
+    assert_eq!(comments[1].get("pending"), None, "false is left out");
     assert_eq!(Review::parse(&bytes), Ok(rewritten));
 }
 
@@ -125,10 +175,6 @@ fn a_missing_or_empty_file_is_no_comments() {
     let dir = tempfile::tempdir().expect("tempdir");
     assert_eq!(read(&file_in(&dir)), Ok(Review::default()));
     assert_eq!(Review::parse(b" \n"), Ok(Review::default()));
-    assert_eq!(
-        default_path(Path::new("/repo/.git")),
-        Path::new("/repo/.git/dffy/comments.json")
-    );
 }
 
 #[test]
@@ -406,6 +452,63 @@ fn upsert_adds_or_updates_by_ref() {
     }
 }
 
+/// An upsert moves a comment into another thread only when nothing is
+/// lost: not a first comment that replies answer, which would leave them
+/// under no thread, nor into its own thread.
+#[test]
+fn an_upsert_into_a_thread_keeps_every_reply_under_one() {
+    let mut c = Review::default();
+    ops(
+        &mut c,
+        r#"[{"op":"upsert","comment":{"ref":"github:R","path":"a.rs","text":"root"}},
+            {"op":"upsert","comment":{"ref":"github:C","text":"reply","in_reply_to_ref":"github:R"}},
+            {"op":"upsert","comment":{"ref":"github:S","path":"a.rs","text":"other"}}]"#,
+    )
+    .expect("adds");
+    let before = c.clone();
+    for bad in [
+        r#"{"op":"upsert","comment":{"ref":"github:R","in_reply_to_ref":"github:S"}}"#,
+        r#"{"op":"upsert","comment":{"ref":"github:S","in_reply_to_ref":"github:S"}}"#,
+    ] {
+        assert!(ops(&mut c, &format!("[{bad}]")).is_err(), "{bad}");
+        assert_eq!(c, before);
+    }
+    ops(
+        &mut c,
+        r#"[{"op":"upsert","comment":{"ref":"github:S","in_reply_to_ref":"github:C"}}]"#,
+    )
+    .expect("a first comment without replies joins a thread");
+    assert_eq!(c.comments[2].in_reply_to, Some(c.comments[0].id.clone()));
+}
+
+/// A `set` leaves a comment the file's format allows, as `add` and
+/// `upsert` do: a general comment keeps its ref, and only a line comment
+/// has an anchor.
+#[test]
+fn a_set_keeps_the_comment_valid() {
+    let mut c = Review::default();
+    ops(
+        &mut c,
+        r#"[{"op":"upsert","comment":{"ref":"github:G","text":"description"}},
+            {"op":"add","comment":{"path":"a.rs","text":"on the file"}}]"#,
+    )
+    .expect("adds");
+    let file = c.comments[1].id.clone();
+    let reply = added(
+        &mut c,
+        &format!(r#"[{{"op":"add","comment":{{"text":"reply","in_reply_to":"{file}"}}}}]"#),
+    );
+    let before = c.clone();
+    for bad in [
+        r#"{"op":"set","ref":"github:G","fields":{"ref":null}}"#.to_owned(),
+        format!(r#"{{"op":"set","id":"{file}","fields":{{"anchor":{{"lines":["x"]}}}}}}"#),
+        format!(r#"{{"op":"set","id":"{reply}","fields":{{"anchor":{{"lines":["x"]}}}}}}"#),
+    ] {
+        assert!(ops(&mut c, &format!("[{bad}]")).is_err(), "{bad}");
+        assert_eq!(c, before);
+    }
+}
+
 /// A general comment is on the review rather than a file, such as its
 /// description: no `path` and no lines. Its `kind` and `label` are the
 /// integration's words, kept as given. It's written without a `path`, and
@@ -471,7 +574,7 @@ fn listing_heads_general_comments_as_the_conversation() {
     )
     .expect("parses");
     let mut c = Canvas::default();
-    render(&threads(&review.comments), &mut c);
+    render(&threads(&review.comments), None, &mut c);
     let mut out = Vec::new();
     c.write_to(&mut out, None).expect("writes");
     insta::assert_snapshot!(String::from_utf8(out).expect("utf-8"), @r"
@@ -525,6 +628,379 @@ fn notice_sets_and_clears() {
     assert_eq!(c.notice.as_deref(), Some("stale"));
     ops(&mut c, r#"[{"op":"notice","notice":null}]"#).expect("clears");
     assert_eq!(c.notice, None);
+    assert_eq!(
+        ops(&mut c, r#"[{"op":"summary","summary":"Ship it."}]"#).expect("sets"),
+        [None]
+    );
+    assert_eq!(c.summary.as_deref(), Some("Ship it."));
+    ops(&mut c, r#"[{"op":"summary","summary":null}]"#).expect("clears");
+    assert_eq!(c.summary, None);
+}
+
+fn comment<'a>(c: &'a Review, id: &str) -> &'a Comment {
+    c.comments.iter().find(|x| x.id == id).expect("in the file")
+}
+
+/// Beside the text, `set` adopts a comment as yours (author only to
+/// empty), changes its suggestion, moves its thread to another branch
+/// (from any of its comments), and marks how a post went.
+#[test]
+fn set_adopts_retargets_and_marks_posts() {
+    let mut c = Review::default();
+    let root = added(
+        &mut c,
+        r#"[{"op":"add","comment":{"path":"a.rs","text":"Rename it.","author":"claude","branch":"topic"}}]"#,
+    );
+    let reply = added(
+        &mut c,
+        &format!(
+            r#"[{{"op":"add","comment":{{"text":"Yes.","in_reply_to":"{root}","branch":"elsewhere"}}}}]"#
+        ),
+    );
+    let branches = |c: &Review| {
+        c.comments
+            .iter()
+            .map(|x| x.branch.clone())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        branches(&c),
+        [Some("topic".to_owned()), Some("topic".to_owned())],
+        "a reply is on its thread's branch"
+    );
+    ops(
+        &mut c,
+        &format!(
+            r#"[{{"op":"set","id":"{root}","fields":{{"author":"","suggestion":"fn renamed()","pending":true,"post_error":"not in the diff"}}}},
+                {{"op":"set","id":"{reply}","fields":{{"branch":"renamed"}}}}]"#
+        ),
+    )
+    .expect("applies");
+    let r = comment(&c, &root);
+    assert_eq!(
+        (
+            r.author.as_str(),
+            r.suggestion.as_deref(),
+            r.pending,
+            r.post_error.as_deref()
+        ),
+        ("", Some("fn renamed()"), true, Some("not in the diff"))
+    );
+    assert_eq!(
+        branches(&c),
+        [Some("renamed".to_owned()), Some("renamed".to_owned())]
+    );
+    ops(
+        &mut c,
+        &format!(
+            r#"[{{"op":"set","id":"{root}","fields":{{"suggestion":null,"pending":false,"post_error":null,"branch":null}}}}]"#
+        ),
+    )
+    .expect("clears");
+    let r = comment(&c, &root);
+    assert_eq!(
+        (r.suggestion.as_deref(), r.pending, r.post_error.as_deref()),
+        (None, false, None)
+    );
+    assert_eq!(branches(&c), [None, None]);
+    for bad in [
+        r#"{"author":"bob"}"#,
+        r#"{"pending":"yes"}"#,
+        r#"{"branch":1}"#,
+    ] {
+        let op = format!(r#"[{{"op":"set","id":"{root}","fields":{bad}}}]"#);
+        assert!(ops(&mut c, &op).is_err(), "{bad}");
+    }
+
+    // Posted, its suggestion and author are the host's, as its text is.
+    ops(
+        &mut c,
+        &format!(r#"[{{"op":"set","id":"{reply}","fields":{{"ref":"github:1"}}}}]"#),
+    )
+    .expect("posts");
+    for posted in [r#"{"suggestion":"x"}"#, r#"{"author":""}"#] {
+        let op = format!(r#"[{{"op":"set","ref":"github:1","fields":{posted}}}]"#);
+        assert!(ops(&mut c, &op).is_err(), "{posted}");
+    }
+}
+
+/// A selection keeps whole threads, judged by their first comment: a reply
+/// is open or resolved, on a file and on a branch as its thread is.
+#[test]
+fn selections_keep_whole_threads() {
+    let review = Review::parse(
+        br#"{"version":1,"comments":[
+{"id":"g1","text":"Ship it.","author":"hubot","created":"t","resolved":false,"ref":"r1"},
+{"id":"a1","path":"a.rs","text":"Open.","author":"","created":"t","resolved":false,"branch":"topic"},
+{"id":"a2","path":"a.rs","text":"Reply.","author":"","created":"t","resolved":false,"in_reply_to":"a1"},
+{"id":"b1","path":"b.rs","old_path":"old_b.rs","text":"Done.","author":"","created":"t","resolved":true},
+{"id":"b2","path":"b.rs","old_path":"old_b.rs","text":"Reply.","author":"","created":"t","resolved":false,"in_reply_to":"b1"},
+{"id":"c1","path":"c.rs","text":"Elsewhere.","author":"","created":"t","resolved":true,"branch":"main"}
+]}"#,
+    )
+    .expect("parses");
+    let ids = |s: Select| {
+        review
+            .selected(&s)
+            .iter()
+            .map(|c| c.id.as_str())
+            .collect::<Vec<_>>()
+    };
+    let all = Select::default();
+    assert_eq!(ids(all), ["g1", "a1", "a2", "b1", "b2", "c1"]);
+    let resolved = |resolved| Select {
+        resolved: Some(resolved),
+        ..all
+    };
+    assert_eq!(ids(resolved(true)), ["b1", "b2", "c1"]);
+    assert_eq!(ids(resolved(false)), ["g1", "a1", "a2"]);
+    assert_eq!(
+        ids(Select {
+            path: Some("old_b.rs"),
+            ..all
+        }),
+        ["b1", "b2"]
+    );
+    let on = |branch| Select {
+        branches: Branches::On(branch),
+        ..all
+    };
+    assert_eq!(ids(on(Some("topic"))), ["g1", "a1", "a2", "b1", "b2"]);
+    assert_eq!(ids(on(Some("main"))), ["g1", "b1", "b2", "c1"]);
+    assert_eq!(ids(on(None)), ["g1", "b1", "b2"], "detached: no branch's");
+}
+
+/// `dffy comments rm --resolved`: the resolved threads a selection keeps
+/// go whole, under the lock, and the rest stay as they were.
+#[test]
+fn removing_resolved_threads_takes_their_replies() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = file_in(&dir);
+    fs::create_dir_all(path.parent().expect("has a parent")).expect("mkdir");
+    fs::write(
+        &path,
+        r#"{"version":1,"notice":"kept","comments":[
+{"id":"a1","path":"a.rs","text":"Open.","author":"","created":"t","resolved":false},
+{"id":"b1","path":"b.rs","text":"Done.","author":"","created":"t","resolved":true},
+{"id":"b2","path":"b.rs","text":"Reply.","author":"","created":"t","resolved":false,"in_reply_to":"b1"},
+{"id":"c1","path":"c.rs","text":"Elsewhere.","author":"","created":"t","resolved":true,"branch":"main"}
+]}"#,
+    )
+    .expect("write");
+    let resolved_here = Select {
+        resolved: Some(true),
+        branches: Branches::On(Some("topic")),
+        ..Select::default()
+    };
+    assert_eq!(remove_threads(&path, &resolved_here), Ok(2));
+    let left = read(&path).expect("reads");
+    assert_eq!(
+        left.comments
+            .iter()
+            .map(|c| c.id.as_str())
+            .collect::<Vec<_>>(),
+        ["a1", "c1"]
+    );
+    assert_eq!(left.notice.as_deref(), Some("kept"));
+}
+
+/// `dffy comments --markdown`: each thread under a heading with its place,
+/// over the commented lines in a fence longer than any run of backticks in
+/// them, then each comment with its suggestion.
+#[test]
+fn markdown_exports_threads_with_their_lines() {
+    let review = Review::parse(
+        br#"{"version":1,"summary":"Two nits.","comments":[
+{"id":"b1","path":"src/lib.rs","side":"old","start":{"old":4,"new":null},"end":{"old":5,"new":null},"text":"Use **checked** math.","suggestion":"a.checked_add(b)","author":"","created":"t1","resolved":true,"anchor":{"before":["x"],"lines":["let s = ```;","a + b"],"after":[]}},
+{"id":"b2","path":"src/lib.rs","text":"Done.","author":"octocat","created":"t2","in_reply_to":"b1","resolved":false},
+{"id":"a1","path":"README.md","text":"Say more.","author":"ada","created":"t0","resolved":false},
+{"id":"g1","text":"Looks good.","author":"hubot","created":"t3","resolved":false,"ref":"r1","kind":"review","label":"approved"}
+]}"#,
+    )
+    .expect("parses");
+    insta::assert_snapshot!(markdown(&threads(&review.comments), review.summary.as_deref()), @r"
+    ## Summary
+
+    Two nits.
+
+    ## Conversation, review, approved
+
+    **hubot**, t3
+
+    Looks good.
+
+    ## `README.md`
+
+    **ada**, t0
+
+    Say more.
+
+    ## `src/lib.rs`, lines 4-5 (old side), resolved
+
+    ````
+    let s = ```;
+    a + b
+    ````
+
+    **you**, t1
+
+    Use **checked** math.
+
+    Suggested change:
+
+    ```
+    a.checked_add(b)
+    ```
+
+    **octocat**, t2
+
+    Done.
+    ");
+}
+
+fn git(dir: &Path, args: &[&str]) -> std::process::Output {
+    std::process::Command::new("git")
+        .current_dir(dir)
+        .args(args)
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_AUTHOR_NAME", "A")
+        .env("GIT_AUTHOR_EMAIL", "a@example.com")
+        .env("GIT_COMMITTER_NAME", "A")
+        .env("GIT_COMMITTER_EMAIL", "a@example.com")
+        .output()
+        .expect("git runs")
+}
+
+fn git_ok(dir: &Path, args: &[&str]) {
+    let out = git(dir, args);
+    assert!(
+        out.status.success(),
+        "git {args:?}: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+fn commit(dir: &Path, name: &str, contents: &str) {
+    fs::write(dir.join(name), contents).expect("write");
+    git_ok(dir, &["add", "-A"]);
+    git_ok(dir, &["commit", "-q", "-m", name]);
+}
+
+/// A repository on `main` with one commit, in a canonical path, so paths
+/// git and dffy give compare equal.
+fn repository() -> (tempfile::TempDir, PathBuf) {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let d = dir.path().canonicalize().expect("canonical");
+    git_ok(&d, &["init", "-q", "-b", "main"]);
+    commit(&d, "a.txt", "base\n");
+    (dir, d)
+}
+
+/// Local comments are kept per branch: HEAD's, an unborn one's, the
+/// branch being rebased while a rebase stops, and none on a detached HEAD.
+#[test]
+fn the_current_branch_follows_head_and_rebases() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let d = dir.path();
+    git_ok(d, &["init", "-q", "-b", "main"]);
+    let branch = || current_branch(&Repo::discover(d).expect("repo"));
+    assert_eq!(branch().as_deref(), Some("main"), "unborn");
+    commit(d, "a.txt", "base\n");
+    git_ok(d, &["checkout", "-q", "-b", "feature/x"]);
+    commit(d, "a.txt", "feature\n");
+    assert_eq!(branch().as_deref(), Some("feature/x"));
+    git_ok(d, &["checkout", "-q", "main"]);
+    commit(d, "a.txt", "main\n");
+    git_ok(d, &["checkout", "-q", "feature/x"]);
+    for backend in ["--merge", "--apply"] {
+        assert!(
+            !git(d, &["rebase", backend, "main"]).status.success(),
+            "{backend} stops on the conflict"
+        );
+        assert_eq!(branch().as_deref(), Some("feature/x"), "{backend}");
+        git_ok(d, &["rebase", "--abort"]);
+    }
+    git_ok(d, &["checkout", "-q", "--detach"]);
+    assert_eq!(branch(), None);
+}
+
+/// The local review's file is in the git directory every worktree shares.
+/// A linked worktree's file from before moves there once, and stays where
+/// it is when the shared one already exists; until it moves, read-only
+/// readers find it where it was.
+#[test]
+fn a_worktrees_old_file_moves_to_the_shared_git_directory() {
+    let (_dir, d) = repository();
+    let shared = d.join(".git/dffy/comments.json");
+    assert_eq!(
+        local_file(&Repo::discover(&d).expect("repo")),
+        Ok(Some(shared.clone()))
+    );
+    let old_file = |name: &str| {
+        let linked = d.join(name);
+        git_ok(
+            &d,
+            &["worktree", "add", "-q", linked.to_str().expect("utf-8")],
+        );
+        let repo = Repo::discover(&linked).expect("repo");
+        let old = repo
+            .git_dir()
+            .expect("a git dir")
+            .canonicalize()
+            .expect("exists")
+            .join("dffy/comments.json");
+        apply(
+            &old,
+            parse_ops(format!("[{LINE_COMMENT}]").as_bytes(), None).expect("ops"),
+        )
+        .expect("writes");
+        (repo, old)
+    };
+    let (linked, old) = old_file("linked");
+    let before = read(&old).expect("reads");
+    assert_eq!(local_file_read_only(&linked), Some(old.clone()));
+    assert_eq!(local_file(&linked), Ok(Some(shared.clone())));
+    assert!(!old.exists(), "moved");
+    assert_eq!(read(&shared), Ok(before));
+    assert_eq!(local_file_read_only(&linked), Some(shared.clone()));
+
+    let (second, stranded) = old_file("second");
+    assert_eq!(local_file(&second), Ok(Some(shared)));
+    assert!(stranded.exists(), "not merged into the shared file");
+}
+
+/// The session pointer names the review session the viewer has open, in
+/// the shared git directory; a pointer dffy can't trust is an error.
+#[test]
+fn the_session_pointer_roundtrips() {
+    let (_dir, d) = repository();
+    let repo = Repo::discover(&d).expect("repo");
+    assert_eq!(read_session(&repo), Ok(None));
+    let pointer = Pointer {
+        comments: PathBuf::from("/data/7/comments.json"),
+        review: "7".to_owned(),
+        branch: Some("feature/x".to_owned()),
+        head: "e4f5a6b".to_owned(),
+    };
+    write_session(&repo, &pointer).expect("writes");
+    assert_eq!(read_session(&repo), Ok(Some(pointer.clone())));
+    let detached = Pointer {
+        branch: None,
+        ..pointer
+    };
+    write_session(&repo, &detached).expect("writes");
+    assert_eq!(read_session(&repo), Ok(Some(detached)));
+    let file = d.join(".git/dffy/session");
+    for bad in [
+        r#"{"version":1,"comments":"relative.json","review":"7","branch":null,"head":"e4f5a6b"}"#,
+        r#"{"version":2,"comments":"/data/7/comments.json","review":"7","branch":null,"head":"e4f5a6b"}"#,
+        r#"{"version":1,"review":"7","head":"e4f5a6b"}"#,
+        "not json",
+    ] {
+        fs::write(&file, bad).expect("write");
+        assert!(read_session(&repo).is_err(), "{bad}");
+    }
 }
 
 /// A batch is applied whole or not at all, and the error names the
@@ -534,7 +1010,7 @@ fn a_failed_batch_writes_nothing() {
     let dir = tempfile::tempdir().expect("tempdir");
     let path = file_in(&dir);
     let input = format!(r#"[{LINE_COMMENT}, {{"op":"rm","id":"missing"}}]"#);
-    let err = apply_json(&path, input.as_bytes()).expect_err("fails");
+    let err = apply_json(&path, input.as_bytes(), None).expect_err("fails");
     assert!(err.starts_with("operation 1 (rm): "), "{err}");
     assert!(!path.exists());
 
@@ -556,7 +1032,7 @@ fn apply_answers_an_id_per_operation() {
     let dir = tempfile::tempdir().expect("tempdir");
     let path = file_in(&dir);
     let input = format!(r#"[{LINE_COMMENT}, {{"op":"notice","notice":"hi"}}]"#);
-    let answer = apply_json(&path, input.as_bytes()).expect("applies");
+    let answer = apply_json(&path, input.as_bytes(), None).expect("applies");
     let value = json::parse(answer.as_bytes()).expect("valid JSON");
     let ids = value.get("ids").and_then(Value::as_array).expect("ids");
     let stored = read(&path).expect("reads");
@@ -677,7 +1153,7 @@ fn writers_wait_for_the_lock_and_lose_nothing() {
     let waiting = {
         let path = path.clone();
         thread::spawn(move || {
-            let result = apply_json(&path, format!("[{LINE_COMMENT}]").as_bytes());
+            let result = apply_json(&path, format!("[{LINE_COMMENT}]").as_bytes(), None);
             tx.send(()).expect("receiver alive");
             result
         })
@@ -692,7 +1168,7 @@ fn writers_wait_for_the_lock_and_lose_nothing() {
     let writers: Vec<_> = (0..8)
         .map(|_| {
             let path = path.clone();
-            thread::spawn(move || apply_json(&path, format!("[{LINE_COMMENT}]").as_bytes()))
+            thread::spawn(move || apply_json(&path, format!("[{LINE_COMMENT}]").as_bytes(), None))
         })
         .collect();
     for w in writers {
@@ -703,20 +1179,21 @@ fn writers_wait_for_the_lock_and_lose_nothing() {
 
 /// Threads go by path and line, each with its replies, and a reply whose
 /// thread is gone gets a heading of its own rather than joining the thread
-/// before it.
+/// before it. A thread on another branch than the one listed says which,
+/// and a comment says how its post went.
 #[test]
 fn listing_heads_every_thread() {
     let review = Review::parse(
         br#"{"version":1,"comments":[
-{"id":"z1","path":"z.rs","text":"Orphan.","author":"","created":"t3","in_reply_to":"gone","resolved":false},
-{"id":"b1","path":"a.rs","side":"old","start":{"old":4,"new":null},"end":{"old":5,"new":null},"text":"Two\nlines.","suggestion":"fixed","author":"","created":"t1","resolved":true,"anchor":{"lines":["x","y"]}},
+{"id":"z1","path":"z.rs","text":"Orphan.","author":"","created":"t3","in_reply_to":"gone","resolved":false,"branch":"main"},
+{"id":"b1","path":"a.rs","side":"old","start":{"old":4,"new":null},"end":{"old":5,"new":null},"text":"Two\nlines.","suggestion":"fixed","author":"","created":"t1","resolved":true,"anchor":{"lines":["x","y"]},"branch":"topic","post_error":"line 4 isn't in the diff"},
 {"id":"a1","path":"a.rs","text":"File.","author":"ada","created":"t0","resolved":false},
-{"id":"b2","path":"a.rs","text":"Reply.","author":"bob","created":"t2","in_reply_to":"b1","resolved":false,"ref":"r"}
+{"id":"b2","path":"a.rs","text":"Reply.","author":"bob","created":"t2","in_reply_to":"b1","resolved":false,"ref":"r","branch":"topic","pending":true}
 ]}"#,
     )
     .expect("parses");
     let mut c = Canvas::default();
-    render(&threads(&review.comments), &mut c);
+    render(&threads(&review.comments), Some("main"), &mut c);
     let mut out = Vec::new();
     c.write_to(&mut out, None).expect("writes");
     insta::assert_snapshot!(String::from_utf8(out).expect("utf-8"), @r"
@@ -724,13 +1201,14 @@ fn listing_heads_every_thread() {
       a1 ada, t0
         File.
 
-    a.rs:4-5 (old side), resolved
+    a.rs:4-5 (old side), branch topic, resolved
       b1 you, t1
         Two
         lines.
         suggestion:
           fixed
-      b2 bob, t2, posted
+        not posted: line 4 isn't in the diff
+      b2 bob, t2, posted, pending
         Reply.
 
     z.rs, reply in thread gone
@@ -749,7 +1227,7 @@ fn moved_threads_leave_their_file_only_once_the_other_has_them() {
     let (from, to) = (dir.path().join("local.json"), dir.path().join("pr.json"));
     let ids = apply(
         &from,
-        parse_ops(format!("[{LINE_COMMENT},{LINE_COMMENT}]").as_bytes()).expect("ops"),
+        parse_ops(format!("[{LINE_COMMENT},{LINE_COMMENT}]").as_bytes(), None).expect("ops"),
     )
     .expect("applies");
     let (moving, staying) = (ids[0].clone().expect("id"), ids[1].clone().expect("id"));
@@ -764,6 +1242,17 @@ fn moved_threads_leave_their_file_only_once_the_other_has_them() {
         }],
     )
     .expect("replies");
+    apply(
+        &from,
+        vec![Op::Set {
+            target: Target::Id(moving.clone()),
+            change: Change {
+                branch: Some(Some("topic".to_owned())),
+                ..Change::default()
+            },
+        }],
+    )
+    .expect("puts it on a branch");
     let before = read(&from).expect("reads");
 
     fs::write(&to, r#"{"version":2,"comments":[]}"#).expect("write");
@@ -813,5 +1302,10 @@ fn moved_threads_leave_their_file_only_once_the_other_has_them() {
     );
     assert_eq!(got[2].text, "And this.");
     assert_eq!(got[2].in_reply_to.as_ref(), Some(&root.id));
+    assert_eq!(
+        (&root.branch, &got[2].branch),
+        (&None, &None),
+        "the review's now, on no branch"
+    );
     assert_eq!(got[0].id, "pr1", "what was there stays");
 }

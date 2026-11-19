@@ -115,8 +115,9 @@ keybind = leader:z=toggle_wrap
 | `leader` | `space` |  | Open the command panel; its next key runs a command |
 | `edit` | `e` |  | Open the file in $EDITOR at the line last tapped, else the top line |
 | `comment` | `c` |  | Comment on the selected lines, or the line v would start on, in a text box under them; esc saves it |
+| `suggest_change` | `S` | `g` | Suggest a change to the selected lines, or the line v would start on: a comment's text box holding them, to edit into what they should be; esc saves it |
 | `comment_file` | `C` |  | Comment on the whole file shown, in a text box under its first row; esc saves it |
-| `comments` | `i` |  | The left panel lists every comment thread in place of the files, or the files again; moving through the threads shows each in the diff, enter or tab goes to it |
+| `comments` | `i` |  | The left panel lists every comment thread in place of the files, or the files again; moving through the threads shows each in the diff, enter or tab goes to it; r, e, x, d and o act on the selected thread |
 | `comment_in_editor` |  | `E` | Write in $EDITOR: your draft in the focused thread, else a reply to it, else a comment on the line; ctrl+g does it from the text box |
 | `review_pull` | `p` |  | On a review a review plugin opened, fetch its new commits and threads and show them in place (experimental, see review) |
 | `review_post` | `P` |  | On a review a review plugin opened, open the dialog that posts your drafts, replies and resolves as a review (experimental, see review) |
@@ -173,6 +174,7 @@ While the file tree has focus, these keys come first; every other key does what 
 | `a` | Watch for changes | `toggle_watch` |
 | `c` | Theme | `cycle_theme` |
 | `E` | Continue in editor | `comment_in_editor` |
+| `g` | Suggest change | `suggest_change` |
 | `P` | Open review… | `open_review` |
 | `R` | Since last review | `since_last_review` |
 | `A` | Show whole review | `whole_review` |

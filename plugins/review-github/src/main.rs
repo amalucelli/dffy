@@ -13,10 +13,11 @@ use std::cell::OnceCell;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
 use std::io::Write as _;
+use std::os::unix::fs::OpenOptionsExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, Stdio};
 use std::thread::JoinHandle;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde_json::{Value, json};
 
@@ -26,9 +27,8 @@ use crate::github::{Error, Page};
 const USAGE: &str = "usage: dffy-review-github describe | doctor | list | detect | prepare <pr> \
                      | check <pr> | pull <pr> \
                      | post <pr> --event pending|comment|approve|request_changes [--summary-file <file>] \
-                     | post <pr> --dry-run \
-                     | post <pr> --apply-event --event comment|approve|request_changes [--summary-file <file>] \
-                     | prefetch";
+                     | post <pr> --dry-run [--drafts <file>] \
+                     | prefetch | prune [--days <n>]";
 
 /// What `describe` says: the command, the words for a PR, and the events
 /// the post dialog offers, `pending` leaving the review open on GitHub.
@@ -57,8 +57,8 @@ fn description() -> Value {
     })
 }
 
-const VERBS: [&str; 9] = [
-    "describe", "doctor", "list", "detect", "prepare", "check", "pull", "post", "prefetch",
+const VERBS: [&str; 10] = [
+    "describe", "doctor", "list", "detect", "prepare", "check", "pull", "post", "prefetch", "prune",
 ];
 
 /// The review plugin protocol this speaks. dffy names the one it wants in
@@ -100,13 +100,17 @@ fn main() -> ExitCode {
         (["list"], _) => list(),
         (["detect"], _) => detect(),
         (["prefetch"], _) => prefetch(),
+        (["prune"], _) => prune(PRUNE_DAYS),
+        (["prune", "--days", days], _) => match days.parse() {
+            Ok(days) => prune(days),
+            Err(_) => return fail(2, &format!("--days takes a number of days, not {days}")),
+        },
         (["prepare", _], Some(pr)) => prepare(pr),
         (["check", _], Some(pr)) => check(pr),
         (["pull", _], Some(pr)) => Review::new(pr).and_then(|review| pull(&review)),
         (["post", _, flags @ ..], Some(pr)) => match post_args(flags) {
             Ok((PostMode::Post(event), summary)) => post(pr, event, summary),
-            Ok((PostMode::DryRun, _)) => dry_run(pr),
-            Ok((PostMode::ApplyEvent(event), summary)) => apply_event(pr, event, summary),
+            Ok((PostMode::DryRun(drafts), _)) => dry_run(pr, drafts),
             Err(e) => return fail(2, &e),
         },
         ([verb, ..], _) if !VERBS.contains(verb) => {
@@ -200,9 +204,16 @@ fn toggled(comment: &Value) -> bool {
             != comment["github_resolved"].as_bool().unwrap_or_default()
 }
 
-/// What a session keeps of [`Page::about`] for `detect` alone, which tells
-/// the PR of a branch by them without asking GitHub.
-const FOR_DETECT: [&str; 4] = ["head_ref", "state", "cross_repository", "head_owner"];
+/// What a session keeps of [`Page::about`] and doesn't print: what
+/// `detect` tells the PR of a branch by without asking GitHub, `state`
+/// printed lowercase, and when the PR last changed, which `check` compares.
+const KEPT: [&str; 5] = [
+    "head_ref",
+    "state",
+    "cross_repository",
+    "head_owner",
+    "updated_at",
+];
 
 /// A PR under review, and what's kept for it: the comments file, drafts
 /// included, the session dffy was last given, and GitHub's hunks of a
@@ -214,7 +225,10 @@ struct Review {
     dir: PathBuf,
 }
 
-/// Where the PRs of `remote`'s repository are kept, one directory each.
+/// Where the PRs of `remote`'s repository are kept, one directory each,
+/// beside what's kept of the repository: whether its host is GitHub's
+/// (`host.json`), the branch `detect` last found no PR for (`detect.json`)
+/// and when `prune` last ran (`pruned`).
 fn repository_dir(remote: &Remote) -> Result<PathBuf, String> {
     let data = std::env::var_os("XDG_DATA_HOME")
         .map(PathBuf::from)
@@ -224,9 +238,121 @@ fn repository_dir(remote: &Remote) -> Result<PathBuf, String> {
     Ok(data.join("dffy-review-github").join(&remote.key))
 }
 
+fn read_json(path: &Path) -> Option<Value> {
+    serde_json::from_slice(&fs::read(path).ok()?).ok()
+}
+
+fn write_json(dir: &Path, name: &str, value: &Value) -> Result<(), String> {
+    let path = dir.join(name);
+    // One per process, as nothing locks the directory and a `prepare`
+    // and a `post` both save the session. One left by a crash is
+    // removed, and `create_new` won't follow a link put in its place.
+    let tmp = dir.join(format!("{name}.{}.tmp", std::process::id()));
+    fs::create_dir_all(dir)
+        .and_then(|()| {
+            fs::remove_file(&tmp).ok();
+            fs::File::options()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&tmp)
+        })
+        .and_then(|mut file| file.write_all(value.to_string().as_bytes()))
+        .and_then(|()| fs::rename(&tmp, &path))
+        .map_err(|e| format!("can't write {}: {e}", path.display()))
+}
+
+fn now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
+}
+
+/// How long whether a host is GitHub's is kept.
+const HOST_TTL: u64 = 24 * 3600;
+
+/// Whether `remote` is on a GitHub host: github.com, `GH_HOST`, or one gh
+/// has a login for. The last is asked of gh once a day, or when gh is
+/// replaced or logs in or out, and kept beside the repository's PRs.
+fn github_host(remote: &Remote) -> bool {
+    let host = remote.host.as_str();
+    if host == "github.com" || host == github::default_host() {
+        return true;
+    }
+    let Ok(dir) = repository_dir(remote) else {
+        return false;
+    };
+    let stamp = gh_stamp();
+    if let Some(kept) = read_json(&dir.join("host.json")).filter(|k| {
+        k["host"] == host
+            && k["stamp"] == stamp.as_str()
+            && now().saturating_sub(k["at"].as_u64().unwrap_or_default()) < HOST_TTL
+    }) {
+        return kept["github"] == true;
+    }
+    let Some(github) = github::logged_in(host) else {
+        return false;
+    };
+    // Unkept, it's asked again next run.
+    write_json(
+        &dir,
+        "host.json",
+        &json!({"host": host, "stamp": stamp, "at": now(), "github": github}),
+    )
+    .ok();
+    github
+}
+
+/// What changes when gh is replaced, or logs in or out: the modification
+/// times and sizes of gh's program on `PATH` and of its hosts file.
+fn gh_stamp() -> String {
+    let stamp = |path: &Path| {
+        fs::metadata(path).ok().map(|m| {
+            let at = m
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+                .map_or(0, |d| d.as_nanos());
+            format!("{at}:{}", m.len())
+        })
+    };
+    let program = std::env::var_os("PATH").and_then(|path| {
+        std::env::split_paths(&path)
+            .filter(|dir| dir.is_absolute())
+            .find_map(|dir| stamp(&dir.join("gh")))
+    });
+    let config = std::env::var_os("GH_CONFIG_DIR")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("XDG_CONFIG_HOME").map(|c| PathBuf::from(c).join("gh")))
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config/gh")));
+    let hosts = config.and_then(|c| stamp(&c.join("hosts.yml")));
+    format!(
+        "{} {}",
+        program.unwrap_or_default(),
+        hosts.unwrap_or_default()
+    )
+}
+
+/// The repository's remote on a GitHub host, as [`Remote::pick`] picks
+/// it. Every API call of the run goes to its host.
+fn remote() -> Result<Remote, String> {
+    let remote = Remote::pick(github_host).ok_or(
+        "no remote names a GitHub repository: origin, upstream, \
+         or the one `gh repo set-default` picked",
+    )?;
+    if !github_host(&remote) {
+        return Err(format!(
+            "{}'s host {} isn't github.com, GH_HOST, or a host gh is logged in to",
+            remote.git_name, remote.host
+        ));
+    }
+    github::use_host(&remote.host);
+    Ok(remote)
+}
+
 impl Review {
     fn new(pr: u64) -> Result<Self, String> {
-        Self::of(Remote::origin()?, pr)
+        Self::of(remote()?, pr)
     }
 
     fn of(remote: Remote, pr: u64) -> Result<Self, String> {
@@ -242,21 +368,25 @@ impl Review {
     }
 
     /// The session line's `session`, without `comments`, as last printed,
-    /// with [`FOR_DETECT`] as GitHub last said. A session saved before
-    /// `state`, `cross_repository` and `head_owner` were kept has none of
-    /// them, and is taken as open and origin's own.
+    /// with [`KEPT`] as GitHub last said. A session saved before `state`,
+    /// `cross_repository` and `head_owner` were kept has none of them, and
+    /// is taken as open and the repository's own.
     fn session(&self) -> Option<Value> {
-        serde_json::from_slice(&fs::read(self.dir.join("session.json")).ok()?).ok()
+        read_json(&self.dir.join("session.json"))
     }
 
-    /// `session` as dffy reads it: the PR's number as its id, with the
-    /// comments file, without what only `detect` reads.
+    /// `session` as dffy reads it: the PR's number as its id, its state
+    /// lowercase, with the comments file, without the rest of [`KEPT`].
     fn printed(&self, session: &Value) -> Value {
         let mut session = session.clone();
+        let state = session["state"].as_str().map(str::to_lowercase);
         if let Some(fields) = session.as_object_mut() {
-            for field in FOR_DETECT.iter().chain(&["number"]) {
+            for field in KEPT.iter().chain(&["number", "github_head"]) {
                 fields.remove(*field);
             }
+        }
+        if let Some(state) = state {
+            session["state"] = json!(state);
         }
         session["id"] = json!(self.pr.to_string());
         session["comments"] = json!(self.file().to_string_lossy());
@@ -272,12 +402,30 @@ impl Review {
     }
 
     fn write(&self, name: &str, value: &Value) -> Result<(), String> {
-        let path = self.dir.join(name);
-        let tmp = self.dir.join(format!("{name}.tmp"));
-        fs::create_dir_all(&self.dir)
-            .and_then(|()| fs::write(&tmp, value.to_string()))
-            .and_then(|()| fs::rename(&tmp, &path))
-            .map_err(|e| format!("can't write {}: {e}", path.display()))
+        write_json(&self.dir, name, value)
+    }
+
+    /// Holds `post.lock` for a run that sends: a second one fails rather
+    /// than post the same drafts twice. Released when the file closes.
+    fn lock(&self) -> Result<fs::File, String> {
+        let path = self.dir.join("post.lock");
+        let file = fs::create_dir_all(&self.dir)
+            .and_then(|()| {
+                fs::File::options()
+                    .write(true)
+                    .create(true)
+                    .truncate(false)
+                    .mode(0o600)
+                    .open(&path)
+            })
+            .map_err(|e| format!("can't open {}: {e}", path.display()))?;
+        match file.try_lock() {
+            Ok(()) => Ok(file),
+            Err(fs::TryLockError::WouldBlock) => {
+                Err(format!("already posting #{} in another run", self.pr))
+            }
+            Err(fs::TryLockError::Error(e)) => Err(format!("can't lock {}: {e}", path.display())),
+        }
     }
 
     /// Keeps GitHub's hunks of the PR from `base` to `head`, for `post` to
@@ -338,6 +486,19 @@ impl Review {
             .collect()
     }
 
+    /// Keeps `head`, the PR's head as GitHub just named it, in the session
+    /// as `github_head`, for `detect` to tell the branch by once it's
+    /// pushed past the session's head, which stays until `pull`.
+    fn saw_head(&self, head: &str) -> Result<(), String> {
+        match self.session() {
+            Some(mut session) if session["head"] != head && session["github_head"] != head => {
+                session["github_head"] = json!(head);
+                self.save(&session)
+            }
+            _ => Ok(()),
+        }
+    }
+
     /// Records the session's head, the one drafts are posted against, as
     /// the head last reviewed.
     fn reviewed(&self) -> Result<(), String> {
@@ -349,19 +510,23 @@ impl Review {
     }
 
     /// Saves and prints the session on `head` with what it keeps of the PR,
-    /// `about` (see [`Page::about`]), keeping the head `post` last reviewed.
+    /// `about` (see [`Page::about`]), keeping the head `post` last
+    /// reviewed, else taking `reviewed`'s, your last review's on GitHub.
     fn start(
         &self,
         saved: Option<&Value>,
         (base, head): (&str, &str),
         about: &Value,
+        reviewed: Option<&str>,
     ) -> Result<(), String> {
         let mut session = about.clone();
         session["number"] = json!(self.pr);
         session["base"] = json!(base);
         session["head"] = json!(head);
-        session["last_reviewed_head"] =
-            saved.map_or(Value::Null, |s| s["last_reviewed_head"].clone());
+        session["last_reviewed_head"] = saved
+            .map(|s| s["last_reviewed_head"].clone())
+            .filter(Value::is_string)
+            .unwrap_or_else(|| json!(reviewed));
         self.save(&session)?;
         self.emit_session(&session);
         Ok(())
@@ -377,7 +542,8 @@ impl Review {
 /// read them leaves them. Once every page is written, the comments of
 /// `before` GitHub no longer has go, as [`sweep`] says; not after a page
 /// that failed, which stops the import, nor when fewer threads came than
-/// GitHub counted, or your pending review had more comments than were read.
+/// GitHub counted. Your pending review's comments, every page of them,
+/// count as there.
 fn import(
     review: &Review,
     mut page: Page,
@@ -394,14 +560,21 @@ fn import(
             (&mut known.toggled, toggled(c)),
             (&mut known.anchored, c["anchor"].is_object()),
             (&mut known.unplaced, c["github_unplaced"].is_string()),
+            (&mut known.pending, c["pending"] == true),
         ] {
             if has {
                 set.insert(reference.to_owned());
             }
         }
     }
-    let (mut written, mut waiting, mut seen, mut pending_read) =
-        (0, Vec::new(), HashSet::new(), true);
+    let (mut written, mut waiting, mut seen) = (0, Vec::new(), HashSet::new());
+    // Every page asks for the pending review's first comments again.
+    let (pending, more_pending) = std::mem::take(&mut page.pending);
+    seen.extend(pending.iter().map(|id| format!("github:{id}")));
+    if let Some(after) = more_pending {
+        let rest = github::rest_of_pending(&review.remote, review.pr, after)?;
+        seen.extend(rest.iter().map(|id| format!("github:{id}")));
+    }
     let total = page.total;
     // A page after the first may carry only the conversation's lists.
     let mut with_threads = true;
@@ -415,10 +588,6 @@ fn import(
             .flat_map(|t| t["comments"]["nodes"].as_array().into_iter().flatten())
             .filter_map(|c| c["id"].as_str());
         seen.extend(ids.map(|id| format!("github:{id}")));
-        match &page.pending {
-            Some(pending) => seen.extend(pending.iter().map(|id| format!("github:{id}"))),
-            None => pending_read = false,
-        }
         let (mut ops, missing) = github::upserts(&page.threads, &page.base, source, &mut known);
         for comment in std::mem::take(&mut page.conversation) {
             seen.extend(comment["ref"].as_str().map(str::to_owned));
@@ -438,14 +607,14 @@ fn import(
         with_threads = after.threads.is_some();
         page = github::page(&review.remote, review.pr, Some(&after))?;
     }
-    if pending_read && u64::try_from(written) == Ok(total) {
+    if u64::try_from(written) == Ok(total) {
         sweep(&file, before, &seen)?;
     }
     let mut commits: Vec<&str> = waiting.iter().filter_map(github::original_commit).collect();
     commits.sort_unstable();
     commits.dedup();
     // Threads on a commit that didn't arrive stay as they were written.
-    if commits.is_empty() || !git::fetch_commits(&commits) {
+    if commits.is_empty() || !git::fetch_commits(&review.remote, &commits) {
         return Ok(());
     }
     // A fresh source: the first one keeps its misses.
@@ -472,9 +641,10 @@ fn on_github(file: &Path) -> HashSet<String> {
 /// Of the comments GitHub had before its first page was asked for, by ref
 /// in `before`, removes those it no longer has, not in `seen`, whoever
 /// wrote them: only their author can delete a comment or discard a pending
-/// review, and posting yours again would undo that. A first comment whose
-/// thread still holds replies not posted, or not gone, stays as what they
-/// answer, posted no longer, so they aren't lost with it.
+/// review, and posting yours again would undo that. A first comment on a
+/// line or a file whose thread still holds replies not posted, or not
+/// gone, stays as what they answer, posted no longer, so they aren't lost
+/// with it; a general comment goes with its replies.
 fn sweep(file: &Path, before: &HashSet<String>, seen: &HashSet<String>) -> Result<(), String> {
     if before.is_subset(seen) {
         return Ok(());
@@ -486,13 +656,16 @@ fn sweep(file: &Path, before: &HashSet<String>, seen: &HashSet<String>) -> Resul
             .as_str()
             .is_some_and(|r| before.contains(r) && !seen.contains(r))
     };
-    // Removing a first comment removes its thread's replies with it.
+    // Removing a first comment removes its thread's replies with it. A
+    // general comment goes with replies not posted too: GitHub can't take
+    // a reply to one, and without its ref it isn't one the file can hold.
     let removed = |root: &Value| {
         gone(root)
-            && all
-                .iter()
-                .filter(|c| c["in_reply_to"] == root["id"])
-                .all(gone)
+            && (root["path"].as_str().is_none_or(str::is_empty)
+                || all
+                    .iter()
+                    .filter(|c| c["in_reply_to"] == root["id"])
+                    .all(gone))
     };
     let mut ops = Vec::new();
     for c in all.iter().filter(|c| gone(c)) {
@@ -566,23 +739,34 @@ fn prepare(pr: u64) -> Result<(), String> {
     let mut files = kept_base.is_none().then(|| fetch_files(&review));
     let before = on_github(&review.file());
     let page = github::page(&review.remote, pr, None)?;
+    if page.head != head {
+        emit(json!({"head": page.head, "moved": true}));
+    }
     // Kept for another base: the PR was retargeted, or the one below it
     // merged. Asked for only now, as GitHub's base comes with the page.
     if kept_base.is_some_and(|base| base != page.base) {
         files = Some(fetch_files(&review));
     }
     // Read again, as a `post` may have saved it since.
-    if let Some(mut kept) = review.session()
-        && FOR_DETECT.iter().any(|&k| kept[k] != page.about[k])
-    {
-        for key in FOR_DETECT {
-            kept[key] = page.about[key].clone();
+    if let Some(mut kept) = review.session() {
+        let reviewed = page
+            .reviewed
+            .as_deref()
+            .filter(|oid| kept["last_reviewed_head"].is_null() && source.has_commit(oid));
+        if reviewed.is_some() || KEPT.iter().any(|&k| kept[k] != page.about[k]) {
+            for key in KEPT {
+                kept[key] = page.about[key].clone();
+            }
+            if let Some(oid) = reviewed {
+                kept["last_reviewed_head"] = json!(oid);
+            }
+            review.save(&kept)?;
         }
-        review.save(&kept)?;
     }
+    review.saw_head(&page.head)?;
     // Threads on a newer head read their anchors from it.
     if !source.has_commit(&page.head) {
-        git::fetch_pulls(&[pr])?;
+        git::fetch_pulls(&review.remote, &[pr])?;
     }
     import_with_files(&review, (page, &before), files, head, &mut source)
 }
@@ -596,7 +780,7 @@ fn pull(review: &Review) -> Result<(), String> {
     let files = fetch_files(review);
     let before = on_github(&review.file());
     let (fetched, first) = std::thread::scope(|s| {
-        let fetch = s.spawn(|| git::fetch_pulls(&[pr]));
+        let fetch = s.spawn(|| git::fetch_pulls(&review.remote, &[pr]));
         let first = github::page(&review.remote, pr, None);
         (
             fetch
@@ -614,12 +798,16 @@ fn pull(review: &Review) -> Result<(), String> {
             let head = fetched?;
             let base = match saved.as_ref().and_then(|s| s["base"].as_str()) {
                 Some(base) => base.to_owned(),
-                None => git::git(&["rev-parse", "refs/remotes/origin/HEAD"])?,
+                None => git::git(&[
+                    "rev-parse",
+                    &format!("refs/remotes/{}/HEAD", review.remote.git_name),
+                ])?,
             };
             review.start(
                 saved.as_ref(),
                 (&base, &head),
                 saved.as_ref().unwrap_or(&Value::Null),
+                None,
             )?;
             return Err(format!("couldn't reach GitHub, comments may be stale: {e}"));
         }
@@ -628,8 +816,8 @@ fn pull(review: &Review) -> Result<(), String> {
     if !source.has_commit(&page.head) {
         fetched?;
         return Err(format!(
-            "origin's refs/pull/{pr}/head isn't the PR's head {}; try again",
-            page.head
+            "{}'s refs/pull/{pr}/head isn't the PR's head {}; try again",
+            review.remote.git_name, page.head
         ));
     }
     if !source.has_commit(&page.base) {
@@ -638,46 +826,86 @@ fn pull(review: &Review) -> Result<(), String> {
             "--quiet",
             "--no-tags",
             "--end-of-options",
-            "origin",
+            &review.remote.git_name,
             &page.base,
         ])?;
     }
-    review.start(saved.as_ref(), (&page.base, &page.head), &page.about)?;
+    // "Since last review" diffs from it, so it has to be here.
+    let reviewed = page
+        .reviewed
+        .as_deref()
+        .filter(|oid| source.has_commit(oid));
+    review.start(
+        saved.as_ref(),
+        (&page.base, &page.head),
+        &page.about,
+        reviewed,
+    )?;
     let head = page.head.clone();
     import_with_files(review, (page, &before), Some(files), &head, &mut source)
 }
 
-/// Whether origin's head for the PR is still the session's, from git alone.
+/// Whether the PR's head on GitHub is still the session's, and whether the
+/// PR changed since it was last imported, which new comments change it
+/// by. Asked with the `ETag` of the last answer, kept in `check.json`:
+/// GitHub doesn't count an unchanged answer against the rate limit.
 fn check(pr: u64) -> Result<(), String> {
     let review = Review::new(pr)?;
     let session = review
         .session()
         .ok_or_else(|| format!("#{pr} isn't prepared; run prepare {pr} first"))?;
-    let name = format!("refs/pull/{pr}/head");
-    let head = git::git(&["ls-remote", "origin", &name])?
-        .lines()
-        .find_map(|l| l.split_once('\t').filter(|(_, r)| *r == name))
-        .map(|(oid, _)| oid.to_owned())
-        .ok_or_else(|| format!("origin has no {name}"))?;
-    emit(json!({"moved": session["head"] != head.as_str(), "head": head}));
+    let kept = read_json(&review.dir.join("check.json"));
+    let etag = kept.as_ref().and_then(|k| k["etag"].as_str());
+    let now = if let Some(now) = github::pull(&review.remote, pr, etag)? {
+        let now = json!({"etag": now.etag, "head": now.head, "updated_at": now.updated_at});
+        review.write("check.json", &now)?;
+        now
+    } else {
+        kept.unwrap_or_default()
+    };
+    let head = now["head"].as_str().unwrap_or_default();
+    if !head.is_empty() {
+        review.saw_head(head)?;
+    }
+    emit(json!({
+        "head": head,
+        "moved": session["head"] != head,
+        "comments_moved": session["updated_at"].as_str().is_some_and(|u| now["updated_at"] != u),
+    }));
     Ok(())
 }
+
+/// How long `detect` keeps having found no PR for a branch at a commit.
+const NO_PR_TTL: u64 = 600;
 
 /// The open PR the branch checked out is the head of, for plain `dffy`, as
 /// [`Head::of`] tells it. From a session kept for it when there's one that
 /// GitHub last said is open, which needs nothing from GitHub, else from
-/// one query. `{"review": null}` without one, or on a detached HEAD.
+/// one query. `{"review": null}` without one, on a detached HEAD, or
+/// without a remote on a GitHub host, which asks GitHub nothing; nor does
+/// a branch GitHub had no PR for in the last 10 minutes, at the same
+/// commit. Then sessions of PRs long closed go, at most once a day.
 fn detect() -> Result<(), String> {
     let Ok(branch) = git::git(&["symbolic-ref", "--quiet", "--short", "HEAD"]) else {
         emit(json!({ "review": null }));
         return Ok(());
     };
-    let remote = Remote::origin()?;
-    let head = Head::of(&branch, &remote);
+    let Ok(remote) = remote() else {
+        emit(json!({ "review": null }));
+        return Ok(());
+    };
+    let found = detected(&remote, &branch)?;
+    emit(json!({ "review": found }));
+    prune_daily(&remote);
+    Ok(())
+}
+
+fn detected(remote: &Remote, branch: &str) -> Result<Value, String> {
+    let head = Head::of(branch, remote);
     let kept: Vec<u64> = if let Head::Pull(pr) = head {
         vec![pr]
     } else {
-        let mut kept: Vec<u64> = fs::read_dir(repository_dir(&remote)?)
+        let mut kept: Vec<u64> = fs::read_dir(repository_dir(remote)?)
             .into_iter()
             .flatten()
             .flatten()
@@ -687,65 +915,208 @@ fn detect() -> Result<(), String> {
         kept.sort_unstable_by(|a, b| b.cmp(a));
         kept
     };
+    let is_ancestor = |a: &str, b: &str| git::git(&["merge-base", "--is-ancestor", a, b]).is_ok();
+    let remotes = format!("refs/remotes/{}/", remote.git_name);
+    let default_branch = format!("{remotes}HEAD");
+    // In the default branch's history; without one known, as a clone made
+    // by `git remote add` has none, in any of the remote's branches but
+    // the PR's own.
+    let merged = |kept: &str, own: &str| {
+        if git::git(&["rev-parse", "--verify", "--quiet", &default_branch]).is_ok() {
+            return is_ancestor(kept, &default_branch);
+        }
+        let own = format!("{remotes}{own}");
+        git::git(&[
+            "for-each-ref",
+            "--format=%(refname)",
+            "--contains",
+            kept,
+            &remotes,
+        ])
+        .is_ok_and(|refs| refs.lines().any(|r| r != own))
+    };
+    // A branch cut again under the name after the PR merged isn't the
+    // PR's: the branch holds the PR's head, the session's or the one
+    // GitHub last named, when either is in the other's history and it
+    // isn't merged. Not caught without asking GitHub: the same branch
+    // carried on after a squash, or a merge into another base.
     let ours = |s: &Value| match &head {
         Head::Pull(_) => true,
         Head::Branch { name, .. } => {
-            s["head_ref"] == name.as_str() && head.owns(&s["cross_repository"], &s["head_owner"])
+            s["head_ref"] == name.as_str()
+                && head.owns(&s["cross_repository"], &s["head_owner"])
+                && [&s["head"], &s["github_head"]]
+                    .into_iter()
+                    .filter_map(Value::as_str)
+                    .any(|kept| {
+                        (is_ancestor(kept, "HEAD") || is_ancestor("HEAD", kept))
+                            && !merged(kept, name)
+                    })
         }
     };
     for pr in kept {
         let review = Review::of(remote.clone(), pr)?;
         if let Some(session) = review
             .session()
-            .filter(|s| ours(s) && s["state"].as_str().is_none_or(|s| s == "OPEN"))
+            .filter(|s| s["state"].as_str().is_none_or(|s| s == "OPEN") && ours(s))
         {
-            emit(json!({ "review": review.printed(&session) }));
-            return Ok(());
+            return Ok(review.printed(&session));
         }
     }
-    let Some(mut found) = github::detect(&remote, &head)? else {
-        emit(json!({ "review": null }));
-        return Ok(());
+    let dir = repository_dir(remote)?;
+    let none = json!({
+        "branch": branch,
+        "commit": git::git(&["rev-parse", "--verify", "--quiet", "HEAD"]).ok(),
+    });
+    if let Some(kept) = read_json(&dir.join("detect.json"))
+        && kept["branch"] == none["branch"]
+        && kept["commit"] == none["commit"]
+        && now().saturating_sub(kept["at"].as_u64().unwrap_or_default()) < NO_PR_TTL
+    {
+        return Ok(Value::Null);
+    }
+    let Some(mut found) = github::detect(remote, &head)? else {
+        let mut none = none;
+        none["at"] = json!(now());
+        write_json(&dir, "detect.json", &none)?;
+        return Ok(Value::Null);
     };
     let pr = found["number"].as_u64().unwrap_or_default();
-    let review = Review::of(remote, pr)?;
+    let review = Review::of(remote.clone(), pr)?;
+    if let Some(head) = found["head"].as_str() {
+        review.saw_head(head)?;
+    }
     found["last_reviewed_head"] = review
         .session()
         .map_or(Value::Null, |s| s["last_reviewed_head"].clone());
-    emit(json!({ "review": review.printed(&found) }));
-    Ok(())
+    Ok(review.printed(&found))
 }
 
-fn open_prs() -> Result<Vec<Value>, String> {
-    let remote = Remote::origin()?;
+fn open_prs() -> Result<(Remote, Vec<Value>), String> {
+    let remote = remote()?;
     let head = git::git(&["symbolic-ref", "--quiet", "--short", "HEAD"])
         .ok()
         .map(|branch| Head::of(&branch, &remote));
-    Ok(github::list(&remote, head.as_ref())?)
+    let prs = github::list(&remote, head.as_ref())?;
+    Ok((remote, prs))
 }
 
+/// The PRs to pick from, each with how many of your drafts its session's
+/// comments file holds, when there are any.
 fn list() -> Result<(), String> {
-    emit(json!({"reviews": open_prs()?}));
+    let (remote, mut prs) = open_prs()?;
+    for pr in &mut prs {
+        let Some(review) = pr["id"]
+            .as_str()
+            .and_then(|id| id.parse().ok())
+            .and_then(|n| Review::of(remote.clone(), n).ok())
+            .filter(|r| r.file().exists())
+        else {
+            continue;
+        };
+        let count = read(&review.file()).map_or(0, |f| drafts(&f).len());
+        if count > 0 {
+            pr["drafts"] = json!(count);
+        }
+    }
+    emit(json!({ "reviews": prs }));
+    prune_daily(&remote);
     Ok(())
 }
 
 /// Fetches the heads of the PRs `list` shows, so preparing one later only
 /// has to ask GitHub for its threads.
 fn prefetch() -> Result<(), String> {
-    let prs: Vec<u64> = open_prs()?
+    let (remote, prs) = open_prs()?;
+    let prs: Vec<u64> = prs
         .iter()
         .filter_map(|pr| pr["id"].as_str()?.parse().ok())
         .collect();
     if !prs.is_empty() {
-        git::fetch_pulls(&prs)?;
+        git::fetch_pulls(&remote, &prs)?;
     }
     emit(json!({ "fetched": prs }));
     Ok(())
 }
 
+/// Days a closed or merged PR's session is kept untouched before `prune`
+/// drops it.
+const PRUNE_DAYS: u64 = 30;
+
+/// Drops the sessions of PRs GitHub last said were closed or merged, not
+/// prepared or pulled for `days` days, with their `refs/dffy/pull/<pr>`,
+/// and prints `{"pruned":[…]}`. One whose comments file holds anything not
+/// on GitHub stays: a comment without a `ref`, yours or an agent's, or a
+/// resolve not sent.
+fn prune(days: u64) -> Result<(), String> {
+    let pruned = prune_sessions(&remote()?, days)?;
+    emit(json!({ "pruned": pruned }));
+    Ok(())
+}
+
+fn prune_sessions(remote: &Remote, days: u64) -> Result<Vec<u64>, String> {
+    let dir = repository_dir(remote)?;
+    let old = Duration::from_secs(days.saturating_mul(86_400));
+    let mut pruned = Vec::new();
+    for pr in fs::read_dir(&dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|entry| entry.file_name().to_str()?.parse::<u64>().ok())
+    {
+        let review = Review::of(remote.clone(), pr)?;
+        let session = review.dir.join("session.json");
+        let untouched = fs::metadata(&session)
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| t.elapsed().ok())
+            .is_some_and(|age| age >= old);
+        let closed =
+            read_json(&session).is_some_and(|s| s["state"] == "CLOSED" || s["state"] == "MERGED");
+        if !untouched || !closed {
+            continue;
+        }
+        let unsent = |c: &Value| c["ref"].is_null() || toggled(c);
+        if review.file().exists()
+            && !read(&review.file()).is_ok_and(|f| !comments(&f).iter().any(unsent))
+        {
+            continue;
+        }
+        fs::remove_dir_all(&review.dir)
+            .map_err(|e| format!("can't remove {}: {e}", review.dir.display()))?;
+        // Already gone when it was never fetched.
+        git::git(&["update-ref", "-d", &git::pull_ref(pr)]).ok();
+        pruned.push(pr);
+    }
+    pruned.sort_unstable();
+    Ok(pruned)
+}
+
+/// [`prune_sessions`] with [`PRUNE_DAYS`], when it hasn't run in a day,
+/// after `list` or `detect` printed their line. What fails is left for
+/// the next day.
+fn prune_daily(remote: &Remote) {
+    let Ok(dir) = repository_dir(remote) else {
+        return;
+    };
+    let stamp = dir.join("pruned");
+    let recent = fs::metadata(&stamp)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.elapsed().ok())
+        .is_some_and(|age| age < Duration::from_secs(86_400));
+    if recent || !dir.is_dir() {
+        return;
+    }
+    if fs::write(&stamp, "").is_ok() {
+        prune_sessions(remote, PRUNE_DAYS).ok();
+    }
+}
+
 /// For `dffy doctor`: whether gh is installed, and logged in to the host
-/// the API calls go to. `gh auth status` asks that host, so it isn't free;
-/// no other verb runs it, they read the same from their first call.
+/// the API calls go to, the repository's, else gh's own. `gh auth status`
+/// asks that host, so it isn't free; no other verb runs it for a host
+/// known to be GitHub's, they read the same from their first call.
 fn doctor() {
     let check =
         |name: &str, ok: bool, detail: &str| json!({"name": name, "ok": ok, "detail": detail});
@@ -776,7 +1147,8 @@ fn doctor() {
             ]
         }
         Ok(version) => {
-            let host = github::host();
+            let host = Remote::pick(github_host).map_or_else(github::default_host, |r| r.host);
+            github::use_host(&host);
             let auth = match gh(&["auth", "status", "--hostname", &host]) {
                 Ok(out) if out.status.success() => {
                     let said = String::from_utf8_lossy(&out.stdout);
@@ -825,27 +1197,26 @@ enum Event {
     Submit(&'static str),
 }
 
-enum PostMode {
+enum PostMode<'a> {
     Post(Event),
-    /// Says what `post` would do with each draft, without asking GitHub.
-    DryRun,
-    /// Submits your pending review, posting no drafts.
-    ApplyEvent(Event),
+    /// Says what `post` would do with each draft, without asking GitHub,
+    /// and with those of another comments file.
+    DryRun(Option<&'a str>),
 }
 
-/// `--dry-run` alone, or `--event`, `--summary-file` and `--apply-event`
-/// in any order.
-fn post_args<'a>(flags: &[&'a str]) -> Result<(PostMode, Option<&'a str>), String> {
-    if flags == ["--dry-run"] {
-        return Ok((PostMode::DryRun, None));
+/// `--dry-run` alone or with `--drafts`, or `--event` and `--summary-file`
+/// in either order.
+fn post_args<'a>(flags: &[&'a str]) -> Result<(PostMode<'a>, Option<&'a str>), String> {
+    match flags {
+        ["--dry-run"] => return Ok((PostMode::DryRun(None), None)),
+        ["--dry-run", "--drafts", file] | ["--drafts", file, "--dry-run"] => {
+            return Ok((PostMode::DryRun(Some(file)), None));
+        }
+        _ => {}
     }
-    let (mut event, mut summary, mut apply_only) = (None, None, false);
+    let (mut event, mut summary) = (None, None);
     let mut flags = flags.iter();
     while let Some(flag) = flags.next() {
-        if *flag == "--apply-event" {
-            apply_only = true;
-            continue;
-        }
         match (*flag, flags.next()) {
             ("--event", Some(name)) => {
                 event = Some(match *name {
@@ -864,17 +1235,8 @@ fn post_args<'a>(flags: &[&'a str]) -> Result<(PostMode, Option<&'a str>), Strin
             _ => return Err(USAGE.to_owned()),
         }
     }
-    let mode = match (event, apply_only) {
-        (None, _) => return Err(USAGE.to_owned()),
-        (Some(Event::Pending), true) => {
-            return Err(
-                "--apply-event submits the review: comment, approve or request_changes".to_owned(),
-            );
-        }
-        (Some(event), true) => PostMode::ApplyEvent(event),
-        (Some(event), false) => PostMode::Post(event),
-    };
-    Ok((mode, summary))
+    let event = event.ok_or(USAGE)?;
+    Ok((PostMode::Post(event), summary))
 }
 
 fn read_summary(file: Option<&str>) -> Result<String, String> {
@@ -1153,17 +1515,25 @@ fn drafts(file: &Value) -> Vec<&Value> {
         .collect()
 }
 
-/// Prints each draft's plan, then how many go each way. It reads git, the
-/// comments file and the kept hunks, and writes nothing.
-fn dry_run(pr: u64) -> Result<(), String> {
+/// Prints each draft's plan, then how many go each way, how many comments
+/// are in your pending review on GitHub already, as last imported, and how
+/// many resolves and reopens wait to be sent. The drafts of `extra`, a
+/// comments file of drafts not moved into the PR's yet, are planned after
+/// the PR's own. It reads git, the comments files and the kept hunks, and
+/// writes nothing.
+fn dry_run(pr: u64, extra: Option<&str>) -> Result<(), String> {
     let review = Review::new(pr)?;
     if review.session().is_none() {
         return Err(format!("#{pr} isn't prepared; run prepare {pr} first"));
     }
     let current = read(&review.file())?;
+    let extra = extra.map(|f| read(Path::new(f))).transpose()?;
     let mut planner = Planner::new(&review, &current);
     let (mut line, mut file, mut skip) = (0, 0, 0);
-    for draft in drafts(&current) {
+    let all = drafts(&current)
+        .into_iter()
+        .chain(extra.as_ref().map(drafts).unwrap_or_default());
+    for draft in all {
         let plan = planner.plan(draft);
         *match plan {
             Plan::Line { .. } => &mut line,
@@ -1172,13 +1542,21 @@ fn dry_run(pr: u64) -> Result<(), String> {
         } += 1;
         emit(plan.line(draft));
     }
-    emit(json!({"planned": {"line": line, "file": file, "skip": skip}}));
+    let count = |has: fn(&Value) -> bool| comments(&current).iter().filter(|c| has(c)).count();
+    emit(json!({"planned": {"line": line, "file": file, "skip": skip,
+        "pending": count(|c| c["pending"] == true), "resolves": count(toggled)}}));
     Ok(())
 }
 
+/// Posts the drafts into your pending review, sends the resolves and
+/// reopens, then applies `event`. Drafts left out, planned so or refused by
+/// GitHub, don't hold the event back; one GitHub refused says why in its
+/// `post_error`. Only a stop, GitHub no longer answering, does: the rest
+/// are posted by the next run.
 fn post(pr: u64, event: Event, summary: Option<&str>) -> Result<(), String> {
     let summary = read_summary(summary)?;
     let review = Review::new(pr)?;
+    let _lock = review.lock()?;
     let file = review.file();
     let current = read(&file)?;
     let drafts = drafts(&current);
@@ -1197,88 +1575,43 @@ fn post(pr: u64, event: Event, summary: Option<&str>) -> Result<(), String> {
     if post.stopped.is_none() {
         post.resolves()?;
     }
-    // Drafts planned to be left out don't hold the event back: dffy showed
-    // them before sending. Refusals nobody saw coming do.
-    let held = post.left.iter().any(|l| l.refused) || !post.resolves_refused.is_empty();
     let failure = if let Some(m) = &post.stopped {
         Some(format!(
             "post stopped: {m}; the rest are still drafts, post again to send them"
         ))
-    } else if held {
-        None
     } else {
         post.send(event, summary.trim_end())
             .err()
             .map(|e| format!("sending the review: {e}"))
     };
-
-    let mut notes = Vec::new();
-    if !post.left.is_empty() || held {
-        let why: Vec<&str> = post
-            .left
-            .iter()
-            .map(|l| l.note.as_str())
-            .chain(post.resolves_refused.iter().map(String::as_str))
-            .collect();
-        let pending = if held { ", review left pending" } else { "" };
-        notes.push(format!(
-            "not posted, still drafts{pending}: {}",
-            why.join("; ")
-        ));
-    }
+    let mut notes: Vec<String> = post
+        .resolves_refused
+        .iter()
+        .map(|why| format!("not resolved or reopened: {why}"))
+        .collect();
     notes.extend(failure.clone());
     notice(
         &file,
         (!notes.is_empty()).then(|| notes.join("; ")).as_deref(),
     )?;
-    let submitted = matches!(event, Event::Submit(_)) && !held && failure.is_none();
+    let submitted = matches!(event, Event::Submit(_)) && failure.is_none();
+    if submitted {
+        post.submitted()?;
+    }
     // A pending review with nothing in it reviewed nothing.
     if failure.is_none() && (post.posted > 0 || submitted) {
         review.reviewed()?;
     }
     for left in &post.left {
-        emit(left.line.clone());
+        emit(left.clone());
     }
-    let mut done = json!({
+    emit(json!({
         "posted": post.posted,
         "failed": drafts.len() - post.posted,
+        "pending": post.pending_before,
         "url": post.url(),
-    });
-    // `pending` leaves the review pending as asked; only a submit is held.
-    if matches!(event, Event::Submit(_)) && !submitted {
-        done["held"] = json!(true);
-        done["held_message"] = json!("review still pending");
-    }
-    emit(done);
+    }));
     failure.map_or(Ok(()), Err)
-}
-
-/// Submits your pending review, after a `post` left it pending, without
-/// posting the drafts still left. With no review pending, the event goes
-/// on a new one, as an approval alone does.
-fn apply_event(pr: u64, event: Event, summary: Option<&str>) -> Result<(), String> {
-    let summary = read_summary(summary)?;
-    let review = Review::new(pr)?;
-    let file = review.file();
-    let state = github::post_state(&review.remote, pr)?;
-    let mut post = Post::new(&review, &file, state, &Value::Null);
-    post.send(event, summary.trim_end())?;
-    // It said the review was left pending.
-    notice(&file, None)?;
-    review.reviewed()?;
-    emit(json!({"posted": 0, "failed": 0, "url": post.url()}));
-    Ok(())
-}
-
-/// A draft a `post` didn't post.
-struct Left {
-    /// Its draft line.
-    line: Value,
-    /// Where it is and why, for the notice.
-    note: String,
-    /// GitHub refused it, or its thread, while posting; else it was
-    /// planned to be left out.
-    refused: bool,
 }
 
 /// A run of `post`: what it sent, and what it couldn't.
@@ -1293,7 +1626,10 @@ struct Post<'a> {
     threads: HashMap<String, String>,
     pace: Pace,
     posted: usize,
-    left: Vec<Left>,
+    /// The comments your pending review had before this run.
+    pending_before: u64,
+    /// The draft lines of the drafts not posted.
+    left: Vec<Value>,
     /// Resolves and reopens GitHub refused, with why.
     resolves_refused: Vec<String>,
     /// Why GitHub stopped answering; nothing more is tried.
@@ -1323,6 +1659,7 @@ impl<'a> Post<'a> {
                 .collect(),
             pace: Pace::default(),
             posted: 0,
+            pending_before: state.pending_comments,
             left: Vec::new(),
             resolves_refused: Vec::new(),
             stopped: None,
@@ -1334,12 +1671,21 @@ impl<'a> Post<'a> {
         self.review.as_ref().map_or(&self.pr_url, |(_, url)| url)
     }
 
-    fn leave(&mut self, draft: &Value, why: String, refused: bool) {
-        self.left.push(Left {
-            note: format!("{}: {why}", location(draft)),
-            line: Plan::Skip(why).line(draft),
-            refused,
-        });
+    fn leave(&mut self, draft: &Value, why: String) {
+        self.left.push(Plan::Skip(why).line(draft));
+    }
+
+    /// Clears `pending` once the review it marked is submitted.
+    fn submitted(&self) -> Result<(), String> {
+        let ops: Vec<Value> = comments(&read(self.file)?)
+            .iter()
+            .filter(|c| c["pending"] == true)
+            .map(|c| json!({"op": "upsert", "comment": {"ref": c["ref"], "pending": null}}))
+            .collect();
+        if ops.is_empty() {
+            return Ok(());
+        }
+        apply(self.file, &ops)
     }
 
     /// Your pending review, started on the first comment that needs it.
@@ -1362,7 +1708,7 @@ impl<'a> Post<'a> {
             match planner.plan(draft) {
                 Plan::Line { placed, .. } => self.draft(&placed, false)?,
                 Plan::File { placed, .. } => self.draft(&placed, true)?,
-                Plan::Skip(why) => self.leave(draft, why, false),
+                Plan::Skip(why) => self.leave(draft, why),
             }
             emit(json!({"progress": format!("{}/{}", i + 1, drafts.len())}));
         }
@@ -1370,13 +1716,16 @@ impl<'a> Post<'a> {
     }
 
     /// Posts one draft, `on_file` or on its lines, and writes its `ref`
-    /// back right away, so a retry skips it. Fails only when that write
-    /// does.
+    /// back right away, so a retry skips it, marked `pending` in your
+    /// pending review until that's submitted. One GitHub refuses gets why
+    /// in its `post_error`, which goes once it's posted. Fails only when a
+    /// write does.
     fn draft(&mut self, comment: &Value, on_file: bool) -> Result<(), String> {
+        let id = comment["id"].as_str().unwrap_or_default();
         let thread = if let Some(root) = comment["in_reply_to"].as_str() {
             // Its root was planned, then refused.
             let Some(thread) = self.threads.get(root).cloned() else {
-                self.leave(comment, "its thread isn't posted".to_owned(), true);
+                self.leave(comment, "its thread isn't posted".to_owned());
                 return Ok(());
             };
             Some(thread)
@@ -1400,9 +1749,8 @@ impl<'a> Post<'a> {
         };
         match result {
             Ok((posted, new_thread)) => {
-                let id = comment["id"].as_str().unwrap_or_default();
                 let reference = format!("github:{}", posted.id);
-                let mut fields = json!({"ref": reference, "url": posted.url});
+                let mut fields = json!({"ref": reference, "url": posted.url, "pending": true});
                 if let Some(thread) = new_thread {
                     fields["github_thread"] = json!(thread);
                     fields["github_resolved"] = json!(false);
@@ -1411,7 +1759,8 @@ impl<'a> Post<'a> {
                 apply(
                     self.file,
                     &[
-                        json!({"op": "set", "id": id, "fields": {"ref": reference}}),
+                        json!({"op": "set", "id": id,
+                            "fields": {"ref": reference, "post_error": null}}),
                         json!({"op": "upsert", "comment": fields}),
                     ],
                 )
@@ -1423,7 +1772,13 @@ impl<'a> Post<'a> {
                 })?;
                 self.posted += 1;
             }
-            Err(Error::Rejected(m)) => self.leave(comment, m, true),
+            Err(Error::Rejected(m)) => {
+                apply(
+                    self.file,
+                    &[json!({"op": "set", "id": id, "fields": {"post_error": m}})],
+                )?;
+                self.leave(comment, m);
+            }
             Err(Error::Failed(m) | Error::Setup(m)) => self.stopped = Some(m),
         }
         Ok(())
@@ -1456,14 +1811,15 @@ impl<'a> Post<'a> {
     }
 
     /// Submits the review, or sets a pending one's summary. A submit with
-    /// no comment in it, as for an approval alone, starts a review first.
+    /// no comment in it, as for an approval alone, or a summary with none,
+    /// starts a review first.
     fn send(&mut self, event: Event, summary: &str) -> Result<(), Error> {
-        match (event, &self.review) {
-            (Event::Submit(event), _) => github::submit(&self.review_id()?, event, summary),
-            (Event::Pending, Some((review, _))) if !summary.is_empty() => {
-                github::set_review_body(review, summary)
+        match event {
+            Event::Submit(event) => github::submit(&self.review_id()?, event, summary),
+            Event::Pending if !summary.is_empty() => {
+                github::set_review_body(&self.review_id()?, summary)
             }
-            (Event::Pending, _) => Ok(()),
+            Event::Pending => Ok(()),
         }
     }
 }

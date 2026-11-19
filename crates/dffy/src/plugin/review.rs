@@ -81,16 +81,23 @@ pub(crate) struct ReviewEvent {
     pub label: String,
     /// The status bar's words once it went: `approved`.
     pub done: String,
-    /// Sending it ends the review on the host, so drafts the host refused
-    /// hold it back (see [`Said::Posted`]); a `false` event leaves the
-    /// review open there.
+    /// Sending it ends the review on the host, sending what's pending there
+    /// with it; a `false` event leaves the review open there.
     pub submits: bool,
 }
 
 /// The dialog's own keys, which an event's key can't be.
-const DIALOG_KEYS: [char; 4] = ['j', 'k', 's', 'v'];
+const DIALOG_KEYS: [char; 5] = ['j', 'k', 'l', 's', 'v'];
 
 impl Naming {
+    /// Whether `word` has the shape of a command a plugin may describe.
+    pub(crate) fn can_be_command(word: &str) -> bool {
+        word.starts_with(|c: char| c.is_ascii_lowercase())
+            && word
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+    }
+
     /// Reads a `describe` answer. A command is lowercase letters, digits
     /// and `-`, starting with a letter. Words are one line of printable
     /// text, since help and the viewer print them as they are.
@@ -99,11 +106,7 @@ impl Naming {
         let field =
             |key: &str| text(&value, key).ok_or_else(|| format!("its describe has no {key}"));
         let command = field("command")?;
-        if !command.starts_with(|c: char| c.is_ascii_lowercase())
-            || !command
-                .bytes()
-                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
-        {
+        if !Self::can_be_command(&command) {
             return Err(format!(
                 "its command '{}' isn't lowercase letters, digits and -, starting with a letter",
                 command.escape_debug()
@@ -193,7 +196,7 @@ fn review_events(events: &Value) -> Result<Vec<ReviewEvent>, String> {
             [k] if (k.is_ascii_lowercase() || k.is_ascii_digit()) && !DIALOG_KEYS.contains(&k) => k,
             _ => {
                 return Err(format!(
-                    "its event {id}'s key '{}' isn't one letter or digit other than j, k, s and v",
+                    "its event {id}'s key '{}' isn't one letter or digit other than j, k, l, s and v",
                     key.escape_debug()
                 ));
             }
@@ -347,6 +350,9 @@ pub(crate) struct Session {
     pub head: String,
     /// The head of the last review posted, if any.
     pub last_reviewed_head: Option<String>,
+    /// As the host last said; `None` when the plugin didn't say, or said
+    /// something dffy doesn't know.
+    pub state: Option<State>,
     /// The comments file, absolute.
     pub comments: PathBuf,
 }
@@ -354,6 +360,24 @@ pub(crate) struct Session {
 impl Session {
     pub(crate) fn shown(&self) -> &str {
         self.label.as_deref().unwrap_or(&self.id)
+    }
+}
+
+/// Where a review stands on its host.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum State {
+    Open,
+    Closed,
+    Merged,
+}
+
+impl State {
+    pub(crate) fn word(self) -> &'static str {
+        match self {
+            Self::Open => "open",
+            Self::Closed => "closed",
+            Self::Merged => "merged",
+        }
     }
 }
 
@@ -377,6 +401,8 @@ pub(crate) struct Listed {
     pub reason: Reason,
     /// The plugin's title for its group, for a reason dffy doesn't know.
     pub group: Option<String>,
+    /// Your drafts its comments file holds.
+    pub drafts: usize,
 }
 
 impl Listed {
@@ -414,28 +440,31 @@ pub(crate) enum Said {
     Detected(Option<Session>),
     Progress(String),
     Listed(Vec<Listed>),
-    /// `check`: the review's head on the host, and whether it isn't the
-    /// session's.
+    /// `check`, or a warm `prepare`: the review's head on the host, whether
+    /// it isn't the session's, and whether the review changed on the host
+    /// since its comments were last imported.
     Head {
         head: String,
         moved: bool,
+        comments_moved: bool,
     },
     Draft(Draft),
     /// `post --dry-run` finished: how many drafts go on a line, on the
-    /// file, and nowhere.
+    /// file, and nowhere; how many comments wait in your pending review on
+    /// the host; how many threads were resolved or reopened and not sent.
     Planned {
         line: usize,
         file: usize,
         skip: usize,
+        pending: usize,
+        resolves: usize,
     },
-    /// `post` finished: comments posted and not, whether the event wasn't
-    /// applied, with the plugin's words for where that leaves the review,
-    /// and the review's link.
+    /// `post` finished: comments posted and not, how many your pending
+    /// review on the host had before, and the review's link.
     Posted {
         posted: usize,
         failed: usize,
-        held: bool,
-        held_message: Option<String>,
+        pending: usize,
         url: Option<String>,
     },
     /// The run is over; `Err` says why it failed: the plugin's own error
@@ -485,6 +514,7 @@ fn decode(bytes: &[u8]) -> Result<Option<Line>, String> {
         Said::Head {
             head: commit(head).ok_or("head isn't a commit")?,
             moved: value.get("moved") == Some(&Value::Bool(true)),
+            comments_moved: value.get("comments_moved") == Some(&Value::Bool(true)),
         }
     } else if let Some(draft) = value.get("draft") {
         let id = text(draft, "id").ok_or("a draft line without an id")?;
@@ -503,14 +533,14 @@ fn decode(bytes: &[u8]) -> Result<Option<Line>, String> {
             line: count(planned.get("line")),
             file: count(planned.get("file")),
             skip: count(planned.get("skip")),
+            pending: count(planned.get("pending")),
+            resolves: count(planned.get("resolves")),
         }
     } else if let Some(posted) = value.get("posted") {
         Said::Posted {
             posted: count(Some(posted)),
             failed: count(value.get("failed")),
-            held: value.get("held") == Some(&Value::Bool(true)),
-            held_message: text(&value, "held_message")
-                .and_then(|m| noun("held_message", m, 200).ok()),
+            pending: count(value.get("pending")),
             url: text(&value, "url"),
         }
     } else {
@@ -581,6 +611,12 @@ fn session(value: &Value) -> Result<Session, String> {
             None | Some(Value::Null) => None,
             Some(_) => Some(side("last_reviewed_head")?),
         },
+        state: match value.get("state").and_then(Value::as_str) {
+            Some("open") => Some(State::Open),
+            Some("closed") => Some(State::Closed),
+            Some("merged") => Some(State::Merged),
+            _ => None,
+        },
         comments,
     })
 }
@@ -600,6 +636,7 @@ fn listed(value: &Value) -> Result<Listed, String> {
         },
         // Words dffy draws as they are, so one printable line or none.
         group: text(value, "group").and_then(|g| noun("group", g, 40).ok()),
+        drafts: count(value.get("drafts")),
     })
 }
 

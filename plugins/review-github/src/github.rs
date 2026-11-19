@@ -6,6 +6,7 @@ use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::io::Write as _;
 use std::process::{Command, Stdio};
+use std::sync::OnceLock;
 
 use serde_json::{Map, Value, json};
 
@@ -22,7 +23,7 @@ pub(crate) const CONTEXT: u64 = 3;
 macro_rules! review_comment {
     () => {
         "fragment ReviewComment on PullRequestReviewComment {
-  id url body createdAt viewerDidAuthor author { login } originalCommit { oid }
+  id url body createdAt state viewerDidAuthor author { login } originalCommit { oid }
 }"
     };
 }
@@ -32,15 +33,19 @@ macro_rules! review_comment {
 /// The PR's body, its `conversation` and its `submitted` reviews are its
 /// general comments; a page after the first asks only for the lists with
 /// more to read. A pending review isn't among them: it's your summary not
-/// sent yet.
+/// sent yet. `latest`, on the first page, finds the commit of your last
+/// submitted review among the last 20.
 const PULL_REQUEST: &str = concat!(
-    "query PullRequest($owner: String!, $name: String!, $number: Int!, $after: String, $first: Int!, $threads: Boolean!, $comments: Boolean!, $commentsAfter: String, $reviews: Boolean!, $reviewsAfter: String) {
+    "query PullRequest($owner: String!, $name: String!, $number: Int!, $after: String, $first: Int!, $threads: Boolean!, $comments: Boolean!, $commentsAfter: String, $reviews: Boolean!, $reviewsAfter: String, $latest: Boolean!) {
   repository(owner: $owner, name: $name) {
     pullRequest(number: $number) {
-      id title url body createdAt viewerDidAuthor author { login }
+      id title url body createdAt updatedAt viewerDidAuthor author { login }
       baseRefOid headRefOid headRefName isCrossRepository headRepositoryOwner { login } state
       reviews(states: [PENDING], first: 1) {
-        nodes { comments(first: 100) { pageInfo { hasNextPage } nodes { id } } }
+        nodes { comments(first: 100) { pageInfo { hasNextPage endCursor } nodes { id } } }
+      }
+      latest: reviews(last: 20, states: [APPROVED, CHANGES_REQUESTED, COMMENTED, DISMISSED]) @include(if: $latest) {
+        nodes { viewerDidAuthor commit { oid } }
       }
       conversation: comments(first: 100, after: $commentsAfter) @include(if: $comments) {
         pageInfo { hasNextPage endCursor }
@@ -83,13 +88,24 @@ const THREAD_COMMENTS: &str = concat!(
     review_comment!()
 );
 
+/// Your pending review's comments past the first page of them.
+const PENDING_COMMENTS: &str = "query PendingComments($owner: String!, $name: String!, $number: Int!, $after: String!) {
+  repository(owner: $owner, name: $name) {
+    pullRequest(number: $number) {
+      reviews(states: [PENDING], first: 1) {
+        nodes { comments(first: 100, after: $after) { pageInfo { hasNextPage endCursor } nodes { id } } }
+      }
+    }
+  }
+}";
+
 /// Pending reviews are visible only to their author, so the first one is
 /// yours.
 const POST_STATE: &str = "query PostState($owner: String!, $name: String!, $number: Int!) {
   repository(owner: $owner, name: $name) {
     pullRequest(number: $number) {
       id url
-      reviews(states: [PENDING], first: 1) { nodes { id url } }
+      reviews(states: [PENDING], first: 1) { nodes { id url comments { totalCount } } }
     }
   }
 }";
@@ -151,17 +167,67 @@ fragment Detected on PullRequest { number title url baseRefOid headRefOid isCros
 pub(crate) const NO_GH: &str =
     "dffy-review-github needs the GitHub CLI (gh): https://cli.github.com";
 
-/// The host gh sends API calls to: `GH_HOST`, else github.com. No call
-/// passes `--hostname`, so this is the one its login has to be for.
-pub(crate) fn host() -> String {
+/// gh's own host when it's given none: `GH_HOST`, else github.com.
+pub(crate) fn default_host() -> String {
     std::env::var("GH_HOST")
         .ok()
         .filter(|h| !h.is_empty())
         .unwrap_or_else(|| "github.com".to_owned())
 }
 
+static HOST: OnceLock<String> = OnceLock::new();
+
+/// Sends every API call of the run to `host`, the repository's, as
+/// `--hostname`. A run sets it once, before its first call.
+pub(crate) fn use_host(host: &str) {
+    HOST.get_or_init(|| host.to_owned());
+}
+
+fn host() -> String {
+    HOST.get().cloned().unwrap_or_else(default_host)
+}
+
 pub(crate) fn logged_out() -> String {
     format!("gh isn't logged in to {}; run `gh auth login`", host())
+}
+
+/// Whether gh has a login for `host`, by `gh auth status --hostname`,
+/// which lists the host only then; it asks nothing of a host it has no
+/// login for. `None` when gh can't run.
+pub(crate) fn logged_in(host: &str) -> Option<bool> {
+    let out = Command::new("gh")
+        .args(["auth", "status", "--hostname", host])
+        .env("GH_PROMPT_DISABLED", "1")
+        .stdin(Stdio::null())
+        .output()
+        .ok()?;
+    // Older gh writes it to stderr.
+    let said = [out.stdout, out.stderr].concat();
+    Some(
+        String::from_utf8_lossy(&said)
+            .lines()
+            .any(|l| l.trim_end() == host),
+    )
+}
+
+/// "resets at 14:05 UTC", for a rate limit reset at `epoch` seconds.
+fn resets(epoch: u64) -> String {
+    let (hours, minutes) = (epoch % 86_400 / 3600, epoch % 3600 / 60);
+    format!("resets at {hours:02}:{minutes:02} UTC")
+}
+
+/// When the GraphQL rate limit resets, from the REST endpoint that says,
+/// which costs no rate limit.
+fn graphql_reset() -> Option<String> {
+    let out = Command::new("gh")
+        .args(["api", "--hostname", &host(), "rate_limit"])
+        .env("GH_PROMPT_DISABLED", "1")
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
+    let answer: Value = serde_json::from_slice(&out.stdout).ok()?;
+    answer["resources"]["graphql"]["reset"].as_u64().map(resets)
 }
 
 #[derive(Debug)]
@@ -193,7 +259,7 @@ impl From<Error> for String {
 fn graphql(operation: &str, query: &str, variables: &Value) -> Result<Value, Error> {
     let body = json!({"query": query, "operationName": operation, "variables": variables});
     let mut child = Command::new("gh")
-        .args(["api", "graphql", "--input", "-"])
+        .args(["api", "--hostname", &host(), "graphql", "--input", "-"])
         .env("GH_PROMPT_DISABLED", "1")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -223,10 +289,14 @@ fn graphql(operation: &str, query: &str, variables: &Value) -> Result<Value, Err
             .filter_map(|e| e["message"].as_str())
             .collect::<Vec<_>>()
             .join("; ");
-        let limited = errors.iter().any(|e| e["type"] == "RATE_LIMITED")
-            || message.to_lowercase().contains("rate limit");
+        let primary = errors.iter().any(|e| e["type"] == "RATE_LIMITED");
+        let limited = primary || message.to_lowercase().contains("rate limit");
         return Err(if limited {
-            Error::Failed(message)
+            // A secondary limit's reset isn't the one `rate_limit` names.
+            match graphql_reset().filter(|_| primary) {
+                Some(reset) => Error::Failed(format!("{message}; {reset}")),
+                None => Error::Failed(message),
+            }
         } else {
             Error::Rejected(message)
         });
@@ -266,7 +336,8 @@ fn string(value: &Value) -> String {
 pub(crate) struct Page {
     /// What the session keeps of the PR: `title`, `url`, its branch in
     /// `head_ref`, `state`, whether it's a fork's in `cross_repository`,
-    /// and the branch's owner in `head_owner`.
+    /// the branch's owner in `head_owner`, and when it last changed in
+    /// `updated_at`.
     pub about: Value,
     pub base: String,
     pub head: String,
@@ -277,9 +348,11 @@ pub(crate) struct Page {
     pub total: u64,
     /// Where the next page starts; `None` after the last.
     pub next: Option<After>,
-    /// The ids of your pending review's comments; `None` when there are
-    /// more than were asked for.
-    pub pending: Option<Vec<String>>,
+    /// The ids of your pending review's first page of comments, and where
+    /// the next page of them starts, for [`rest_of_pending`].
+    pub pending: (Vec<String>, Option<String>),
+    /// The commit of your last submitted review, on the first page.
+    pub reviewed: Option<String>,
     /// The page's general comments, as the comments file holds them, by
     /// when they were written: the PR's description on the first page,
     /// then comments in its conversation and the summaries of reviews.
@@ -314,27 +387,28 @@ pub(crate) fn page(remote: &Remote, pr: u64, after: Option<&After>) -> Result<Pa
         vars[cursor] = json!(from.cloned().flatten());
         vars[wanted] = json!(from.is_none_or(Option::is_some));
     }
+    vars["latest"] = json!(after.is_none());
     let mut data = graphql("PullRequest", PULL_REQUEST, &vars)?;
     let nodes = data
         .pointer_mut("/repository/pullRequest/reviewThreads/nodes")
         .map(Value::take);
     let found = pull_request(&data, pr)?;
     let threads = &found["reviewThreads"];
-    let pending = &found["reviews"]["nodes"][0]["comments"];
+    let reviewed = found["latest"]["nodes"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .rfind(|r| r["viewerDidAuthor"] == true)
+        .and_then(|r| r["commit"]["oid"].as_str())
+        .map(str::to_owned);
     Ok(Page {
         about: json!({"title": found["title"], "url": found["url"], "head_ref": found["headRefName"],
             "state": found["state"], "cross_repository": found["isCrossRepository"],
-            "head_owner": found["headRepositoryOwner"]["login"]}),
+            "head_owner": found["headRepositoryOwner"]["login"], "updated_at": found["updatedAt"]}),
         base: string(&found["baseRefOid"]),
         head: string(&found["headRefOid"]),
-        pending: (pending["pageInfo"]["hasNextPage"] != true).then(|| {
-            pending["nodes"]
-                .as_array()
-                .into_iter()
-                .flatten()
-                .filter_map(|c| c["id"].as_str().map(str::to_owned))
-                .collect()
-        }),
+        pending: pending_ids(&found["reviews"]["nodes"][0]["comments"]),
+        reviewed,
         threads: match nodes {
             Some(Value::Array(nodes)) => nodes,
             _ => Vec::new(),
@@ -348,6 +422,41 @@ pub(crate) fn page(remote: &Remote, pr: u64, after: Option<&After>) -> Result<Pa
         .filter(|a| a.threads.is_some() || a.comments.is_some() || a.reviews.is_some()),
         conversation: conversation(found, after.is_none()),
     })
+}
+
+/// A page of your pending review's comments: their ids, and where the next
+/// page starts.
+fn pending_ids(comments: &Value) -> (Vec<String>, Option<String>) {
+    let ids = comments["nodes"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|c| c["id"].as_str().map(str::to_owned))
+        .collect();
+    (ids, more(comments))
+}
+
+/// The ids of your pending review's comments from `after` on, a query a
+/// page.
+pub(crate) fn rest_of_pending(
+    remote: &Remote,
+    pr: u64,
+    mut after: String,
+) -> Result<Vec<String>, Error> {
+    let mut all = Vec::new();
+    loop {
+        let data = graphql(
+            "PendingComments",
+            PENDING_COMMENTS,
+            &json!({"owner": remote.owner, "name": remote.name, "number": pr, "after": after}),
+        )?;
+        let (ids, next) = pending_ids(&pull_request(&data, pr)?["reviews"]["nodes"][0]["comments"]);
+        all.extend(ids);
+        match next {
+            Some(next) => after = next,
+            None => return Ok(all),
+        }
+    }
 }
 
 /// The general comments of `pr`, a page of the PR: its description when
@@ -439,6 +548,8 @@ pub(crate) fn files(remote: &Remote, pr: u64) -> Option<HashMap<String, Vec<git:
     let out = Command::new("gh")
         .args([
             "api",
+            "--hostname",
+            &host(),
             &format!(
                 "repos/{}/{}/pulls/{pr}/files?per_page=100",
                 remote.owner, remote.name
@@ -487,6 +598,21 @@ pub(crate) struct Known {
     pub anchored: HashSet<String>,
     /// With a `github_unplaced`, which goes once it no longer holds.
     pub unplaced: HashSet<String>,
+    /// With `pending`, in your pending review, which goes once it's sent.
+    pub pending: HashSet<String>,
+}
+
+impl Known {
+    /// `pending` for the comment `node` of `reference`, if it changed: set
+    /// while it's in your pending review, cleared once it isn't.
+    fn pending(&mut self, node: &Value, reference: &str, comment: &mut Map<String, Value>) {
+        if node["state"] == "PENDING" {
+            self.pending.insert(reference.to_owned());
+            comment.insert("pending".to_owned(), json!(true));
+        } else if self.pending.remove(reference) {
+            comment.insert("pending".to_owned(), Value::Null);
+        }
+    }
 }
 
 /// The comments file's operations for a page of threads: each thread's
@@ -510,6 +636,7 @@ pub(crate) fn upserts(
         };
         let root_ref = format!("github:{}", string(&root["id"]));
         let mut comment = imported(root, &root_ref);
+        known.pending(root, &root_ref, &mut comment);
         comment.insert("path".to_owned(), thread["path"].clone());
         comment.insert("github_thread".to_owned(), thread["id"].clone());
         comment.insert("github_resolved".to_owned(), thread["isResolved"].clone());
@@ -543,7 +670,9 @@ pub(crate) fn upserts(
         }
         ops.push(json!({"op": "upsert", "comment": comment}));
         for reply in replies {
-            let mut comment = imported(reply, &format!("github:{}", string(&reply["id"])));
+            let reference = format!("github:{}", string(&reply["id"]));
+            let mut comment = imported(reply, &reference);
+            known.pending(reply, &reference, &mut comment);
             comment.insert("in_reply_to_ref".to_owned(), json!(root_ref));
             ops.push(json!({"op": "upsert", "comment": comment}));
         }
@@ -764,6 +893,8 @@ pub(crate) struct PostState {
     pub url: String,
     /// Your pending review.
     pub pending: Option<Review>,
+    /// The comments in it.
+    pub pending_comments: u64,
 }
 
 /// A review: its id, and its url on GitHub.
@@ -783,6 +914,9 @@ pub(crate) fn post_state(remote: &Remote, pr: u64) -> Result<PostState, Error> {
         pending: pending["id"]
             .as_str()
             .map(|id| (id.to_owned(), string(&pending["url"]))),
+        pending_comments: pending["comments"]["totalCount"]
+            .as_u64()
+            .unwrap_or_default(),
     })
 }
 
@@ -898,7 +1032,84 @@ pub(crate) fn detect(remote: &Remote, head: &Head) -> Result<Option<Value>, Erro
     };
     Ok(pr["number"].as_u64().map(|number| {
         json!({"number": number, "title": pr["title"], "url": pr["url"],
-            "base": pr["baseRefOid"], "head": pr["headRefOid"]})
+            "base": pr["baseRefOid"], "head": pr["headRefOid"], "state": pr["state"]})
+    }))
+}
+
+/// What `check` keeps of the PR between runs: the `ETag` of GitHub's last
+/// answer, its head and when it last changed.
+pub(crate) struct Checked {
+    pub etag: Option<String>,
+    pub head: String,
+    pub updated_at: String,
+}
+
+/// The PR as GitHub has it now, by a conditional request: `None` when it
+/// hasn't changed since the answer `etag` is of, which GitHub doesn't
+/// count against the rate limit.
+pub(crate) fn pull(remote: &Remote, pr: u64, etag: Option<&str>) -> Result<Option<Checked>, Error> {
+    let path = format!("repos/{}/{}/pulls/{pr}", remote.owner, remote.name);
+    let host = host();
+    let mut args = vec!["api", "--hostname", &host, &path, "--include"];
+    let condition = etag.map(|e| format!("If-None-Match: {e}"));
+    if let Some(condition) = &condition {
+        args.extend(["--header", condition]);
+    }
+    let out = Command::new("gh")
+        .args(&args)
+        .env("GH_PROMPT_DISABLED", "1")
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|e| match e.kind() {
+            std::io::ErrorKind::NotFound => Error::Setup(NO_GH.to_owned()),
+            _ => Error::Failed(format!("can't run gh: {e}")),
+        })?;
+    // `--include` prints the status line and headers, then the body; gh
+    // exits 1 past a 2xx, 304 included.
+    let said = String::from_utf8_lossy(&out.stdout);
+    let (head, body) = said
+        .split_once("\r\n\r\n")
+        .or_else(|| said.split_once("\n\n"))
+        .unwrap_or((&said, ""));
+    let status: u16 = head
+        .lines()
+        .next()
+        .and_then(|l| l.split(' ').nth(1)?.parse().ok())
+        .unwrap_or_default();
+    let header = |name: &str| {
+        head.lines().find_map(|l| {
+            let (key, value) = l.split_once(':')?;
+            key.eq_ignore_ascii_case(name)
+                .then(|| value.trim().to_owned())
+        })
+    };
+    match status {
+        304 => return Ok(None),
+        200..=299 => {}
+        401 => return Err(Error::Setup(logged_out())),
+        403 | 429 if header("X-RateLimit-Remaining").as_deref() == Some("0") => {
+            let reset = header("X-RateLimit-Reset")
+                .and_then(|r| r.parse().ok())
+                .map(|r| format!("; {}", resets(r)))
+                .unwrap_or_default();
+            return Err(Error::Failed(format!(
+                "GitHub's rate limit is used up{reset}"
+            )));
+        }
+        _ => {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            return Err(Error::Failed(match stderr.trim() {
+                "" => format!("gh exited with {}", out.status),
+                said => said.to_owned(),
+            }));
+        }
+    }
+    let found: Value = serde_json::from_str(body)
+        .map_err(|e| Error::Failed(format!("GitHub's answer for #{pr}: {e}")))?;
+    Ok(Some(Checked {
+        etag: header("ETag"),
+        head: string(&found["head"]["sha"]),
+        updated_at: string(&found["updated_at"]),
     }))
 }
 
@@ -1025,6 +1236,8 @@ mod tests {
         let (repo, number) = pr.split_once('#').expect("owner/repo#n");
         let (owner, name) = repo.split_once('/').expect("owner/repo");
         let remote = Remote {
+            git_name: "origin".to_owned(),
+            host: "github.com".to_owned(),
             owner: owner.to_owned(),
             name: name.to_owned(),
             key: String::new(),

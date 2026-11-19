@@ -885,11 +885,11 @@ impl Facts {
     }
 }
 
-/// The review plugin `name`: the command it described as dffy started,
-/// and its own checks, run now.
+/// The review plugin `name`: the command it describes, and its own
+/// checks, run now.
 fn review(name: &str, ctx: &Ctx) -> ReviewFacts {
     let found = crate::plugin::find(crate::plugin::REVIEW_PREFIX, name);
-    let command = ctx.review.as_ref().map(|r| {
+    let command = ctx.review().map(|r| {
         r.as_ref()
             .map(|d| d.naming.command.clone())
             .map_err(Clone::clone)

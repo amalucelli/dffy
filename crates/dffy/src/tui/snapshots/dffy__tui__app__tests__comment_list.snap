@@ -1,6 +1,5 @@
 ---
 source: crates/dffy/src/tui/app.rs
-assertion_line: 8634
 expression: screen(&mut app)
 ---
 ┌ Comments · 6 threads · 5 open ─────────────┬─ modified · src/some/deeply/nested/module/file.rs · +2 -2 ────── @@ -1,7 +1,7 @@ ─┐
@@ -24,4 +23,4 @@ expression: screen(&mut app)
 │                                            │  6  6  │ line 6                                                                   │
 │                                            │  7  7  │ line 7                                                                   │
 │                                            │ ⋯ 39 unchanged lines  @@ -47,7 +47,7 @@ line 46                                   │
-└«─  review 7  1/12 · 1/2 hunk ──────────────┴─ unified  review 7 · 6 threads · 5 drafts ─ / search · f filter · space commands ─┘
+└«─  review 7  1/12 · 1/2 hunk ──────────────┴─ r reply · e edit · d delete · x resolve  review 7 · 6 threads · 5 drafts ────────┘

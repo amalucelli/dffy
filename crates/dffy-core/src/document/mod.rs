@@ -264,8 +264,8 @@ impl Shown<'_> {
     }
 }
 
-/// What the user revealed of a gap: lines from each edge, and windows of
-/// lines between. Kept settled for the gap's length: windows sorted, none
+/// What's revealed of a gap: lines from each edge, and windows of lines
+/// between. Kept settled for the gap's length: windows sorted, none
 /// touching another window or an edge.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct Reveal {

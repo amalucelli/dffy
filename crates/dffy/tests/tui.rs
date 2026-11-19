@@ -620,6 +620,32 @@ impl Pull {
     }
 }
 
+/// A diff piped into the viewer has no review, so the review plugin isn't
+/// asked to describe itself, as git's pager runs would all wait on it.
+#[test]
+fn a_piped_diff_doesnt_ask_the_review_plugin() {
+    let pull = Pull::new();
+    std::fs::write(pull.repo.path().join("in.diff"), many_files_diff(3)).expect("write");
+    let mut cmd = CommandBuilder::new("sh");
+    cmd.args([
+        "-c",
+        "cat in.diff | \"$DFFY\" --review test --paging=always --no-cache",
+    ]);
+    cmd.env("DFFY", env!("CARGO_BIN_EXE_dffy"));
+    let search = format!(
+        "{}:{}",
+        pull.stub.path().display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let mut term = Term::spawn_command(cmd, pull.repo.path(), 100, 20, &[("PATH", &search)]);
+    term.wait_for("the viewer", |t| {
+        t.vt.screen().alternate_screen() && t.contains("new 0")
+    });
+    term.send("q");
+    assert!(term.wait_exit().success());
+    assert!(!pull.stub.path().join("described").exists());
+}
+
 /// `dffy pr 7` says it's fetching until `prepare` names the PR's commits,
 /// then opens its diff with its comments while the plugin goes on in the
 /// background, its progress in the status bar. The plugin runs in the
@@ -918,6 +944,68 @@ fn since_last_review_from_a_head_not_in_the_clone_stays_on_the_pr() {
     assert!(term.wait_exit().success());
 }
 
+/// "Since last review" from a head the PR's head no longer descends from,
+/// as after a rebase, shows the range from it and says what it takes in.
+#[test]
+fn since_last_review_after_a_rebase_says_so() {
+    let pull = Pull::new();
+    let d = pull.repo.path();
+    git(d, &["checkout", "-q", "-b", "old", &pull.base]);
+    std::fs::write(d.join("README.md"), "# demo\n\nBefore the rebase.\n").expect("write");
+    git(d, &["commit", "-q", "-am", "old head"]);
+    let old = rev_parse(d, "HEAD");
+    git(d, &["checkout", "-q", "main"]);
+    let session = pull.session(7, &pull.head).replace(
+        r#""last_reviewed_head":null"#,
+        &format!(r#""last_reviewed_head":"{old}""#),
+    );
+    pull.verb("prepare", &[&session], 0);
+    let mut term = pull.spawn(&["pr", "7"]);
+    term.wait_for("the PR's diff", |t| t.contains("From the PR."));
+    term.send(" ");
+    term.send("R");
+    term.wait_for("why the range takes in more", |t| {
+        t.status().contains("rebased since your last review")
+    });
+    term.send("q");
+    assert!(term.wait_exit().success());
+}
+
+/// A comment on a renamed file's old side shows on the old file when the
+/// diff lists the two apart, as with renames off, and not on the new one.
+#[test]
+fn an_old_side_comment_shows_on_the_old_path_when_renames_are_off() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let d = dir.path();
+    git(d, &["init", "-q", "-b", "main"]);
+    let body = "fn f1() {}\nfn f2() {}\nfn f3() {}\nfn f4() {}\nfn f5() {}\nfn f6() {}\n";
+    std::fs::write(d.join("old.rs"), body).expect("write");
+    git(d, &["add", "-A"]);
+    git(d, &["commit", "-q", "-m", "init"]);
+    git(d, &["mv", "old.rs", "new.rs"]);
+    std::fs::create_dir_all(d.join(".git/dffy")).expect("mkdir");
+    std::fs::write(
+        d.join(".git/dffy/comments.json"),
+        r#"{"version":1,"comments":[{"id":"o1","path":"new.rs","old_path":"old.rs","side":"old","start":{"old":2,"new":null},"end":{"old":2,"new":null},"text":"Was here","author":"","created":"2026-11-17T10:00:00Z","anchor":{"before":["fn f1() {}"],"lines":["fn f2() {}"],"after":["fn f3() {}"]}}]}"#,
+    )
+    .expect("write");
+    let config = config("renames = false\n");
+    let mut term = Term::spawn(d, 120, 30, &[("XDG_CONFIG_HOME", &path(&config))]);
+    term.wait_for("the added file", |t| t.row(0).contains("new.rs"));
+    term.settle();
+    assert!(
+        !term.contains("Was here"),
+        "{}",
+        term.vt.screen().contents()
+    );
+    term.send("f");
+    term.wait_for("the comment on the old file", |t| {
+        t.row(0).contains("old.rs") && t.contains("Was here")
+    });
+    term.send("q");
+    assert!(term.wait_exit().success());
+}
+
 /// Without a number and with no PR on the branch, `dffy pr` opens on the
 /// usual diff with the picker; picking one shows it in place. `p` then
 /// pulls a new head, shown in place with the draft written before, and
@@ -973,7 +1061,7 @@ fn a_picked_pr_updates_in_place_and_posts() {
     );
 
     term.send("P");
-    term.wait_for("the dialog", |t| t.contains("post review · PR #11"));
+    term.wait_for("the dialog", |t| t.contains("finish your review · PR #11"));
     assert!(
         term.contains("1 comment"),
         "{}",
@@ -1017,15 +1105,16 @@ fn a_picked_pr_updates_in_place_and_posts() {
     assert!(term.wait_exit().success());
 }
 
-/// `P` runs `post --dry-run` beside the `prepare` still going, and the
-/// dialog counts what it says. A post the host refused a comment in asks
-/// what to do; `s` applies the approval without the comments left out.
+/// The drafts are planned in the background with `post --dry-run`, beside
+/// the `prepare` still going, and their headings say what posting does;
+/// the dialog counts it, with one warning for what won't go. The review is
+/// sent without those, and the status bar says so.
 #[test]
-fn posting_checks_first_and_asks_when_a_comment_is_refused() {
+fn drafts_are_planned_and_the_review_goes_without_those_that_cant() {
     let pull = Pull::new();
     std::fs::write(
         pull.comments(),
-        r#"{"version":1,"comments":[{"id":"c1","path":"README.md","text":"Draft here","created":"2026-11-17T10:00:00Z"},{"id":"c2","path":"README.md","text":"And here","created":"2026-11-17T10:01:00Z"}]}"#,
+        r#"{"version":1,"comments":[{"id":"c1","path":"README.md","text":"Draft here","created":"2026-11-17T10:00:00Z"},{"id":"c2","path":"README.md","text":"And here","created":"2026-11-17T10:01:00Z","post_error":"Line could not be resolved"}]}"#,
     )
     .expect("write");
     pull.verb(
@@ -1044,13 +1133,8 @@ fn posting_checks_first_and_asks_when_a_comment_is_refused() {
         &[
             skipped,
             r#"{"version":1,"draft":{"id":"c2","path":"README.md","plan":"file"}}"#,
-            r#"{"version":1,"planned":{"line":0,"file":1,"skip":1}}"#,
+            r#"{"version":1,"planned":{"line":0,"file":1,"skip":1,"pending":2,"resolves":0}}"#,
         ],
-        0,
-    );
-    pull.verb(
-        "post.apply-event",
-        &[r#"{"version":1,"posted":0,"failed":0,"url":"https://example.com/pull/7#review"}"#],
         0,
     );
     pull.verb(
@@ -1058,11 +1142,10 @@ fn posting_checks_first_and_asks_when_a_comment_is_refused() {
         &[
             skipped,
             refused,
-            r#"{"version":1,"posted":0,"failed":2,"held":true,"held_message":"review still pending","url":"https://example.com/pull/7#review"}"#,
+            r#"{"version":1,"posted":0,"failed":2,"pending":2,"url":"https://example.com/pull/7#review"}"#,
         ],
         0,
     );
-    let args = pull.stub.path().join("post.apply-event.args");
     let mut term = pull.spawn(&["pr", "7"]);
     term.wait_for("the PR's diff", |t| t.contains("From the PR."));
     // 100 of 312 threads: Fetching threads · PR #7, a third done.
@@ -1073,10 +1156,19 @@ fn posting_checks_first_and_asks_when_a_comment_is_refused() {
             b"\x1b]7501;state=working:app=dffy:progress=32:msg=RmV0Y2hpbmcgdGhyZWFkcyDCtyBQUiAjNw==\x1b\\",
         )
     });
+    term.wait_for("the plan in the headings", |t| {
+        t.contains("draft · not in the PR yet") && t.contains("refused: Line could not")
+    });
+    let planned = std::fs::read_to_string(pull.stub.path().join("post.dry-run.args"))
+        .expect("the dry run's arguments");
+    assert!(
+        planned.starts_with("post 7 --dry-run --drafts "),
+        "{planned}"
+    );
     term.send("P");
     term.wait_for("the counts", |t| {
-        t.contains("2 comments · 1 as a file comment")
-            && t.contains("1 can't be posted and stays a draft")
+        t.contains("2 comments · 1 as a file comment · 2 pending on PR #7")
+            && t.contains("! 1 draft waits for a push · 1 refused before")
     });
     assert!(
         term.status().contains("fetching threads"),
@@ -1085,24 +1177,132 @@ fn posting_checks_first_and_asks_when_a_comment_is_refused() {
     );
     term.send("a");
     term.send("\r");
-    term.wait_for("the prompt", |t| t.contains("2 comments weren't posted"));
-    // 2 comments weren't posted · approve without them?
-    assert!(sent(
-        &term,
-        0,
-        b"\x1b]7501;state=blocked:kind=permission:app=dffy:msg=MiBjb21tZW50cyB3ZXJlbid0IHBvc3RlZCDCtyBhcHByb3ZlIHdpdGhvdXQgdGhlbT8=\x1b\\"
-    ));
-    assert!(
-        term.contains("Line could not be resolved"),
-        "{}",
-        term.vt.screen().contents()
-    );
-    term.send("s");
-    term.wait_for("the submit", |t| {
-        t.status().contains("approved · 2 comments not posted")
+    term.wait_for("the post", |t| {
+        t.status()
+            .contains("review sent · 1 comment refused, kept as drafts · 1 draft waits for a push")
     });
-    let sent = std::fs::read_to_string(&args).expect("args");
-    assert_eq!(sent.trim(), "post 7 --apply-event --event approve");
+    let args = std::fs::read_to_string(pull.stub.path().join("post.args")).expect("args");
+    assert_eq!(args.trim(), "post 7 --event approve");
+    term.send("q");
+    assert!(term.wait_exit().success());
+}
+
+/// A signal to stop while a post runs lets the post finish first, and
+/// saves the text box's text; quitting a review with drafts not posted
+/// says so once the screen is back.
+#[test]
+fn a_signal_waits_for_the_post_and_saves_the_box() {
+    let pull = Pull::new();
+    std::fs::write(
+        pull.comments(),
+        r#"{"version":1,"comments":[{"id":"c1","path":"README.md","text":"Draft here","created":"2026-11-17T10:00:00Z"}]}"#,
+    )
+    .expect("write");
+    pull.verb("prepare", &[&pull.session(7, &pull.head)], 0);
+    pull.verb("post.dry-run", &[], 0);
+    pull.verb(
+        "post",
+        &[r#"{"version":1,"posted":1,"failed":0,"pending":0,"url":null}"#],
+        0,
+    );
+    let gate = pull.gate("post");
+    let mut term = pull.spawn(&["pr", "7"]);
+    term.wait_for("the PR's diff", |t| t.contains("From the PR."));
+    term.send("P");
+    term.wait_for("the dialog", |t| t.contains("finish your review"));
+    term.send("\r");
+    term.wait_for("the post", |t| t.status().contains("posting"));
+    let pid = term.child.process_id().expect("a pid").to_string();
+    Command::new("kill")
+        .args(["-TERM", &pid])
+        .status()
+        .expect("kill");
+    std::thread::sleep(Duration::from_millis(300));
+    assert!(
+        term.child.try_wait().expect("wait").is_none(),
+        "it waits for the post"
+    );
+    std::fs::remove_file(&gate).expect("open the gate");
+    assert!(term.wait_exit().success());
+
+    // Unposted drafts are named on the way out; the box saved on a signal.
+    pull.verb("post", &[], 2);
+    let mut term = pull.spawn(&["pr", "7"]);
+    term.wait_for("the PR's diff", |t| t.contains("From the PR."));
+    term.send("C");
+    term.send("Half written");
+    let pid = term.child.process_id().expect("a pid").to_string();
+    Command::new("kill")
+        .args(["-TERM", &pid])
+        .status()
+        .expect("kill");
+    assert!(term.wait_exit().success());
+    let saved = std::fs::read_to_string(pull.comments()).expect("comments");
+    assert!(saved.contains("Half written"), "{saved}");
+    let out = String::from_utf8_lossy(&term.output()).into_owned();
+    assert!(out.contains("PR #7: 2 drafts not posted"), "{out:?}");
+}
+
+/// A clean working tree prints that there are no changes, and where the
+/// comments left open on this branch are.
+#[test]
+fn no_changes_names_the_open_comments() {
+    let repo = repo();
+    let d = repo.path();
+    git(d, &["add", "-A"]);
+    git(d, &["commit", "-q", "-m", "everything"]);
+    std::fs::create_dir_all(d.join(".git/dffy")).expect("mkdir");
+    std::fs::write(
+        d.join(".git/dffy/comments.json"),
+        r#"{"version":1,"comments":[
+{"id":"a","path":"README.md","text":"Open","author":"","created":"2026-11-17T10:00:00Z","branch":"main"},
+{"id":"b","path":"README.md","text":"Done","author":"","created":"2026-11-17T10:00:00Z","resolved":true},
+{"id":"c","path":"README.md","text":"Elsewhere","author":"","created":"2026-11-17T10:00:00Z","branch":"topic"}
+]}"#,
+    )
+    .expect("write");
+    let mut term = Term::spawn(d, 80, 24, &[]);
+    assert!(term.wait_exit().success());
+    let out = String::from_utf8_lossy(&term.output()).into_owned();
+    assert!(
+        out.contains(
+            "no changes · 1 open comment · dffy comments lists them, dffy HEAD~1.. shows them"
+        ),
+        "{out:?}"
+    );
+}
+
+/// A local comments file that can't be had leaves the viewer without it,
+/// saying why, rather than without the diff.
+#[test]
+fn a_local_comments_file_that_cant_be_had_doesnt_stop_the_viewer() {
+    let repo = repo();
+    let d = repo.path();
+    git(d, &["add", "-A"]);
+    git(d, &["commit", "-q", "-m", "everything"]);
+    let linked = tempfile::tempdir().expect("tempdir");
+    let wt = linked.path().join("wt");
+    git(
+        d,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            wt.to_str().expect("utf-8"),
+            "-b",
+            "wt",
+        ],
+    );
+    std::fs::write(wt.join("README.md"), "# demo\n\nIn the worktree.\n").expect("write");
+    let old = d.join(".git/worktrees/wt/dffy");
+    std::fs::create_dir_all(&old).expect("mkdir");
+    std::fs::write(old.join("comments.json"), r#"{"version":1,"comments":[]}"#).expect("write");
+    // Where the shared file's directory would go.
+    std::fs::write(d.join(".git/dffy"), "").expect("write");
+    let mut term = Term::spawn(&wt, 120, 16, &[]);
+    term.wait_for("the diff and why", |t| {
+        t.contains("In the worktree.") && t.status().contains("no local comments")
+    });
     term.send("q");
     assert!(term.wait_exit().success());
 }

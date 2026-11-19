@@ -3,33 +3,59 @@
 # $STUB/gh and logs each request. Each event records how many lines the
 # plugin had printed by then, which orders the plugin's output against its
 # requests without sleeps. GraphQL requests go to `requests` and `events`,
-# REST ones to `rest`.
+# REST ones to `rest`, and every `gh api` names its host first, which goes
+# to `hostnames`.
 case "$1" in
   --version) echo 'gh version 2.0.0 (stub)'; exit 0 ;;
   auth)
+    # `auth status --hostname <host>`: logged in to github.com and to the
+    # hosts listed in $STUB/gh/hosts.
     printf '%s\n' "$*" >> "$STUB/auth"
     if [ -f "$STUB/gh/logged-out" ]; then
       echo 'You are not logged into any GitHub hosts. To log in, run: gh auth login' >&2; exit 1
     fi
-    printf 'github.com\n  ✓ Logged in to github.com account octocat (keyring)\n'; exit 0 ;;
+    if [ "$4" = github.com ] || grep -qx "$4" "$STUB/gh/hosts" 2>/dev/null; then
+      printf '%s\n  ✓ Logged in to %s account octocat (keyring)\n' "$4" "$4"; exit 0
+    fi
+    echo "You are not logged into any accounts on $4" >&2; exit 1 ;;
 esac
+if [ "$1" != api ] || [ "$2" != --hostname ] || [ -z "$3" ]; then
+  echo "gh stub: a call without --hostname: $*" >&2; exit 1
+fi
+all="$*"
+printf '%s\n' "$3" >> "$STUB/hostnames"
+shift 3
 body=$(cat)
 if [ -f "$STUB/gh/logged-out" ]; then
   echo 'To get started with GitHub CLI, please run:  gh auth login' >&2; exit 4
 fi
 if [ -f "$STUB/gh/bad-token" ]; then echo 'gh: Bad credentials (HTTP 401)' >&2; exit 1; fi
-if [ "$2" != graphql ]; then
-  # REST, named by the path's last segment. A `.hold` makes the answer wait
-  # for the plugin's first line; the log says how many lines it had then.
-  op=$(printf '%s' "$2" | sed 's/?.*//; s|.*/||')
-  n=$(($(cat "$STUB/rest" 2>/dev/null | grep -c "/$op?") + 1))
+if [ "$1" != graphql ]; then
+  # REST, named by the path's last segment, a PR itself `pull`. A `.hold`
+  # makes the answer wait for the plugin's first line; the log says how
+  # many lines it had then. An `.http` answer is a whole response, as
+  # `gh api -i` prints it, and fails as gh does past a 2xx.
+  path=${1%%\?*}
+  case "$path" in
+    */pulls/*/*) op=${path##*/} ;;
+    */pulls/*) op=pull ;;
+    *) op=${path##*/} ;;
+  esac
+  printf '%s\n' "$op" >> "$STUB/rest-ops"
+  n=$(grep -cx "$op" "$STUB/rest-ops")
   if [ -f "$STUB/gh/$op.hold" ]; then
     i=0
     while [ "$(wc -l < "$STUB/out")" -lt 1 ] && [ $i -lt 30 ]; do sleep 0.1; i=$((i + 1)); done
   fi
-  printf '%s after %s\n' "$*" "$(wc -l < "$STUB/out" | tr -d ' ')" >> "$STUB/rest"
+  printf '%s after %s\n' "$all" "$(wc -l < "$STUB/out" | tr -d ' ')" >> "$STUB/rest"
   for f in "$STUB/gh/$op.$n" "$STUB/gh/$op"; do
     if [ -f "$f.json" ]; then cat "$f.json"; exit 0; fi
+    if [ -f "$f.http" ]; then
+      cat "$f.http"
+      code=$(sed -n '1s/^HTTP\/[0-9.]* \([0-9]*\).*/\1/p' "$f.http")
+      case "$code" in 2??) exit 0 ;; esac
+      echo "gh: HTTP $code" >&2; exit 1
+    fi
     if [ -f "$f.down" ]; then echo 'error connecting to api.github.com' >&2; exit 1; fi
   done
   echo "gh stub: no fixture for $op call $n" >&2

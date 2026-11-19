@@ -29,6 +29,11 @@ impl TextBox {
         &self.text
     }
 
+    /// Puts the cursor before the text.
+    pub(crate) fn rewind(&mut self) {
+        self.cursor = 0;
+    }
+
     /// Edits for `key`. Moves and deletes by word and to the line's start
     /// take readline's keys, which macOS terminals send for option and
     /// command. Other keys with ctrl or alt do nothing.

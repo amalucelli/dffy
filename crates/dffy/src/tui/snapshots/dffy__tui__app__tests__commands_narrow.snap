@@ -20,7 +20,7 @@ expression: screen(&mut phone)
 │     More context                          x   ┃│
 │ [ ] Whole file                            X   ┃│
 │     Indicators ‹ classic ›                i   ┃│
-│     Modified lines ‹ changed ›            e   ┃│
+│     Modified lines ‹ changed ›            e   ││
 │ [x] Syntax highlighting                   H   ││
 │ [ ] Ignore whitespace                     W   ││
 │ [x] Line numbers                          L   ││

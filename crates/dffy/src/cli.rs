@@ -151,14 +151,16 @@ pub(crate) fn with_default_subcommand(
     args
 }
 
-/// dffy's own commands that neither open the viewer nor list dffy's
-/// commands, so the review plugin's command changes nothing they do.
-const WITHOUT_REVIEW: [&str; 6] = ["comments", "config", "themes", "daemon", "mcp", "man"];
-
-/// Whether running `args` needs the review plugin described. The plugin's
-/// own `dffy comments apply` runs don't, so they skip spawning it again.
-pub(crate) fn needs_review(args: &[OsString]) -> bool {
-    first_command(args).is_none_or(|(_, arg)| !WITHOUT_REVIEW.contains(&arg))
+/// Whether parsing `args` with `command` needs the review plugin's command
+/// first: help lists it, and a first word that isn't one of `command`'s
+/// subcommands may be it, unless no command could be named so
+/// (`main..HEAD`, `HEAD~3`, `src/lib.rs`). Every other run that uses the
+/// plugin's description asks for it after parsing.
+pub(crate) fn parses_review(command: &clap::Command, args: &[OsString]) -> bool {
+    first_command(args).is_some_and(|(_, arg)| {
+        matches!(arg, "-h" | "--help" | "help")
+            || (!is_subcommand(command, arg) && Naming::can_be_command(arg))
+    })
 }
 
 /// The first argument that isn't a global option, and where it is.
@@ -168,10 +170,12 @@ fn first_command(args: &[OsString]) -> Option<(usize, &str)> {
         let arg = arg.to_str().unwrap_or_default();
         if GLOBAL_WITH_VALUE.contains(&arg) {
             i += 2;
-        } else if GLOBAL_WITH_VALUE.iter().any(|g| {
-            arg.strip_prefix(g)
-                .is_some_and(|rest| rest.starts_with('=') || (*g == "-C" && !rest.is_empty()))
-        }) {
+        } else if arg == "--no-cache"
+            || GLOBAL_WITH_VALUE.iter().any(|g| {
+                arg.strip_prefix(g)
+                    .is_some_and(|rest| rest.starts_with('=') || (*g == "-C" && !rest.is_empty()))
+            })
+        {
             i += 1;
         } else {
             return Some((i, arg));
@@ -195,8 +199,8 @@ pub(crate) struct Global {
     /// Theme: a built-in or a file in the config's themes directory
     #[arg(long, value_name = "name", global = true)]
     pub theme: Option<String>,
-    /// Review comments file; the default is dffy/comments.json in the
-    /// repository's git directory
+    /// Review comments file; the default is dffy/comments.json in the git
+    /// directory the repository's worktrees share
     #[arg(long, value_name = "file", global = true)]
     pub comments: Option<PathBuf>,
     /// Review plugin, dffy-review-<name>, over the config's review for this
@@ -219,18 +223,16 @@ pub(crate) enum Command {
     /// Show a commit against its first parent, with its header
     Show(ShowArgs),
     /// List the review comments, or change them with apply
-    #[command(long_about = "List the review comments of --comments <file>, or of \
-        dffy/comments.json in the repository's git directory.\n\n\
-        With --json, print the file in its format. `dffy comments apply` reads a \
-        JSON list of operations on stdin, applies them all or none, and prints the \
-        ids they touched. See docs/comments.md.")]
-    Comments {
-        /// Print the comments file as JSON (docs/comments.md)
-        #[arg(long)]
-        json: bool,
-        #[command(subcommand)]
-        action: Option<CommentsAction>,
-    },
+    #[command(long_about = "List the review comments of --comments <file>, of the \
+        review session the viewer has open with --session, or of dffy/comments.json \
+        in the repository's shared git directory: the current branch's threads and \
+        those on no branch, unless --branch or --all-branches says otherwise.\n\n\
+        With --json, print the whole file in its format; with --markdown, the \
+        threads with their lines. `dffy comments apply` reads a JSON list of \
+        operations on stdin, applies them all or none, and prints the ids they \
+        touched; `dffy comments rm --resolved` removes resolved threads. See \
+        docs/comments.md.")]
+    Comments(CommentsArgs),
     /// The review plugin's command, which [`command`] adds and [`parse`]
     /// reads.
     #[command(skip)]
@@ -297,10 +299,70 @@ pub(crate) enum DocPage {
     Config,
 }
 
-#[derive(Debug, Clone, Copy, Subcommand)]
+#[derive(Debug, Args)]
+#[expect(clippy::struct_excessive_bools, reason = "each flag is its own switch")]
+pub(crate) struct CommentsArgs {
+    /// Print the whole comments file as JSON (docs/comments.md)
+    #[arg(long, conflicts_with_all = ["markdown", "open", "resolved", "path", "branch", "all_branches"])]
+    pub json: bool,
+    /// Print the threads as Markdown, with the lines they're on
+    #[arg(long)]
+    pub markdown: bool,
+    /// The comments of the review session the viewer has open, instead of the local ones
+    #[arg(long)]
+    pub session: bool,
+    /// Only open threads
+    #[arg(long, conflicts_with = "resolved")]
+    pub open: bool,
+    /// Only resolved threads
+    #[arg(long)]
+    pub resolved: bool,
+    /// Only the threads on this file, relative to the repository root; a renamed file's old path works too
+    #[arg(long, value_name = "path")]
+    pub path: Option<String>,
+    #[command(flatten)]
+    pub branches: BranchArgs,
+    #[command(subcommand)]
+    pub action: Option<CommentsAction>,
+}
+
+impl CommentsArgs {
+    /// Whether a flag that only a listing reads is given.
+    pub(crate) fn lists(&self) -> bool {
+        self.json
+            || self.markdown
+            || self.open
+            || self.resolved
+            || self.path.is_some()
+            || self.branches.branch.is_some()
+            || self.branches.all_branches
+    }
+}
+
+/// Which branches' threads a comments command takes; by default the
+/// current branch's and those on no branch.
+#[derive(Debug, Clone, Default, Args)]
+pub(crate) struct BranchArgs {
+    /// The threads on this branch and those on none, instead of the current branch's
+    #[arg(long, value_name = "name", conflicts_with = "all_branches")]
+    pub branch: Option<String>,
+    /// Every branch's threads
+    #[arg(long)]
+    pub all_branches: bool,
+}
+
+#[derive(Debug, Clone, Subcommand)]
 pub(crate) enum CommentsAction {
     /// Apply a JSON list of operations from stdin, all or none, and print the ids they touched
     Apply,
+    /// Remove the resolved threads, with their replies, of the current branch and of none
+    Rm {
+        /// Remove the resolved threads; required
+        #[arg(long, required = true)]
+        resolved: bool,
+        #[command(flatten)]
+        branches: BranchArgs,
+    },
 }
 
 #[derive(Debug, Clone, Subcommand)]
@@ -535,6 +597,9 @@ mod tests {
         assert_eq!(id.as_deref(), Some("7"));
         assert_eq!(global.dir, Some(PathBuf::from("repo")));
         assert_eq!(global.color, Some(ColorWhen::Never));
+        let (id, global) = review(&["--no-cache", "mr", "7"]);
+        assert_eq!(id.as_deref(), Some("7"));
+        assert!(global.no_cache);
         let revision = |review: Option<&Naming>, args: &[&str]| {
             diff_args(parse_with(review, args).unwrap_or_else(|e| panic!("{args:?}: {e}"))).revs
         };
@@ -583,30 +648,23 @@ mod tests {
     }
 
     #[test]
-    fn only_the_viewer_and_command_listings_need_the_review_plugin() {
-        let needs = |args: &[&str]| {
+    fn only_help_and_a_word_that_may_be_the_review_command_parse_with_it() {
+        let parses = |args: &[&str]| {
             let mut full = vec![OsString::from("dffy")];
             full.extend(args.iter().map(OsString::from));
-            needs_review(&full)
+            parses_review(&Cli::command(), &full)
         };
+        for args in [&["-C", "repo", "pr", "7"][..], &["--help"], &["help"]] {
+            assert!(parses(args), "{args:?}");
+        }
         for args in [
             &[][..],
-            &["pr", "7"],
             &["main..HEAD"],
-            &["show"],
-            &["--help"],
-            &["doctor"],
+            &["--stat"],
+            &["diff", "pr"],
+            &["comments", "apply"],
         ] {
-            assert!(needs(args), "{args:?}");
-        }
-        for args in [
-            &["comments", "apply"][..],
-            &["-C", "repo", "--review=github", "mcp"],
-        ] {
-            assert!(!needs(args), "{args:?}");
-        }
-        for name in WITHOUT_REVIEW {
-            assert!(is_subcommand(&Cli::command(), name), "{name}");
+            assert!(!parses(args), "{args:?}");
         }
     }
 

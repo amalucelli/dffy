@@ -129,8 +129,15 @@ Read-only: it reads the comments file on every call and never writes it. Writing
 | Input | Default | Meaning |
 |---|---|---|
 | `path` | all | Only the comments on this file, relative to the repository root. A renamed file's old path finds them too. |
+| `open` | all | `true` for open threads only, `false` for resolved ones. |
+| `resolved` | all | `true` for resolved threads only, `false` for open ones. Given with `open`, the two must agree. |
+| `branch` | the current branch | The threads on this branch, and those on no branch ([comments.md](comments.md#branches)). |
+| `all_branches` | `false` | Every branch's threads. Not with `branch`. |
+| `session` | `false` | The comments of the review session the viewer has open, from the file the [session pointer](comments.md#the-session-pointer) names, instead of the local ones. Read as the review plugin last wrote it; the host isn't asked. An error when no session was opened. |
 | `limit` | 100 | Comments per page, 1 to 1000. |
 | `cursor` | | The previous page's `next_cursor`. |
+
+Each filter judges a thread by its first comment, so a thread is in or out whole. Without `branch` or `all_branches`, it lists the current branch's threads and those on no branch, as `dffy comments` does; the current branch is read on every call. Outside a repository, with `--comments`, it lists every branch's.
 
 The result:
 
@@ -140,8 +147,9 @@ The result:
 
 - **`comments`:** each comment as the file holds it ([comments.md](comments.md#the-file-version-1)), unknown fields included, in thread order: a thread's first comment, then its replies in the order they were added. [General comments](comments.md#general-comments), which have no `path`, come first; then threads by path and first line, file comments first. With `path`, general comments are left out. A page may end inside a thread; the next page continues it.
 - **`notice`:** the file's `notice`, set by the integration that keeps the comments, such as that they're stale; null without one.
-- **`total_comments`:** the number of comments `path` selects, on every page.
+- **`total_comments`:** the number of comments the filters select, on every page.
 - A missing comments file has no comments. Outside a repository, without `--comments`, the tool returns an error.
+- In a linked worktree whose comments file hasn't [moved to the shared place](comments.md#moving-from-the-worktrees-file) yet, it reads the worktree's own file: it never moves or writes one.
 
 ## Results
 

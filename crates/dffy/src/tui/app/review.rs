@@ -4,7 +4,7 @@
 //! comes back as [`Event::Review`] for the run's id, and runs that are no
 //! longer wanted are ignored. Every word naming the host's kind of review is the plugin's.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
 use std::ops::ControlFlow;
 use std::path::PathBuf;
@@ -15,7 +15,7 @@ use dffy_core::view::Attributes;
 use unicode_width::UnicodeWidthStr;
 
 use super::{Action, App, Comments, escape, is_web};
-use crate::plugin::review::{self, Draft, Listed, Plan, Reason, ReviewEvent, Said, Session};
+use crate::plugin::review::{self, Listed, Plan, Reason, ReviewEvent, Said, Session, State};
 use crate::term::{self, Grid, Input, Key, Mods};
 use crate::theme::{Role, Style, Theme};
 use crate::tui::help;
@@ -23,6 +23,14 @@ use crate::tui::textbox::TextBox;
 
 /// How often the plugin is asked whether the review's head moved.
 pub(super) const CHECK_EVERY: Duration = Duration::from_secs(60);
+
+/// No input for this long stops the checks until the next key: a viewer
+/// left open overnight shouldn't ask the host all night.
+pub(super) const IDLE_AFTER: Duration = Duration::from_secs(10 * 60);
+
+/// How long after the drafts change their plan is asked for again, so a
+/// burst of edits or a plugin's page of threads asks once.
+const PLAN_AFTER: Duration = Duration::from_millis(400);
 
 /// The review shown.
 pub(super) struct Mode {
@@ -38,20 +46,25 @@ pub(super) struct Mode {
     /// With `plain`: the review's base against the working tree instead,
     /// so changes not pushed yet show with the review's.
     pub whole: bool,
+    /// The event the last post sent, which the dialog starts on when the
+    /// plugin's events have none that submits.
     pub event: Option<ReviewEvent>,
     /// How the last post ended, which the status bar keeps saying.
     pub outcome: Option<String>,
     /// The head on the host, when the last check found it moved.
     pub moved: Option<String>,
+    /// The last check found the review changed on the host since its
+    /// comments were imported: new comments, most likely.
+    pub comments_moved: bool,
     /// The check running, by its run's id.
     pub check: Option<u64>,
     pub next_check: Instant,
-    /// Threads resolved or reopened here since the last post, by root,
-    /// with the state each had before. The comments file can't tell an
-    /// unsent resolve from a sent one; the plugin keeps that its own way.
-    pub resolves: HashMap<String, bool>,
-    /// The post dialog's summary, kept between openings until it's sent.
-    pub summary: String,
+    /// Why the last check failed, said once until it changes.
+    pub check_failed: Option<String>,
+    /// When the session started, seconds since 1970: local drafts written
+    /// since are this review's, and the dialog sends them unasked.
+    pub started: u64,
+    pub plans: Plans,
 }
 
 impl Mode {
@@ -66,10 +79,12 @@ impl Mode {
             event: None,
             outcome: None,
             moved: None,
+            comments_moved: false,
             check: None,
             next_check: Instant::now() + CHECK_EVERY,
-            resolves: HashMap::new(),
-            summary: String::new(),
+            check_failed: None,
+            started: super::now(),
+            plans: Plans::default(),
         }
     }
 
@@ -104,6 +119,43 @@ impl Mode {
             None => label.clone(),
         }
     }
+
+    /// Closed or merged on the host, when the plugin says so.
+    fn ended(&self) -> Option<State> {
+        self.session.state.filter(|s| *s != State::Open)
+    }
+}
+
+/// What `post --dry-run` last said posting would do with each draft. It
+/// runs in the background after the drafts change, never while a post
+/// does, and its answer goes into the drafts' headings and the dialog.
+#[derive(Default)]
+pub(super) struct Plans {
+    /// The dry run going on, by its run's id, and what it said so far.
+    running: Option<(u64, Answer)>,
+    /// The last whole answer.
+    known: Option<Answer>,
+    /// Why the last run failed, until one doesn't.
+    failed: Option<String>,
+    /// When the next is to run: the drafts changed since the last.
+    pub due: Option<Instant>,
+}
+
+/// Where the dialog's counts stand.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum Checked {
+    /// A plan answered since the drafts last changed.
+    Yes,
+    Checking,
+    /// The last plan failed, saying this.
+    Failed(String),
+}
+
+#[derive(Default, Clone)]
+struct Answer {
+    drafts: HashMap<String, Plan>,
+    pending: usize,
+    resolves: usize,
 }
 
 /// A plugin run that isn't a `check`, a `list` or a dry run; one at a
@@ -113,22 +165,14 @@ pub(super) enum Job {
     Prepare,
     Pull,
     Post,
-    /// `post --apply-event`, after a post that left this many drafts out.
-    ApplyEvent(usize),
 }
 
 impl Job {
-    /// Sends to the host, so nothing may stop it halfway.
-    fn posts(self) -> bool {
-        matches!(self, Self::Post | Self::ApplyEvent(_))
-    }
-
     fn doing(self) -> &'static str {
         match self {
             Self::Prepare => "fetching threads",
             Self::Pull => "updating",
             Self::Post => "posting",
-            Self::ApplyEvent(_) => "sending",
         }
     }
 }
@@ -141,12 +185,18 @@ pub(super) struct Running {
     pub progress: Option<String>,
     /// A `prepare` of the review `detect` found for the branch checked out.
     pub local: bool,
-    /// A post's drafts not posted, and its last line: comments posted,
-    /// comments not, and whether the event wasn't applied, with the
-    /// plugin's words for that.
-    pub unposted: Vec<Unposted>,
-    pub posted: Option<(usize, usize, bool)>,
-    pub held_message: Option<String>,
+    /// A post's drafts not posted, by id, with why.
+    pub unposted: Vec<(String, String)>,
+    /// A post's last line: comments posted, and not.
+    pub posted: Option<(usize, usize)>,
+    /// For a `prepare` or `pull`: the posted threads' roots by ref as its
+    /// first word came, to tell the new ones at its end; none when there's
+    /// nothing to tell them from, as on a first open.
+    pub before: Option<HashMap<String, String>>,
+    /// `before` was taken, or found to have nothing.
+    pub looked: bool,
+    /// A `pull` whose session line named the head already shown.
+    pub same: bool,
 }
 
 impl Running {
@@ -159,49 +209,15 @@ impl Running {
             local: false,
             unposted: Vec::new(),
             posted: None,
-            held_message: None,
+            before: None,
+            looked: false,
+            same: false,
         }
     }
 }
 
-/// A draft `post` can't post or didn't, with why.
-#[derive(Debug, Clone)]
-pub(super) struct Unposted {
-    id: String,
-    path: String,
-    why: String,
-}
-
-impl Unposted {
-    /// The draft of a draft line, when it's left out.
-    fn of(draft: Draft) -> Option<Self> {
-        match draft.plan {
-            Plan::Skip(why) => Some(Self {
-                id: draft.id,
-                path: draft.path,
-                why,
-            }),
-            Plan::Line | Plan::File => None,
-        }
-    }
-}
-
-/// How a post of `event` ended, in the words the status bar keeps:
-/// `review sent`, `approved · 2 comments not posted`, the plugin's words
-/// for an event `held` back (`review still pending · 2 not posted`), or
-/// `nothing posted`.
-fn outcome(event: &ReviewEvent, (posted, failed): (usize, usize), held: Option<&str>) -> String {
-    match held {
-        Some(held) if failed > 0 => format!("{held} · {failed} not posted"),
-        Some(held) => held.to_owned(),
-        None if !event.submits && posted + failed == 0 => "nothing posted".to_owned(),
-        None if event.submits && failed == 0 => "review sent".to_owned(),
-        None if failed == 0 => event.done.clone(),
-        None => format!("{} · {} not posted", event.done, plural(failed, "comment")),
-    }
-}
-
-/// The dialog `P` opens.
+/// The dialog `P` opens, as GitHub's "Finish your review": a summary, the
+/// plugin's events, and one line when something won't go.
 pub(super) struct Dialog {
     /// The plugin's events, and the one picked.
     events: Vec<ReviewEvent>,
@@ -209,27 +225,54 @@ pub(super) struct Dialog {
     summary: TextBox,
     /// Keys go to the summary.
     writing: bool,
-    preflight: Preflight,
+    /// The local drafts in view go with the review (`l`).
+    local: bool,
 }
 
-/// What `post --dry-run`, run as the dialog opens, says.
-struct Preflight {
-    id: u64,
-    done: bool,
-    /// Drafts on a line, on the file, and left out.
-    planned: Option<(usize, usize, usize)>,
-    skipped: Vec<Unposted>,
-    failed: Option<String>,
+/// What the dialog says goes, from the drafts and the last plan.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(super) struct Sending {
+    /// Drafts that go, replies included.
+    pub comments: usize,
+    /// Of them, on the whole file.
+    pub file: usize,
+    /// Of them, waiting for their lines to be on the host.
+    pub waits: usize,
+    /// Of them, refused by the host before.
+    pub refused: usize,
+    /// Local drafts in view, whether or not they go.
+    pub local: usize,
+    /// Threads resolved or reopened and not sent, once a plan said.
+    pub resolves: Option<usize>,
+    /// Comments in your pending review on the host, which a submitting
+    /// event sends.
+    pub pending: usize,
 }
 
-/// The prompt after a post that left drafts out and so didn't apply the
-/// event picked.
-pub(super) struct Held {
-    failed: usize,
-    unposted: Vec<Unposted>,
-    event: ReviewEvent,
-    /// The plugin's words for where that leaves the review.
-    message: Option<String>,
+/// How a post of `event` ended, in the words the status bar keeps:
+/// `review sent`, `review sent · 2 comments refused, kept as drafts`, the
+/// event's own words for one that leaves the review open, or `nothing
+/// posted`.
+fn outcome(event: &ReviewEvent, posted: usize, (refused, waits): (usize, usize)) -> String {
+    let mut text = if event.submits {
+        "review sent".to_owned()
+    } else if posted + refused + waits == 0 {
+        "nothing posted".to_owned()
+    } else {
+        event.done.clone()
+    };
+    if refused > 0 {
+        let _ = write!(
+            text,
+            " · {} refused, kept as drafts",
+            plural(refused, "comment")
+        );
+    }
+    if waits > 0 {
+        let wait = if waits == 1 { "waits" } else { "wait" };
+        let _ = write!(text, " · {} {wait} for a push", plural(waits, "draft"));
+    }
+    text
 }
 
 /// The reviews `list` gave, grouped, to open one: the reasons dffy knows
@@ -292,7 +335,7 @@ impl Picker {
     }
 }
 
-fn plural(n: usize, one: &str) -> String {
+pub(super) fn plural(n: usize, one: &str) -> String {
     if n == 1 {
         format!("{n} {one}")
     } else {
@@ -326,6 +369,7 @@ impl App {
         if !changed.is_empty() {
             self.placed_again(&changed);
         }
+        self.plan_soon();
         id
     }
 
@@ -373,6 +417,11 @@ impl App {
         self.message(said);
     }
 
+    /// Whether a post is running: it can't be stopped halfway.
+    pub(crate) fn posting_now(&self) -> bool {
+        self.job.as_ref().is_some_and(|r| r.job == Job::Post)
+    }
+
     /// The run of `job` on the review `label` names, with `args`, unless a
     /// post is still running: a post can't be stopped halfway, and
     /// anything else would stop it.
@@ -382,7 +431,7 @@ impl App {
         (job, label): (Job, String),
         args: Vec<String>,
     ) -> Option<Action> {
-        if self.job.as_ref().is_some_and(|r| r.job.posts()) {
+        if self.posting_now() {
             self.message("the review is still being posted; wait for it to finish");
             return None;
         }
@@ -390,9 +439,7 @@ impl App {
         self.job = Some(Running::new(id, job, label));
         let comments = match job {
             Job::Prepare => None,
-            Job::Pull | Job::Post | Job::ApplyEvent(_) => {
-                self.reviewing.as_ref().map(|p| p.session.comments.clone())
-            }
+            Job::Pull | Job::Post => self.reviewing.as_ref().map(|p| p.session.comments.clone()),
         };
         Some(Action::Plugin {
             id,
@@ -499,14 +546,16 @@ impl App {
         self.run(plugin, (Job::Pull, label), vec!["pull".to_owned(), id])
     }
 
-    /// `P`: the dialog that posts the review, and the dry run that says
-    /// what posting would do, beside whatever else runs.
+    /// `P`: the dialog that posts the review, with the summary kept from
+    /// before and the first event that submits, else the one last sent. It
+    /// asks for a plan beside whatever else runs, unless the last still
+    /// holds.
     pub(super) fn open_post(&mut self) -> Option<Action> {
         let Some(mode) = &self.reviewing else {
             self.say_not_on_review();
             return None;
         };
-        if let Some(running) = self.job.as_ref().filter(|r| r.job.posts()) {
+        if let Some(running) = self.job.as_ref().filter(|r| r.job == Job::Post) {
             let at = running
                 .progress
                 .as_deref()
@@ -515,67 +564,210 @@ impl App {
             self.message(format!("posting{at}…"));
             return None;
         }
-        let summary = TextBox::new(&mode.summary);
-        let (plugin, review, comments) = (
-            mode.plugin.clone(),
-            mode.session.id.clone(),
-            mode.session.comments.clone(),
-        );
         let events =
             (self.naming.as_ref()).map_or_else(review::default_events, |n| n.events.clone());
-        let id = self.next_run();
+        let last = mode.event.as_ref().map(|e| e.id.as_str());
+        let event = events
+            .iter()
+            .position(|e| e.submits)
+            .or_else(|| events.iter().position(|e| Some(e.id.as_str()) == last))
+            .unwrap_or(0);
+        let started = mode.started;
+        let (summary, local) = self.comments.as_ref().map_or((String::new(), true), |c| {
+            (
+                c.summary().unwrap_or_default().to_owned(),
+                c.local_drafts_before(started) == 0,
+            )
+        });
         self.posting = Some(Dialog {
             events,
-            event: 0,
-            summary,
+            event,
+            summary: TextBox::new(&summary),
             writing: false,
-            preflight: Preflight {
-                id,
-                done: false,
-                planned: None,
-                skipped: Vec::new(),
-                failed: None,
-            },
+            local,
         });
+        let plans = &self.reviewing.as_ref()?.plans;
+        if plans.running.is_none() && (plans.known.is_none() || plans.due.is_some()) {
+            return self.start_plan();
+        }
+        None
+    }
+
+    /// The drafts' plan, due soon: they changed.
+    pub(super) fn plan_soon(&mut self) {
+        if let Some(mode) = &mut self.reviewing {
+            mode.plans.due = Some(Instant::now() + PLAN_AFTER);
+        }
+    }
+
+    /// When the plan due should run, while it can: none runs, no post
+    /// does, and there are drafts to plan.
+    pub(super) fn plan_deadline(&self) -> Option<Instant> {
+        let plans = &self.reviewing.as_ref()?.plans;
+        let due = plans.due?;
+        let drafts = || self.comments.as_ref().is_some_and(|c| c.counts().1 > 0);
+        (plans.running.is_none() && !self.posting_now() && drafts()).then_some(due)
+    }
+
+    /// The plan, once it's due.
+    pub(super) fn due_plan(&mut self) -> Option<Action> {
+        let due = self.plan_deadline()?;
+        if Instant::now() < due {
+            return None;
+        }
+        self.start_plan()
+    }
+
+    /// `post --dry-run`, with the local review's drafts, which the plugin
+    /// plans after the review's own.
+    fn start_plan(&mut self) -> Option<Action> {
+        let id = self.run_id + 1;
+        let local = self
+            .comments
+            .as_ref()
+            .and_then(|c| c.sources().get(1).cloned());
+        let mode = self.reviewing.as_mut()?;
+        self.run_id = id;
+        mode.plans.due = None;
+        mode.plans.running = Some((id, Answer::default()));
+        let mut args = vec![
+            "post".to_owned(),
+            mode.session.id.clone(),
+            "--dry-run".to_owned(),
+        ];
+        if let Some(local) = local {
+            args.extend(["--drafts".to_owned(), local.display().to_string()]);
+        }
         Some(Action::Plugin {
             id,
-            plugin,
-            args: vec!["post".to_owned(), review, "--dry-run".to_owned()],
-            comments: Some(comments),
+            plugin: mode.plugin.clone(),
+            args,
+            comments: Some(mode.session.comments.clone()),
             summary: None,
         })
     }
 
-    fn preflighted(&mut self, said: Said) {
-        let Some(preflight) = self.posting.as_mut().map(|d| &mut d.preflight) else {
+    /// What the dry run says. A failed one says nothing, which the dialog
+    /// shows as not knowing; the last answer stays.
+    fn planned(&mut self, said: Said) {
+        let short = self.naming.as_ref().map_or("review", |n| n.short.as_str());
+        let waits = format!("not in the {short} yet");
+        let Some(mode) = &mut self.reviewing else {
+            return;
+        };
+        let Some((_, answer)) = &mut mode.plans.running else {
             return;
         };
         match said {
-            Said::Draft(draft) => preflight.skipped.extend(Unposted::of(draft)),
-            Said::Planned { line, file, skip } => preflight.planned = Some((line, file, skip)),
+            Said::Draft(draft) => {
+                answer.drafts.insert(draft.id, draft.plan);
+            }
+            Said::Planned {
+                pending, resolves, ..
+            } => {
+                answer.pending = pending;
+                answer.resolves = resolves;
+            }
             Said::Done(result) => {
-                preflight.done = true;
-                preflight.failed = result.err();
+                let answer = mode.plans.running.take().map(|(_, a)| a);
+                match result {
+                    Ok(()) => {
+                        mode.plans.known = answer;
+                        mode.plans.failed = None;
+                    }
+                    Err(e) => mode.plans.failed = Some(e),
+                }
+                let words =
+                    mode.plans
+                        .known
+                        .iter()
+                        .flat_map(|a| &a.drafts)
+                        .filter_map(|(id, plan)| {
+                            let word = match plan {
+                                Plan::Line => return None,
+                                Plan::File => (Role::Dim, "posts as file comment".to_owned()),
+                                Plan::Skip(_) => (Role::Warn, waits.clone()),
+                            };
+                            Some((id.clone(), word))
+                        });
+                let words = words.collect();
+                let changed = self
+                    .comments
+                    .as_mut()
+                    .map_or_else(Vec::new, |c| c.set_plans(words));
+                if !changed.is_empty() {
+                    self.placed_again(&changed);
+                }
             }
             _ => {}
         }
         self.dirty = true;
     }
 
+    /// What the dialog says goes: the drafts in view, the local ones only
+    /// with `local`, counted by what the last plan said of each.
+    pub(super) fn sending(&self, local: bool) -> Sending {
+        let Some(comments) = &self.comments else {
+            return Sending::default();
+        };
+        let known = self.reviewing.as_ref().and_then(|m| m.plans.known.as_ref());
+        let mut out = Sending {
+            pending: known.map_or_else(|| comments.host_pending(), |k| k.pending),
+            resolves: known.map(|k| k.resolves),
+            ..Sending::default()
+        };
+        for (id, from_local, refused) in comments.drafts() {
+            out.local += usize::from(from_local);
+            if from_local && !local {
+                continue;
+            }
+            out.comments += 1;
+            out.refused += usize::from(refused);
+            match known.and_then(|k| k.drafts.get(id)) {
+                Some(Plan::File) => out.file += 1,
+                Some(Plan::Skip(_)) => out.waits += 1,
+                Some(Plan::Line) | None => {}
+            }
+        }
+        out
+    }
+
+    /// The drafts that won't go as they are, with why: those the plan
+    /// skips, and those the host refused before.
+    fn wont_go(&self, local: bool) -> Vec<(String, String)> {
+        let (Some(comments), Some(mode)) = (&self.comments, &self.reviewing) else {
+            return Vec::new();
+        };
+        let known = mode.plans.known.as_ref();
+        comments
+            .drafts()
+            .into_iter()
+            .filter(|&(_, from_local, _)| local || !from_local)
+            .filter_map(|(id, _, refused)| {
+                let why = match known.and_then(|k| k.drafts.get(id)) {
+                    Some(Plan::Skip(why)) => why.clone(),
+                    _ if refused => "refused before".to_owned(),
+                    _ => return None,
+                };
+                Some((id.to_owned(), why))
+            })
+            .collect()
+    }
+
     /// Focuses the thread of the first of `drafts` still in the file, and
-    /// says why it wasn't posted; `m`/`M` go on from there.
-    fn go_to_unposted(&mut self, drafts: &[Unposted]) {
+    /// says why it won't go; `m`/`M` go on from there.
+    fn go_to_unposted(&mut self, drafts: &[(String, String)]) {
         let Some(comments) = &self.comments else {
             return;
         };
-        let Some((draft, root)) = drafts
+        let Some(((_, why), root)) = drafts
             .iter()
-            .find_map(|d| Some((d, comments.thread_root(&d.id)?)))
+            .find_map(|d| Some((d, comments.thread_root(&d.0)?)))
         else {
             self.message("the drafts left out aren't in the file any more");
             return;
         };
-        let mut note = format!("not posted: {}", escape(draft.why.as_bytes()));
+        let mut note = format!("not posted: {}", escape(why.as_bytes()));
         if drafts.len() > 1 {
             let _ = write!(
                 note,
@@ -681,11 +873,14 @@ impl App {
         Some(revisions)
     }
 
-    /// The head of your last review, while "Since last review" shows from
-    /// it.
-    pub(crate) fn reviewed_from(&self) -> Option<&str> {
+    /// The head of your last review and the head, while "Since last review"
+    /// shows from it.
+    pub(crate) fn reviewed_from(&self) -> Option<(&str, &str)> {
         let mode = self.reviewing.as_ref().filter(|p| p.since_last)?;
-        mode.session.last_reviewed_head.as_deref()
+        Some((
+            mode.session.last_reviewed_head.as_deref()?,
+            &mode.session.head,
+        ))
     }
 
     /// The head of your last review isn't in the clone, so the range from
@@ -702,23 +897,40 @@ impl App {
         self.review_range()
     }
 
+    /// The review was rebased since your last review: the range from it
+    /// takes in what the base gained too, which the note says.
+    pub(crate) fn reviewed_head_rebased(&mut self) {
+        let Some((last, head)) = self.reviewed_from() else {
+            return;
+        };
+        let note = format!(
+            "rebased since your last review; showing {}..{}, the base's changes since included",
+            short(last),
+            short(head)
+        );
+        self.message(note);
+    }
+
     pub(super) fn since_review(&self) -> bool {
         self.reviewing.as_ref().is_some_and(|p| p.since_last)
     }
 
     /// The check, when it's due: none while the review's head is being
-    /// fetched.
+    /// fetched, nor while no key came for a while.
     pub(super) fn due_check(&mut self) -> Option<Action> {
         let busy = matches!(
             self.job.as_ref().map(|r| r.job),
             Some(Job::Pull | Job::Prepare)
         );
+        let idle = self.last_input.elapsed() >= IDLE_AFTER;
         let id = self.run_id + 1;
         let mode = self.reviewing.as_mut()?;
         if mode.check.is_some() || Instant::now() < mode.next_check {
             return None;
         }
-        if busy {
+        // Past the idle mark the next check is beyond it, which wakes
+        // nothing; a key brings it forward (see `App::resume_checks`).
+        if busy || idle {
             mode.next_check = Instant::now() + CHECK_EVERY;
             return None;
         }
@@ -733,27 +945,20 @@ impl App {
         })
     }
 
-    /// When the next check is due, while none runs.
-    pub(super) fn check_deadline(&self) -> Option<Instant> {
-        self.reviewing
-            .as_ref()
-            .filter(|p| p.check.is_none())
-            .map(|p| p.next_check)
+    /// A key after a while without one: the check is due now.
+    pub(super) fn resume_checks(&mut self) {
+        if let Some(mode) = &mut self.reviewing {
+            mode.next_check = mode.next_check.min(Instant::now());
+        }
     }
 
-    /// `x` on a thread in review mode, for the post dialog's count.
-    pub(super) fn note_resolve(&mut self, root: &str, was: bool) {
-        if let Some(mode) = &mut self.reviewing {
-            match mode.resolves.get(root) {
-                Some(&before) if before != was => {
-                    mode.resolves.remove(root);
-                }
-                Some(_) => {}
-                None => {
-                    mode.resolves.insert(root.to_owned(), was);
-                }
-            }
-        }
+    /// When the next check is due, while none runs and keys come.
+    pub(super) fn check_deadline(&self) -> Option<Instant> {
+        let idle_at = self.last_input + IDLE_AFTER;
+        self.reviewing
+            .as_ref()
+            .filter(|p| p.check.is_none() && p.next_check < idle_at)
+            .map(|p| p.next_check)
     }
 
     /// Runs no longer wanted are ignored.
@@ -769,8 +974,11 @@ impl App {
         if self.detecting == Some(id) {
             return self.detected(said);
         }
-        if self.posting.as_ref().is_some_and(|d| d.preflight.id == id) {
-            self.preflighted(said);
+        if (self.reviewing.as_ref())
+            .and_then(|p| p.plans.running.as_ref())
+            .is_some_and(|(run, _)| *run == id)
+        {
+            self.planned(said);
             return None;
         }
         let running = self.job.as_mut().filter(|r| r.id == id)?;
@@ -779,27 +987,31 @@ impl App {
         match said {
             Said::Progress(progress) => running.progress = Some(progress),
             Said::Session(session) => return self.prepared(job, local, session),
-            Said::Draft(draft) => running.unposted.extend(Unposted::of(draft)),
+            Said::Draft(draft) => {
+                if let Plan::Skip(why) = draft.plan {
+                    running.unposted.push((draft.id, why));
+                }
+            }
             Said::Posted {
                 posted,
                 failed,
-                held,
-                held_message,
                 url,
+                ..
             } => {
-                running.posted = Some((posted, failed, held));
-                running.held_message = held_message;
+                running.posted = Some((posted, failed));
                 self.link = url.filter(|u| is_web(u));
+            }
+            Said::Head { head, moved, .. } => {
+                if let Some(mode) = &mut self.reviewing {
+                    mode.moved = (moved && head != mode.session.head).then_some(head);
+                }
             }
             Said::Done(result) => {
                 let running = self.job.take()?;
+                self.plan_soon();
                 match (job, result) {
-                    (Job::Post | Job::ApplyEvent(_), Ok(())) => {
-                        if let Job::ApplyEvent(failed) = job {
-                            self.applied(failed);
-                        } else {
-                            self.posted(running);
-                        }
+                    (Job::Post, Ok(())) => {
+                        self.posted(&running);
                         // The plugin's notice, read as the run ended, says
                         // more than the outcome, which the status bar keeps.
                         if let Some(notice) = self.comments.as_ref().and_then(Comments::notice) {
@@ -820,7 +1032,7 @@ impl App {
                             })
                         });
                     }
-                    (_, Ok(())) => {}
+                    (Job::Prepare | Job::Pull, Ok(())) => self.imported(&running),
                     (job, Err(e)) => {
                         let e = escape(e.as_bytes());
                         let label = &running.label;
@@ -828,130 +1040,113 @@ impl App {
                             Job::Prepare => format!("{label}: {e}"),
                             Job::Pull => format!("updating {label} failed: {e}"),
                             Job::Post => format!("posting failed: {e}"),
-                            Job::ApplyEvent(_) => format!("sending the review failed: {e}"),
                         });
                     }
                 }
             }
-            Said::Listed(_) | Said::Head { .. } | Said::Detected(_) | Said::Planned { .. } => {}
+            Said::Listed(_) | Said::Detected(_) | Said::Planned { .. } => {}
         }
         None
     }
 
-    /// A post that finished: what it did goes in the status bar, unless the
-    /// host refused drafts and so the submitting event picked was held
-    /// back, which asks first. Drafts the dialog showed couldn't be posted
-    /// don't hold the event back.
-    fn posted(&mut self, running: Running) {
+    /// Before a `prepare`'s or `pull`'s word is read: the threads the
+    /// comments file has, to tell the ones it brings. Nothing to tell them
+    /// from on the first word of a `prepare` of a review whose file isn't
+    /// shown yet, as when it was just picked or opened for the first time.
+    pub(super) fn before_import(&mut self, id: u64) {
+        let shown = self
+            .comments
+            .as_ref()
+            .filter(|c| {
+                self.reviewing
+                    .as_ref()
+                    .is_some_and(|p| c.sources().first() == Some(&p.session.comments))
+            })
+            .map(Comments::posted_roots);
+        let Some(running) = self
+            .job
+            .as_mut()
+            .filter(|r| r.id == id && r.job != Job::Post && !r.looked)
+        else {
+            return;
+        };
+        running.looked = true;
+        running.before = shown.filter(|roots| !roots.is_empty());
+    }
+
+    /// A `prepare` or `pull` finished: the threads it brought, which `m`
+    /// goes to first, or that the review is as it was.
+    fn imported(&mut self, running: &Running) {
+        if let Some(mode) = &mut self.reviewing {
+            mode.comments_moved = false;
+        }
+        let new: HashSet<String> = match (&running.before, &self.comments) {
+            (Some(before), Some(comments)) => comments
+                .posted_roots()
+                .into_iter()
+                .filter(|(reference, _)| !before.contains_key(reference))
+                .map(|(_, id)| id)
+                .collect(),
+            _ => HashSet::new(),
+        };
+        if let Some(comments) = self.comments.as_ref().filter(|_| !new.is_empty()) {
+            self.new_threads = comments.in_order(&new);
+            let next = self
+                .key_for(false, crate::keys::Action::NextThread)
+                .unwrap_or_default();
+            let note = format!(
+                "{} · {next} goes to them",
+                plural(self.new_threads.len(), "new comment")
+            );
+            self.message(note);
+        } else if running.same {
+            self.message(format!("{} is up to date", running.label));
+        }
+    }
+
+    /// A post that finished: what it did goes in the status bar. Drafts it
+    /// left out stay drafts; one the host refused says why in its heading.
+    fn posted(&mut self, running: &Running) {
+        let refused = self.comments.as_ref().map_or(0, |c| {
+            running
+                .unposted
+                .iter()
+                .filter(|(id, _)| c.refused(id))
+                .count()
+        });
         let Some(mode) = &mut self.reviewing else {
             return;
         };
         let Some(event) = mode.event.clone() else {
             return;
         };
-        let (posted, failed, held) = running.posted.unwrap_or_default();
+        let (posted, failed) = running.posted.unwrap_or_default();
         // As the plugin records it: an event that leaves the review open,
         // with nothing in it, reviewed nothing.
-        if posted > 0 || (event.submits && !held) {
+        if posted > 0 || event.submits {
             mode.session.last_reviewed_head = Some(mode.session.head.clone());
         }
-        mode.resolves.clear();
-        let message =
-            held.then(|| (running.held_message).unwrap_or_else(|| "review not sent".to_owned()));
-        let text = outcome(&event, (posted, failed), message.as_deref());
-        if event.submits && held && failed > 0 {
-            mode.outcome = Some(text);
-            self.held = Some(Held {
-                failed,
-                unposted: running.unposted,
-                event,
-                message,
-            });
-            self.message = None;
-            return;
-        }
-        mode.summary.clear();
+        let text = outcome(&event, posted, (refused, failed.saturating_sub(refused)));
         mode.outcome = Some(text.clone());
+        // The summary went with the event.
+        if event.submits
+            && let Some(comments) = &mut self.comments
+        {
+            match comments.keep_summary("") {
+                Ok(changed) => self.placed_again(&changed),
+                Err(e) => {
+                    self.message(format!("comments: {e}"));
+                    return;
+                }
+            }
+        }
         // The link goes in the note only: it would crowd the status bar
-        // out of room for the review's part.
+        // out of room for the review's part, which a long outcome may not
+        // fit in either.
         match self.link.as_deref().filter(|_| failed == 0) {
             Some(url) => self.message(format!("{text} · {url}")),
-            None => self.message = None,
+            None => self.message(text),
         }
-    }
-
-    /// `post --apply-event` finished: the event went without the drafts
-    /// left out.
-    fn applied(&mut self, failed: usize) {
-        let Some(mode) = &mut self.reviewing else {
-            return;
-        };
-        mode.session.last_reviewed_head = Some(mode.session.head.clone());
-        mode.summary.clear();
-        if let Some(event) = &mode.event {
-            mode.outcome = Some(outcome(event, (0, failed), None));
-        }
-        self.message = None;
-    }
-
-    /// Another overlay or a text input takes the keys. The prompt after a
-    /// post, which opens without a key, waits until it's closed, so an `s`
-    /// typed there isn't taken for submitting.
-    pub(super) fn keys_elsewhere(&self) -> bool {
-        self.commands.is_some()
-            || self.help.is_some()
-            || self.panel.is_some()
-            || self.picker.is_some()
-            || self.tree.editing
-            || self.search.as_ref().is_some_and(|s| s.editing)
-    }
-
-    /// Input while the prompt after a post that left drafts out is open.
-    fn held_input(&mut self, input: &Input) -> Option<Action> {
-        let &Input::Key(key, mods) = input else {
-            return None;
-        };
-        if key == Key::Char('c') && mods.contains(Mods::CTRL) {
-            return Some(Action::Quit);
-        }
-        let held = self.held.as_ref()?;
-        let (failed, event) = (held.failed, held.event.id.clone());
-        match key {
-            Key::Char('s') => {
-                self.held = None;
-                let current = self.reviewing.as_ref()?;
-                let (plugin, id, label, summary) = (
-                    current.plugin.clone(),
-                    current.session.id.clone(),
-                    current.label.clone(),
-                    current.summary.clone(),
-                );
-                self.message("sending the review without them…");
-                let mut action = self.run(
-                    plugin,
-                    (Job::ApplyEvent(failed), label),
-                    vec![
-                        "post".to_owned(),
-                        id,
-                        "--apply-event".to_owned(),
-                        "--event".to_owned(),
-                        event,
-                    ],
-                );
-                if let Some(Action::Plugin { summary: s, .. }) = &mut action {
-                    *s = (!summary.is_empty()).then_some(summary);
-                }
-                return action;
-            }
-            Key::Char('f') => {
-                if let Some(held) = self.held.take() {
-                    self.go_to_unposted(&held.unposted);
-                }
-            }
-            Key::Char('k') | Key::Esc => self.held = None,
-            _ => {}
-        }
-        None
     }
 
     fn listed(&mut self, said: Said) {
@@ -989,6 +1184,7 @@ impl App {
                 // The retarget takes the session's comments file, read as
                 // a session's from here on.
                 self.reviewing = Some(mode);
+                self.plan_soon();
                 let on = if local { " · this branch's" } else { "" };
                 self.message(format!("{label}{on} · {}", escape(title.as_bytes())));
                 if local {
@@ -1009,14 +1205,17 @@ impl App {
                 let s = &mode.session;
                 let comments = (s.comments != old.comments).then(|| s.comments.clone());
                 if (&s.base, &s.head) == (&old.base, &old.head) && comments.is_none() {
-                    self.message(format!("{label} is up to date"));
+                    // Said once its threads are in.
+                    if let Some(running) = &mut self.job {
+                        running.same = true;
+                    }
                     return None;
                 }
                 let moved = (s.head != old.head).then(|| (old.head.clone(), s.head.clone()));
                 self.message(format!("{label} updated"));
                 self.retarget(comments, moved)
             }
-            Job::Post | Job::ApplyEvent(_) => None,
+            Job::Post => None,
         }
     }
 
@@ -1035,28 +1234,42 @@ impl App {
             return;
         };
         match said {
-            Said::Head { head, moved } => {
+            Said::Head {
+                head,
+                moved,
+                comments_moved,
+            } => {
                 mode.moved = (moved && head != mode.session.head).then_some(head);
+                mode.comments_moved = comments_moved;
                 self.dirty = true;
             }
             Said::Done(result) => {
                 mode.check = None;
                 mode.next_check = Instant::now() + CHECK_EVERY;
-                if let Err(e) = result {
-                    let e = escape(e.as_bytes());
-                    let note = format!("checking {} failed: {e}", mode.label);
-                    self.message(note);
+                match result {
+                    Ok(()) => mode.check_failed = None,
+                    Err(e) if mode.check_failed.as_ref() != Some(&e) => {
+                        let note =
+                            format!("checking {} failed: {}", mode.label, escape(e.as_bytes()));
+                        mode.check_failed = Some(e);
+                        self.message(note);
+                    }
+                    Err(_) => {}
                 }
             }
             _ => {}
         }
     }
 
-    /// The review's part of the status bar: `PR #7`, what's running, and
-    /// whether the head moved.
+    /// The review's part of the status bar: `PR #7`, its state when it's
+    /// over, what's running, whether the head moved or new comments came,
+    /// and what waits on the host.
     pub(super) fn review_part(&self) -> Option<String> {
         let mode = self.reviewing.as_ref()?;
         let mut text = mode.label.clone();
+        if let Some(state) = mode.ended() {
+            let _ = write!(text, " · {}", state.word());
+        }
         if let Some(running) = &self.job {
             let _ = write!(text, " · {}", running.job.doing());
             if let Some(progress) = &running.progress {
@@ -1064,9 +1277,15 @@ impl App {
             }
         } else if mode.moved.is_some() {
             text.push_str(" updated · new commits · p to update");
+        } else if mode.comments_moved {
+            text.push_str(" · new comments · p to update");
         }
         if let Some(outcome) = &mode.outcome {
             let _ = write!(text, " · {outcome}");
+        }
+        let pending = self.comments.as_ref().map_or(0, Comments::host_pending);
+        if pending > 0 && self.job.is_none() {
+            let _ = write!(text, " · {pending} pending · P submits");
         }
         if self.link.is_some() {
             text.push_str(" · o opens it");
@@ -1074,28 +1293,14 @@ impl App {
         Some(text)
     }
 
-    /// The review's part of the program status: the prompt after a post
-    /// waits on the user, and a plugin run is work going on.
+    /// The review's part of the program status: a plugin run is work going
+    /// on.
     pub(super) fn review_status(&self) -> Option<term::Status> {
-        if let Some(held) = &self.held {
-            let n = held.failed;
-            let were = if n == 1 { "wasn't" } else { "weren't" };
-            return Some(term::Status {
-                state: term::State::Blocked,
-                message: Some(format!(
-                    "{} {were} posted · {} without them?",
-                    plural(n, "comment"),
-                    held.event.label
-                )),
-                ..term::Status::default()
-            });
-        }
         let running = self.job.as_ref()?;
         let doing = match running.job {
             Job::Prepare => "Fetching threads",
             Job::Pull => "Fetching updates",
             Job::Post => "Posting review",
-            Job::ApplyEvent(_) => "Sending review",
         };
         // Plugins count progress as done of all: `100/312`.
         let progress = running.progress.as_deref().and_then(|p| {
@@ -1110,14 +1315,38 @@ impl App {
         })
     }
 
+    /// What the first quit while a post runs says, with how far it got;
+    /// `None` while none does.
+    pub(super) fn still_posting(&self) -> Option<String> {
+        let running = self.job.as_ref().filter(|r| r.job == Job::Post)?;
+        let at = running
+            .progress
+            .as_deref()
+            .map(|p| format!(" {}", escape(p.as_bytes())))
+            .unwrap_or_default();
+        Some(format!("still posting{at} · q again stops it"))
+    }
+
+    /// What's left to say once the viewer is gone: drafts in a review
+    /// session that weren't posted, `PR #7: 3 drafts not posted`.
+    pub(crate) fn unposted_note(&self) -> Option<String> {
+        let mode = self.reviewing.as_ref()?;
+        let drafts = self.comments.as_ref()?.drafts().len();
+        (drafts > 0).then(|| format!("{}: {} not posted", mode.label, plural(drafts, "draft")))
+    }
+
+    /// The review session the session pointer names: its comments file,
+    /// the review's id and its head.
+    pub(crate) fn session_pointer(&self) -> Option<(PathBuf, String, String)> {
+        let s = &self.reviewing.as_ref()?.session;
+        Some((s.comments.clone(), s.id.clone(), s.head.clone()))
+    }
+
     /// Input that review mode's overlays take, or `o` while a posted review's
     /// note shows; `Continue` when it's for the rest of the viewer.
     pub(super) fn review_input(&mut self, input: &Input) -> ControlFlow<Option<Action>> {
         if self.posting.is_some() {
             return ControlFlow::Break(self.post_input(input));
-        }
-        if self.held.is_some() && !self.keys_elsewhere() {
-            return ControlFlow::Break(self.held_input(input));
         }
         if self.reviews.is_some() {
             return ControlFlow::Break(self.review_picker_input(input));
@@ -1134,6 +1363,22 @@ impl App {
         }
     }
 
+    /// Closes the dialog, keeping its summary in the comments file for
+    /// the next time.
+    fn close_post(&mut self) -> Option<Dialog> {
+        let dialog = self.posting.take()?;
+        let kept = self
+            .comments
+            .as_mut()
+            .map(|c| c.keep_summary(dialog.summary.text()));
+        match kept {
+            Some(Ok(changed)) => self.placed_again(&changed),
+            Some(Err(e)) => self.message(format!("the summary isn't kept: {e}")),
+            None => {}
+        }
+        Some(dialog)
+    }
+
     fn post_input(&mut self, input: &Input) -> Option<Action> {
         let dialog = self.posting.as_mut()?;
         let (key, mods) = match input {
@@ -1146,6 +1391,7 @@ impl App {
             _ => return None,
         };
         if key == Key::Char('c') && mods.contains(Mods::CTRL) {
+            self.close_post();
             return Some(Action::Quit);
         }
         if dialog.writing {
@@ -1158,33 +1404,38 @@ impl App {
         }
         match key {
             Key::Esc => {
-                if let (Some(mode), Some(dialog)) = (&mut self.reviewing, self.posting.take()) {
-                    dialog.summary.text().clone_into(&mut mode.summary);
-                }
+                self.close_post();
             }
             Key::Tab | Key::Char('s') => dialog.writing = true,
             Key::Up | Key::Char('k') => dialog.event = dialog.event.saturating_sub(1),
             Key::Down | Key::Char('j') => {
                 dialog.event = (dialog.event + 1).min(dialog.events.len() - 1);
             }
+            Key::Char('l') => {
+                dialog.local = !dialog.local;
+                let local = dialog.local;
+                if self.sending(true).local == 0 {
+                    self.message("no local drafts on this diff");
+                } else {
+                    self.message(if local {
+                        "the local drafts go with the review"
+                    } else {
+                        "the local drafts stay local"
+                    });
+                }
+            }
             Key::Char(c) if dialog.events.iter().any(|e| e.key == c) => {
                 dialog.event = dialog.events.iter().position(|e| e.key == c).unwrap_or(0);
             }
-            Key::Char('v') if dialog.preflight.skipped.is_empty() => {
-                let p = &dialog.preflight;
-                let note = match p.planned {
-                    Some(_) => "every draft can be posted",
-                    None if p.done => "couldn't check what can be posted",
-                    None => "still checking what can be posted",
-                };
-                self.message(note);
-            }
             Key::Char('v') => {
-                let skipped = std::mem::take(&mut dialog.preflight.skipped);
-                if let (Some(mode), Some(dialog)) = (&mut self.reviewing, self.posting.take()) {
-                    dialog.summary.text().clone_into(&mut mode.summary);
+                let local = dialog.local;
+                let left = self.wont_go(local);
+                if left.is_empty() {
+                    self.message("every draft can be posted");
+                } else {
+                    self.close_post();
+                    self.go_to_unposted(&left);
                 }
-                self.go_to_unposted(&skipped);
             }
             Key::Enter => return self.send_review(),
             _ => {}
@@ -1193,11 +1444,13 @@ impl App {
     }
 
     /// Posts the review as the dialog has it, once the local drafts in view
-    /// are in the review's comments file, where `post` reads them. When
-    /// they can't be moved, nothing is posted and the dialog stays.
+    /// are in the review's comments file, where `post` reads them, when
+    /// they go. When they can't be moved, nothing is posted and the dialog
+    /// stays.
     fn send_review(&mut self) -> Option<Action> {
+        let local = self.posting.as_ref()?.local;
         let moved = (self.comments.as_mut())
-            .filter(|c| c.local_drafts() > 0)
+            .filter(|c| local && c.local_drafts() > 0)
             .map(Comments::move_local);
         match moved {
             Some(Ok(changed)) => self.placed_again(&changed),
@@ -1211,10 +1464,9 @@ impl App {
             }
             None => {}
         }
-        let mut dialog = self.posting.take()?;
-        let mode = self.reviewing.as_mut()?;
+        let mut dialog = self.close_post()?;
         let summary = dialog.summary.text().trim_end().to_owned();
-        mode.summary.clone_from(&summary);
+        let mode = self.reviewing.as_mut()?;
         let (plugin, id, label) = (
             mode.plugin.clone(),
             mode.session.id.clone(),
@@ -1235,70 +1487,24 @@ impl App {
         }
         action
     }
-
-    /// What `P` would send: new comments, replies and resolve changes, and
-    /// how many of the comments and replies are local drafts.
-    pub(super) fn unsent(&self) -> Unsent {
-        let (comments, replies) = self.comments.as_ref().map_or((0, 0), Comments::unsent);
-        Unsent {
-            comments,
-            replies,
-            resolves: self.reviewing.as_ref().map_or(0, |p| p.resolves.len()),
-            local: self.comments.as_ref().map_or(0, Comments::local_drafts),
-        }
-    }
 }
 
-/// What `P` would send (see [`App::unsent`]).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) struct Unsent {
-    pub comments: usize,
-    pub replies: usize,
-    pub resolves: usize,
-    /// Comments and replies among them from the local review's file, which
-    /// the plugin's dry run doesn't see: they move to the review's file only
-    /// as the review is sent.
-    pub local: usize,
-}
-
-impl Preflight {
-    /// What goes: the plugin's count of drafts once its dry run is in, in
-    /// which replies are comments, plus the local drafts it doesn't see;
-    /// else dffy's own count.
-    fn what(&self, unsent: Unsent) -> String {
-        let Unsent {
-            comments,
-            replies,
-            resolves,
-            local,
-        } = unsent;
+impl Sending {
+    /// What goes: the drafts, the threads resolved or reopened, and what
+    /// waits on the host, `label` naming the review.
+    fn what(&self, label: &str) -> String {
         let mut parts = Vec::new();
-        let of_which = |parts: &mut Vec<String>| {
-            if local > 0
-                && let Some(last) = parts.last_mut()
-            {
-                let _ = write!(last, " ({local} local)");
-            }
-        };
-        if let Some((line, file, skip)) = self.planned {
-            if line + file + skip + local > 0 {
-                parts.push(plural(line + file + skip + local, "comment"));
-            }
-            of_which(&mut parts);
-            if file > 0 {
-                parts.push(format!("{file} as a file comment"));
-            }
-        } else {
-            if comments > 0 {
-                parts.push(plural(comments, "comment"));
-            }
-            if replies > 0 {
-                parts.push(plural(replies, "reply").replace("replys", "replies"));
-            }
-            of_which(&mut parts);
+        if self.comments > 0 {
+            parts.push(plural(self.comments, "comment"));
         }
-        if resolves > 0 {
+        if self.file > 0 {
+            parts.push(format!("{} as a file comment", self.file));
+        }
+        if let Some(resolves) = self.resolves.filter(|&r| r > 0) {
             parts.push(plural(resolves, "resolve change"));
+        }
+        if self.pending > 0 {
+            parts.push(format!("{} pending on {label}", self.pending));
         }
         if parts.is_empty() {
             "no comments to send".to_owned()
@@ -1307,37 +1513,29 @@ impl Preflight {
         }
     }
 
-    /// The line under it: the drafts that can't be posted, which sending
-    /// leaves as drafts, or how the check goes. The first is a warning.
-    fn note(&self) -> Option<(String, bool)> {
-        match (self.planned, &self.failed) {
-            (Some((.., skip)), _) => (skip > 0).then(|| {
-                let stay = if skip == 1 {
-                    "stays a draft"
-                } else {
-                    "stay drafts"
-                };
-                (
-                    format!("{skip} can't be posted and {stay} · v goes to them"),
-                    true,
-                )
-            }),
-            (None, Some(e)) => Some((
-                format!(
-                    "couldn't check what can be posted: {}",
-                    escape(e.as_bytes())
-                ),
-                false,
-            )),
-            (None, None) => {
-                (!self.done).then(|| ("checking what can be posted…".to_owned(), false))
-            }
+    /// The one warning: drafts that won't go up as they are.
+    fn warning(&self) -> Option<String> {
+        let mut parts = Vec::new();
+        if self.waits > 0 {
+            let wait = if self.waits == 1 { "waits" } else { "wait" };
+            parts.push(format!("{} {wait} for a push", plural(self.waits, "draft")));
         }
+        if self.refused > 0 {
+            parts.push(format!("{} refused before", self.refused));
+        }
+        (!parts.is_empty()).then(|| format!("{} · v goes to them", parts.join(" · ")))
     }
 }
 
 impl Dialog {
-    pub(super) fn draw(&mut self, grid: &mut Grid, theme: &Theme, mode: &Mode, unsent: Unsent) {
+    /// `checked` says where the plan the counts come from stands.
+    pub(super) fn draw(
+        &mut self,
+        grid: &mut Grid,
+        theme: &Theme,
+        mode: &Mode,
+        (sending, checked): (Sending, Checked),
+    ) {
         let (gw, gh) = (grid.width(), grid.height());
         if gw < 20 || gh < 8 {
             return;
@@ -1347,23 +1545,8 @@ impl Dialog {
         } else {
             64.min(gw - 4)
         };
-        let mut lines: Vec<(String, Style)> = Vec::new();
         let dim = theme.style(Role::Dim);
-        lines.push((self.preflight.what(unsent), Style::PLAIN));
-        lines.extend(
-            self.preflight
-                .note()
-                .map(|(text, warn)| (text, if warn { theme.style(Role::Warn) } else { dim })),
-        );
-        if mode.moved.is_some() {
-            lines.push((
-                format!(
-                    "! {} has new commits; this review goes on the head shown",
-                    mode.label
-                ),
-                theme.style(Role::Warn),
-            ));
-        }
+        let mut lines = self.heading(theme, mode, (sending, checked));
         lines.push((String::new(), Style::PLAIN));
         let first_event = lines.len();
         for (i, event) in self.events.iter().enumerate() {
@@ -1394,7 +1577,7 @@ impl Dialog {
         };
         let height = (lines.len() + shown + 4).min(gh);
         let (x0, y0) = ((gw - width) / 2, (gh - height) / 2);
-        let title = format!(" post review · {} ", mode.label);
+        let title = format!(" finish your review · {} ", mode.label);
         help::frame(grid, (x0, y0, width, height), &title, theme);
         let (x, right) = (x0 + 2, x0 + width - 2);
         for (i, (text, style)) in lines.iter().enumerate() {
@@ -1427,78 +1610,76 @@ impl Dialog {
         }
         grid.put_str(x, y0 + height - 2, right, footer, dim);
     }
-}
 
-impl Held {
-    pub(super) fn draw(&self, grid: &mut Grid, theme: &Theme, mode: &Mode) {
-        let (gw, gh) = (grid.width(), grid.height());
-        if gw < 20 || gh < 8 {
-            return;
-        }
-        let width = if gw < help::FULL_SCREEN_BELOW {
-            gw
-        } else {
-            64.min(gw - 4)
-        };
-        let dim = theme.style(Role::Dim);
-        let n = self.failed;
-        let were = if n == 1 { "wasn't" } else { "weren't" };
-        let mut lines = vec![(
-            format!("{} {were} posted:", plural(n, "comment")),
-            Style::PLAIN,
-        )];
-        // Room for the rest of the prompt on a phone's screen.
-        let room = gh.saturating_sub(12).max(1);
-        for draft in self.unposted.iter().take(room) {
-            // The reason first: a deep path would push it off the line.
-            let name = draft.path.rsplit('/').next().unwrap_or_default();
-            lines.push((
+    /// The lines over the events: what goes, the one warning about what
+    /// won't, the review's state, and the local drafts' toggle.
+    fn heading(
+        &self,
+        theme: &Theme,
+        mode: &Mode,
+        (sending, checked): (Sending, Checked),
+    ) -> Vec<(String, Style)> {
+        let (dim, warn) = (theme.style(Role::Dim), theme.style(Role::Warn));
+        let mut lines = vec![(sending.what(&mode.label), Style::PLAIN)];
+        match (sending.warning(), checked) {
+            (Some(warning), _) => lines.push((format!("! {warning}"), warn)),
+            (None, Checked::Failed(e)) => lines.push((
                 format!(
-                    "· {} · {}",
-                    escape(draft.why.as_bytes()),
-                    escape(name.as_bytes())
+                    "couldn't check what can be posted: {}",
+                    escape(e.as_bytes())
                 ),
                 dim,
+            )),
+            (None, Checked::Checking) if sending.comments > 0 => {
+                lines.push(("checking what can be posted…".to_owned(), dim));
+            }
+            (None, _) => {}
+        }
+        if mode.moved.is_some() {
+            lines.push((
+                format!(
+                    "! {} has new commits; this review goes on the head shown",
+                    mode.label
+                ),
+                warn,
             ));
         }
-        if self.unposted.len() > room {
-            lines.push((format!("· {} more", self.unposted.len() - room), dim));
+        if let Some(state) = mode.ended() {
+            lines.push((format!("! {} is {}", mode.label, state.word()), warn));
         }
-        let label = &self.event.label;
-        lines.push((String::new(), Style::PLAIN));
-        lines.push((
-            format!("so “{label}” wasn't applied"),
-            theme.style(Role::Warn),
-        ));
-        if let Some(message) = &self.message {
-            lines.push((escape(message.as_bytes()), dim));
-        }
-        lines.extend([
-            (String::new(), Style::PLAIN),
-            (format!("s  {label} without them"), Style::PLAIN),
-            (
-                "f  fix them: go to the first, the review stays as it is".to_owned(),
+        if sending.local > 0 {
+            let mark = if self.local { "[x]" } else { "[ ]" };
+            lines.push((
+                format!(
+                    "l  {mark} with the {} on this diff",
+                    plural(sending.local, "local draft")
+                ),
                 Style::PLAIN,
-            ),
-            ("k  leave the review as it is".to_owned(), Style::PLAIN),
-        ]);
-        let height = (lines.len() + 4).min(gh);
-        let (x0, y0) = ((gw - width) / 2, (gh - height) / 2);
-        let title = format!(" review not sent · {} ", mode.label);
-        help::frame(grid, (x0, y0, width, height), &title, theme);
-        let (x, right) = (x0 + 2, x0 + width - 2);
-        for (i, (text, style)) in lines.iter().enumerate() {
-            let y = y0 + 1 + i;
-            if y + 2 >= y0 + height {
-                break;
-            }
-            grid.put_str(x, y, right, text, *style);
+            ));
         }
-        grid.put_str(x, y0 + height - 2, right, "s, f or k · esc leaves it", dim);
+        lines
+    }
+
+    /// Whether the local drafts in view go with the review.
+    pub(super) fn with_local(&self) -> bool {
+        self.local
     }
 }
 
 impl App {
+    /// Where the plan the dialog counts by stands.
+    pub(super) fn plan_checked(&self) -> Checked {
+        let Some(plans) = self.reviewing.as_ref().map(|m| &m.plans) else {
+            return Checked::Checking;
+        };
+        let waiting = plans.running.is_some() || plans.due.is_some();
+        match &plans.failed {
+            Some(e) if !waiting => Checked::Failed(e.clone()),
+            None if !waiting && plans.known.is_some() => Checked::Yes,
+            _ => Checked::Checking,
+        }
+    }
+
     fn review_picker_input(&mut self, input: &Input) -> Option<Action> {
         let picker = self.reviews.as_mut()?;
         let last = picker.reviews.len() - 1;
@@ -1616,8 +1797,12 @@ impl Picker {
                 &format!("{:<w$}", self.tags[i], w = self.tag_width),
                 mark(theme.style(Role::Hint)),
             );
+            let drafts = match listed.drafts {
+                0 => String::new(),
+                n => format!("  {}", plural(n, "draft")),
+            };
             let author = format!("  {}", escape(listed.author.as_bytes()));
-            let title_end = right.saturating_sub(author.width());
+            let title_end = right.saturating_sub(author.width() + drafts.width());
             grid.put_str(
                 after + 1,
                 y,
@@ -1625,7 +1810,8 @@ impl Picker {
                 &escape(listed.title.as_bytes()),
                 mark(Style::PLAIN),
             );
-            grid.put_str(title_end, y, right, &author, mark(dim));
+            let end = grid.put_str(title_end, y, right, &author, mark(dim));
+            grid.put_str(end, y, right, &drafts, mark(theme.style(Role::Warn)));
         }
         help::scrollbar(
             grid,

@@ -1255,6 +1255,83 @@ fn without_a_described_plugin_there_is_no_review_command() {
     );
 }
 
+/// The plugin is asked to describe itself only by a run that could use
+/// its command: not by a range, `--stat`, a diff on stdin or dffy's own
+/// subcommands, even with the cache off.
+#[test]
+fn describe_runs_only_where_the_review_command_could_be() {
+    let repo = repo();
+    let bin = describing_plugin(MERGE_REQUEST);
+    let path = format!("{}:/usr/bin:/bin", bin.path().display());
+    let run = |args: &[&str], stdin: &[u8]| {
+        let mut full = vec!["--review", "test", "--color=never"];
+        full.extend(args);
+        full.push("--no-cache");
+        let mut child = dffy_cmd(repo.path(), &full)
+            .env("PATH", &path)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn dffy");
+        child
+            .stdin
+            .take()
+            .expect("piped stdin")
+            .write_all(stdin)
+            .expect("write stdin");
+        let out = child.wait_with_output().expect("dffy exits");
+        assert!(out.status.success(), "{args:?}: {}", stderr(&out));
+    };
+    let runs = || {
+        std::fs::read_to_string(bin.path().join("described"))
+            .unwrap_or_default()
+            .lines()
+            .count()
+    };
+    run(&["main~1..main"], b"");
+    run(&["diff", "--stat"], b"");
+    run(&["--stat"], b"");
+    run(&[], FIXTURE);
+    run(&["config"], b"");
+    run(&["comments", "apply"], b"[]");
+    assert_eq!(runs(), 0);
+    run(&["--help"], b"");
+    assert_eq!(runs(), 1);
+}
+
+/// When the plugin can't describe itself, its command is a revision, and
+/// the error for it says why the command is missing.
+#[test]
+fn a_plugin_that_cant_describe_itself_is_named_where_its_command_fails() {
+    let repo = repo();
+    let bin = describing_plugin("not an answer\n");
+    let path = format!("{}:/usr/bin:/bin", bin.path().display());
+    let out = dffy_cmd(
+        repo.path(),
+        &["--review", "test", "--color=never", "mr", "7"],
+    )
+    .env("PATH", &path)
+    .output()
+    .expect("spawn dffy");
+    assert_eq!(out.status.code(), Some(128));
+    let said = stderr(&out);
+    assert!(said.starts_with("error: unknown revision 'mr'\n"), "{said}");
+    assert!(
+        said.contains("hint: dffy-review-test adds no command: "),
+        "{said}"
+    );
+    let quiet = dffy_cmd(
+        repo.path(),
+        &["--review", "test", "--color=never", "main~1..main"],
+    )
+    .env("PATH", &path)
+    .output()
+    .expect("spawn dffy");
+    assert!(quiet.status.success(), "{}", stderr(&quiet));
+    assert_eq!(stderr(&quiet), "", "no warning on every start");
+}
+
 #[test]
 fn completions_and_man_page() {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -1433,6 +1510,23 @@ fn comments_apply_round_trips_through_the_default_file() {
     );
     assert!(written.contains(r#""resolved":true"#), "{written}");
     assert!(written.contains(r#""github_thread":7"#), "{written}");
+    // The local file's threads go on the branch they were added on.
+    let branch = String::from_utf8(
+        Command::new("git")
+            .current_dir(d)
+            .args(["branch", "--show-current"])
+            .output()
+            .expect("git")
+            .stdout,
+    )
+    .expect("utf-8");
+    assert_eq!(
+        written
+            .matches(&format!(r#""branch":"{}""#, branch.trim()))
+            .count(),
+        3,
+        "{written}"
+    );
 
     let failed = comments_apply(
         d,
@@ -1500,6 +1594,7 @@ fn comments_takes_its_file_from_the_flag_anywhere() {
         "{}",
         stdout(&read)
     );
+    assert!(!stdout(&read).contains("\"branch\""), "{}", stdout(&read));
     let listed = dffy(
         d,
         &["--color=never", "--comments", "pr/one.json", "comments"],
@@ -1519,4 +1614,121 @@ fn comments_takes_its_file_from_the_flag_anywhere() {
         "{}",
         stderr(&out)
     );
+}
+
+/// The local file holds every branch's comments: `dffy comments` lists the
+/// current branch's threads and those on none, `--branch` another's and
+/// `--all-branches` all, each by state and file too; `rm --resolved`
+/// removes the resolved threads it would list, replies and all.
+#[test]
+fn comments_are_listed_and_removed_by_branch_state_and_path() {
+    let repo = repo();
+    let d = repo.path();
+    write(
+        d,
+        ".git/dffy/comments.json",
+        r#"{"version":1,"comments":[
+{"id":"m1","path":"src/lib.rs","text":"Open on main.","author":"","created":"t1","resolved":false,"branch":"main"},
+{"id":"m2","path":"README.md","text":"Done on main.","author":"","created":"t2","resolved":true,"branch":"main"},
+{"id":"m3","path":"README.md","text":"Reply.","author":"ada","created":"t3","in_reply_to":"m2","resolved":false,"branch":"main"},
+{"id":"u1","path":"src/lib.rs","text":"On no branch.","author":"","created":"t4","resolved":true},
+{"id":"t1","path":"src/lib.rs","text":"On topic.","author":"","created":"t5","resolved":true,"branch":"topic"}
+]}"#,
+    );
+    let ids = |args: &[&str]| {
+        let mut all = vec!["--color=never", "comments"];
+        all.extend(args);
+        let out = dffy(d, &all);
+        assert!(out.status.success(), "{args:?}: {}", stderr(&out));
+        let text = stdout(&out);
+        let mut ids: Vec<String> = text
+            .lines()
+            .filter_map(|l| {
+                let id = l.strip_prefix("  ")?.split(' ').next()?;
+                (!id.is_empty()).then(|| id.to_owned())
+            })
+            .collect();
+        ids.sort();
+        (ids, text)
+    };
+    let (here, text) = ids(&[]);
+    assert_eq!(here, ["m1", "m2", "m3", "u1"]);
+    assert!(
+        text.ends_with("\n1 more on other branches; --all-branches lists them\n"),
+        "{text}"
+    );
+    assert_eq!(ids(&["--open"]).0, ["m1"]);
+    assert_eq!(ids(&["--resolved", "--path", "README.md"]).0, ["m2", "m3"]);
+    assert_eq!(ids(&["--branch", "topic"]).0, ["t1", "u1"]);
+    let (all, text) = ids(&["--all-branches", "--resolved"]);
+    assert_eq!(all, ["m2", "m3", "t1", "u1"]);
+    assert!(
+        text.contains("src/lib.rs, branch topic, resolved\n"),
+        "{text}"
+    );
+    let markdown = dffy(d, &["comments", "--markdown", "--open"]);
+    assert_eq!(
+        stdout(&markdown),
+        "## `src/lib.rs`\n\n**you**, t1\n\nOpen on main.\n"
+    );
+
+    let removed = dffy(d, &["comments", "rm", "--resolved"]);
+    assert!(removed.status.success(), "{}", stderr(&removed));
+    assert_eq!(stdout(&removed), "removed 3 comments\n");
+    assert_eq!(ids(&["--all-branches"]).0, ["m1", "t1"]);
+    let removed = dffy(d, &["comments", "rm", "--resolved", "--branch", "topic"]);
+    assert_eq!(stdout(&removed), "removed 1 comment\n");
+    assert_eq!(ids(&["--all-branches"]).0, ["m1"]);
+
+    for (args, error) in [
+        (&["comments", "rm"][..], "--resolved"),
+        (&["comments", "--open", "rm", "--resolved"], "for listing"),
+        (&["comments", "--json", "--open"], "cannot be used with"),
+    ] {
+        let out = dffy(d, args);
+        assert!(!out.status.success(), "{args:?}");
+        assert!(stderr(&out).contains(error), "{args:?}: {}", stderr(&out));
+    }
+}
+
+/// `--session` reads the comments file of the review session the viewer
+/// has open, as the session pointer in the shared git directory names it,
+/// and says so when there's none.
+#[test]
+fn comments_session_reads_the_file_the_pointer_names() {
+    let repo = repo();
+    let d = repo.path();
+    let out = dffy(d, &["comments", "--session"]);
+    assert_eq!(out.status.code(), Some(128));
+    assert!(
+        stderr(&out).contains("no review session"),
+        "{}",
+        stderr(&out)
+    );
+    let pr = d.join(".git/review/7.json");
+    write(
+        d,
+        ".git/review/7.json",
+        r#"{"version":1,"summary":"Two nits.","comments":[{"id":"p1","path":"src/lib.rs","text":"Posted.","author":"octocat","created":"t1","resolved":false,"ref":"github:1"}]}"#,
+    );
+    write(
+        d,
+        ".git/dffy/session",
+        &format!(
+            r#"{{"version":1,"comments":"{}","review":"7","branch":"main","head":"abc1234"}}"#,
+            pr.display()
+        ),
+    );
+    let listed = dffy(d, &["--color=never", "comments", "--session"]);
+    assert!(listed.status.success(), "{}", stderr(&listed));
+    insta::assert_snapshot!(stdout(&listed), @r"
+    summary, not posted yet
+        Two nits.
+
+    src/lib.rs
+      p1 octocat, t1, posted
+        Posted.
+    ");
+    let both = dffy(d, &["--comments", "x.json", "comments", "--session"]);
+    assert!(stderr(&both).contains("give one"), "{}", stderr(&both));
 }

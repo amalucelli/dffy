@@ -6,7 +6,8 @@ dffy [options] [--no-index] <path> <path>
 dffy --json [options] [<rev>...] [-- <path>...]
 dffy show [<rev>] [-- <path>...]
 dffy config [--default]
-dffy comments [--json] | comments apply
+dffy comments [--json | --markdown] [--session] [--open | --resolved] [--path <path>] [--branch <name> | --all-branches]
+dffy comments apply | comments rm --resolved [--branch <name> | --all-branches]
 dffy <review-command> [<number>]    # e.g. dffy pr, with a review plugin set
 dffy mcp
 dffy themes | doctor | daemon status|stop | completions <shell>
@@ -35,7 +36,7 @@ Otherwise dffy prints.
 |---|---|
 | `diff` | Changes between the working tree, the index and revisions. The default. |
 | `show [<rev>]` | A commit against its first parent, with the commit header. `<rev>` defaults to `HEAD`; a root commit is compared with the empty tree. |
-| `comments` | The review comments, as threads. `--json` prints the comments file; `comments apply` changes it with a JSON list of operations on stdin. See [comments.md](comments.md). |
+| `comments` | The review comments, as threads: the current branch's and those on no branch, or `--branch <name>`'s, or `--all-branches`; `--open`, `--resolved` and `--path <path>` narrow them. `--markdown` prints them as Markdown, `--json` prints the whole comments file, and `--session` reads the review session the viewer has open. `comments apply` changes the file with a JSON list of operations on stdin; `comments rm --resolved` removes resolved threads. See [comments.md](comments.md#reading-dffy-comments). |
 | `<review command> [<id>]` | Experimental, and only with a review plugin set (`review` or `--review`) that describes itself: the plugin's command, named by the plugin, e.g. `dffy pr` for dffy-review-github (a GitLab plugin could name it `mr`). One of the code host's reviews in the viewer: `<base>...<head>` with its review threads, which you answer and post from there. Without an id, the current branch's review, or a list to pick from. It needs a terminal. Without such a plugin, `pr` is a revision like any other. See [viewer.md](viewer.md#code-host-reviews) and [plugins.md](plugins.md#the-review-command). |
 | `config` | The effective settings, each marked with where its value comes from. `--default` prints every key with its documentation and default instead. See [config.md](config.md). |
 | `themes` | The available themes, with a preview. `--dump <name>` prints a built-in theme as a theme file to copy and edit. See [themes.md](themes.md). |
@@ -214,7 +215,7 @@ These can go before or after the subcommand.
 | `--color auto\|always\|never` | When to color output. `auto` colors terminals, and follows `NO_COLOR` and `CLICOLOR_FORCE`. |
 | `--paging auto\|always\|never` | `never` writes straight to the terminal and also keeps the viewer from opening. `always` opens the viewer for a piped diff that fits one screen, which `auto` prints; see [git.md](git.md#piped-input). |
 | `--theme <name>` | A built-in theme or a file in the config's `themes/` directory. See [themes.md](themes.md). |
-| `--comments <file>` | The review comments file, relative to `-C`'s directory; the default is `dffy/comments.json` in the repository's git directory. See [comments.md](comments.md#where-the-file-is). |
+| `--comments <file>` | The review comments file, relative to `-C`'s directory; the default is `dffy/comments.json` in the git directory the repository's worktrees share. See [comments.md](comments.md#where-the-file-is). |
 | `--review <name>` | The review plugin, `dffy-review-<name>`, over the `review` setting; it adds the plugin's command (`dffy pr`) for the run. See [plugins.md](plugins.md#review-plugins). |
 | `-h`, `--help` | Help; `dffy diff --help` lists the diff options. |
 | `-V`, `--version` | The version. |

@@ -14,12 +14,15 @@ use std::io::Write as _;
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::time::{Duration, SystemTime};
 
 use serde_json::{Value, json};
 
 const PR: &str = "7";
 
 const URL: &str = "https://github.com/acme/widgets/pull/7";
+
+const ORIGIN: &str = "git@github.com:acme/widgets.git";
 
 /// The dffy built with the workspace, when its `comments apply` works.
 fn real_dffy() -> Option<PathBuf> {
@@ -207,11 +210,18 @@ impl Fixture {
         );
 
         git(d, &["clone", "-q", url, "work"]);
+        // On GitHub as far as the plugin can tell; the stub ssh fetches
+        // from the bare repository.
+        git(&d.join("work"), &["remote", "set-url", "origin", ORIGIN]);
         fs::create_dir_all(d.join("stub/bin")).expect("stub dir");
         fs::create_dir_all(d.join("stub/gh")).expect("stub dir");
-        let gh = d.join("stub/bin/gh");
-        fs::write(&gh, include_str!("fixtures/stubs/gh.sh")).expect("stub");
-        fs::set_permissions(&gh, fs::Permissions::from_mode(0o755)).expect("chmod");
+        for (path, script) in [
+            ("stub/bin/gh", include_str!("fixtures/stubs/gh.sh")),
+            ("stub/ssh", include_str!("fixtures/stubs/ssh.sh")),
+        ] {
+            fs::write(d.join(path), script).expect("stub");
+            fs::set_permissions(d.join(path), fs::Permissions::from_mode(0o755)).expect("chmod");
+        }
         std::os::unix::fs::symlink(&real_dffy, d.join("stub/bin/dffy")).expect("dffy on PATH");
         Self {
             dir,
@@ -262,6 +272,39 @@ impl Fixture {
             None => format!("{operation}.down"),
         };
         fs::write(self.path("stub/gh").join(name), "").expect("write");
+    }
+
+    /// Answers the `n`th REST `operation` (every one when `None`) as `gh
+    /// api --include` prints a response: its status line, `headers` and
+    /// `body`, and failing past a 2xx as gh does.
+    fn http(
+        &self,
+        operation: &str,
+        n: Option<usize>,
+        status: &str,
+        headers: &[(&str, &str)],
+        body: &str,
+    ) {
+        let name = match n {
+            Some(n) => format!("{operation}.{n}.http"),
+            None => format!("{operation}.http"),
+        };
+        let headers: String = headers
+            .iter()
+            .map(|(k, v)| [k, ": ", v, "\r\n"].concat())
+            .collect();
+        fs::write(
+            self.path("stub/gh").join(name),
+            format!("HTTP/2.0 {status}\n{headers}\r\n{body}"),
+        )
+        .expect("an answer written");
+    }
+
+    /// Answers the `n`th `check` (every one when `None`) with the PR on
+    /// `head`, last changed at `updated_at`, under `etag`.
+    fn pull_answer(&self, n: Option<usize>, etag: &str, head: &str, updated_at: &str) {
+        let body = json!({"number": 7, "head": {"sha": head}, "updated_at": updated_at});
+        self.http("pull", n, "200 OK", &[("Etag", etag)], &body.to_string());
     }
 
     fn up(&self, operation: &str) {
@@ -320,6 +363,10 @@ impl Fixture {
             .env_remove("GH_HOST")
             .env("STUB", self.path("stub"))
             .env("STUB_GIT", real_git())
+            .env("STUB_REMOTES", self.path("github"))
+            .env("GIT_SSH_COMMAND", self.path("stub/ssh"))
+            .env("GIT_SSH_VARIANT", "simple")
+            .env_remove("GH_CONFIG_DIR")
             .env("DFFY_REVIEW_PROTOCOL", "1")
             .env("XDG_DATA_HOME", self.path("data"))
             .env("XDG_CONFIG_HOME", self.path("config"))
@@ -750,7 +797,7 @@ fn prepare_prints_the_session_once_the_head_is_local_then_imports_the_rest() {
         [
             json!({"session": {"id": "7", "title": "Spell out five", "url": URL,
                 "base": f.base, "head": f.head, "last_reviewed_head": null,
-                "comments": f.comments_file()}}),
+                "state": "open", "comments": f.comments_file()}}),
             json!({"progress": "1/4"}),
             json!({"progress": "4/4"}),
         ]
@@ -808,6 +855,8 @@ fn prepare_prints_the_session_once_the_head_is_local_then_imports_the_rest() {
     assert!(file_comment.get("start").is_none() && file_comment.get("anchor").is_none());
 }
 
+/// A warm `prepare` prints the kept session first, then says the PR's head
+/// moved once GitHub's first page says so, as `check` would.
 #[test]
 fn a_warm_prepare_answers_from_the_session_before_asking_github() {
     let f = Fixture::new();
@@ -822,9 +871,24 @@ fn a_warm_prepare_answers_from_the_session_before_asking_github() {
     assert_eq!(warm.session(), cold.session());
     assert_eq!(f.events(), ["gh PullRequest after 1"]);
     assert_eq!(f.rest().len(), 1, "the session head's files were kept");
-    assert_eq!(warm.lines[1..], [json!({"progress": "0/0"})]);
-    let check = f.run(&["check", PR]);
-    assert_eq!(check.lines, [json!({"head": f.head2, "moved": true})]);
+    assert_eq!(
+        warm.lines[1..],
+        [
+            json!({"head": f.head2, "moved": true}),
+            json!({"progress": "0/0"})
+        ]
+    );
+
+    // On the head the session has, nothing moved.
+    f.reply("PullRequest", Some(4), "pull_request_page_1.json");
+    f.reply("PullRequest", Some(5), "pull_request_page_2.json");
+    let unmoved = f.run(&["prepare", PR]);
+    unmoved.ok();
+    assert!(
+        unmoved.lines.iter().all(|l| l.get("moved").is_none()),
+        "{:?}",
+        unmoved.lines
+    );
 }
 
 /// The PR below this one merged, and GitHub points this one at another
@@ -844,25 +908,113 @@ fn a_warm_prepare_on_a_new_base_asks_for_the_files_again() {
     assert_eq!(f.rest().len(), 2, "{:?}", f.rest());
 }
 
+/// `check` asks GitHub's REST API for the PR, with the `ETag` of its last
+/// answer: a 304, which costs no rate limit, answers from what the last
+/// 200 said. `comments_moved` says the PR changed since the last import,
+/// as a new comment changes it; `moved`, that its head did. It runs no
+/// git fetch, ls-remote or ssh, and no GraphQL.
 #[test]
-fn check_asks_git_whether_the_head_moved_and_never_the_api() {
+fn check_asks_github_by_etag_and_never_git() {
     let f = Fixture::new();
     f.prepare();
+    f.log_git();
     let before = f.requests().len();
+    let imported = "2026-11-16T10:02:11Z";
+    f.pull_answer(Some(1), "\"one\"", &f.head, imported);
+    f.http(
+        "pull",
+        Some(2),
+        "304 Not Modified",
+        &[("Etag", "\"one\"")],
+        "",
+    );
+    f.pull_answer(Some(3), "\"two\"", &f.head, "2026-11-17T08:00:00Z");
+    f.http(
+        "pull",
+        Some(4),
+        "304 Not Modified",
+        &[("Etag", "\"two\"")],
+        "",
+    );
+    f.pull_answer(Some(5), "\"three\"", &f.head2, "2026-11-17T09:00:00Z");
+    let check = |head: &str, moved: bool, comments_moved: bool| {
+        let run = f.run(&["check", PR]);
+        run.ok();
+        assert_eq!(
+            run.lines,
+            [json!({"head": head, "moved": moved, "comments_moved": comments_moved})]
+        );
+    };
+    check(&f.head, false, false);
+    check(&f.head, false, false);
+    check(&f.head, false, true);
+    check(&f.head, false, true);
+    check(&f.head2, true, true);
 
-    let run = f.run(&["check", PR]);
-    run.ok();
-    assert_eq!(run.lines, [json!({"head": f.head, "moved": false})]);
-
-    f.move_head();
-    let run = f.run(&["check", PR]);
-    run.ok();
-    assert_eq!(run.lines, [json!({"head": f.head2, "moved": true})]);
-    assert_eq!(f.requests().len(), before);
-    // Nothing was fetched.
+    let sent: Vec<String> = f.rest()[1..].to_vec();
+    let path = format!("api --hostname github.com repos/acme/widgets/pulls/{PR} --include");
     assert_eq!(
-        git(&f.work(), &["rev-parse", &format!("refs/dffy/pull/{PR}")]),
-        f.head
+        sent.iter()
+            .map(|r| r.rsplit_once(" after ").expect("a count").0)
+            .collect::<Vec<_>>(),
+        [
+            path.clone(),
+            format!("{path} --header If-None-Match: \"one\""),
+            format!("{path} --header If-None-Match: \"one\""),
+            format!("{path} --header If-None-Match: \"two\""),
+            format!("{path} --header If-None-Match: \"two\""),
+        ]
+    );
+    assert_eq!(f.requests().len(), before);
+    let git_calls = f.git_calls();
+    assert!(
+        git_calls
+            .iter()
+            .all(|c| !c.starts_with("fetch") && !c.starts_with("ls-remote")),
+        "{git_calls:?}"
+    );
+    let ssh = fs::read_to_string(f.path("stub/ssh.log")).expect("prepare fetched");
+    assert_eq!(ssh.lines().count(), 1, "prepare's fetch alone: {ssh}");
+}
+
+/// A REST answer of a used-up rate limit says when it resets.
+#[test]
+fn a_used_up_rate_limit_says_when_it_resets() {
+    let f = Fixture::new();
+    f.prepare();
+    // 2026-11-18T14:05:00Z
+    f.http(
+        "pull",
+        None,
+        "403 Forbidden",
+        &[
+            ("X-Ratelimit-Remaining", "0"),
+            ("X-Ratelimit-Reset", "1795010700"),
+        ],
+        r#"{"message":"API rate limit exceeded"}"#,
+    );
+    let run = f.run(&["check", PR]);
+    assert_eq!(run.code, Some(1));
+    assert!(
+        run.error().contains("resets at 14:05 UTC"),
+        "{}",
+        run.error()
+    );
+
+    let limited = json!({"data": null, "errors": [{"type": "RATE_LIMITED",
+        "message": "API rate limit exceeded for user ID 1."}]});
+    fs::write(
+        f.path("stub/gh/PullRequest.error.json"),
+        limited.to_string(),
+    )
+    .expect("answer");
+    f.reply("rate_limit", None, "rate_limit.json");
+    let run = f.run(&["pull", PR]);
+    assert_eq!(run.code, Some(1));
+    assert!(
+        run.error().contains("resets at 14:05 UTC"),
+        "{}",
+        run.error()
     );
 }
 
@@ -880,13 +1032,51 @@ fn pull_moves_the_session_to_the_new_head_and_leaves_the_last_reviewed_one() {
         [
             json!({"session": {"id": "7", "title": "Spell out five", "url": URL,
                 "base": f.base, "head": f.head2, "last_reviewed_head": null,
-                "comments": f.comments_file()}}),
+                "state": "open", "comments": f.comments_file()}}),
             json!({"progress": "0/0"}),
         ]
     );
+    // What the pull imported is what GitHub has.
+    f.pull_answer(None, "\"moved\"", &f.head2, "2026-11-17T08:00:00Z");
     let check = f.run(&["check", PR]);
-    assert_eq!(check.lines, [json!({"head": f.head2, "moved": false})]);
+    assert_eq!(
+        check.lines,
+        [json!({"head": f.head2, "moved": false, "comments_moved": false})]
+    );
     assert_eq!(f.run(&["prepare", PR]).session(), run.session());
+}
+
+/// Without a head recorded by a `post`, the last reviewed one is your last
+/// review's on GitHub, from the first page, when the clone has it.
+#[test]
+fn the_last_reviewed_head_starts_as_your_last_reviews_on_github() {
+    let f = Fixture::new();
+    f.reply("PullRequest", Some(1), "pull_request_page_1.json");
+    let mut first = f.answer("PullRequest.1.json");
+    first["data"]["repository"]["pullRequest"]["latest"] = json!({"nodes": [
+        {"viewerDidAuthor": true, "commit": {"oid": f.base}},
+        {"viewerDidAuthor": false, "commit": {"oid": f.head}},
+    ]});
+    fs::write(f.path("stub/gh/PullRequest.1.json"), first.to_string()).expect("fixture");
+    f.reply("PullRequest", Some(2), "pull_request_page_2.json");
+    f.reply("files", None, "files.json");
+    let run = f.run(&["prepare", PR]);
+    run.ok();
+    assert_eq!(run.session()["last_reviewed_head"], f.base.as_str());
+    let asked = &f.requests()[0]["variables"];
+    assert_eq!(asked["latest"], true);
+    assert_eq!(f.requests()[1]["variables"]["latest"], false);
+
+    // One the clone doesn't have isn't taken.
+    let mut gone = first.clone();
+    gone["data"]["repository"]["pullRequest"]["latest"]["nodes"][0]["commit"]["oid"] = json!(GONE);
+    fs::write(f.path("stub/gh/PullRequest.3.json"), gone.to_string()).expect("fixture");
+    f.reply("PullRequest", Some(4), "pull_request_page_2.json");
+    let mut session = f.saved_session();
+    session["last_reviewed_head"] = Value::Null;
+    f.save_session(&session);
+    f.run(&["pull", PR]).ok();
+    assert_eq!(f.saved_session()["last_reviewed_head"], Value::Null);
 }
 
 /// `post` records the head it posted against as the last reviewed one,
@@ -940,7 +1130,8 @@ fn post_sends_drafts_replies_and_resolves_once_and_a_second_post_sends_nothing()
             json!({"progress": "1/3"}),
             json!({"progress": "2/3"}),
             json!({"progress": "3/3"}),
-            json!({"posted": 3, "failed": 0, "url": format!("{URL}#pullrequestreview-2001")}),
+            json!({"posted": 3, "failed": 0, "pending": 0,
+                "url": format!("{URL}#pullrequestreview-2001")}),
         ]
     );
 
@@ -990,6 +1181,7 @@ fn post_sends_drafts_replies_and_resolves_once_and_a_second_post_sends_nothing()
     assert_eq!(posted["ref"], "github:PRRC_kwDOAAAAB84AAAC1");
     assert_eq!(posted["github_thread"], "PRRT_kwDOAAAAB84AAAB1");
     assert_eq!(posted["url"], format!("{URL}#discussion_r1101"));
+    assert!(posted.get("pending").is_none(), "submitted: {posted}");
     assert_eq!(f.draft(&ids[1])["ref"], "github:PRRC_kwDOAAAAB84AAAC3");
     assert_eq!(f.draft(&ids[1])["url"], format!("{URL}#discussion_r1103"));
     assert_eq!(f.draft(&ids[2])["ref"], "github:PRRC_kwDOAAAAB84AAAC2");
@@ -1002,17 +1194,23 @@ fn post_sends_drafts_replies_and_resolves_once_and_a_second_post_sends_nothing()
     let before = f.operations().len();
     let run = f.post("pending", "");
     run.ok();
-    assert_eq!(run.lines, [json!({"posted": 0, "failed": 0, "url": URL})]);
+    assert_eq!(
+        run.lines,
+        [json!({"posted": 0, "failed": 0, "pending": 0, "url": URL})]
+    );
     assert_eq!(f.operations()[before..], ["PostState"]);
 }
 
+/// A draft GitHub refuses stays a draft, with GitHub's reason in its
+/// `post_error` and in its draft line, and the review is submitted with
+/// the event anyway, without it. A retry posts it in a new review, and its
+/// `post_error` goes.
 #[test]
-fn a_rejected_comment_stays_a_draft_and_a_retry_posts_only_it_in_the_pending_review() {
+fn a_refused_comment_stays_a_draft_saying_why_and_the_review_goes_without_it() {
     let f = Fixture::new();
     f.prepare();
     let ids = f.add_drafts();
-    f.reply("PostState", Some(1), "post_state.json");
-    f.reply("PostState", Some(2), "post_state_pending.json");
+    f.reply("PostState", None, "post_state.json");
     f.reply("AddReview", None, "add_review.json");
     f.reply(
         "AddPullRequestReviewThread",
@@ -1031,46 +1229,41 @@ fn a_rejected_comment_stays_a_draft_and_a_retry_posts_only_it_in_the_pending_rev
         [
             json!({"draft": {"id": ids[0], "path": "src/lib.rs", "plan": "skip",
                 "reason": "Line could not be resolved"}}),
-            json!({"posted": 2, "failed": 1, "held": true, "held_message": "review still pending",
+            json!({"posted": 2, "failed": 1, "pending": 0,
                 "url": format!("{URL}#pullrequestreview-2001")}),
         ]
     );
     let rejected = f.draft(&ids[0]);
     assert!(rejected.get("ref").is_none(), "{rejected}");
     assert_eq!(rejected["text"], "Needs a test.");
+    assert_eq!(rejected["post_error"], "Line could not be resolved");
     assert_eq!(f.draft(&ids[2])["ref"], "github:PRRC_kwDOAAAAB84AAAC2");
-    let notice = f.comments()["notice"]
-        .as_str()
-        .expect("a notice")
-        .to_owned();
-    assert!(notice.contains("Line could not be resolved"), "{notice}");
     assert!(
-        !f.operations()
-            .iter()
-            .any(|o| o == "SubmitPullRequestReview"),
-        "the review stays pending while a comment is missing from it"
+        f.comments().get("notice").is_none(),
+        "the reason is the draft's"
     );
+    assert_eq!(
+        f.requests().last().expect("the submit")["variables"],
+        json!({"review": "PRR_kwDOAAAAB84AAAAR", "event": "APPROVE"})
+    );
+    assert_eq!(f.saved_session()["last_reviewed_head"], f.head.as_str());
 
     let run = f.post("approve", "");
     run.ok();
     assert_eq!(
         *run.last(),
-        json!({"posted": 1, "failed": 0, "url": format!("{URL}#pullrequestreview-2001")})
+        json!({"posted": 1, "failed": 0, "pending": 0,
+            "url": format!("{URL}#pullrequestreview-2001")})
     );
-    assert_eq!(f.draft(&ids[0])["ref"], "github:PRRC_kwDOAAAAB84AAAC1");
+    let posted = f.draft(&ids[0]);
+    assert_eq!(posted["ref"], "github:PRRC_kwDOAAAAB84AAAC1");
+    assert!(posted.get("post_error").is_none(), "{posted}");
     let sent = f.operations();
     let count = |op: &str| sent.iter().filter(|o| *o == op).count();
-    assert_eq!(count("AddReview"), 1, "the retry reuses the pending review");
+    assert_eq!(count("AddReview"), 2);
     assert_eq!(count("AddPullRequestReviewThread"), 3);
     assert_eq!(count("AddPullRequestReviewThreadReply"), 1);
-    assert_eq!(count("SubmitPullRequestReview"), 1);
-    let last_thread = f
-        .requests()
-        .into_iter()
-        .rfind(|r| r["operationName"] == "AddPullRequestReviewThread")
-        .expect("a thread");
-    assert_eq!(last_thread["variables"]["review"], "PRR_kwDOAAAAB84AAAAR");
-    assert!(f.comments().get("notice").is_none());
+    assert_eq!(count("SubmitPullRequestReview"), 2);
 }
 
 #[test]
@@ -1091,18 +1284,23 @@ fn a_post_stopped_midway_fails_and_a_retry_resumes_without_posting_twice() {
     assert_eq!(run.code, Some(1));
     assert_eq!(
         run.lines[run.lines.len() - 2],
-        json!({"posted": 2, "failed": 1, "held": true, "held_message": "review still pending",
+        json!({"posted": 2, "failed": 1, "pending": 0,
             "url": format!("{URL}#pullrequestreview-2001")})
     );
     assert!(run.error().contains("api.github.com"), "{}", run.error());
     assert!(f.draft(&ids[2]).get("ref").is_none());
+    // Not submitted: they wait in your pending review.
+    assert_eq!(f.draft(&ids[0])["pending"], true);
+    assert!(f.draft(&ids[2]).get("post_error").is_none(), "not refused");
 
     let run = f.post("comment", "");
     run.ok();
     assert_eq!(
         *run.last(),
-        json!({"posted": 1, "failed": 0, "url": format!("{URL}#pullrequestreview-2001")})
+        json!({"posted": 1, "failed": 0, "pending": 2,
+            "url": format!("{URL}#pullrequestreview-2001")})
     );
+    assert!(f.draft(&ids[0]).get("pending").is_none(), "submitted");
     let sent = f.operations();
     let count = |op: &str| sent.iter().filter(|o| *o == op).count();
     assert_eq!(count("AddReview"), 1);
@@ -1222,7 +1420,8 @@ fn post_places_drafts_by_their_anchor_at_the_pr_head() {
         [
             json!({"draft": {"id": local, "path": "src/lib.rs", "plan": "skip",
                 "reason": "lines not in the PR head (unpushed changes?)"}}),
-            json!({"posted": 1, "failed": 1, "url": format!("{URL}#pullrequestreview-2001")}),
+            json!({"posted": 1, "failed": 1, "pending": 0,
+                "url": format!("{URL}#pullrequestreview-2001")}),
         ]
     );
     assert_eq!(
@@ -1236,14 +1435,15 @@ fn post_places_drafts_by_their_anchor_at_the_pr_head() {
         .find(|r| r["operationName"] == "AddPullRequestReviewThread")
         .expect("a thread");
     assert_eq!(thread["variables"]["line"], 13);
-    assert!(f.draft(&local).get("ref").is_none());
-    let notice = f.comments()["notice"]
-        .as_str()
-        .expect("a notice")
-        .to_owned();
+    let skipped = f.draft(&local);
+    assert!(skipped.get("ref").is_none());
     assert!(
-        notice.contains("src/lib.rs:3: lines not in the PR head (unpushed changes?)"),
-        "{notice}"
+        skipped.get("post_error").is_none(),
+        "planned out, not refused"
+    );
+    assert!(
+        f.comments().get("notice").is_none(),
+        "its draft line says why"
     );
     assert_eq!(
         f.saved_session()["last_reviewed_head"],
@@ -1292,10 +1492,71 @@ fn a_dry_run_plans_each_draft_without_asking_github() {
                 6,
                 json!({"plan": "skip", "reason": "its thread isn't posted"})
             ),
-            json!({"planned": {"line": 2, "file": 2, "skip": 3}}),
+            json!({"planned": {"line": 2, "file": 2, "skip": 3, "pending": 0, "resolves": 0}}),
         ]
     );
     assert_eq!((f.requests().len(), f.rest().len(), f.comments()), before);
+}
+
+/// The dry run counts the comments already in your pending review on
+/// GitHub, which a submitting event sends with the drafts, and the
+/// resolves and reopens waiting. `--drafts` plans another comments file's
+/// drafts after the PR's own, as `post` would once they're moved in,
+/// writing neither file.
+#[test]
+fn a_dry_run_counts_whats_pending_and_plans_drafts_from_another_file() {
+    let f = Fixture::new();
+    f.prepare();
+    f.apply(&json!([
+        {"op": "set", "ref": "github:PRRC_kwDOAAAAB84AAAB1", "fields": {"resolved": true}},
+        {"op": "upsert", "comment": {"ref": "github:PRRC_kwDOAAAAB84AAAB2", "pending": true}},
+    ]));
+    let local = f.path("local.json");
+    let mut child = Command::new(&f.real_dffy)
+        .arg("--comments")
+        .arg(&local)
+        .args(["comments", "apply"])
+        .env("XDG_CONFIG_HOME", f.path("config"))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("dffy runs");
+    child
+        .stdin
+        .take()
+        .expect("stdin")
+        .write_all(
+            json!([{"op": "add", "comment": {"path": "src/lib.rs", "side": "new",
+                "start": {"old": null, "new": 13}, "end": {"old": null, "new": 13},
+                "anchor": {"before": ["line 11", "line 12"], "lines": ["thirteen"], "after": []},
+                "text": "Needs a test.", "distance": 0}}])
+            .to_string()
+            .as_bytes(),
+        )
+        .expect("ops written");
+    let out = child.wait_with_output().expect("dffy exits");
+    let id = serde_json::from_slice::<Value>(&out.stdout).expect("JSON")["ids"][0].clone();
+    let before = (f.comments(), fs::read(&local).expect("the local file"));
+
+    let run = f.run(&[
+        "post",
+        PR,
+        "--dry-run",
+        "--drafts",
+        local.to_str().expect("utf-8"),
+    ]);
+    run.ok();
+    assert_eq!(
+        run.lines,
+        [
+            json!({"draft": {"id": id, "path": "src/lib.rs", "plan": "line", "line": 13, "side": "new"}}),
+            json!({"planned": {"line": 1, "file": 0, "skip": 0, "pending": 1, "resolves": 1}}),
+        ]
+    );
+    assert_eq!(
+        (f.comments(), fs::read(&local).expect("the local file")),
+        before
+    );
 }
 
 /// `post` does what `--dry-run` said, draft by draft: the same drafts are
@@ -1358,7 +1619,8 @@ fn post_follows_the_dry_runs_plan() {
     assert_eq!(replies, 1);
     assert_eq!(
         *run.last(),
-        json!({"posted": 4, "failed": 3, "url": format!("{URL}#pullrequestreview-2001")})
+        json!({"posted": 4, "failed": 3, "pending": 0,
+            "url": format!("{URL}#pullrequestreview-2001")})
     );
     assert_eq!(
         f.operations().last().map(String::as_str),
@@ -1636,7 +1898,8 @@ fn a_prepare_with_every_original_commit_local_fetches_nothing() {
     assert_eq!(
         calls,
         [
-            "remote get-url origin".to_owned(),
+            r"config --get-regexp ^remote\..*\.gh-resolved$".to_owned(),
+            "remote -v".to_owned(),
             "cat-file --batch".to_owned(),
             format!("merge-base --end-of-options {base} {head}"),
         ]
@@ -1657,7 +1920,7 @@ fn drafts_are_planned_by_githubs_hunks_and_by_gits_where_github_left_the_patch_o
     assert_eq!(rest.len(), 1, "{rest:?}");
     assert!(
         rest[0].starts_with(&format!(
-            "api repos/acme/widgets/pulls/{PR}/files?per_page=100 --paginate after "
+            "api --hostname github.com repos/acme/widgets/pulls/{PR}/files?per_page=100 --paginate after "
         )),
         "{rest:?}"
     );
@@ -1688,7 +1951,7 @@ fn drafts_are_planned_by_githubs_hunks_and_by_gits_where_github_left_the_patch_o
             json!({"draft": {"id": id(2), "path": "src/lib.rs", "plan": "line", "line": 13, "side": "new",
                 "unsure": true}}),
             json!({"draft": {"id": id(3), "path": "src/lib.rs", "plan": "file"}}),
-            json!({"planned": {"line": 3, "file": 1, "skip": 0}}),
+            json!({"planned": {"line": 3, "file": 1, "skip": 0, "pending": 0, "resolves": 0}}),
         ]
     );
 }
@@ -1741,42 +2004,63 @@ fn prepare_prints_the_session_without_waiting_for_the_prs_files() {
     assert!(printed >= 1, "answered before the session line: {rest:?}");
 }
 
-/// After a post that held the event back, leaving the review pending,
-/// `--apply-event` submits it with the event and summary, without posting
-/// the drafts still left.
+/// The session and hunks sit beside your drafts, and are as private.
 #[test]
-fn apply_event_submits_the_pending_review_without_posting_drafts() {
+fn what_prepare_keeps_is_readable_by_you_alone() {
+    let f = Fixture::new();
+    f.prepare();
+    for name in ["comments.json", "session.json", "hunks.json"] {
+        let path = f.comments_file().with_file_name(name);
+        let mode = fs::metadata(&path).expect("kept").permissions().mode();
+        assert_eq!(mode & 0o777, 0o600, "{name}");
+    }
+}
+
+/// `pending` with a summary and nothing to post starts a pending review
+/// to hold the summary, rather than dropping it.
+#[test]
+fn a_pending_summary_alone_starts_a_review_for_it() {
+    let f = Fixture::new();
+    f.prepare();
+    f.reply("PostState", None, "post_state.json");
+    f.reply("AddReview", None, "add_review.json");
+    f.reply("UpdatePullRequestReview", None, "update_review.json");
+    let before = f.operations().len();
+    f.post("pending", "Looks close.\n").ok();
+    assert_eq!(
+        f.operations()[before..],
+        ["PostState", "AddReview", "UpdatePullRequestReview"]
+    );
+    assert_eq!(
+        f.requests().last().expect("the update")["variables"],
+        json!({"review": "PRR_kwDOAAAAB84AAAAR", "body": "Looks close."})
+    );
+}
+
+/// A post with a submitting event and no drafts left submits your pending
+/// review with the summary, and what was pending in it no longer is.
+#[test]
+fn a_post_with_nothing_new_submits_the_pending_review() {
     let f = Fixture::new();
     f.prepare();
     let ids = f.add_drafts();
     f.reply("PostState", Some(1), "post_state.json");
     f.reply("PostState", Some(2), "post_state_pending.json");
     f.reply("AddReview", None, "add_review.json");
-    f.reply(
-        "AddPullRequestReviewThread",
-        Some(1),
-        "add_thread_rejected.json",
-    );
+    f.reply("AddPullRequestReviewThread", Some(1), "add_thread_1.json");
     f.reply("AddPullRequestReviewThread", Some(2), "add_thread_2.json");
     f.reply("AddPullRequestReviewThreadReply", None, "add_reply.json");
     f.reply("SubmitPullRequestReview", None, "submit.json");
-    assert_eq!(f.post("approve", "").last()["held"], true);
+    f.post("pending", "").ok();
+    assert_eq!(f.draft(&ids[2])["pending"], true);
     let before = f.operations().len();
 
-    let file = f.summary("Ship it\n");
-    let run = f.run(&[
-        "post",
-        PR,
-        "--apply-event",
-        "--event",
-        "approve",
-        "--summary-file",
-        &file,
-    ]);
+    let run = f.post("approve", "Ship it\n");
     run.ok();
     assert_eq!(
         run.lines,
-        [json!({"posted": 0, "failed": 0, "url": format!("{URL}#pullrequestreview-2001")})]
+        [json!({"posted": 0, "failed": 0, "pending": 2,
+            "url": format!("{URL}#pullrequestreview-2001")})]
     );
     assert_eq!(
         f.operations()[before..],
@@ -1786,20 +2070,22 @@ fn apply_event_submits_the_pending_review_without_posting_drafts() {
         f.requests().last().expect("the submit")["variables"],
         json!({"review": "PRR_kwDOAAAAB84AAAAR", "event": "APPROVE", "body": "Ship it"})
     );
-    assert!(f.draft(&ids[0]).get("ref").is_none(), "still a draft");
-    assert!(
-        f.comments().get("notice").is_none(),
-        "the review isn't pending any more"
-    );
+    assert!(f.draft(&ids[2]).get("pending").is_none(), "submitted");
 }
 
 /// `detect` answers for the branch checked out: from the session kept for
 /// it without asking GitHub, else from one query; on another branch with
-/// no PR, or a detached HEAD, with none.
+/// no PR, or a detached HEAD, with none. A partial clone's remote, which
+/// git lists with its filter, is found as any other.
 #[test]
 fn detect_finds_the_branchs_pr_from_its_session_else_by_one_query() {
     let f = Fixture::new();
     git(&f.work(), &["checkout", "-q", "-b", "five"]);
+    git(&f.work(), &["config", "remote.origin.promisor", "true"]);
+    git(
+        &f.work(),
+        &["config", "remote.origin.partialclonefilter", "blob:none"],
+    );
     f.reply("Detect", None, "detect.json");
     let run = f.run(&["detect"]);
     run.ok();
@@ -1811,7 +2097,7 @@ fn detect_finds_the_branchs_pr_from_its_session_else_by_one_query() {
     assert_eq!(
         queried,
         json!({"id": "7", "title": "Spell out five", "url": URL,
-            "base": f.base, "head": f.head, "last_reviewed_head": null})
+            "base": f.base, "head": f.head, "last_reviewed_head": null, "state": "open"})
     );
     assert_eq!(f.operations(), ["Detect"]);
 
@@ -1825,6 +2111,212 @@ fn detect_finds_the_branchs_pr_from_its_session_else_by_one_query() {
 
     git(&f.work(), &["checkout", "-q", "--detach"]);
     assert_eq!(f.run(&["detect"]).lines, [json!({"review": null})]);
+}
+
+/// A session kept for a branch name answers only while the branch holds
+/// its head: a branch of that name cut after the PR merged, squashed or
+/// with a merge commit, is asked about.
+#[test]
+fn detect_asks_about_a_branch_cut_again_after_its_pr_merged() {
+    let f = Fixture::new();
+    f.prepare();
+    f.reply("Detect", None, "detect.json");
+    let work = f.work();
+    let detected = |label: &str| {
+        let before = f.operations().len();
+        f.run(&["detect"]).ok();
+        assert_eq!(f.operations()[before..], ["Detect"], "{label}");
+    };
+    fs::write(work.join("notes.txt"), "squashed\n").expect("write");
+    git(&work, &["commit", "-q", "-am", "squashed"]);
+    git(&work, &["checkout", "-q", "-b", "five"]);
+    detected("squashed");
+
+    git(&work, &["checkout", "-q", "main"]);
+    git(&work, &["branch", "-q", "-D", "five"]);
+    git(&work, &["merge", "-q", "--no-ff", "-m", "merged", &f.head]);
+    git(&work, &["update-ref", "refs/remotes/origin/main", "HEAD"]);
+    git(&work, &["checkout", "-q", "-b", "five"]);
+    detected("merged");
+
+    // Without the remote's default branch, any of its branches but the
+    // PR's own that has the head says it merged.
+    git(
+        &work,
+        &["symbolic-ref", "--delete", "refs/remotes/origin/HEAD"],
+    );
+    detected("merged, without origin/HEAD");
+}
+
+/// A PR rebased since it was prepared asks GitHub once: the head GitHub
+/// names then is kept, and tells the branch by from then on, with the
+/// remote's default branch or without it.
+#[test]
+fn detect_asks_once_about_a_branch_rebased_since_prepare() {
+    let f = Fixture::new();
+    f.prepare();
+    let work = f.work();
+    fs::write(work.join("notes.txt"), "upstream\n").expect("write");
+    git(&work, &["commit", "-q", "-am", "upstream"]);
+    git(&work, &["checkout", "-q", "-b", "five"]);
+    fs::write(work.join("src/lib.rs"), "five, rebased\n").expect("write");
+    git(&work, &["commit", "-q", "-am", "five, rebased"]);
+    let rebased = git(&work, &["rev-parse", "HEAD"]);
+    f.reply("Detect", None, "detect.json");
+    let mut answer = f.answer("Detect.json");
+    answer["data"]["repository"]["pullRequests"]["nodes"][1]["headRefOid"] = json!(rebased);
+    fs::write(f.path("stub/gh/Detect.json"), answer.to_string()).expect("write");
+    let asked = || {
+        let before = f.operations().len();
+        f.run(&["detect"]).ok();
+        f.operations().len() - before
+    };
+    assert_eq!(asked(), 1);
+    assert_eq!(asked(), 0, "by the head GitHub named");
+    git(
+        &work,
+        &["symbolic-ref", "--delete", "refs/remotes/origin/HEAD"],
+    );
+    assert_eq!(asked(), 0, "without origin/HEAD");
+}
+
+/// `detect` has no review for a repository whose remote isn't on a GitHub
+/// host, and asks GitHub nothing for it: a remote that names no host
+/// isn't asked about at all, and another host only of gh's own logins,
+/// once a day. A host gh is logged in to is GitHub's, and every API call
+/// names it.
+#[test]
+fn detect_asks_nothing_of_a_host_that_isnt_githubs() {
+    let f = Fixture::new();
+    let work = f.work();
+    git(&work, &["checkout", "-q", "-b", "five"]);
+    let auth = || fs::read_to_string(f.path("stub/auth")).unwrap_or_default();
+    let detect = || {
+        let run = f.run(&["detect"]);
+        run.ok();
+        run.lines
+    };
+
+    let local = f.path("github/acme/widgets.git");
+    git(
+        &work,
+        &[
+            "remote",
+            "set-url",
+            "origin",
+            local.to_str().expect("utf-8"),
+        ],
+    );
+    assert_eq!(detect(), [json!({"review": null})]);
+    assert_eq!(auth(), "");
+
+    git(
+        &work,
+        &[
+            "remote",
+            "set-url",
+            "origin",
+            "git@gitlab.com:acme/widgets.git",
+        ],
+    );
+    assert_eq!(detect(), [json!({"review": null})]);
+    assert_eq!(detect(), [json!({"review": null})]);
+    assert_eq!(auth(), "auth status --hostname gitlab.com\n", "asked once");
+    assert!(!f.path("stub/hostnames").exists(), "no API call");
+
+    fs::write(f.path("stub/gh/hosts"), "ghe.example.com\n").expect("hosts");
+    git(
+        &work,
+        &[
+            "remote",
+            "set-url",
+            "origin",
+            "git@ghe.example.com:acme/widgets.git",
+        ],
+    );
+    f.reply("Detect", None, "detect.json");
+    assert_eq!(detect()[0]["review"]["id"], "7");
+    let hostnames = fs::read_to_string(f.path("stub/hostnames")).expect("API calls");
+    assert_eq!(hostnames, "ghe.example.com\n");
+}
+
+/// GitHub having no PR for a branch is kept for 10 minutes at the
+/// branch's commit, so `detect` asks again only once it moved.
+#[test]
+fn detect_keeps_that_a_branch_has_no_pr_until_it_moves() {
+    let f = Fixture::new();
+    let work = f.work();
+    git(&work, &["checkout", "-q", "-b", "nothing-yet"]);
+    let none = json!({"data": {"repository": {"pullRequests": {"nodes": []}}}});
+    fs::write(f.path("stub/gh/Detect.json"), none.to_string()).expect("fixture");
+    let detect = || {
+        let run = f.run(&["detect"]);
+        run.ok();
+        assert_eq!(run.lines, [json!({"review": null})]);
+        f.operations().len()
+    };
+    assert_eq!(detect(), 1);
+    assert_eq!(detect(), 1, "kept");
+    fs::write(work.join("notes.txt"), "moved on\n").expect("write");
+    git(&work, &["commit", "-q", "-am", "moved on"]);
+    assert_eq!(detect(), 2, "the branch moved");
+    git(&work, &["checkout", "-q", "-b", "other"]);
+    assert_eq!(detect(), 3, "another branch");
+}
+
+/// A fork's clone has the PR's repository as `upstream`: that's the one
+/// asked for and fetched from, as gh takes it, unless `gh repo
+/// set-default` picked another remote.
+#[test]
+fn the_repository_is_upstream_or_the_remote_gh_resolved() {
+    let f = Fixture::new();
+    let work = f.work();
+    git(
+        &work,
+        &[
+            "remote",
+            "set-url",
+            "origin",
+            "git@github.com:forker/widgets.git",
+        ],
+    );
+    git(
+        &work,
+        &[
+            "remote",
+            "add",
+            "upstream",
+            "git@github.com:acme/widgets.git",
+        ],
+    );
+    f.log_git();
+    f.prepare();
+    let asked = &f.requests()[0]["variables"];
+    assert_eq!(
+        (&asked["owner"], &asked["name"]),
+        (&json!("acme"), &json!("widgets"))
+    );
+    assert!(
+        f.git_calls()
+            .iter()
+            .any(|c| c.starts_with("fetch --quiet --no-tags --end-of-options upstream ")),
+        "{:?}",
+        f.git_calls()
+    );
+
+    git(
+        &work,
+        &["remote", "add", "picked", "git@github.com:acme/gadgets.git"],
+    );
+    git(&work, &["config", "remote.picked.gh-resolved", "base"]);
+    f.reply("List", None, "list.json");
+    f.run(&["list"]).ok();
+    let requests = f.requests();
+    let asked = &requests.last().expect("List")["variables"];
+    assert_eq!(
+        (&asked["owner"], &asked["name"]),
+        (&json!("acme"), &json!("gadgets"))
+    );
 }
 
 #[test]
@@ -1892,9 +2384,9 @@ fn what_the_plugin_doesnt_speak_exits_2_with_an_error_line() {
         ),
         (&["post", PR], "1", "usage"),
         (
-            &["post", PR, "--apply-event", "--event", "pending"],
+            &["post", PR, "--apply-event", "--event", "approve"],
             "1",
-            "--apply-event submits",
+            "usage",
         ),
         (
             &["post", PR, "--dry-run", "--event", "comment"],
@@ -1961,7 +2453,7 @@ fn a_comment_by_someone_else_is_never_posted() {
         run.lines,
         [
             json!({"draft": {"id": yours, "path": "src/lib.rs", "plan": "line", "line": 13, "side": "new"}}),
-            json!({"planned": {"line": 1, "file": 0, "skip": 0}}),
+            json!({"planned": {"line": 1, "file": 0, "skip": 0, "pending": 0, "resolves": 0}}),
         ]
     );
 
@@ -1974,12 +2466,9 @@ fn a_comment_by_someone_else_is_never_posted() {
         (&run.last()["posted"], &run.last()["failed"]),
         (&json!(1), &json!(0))
     );
-    assert_eq!(
-        run.last().get("held"),
-        None,
-        "pending is left pending as asked"
-    );
-    assert!(f.draft(yours.as_str().expect("an id")).get("ref").is_some());
+    let posted = f.draft(yours.as_str().expect("an id"));
+    assert!(posted.get("ref").is_some());
+    assert_eq!(posted["pending"], true, "left pending as asked");
     assert!(
         f.draft(theirs.as_str().expect("an id"))
             .get("ref")
@@ -2096,6 +2585,16 @@ fn detect_passes_over_forks_and_prs_no_longer_open() {
     let mut fork = session.clone();
     fork["cross_repository"] = json!(true);
     f.save_session(&fork);
+    // That GitHub had none for the branch was kept.
+    assert_eq!(detect(), (vec![json!({"review": null})], 0));
+    fs::remove_file(
+        f.comments_file()
+            .parent()
+            .and_then(Path::parent)
+            .expect("a repository")
+            .join("detect.json"),
+    )
+    .expect("kept");
     assert_eq!(detect(), (vec![json!({"review": null})], 1));
 
     let mut old = session;
@@ -2103,7 +2602,12 @@ fn detect_passes_over_forks_and_prs_no_longer_open() {
         old.as_object_mut().expect("a session").remove(field);
     }
     f.save_session(&old);
-    assert_eq!(detect(), (vec![json!({"review": prepared.session()})], 0));
+    let mut stateless = prepared.session().clone();
+    stateless
+        .as_object_mut()
+        .expect("a session")
+        .remove("state");
+    assert_eq!(detect(), (vec![json!({ "review": stateless })], 0));
 }
 
 /// A branch `gh pr checkout` made tracks the PR's own ref, which names the
@@ -2405,7 +2909,7 @@ fn an_import_removes_what_github_dropped_but_keeps_a_thread_for_your_drafts() {
         [
             json!({"draft": {"id": id(0), "path": "notes.txt", "plan": "skip",
                 "reason": "its thread isn't posted"}}),
-            json!({"planned": {"line": 0, "file": 0, "skip": 1}}),
+            json!({"planned": {"line": 0, "file": 0, "skip": 1, "pending": 0, "resolves": 0}}),
         ]
     );
 }
@@ -2454,6 +2958,35 @@ fn a_comment_posted_during_an_import_stays_posted() {
     );
     f.finish(cmd.env("STUB_COMMENTS", f.comments_file())).ok();
     assert_eq!(f.comment("github:PRRC_racing")["text"], "Posted meanwhile.");
+}
+
+/// A conversation comment GitHub no longer has goes with the replies
+/// drafted under it, which GitHub can't thread there: kept without its
+/// ref, it would be a general comment the comments file can't hold, and
+/// the pull would fail.
+#[test]
+fn a_general_comment_gone_from_github_goes_with_its_draft_replies() {
+    let f = Fixture::new();
+    f.reply("PullRequest", Some(1), "pull_request_conversation_1.json");
+    f.reply("PullRequest", Some(2), "pull_request_conversation_2.json");
+    f.reply("files", None, "files.json");
+    f.run(&["prepare", PR]).ok();
+    f.apply(&json!([{"op": "add", "comment":
+        {"in_reply_to_ref": "github:IC_kwDOAAAAB84AAAC1", "text": "Agreed."}}]));
+
+    let mut first = f.answer("PullRequest.1.json");
+    first["data"]["repository"]["pullRequest"]["conversation"]["nodes"] = json!([]);
+    fs::write(f.path("stub/gh/PullRequest.3.json"), first.to_string()).expect("fixture");
+    f.reply("PullRequest", Some(4), "pull_request_conversation_2.json");
+    f.run(&["pull", PR]).ok();
+    let comments = f.comments()["comments"].clone();
+    let comments = comments.as_array().expect("comments");
+    assert!(
+        !comments
+            .iter()
+            .any(|c| c["ref"] == "github:IC_kwDOAAAAB84AAAC1" || c["text"] == "Agreed."),
+        "{comments:?}"
+    );
 }
 
 /// The comments without a path: general comments.
@@ -2579,4 +3112,215 @@ fn the_conversation_comes_in_as_general_comments() {
     let now = general(&f);
     let now: Vec<&Value> = now.iter().map(|c| &c["ref"]).collect();
     assert_eq!(now, left[2..]);
+}
+
+/// A comment in your pending review on GitHub comes in `pending`, which
+/// goes once GitHub has it submitted.
+#[test]
+fn comments_in_your_pending_review_come_in_pending() {
+    let f = Fixture::new();
+    f.reply("PullRequest", Some(1), "pull_request_page_1.json");
+    let mut first = f.answer("PullRequest.1.json");
+    first["data"]["repository"]["pullRequest"]["reviewThreads"]["nodes"][0]["comments"]["nodes"]
+        [1]["state"] = json!("PENDING");
+    fs::write(f.path("stub/gh/PullRequest.1.json"), first.to_string()).expect("fixture");
+    f.reply("PullRequest", Some(2), "pull_request_page_2.json");
+    f.reply("files", None, "files.json");
+    f.run(&["prepare", PR]).ok();
+    assert_eq!(f.comment("github:PRRC_kwDOAAAAB84AAAB2")["pending"], true);
+    assert!(
+        f.comment("github:PRRC_kwDOAAAAB84AAAB1")
+            .get("pending")
+            .is_none()
+    );
+
+    f.reply("PullRequest", Some(3), "pull_request_page_1.json");
+    f.reply("PullRequest", Some(4), "pull_request_page_2.json");
+    f.run(&["prepare", PR]).ok();
+    assert!(
+        f.comment("github:PRRC_kwDOAAAAB84AAAB2")
+            .get("pending")
+            .is_none()
+    );
+}
+
+/// Your pending review's comments past its first page are read too, so an
+/// import still removes what GitHub dropped, and not them.
+#[test]
+fn an_import_reads_every_page_of_your_pending_review() {
+    let f = Fixture::new();
+    f.prepare();
+    let posted = |n: &str| {
+        json!({"op": "upsert", "comment": {"ref": format!("github:PRRC_{n}"), "path": "src/lib.rs",
+            "text": "Mine.", "author": "", "url": URL, "github_thread": format!("PRRT_{n}"),
+            "github_resolved": false}})
+    };
+    f.apply(&json!([posted("later"), posted("dropped")]));
+    f.reply("PullRequest", Some(3), "pull_request_page_1.json");
+    let mut page = f.answer("PullRequest.3.json");
+    page["data"]["repository"]["pullRequest"]["reviews"] = json!({"nodes": [{"comments": {
+        "pageInfo": {"hasNextPage": true, "endCursor": "cGVuZGluZw=="},
+        "nodes": [{"id": "PRRC_first"}]}}]});
+    fs::write(f.path("stub/gh/PullRequest.3.json"), page.to_string()).expect("fixture");
+    f.reply("PullRequest", Some(4), "pull_request_page_2.json");
+    let rest = json!({"data": {"repository": {"pullRequest": {"reviews": {"nodes": [{"comments": {
+        "pageInfo": {"hasNextPage": false, "endCursor": null},
+        "nodes": [{"id": "PRRC_later"}]}}]}}}}});
+    fs::write(f.path("stub/gh/PendingComments.json"), rest.to_string()).expect("fixture");
+    f.run(&["prepare", PR]).ok();
+
+    let refs: Vec<Value> = f.comments()["comments"]
+        .as_array()
+        .expect("comments")
+        .iter()
+        .map(|c| c["ref"].clone())
+        .collect();
+    assert!(refs.contains(&json!("github:PRRC_later")), "{refs:?}");
+    assert!(!refs.contains(&json!("github:PRRC_dropped")), "{refs:?}");
+    let asked: Vec<Value> = f
+        .requests()
+        .into_iter()
+        .filter(|r| r["operationName"] == "PendingComments")
+        .map(|r| r["variables"]["after"].clone())
+        .collect();
+    assert_eq!(asked, [json!("cGVuZGluZw==")]);
+}
+
+/// A post holds `post.lock` in the PR's directory: a second one while it
+/// runs fails at once and sends nothing.
+#[test]
+fn a_second_post_while_one_runs_fails_and_sends_nothing() {
+    let f = Fixture::new();
+    f.prepare();
+    f.add_drafts();
+    let lock = fs::File::create(f.comments_file().with_file_name("post.lock")).expect("lock file");
+    lock.lock().expect("locked");
+    let before = (f.operations().len(), f.comments());
+    let run = f.post("comment", "");
+    assert_eq!(run.code, Some(1));
+    assert!(run.error().contains("already posting"), "{}", run.error());
+    assert_eq!((f.operations().len(), f.comments()), before);
+
+    drop(lock);
+    f.reply("PostState", None, "post_state.json");
+    f.reply("AddReview", None, "add_review.json");
+    f.reply("AddPullRequestReviewThread", Some(1), "add_thread_1.json");
+    f.reply("AddPullRequestReviewThread", Some(2), "add_thread_2.json");
+    f.reply("AddPullRequestReviewThreadReply", None, "add_reply.json");
+    f.reply("SubmitPullRequestReview", None, "submit.json");
+    f.post("comment", "").ok();
+}
+
+/// Makes the PR's session look last prepared `days` ago.
+fn age_session(f: &Fixture, days: u64) {
+    fs::File::options()
+        .write(true)
+        .open(f.comments_file().with_file_name("session.json"))
+        .and_then(|s| s.set_modified(SystemTime::now() - Duration::from_secs(days * 86_400)))
+        .expect("aged");
+}
+
+fn has_pull_ref(f: &Fixture) -> bool {
+    Command::new("git")
+        .current_dir(f.work())
+        .args([
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            &format!("refs/dffy/pull/{PR}"),
+        ])
+        .stdout(Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success())
+}
+
+/// `prune` drops the session of a PR GitHub last said was merged or
+/// closed, untouched for the days given (30 without), with its fetched
+/// ref; not one holding anything GitHub doesn't have: a draft, yours or
+/// an agent's, or a resolve not sent.
+#[test]
+fn prune_drops_sessions_of_prs_long_closed_without_drafts() {
+    let f = Fixture::new();
+    f.prepare();
+    let mut session = f.saved_session();
+    session["state"] = json!("MERGED");
+    f.save_session(&session);
+    let prune = |args: &[&str]| {
+        let mut all = vec!["prune"];
+        all.extend(args);
+        let run = f.run(&all);
+        run.ok();
+        run.lines
+    };
+    age_session(&f, 10);
+    assert_eq!(prune(&[]), [json!({"pruned": []})]);
+    let mut ids = f.add_drafts();
+    let agent = f.apply(&json!([{"op": "add", "comment": {"path": "src/lib.rs",
+        "text": "Off by one?", "author": "claude"}}]));
+    ids.push(agent["ids"][0].as_str().expect("an id").to_owned());
+    for keeps in ids.iter().rev() {
+        assert_eq!(prune(&["--days", "5"]), [json!({"pruned": []})], "{keeps}");
+        f.apply(&json!([{"op": "rm", "id": keeps}]));
+    }
+    f.apply(&json!([{"op": "set", "ref": "github:PRRC_kwDOAAAAB84AAAB1", "fields": {"resolved": true}}]));
+    assert_eq!(
+        prune(&["--days", "5"]),
+        [json!({"pruned": []})],
+        "a resolve"
+    );
+    f.apply(&json!([{"op": "set", "ref": "github:PRRC_kwDOAAAAB84AAAB1", "fields": {"resolved": false}}]));
+    age_session(&f, 40);
+    assert!(has_pull_ref(&f));
+    assert_eq!(prune(&[]), [json!({"pruned": [7]})]);
+    assert!(!f.comments_file().parent().expect("a PR directory").exists());
+    assert!(!has_pull_ref(&f));
+}
+
+/// `list` gives each PR with a session the count of your drafts in it,
+/// then prunes, at most once a day.
+#[test]
+fn list_counts_your_drafts_and_prunes_once_a_day() {
+    let f = Fixture::new();
+    f.prepare();
+    f.add_drafts();
+    f.reply("List", None, "list.json");
+    let run = f.run(&["list"]);
+    run.ok();
+    let drafts: Vec<&Value> = run.lines[0]["reviews"]
+        .as_array()
+        .expect("reviews")
+        .iter()
+        .map(|r| &r["drafts"])
+        .collect();
+    assert_eq!(drafts, [&json!(3), &Value::Null, &Value::Null]);
+
+    // Pruned today already, so not again.
+    let rm: Vec<Value> = f.comments()["comments"]
+        .as_array()
+        .expect("comments")
+        .iter()
+        .filter(|c| c.get("ref").is_none())
+        .map(|c| json!({"op": "rm", "id": c["id"]}))
+        .collect();
+    f.apply(&json!(rm));
+    let mut session = f.saved_session();
+    session["state"] = json!("CLOSED");
+    f.save_session(&session);
+    age_session(&f, 40);
+    f.run(&["list"]).ok();
+    assert!(f.comments_file().exists(), "kept until tomorrow");
+
+    let stamp = f
+        .comments_file()
+        .parent()
+        .and_then(Path::parent)
+        .expect("a repository")
+        .join("pruned");
+    fs::File::options()
+        .write(true)
+        .open(&stamp)
+        .and_then(|s| s.set_modified(SystemTime::now() - Duration::from_secs(2 * 86_400)))
+        .expect("a day later");
+    f.run(&["list"]).ok();
+    assert!(!f.comments_file().parent().expect("a PR directory").exists());
 }

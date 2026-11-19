@@ -16,6 +16,7 @@ fn session() -> Session {
         base: "a1b2c3d".to_owned(),
         head: "e4f5a6b".to_owned(),
         last_reviewed_head: None,
+        state: None,
         comments: PathBuf::from("/data/7/comments.json"),
     }
 }
@@ -134,7 +135,11 @@ fn a_describe_answer_names_labels_and_events() {
     for (answer, why) in [
         (
             full.replace(r#""key":"d""#, r#""key":"j""#),
-            "other than j, k, s and v",
+            "other than j, k, l, s and v",
+        ),
+        (
+            full.replace(r#""key":"d""#, r#""key":"l""#),
+            "other than j, k, l, s and v",
         ),
         (
             full.replace(r#""key":"d""#, r#""key":"a""#),
@@ -170,28 +175,36 @@ fn lines_decode_by_kind_and_unknown_ones_are_skipped() {
         said(r#"{"version":1,"head":"e4f5a6b","moved":true}"#),
         Said::Head {
             head: "e4f5a6b".to_owned(),
-            moved: true
+            moved: true,
+            comments_moved: false,
         }
     );
     assert_eq!(
-        said(r#"{"version":1,"posted":11,"failed":1,"url":"https://x/pull/7#r"}"#),
+        said(r#"{"version":1,"head":"e4f5a6b","moved":false,"comments_moved":true}"#),
+        Said::Head {
+            head: "e4f5a6b".to_owned(),
+            moved: false,
+            comments_moved: true,
+        }
+    );
+    // `held` came from an older plugin, and means nothing now.
+    assert_eq!(
+        said(
+            r#"{"version":1,"posted":11,"failed":1,"pending":4,"held":true,"url":"https://x/pull/7#r"}"#
+        ),
         Said::Posted {
             posted: 11,
             failed: 1,
-            held: false,
-            held_message: None,
+            pending: 4,
             url: Some("https://x/pull/7#r".to_owned())
         }
     );
     assert_eq!(
-        said(
-            r#"{"version":1,"posted":1,"failed":2,"held":true,"held_message":"review left pending","url":null}"#
-        ),
+        said(r#"{"version":1,"posted":1,"failed":2,"url":null}"#),
         Said::Posted {
             posted: 1,
             failed: 2,
-            held: true,
-            held_message: Some("review left pending".to_owned()),
+            pending: 0,
             url: None
         }
     );
@@ -219,11 +232,23 @@ fn lines_decode_by_kind_and_unknown_ones_are_skipped() {
         draft("d3", Plan::Skip("file not in the PR".to_owned()))
     );
     assert_eq!(
-        said(r#"{"version":1,"planned":{"line":9,"file":1,"skip":2}}"#),
+        said(r#"{"version":1,"planned":{"line":9,"file":1,"skip":2,"pending":4,"resolves":1}}"#),
         Said::Planned {
             line: 9,
             file: 1,
-            skip: 2
+            skip: 2,
+            pending: 4,
+            resolves: 1,
+        }
+    );
+    assert_eq!(
+        said(r#"{"version":1,"planned":{"line":1}}"#),
+        Said::Planned {
+            line: 1,
+            file: 0,
+            skip: 0,
+            pending: 0,
+            resolves: 0,
         }
     );
     assert_eq!(
@@ -244,7 +269,7 @@ fn reviews_are_listed_and_detected_by_id() {
     };
     assert_eq!(
         said(
-            r#"{"version":1,"reviews":[{"id":"9","title":"Add a cache","author":"hubot","url":"u","head_ref":"cache","reason":"review_requested"},{"id":"I8f2c","label":"3","reason":"later","group":"Starred"}]}"#
+            r#"{"version":1,"reviews":[{"id":"9","title":"Add a cache","author":"hubot","url":"u","head_ref":"cache","reason":"review_requested","drafts":3},{"id":"I8f2c","label":"3","reason":"later","group":"Starred"}]}"#
         ),
         Said::Listed(vec![
             Listed {
@@ -254,6 +279,7 @@ fn reviews_are_listed_and_detected_by_id() {
                 author: "hubot".to_owned(),
                 reason: Reason::ReviewRequested,
                 group: None,
+                drafts: 3,
             },
             Listed {
                 id: "I8f2c".to_owned(),
@@ -262,6 +288,7 @@ fn reviews_are_listed_and_detected_by_id() {
                 author: String::new(),
                 reason: Reason::Other,
                 group: Some("Starred".to_owned()),
+                drafts: 0,
             },
         ])
     );
@@ -270,22 +297,35 @@ fn reviews_are_listed_and_detected_by_id() {
         Said::Detected(Some(session()))
     );
     assert_eq!(said(r#"{"version":1,"review":null}"#), Said::Detected(None));
-    // Words dffy draws as they are: a group or a held message that isn't
-    // one printable line is dropped.
+    // Words dffy draws as they are: a group that isn't one printable line
+    // is dropped.
     let Said::Listed(listed) =
         said(r#"{"version":1,"reviews":[{"id":"1","group":"x\u001b[2Jy"}]}"#)
     else {
         panic!("a list");
     };
     assert_eq!(listed[0].group, None);
-    assert!(matches!(
-        said(r#"{"version":1,"posted":0,"failed":1,"held":true,"held_message":"a\nb"}"#),
-        Said::Posted {
-            held: true,
-            held_message: None,
-            ..
-        }
-    ));
+    // A session's state as the host last said it; one dffy doesn't know is
+    // none.
+    for (state, read) in [
+        ("open", Some(State::Open)),
+        ("closed", Some(State::Closed)),
+        ("merged", Some(State::Merged)),
+        ("locked", None),
+    ] {
+        let line = SESSION.replace(
+            r#""last_reviewed_head":null"#,
+            &format!(r#""last_reviewed_head":null,"state":"{state}""#),
+        );
+        assert_eq!(
+            said(&line),
+            Said::Session(Session {
+                state: read,
+                ..session()
+            }),
+            "{state}"
+        );
+    }
 }
 
 /// Another version, or a session naming something other than commits and

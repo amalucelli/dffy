@@ -37,20 +37,26 @@ pub(crate) fn pull_ref(pr: u64) -> String {
     format!("refs/dffy/pull/{pr}")
 }
 
-pub(crate) fn fetch_pulls(prs: &[u64]) -> Result<(), String> {
+pub(crate) fn fetch_pulls(remote: &Remote, prs: &[u64]) -> Result<(), String> {
     let specs: Vec<String> = prs
         .iter()
         .map(|pr| format!("+refs/pull/{pr}/head:{}", pull_ref(*pr)))
         .collect();
-    let mut args = vec!["fetch", "--quiet", "--no-tags", "origin"];
+    let mut args = vec![
+        "fetch",
+        "--quiet",
+        "--no-tags",
+        "--end-of-options",
+        &remote.git_name,
+    ];
     args.extend(specs.iter().map(String::as_str));
     git(&args).map(drop)
 }
 
-/// Fetches `commits` from origin by oid, onto no ref. A commit origin
-/// lacks fails the whole fetch and git names it, so the fetch retries
-/// without the named ones. Returns whether any arrived.
-pub(crate) fn fetch_commits(commits: &[&str]) -> bool {
+/// Fetches `commits` from `remote` by oid, onto no ref. A commit the
+/// remote lacks fails the whole fetch and git names it, so the fetch
+/// retries without the named ones. Returns whether any arrived.
+pub(crate) fn fetch_commits(remote: &Remote, commits: &[&str]) -> bool {
     let mut wanted = commits.to_vec();
     while !wanted.is_empty() {
         let mut args = vec![
@@ -58,7 +64,7 @@ pub(crate) fn fetch_commits(commits: &[&str]) -> bool {
             "--quiet",
             "--no-tags",
             "--end-of-options",
-            "origin",
+            &remote.git_name,
         ];
         args.extend(&wanted);
         let Err(e) = git(&args) else {
@@ -75,9 +81,12 @@ pub(crate) fn fetch_commits(commits: &[&str]) -> bool {
     false
 }
 
-/// The GitHub repository `origin` points at.
+/// The repository a git remote points at, on the host its URL names.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Remote {
+    /// The git remote's name, which fetches go to.
+    pub git_name: String,
+    pub host: String,
     pub owner: String,
     pub name: String,
     /// One path component naming the repository, for the session cache.
@@ -85,26 +94,68 @@ pub(crate) struct Remote {
 }
 
 impl Remote {
-    pub(crate) fn origin() -> Result<Self, String> {
-        let url = git(&["remote", "get-url", "origin"])?;
-        Self::parse(&url)
-            .ok_or_else(|| format!("can't tell a GitHub repository from origin's URL {url}"))
+    /// The remote `gh` takes for the repository's own: the one `gh repo
+    /// set-default` marked with `remote.<name>.gh-resolved`, else
+    /// `upstream` when `on_github` says its host is one, else `origin`.
+    /// URLs are as git rewrites them (`url.<base>.insteadOf`). `None`
+    /// when that remote's URL names no host and repository.
+    pub(crate) fn pick(on_github: impl Fn(&Self) -> bool) -> Option<Self> {
+        let resolved =
+            git(&["config", "--get-regexp", r"^remote\..*\.gh-resolved$"]).unwrap_or_default();
+        let resolved = resolved.lines().find_map(|l| {
+            l.split_once(' ')?
+                .0
+                .strip_prefix("remote.")?
+                .strip_suffix(".gh-resolved")
+        });
+        let listed = git(&["remote", "-v"]).ok()?;
+        let url = |name: &str| {
+            listed.lines().find_map(|l| {
+                let (remote, rest) = l.split_once('\t')?;
+                // A partial clone's filter follows: ` (fetch) [blob:none]`.
+                let (url, _) = rest.split_once(" (fetch)")?;
+                (remote == name).then(|| Self::parse(url, name)).flatten()
+            })
+        };
+        if let Some(remote) = resolved.and_then(url) {
+            return Some(remote);
+        }
+        url("upstream")
+            .filter(|r| on_github(r))
+            .or_else(|| url("origin"))
     }
 
     /// `https://github.com/o/r.git`, `git@github.com:o/r` and
-    /// `ssh://git@github.com/o/r` are the same repository, with one key.
-    fn parse(url: &str) -> Option<Self> {
+    /// `ssh://git@github.com:22/o/r` are the same repository, with one key.
+    /// A local path names no host, so no repository.
+    pub(crate) fn parse(url: &str, remote: &str) -> Option<Self> {
         let url = url.trim_end_matches('/');
         let url = url.strip_suffix(".git").unwrap_or(url);
         let mut parts = url.rsplit(['/', ':']);
         let name = parts.next().filter(|s| !s.is_empty())?.to_owned();
         let owner = parts.next().filter(|s| !s.is_empty())?.to_owned();
-        let rest = url.split_once("://").map_or(url, |(_, rest)| rest);
-        let rest = rest
-            .split_once('@')
-            .filter(|(user, _)| !user.contains('/'))
-            .map_or(rest, |(_, host)| host);
-        let key: String = rest
+        // `host:path` is scp-like only without a `/` before the colon.
+        let rest = match url.split_once("://") {
+            Some((_, rest)) => rest,
+            None => url.split_once(':').filter(|(h, _)| !h.contains('/'))?.0,
+        };
+        let authority = rest.split('/').next().unwrap_or_default();
+        let authority = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
+        let host = authority
+            .split(':')
+            .next()
+            .unwrap_or_default()
+            .to_lowercase();
+        if host.is_empty() {
+            return None;
+        }
+        // As gh names hosts: `ssh.github.com` (ssh over 443) is github.com.
+        let host = if host.ends_with(".github.com") {
+            "github.com".to_owned()
+        } else {
+            host
+        };
+        let key: String = format!("{host}/{owner}/{name}")
             .chars()
             .map(|c| {
                 if c.is_ascii_alphanumeric() || matches!(c, '.' | '-') {
@@ -115,6 +166,8 @@ impl Remote {
             })
             .collect();
         Some(Self {
+            git_name: remote.to_owned(),
+            host,
             owner,
             name,
             key: key.trim_matches('_').to_owned(),
@@ -122,10 +175,10 @@ impl Remote {
     }
 }
 
-/// Which of origin's PRs a branch is the head of.
+/// Which of the repository's PRs a branch is the head of.
 pub(crate) enum Head {
     Pull(u64),
-    /// From the branch called `name` of origin, or of a fork of
+    /// From the branch called `name` of the repository, or of a fork of
     /// `fork_owner`'s.
     Branch {
         name: String,
@@ -138,8 +191,8 @@ impl Head {
     /// you can't push to the fork, else the fork's branch, by the fork's
     /// URL or a remote of it, under a local name that may not be the
     /// branch's (`<owner>/main` for a fork's default branch). Without an
-    /// upstream, the branch of origin's with its name.
-    pub(crate) fn of(branch: &str, origin: &Remote) -> Self {
+    /// upstream, the repository's branch with its name.
+    pub(crate) fn of(branch: &str, repository: &Remote) -> Self {
         let config = |key: &str| git(&["config", "--get", &format!("branch.{branch}.{key}")]).ok();
         let own = |name: &str| Self::Branch {
             name: name.to_owned(),
@@ -161,12 +214,12 @@ impl Head {
         ) else {
             return own(branch);
         };
-        if remote == "origin" {
+        if remote == repository.git_name {
             return own(name);
         }
         let url = git(&["remote", "get-url", &remote]).unwrap_or(remote);
-        match Remote::parse(&url) {
-            Some(r) if r == *origin => own(name),
+        match Remote::parse(&url, "") {
+            Some(r) if r.key == repository.key => own(name),
             Some(r) => Self::Branch {
                 name: name.to_owned(),
                 fork_owner: Some(r.owner),
@@ -395,19 +448,39 @@ mod tests {
     use super::*;
 
     #[test]
-    fn every_url_form_of_a_repository_has_one_key() {
-        let https = Remote::parse("https://github.com/acme/widgets.git");
+    fn every_url_form_of_a_repository_has_one_key_and_its_host() {
+        let https = Remote::parse("https://github.com/acme/widgets.git", "origin");
         assert_eq!(
             https,
             Some(Remote {
+                git_name: "origin".to_owned(),
+                host: "github.com".to_owned(),
                 owner: "acme".to_owned(),
                 name: "widgets".to_owned(),
                 key: "github.com_acme_widgets".to_owned(),
             })
         );
-        assert_eq!(Remote::parse("git@github.com:acme/widgets"), https);
-        assert_eq!(Remote::parse("ssh://git@github.com/acme/widgets/"), https);
-        assert_eq!(Remote::parse("widgets"), None);
+        for url in [
+            "git@github.com:acme/widgets",
+            "ssh://git@github.com/acme/widgets/",
+            "ssh://git@ssh.github.com:443/acme/widgets.git",
+            "https://user@GitHub.com/acme/widgets",
+        ] {
+            assert_eq!(Remote::parse(url, "origin"), https, "{url}");
+        }
+        let enterprise =
+            Remote::parse("git@ghe.example.com:acme/widgets.git", "upstream").expect("a remote");
+        assert_eq!(
+            (enterprise.host.as_str(), enterprise.key.as_str()),
+            ("ghe.example.com", "ghe.example.com_acme_widgets")
+        );
+        for url in [
+            "widgets",
+            "/srv/git/acme/widgets.git",
+            "file:///srv/acme/widgets",
+        ] {
+            assert_eq!(Remote::parse(url, "origin"), None, "{url}");
+        }
     }
 
     #[test]

@@ -101,8 +101,9 @@ actions! {
     ToggleCopyDecorations "toggle_copy_decorations" "copy decorations" "copies include line numbers and +/- signs, or only the code",
     Edit "edit" "open in editor" "open the file in $EDITOR at the line last tapped, else the top line",
     Comment "comment" "comment on lines" "comment on the selected lines, or the line v would start on, in a text box under them; esc saves it",
+    SuggestChange "suggest_change" "suggest change" "suggest a change to the selected lines, or the line v would start on: a comment's text box holding them, to edit into what they should be; esc saves it",
     CommentFile "comment_file" "comment on file" "comment on the whole file shown, in a text box under its first row; esc saves it",
-    Comments "comments" "comments panel" "the left panel lists every comment thread in place of the files, or the files again; moving through the threads shows each in the diff, enter or tab goes to it",
+    Comments "comments" "comments panel" "the left panel lists every comment thread in place of the files, or the files again; moving through the threads shows each in the diff, enter or tab goes to it; r, e, x, d and o act on the selected thread",
     NextThread "next_thread" "next thread" "next comment thread, on into the next file with comments; it takes the focus, where r replies, e edits, x resolves, d deletes and o opens it on its host",
     PrevThread "prev_thread" "prev thread" "previous comment thread, back into the previous file with comments",
     ToggleThread "toggle_thread" "fold thread" "fold or unfold the focused comment thread, or the first on screen",
@@ -213,6 +214,7 @@ const DEFAULTS: &[(Table, &str, Action)] = &[
     (M, "w", Action::ToggleWatch),
     (M, "e", Action::Edit),
     (M, "c", Action::Comment),
+    (M, "S", Action::SuggestChange),
     (M, "C", Action::CommentFile),
     (M, "i", Action::Comments),
     (M, "m", Action::NextThread),
@@ -254,6 +256,7 @@ const DEFAULTS: &[(Table, &str, Action)] = &[
     (L, "a", Action::ToggleWatch),
     (L, "c", Action::CycleTheme),
     (L, "E", Action::CommentInEditor),
+    (L, "g", Action::SuggestChange),
     (L, "P", Action::OpenReview),
     (L, "R", Action::SinceLastReview),
     (L, "A", Action::WholeReview),
@@ -353,6 +356,7 @@ impl Action {
             Self::Leader
             | Self::Edit
             | Self::Comment
+            | Self::SuggestChange
             | Self::CommentFile
             | Self::Comments
             | Self::CommentInEditor
@@ -399,6 +403,7 @@ impl Action {
             Self::ToggleMouse => "Mouse selection",
             Self::ToggleWatch => "Watch for changes",
             Self::CommentInEditor => "Continue in editor",
+            Self::SuggestChange => "Suggest change",
             Self::CommentedFiles => "Files with comments",
             Self::OpenReview => "Open review…",
             Self::SinceLastReview => "Since last review",
@@ -464,6 +469,7 @@ impl Action {
             Self::ToggleCopyDecorations => "copy decorations",
             Self::Edit => "edit",
             Self::Comment => "comment",
+            Self::SuggestChange => "suggest change",
             Self::CommentFile => "comment on file",
             Self::Comments => "comments",
             Self::NextThread => "next thread",

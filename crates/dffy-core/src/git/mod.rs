@@ -529,6 +529,14 @@ impl Repo {
         self.git().ok().map(gix::Repository::git_dir)
     }
 
+    /// The git directory every worktree of the repository shares; the same
+    /// as [`Repo::git_dir`] outside a linked worktree. `None` for paths
+    /// compared outside git.
+    #[must_use]
+    pub fn common_dir(&self) -> Option<&Path> {
+        self.git().ok().map(gix::Repository::common_dir)
+    }
+
     /// Streams the changed files of `spec` to `emit`, which can stop the
     /// enumeration early by returning [`ControlFlow::Break`].
     ///

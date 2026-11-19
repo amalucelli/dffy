@@ -24,6 +24,27 @@ curl -fsSL https://raw.githubusercontent.com/amalucelli/dffy/main/install.sh | s
 
 Then try it in any repository: `dffy HEAD~10`.
 
+## Plugins
+
+Plugins are separate programs that dffy runs when your config names them. All are experimental.
+
+| Plugin | What it adds | Homebrew |
+|---|---|---|
+| `dffy-render-markdown` | Markdown files diffed as rendered text, with Mermaid fences drawn | `brew install --cask amalucelli/tap/dffy-render-markdown` |
+| `dffy-render-mermaid` | `.mmd` and `.mermaid` flowcharts and sequence diagrams drawn in the terminal | `brew install --cask amalucelli/tap/dffy-render-mermaid` |
+| `dffy-review-github` | GitHub pull request reviews: `dffy pr 123`, threads inline, post your review. Needs [`gh`](https://cli.github.com), logged in. | `brew install --cask amalucelli/tap/dffy-review-github` |
+
+Or with the install script: `… | sh -s -- --plugin markdown --plugin mermaid --plugin review-github`.
+
+Then turn them on in `~/.config/dffy/config`:
+
+```
+render = md:markdown mmd:mermaid mermaid:mermaid
+review = github
+```
+
+`r` switches a Markdown or Mermaid file between its lines and its rendered form. `dffy pr 123` opens a pull request, and plain `dffy` on a branch with an open PR brings in its comments. `dffy doctor` checks that each plugin is found and, for `dffy-review-github`, that `gh` is logged in. [plugins.md](docs/plugins.md) has the details.
+
 ## About
 
 `dffy` is a diff viewer for the terminal. Run it in a git repository and it opens a full-screen view of your changes: a file tree on the left, the diff on the right, split or unified. Pipe it, and it prints the diff instead.

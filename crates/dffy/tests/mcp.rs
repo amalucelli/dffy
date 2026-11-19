@@ -641,6 +641,80 @@ fn list_comments_pages_through_threads() {
     assert!(stale.text().contains("start over"), "{}", stale.text());
 }
 
+/// `list_comments` takes the current branch's threads and those on none,
+/// or another branch's or all; open or resolved ones, judged by the
+/// thread's first comment; and the review session's file with `session`.
+#[test]
+fn list_comments_filters_by_branch_and_state() {
+    let repo = repo();
+    let d = repo.path();
+    write(
+        d,
+        ".git/dffy/comments.json",
+        r#"{"version":1,"comments":[
+{"id":"m1","path":"lib.rs","text":"Open on main.","author":"","created":"t1","resolved":false,"branch":"main"},
+{"id":"m2","path":"lib.rs","text":"Done on main.","author":"","created":"t2","resolved":true,"branch":"main"},
+{"id":"m3","path":"lib.rs","text":"Reply.","author":"ada","created":"t3","in_reply_to":"m2","resolved":false,"branch":"main"},
+{"id":"t1","path":"lib.rs","text":"On topic.","author":"","created":"t4","resolved":false,"branch":"topic"}
+]}"#,
+    );
+    let mut server = Server::start(d);
+    initialize(&mut server);
+    let ids = |call: &Call| -> Vec<String> {
+        assert!(!call.is_error(), "{}", call.text());
+        call.structured()
+            .get("comments")
+            .and_then(Value::as_array)
+            .expect("comments")
+            .iter()
+            .filter_map(|c| c.get("id").and_then(Value::as_str).map(str::to_owned))
+            .collect()
+    };
+    let here = server.call("list_comments", "{}");
+    assert_eq!(ids(&here), ["m1", "m2", "m3"]);
+    let resolved = server.call("list_comments", r#"{"resolved":true}"#);
+    assert_eq!(ids(&resolved), ["m2", "m3"]);
+    let open = server.call("list_comments", r#"{"open":true}"#);
+    assert_eq!(ids(&open), ["m1"]);
+    assert_eq!(
+        ids(&server.call("list_comments", r#"{"resolved":false}"#)),
+        ["m1"]
+    );
+    let topic = server.call("list_comments", r#"{"branch":"topic"}"#);
+    assert_eq!(ids(&topic), ["t1"]);
+    let all = server.call("list_comments", r#"{"all_branches":true,"open":true}"#);
+    assert_eq!(ids(&all), ["m1", "t1"]);
+    insta::assert_snapshot!(
+        "mcp_list_comments_filtered",
+        snapshot(&[all.raw_structured(), all.text().to_owned()])
+    );
+    for bad in [
+        r#"{"open":true,"resolved":true}"#,
+        r#"{"branch":"topic","all_branches":true}"#,
+        r#"{"session":true}"#,
+    ] {
+        let call = server.call("list_comments", bad);
+        assert!(call.is_error(), "{bad}");
+    }
+
+    let pr = d.join(".git/review/7.json");
+    write(
+        d,
+        ".git/review/7.json",
+        r#"{"version":1,"comments":[{"id":"p1","path":"lib.rs","text":"Posted.","author":"octocat","created":"t1","resolved":false,"ref":"github:1"}]}"#,
+    );
+    write(
+        d,
+        ".git/dffy/session",
+        &format!(
+            r#"{{"version":1,"comments":"{}","review":"7","branch":"main","head":"abc1234"}}"#,
+            pr.display()
+        ),
+    );
+    let session = server.call("list_comments", r#"{"session":true}"#);
+    assert_eq!(ids(&session), ["p1"]);
+}
+
 /// The repository stays open across calls, and each call sees it as it is
 /// now: a file written and a commit made after startup show on the next
 /// call.

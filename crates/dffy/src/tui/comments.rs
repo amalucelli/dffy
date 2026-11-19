@@ -8,7 +8,7 @@
 //! on the whole file under the file's first row, and one whose lines are
 //! gone under its last row; [`thread_rows`] writes what goes there.
 
-use std::cell::{Cell, OnceCell};
+use std::cell::{Cell, OnceCell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 use std::os::unix::fs::MetadataExt;
@@ -29,7 +29,7 @@ use super::view::{Entry, paint};
 use super::{fuzzy, tree};
 use crate::keys::{Action as Act, Keys};
 use crate::render::{Canvas, escape};
-use crate::review::{self, Anchor, Comment, LineNumbers, Op, Review};
+use crate::review::{self, Anchor, Comment, LineNumbers, Op, Review, who};
 use crate::term::{Grid, Key, Mods};
 use crate::theme::{Ink, Role, Theme};
 
@@ -109,6 +109,11 @@ pub(crate) struct Note {
     pub summary: String,
     pub suggestion: Option<String>,
     pub standing: Standing,
+    /// On the host, but only for you: in a review not submitted yet.
+    pub pending: bool,
+    /// For a draft, what posting it does, when that's news: refused
+    /// before, waiting for its lines, or going on the whole file. Escaped.
+    pub posting: Option<(Role, String)>,
 }
 
 impl Note {
@@ -138,6 +143,17 @@ pub(crate) struct Thread {
     /// A draft of the local review's file, shown on a review session's
     /// diff.
     pub local: bool,
+    /// The branch of a thread written on a branch other than the current
+    /// one, which only the comments panel lists. Escaped.
+    pub branch: Option<String>,
+}
+
+impl Thread {
+    /// Whether it holds someone else's comment not posted, as an agent's,
+    /// that `a` makes yours.
+    pub(crate) fn unposted(&self) -> bool {
+        self.notes.iter().any(|n| n.standing == Standing::Unposted)
+    }
 }
 
 /// The code a thread was written on, drawn at the top of its box when its
@@ -203,10 +219,29 @@ pub(super) enum Compose {
 impl Compose {
     /// The operation saving `text`, and what the status bar says after;
     /// `None` when there's nothing to save. A draft edited down to nothing
-    /// is deleted, as `d d` would.
+    /// is deleted, as `d d` would. A comment on lines that ends in a
+    /// `suggestion` fenced block, as [`with_suggestion`] writes it, keeps
+    /// the block's lines as its suggestion, as they were typed; a new one
+    /// suggesting the lines as they are, with nothing said, is nothing.
     pub(super) fn into_op(self, text: &str) -> Option<(Op, &'static str)> {
+        let lines = match &self {
+            Self::New(comment) => comment.end.is_some(),
+            Self::Edit { .. } => true,
+            Self::Reply(_) => false,
+        };
+        let (text, mut suggestion) = if lines {
+            split_suggestion(text)
+        } else {
+            (text, None)
+        };
         let text = text.trim();
-        if text.is_empty() {
+        if let Self::New(comment) = &self
+            && text.is_empty()
+            && suggestion == comment.anchor.as_ref().map(|a| a.lines.join("\n"))
+        {
+            suggestion = None;
+        }
+        if text.is_empty() && suggestion.is_none() {
             return match self {
                 Self::Edit { id, .. } => Some((Op::Rm(review::Target::Id(id)), "draft deleted")),
                 Self::New(_) | Self::Reply(_) => None,
@@ -215,6 +250,7 @@ impl Compose {
         Some(match self {
             Self::New(mut comment) => {
                 text.clone_into(&mut comment.text);
+                comment.suggestion = suggestion;
                 (
                     Op::Add {
                         comment,
@@ -233,12 +269,17 @@ impl Compose {
                 },
                 "reply saved",
             ),
-            Self::Edit { before, .. } if before.trim() == text => return None,
+            Self::Edit { before, .. }
+                if split_suggestion(&before) == (text, suggestion.clone()) =>
+            {
+                return None;
+            }
             Self::Edit { id, .. } => (
                 Op::Set {
                     target: review::Target::Id(id),
                     change: review::Change {
                         text: Some(text.to_owned()),
+                        suggestion: Some(suggestion),
                         ..review::Change::default()
                     },
                 },
@@ -248,11 +289,42 @@ impl Compose {
     }
 }
 
+/// `text` with `suggestion` after it as a closing `suggestion` fenced
+/// block, the way code hosts write one, to edit both in one box.
+pub(super) fn with_suggestion(text: &str, suggestion: Option<&str>) -> String {
+    let Some(suggestion) = suggestion else {
+        return text.to_owned();
+    };
+    let text = text.trim_end();
+    let gap = if text.is_empty() { "" } else { "\n\n" };
+    format!("{text}{gap}```suggestion\n{suggestion}\n```")
+}
+
+/// `text` without the closing `suggestion` fenced block [`with_suggestion`]
+/// writes, trimmed, and the block's lines, without their last line break.
+fn split_suggestion(text: &str) -> (&str, Option<String>) {
+    text.trim_end()
+        .strip_suffix("```")
+        .and_then(|t| t.rsplit_once("```suggestion\n"))
+        .filter(|(before, _)| before.is_empty() || before.ends_with('\n'))
+        .map_or_else(
+            || (text.trim(), None),
+            |(before, block)| {
+                let block = block.strip_suffix('\n').unwrap_or(block);
+                (before.trim(), Some(block.to_owned()))
+            },
+        )
+}
+
 /// The comments file shown and, on a review session's, the drafts of the
 /// local review's file (your comments without a ref, and their threads).
 /// A local draft shows only where it places on this diff, marked `local`;
 /// edits, replies and deletes in its thread go to the local file, and
 /// posting moves it to the session's first (see [`Comments::move_local`]).
+///
+/// The local review's file holds every branch's threads: only those on
+/// `branch` and on none are shown, the rest kept apart for the panel's
+/// "other branches" group. A review session's own file isn't split so.
 pub(super) struct Comments {
     path: PathBuf,
     /// The local review's file, when it isn't `path`.
@@ -260,10 +332,23 @@ pub(super) struct Comments {
     /// `path` is a review session's: your comments without a ref in it
     /// are drafts.
     session: bool,
+    /// The current branch; `None` on a detached HEAD.
+    branch: Option<String>,
+    /// New threads go to `local`, not `path`: on the review plain `dffy`
+    /// found, where they're the working tree's until posted.
+    new_local: bool,
     /// `path`'s comments, then `local`'s drafts.
     review: Review,
     /// The ids of the comments in `review` from `local`.
     from_local: HashSet<String>,
+    /// The threads of the local review's file on other branches, roots
+    /// first, as the file has them; not in `review`.
+    others: Vec<Comment>,
+    /// What posting each draft does, by id, when that's news: the words
+    /// its heading says.
+    plans: HashMap<String, (Role, String)>,
+    /// Renamed files in the list, by new path: their old path.
+    renamed: HashMap<BString, BString>,
     /// Each path's comments, replies included, as indices into `review`.
     by_path: HashMap<BString, Vec<usize>>,
     placed: HashMap<BString, Placed>,
@@ -280,6 +365,12 @@ pub(super) struct Comments {
     /// [`Comments::counts`] at the generation it was counted at: the status
     /// bar asks every frame.
     counted: Cell<Option<(u64, (usize, usize))>>,
+    /// [`Comments::host_pending`] at the generation it was counted at: the
+    /// status bar asks every frame.
+    pending_counted: Cell<Option<(u64, usize)>>,
+    /// [`Comments::tally`] of every path, at the generation it was counted
+    /// at: the tree asks for each row it draws, every frame.
+    tallied: RefCell<Option<(u64, Tallies)>>,
     /// How many general comments [`Comments::conversation`] shows, for the
     /// tree's row.
     general_len: usize,
@@ -288,10 +379,18 @@ pub(super) struct Comments {
 /// Modification time (seconds, nanoseconds), size and inode.
 type Stamp = (i64, i64, u64, u64);
 
+/// [`Comments::tally`] by path.
+type Tallies = HashMap<BString, (usize, Look)>;
+
 impl Comments {
     /// No comments until [`Comments::reload`] reads `path`, and `local`'s
-    /// drafts when it's another file.
-    pub(super) fn new(path: PathBuf, local: Option<PathBuf>, session: bool) -> Self {
+    /// drafts when it's another file. `branch` is the current branch.
+    pub(super) fn new(
+        path: PathBuf,
+        local: Option<PathBuf>,
+        session: bool,
+        branch: Option<String>,
+    ) -> Self {
         // Compared as the files they name: posting moves drafts from `local`
         // to `path`, and one file under two spellings would wait forever on
         // its own lock. A file not written yet is named by its directory.
@@ -304,8 +403,13 @@ impl Comments {
             local: local.filter(|l| *l != path && real(l).is_none_or(|l| Some(l) != real(&path))),
             path,
             session,
+            branch,
+            new_local: false,
             review: Review::default(),
             from_local: HashSet::new(),
+            others: Vec::new(),
+            plans: HashMap::new(),
+            renamed: HashMap::new(),
             by_path: HashMap::new(),
             placed: HashMap::new(),
             located: HashMap::new(),
@@ -313,6 +417,8 @@ impl Comments {
             generation: 0,
             conversation: OnceCell::new(),
             counted: Cell::new(None),
+            pending_counted: Cell::new(None),
+            tallied: RefCell::new(None),
             general_len: 0,
         }
     }
@@ -396,6 +502,13 @@ impl Comments {
         self.stamps = self.stamped();
         let mut review = review::read(&self.path)?;
         let mut from_local = HashSet::new();
+        let mut others = Vec::new();
+        if !self.session {
+            let (here, elsewhere) =
+                by_branch(std::mem::take(&mut review.comments), self.branch.as_deref());
+            review.comments = here;
+            others = elsewhere;
+        }
         if let Some(local) = &self.local {
             let drafts = review::read(local)?.comments;
             // Yours only: posting moves these threads, and someone else's
@@ -405,20 +518,27 @@ impl Comments {
                 .filter(|c| c.in_reply_to.is_none() && c.reference.is_none() && c.author.is_empty())
                 .map(|c| c.id.clone())
                 .collect();
-            for c in drafts {
-                if c.reference.is_none() && roots.contains(c.in_reply_to.as_ref().unwrap_or(&c.id))
-                {
-                    from_local.insert(c.id.clone());
-                    review.comments.push(c);
-                }
+            let drafts = drafts
+                .into_iter()
+                .filter(|c| {
+                    c.reference.is_none() && roots.contains(c.in_reply_to.as_ref().unwrap_or(&c.id))
+                })
+                .collect();
+            let (here, elsewhere) = by_branch(drafts, self.branch.as_deref());
+            for c in here {
+                from_local.insert(c.id.clone());
+                review.comments.push(c);
             }
+            others = elsewhere;
         }
         self.from_local = from_local;
         // Before the check: the local drafts may change when the review
         // doesn't.
         self.generation += 1;
+        let others_changed = others != self.others;
+        self.others = others;
         if review == self.review {
-            return Ok(None);
+            return Ok(others_changed.then(Vec::new));
         }
         let mut by_path: HashMap<BString, Vec<usize>> = HashMap::new();
         for (i, comment) in review.comments.iter().enumerate() {
@@ -426,6 +546,13 @@ impl Comments {
                 .entry(comment.path.as_bytes().into())
                 .or_default()
                 .push(i);
+            // An old side's lines are the old file's, which a diff that
+            // doesn't pair the rename lists on its own.
+            if let (Some(old), Some((review::Side::Old, _))) = (&comment.old_path, comment.range())
+                && *old != comment.path
+            {
+                by_path.entry(old.as_bytes().into()).or_default().push(i);
+            }
         }
         let same = |path: &BString| {
             let old = self.by_path.get(path).map_or(&[][..], Vec::as_slice);
@@ -455,9 +582,9 @@ impl Comments {
 
     /// Applies `ops` to a file under its lock, then reads it back: the
     /// local review's when the first names a local draft by id (a reply
-    /// in its thread, a change or a removal), else the comments file.
-    /// Returns the paths whose comments changed and the id each operation
-    /// touched.
+    /// in its thread, a change or a removal), or adds a thread while new
+    /// threads go there, else the comments file. Returns the paths whose
+    /// comments changed and the id each operation touched.
     pub(super) fn apply(
         &mut self,
         ops: Vec<Op>,
@@ -476,12 +603,154 @@ impl Comments {
             ) => Some(id),
             _ => None,
         };
+        let new_thread = matches!(ops.first(), Some(Op::Add { reply_to: None, .. }));
+        let local = named.is_some_and(|id| {
+            self.from_local.contains(id) || self.others.iter().any(|c| c.id == *id)
+        }) || (new_thread && self.new_local);
         let file = match &self.local {
-            Some(local) if named.is_some_and(|id| self.from_local.contains(id)) => local,
+            Some(file) if local => file,
             _ => &self.path,
         };
         let ids = review::apply(file, ops)?;
         Ok((self.reload()?.unwrap_or_default(), ids))
+    }
+
+    /// New threads go to the local review's file rather than the
+    /// comments file, when there's one.
+    pub(super) fn set_new_local(&mut self, on: bool) {
+        self.new_local = on && self.local.is_some();
+    }
+
+    /// Whether new threads written now go on the current branch: they go
+    /// to the local review's file, which keeps branches apart.
+    pub(super) fn branched(&self) -> bool {
+        !self.session || self.new_local
+    }
+
+    /// The summary being written for the review, kept in the comments file.
+    pub(super) fn summary(&self) -> Option<&str> {
+        self.review.summary.as_deref()
+    }
+
+    /// Writes the review's summary to the comments file, unless it's what
+    /// the file has already; empty removes it. Returns the paths whose
+    /// comments changed in the read back, as another writer's may have.
+    pub(super) fn keep_summary(&mut self, text: &str) -> Result<Vec<BString>, String> {
+        let summary = Some(text.trim_end()).filter(|s| !s.is_empty());
+        if summary == self.summary() {
+            return Ok(Vec::new());
+        }
+        review::apply(&self.path, vec![Op::Summary(summary.map(str::to_owned))])?;
+        Ok(self.reload()?.unwrap_or_default())
+    }
+
+    /// The path whose entry shows the thread with root `root` (see
+    /// [`Comments::homes`]); empty for a general comment's.
+    pub(super) fn home_of(&self, root: &str) -> Option<&str> {
+        self.find(root).map(|c| self.home(c))
+    }
+
+    /// The posted threads' roots, by `ref`: what a run importing from the
+    /// host is compared with, before and after, to find the new ones.
+    pub(super) fn posted_roots(&self) -> HashMap<String, String> {
+        self.review
+            .comments
+            .iter()
+            .filter(|c| c.in_reply_to.is_none() && !c.path.is_empty())
+            .filter_map(|c| Some((c.reference.clone()?, c.id.clone())))
+            .collect()
+    }
+
+    /// How many of the comments shown are on the host for you only.
+    pub(super) fn host_pending(&self) -> usize {
+        if let Some((generation, pending)) = self.pending_counted.get()
+            && generation == self.generation
+        {
+            return pending;
+        }
+        let pending = self.review.comments.iter().filter(|c| c.pending).count();
+        self.pending_counted.set(Some((self.generation, pending)));
+        pending
+    }
+
+    /// The drafts posting sends, in file order, local ones in view
+    /// included: each one's id, whether it's from the local review's file,
+    /// and whether the host refused it before.
+    pub(super) fn drafts(&self) -> Vec<(&str, bool, bool)> {
+        self.review
+            .comments
+            .iter()
+            .filter(|c| self.standing(c) == Standing::Draft && !self.hides(c))
+            .map(|c| {
+                (
+                    c.id.as_str(),
+                    self.from_local.contains(&c.id),
+                    c.post_error.is_some(),
+                )
+            })
+            .collect()
+    }
+
+    /// How many local drafts in view were written before `epoch` (seconds
+    /// since 1970), or at a time that doesn't read as one.
+    pub(super) fn local_drafts_before(&self, epoch: u64) -> usize {
+        self.local_shown()
+            .filter(|c| self.standing(c) == Standing::Draft)
+            .filter(|c| self::epoch(&c.created).is_none_or(|t| t < epoch))
+            .count()
+    }
+
+    /// Takes what posting each draft does, by id. Returns the paths whose
+    /// threads are to be placed again for it.
+    pub(super) fn set_plans(&mut self, plans: HashMap<String, (Role, String)>) -> Vec<BString> {
+        if plans == self.plans {
+            return Vec::new();
+        }
+        let ids: HashSet<&String> = plans
+            .iter()
+            .filter(|&(id, word)| self.plans.get(id) != Some(word))
+            .chain(self.plans.iter().filter(|(id, _)| !plans.contains_key(*id)))
+            .map(|(id, _)| id)
+            .collect();
+        let mut paths: Vec<BString> = self
+            .review
+            .comments
+            .iter()
+            .filter(|c| ids.contains(&c.id))
+            .map(|c| c.path.as_bytes().into())
+            .collect();
+        paths.sort_unstable();
+        paths.dedup();
+        for path in &paths {
+            self.placed.remove(path);
+        }
+        self.plans = plans;
+        self.generation += 1;
+        self.conversation = OnceCell::new();
+        paths
+    }
+
+    /// Whether `root` starts a thread on another branch.
+    pub(super) fn elsewhere(&self, root: &str) -> bool {
+        self.others.iter().any(|c| c.id == root)
+    }
+
+    /// Whether the host refused comment `id` when it was last posted.
+    pub(super) fn refused(&self, id: &str) -> bool {
+        self.find(id).is_some_and(|c| c.post_error.is_some())
+    }
+
+    /// `roots` in the order the threads are listed: by file, then line.
+    pub(super) fn in_order(&self, roots: &HashSet<String>) -> Vec<String> {
+        review::threads(
+            self.review
+                .comments
+                .iter()
+                .filter(|c| roots.contains(&c.id)),
+        )
+        .into_iter()
+        .map(|c| c.id.clone())
+        .collect()
     }
 
     /// The local drafts in view, replies included: what posting moves.
@@ -524,23 +793,59 @@ impl Comments {
     pub(super) fn locate(&mut self, files: &[Entry]) {
         self.generation += 1;
         self.located.clear();
+        self.renamed.clear();
         if self.by_path.is_empty() {
             return;
         }
         for (i, entry) in files.iter().enumerate() {
-            let path = &entry.change().path;
-            if !entry.is_commit() && self.by_path.contains_key(path) {
-                self.located.insert(path.clone(), i);
-            }
+            self.note_entry(i, entry);
         }
     }
 
     /// Notes `entry`, just listed at `file`, if it has comments.
     pub(super) fn locate_one(&mut self, file: usize, entry: &Entry) {
-        let path = &entry.change().path;
-        if !entry.is_commit() && self.by_path.contains_key(path) {
+        if self.note_entry(file, entry) {
             self.generation += 1;
-            self.located.insert(path.clone(), file);
+        }
+    }
+
+    /// Notes where `entry` is when it has comments, and a rename's old
+    /// path; returns whether it has.
+    fn note_entry(&mut self, file: usize, entry: &Entry) -> bool {
+        let change = entry.change();
+        if entry.is_commit() || !self.by_path.contains_key(&change.path) {
+            return false;
+        }
+        self.located.insert(change.path.clone(), file);
+        if let Status::Renamed { from, .. } = &change.status {
+            self.renamed.insert(change.path.clone(), from.clone());
+        }
+        true
+    }
+
+    /// Whether the thread starting with `root`, indexed under `key`, shows
+    /// on that path's entry. An old side's comment shows on its file's
+    /// entry when the diff pairs the rename, else on its old path's entry
+    /// when the list has one.
+    fn homes(&self, root: &Comment, key: &[u8]) -> bool {
+        self.home(root).as_bytes() == key
+    }
+
+    /// The path whose entry shows the thread starting with `root` (see
+    /// [`Comments::homes`]).
+    fn home<'a>(&self, root: &'a Comment) -> &'a str {
+        let Some(old) = root
+            .old_path
+            .as_deref()
+            .filter(|_| matches!(root.range(), Some((review::Side::Old, _))))
+        else {
+            return &root.path;
+        };
+        let paired = self.renamed.get(root.path.as_bytes()).map(|f| &f[..]) == Some(old.as_bytes());
+        if paired || !self.located.contains_key(old.as_bytes()) {
+            &root.path
+        } else {
+            old
         }
     }
 
@@ -612,7 +917,10 @@ impl Comments {
         let mut threads = Vec::new();
         let mut hidden = Vec::new();
         let roots = review::threads(indices.iter().map(|&i| &self.review.comments[i]));
-        for comment in roots.into_iter().filter(|c| c.in_reply_to.is_none()) {
+        for comment in roots
+            .into_iter()
+            .filter(|c| c.in_reply_to.is_none() && self.homes(c, path))
+        {
             let local = self.from_local.contains(&comment.id);
             let at = match comment.range() {
                 None => At::File,
@@ -654,14 +962,24 @@ impl Comments {
     /// The thread whose first comment is `root`, shown `at`. `highlight`
     /// colors the code of one whose lines weren't found.
     fn thread_of(&self, root: &Comment, at: At, highlight: bool) -> Thread {
+        self.thread_from(root, self.thread(&root.id), at, highlight)
+    }
+
+    /// The thread of `comments`, `root` first, shown `at`.
+    fn thread_from(
+        &self,
+        root: &Comment,
+        comments: Vec<&Comment>,
+        at: At,
+        highlight: bool,
+    ) -> Thread {
         Thread {
             root: root.id.clone(),
             look: self.look(root),
             resolved: root.resolved,
             outdated: root.outdated,
             url: root.url.clone(),
-            notes: self
-                .thread(&root.id)
+            notes: comments
                 .into_iter()
                 .map(|c| Note {
                     id: c.id.clone(),
@@ -671,6 +989,8 @@ impl Comments {
                     summary: markdown::summary(&c.text),
                     suggestion: c.suggestion.clone(),
                     standing: self.standing(c),
+                    pending: c.pending,
+                    posting: self.posting(c),
                 })
                 .collect(),
             lines: root
@@ -680,8 +1000,48 @@ impl Comments {
                 .unwrap_or_default(),
             snippet: (at == At::Lost).then(|| snippet(root, highlight)).flatten(),
             local: self.from_local.contains(&root.id),
+            branch: None,
             at,
         }
+    }
+
+    /// What posting draft `c` does, when that's news: the host refused it
+    /// before, else what the last plan said.
+    fn posting(&self, c: &Comment) -> Option<(Role, String)> {
+        if self.standing(c) != Standing::Draft {
+            return None;
+        }
+        match &c.post_error {
+            Some(why) => Some((Role::Warn, format!("refused: {}", escape(why.as_bytes())))),
+            None => self.plans.get(&c.id).cloned(),
+        }
+    }
+
+    /// The threads on other branches, for the comments panel: each with
+    /// its branch, on its file.
+    fn elsewhere_threads(&self) -> Vec<Thread> {
+        self.others
+            .iter()
+            .filter(|c| c.in_reply_to.is_none())
+            .map(|root| {
+                let comments = std::iter::once(root)
+                    .chain(
+                        self.others
+                            .iter()
+                            .filter(|c| c.in_reply_to.as_ref() == Some(&root.id)),
+                    )
+                    .collect();
+                let at = if root.range().is_some() {
+                    At::Lost
+                } else {
+                    At::File
+                };
+                Thread {
+                    branch: root.branch.as_deref().map(|b| escape(b.as_bytes())),
+                    ..self.thread_from(root, comments, at, false)
+                }
+            })
+            .collect()
     }
 
     /// The threads of `path`, once placed.
@@ -738,19 +1098,31 @@ impl Comments {
     /// How many comments `path` has, and how the most pressing thread
     /// among them looks.
     pub(super) fn tally(&self, path: &[u8]) -> Option<(usize, Look)> {
-        let mut shown = 0;
-        let mut look = None;
-        for &i in self.by_path.get(path)? {
-            let c = &self.review.comments[i];
-            if self.hides(c) {
-                continue;
+        let mut tallied = self.tallied.borrow_mut();
+        if tallied
+            .as_ref()
+            .is_none_or(|(generation, _)| *generation != self.generation)
+        {
+            let mut all = HashMap::new();
+            for (path, comments) in &self.by_path {
+                let mut shown = 0;
+                let mut look = None;
+                for c in comments.iter().map(|&i| &self.review.comments[i]) {
+                    if self.hides(c) {
+                        continue;
+                    }
+                    shown += 1;
+                    if c.in_reply_to.is_none() {
+                        look = look.max(Some(self.look(c)));
+                    }
+                }
+                if shown > 0 {
+                    all.insert(path.clone(), (shown, look.unwrap_or(Look::Open)));
+                }
             }
-            shown += 1;
-            if c.in_reply_to.is_none() {
-                look = look.max(Some(self.look(c)));
-            }
+            *tallied = Some((self.generation, all));
         }
-        (shown > 0).then(|| (shown, look.unwrap_or(Look::Open)))
+        tallied.as_ref()?.1.get(path).copied()
     }
 
     /// Threads in the file shown and the local drafts in view, and the
@@ -772,18 +1144,6 @@ impl Comments {
         );
         self.counted.set(Some((self.generation, counts)));
         counts
-    }
-
-    /// Drafts to post, local ones in view included: new threads, and
-    /// replies.
-    pub(super) fn unsent(&self) -> (usize, usize) {
-        let drafts = self
-            .review
-            .comments
-            .iter()
-            .filter(|c| self.standing(c) == Standing::Draft && !self.hides(c));
-        let replies = drafts.clone().filter(|c| c.in_reply_to.is_some()).count();
-        (drafts.count() - replies, replies)
     }
 
     fn look(&self, root: &Comment) -> Look {
@@ -872,7 +1232,7 @@ impl Comments {
         let (list, waiting) = self.listed(listing);
         let mut by_path: HashMap<&str, Vec<&Comment>> = HashMap::new();
         for &root in &list {
-            by_path.entry(&root.path).or_default().push(root);
+            by_path.entry(self.home(root)).or_default().push(root);
         }
         let mut paths: Vec<&str> = by_path.keys().copied().collect();
         paths.sort_unstable_by_key(|&p| (self.file_of(p.as_bytes()).unwrap_or(usize::MAX), p));
@@ -891,6 +1251,7 @@ impl Comments {
                 path: String::new(),
                 absent: false,
                 conversation: true,
+                branches: false,
             });
         }
         let general = items.len();
@@ -934,22 +1295,56 @@ impl Comments {
                 path: path.to_owned(),
                 absent,
                 conversation: false,
+                branches: false,
             });
         }
         #[cfg(test)]
         LISTED.with(|n| n.set(n.get() + 1));
         let threads = &items[general..];
+        let counts = [
+            threads.len(),
+            threads.iter().filter(|i| !i.thread().resolved).count(),
+        ];
+        let elsewhere: Arc<[Thread]> = self.elsewhere_threads().into();
+        if !elsewhere.is_empty() {
+            items.extend((0..elsewhere.len()).map(|at| Item {
+                group: files.len(),
+                rank: Rank::of(&elsewhere[at]),
+                threads: Arc::clone(&elsewhere),
+                at,
+                line: None,
+            }));
+            files.push(Group {
+                path: String::new(),
+                absent: true,
+                conversation: false,
+                branches: true,
+            });
+        }
         Listing {
             key: (self.generation, listing),
-            counts: [
-                threads.len(),
-                threads.iter().filter(|i| !i.thread().resolved).count(),
-            ],
+            counts,
             files,
             items,
             waiting,
         }
     }
+}
+
+/// `comments` split into the threads that show on `branch`, `None` for a
+/// detached HEAD, and the rest, each judged by its first comment.
+fn by_branch(comments: Vec<Comment>, branch: Option<&str>) -> (Vec<Comment>, Vec<Comment>) {
+    let elsewhere: HashSet<String> = comments
+        .iter()
+        .filter(|c| c.in_reply_to.is_none() && !c.on_branch(branch))
+        .map(|c| c.id.clone())
+        .collect();
+    if elsewhere.is_empty() {
+        return (comments, Vec::new());
+    }
+    comments
+        .into_iter()
+        .partition(|c| !elsewhere.contains(c.in_reply_to.as_ref().unwrap_or(&c.id)))
 }
 
 /// The line diff of a loaded file, the source of a rendered view: what
@@ -1222,26 +1617,12 @@ pub(crate) fn thread_text(thread: &Thread) -> String {
         .notes
         .iter()
         .map(|note| {
-            let author = if note.author.is_empty() {
-                "you"
-            } else {
-                &note.author
-            };
             let day = note.created.get(..10).unwrap_or(&note.created);
             let text = note.text.trim_end_matches(['\n', '\r']);
-            format!("{author} · {day}\n{text}")
+            format!("{} · {day}\n{text}", who(&note.author))
         })
         .collect();
     comments.join("\n\n")
-}
-
-/// `you` for an empty author.
-fn who(author: &str) -> String {
-    if author.is_empty() {
-        "you".to_owned()
-    } else {
-        escape(author.as_bytes())
-    }
 }
 
 /// Seconds since 1970 at `created`, an RFC 3339 time; `None` when it isn't
@@ -1305,6 +1686,12 @@ const AUTHOR: Ink = Ink {
     role: Role::Plain,
     syntax: None,
     attributes: Attributes::BOLD,
+};
+
+const DIM: Ink = Ink {
+    role: Role::Dim,
+    syntax: None,
+    attributes: Attributes::NONE,
 };
 
 fn spans_width<I>(spans: &[(I, &str)]) -> usize {
@@ -1549,11 +1936,23 @@ fn standing_tag(standing: Standing) -> Option<(Role, &'static str)> {
     }
 }
 
+/// The words after a comment's author: where it stands, what posting it
+/// does, and whether it's on the host for you only.
+fn note_tags(note: &Note) -> impl Iterator<Item = (Role, &str)> {
+    standing_tag(note.standing)
+        .into_iter()
+        .chain(
+            note.posting
+                .as_ref()
+                .map(|(role, word)| (*role, word.as_str())),
+        )
+        .chain(note.pending.then_some((Role::Hint, "pending")))
+}
+
 /// The words after a thread's first author: its state, then where it is
 /// when that's not on a line, with the line it was on.
-fn tags<'a>(thread: &'a Thread, first: &Note) -> Vec<(Role, &'a str)> {
-    let mut out = Vec::new();
-    out.extend(standing_tag(first.standing));
+fn tags<'a>(thread: &'a Thread, first: &'a Note) -> Vec<(Role, &'a str)> {
+    let mut out: Vec<(Role, &str)> = note_tags(first).collect();
     if thread.local {
         out.push((Role::Hint, "local"));
     }
@@ -1653,7 +2052,7 @@ pub(crate) fn thread_rows(
         let words = if i == 0 {
             tags(thread, note)
         } else {
-            standing_tag(note.standing).into_iter().collect()
+            note_tags(note).collect()
         };
         for (role, word) in words {
             spans.extend([(Role::Dim.into(), " · "), (role.into(), word)]);
@@ -1804,6 +2203,8 @@ struct Group {
     absent: bool,
     /// The general comments, listed first: not a file's.
     conversation: bool,
+    /// The threads on other branches, listed last while asked for.
+    branches: bool,
 }
 
 struct Item {
@@ -1853,9 +2254,12 @@ pub(super) struct Panel {
     search: String,
     /// Keys go to the search.
     pub editing: bool,
+    /// The threads on other branches are listed (`b`); folded to one row
+    /// otherwise.
+    others: bool,
     listing: Option<Listing>,
     rows: Vec<Row>,
-    /// The filter or the search changed since `rows` were made.
+    /// The filter, the search or `others` changed since `rows` were made.
     stale: bool,
     /// The last root [`Panel::select`] didn't find in `rows`, so a frame
     /// with a thread focused that the filter hides doesn't look again.
@@ -1876,6 +2280,7 @@ impl Panel {
             filter: 0,
             search: String::new(),
             editing: false,
+            others: false,
             listing: None,
             rows: Vec::new(),
             stale: true,
@@ -1904,10 +2309,16 @@ impl Panel {
 
     /// The selected thread's root.
     pub(super) fn selected(&self) -> Option<&str> {
+        self.thread().map(|t| t.root.as_str())
+    }
+
+    /// The selected thread, as the list was last made: placed, or made
+    /// for the panel when its file isn't in the diff.
+    pub(super) fn thread(&self) -> Option<&Thread> {
         let Row::Thread { item, .. } = self.rows.get(self.selected)? else {
             return None;
         };
-        Some(&self.listing.as_ref()?.items[*item].thread().root)
+        Some(self.listing.as_ref()?.items[*item].thread())
     }
 
     pub(super) fn select(&mut self, root: &str) {
@@ -1979,7 +2390,7 @@ impl Panel {
         let Some(list) = &self.listing else {
             return;
         };
-        self.rows = rows(list, self.filter, &self.search);
+        self.rows = rows(list, self.filter, &self.search, self.others);
         self.missed = None;
         let threads = self
             .rows
@@ -2054,6 +2465,10 @@ impl Panel {
                 self.filter = (self.filter + FILTERS.len() - 1) % FILTERS.len();
                 self.stale = true;
             }
+            (Key::Char('b'), _) if plain => {
+                self.others = !self.others;
+                self.stale = true;
+            }
             (_, Some(Act::FilterTree)) => self.editing = true,
             (_, Some(Act::ScrollDown)) => self.step(1),
             (_, Some(Act::ScrollUp)) => self.step(-1),
@@ -2084,7 +2499,8 @@ impl Panel {
             .iter()
             .filter(|r| {
                 matches!(r, Row::Thread { item, .. }
-                    if !list.files[list.items[*item].group].conversation)
+                    if !list.files[list.items[*item].group].conversation
+                        && !list.files[list.items[*item].group].branches)
             })
             .count();
         parts.push((format!(" · {kept}/{all}"), Role::Dim));
@@ -2156,8 +2572,9 @@ impl Panel {
 }
 
 /// The rows of `list` that filter `filter` and `search` keep: each file's
-/// header, then its threads.
-fn rows(list: &Listing, filter: usize, search: &str) -> Vec<Row> {
+/// header, then its threads; the threads on other branches last, with
+/// `others`, else a row saying how many there are.
+fn rows(list: &Listing, filter: usize, search: &str, others: bool) -> Vec<Row> {
     let mut rows = Vec::new();
     if list.waiting > 0 {
         let s = if list.waiting == 1 { "" } else { "s" };
@@ -2174,9 +2591,21 @@ fn rows(list: &Listing, filter: usize, search: &str) -> Vec<Row> {
         }
         return rows;
     }
+    let elsewhere = |i: usize| list.files[list.items[i].group].branches;
+    let folded = if others {
+        0
+    } else {
+        (0..list.items.len()).filter(|&i| elsewhere(i)).count()
+    };
     let kept: Vec<usize> = (0..list.items.len())
-        .filter(|&i| keeps(list, &list.items[i], filter, search))
+        .filter(|&i| (others || !elsewhere(i)) && keeps(list, &list.items[i], filter, search))
         .collect();
+    if folded > 0 {
+        let s = if folded == 1 { "" } else { "s" };
+        rows.push(Row::Note(format!(
+            "{folded} thread{s} on other branches · b lists them"
+        )));
+    }
     if kept.is_empty() {
         rows.push(Row::Note(if search.is_empty() {
             FILTERS[filter].1.to_owned()
@@ -2232,13 +2661,15 @@ fn list_row(c: &mut Canvas, list: &Listing, row: &Row, width: usize) {
         Row::Note(text) => {
             cut(c, &[(Role::Dim, text.as_str())], width);
         }
-        Row::File { group, threads } if list.files[*group].conversation => {
-            spread(
-                c,
-                &[(AUTHOR, "Conversation")],
-                &[(Role::Dim, &threads.to_string())],
-                width,
-            );
+        Row::File { group, threads }
+            if list.files[*group].conversation || list.files[*group].branches =>
+        {
+            let title: &[(Ink, &str)] = if list.files[*group].conversation {
+                &[(AUTHOR, "Conversation")]
+            } else {
+                &[(AUTHOR, "Other branches"), (DIM, " · B moves one here")]
+            };
+            spread(c, title, &[(Role::Dim, &threads.to_string())], width);
         }
         Row::File { group, threads } => {
             let group = &list.files[*group];
@@ -2292,6 +2723,7 @@ fn list_row(c: &mut Canvas, list: &Listing, row: &Row, width: usize) {
             let words = [
                 (thread.at == At::Lost && !list.files[item.group].absent)
                     .then_some((moved, "moved")),
+                thread.branch.as_deref().map(|b| (ink(Role::Hint), b)),
                 thread.local.then_some((ink(Role::Hint), "local")),
                 (first.standing == Standing::Unposted).then_some((ink(Role::Dim), "not posted")),
                 kind.map(|k| (ink(Role::Dim), k)),
@@ -2404,7 +2836,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("comments.json");
         std::fs::write(&path, "{\"version\":1,\"notice\":\"a\",\"comments\":[]}").expect("write");
-        let mut comments = Comments::new(path.clone(), None, false);
+        let mut comments = Comments::new(path.clone(), None, false, None);
         assert_eq!(comments.refresh(), Ok(Some(Vec::new())), "the first read");
         let before = std::fs::metadata(&path)
             .expect("stat")
@@ -2438,7 +2870,8 @@ mod tests {
         let alias = dir.path().join("alias");
         std::os::unix::fs::symlink(&real, &alias).expect("symlink");
         let path = real.join("comments.json");
-        let sources = |local: PathBuf| Comments::new(path.clone(), Some(local), true).sources();
+        let sources =
+            |local: PathBuf| Comments::new(path.clone(), Some(local), true, None).sources();
         let alone = std::slice::from_ref(&path);
         assert_eq!(
             sources(alias.join("comments.json")),

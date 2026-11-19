@@ -104,7 +104,6 @@ pub(crate) fn theme(ctx: &Ctx) -> Theme {
 /// away so a second viewer started meanwhile doesn't show it too.
 fn prepare(app: &mut App, ctx: &Ctx) {
     app.set_color(ctx.color_out);
-    app.set_naming(ctx.described().map(|d| d.naming.clone()));
     app.set_view_remembered(ctx.sources.get("view") == crate::config::Source::LastUsed);
     app.start_tree(ctx.sources.get("tree") == crate::config::Source::LastUsed);
     app.set_context_lines(ctx.context_lines);
@@ -198,8 +197,9 @@ pub(crate) fn run(
                     break None;
                 }
                 let mut c = Canvas::default();
-                let message =
+                let mut message =
                     print::empty_message(&repo, &selected, &paths, ctx.config.default_diff);
+                message.extend(open_comments(&repo));
                 c.line(Role::Dim, &message);
                 let mut out = Vec::new();
                 c.write_to(&mut out, ctx.out_theme())?;
@@ -219,6 +219,9 @@ pub(crate) fn run(
         ctx.indicators(),
     );
     prepare(&mut app, ctx);
+    // Not in `prepare`: a piped diff has no review, so the plugin isn't
+    // asked to describe itself for one.
+    app.set_naming(ctx.described().map(|d| d.naming.clone()));
     app.set_selected(selected, ctx.config.default_diff);
     app.set_repository(
         repo.workdir()
@@ -239,7 +242,12 @@ pub(crate) fn run(
     }
     // Absolute: review plugins get it, and run from the working tree's root.
     let absolute = |path: PathBuf| std::path::absolute(&path).unwrap_or(path);
-    let default = repo.git_dir().map(crate::review::default_path);
+    // A local file that can't be had, as when moving an old one failed,
+    // leaves the viewer without it rather than without the diff.
+    let default = crate::review::local_file(&repo).unwrap_or_else(|e| {
+        app.message(format!("no local comments: {e}"));
+        None
+    });
     let comments = ctx
         .comments
         .clone()
@@ -306,8 +314,33 @@ pub(crate) fn run(
     }
     let result = session.interact(&mut app, tx, &rx);
     term::restore();
+    // Off the alternate screen, so it stays once the viewer is gone.
+    if let Some(note) = app.unposted_note() {
+        eprintln!("{note}");
+    }
     result?;
     Ok(ExitCode::SUCCESS)
+}
+
+/// What an empty diff's message adds when the local review's file has
+/// threads left open on this branch, and how to see them: read only on
+/// the way out, with no frame waiting on it.
+fn open_comments(repo: &Repo) -> Option<String> {
+    let file = crate::review::local_file_read_only(repo)?;
+    let comments = crate::review::read(&file).ok()?;
+    let branch = crate::review::current_branch(repo);
+    let select = crate::review::Select {
+        resolved: Some(false),
+        branches: crate::review::Branches::On(branch.as_deref()),
+        ..crate::review::Select::default()
+    };
+    let open = (comments.selected(&select).iter())
+        .filter(|c| c.in_reply_to.is_none() && !c.path.is_empty())
+        .count();
+    let s = if open == 1 { "" } else { "s" };
+    (open > 0).then(|| {
+        format!(" · {open} open comment{s} · dffy comments lists them, dffy HEAD~1.. shows them")
+    })
 }
 
 /// Runs the viewer on `tty` for the diff arriving on `stdin`, read only as
@@ -408,6 +441,28 @@ fn watch_comments(
         .ok()
 }
 
+/// How long a signal to stop waits for a post running to end, as killing
+/// it leaves the review half sent until the next post.
+const POST_GRACE: Duration = Duration::from_secs(30);
+
+/// A signal or the terminal going away stops the viewer: the text box's
+/// text is saved, and a post running may end first, for up to
+/// [`POST_GRACE`], taking only what review plugins say. The terminal may
+/// be gone, so nothing is drawn.
+fn stop(app: &mut App, rx: &mpsc::Receiver<Event>) {
+    app.interrupted();
+    let until = Instant::now() + POST_GRACE;
+    while app.posting_now() {
+        match rx.recv_timeout(until.saturating_duration_since(Instant::now())) {
+            Ok(event @ (Event::Review { .. } | Event::Comments)) => {
+                app.event(event);
+            }
+            Ok(_) => {}
+            Err(_) => return,
+        }
+    }
+}
+
 /// Opens `url` with the platform's opener, detached from the terminal;
 /// says so when it can't start.
 fn browse(app: &mut App, url: &str) {
@@ -433,20 +488,17 @@ fn browse(app: &mut App, url: &str) {
     }
 }
 
-/// Writes a review's summary to a new file of its own, for a plugin's
-/// `--summary-file`.
-fn write_summary(text: &str) -> io::Result<PathBuf> {
-    let path = std::env::temp_dir().join(format!("dffy-summary-{}.md", std::process::id()));
+/// Writes `text` to a new file at `path` that only you can read.
+fn write_private(path: &Path, text: &str) -> io::Result<()> {
     // Left over from a run that crashed; `create_new` then refuses to
     // follow a link put in its place.
-    std::fs::remove_file(&path).ok();
+    std::fs::remove_file(path).ok();
     std::fs::File::options()
         .write(true)
         .create_new(true)
         .mode(0o600)
-        .open(&path)
-        .and_then(|mut file| file.write_all(text.as_bytes()))?;
-    Ok(path)
+        .open(path)
+        .and_then(|mut file| file.write_all(text.as_bytes()))
 }
 
 /// The watch's sink: changes go to the change-set thread, the watch's
@@ -665,9 +717,12 @@ impl Session<'_> {
             self.paint(app)?;
             if self.unread.is_some() || self.detect.is_some() {
                 if let Some(path) = self.unread.take() {
+                    // HEAD is read here, after the first frame, once.
+                    app.set_branch(self.files.as_ref().and_then(crate::review::current_branch));
                     let files = app.comment_files(path.clone());
                     app.set_comments(path);
                     self.watching = watch_comments(files, self.events.clone());
+                    self.point_session(app);
                 }
                 if let Some(Action::Plugin {
                     id,
@@ -717,7 +772,10 @@ impl Session<'_> {
                         let (width, height) = self.tty.size();
                         app.resize(width, height);
                     }
-                    Event::Interrupt => return Ok(()),
+                    Event::Interrupt => {
+                        stop(app, rx);
+                        return Ok(());
+                    }
                     event => match app.event(event) {
                         Some(Action::Quit) => return Ok(()),
                         Some(Action::Edit { path, line }) => self.edit(app, &path, line)?,
@@ -887,7 +945,11 @@ impl Session<'_> {
         let Some(program) = crate::plugin::find(crate::plugin::REVIEW_PREFIX, plugin) else {
             return fail(format!("{name} isn't on PATH (see docs/plugins.md)"));
         };
-        let summary = match summary.map(|text| write_summary(&text)).transpose() {
+        let summary = summary.map(|text| {
+            let path = std::env::temp_dir().join(format!("dffy-summary-{}.md", std::process::id()));
+            write_private(&path, &text).map(|()| path)
+        });
+        let summary = match summary.transpose() {
             Ok(file) => file,
             Err(e) => return fail(format!("couldn't write the summary: {e}")),
         };
@@ -930,18 +992,29 @@ impl Session<'_> {
         if let Some(mut revisions) = revisions {
             // Checked first: once the list has a range that doesn't
             // resolve, every refresh after fails too.
-            if let (Some(last), Some(repo)) = (app.reviewed_from(), &self.files)
-                && !repo.is_revision(last)
-                && let Some(whole) = app.reviewed_head_missing()
-            {
-                revisions = whole;
+            let from = (app.reviewed_from()).map(|(last, head)| (last.to_owned(), head.to_owned()));
+            if let (Some((last, head)), Some(repo)) = (from, &self.files) {
+                if !repo.is_revision(&last) {
+                    if let Some(whole) = app.reviewed_head_missing() {
+                        revisions = whole;
+                    }
+                } else if repo
+                    .workdir()
+                    .is_some_and(|root| rewritten(root, &last, &head))
+                {
+                    app.reviewed_head_rebased();
+                }
             }
             self.requests.send(Request::Retarget(revisions)).ok();
         }
+        let repointed = comments.is_some() || moved.is_some();
         if let Some(path) = comments {
             let files = app.comment_files(path.clone());
             app.set_comments(path);
             self.watching = watch_comments(files, self.events.clone());
+        }
+        if repointed {
+            self.point_session(app);
         }
         if let (Some((old, new)), Some(root)) = (moved, self.files.as_ref().and_then(Repo::workdir))
         {
@@ -967,21 +1040,16 @@ impl Session<'_> {
     }
 
     /// Writes a comment in the editor, from `text`, on a temporary file
-    /// removed after; what's written goes to [`App::composed`].
+    /// removed after; what's written goes to [`App::composed`]. Text that
+    /// couldn't be saved, nor go back in the box, stays in a file of its
+    /// own, which the status bar names.
     fn compose(&self, app: &mut App, text: &str) -> io::Result<()> {
         let Some(reader) = &self.reader else {
             app.composed(None);
             return Ok(());
         };
         let path = std::env::temp_dir().join(format!("dffy-comment-{}.md", std::process::id()));
-        std::fs::remove_file(&path).ok();
-        let created = std::fs::File::options()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(&path)
-            .and_then(|mut file| file.write_all(text.as_bytes()));
-        if let Err(e) = created {
+        if let Err(e) = write_private(&path, text) {
             app.message(format!("couldn't write {}: {e}", path.display()));
             app.composed(None);
             return Ok(());
@@ -991,10 +1059,56 @@ impl Session<'_> {
         } else {
             None
         };
+        if app.composed(written).is_some() {
+            let kept = path.with_file_name(format!(
+                "dffy-comment-{}-{}.md",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |d| d.as_millis())
+            ));
+            let note = match std::fs::rename(&path, &kept) {
+                Ok(()) => format!("not saved; the text is in {}", kept.display()),
+                Err(_) => format!("not saved; the text is in {}", path.display()),
+            };
+            app.message(note);
+            return Ok(());
+        }
         std::fs::remove_file(&path).ok();
-        app.composed(written);
         Ok(())
     }
+
+    /// Points the session pointer at the review session shown, for `dffy
+    /// comments --session` and agents. It stays when the viewer exits;
+    /// the next session replaces it.
+    fn point_session(&self, app: &mut App) {
+        let (Some(repo), Some((comments, review, head))) = (&self.files, app.session_pointer())
+        else {
+            return;
+        };
+        let pointer = crate::review::Pointer {
+            comments,
+            review,
+            branch: crate::review::current_branch(repo),
+            head,
+        };
+        if let Err(e) = crate::review::write_session(repo, &pointer) {
+            app.message(format!("the session pointer isn't written: {e}"));
+        }
+    }
+}
+
+/// Whether git in `root` says `last` isn't an ancestor of `head`, as after
+/// a rebase; a git that can't tell says nothing.
+fn rewritten(root: &Path, last: &str, head: &str) -> bool {
+    Command::new("git")
+        .args(["merge-base", "--is-ancestor", last, head])
+        .current_dir(root)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|s| s.code() == Some(1))
 }
 
 #[cfg(test)]

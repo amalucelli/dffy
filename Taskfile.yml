@@ -201,14 +201,23 @@ tasks:
         msg: "{{.TAG}} doesn't match dffy's version in Cargo.toml; bump it first"
       - sh: test "v$(cargo pkgid -p dffy-core | sed 's/.*[#@]//')" = "{{.TAG}}"
         msg: "{{.TAG}} doesn't match dffy-core's version in crates/dffy-core/Cargo.toml; bump it first"
+      - sh: grep -q "^## {{trimPrefix "v" .TAG}} " CHANGELOG.md
+        msg: "CHANGELOG.md has no section for {{.TAG}}; add one first"
     env:
       GITHUB_TOKEN:
         sh: gh auth token
     cmds:
+      # The release notes are the tag's section of CHANGELOG.md, without its
+      # heading, with its relative doc links pointed at the tag on GitHub.
+      - mkdir -p target
+      - >-
+        awk -v v="{{trimPrefix "v" .TAG}}" '/^## /{p = ($2 == v); next} p' CHANGELOG.md
+        | sed 's#](docs/#](https://github.com/amalucelli/dffy/blob/{{.TAG}}/docs/#g'
+        > target/release-notes.md
       # goreleaser reads the tag from the remote, so it has to be pushed first.
       - git tag -s {{.TAG}} -m {{.TAG}}
       - git push --follow-tags
-      - goreleaser release --clean
+      - goreleaser release --clean --release-notes target/release-notes.md
 
   # Sequential on purpose: `deps:` would run these in parallel.
   ci:

@@ -173,7 +173,7 @@ As git's pager, `dffy` streams the whole 48MB patch in 3.1MB of its own memory, 
 
 ## Docs
 
-The [documentation](docs/README.md) covers every key, flag and setting: [installation](docs/install.md), [usage](docs/usage.md), [the viewer](docs/viewer.md), [keys](docs/keys.md), [configuration](docs/config.md), [themes](docs/themes.md), [git integration](docs/git.md), [watch mode](docs/watch.md), [review comments](docs/comments.md), [plugins](docs/plugins.md), [JSON output](docs/json.md), [the MCP server](docs/mcp.md), [troubleshooting](docs/troubleshooting.md), [architecture](docs/architecture.md) and [benchmarks](docs/benchmarks.md).
+The [documentation](docs/README.md) covers every key, flag and setting: [installation](docs/install.md), [usage](docs/usage.md), [the viewer](docs/viewer.md), [keys](docs/keys.md), [configuration](docs/config.md), [themes](docs/themes.md), [git integration](docs/git.md), [watch mode](docs/watch.md), [review comments](docs/comments.md), [plugins](docs/plugins.md), [JSON output](docs/json.md), [the MCP server](docs/mcp.md), [troubleshooting](docs/troubleshooting.md), [architecture](docs/architecture.md) and [benchmarks](docs/benchmarks.md). [CHANGELOG.md](CHANGELOG.md) lists what each release changed.
 
 ## License
 

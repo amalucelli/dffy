@@ -1,0 +1,18 @@
+---
+source: crates/dffy/src/tui/app.rs
+expression: screen(&mut app)
+---
+ ‹ 1/2 file.rs › +2 -2                                          @@ -1,7 +1,7 @@
+@@ -1,7 +1,7 @@                                                                █
+ 1  1  │ line 1                                                                ┃
+ 2  2  │ line 2                                                                ┃
+ 3  3  │ line 3                                                                ┃
+ 4    -│ line 4                                                                ┃
+    4 +│ line four                                                             ┃
+ 5  5  │ line 5                                                                ┃
+ 6  6  │ line 6                                                                ┃
+ 7  7  │ line 7                                                                ┃
+⋯ 39 unchanged lines  @@ -47,7 +47,7 @@ line 46         ┌──────────────────────┐
+47 47  │ line 47                                        │ Copy line        v y │
+48 48  │ line 48                                        │ Open in editor   e   │
+   working tree  1/2 hunk  unified             / search └──────────────────────┘

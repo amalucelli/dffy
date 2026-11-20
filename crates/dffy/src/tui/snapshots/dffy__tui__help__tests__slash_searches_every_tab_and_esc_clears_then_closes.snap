@@ -3,18 +3,20 @@ source: crates/dffy/src/tui/help.rs
 expression: "shown(&mut help, &keys, 100, 20)"
 ---
 
-
-
        ┌─ keybinds ──────────────────────────────────────────────────────────── esc close ─┐
        │  Move  Files  View  Copy  Other                                                   │
+       │ g home            top of file           Move                                      │
+       │ f ]               next file             Files                                     │
+       │ F [               prev file             Files                                     │
+       │ o                 find file             Files                                     │
+       │ G end             bottom of file        Move                                      │
+       │ c                 files with comments   Files                                     │
+       │ C                 comment on file       Other                                     │
+       │ enter l           open file or folder   Files                                     │
+       │ X                 toggle whole file     View                                      │
+       │ /                 filter tree           Files                                     │
        │                                                                                   │
-       │ g home            top of file           Move                                     ┃│
-       │ f ]               next file             Files                                    ┃│
-       │ F [               prev file             Files                                    ┃│
-       │ o                 find file             Files                                    ┃│
-       │ G end             bottom of file        Move                                     ┃│
-       │ enter l           open file or folder   Files                                    ┃│
-       │ X                 toggle whole file     View                                     ││
+       │                                                                                   │
        │                                                                                   │
        │ more settings: space · all keys: docs/keys.md                                     │
        │ /file▏ · esc clear                                                                │

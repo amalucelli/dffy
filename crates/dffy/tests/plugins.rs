@@ -26,6 +26,8 @@ struct Term {
     output: Arc<Mutex<Vec<u8>>>,
     vt: vt100::Parser,
     seen: usize,
+    /// The viewer's dffyd's, so it never registers with the user's.
+    _runtime: tempfile::TempDir,
 }
 
 impl Term {
@@ -60,6 +62,9 @@ impl Term {
         cmd.env("XDG_CONFIG_HOME", git.join("cfg"));
         cmd.env("XDG_CACHE_HOME", git.join("cache"));
         cmd.env("XDG_STATE_HOME", git.join("state"));
+        let runtime = tempfile::tempdir().expect("tempdir");
+        cmd.env("XDG_RUNTIME_DIR", runtime.path());
+        cmd.env("DFFY_DAEMON_IDLE_SECS", "1");
         let path = std::env::var("PATH").unwrap_or_default();
         cmd.env("PATH", format!("{}:{path}", bin.display()));
         for name in [
@@ -97,6 +102,7 @@ impl Term {
             output,
             vt: vt100::Parser::new(rows, cols, 0),
             seen: 0,
+            _runtime: runtime,
         }
     }
 
@@ -207,17 +213,15 @@ const ANSWER: &str = r#"{"version":1,
 {"kind":"paragraph","source":[4,5],"lines":[["SHARED TAIL."]]},
 {"kind":"paragraph","source":[6,7],"lines":[["A BRAND NEW PARAGRAPH."]]}]}"#;
 
-/// A directory holding `dffy-render-<name>`, a shell script of `body`.
-fn renderer(name: &str, body: &str) -> tempfile::TempDir {
+/// A directory holding the test renderer as `dffy-render-<name>`, doing
+/// what its name says (see the script), with [`ANSWER`] beside it.
+fn renderer(name: &str) -> tempfile::TempDir {
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().join(format!("dffy-render-{name}"));
-    std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).expect("write");
+    std::fs::write(&path, include_str!("fixtures/stubs/renderer.sh")).expect("write");
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    std::fs::write(dir.path().join("answer.json"), ANSWER).expect("write");
     dir
-}
-
-fn answering() -> tempfile::TempDir {
-    renderer("fake", &format!("cat >/dev/null\nprintf '%s' '{ANSWER}'"))
 }
 
 fn rgb(color: Option<vt100::Color>) -> (u8, u8, u8) {
@@ -230,8 +234,8 @@ fn rgb(color: Option<vt100::Color>) -> (u8, u8, u8) {
 #[test]
 fn the_rendered_view_shows_blocks_diffed_with_tints_and_word_emphasis() {
     let repo = repo(OLD, NEW);
-    let bin = answering();
-    let mut term = Term::spawn(repo.path(), "render = md:fake\n", bin.path());
+    let bin = renderer("answers");
+    let mut term = Term::spawn(repo.path(), "render = md:answers\n", bin.path());
     term.wait_for("the line diff", |t| t.contains("A brand new paragraph."));
     term.send("r");
     term.wait_for("the rendered view", |t| {
@@ -259,8 +263,8 @@ fn the_rendered_view_shows_blocks_diffed_with_tints_and_word_emphasis() {
 #[test]
 fn r_toggles_the_rendered_view_and_is_remembered() {
     let repo = repo(OLD, NEW);
-    let bin = answering();
-    let mut term = Term::spawn(repo.path(), "render = md:fake\n", bin.path());
+    let bin = renderer("answers");
+    let mut term = Term::spawn(repo.path(), "render = md:answers\n", bin.path());
     term.wait_for("the line diff", |t| t.contains("# Title"));
     term.send("r");
     term.wait_for("rendered", |t| {
@@ -276,7 +280,7 @@ fn r_toggles_the_rendered_view_and_is_remembered() {
     let state = std::fs::read_to_string(repo.path().join(".git/state/dffy/state")).expect("state");
     assert!(state.contains("rendered = true"), "{state}");
 
-    let mut term = Term::spawn(repo.path(), "render = md:fake\n", bin.path());
+    let mut term = Term::spawn(repo.path(), "render = md:answers\n", bin.path());
     term.wait_for("rendered from the start", |t| {
         t.contains("A BRAND NEW PARAGRAPH.")
     });
@@ -286,14 +290,11 @@ fn r_toggles_the_rendered_view_and_is_remembered() {
 /// The failed renderer isn't asked again for that file.
 #[test]
 fn a_slow_or_broken_renderer_falls_back_to_the_lines_with_a_note() {
-    for (body, note) in [
-        ("cat >/dev/null\nsleep 5", "took over 500ms"),
-        ("cat >/dev/null\necho nope", "bad answer"),
-    ] {
+    for (name, note) in [("slow", "took over 500ms"), ("broken", "bad answer")] {
         let repo = repo(OLD, NEW);
-        let runs = repo.path().join(".git/renderer-runs");
-        let bin = renderer("fake", &format!("echo run >> {}\n{body}", runs.display()));
-        let mut term = Term::spawn(repo.path(), "render = md:fake\n", bin.path());
+        let bin = renderer(name);
+        let runs = bin.path().join("runs");
+        let mut term = Term::spawn(repo.path(), &format!("render = md:{name}\n"), bin.path());
         term.wait_for("the line diff", |t| t.contains("# Title"));
         term.send("r");
         term.wait_for(note, |t| t.status().contains(note));
@@ -315,15 +316,9 @@ fn a_slow_or_broken_renderer_falls_back_to_the_lines_with_a_note() {
 #[test]
 fn moving_away_cancels_a_running_renderer() {
     let repo = repo(OLD, NEW);
-    let runs = repo.path().join(".git/renderer-runs");
-    let bin = renderer(
-        "fake",
-        &format!(
-            "echo start >> {runs}\ncat >/dev/null\nsleep 3\necho end >> {runs}",
-            runs = runs.display()
-        ),
-    );
-    let mut term = Term::spawn(repo.path(), "render = md:fake\n", bin.path());
+    let bin = renderer("late");
+    let runs = bin.path().join("runs");
+    let mut term = Term::spawn(repo.path(), "render = md:late\n", bin.path());
     term.wait_for("the line diff", |t| t.contains("# Title"));
     term.send("r");
     term.wait_for("the renderer", |_| runs.exists());
@@ -333,7 +328,7 @@ fn moving_away_cancels_a_running_renderer() {
     });
     std::thread::sleep(Duration::from_millis(3500));
     term.update();
-    assert_eq!(std::fs::read_to_string(&runs).expect("runs"), "start\n");
+    assert_eq!(std::fs::read_to_string(&runs).expect("runs"), "run\n");
     assert!(!term.status().contains("took over"), "{}", term.status());
     term.quit();
 }
@@ -353,15 +348,9 @@ fn alive(pid: &str) -> bool {
 #[test]
 fn quitting_stops_a_running_renderer() {
     let repo = repo(OLD, NEW);
-    let pids = repo.path().join(".git/renderer-pids");
-    let bin = renderer(
-        "fake",
-        &format!(
-            "sleep 300 &\necho \"$$ $!\" > {pids}.tmp\nmv {pids}.tmp {pids}\ncat >/dev/null\nwait",
-            pids = pids.display()
-        ),
-    );
-    let mut term = Term::spawn(repo.path(), "render = md:fake\n", bin.path());
+    let bin = renderer("forks");
+    let pids = bin.path().join("pids");
+    let mut term = Term::spawn(repo.path(), "render = md:forks\n", bin.path());
     term.wait_for("the line diff", |t| t.contains("# Title"));
     term.send("r");
     term.wait_for("the renderer", |_| pids.exists());
@@ -407,25 +396,19 @@ fn a_missing_renderer_gives_a_hint() {
 #[test]
 fn no_renderer_runs_until_r_is_pressed() {
     let repo = repo(OLD, NEW);
-    let marker = repo.path().join(".git/renderer-ran");
-    let bin = renderer(
-        "fake",
-        &format!(
-            "touch {}\ncat >/dev/null\nprintf '%s' '{ANSWER}'",
-            marker.display()
-        ),
-    );
-    let mut term = Term::spawn(repo.path(), "render = md:fake\n", bin.path());
+    let bin = renderer("answers");
+    let runs = bin.path().join("runs");
+    let mut term = Term::spawn(repo.path(), "render = md:answers\n", bin.path());
     term.wait_for("the line diff", |t| t.contains("# Title"));
     for key in ["f", "F", "n", "N", "j", "k"] {
         term.send(key);
         std::thread::sleep(Duration::from_millis(50));
     }
     std::thread::sleep(Duration::from_millis(300));
-    assert!(!marker.exists(), "the renderer ran unasked");
+    assert!(!runs.exists(), "the renderer ran unasked");
     term.send("r");
     term.wait_for("the rendered view", |t| t.contains("SHARED TAIL."));
-    assert!(marker.exists());
+    assert!(runs.exists());
     term.quit();
 }
 

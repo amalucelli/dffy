@@ -1,0 +1,52 @@
+---
+source: crates/dffy/src/tui/app.rs
+assertion_line: 8643
+expression: "narrow.join(\"\\n\\n\")"
+---
+┌ Comments · 6 threads ──┬
+│ …ted/module/file.rs  4 │
+│   ◆ you On the whole … │
+│   ◆ Why two?        ↩1 │
+│   ● octocat Fifty?     │
+│   ○ you Old four       │
+│ src/zz9.rs           1 │
+│   ◆ moved you Moved a… │
+│ gone.rs · not in t…  1 │
+│   ◆ you Gone           │
+│                        │
+
+┌ Comments · 6 threads ┬
+│ …d/module/file.rs  4 │
+│   ◆ you On the whol… │
+│   ◆ Why two?      ↩1 │
+│   ● octocat Fifty?   │
+│   ○ you Old four     │
+│ src/zz9.rs         1 │
+│   ◆ moved you Moved… │
+│ gone.rs · not in…  1 │
+│   ◆ you Gone         │
+│                      │
+
+┌ Comments ──────────┬
+│ …module/file.rs  4 │
+│   ◆ you On the wh… │
+│   ◆ Why two?       │
+│   ● octocat Fifty? │
+│   ○ you Old four   │
+│ src/zz9.rs       1 │
+│   ◆ moved you Mov… │
+│ gone.rs · not …  1 │
+│   ◆ you Gone       │
+│                    │
+
+┌ Comments ────────┬
+│ …dule/file.rs  4 │
+│   ◆ you On the … │
+│   ◆ Why two?     │
+│   ● octocat Fif… │
+│   ○ you Old four │
+│ src/zz9.rs     1 │
+│   ◆ moved you M… │
+│ gone.rs · no…  1 │
+│   ◆ you Gone     │
+│                  │

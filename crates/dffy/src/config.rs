@@ -301,6 +301,11 @@ pub(crate) const KEYS: &[Key] = &[
         default: "false",
     },
     Key {
+        name: "review",
+        doc: "Experimental: the review plugin, the program dffy-review-<name> on PATH. It adds the command it names to open one of the code host's reviews in the viewer, and plain `dffy` asks it for the branch's; empty for none, and no such command. --review <name> sets it for one run. See docs/plugins.md.",
+        default: "",
+    },
+    Key {
         name: "watch",
         doc: "Start the viewer in watch mode, refreshing as files, the index or refs change; `w` toggles it. With nothing to show, a watching viewer opens and waits for changes instead of printing that there are none.",
         default: "false",
@@ -347,7 +352,7 @@ pub(crate) const KEYS: &[Key] = &[
     },
     Key {
         name: "mouse",
-        doc: "Take mouse input in the viewer: clicks, the wheel, and dragging over code to select and copy it. `M` turns it off for the terminal's own selection (many terminals, Ghostty included, also select natively with shift held while dragging).",
+        doc: "Take mouse input in the viewer: clicks, the wheel, and dragging over code to select and copy it. `M` in the command panel turns it off for the terminal's own selection (many terminals, Ghostty included, also select natively with shift held while dragging).",
         default: "true",
     },
     Key {
@@ -388,6 +393,7 @@ pub(crate) struct Config {
     pub syntax_diff: bool,
     pub render: Renderers,
     pub rendered: bool,
+    pub review: Option<String>,
     pub watch: bool,
     pub tree: TreeMode,
     /// `None` follows the terminal's width.
@@ -431,6 +437,7 @@ impl Default for Config {
             syntax_diff: false,
             render: Renderers::default(),
             rendered: false,
+            review: None,
             watch: false,
             tree: TreeMode::Auto,
             tree_width: None,
@@ -498,6 +505,11 @@ impl Config {
             "syntax-diff" => self.syntax_diff = boolean(value)?,
             "render" => self.render = Renderers::parse(value)?,
             "rendered" => self.rendered = boolean(value)?,
+            "review" if value.is_empty() => self.review = None,
+            "review" => {
+                crate::plugin::check_name(value)?;
+                self.review = Some(value.to_owned());
+            }
             "watch" => self.watch = boolean(value)?,
             "tree" => self.tree = choice(value)?,
             "tree-width" => {
@@ -543,6 +555,7 @@ impl Config {
             "syntax-diff" => self.syntax_diff.to_string(),
             "render" => self.render.to_string(),
             "rendered" => self.rendered.to_string(),
+            "review" => self.review.clone().unwrap_or_default(),
             "watch" => self.watch.to_string(),
             "tree" => choice_name(&self.tree),
             "tree-width" => self

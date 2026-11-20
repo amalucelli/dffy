@@ -113,6 +113,11 @@ impl ChangeSet {
         self
     }
 
+    /// Lists `revisions` from the next [`ChangeSet::rescan`] on.
+    pub fn set_revisions(&mut self, revisions: Revisions) {
+        self.revisions = revisions;
+    }
+
     /// The current list, in enumeration order, without renames.
     #[must_use]
     pub fn files(&self) -> Vec<FileChange> {

@@ -288,6 +288,41 @@ pub(crate) fn string(out: &mut String, s: &str) {
     out.push('"');
 }
 
+/// Appends `value` as compact JSON. A repeated key is written as often as
+/// it was read.
+pub(crate) fn write(out: &mut String, value: &Value) {
+    match value {
+        Value::Null => out.push_str("null"),
+        Value::Bool(b) => out.push_str(if *b { "true" } else { "false" }),
+        Value::Number(n) => {
+            let _ = write!(out, "{n}");
+        }
+        Value::String(text) => string(out, text),
+        Value::Array(items) => {
+            out.push('[');
+            for (i, item) in items.iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                write(out, item);
+            }
+            out.push(']');
+        }
+        Value::Object(fields) => {
+            out.push('{');
+            for (i, (key, item)) in fields.iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                string(out, key);
+                out.push(':');
+                write(out, item);
+            }
+            out.push('}');
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

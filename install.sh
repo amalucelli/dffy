@@ -1,12 +1,12 @@
 #!/bin/sh
-# Installs the dffy binary, and optionally renderer plugins, from a GitHub release.
+# Installs the dffy binary, and optionally plugins, from a GitHub release.
 #
 #   curl -fsSL https://raw.githubusercontent.com/amalucelli/dffy/main/install.sh | sh
 #   curl -fsSL https://raw.githubusercontent.com/amalucelli/dffy/main/install.sh | sh -s -- --plugin markdown
 #
 # Options:
-#   --plugin NAME     also install the renderer plugin dffy-render-NAME next to dffy;
-#                     repeatable. Plugins: markdown, mermaid
+#   --plugin NAME     also install a plugin next to dffy; repeatable. Plugins: markdown
+#                     and mermaid (dffy-render-NAME), review-github (dffy-review-github)
 #
 # Environment:
 #   DFFY_PLUGINS      plugins to install, separated by spaces or commas; adds to --plugin
@@ -66,7 +66,11 @@ detect_arch() {
 # download URL DEST
 download() {
 	if has curl; then
-		curl -fsSL --retry 3 -o "$2" "$1" || die "download failed: $1"
+		# DFFY_BASE_URL may point at a local build over file:// or plain http.
+		case "$1" in
+		https://*) curl --proto '=https' --tlsv1.2 -fsSL --retry 3 -o "$2" "$1" || die "download failed: $1" ;;
+		*) curl -fsSL --retry 3 -o "$2" "$1" || die "download failed: $1" ;;
+		esac
 	elif has wget; then
 		wget -q -O "$2" "$1" || die "download failed: $1"
 	else
@@ -87,8 +91,8 @@ sha256() {
 # add_plugin NAME
 add_plugin() {
 	case "$1" in
-	markdown | mermaid) ;;
-	*) die "unknown plugin '$1'; available: markdown, mermaid" ;;
+	markdown | mermaid | review-github) ;;
+	*) die "unknown plugin '$1'; available: markdown, mermaid, review-github" ;;
 	esac
 	case " $plugins " in
 	*" $1 "*) ;;
@@ -179,7 +183,10 @@ main() {
 
 	binaries=dffy
 	for name in $plugins; do
-		binaries="$binaries dffy-render-$name"
+		case "$name" in
+		review-*) binaries="$binaries dffy-$name" ;;
+		*) binaries="$binaries dffy-render-$name" ;;
+		esac
 	done
 
 	say "downloading $binaries${version:+ ($version)}"
@@ -198,6 +205,13 @@ main() {
 	case ":${PATH:-}:" in
 	*":$install_dir:"*) ;;
 	*) say "$install_dir is not on your PATH; add it in your shell profile, e.g. export PATH=\"$install_dir:\$PATH\"" ;;
+	esac
+
+	case " $plugins " in
+	*" review-github "*)
+		command -v gh >/dev/null 2>&1 ||
+			say "dffy-review-github needs the GitHub CLI (gh): https://cli.github.com"
+		;;
 	esac
 }
 

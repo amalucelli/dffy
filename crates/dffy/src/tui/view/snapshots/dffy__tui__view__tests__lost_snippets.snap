@@ -1,0 +1,21 @@
+---
+source: crates/dffy/src/tui/view/tests.rs
+expression: unified
+---
+     │  ┌ ▾ ana · 3h ago · line 145 not found ────────────┐
+     │  │ 143   let request = Request {                   │
+     │  │ 144       url,                                  │
+     │  │ 145 +     headers: vec![("accept", "applicatio… │
+     │  │ 146       retries: 3,                           │
+     │  │ 147   };                                        │
+     │  │                                                 │
+     │  │ Accept anything here?                           │
+     │  └─────────────────────────────────────────────────┘
+     │
+     │  ┌ ▾ ana · 3h ago · outdated · old lines 140–141 … ┐
+     │  │ 139   fn count(items: &[u8]) -> usize {         │
+     │  │ 140 -     let n = items.len();                  │
+     │  │ 141 -     n                                     │
+     │  │                                                 │
+     │  │ Why inline it?                                  │
+     │  └─────────────────────────────────────────────────┘

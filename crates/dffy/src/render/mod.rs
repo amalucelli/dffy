@@ -397,24 +397,12 @@ impl Layout {
         }
     }
 
-    /// Whether `line` is a conflict marker git wrote into an unmerged file:
-    /// seven `<`, `|`, `=` or `>`, then the end of the line or a space and
-    /// a label (`=======` takes none). Removed lines never count.
+    /// Whether `line` is a conflict marker git wrote into an unmerged file
+    /// (see [`dffy_core::conflict::marker`]). Removed lines never count.
     fn conflict_marker(&self, line: &Line) -> bool {
-        if !self.unmerged || !matches!(line.state.kind(), Kind::Context | Kind::Added) {
-            return false;
-        }
-        let Some(&c @ (b'<' | b'|' | b'=' | b'>')) = line.text.first() else {
-            return false;
-        };
-        line.text
-            .get(..7)
-            .is_some_and(|run| run.iter().all(|&b| b == c))
-            && match line.text.get(7) {
-                None => true,
-                Some(b' ') => c != b'=',
-                Some(_) => false,
-            }
+        self.unmerged
+            && matches!(line.state.kind(), Kind::Context | Kind::Added)
+            && dffy_core::conflict::marker(line.text).is_some()
     }
 
     /// Columns of each line number; 0 without line numbers.
@@ -1412,6 +1400,12 @@ pub(crate) fn escape(bytes: &[u8]) -> String {
         ControlFlow::Continue(())
     });
     out
+}
+
+/// A line of code to draw in a comment's box or a printed thread: tabs as
+/// four spaces, escaped.
+pub(crate) fn plain(text: &str) -> String {
+    escape(text.replace('\t', "    ").as_bytes())
 }
 
 /// [`escape`] for a message of one or more lines, keeping its line breaks.

@@ -1,0 +1,21 @@
+---
+source: crates/dffy/src/tui/view/tests.rs
+expression: rows(34).1
+---
+     │  ┌ ▾ ana · 3h ago · lin… ┐
+     │  │ 143   let request = … │
+     │  │ 144       url,        │
+     │  │ 145 +     headers: v… │
+     │  │ 146       retries: 3, │
+     │  │ 147   };              │
+     │  │                       │
+     │  │ Accept anything here? │
+     │  └───────────────────────┘
+     │
+     │  ┌ ▾ ana · 3h ago · out… ┐
+     │  │ 139   fn count(items… │
+     │  │ 140 -     let n = it… │
+     │  │ 141 -     n           │
+     │  │                       │
+     │  │ Why inline it?        │
+     │  └───────────────────────┘

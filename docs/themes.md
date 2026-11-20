@@ -79,8 +79,8 @@ For example `bold #f8f8f2 on #44475a`.
 | `dim` | Secondary text: borders, separators, `⋯ unchanged lines`, untracked files (`?`), files marked viewed, and lines the syntax diff found only reformatted. |
 | `search-match`, `search-current` | Search matches, and the one `n`/`N` went to. |
 | `status-tag` | The chip in the status bar naming what's compared (`uncommitted`, `v6.0..v6.1`). |
-| `selection` | The selected row of the file tree, the picker and the command panel. Its background and attributes go over the row; its text color only fills in where the row's text has none, so status letters and counts keep their colors. |
-| `selection-inactive` | The tree's selected row while the diff has the keys. |
+| `selection` | The selected row of the file tree, the picker and the command panel. Its background and attributes go over the row; its text color only fills in where the row's text has none, so status letters and counts keep their colors. Its background alone also tints a folded review thread while it has the focus. |
+| `selection-inactive` | The tree's selected row while the diff has the keys. Its background alone also tints a folded review thread. |
 | `syntax-keyword` | Keywords. |
 | `syntax-string` | Strings. |
 | `syntax-escape` | Escape sequences in strings. |

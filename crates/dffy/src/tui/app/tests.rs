@@ -1,0 +1,13 @@
+mod command_panel;
+mod draw;
+mod jobs;
+mod keys;
+mod mouse;
+mod piped;
+mod render;
+mod review;
+mod search;
+mod staging;
+mod support;
+mod threads;
+mod tree;

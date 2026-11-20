@@ -37,13 +37,19 @@ use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
+use crate::comments;
 use crate::results::{Entry, Header, Results};
 use crate::{
     ROOT, Result, Sandbox, TIME, Timing, USAGE, bench_repo, describe, expand_tilde, instructions,
     median, now, peak_rss, quote, time_flag, which,
 };
 
-pub(crate) const GROUPS: [&str; 7] = ["frame", "engine", "pty", "count", "paint", "print", "pager"];
+pub(crate) const GROUPS: [&str; 8] = [
+    "frame", "engine", "pty", "count", "paint", "print", "pager", "comments",
+];
+
+/// The groups with only timings, which the quick tier leaves out.
+pub(crate) const TIMINGS_ONLY: [&str; 2] = ["pty", "comments"];
 
 /// A set's executables by cargo target kind and name. cargo also builds
 /// test harnesses for the `dffy` lib and bin when it builds the benches, so
@@ -106,6 +112,7 @@ pub(crate) fn main(cmd: &str, args: &[String]) -> Result<bool> {
     let mut groups = GROUPS.to_vec();
     let mut counted = Vec::new();
     let mut quick = false;
+    let mut allow_missing_baseline = false;
     let mut args = args.iter();
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -113,6 +120,7 @@ pub(crate) fn main(cmd: &str, args: &[String]) -> Result<bool> {
                 counted.extend(args.next().ok_or(USAGE)?.split(',').map(str::to_owned));
             }
             "--quick" if cmd == "bench-ab" => quick = true,
+            "--allow-missing-baseline" if cmd == "bench-ab" => allow_missing_baseline = true,
             "--layouts" if cmd == "bench-layouts" => {
                 layouts = args
                     .next()
@@ -158,7 +166,7 @@ pub(crate) fn main(cmd: &str, args: &[String]) -> Result<bool> {
         if !counted.is_empty() {
             return Err("--quick counts every divan benchmark; drop --instructions".to_owned());
         }
-        groups.retain(|&g| g != "pty");
+        groups.retain(|g| !TIMINGS_ONLY.contains(g));
     }
     let base = baseline(&dir)?;
     run(
@@ -167,7 +175,7 @@ pub(crate) fn main(cmd: &str, args: &[String]) -> Result<bool> {
         &groups,
         tier,
         &base.join("layout.tsv"),
-        &counted,
+        (&counted, allow_missing_baseline),
     )
 }
 
@@ -206,6 +214,52 @@ pub(crate) fn quick_supported() -> Result<()> {
     ))
 }
 
+/// A feature of dffy a group's scenario needs, which a baseline built from
+/// before the feature lacks. Such a group runs only on the sides that have
+/// it ([`sides`]), and `--full` measures its layout bands only on a
+/// baseline that has it. A group that needs one adds a row to [`NEEDS`].
+pub(crate) struct Needs {
+    pub group: &'static str,
+    /// What it needs, as the messages say it: `open a comments file`.
+    pub what: &'static str,
+    /// Whether the `dffy` given has it, checked with files under the
+    /// directory given, which may not hold them yet.
+    pub has: fn(dffy: &Path, dir: &Path) -> bool,
+}
+
+pub(crate) const NEEDS: [Needs; 1] = [Needs {
+    group: "comments",
+    what: "open a comments file",
+    has: comments::opens_in,
+}];
+
+/// What `group` needs, when it needs something.
+pub(crate) fn needs(group: &str) -> Option<&'static Needs> {
+    NEEDS.iter().find(|n| n.group == group)
+}
+
+/// The sides `need`'s group runs on, from whether each side's `dffy` `has`
+/// it. A group measured on B alone compares nothing, so a baseline
+/// without it fails the run unless `allow_missing_baseline`; a checkout
+/// without it always does.
+fn sides(need: &Needs, has: [bool; 2], allow_missing_baseline: bool) -> Result<[bool; 2]> {
+    let (group, what) = (need.group, need.what);
+    match has {
+        [_, false] => Err(format!(
+            "B's dffy can't {what}, which the {group} group needs"
+        )),
+        [false, true] if !allow_missing_baseline => Err(format!(
+            "A's dffy can't {what}, so the {group} group would compare nothing; \
+             pass --allow-missing-baseline to run it on B alone, or leave it out with --only"
+        )),
+        [false, true] => {
+            eprintln!("warning: A's dffy can't {what}; the {group} group runs only on B");
+            Ok(has)
+        }
+        [true, true] => Ok(has),
+    }
+}
+
 /// The set in `dir`, canonical, or how to build one.
 fn baseline(dir: &Path) -> Result<PathBuf> {
     let missing = |what: String| {
@@ -230,14 +284,16 @@ fn baseline(dir: &Path) -> Result<PathBuf> {
 /// allocation counts, and `noise` measures `base` against itself and writes
 /// its bands to `noise.tsv`. Timings are held to the layout bands in
 /// `layout`. `counted` names divan benchmarks to count the instructions of
-/// whatever their timing's result.
+/// whatever their timing's result; `allow_missing_baseline` runs the
+/// comments group on B alone when A can't open its file, which otherwise
+/// fails the run.
 pub(crate) fn run(
     base: &Path,
     rounds: usize,
     groups: &[&str],
     tier: &str,
     layout: &Path,
-    counted: &[String],
+    (counted, allow_missing_baseline): (&[String], bool),
 ) -> Result<bool> {
     let (quick, noise) = (tier == "quick", tier == "noise");
     let base = base.to_path_buf();
@@ -262,7 +318,7 @@ pub(crate) fn run(
         runner.plan_divan([&base, &candidate], groups)?;
     }
 
-    let mut metrics = runner.rounds(rounds, [&base, &candidate], groups)?;
+    let mut metrics = runner.rounds(rounds, [&base, &candidate], groups, allow_missing_baseline)?;
     let noise_file = base.join("noise.tsv");
     let layout = read_bands(layout);
     if noise {
@@ -607,12 +663,30 @@ impl Runner {
         Ok(())
     }
 
-    fn rounds(&self, rounds: usize, sets: [&Path; 2], groups: &[&str]) -> Result<Vec<Metric>> {
+    fn rounds(
+        &self,
+        rounds: usize,
+        sets: [&Path; 2],
+        groups: &[&str],
+        allow_missing_baseline: bool,
+    ) -> Result<Vec<Metric>> {
+        if groups.contains(&"comments") {
+            comments::fixture(&self.sandbox, &sets[1].join("dffy"))?;
+        }
+        let mut runs_on: HashMap<&str, [bool; 2]> = HashMap::new();
+        for need in groups.iter().filter_map(|g| needs(g)) {
+            let dir = self.sandbox.path("");
+            let has = sets.map(|set| (need.has)(&set.join("dffy"), &dir));
+            runs_on.insert(need.group, sides(need, has, allow_missing_baseline)?);
+        }
         let mut metrics: Vec<Metric> = Vec::new();
         for round in 1..=rounds {
             let order = if round % 2 == 1 { [0, 1] } else { [1, 0] };
             for group in groups {
                 for side in order {
+                    if runs_on.get(group).is_some_and(|on| !on[side]) {
+                        continue;
+                    }
                     eprintln!("round {round}/{rounds}: {group}, {}", SIDES[side]);
                     let tag = format!("{round}-{}", SIDES[side]);
                     let mut rows = self.measure(group, sets[side], side, &tag)?;
@@ -741,16 +815,21 @@ impl Runner {
         };
         for (ext, text) in [("txt", stdout), ("err", stderr)] {
             if !text.is_empty() {
-                let path = self.raw.join(format!("{stem}.{ext}"));
-                OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open(&path)
-                    .and_then(|mut f| f.write_all(text.as_bytes()))
-                    .map_err(|e| format!("{}: {e}", path.display()))?;
+                self.record(&format!("{stem}.{ext}"), text)?;
             }
         }
         result
+    }
+
+    /// Appends `text` to the raw file `name`.
+    fn record(&self, name: &str, text: &str) -> Result<()> {
+        let path = self.raw.join(name);
+        OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .and_then(|mut f| f.write_all(text.as_bytes()))
+            .map_err(|e| format!("{}: {e}", path.display()))
     }
 
     /// `run`'s stdout, and the instructions of `cmd` and what it started.
@@ -862,8 +941,22 @@ impl Runner {
                 rows.extend(self.hyperfine(tag, "pager/range", 5, 1, set, &args, patch)?);
                 rows.extend(self.peak_rss(tag, "pager/range peak RSS", set, &args, patch)?);
             }
+            "comments" => rows = self.comments(set, tag)?,
             _ => return Err(format!("unknown group {group}")),
         }
+        Ok(rows)
+    }
+
+    /// The comments group's rows for `set`, also kept as raw text.
+    fn comments(&self, set: &Path, tag: &str) -> Result<Vec<Row>> {
+        let times = comments::measure(&self.sandbox, &set.join("dffy"))?;
+        let mut raw = String::new();
+        let mut rows = Vec::new();
+        for (name, ms) in times {
+            let _ = writeln!(raw, "{name}: {ms:.1}ms");
+            rows.push((format!("comments/{name}"), Unit::Time, Some(ms * 1e6)));
+        }
+        self.record(&format!("{tag}-comments.txt"), &raw)?;
         Ok(rows)
     }
 
@@ -1218,7 +1311,7 @@ pub(crate) fn measure_layouts(
     for (k, set) in sets.iter().enumerate().skip(1) {
         runner.raw = raw.join(format!("layout-{k}"));
         fs::create_dir_all(&runner.raw).map_err(|e| format!("{}: {e}", runner.raw.display()))?;
-        for m in runner.rounds(rounds, [&sets[0], set], groups)? {
+        for m in runner.rounds(rounds, [&sets[0], set], groups, false)? {
             let ((Some(a), Some(b)), false) = (medians(&m), m.name == COUNT_MISMATCH) else {
                 continue;
             };
@@ -1451,6 +1544,22 @@ fn show(v: f64, unit: Unit) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A group compares A with B, so a baseline without what it needs
+    /// fails the run unless `--allow-missing-baseline` says to run it on B
+    /// alone; a checkout without it always fails. The comments group needs
+    /// a dffy that opens a comments file.
+    #[test]
+    fn a_baseline_without_what_a_group_needs_fails_it_unless_allowed() {
+        let need = needs("comments").expect("the comments group needs comments");
+        assert_eq!(sides(need, [true, true], false), Ok([true, true]));
+        let refused = sides(need, [false, true], false).unwrap_err();
+        assert!(refused.contains("--allow-missing-baseline"), "{refused}");
+        assert!(refused.contains("open a comments file"), "{refused}");
+        assert_eq!(sides(need, [false, true], true), Ok([false, true]));
+        assert!(sides(need, [true, false], true).is_err());
+        assert!(needs("frame").is_none());
+    }
 
     #[test]
     fn divan_names_times_and_mean_allocations() {

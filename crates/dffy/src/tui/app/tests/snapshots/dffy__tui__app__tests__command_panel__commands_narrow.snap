@@ -1,32 +1,31 @@
 ---
-source: crates/dffy/src/tui/app.rs
-assertion_line: 3576
+source: crates/dffy/src/tui/app/tests.rs
 expression: screen(&mut phone)
 ---
 ┌─ commands ───────────────────────── esc close ─┐
 │ Files                                         ┃│
 │     Find file…                            o   ┃│
-│     Filter tree…                          f / ┃│
-│     Search in diff…                       S / ┃│
+│     Filter tree…                          | / ┃│
+│ [ ] Files with comments                   ! c ┃│
 │ [ ] File tree                             t T ┃│
-│     Next file                             n f ┃│
-│     Previous file                         p F ┃│
+│     Next file                             f   ┃│
+│     Previous file                         F   ┃│
 │                                               ┃│
 │ View                                          ┃│
 │     Layout ‹ auto (unified here) ›        s   ┃│
-│ [ ] Wrap long lines                       w W ┃│
+│ [ ] Wrap long lines                       W   ┃│
 │ [ ] Syntax diff                           d   ┃│
 │ [ ] Rendered view                         r   ┃│
 │     More context                          x   ┃│
 │ [ ] Whole file                            X   ┃│
-│     Indicators ‹ classic ›                i   ┃│
-│     Modified lines ‹ changed ›            e   ┃│
-│ [x] Syntax highlighting                   H   ┃│
-│ [ ] Ignore whitespace                     W   ┃│
-│ [x] Line numbers                          L   ┃│
-│ [x] Hunk headers                          m   ││
-│     Status bar ‹ bottom ›                 b   ││
-│     Theme ‹ default ›                     c   ││
+│     Indicators ‹ classic ›                K   ┃│
+│     Modified lines ‹ changed ›            %   ││
+│ [x] Syntax highlighting                   *   ││
+│ [ ] Ignore whitespace                     I   ││
+│ [x] Line numbers                          #   ││
+│ [x] Hunk headers                          @   ││
+│     Status bar ‹ bottom ›                 B   ││
+│     Theme ‹ default ›                     a   ││
 │                                               ││
 │ Copy                                          ││
 │     Copy selection                        y   ││

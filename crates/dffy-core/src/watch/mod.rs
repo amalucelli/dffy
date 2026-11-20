@@ -123,6 +123,30 @@ impl Root {
         })
     }
 
+    /// Only the file `path`, which may not exist yet; its directory must.
+    /// Watching the directory sees the file replaced by a rename, which
+    /// atomic writers do.
+    ///
+    /// # Errors
+    ///
+    /// When `path`'s directory can't be resolved, or `path` has no name.
+    pub fn file(path: &Path) -> io::Result<Self> {
+        let name = path.file_name().ok_or(io::ErrorKind::InvalidInput)?;
+        let dir = match path.parent() {
+            Some(dir) if !dir.as_os_str().is_empty() => dir,
+            _ => Path::new("."),
+        };
+        let worktree = dir.canonicalize()?;
+        // A placeholder: a plain root never watches or reads it.
+        let git_dir = worktree.join(".git");
+        Ok(Self {
+            common_dir: git_dir.clone(),
+            git_dir,
+            worktree,
+            plain: Some(Plain::File(name.to_owned())),
+        })
+    }
+
     /// What `path` means, `None` when no diff depends on it (git's object
     /// store, logs, lock files, nested repositories' git directories).
     #[must_use]

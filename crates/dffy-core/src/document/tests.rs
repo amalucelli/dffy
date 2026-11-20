@@ -87,7 +87,7 @@ fn missing_names_the_work_for_the_rows_shown() {
     assert_eq!(missing(&doc, top, bottom), [Missing::Emphasis(1)]);
 
     // Ten lines each side of the separator: rows 0..10, 10, 11..21.
-    assert!(doc.expand(0, 1));
+    assert!(doc.expand(0, 1, unified));
     assert_eq!(doc.shown(0, 1).map(Shown::rows), Some(21));
     assert_eq!(
         missing(&doc, at(0, 3, 10), at(0, 3, 10)),
@@ -111,6 +111,210 @@ fn missing_names_the_work_for_the_rows_shown() {
             Missing::Structural
         ]
     );
+}
+
+/// A file's definitions are their own step, asked for once its
+/// highlighting is ready: until then it has no scopes, as before the
+/// highlighting.
+#[test]
+fn scopes_are_missing_once_the_highlighting_is_ready() {
+    let mut doc = Document::<()>::default();
+    doc.push(long_diff("long.c").change, Source::Repo);
+    let _ = doc.load(0, Ok(prepared(long_diff("long.c"))));
+    let missing = |doc: &Document<()>| doc.missing(at(0, 1, 0), at(0, 5, 0)).collect::<Vec<_>>();
+    assert_eq!(missing(&doc), [Missing::Emphasis(0), Missing::Emphasis(1)]);
+
+    let prepare = File::prepare(&GRAMMARS, None);
+    let file = doc.file(0).expect("loaded");
+    let (diff, slot) = (Arc::clone(file.diff()), file.syntax().cloned());
+    let (emphasis, syntax) = prepare.emphasis(&diff, 0, slot.as_ref());
+    doc.set_emphasis(0, &diff, 0, emphasis, syntax);
+    assert_eq!(missing(&doc), [Missing::Emphasis(1), Missing::Scopes]);
+    let file = doc.file(0).expect("loaded");
+    assert_eq!(file.scopes(Side::New, 2), None);
+
+    prepare.scopes(&diff, slot.as_ref().expect("highlighted"));
+    assert_eq!(missing(&doc), [Missing::Emphasis(1)]);
+    let file = doc.file(0).expect("loaded");
+    assert_eq!(file.scopes(Side::New, 2), Some(Vec::new()));
+}
+
+/// Each separator counts the lines it hides, and only the last carries the
+/// hunk's numbers; search scans the revealed lines. A position on a
+/// separator stays on its line, one on a line moves with it, and so does
+/// the place another file was left at. A window reaching an edge or another
+/// window joins it, and `x` opens the rest as before.
+#[test]
+fn lines_revealed_inside_a_gap_show_between_two_separators() {
+    let mut doc = Document::<()>::default();
+    doc.push(long_diff("long.c").change, Source::Repo);
+    doc.push(long_diff("other.c").change, Source::Repo);
+    let _ = doc.load(0, Ok(prepared(long_diff("long.c"))));
+    doc.open(0, unified);
+    let separator = |doc: &mut Document<()>, row| match doc.row(at(0, 3, row), unified) {
+        Some(Content::Separator { hidden, next }) => Some((hidden, next.is_some())),
+        _ => None,
+    };
+    // Gap 1 holds lines 7 to 56; line 30 is its 24th, so offset 23.
+    doc.pos = at(0, 3, 0);
+    assert!(doc.reveal_lines(0, Side::New, 29..30, 2, unified));
+    assert!(
+        !doc.reveal_lines(0, Side::New, 29..30, 2, unified),
+        "already shown"
+    );
+    let shown = doc.shown(0, 1).expect("loaded");
+    let lines: Vec<Option<usize>> = (0..shown.rows()).map(|r| shown.line(r)).collect();
+    assert_eq!(
+        lines,
+        [None, Some(21), Some(22), Some(23), Some(24), Some(25), None]
+    );
+    assert_eq!((shown.row(10), shown.row(23), shown.row(40)), (0, 3, 6));
+    assert_eq!(separator(&mut doc, 0), Some((21, false)));
+    assert_eq!(separator(&mut doc, 6), Some((24, true)));
+    assert_eq!(
+        doc.pos,
+        at(0, 3, 0),
+        "its first hidden line is still hidden"
+    );
+    assert_eq!(doc.hidden_lines(0), Some(vec![6..27, 32..56, 63..80]));
+
+    // On line 24 of the gap, then lines next to the top edge join it.
+    doc.pos = at(0, 3, 4);
+    assert!(doc.reveal_lines(0, Side::Old, 7..8, 2, unified));
+    let shown = doc.shown(0, 1).expect("loaded");
+    assert_eq!((shown.top, shown.rows()), (4, 4 + 1 + 5 + 1));
+    assert_eq!(doc.pos, at(0, 3, 4 + 1 + 3), "on the same line");
+
+    // 41 hidden lines: `x` reveals 20 from the edges.
+    assert!(doc.expand(0, 1, unified));
+    assert_eq!(doc.shown(0, 1).map(Shown::hidden), Some(21));
+    assert_eq!(doc.pos, at(0, 3, 14 + 1 + 3));
+
+    // Left for another file, then lines just above the window join it.
+    let _ = doc.goto_file(1);
+    assert!(doc.reveal_lines(0, Side::New, 24..25, 2, unified));
+    assert_eq!(doc.goto_file(0), Some(Settle::Keep));
+    assert_eq!(doc.pos, at(0, 3, 14 + 1 + 8));
+
+    // 16 hidden lines: `x` opens them whole.
+    assert!(doc.expand(0, 1, unified));
+    assert_eq!(
+        doc.shown(0, 1).map(|s| (s.hidden(), s.rows())),
+        Some((0, 50))
+    );
+    assert_eq!(doc.pos, at(0, 3, 24));
+}
+
+/// Revealing one gap leaves a position in another where it was, down to
+/// the screen row inside its line.
+#[test]
+fn revealing_a_gap_keeps_a_position_in_another() {
+    let mut doc = Document::<()>::default();
+    doc.push(long_diff("long.c").change, Source::Repo);
+    let _ = doc.load(0, Ok(prepared(long_diff("long.c"))));
+    assert!(doc.expand(0, 1, unified));
+    let on_a_line = Pos {
+        offset: 2,
+        ..at(0, 3, 2)
+    };
+    doc.pos = on_a_line;
+    assert!(doc.expand(0, 2, unified));
+    assert_eq!(doc.pos, on_a_line);
+}
+
+#[test]
+fn an_edge_revealed_past_a_window_keeps_its_lines() {
+    let mut doc = Document::<()>::default();
+    doc.push(long_diff("long.c").change, Source::Repo);
+    let _ = doc.load(0, Ok(prepared(long_diff("long.c"))));
+    // Line 53, the gap's 47th: 49 lines stay hidden, so ten from each edge.
+    assert!(doc.reveal_lines(0, Side::New, 52..53, 0, unified));
+    assert!(doc.expand(0, 1, unified));
+    let shown = doc.shown(0, 1).expect("loaded");
+    assert_eq!((shown.top, shown.bottom, shown.windows), (10, 10, &[][..]));
+}
+
+/// Swapping to the rendered view and back drops what the user revealed and
+/// keeps the lines the host revealed, those that showed already included.
+#[test]
+fn a_view_swap_keeps_only_the_lines_the_host_revealed() {
+    let mut doc = Document::<()>::default();
+    doc.push(long_diff("long.md").change, Source::Repo);
+    let _ = doc.load(0, Ok(prepared(long_diff("long.md"))));
+    // Ten lines from each edge of gap 1, which holds lines 7 to 56.
+    assert!(doc.expand(0, 1, unified));
+    assert!(
+        !doc.reveal_lines(0, Side::New, 9..10, 0, unified),
+        "in the top edge"
+    );
+    assert!(doc.reveal_lines(0, Side::New, 29..30, 0, unified));
+    let diff = Arc::clone(doc.diff_of(0).expect("loaded"));
+    let _ = doc.set_rendered(0, &diff, Ok(prepared(long_diff("long.md"))));
+    let _ = doc.set_rendered_mode(true);
+    let _ = doc.set_rendered_mode(false);
+    let shown = doc.shown(0, 1).expect("loaded");
+    assert_eq!(
+        (shown.top, shown.bottom, shown.windows),
+        (0, 0, &[3..4, 23..24][..])
+    );
+
+    // A diff cut into other gaps drops them, swapped in or not.
+    doc.restale();
+    let mut fd = long_diff("long.md");
+    fd.hunks.pop();
+    let _ = doc.load(0, Ok(prepared(fd)));
+    let diff = Arc::clone(doc.diff_of(0).expect("loaded"));
+    let _ = doc.set_rendered(0, &diff, Ok(prepared(long_diff("long.md"))));
+    let _ = doc.set_rendered_mode(true);
+    let _ = doc.set_rendered_mode(false);
+    assert_eq!(doc.shown(0, 1).map(|s| s.windows.len()), Some(0));
+}
+
+/// Lines revealed while the rendered view shows leave it as it is and show
+/// once the line diff is back.
+#[test]
+fn lines_revealed_under_the_rendered_view_show_in_the_line_diff() {
+    let mut doc = Document::<()>::default();
+    doc.push(long_diff("long.md").change, Source::Repo);
+    let _ = doc.load(0, Ok(prepared(long_diff("long.md"))));
+    let diff = Arc::clone(doc.diff_of(0).expect("loaded"));
+    let _ = doc.set_rendered_mode(true);
+    let _ = doc.set_rendered(0, &diff, Ok(prepared(long_diff("long.md"))));
+    assert!(!doc.reveal_lines(0, Side::New, 29..30, 0, unified));
+    assert_eq!(doc.shown(0, 1).map(|s| s.windows.len()), Some(0));
+    let _ = doc.set_rendered_mode(false);
+    assert_eq!(
+        doc.shown(0, 1)
+            .map(|s| (s.windows.len(), s.windows.first().cloned())),
+        Some((1, Some(23..24)))
+    );
+}
+
+/// The place a file was left at stays on its gap line when lines are
+/// revealed there after the list moved under it.
+#[test]
+fn a_saved_place_follows_a_reveal_after_the_list_moved() {
+    let mut doc = Document::<()>::default();
+    doc.push(long_diff("a.c").change, Source::Repo);
+    doc.push(long_diff("b.c").change, Source::Repo);
+    let _ = doc.load(0, Ok(prepared(long_diff("a.c"))));
+    doc.open(0, unified);
+    assert!(doc.expand(0, 1, unified));
+    // Gap line 44, in the bottom edge.
+    doc.pos = at(0, 3, 15);
+    let _ = doc.goto_file(1);
+    let page = FileChange {
+        path: "".into(),
+        status: Status::Modified,
+        old: None,
+        new: None,
+        staging: None,
+    };
+    assert_eq!(doc.set_page(Some((page, 1))), 1);
+    assert!(doc.reveal_lines(1, Side::New, 29..30, 2, unified));
+    let _ = doc.goto_file(1);
+    // Below a window of five lines and its separator.
+    assert_eq!(doc.pos, at(1, 3, 15 + 6));
 }
 
 /// `n` lands on each change of the file shown, then shows the next file;
@@ -168,6 +372,55 @@ fn changes_lead_across_files_and_wait_for_a_diff() {
     assert_eq!(doc.goto_file(0), None, "already shown");
 }
 
+/// A page goes first and stays there: the entries after it move down and
+/// the position stays on the file it was on, a refreshed list and a sort
+/// keep it first, and taking it away moves them back. Its rows are the
+/// host's count; it has no changes, so `n` passes over it.
+#[test]
+fn a_page_stays_first_and_files_move_around_it() {
+    let mut doc = Document::<()>::default();
+    doc.push(long_diff("b.c").change, Source::Repo);
+    doc.push(long_diff("a.c").change, Source::Repo);
+    let _ = doc.load(1, Ok(prepared(long_diff("a.c"))));
+    let _ = doc.goto_file(1);
+    doc.pos = at(1, 3, 2);
+    let page = |rows| {
+        Some((
+            FileChange {
+                path: "".into(),
+                status: Status::Modified,
+                old: None,
+                new: None,
+                staging: None,
+            },
+            rows,
+        ))
+    };
+    assert_eq!(doc.set_page(page(3)), 1);
+    assert!(doc.files()[0].is_page() && doc.files()[0].is_sheet());
+    assert_eq!(doc.pos, at(2, 3, 2), "on the same file");
+    assert_eq!(doc.rows(0, 0, unified), 3);
+    assert_eq!(doc.set_page(page(5)), 0, "already first");
+    assert_eq!(doc.rows(0, 0, unified), 5);
+
+    assert!(doc.sort_by_path());
+    let paths: Vec<String> = doc
+        .files()
+        .iter()
+        .map(|e| e.change().path.to_string())
+        .collect();
+    assert_eq!(paths, ["", "a.c", "b.c"]);
+    assert_eq!(doc.pos.file, 1, "a.c, sorted first after the page");
+    let _ = doc.goto_file(0);
+    assert_eq!(doc.pos, at(0, 0, 0));
+    assert_eq!(doc.next_change(unified).map(|_| doc.pos.file), Some(1));
+
+    assert_eq!(doc.set_page(None), -1);
+    assert_eq!(doc.files().len(), 2);
+    assert!(!doc.files()[0].is_page());
+    assert_eq!(doc.set_page(None), 0, "none to take away");
+}
+
 /// Eviction drops the least recently shown diffs first, never one in the
 /// range kept, and a dropped file wants its diff again.
 #[test]
@@ -179,11 +432,98 @@ fn eviction_drops_the_least_recently_shown_outside_the_kept_range() {
     }
     doc.touch(0, 2);
     doc.touch(1, 1);
-    let total = doc.loaded_bytes();
+    let total: usize = (0..2).filter_map(|i| doc.file(i)).map(File::bytes).sum();
     doc.evict(total - 1, &(0..0));
     assert!(doc.file(0).is_some());
     assert!(doc.file(1).is_none() && doc.files()[1].wants_diff());
     doc.evict(0, &(0..1));
     assert!(doc.file(0).is_some(), "the kept range stays");
-    assert_eq!(doc.loaded_bytes(), doc.file(0).map_or(0, File::bytes));
+}
+
+proptest::proptest! {
+    /// A line's row is the one a scan of the body and then of the rows
+    /// finds, in either arrangement, whatever the order of the hunk's
+    /// kinds of line, its blocks and its no-newline markers.
+    #[test]
+    fn a_lines_row_is_the_row_a_scan_finds(
+        kinds in proptest::collection::vec((0..3usize, proptest::bool::ANY), 0..40),
+        no_newline in proptest::bool::ANY,
+        split in proptest::bool::ANY,
+    ) {
+        let (mut old, mut new) = (0, 0);
+        let lines: Vec<diff::Line> = kinds
+            .iter()
+            .map(|&(k, block_start)| {
+                let kind = [LineKind::Context, LineKind::Removed, LineKind::Added][k];
+                let line = diff::Line {
+                    kind,
+                    old,
+                    new,
+                    emphasis: Vec::new(),
+                    unchanged: diff::Unchanged::No,
+                    block_start,
+                    paired: false,
+                };
+                old += usize::from(kind != LineKind::Added);
+                new += usize::from(kind != LineKind::Removed);
+                line
+            })
+            .collect();
+        // The last line of each side may end without a newline.
+        let last = |not: LineKind| lines.iter().rposition(|l| l.kind != not);
+        let marked = [last(LineKind::Added), last(LineKind::Removed)];
+        let mut body = Vec::new();
+        for (i, line) in lines.iter().enumerate() {
+            let line_index = u32::try_from(i).unwrap();
+            body.push(BodyLine { line: line_index, state: LineState::of(line) });
+            if no_newline && marked.contains(&Some(i)) {
+                body.push(BodyLine { line: line_index, state: LineState::NoNewline });
+            }
+        }
+        let arrangement = if split { Arrangement::Split } else { Arrangement::Unified };
+        let mut arranged = Vec::new();
+        let kind = |i: usize| {
+            let BodyLine { line, state } = body[i];
+            let block_start = state != LineState::NoNewline && lines[line as usize].block_start;
+            (state.kind(), block_start)
+        };
+        rows(arrangement, body.len(), kind, &mut arranged);
+        let core = Hunk { old_start: 0, old_len: old, new_start: 0, new_len: new, lines };
+        let view = HunkView {
+            heading: None,
+            body,
+            rows: arranged,
+            starts: Vec::new(),
+            arrangement: Some(arrangement),
+            other: None,
+            emphasis: None,
+            syntax: None,
+        };
+        let scan = |side: Side, line: usize| {
+            let body = view.body.iter().position(|b| {
+                let l = &core.lines[b.line as usize];
+                b.state != LineState::NoNewline
+                    && match side {
+                        Side::Old => l.kind != LineKind::Added && l.old == line,
+                        Side::New => l.kind != LineKind::Removed && l.new == line,
+                    }
+            })?;
+            view.rows.iter().position(|r| match *r {
+                Row::Line(i) => i == body,
+                Row::Pair(old, new) => old == Some(body) || new == Some(body),
+                Row::Header | Row::Marker => false,
+            })
+        };
+        for (side, len) in [(Side::Old, old), (Side::New, new)] {
+            for line in 0..=len {
+                proptest::prop_assert_eq!(
+                    line_row(&core, &view, side, line),
+                    scan(side, line),
+                    "{:?} line {}",
+                    side,
+                    line
+                );
+            }
+        }
+    }
 }

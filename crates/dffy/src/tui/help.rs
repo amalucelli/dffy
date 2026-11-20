@@ -17,7 +17,7 @@ use crate::term::{Grid, Key, Mods};
 use crate::theme::{Role, Style, Theme};
 
 /// Narrower screens get the whole screen.
-const FULL_SCREEN_BELOW: usize = 70;
+pub(super) const FULL_SCREEN_BELOW: usize = 70;
 const TITLE: &str = " keybinds ";
 const CLOSE: &str = " esc close ";
 const HINTS: &str = "tab section · / search · esc close";
@@ -51,7 +51,7 @@ fn tab(group: Group) -> usize {
         Group::Files => FILES,
         Group::View => 2,
         Group::Copy => 3,
-        Group::Modes | Group::Other => 4,
+        Group::Changes | Group::Modes | Group::Other => 4,
     }
 }
 
@@ -92,7 +92,12 @@ fn rows(keys: &Keys) -> Vec<Row> {
         .iter()
         .flat_map(|&action| {
             [false, true].into_iter().filter_map(move |tree| {
-                let mut chords = keys.chords(tree, action);
+                // A thread's keys and a conflict's show with the diff's:
+                // both are in it.
+                let thread = (keys.thread_chords(action))
+                    .chain(keys.conflict_chords(action))
+                    .filter(move |_| !tree);
+                let mut chords = keys.chords(tree, action).chain(thread);
                 let first = chords.next()?;
                 Some(Row {
                     action,
@@ -303,7 +308,7 @@ impl Help {
         let mut scored: Vec<(i64, Line<'a>)> = rows
             .iter()
             .filter_map(|row| {
-                let on = |text: &str| fuzzy::score_close(&self.filter, text);
+                let on = |text: &str| crate::fuzzy::score_close(&self.filter, text);
                 let typed = [Some(&row.key), row.alias.as_ref()]
                     .into_iter()
                     .flatten()
@@ -475,6 +480,19 @@ pub(super) fn frame(
     title: &str,
     theme: &Theme,
 ) {
+    border(grid, (x0, y0, width, height), theme);
+    let end = x0 + width;
+    grid.put_str(x0 + 2, y0, end - 1, title, theme.style(Role::FileHeader));
+    let close = end.saturating_sub(CLOSE.width() + 2);
+    grid.put_str(close, y0, end - 1, CLOSE, theme.style(Role::Dim));
+}
+
+/// Clears the box and draws its border.
+pub(super) fn border(
+    grid: &mut Grid,
+    (x0, y0, width, height): (usize, usize, usize, usize),
+    theme: &Theme,
+) {
     let end = x0 + width;
     let border = theme.style(Role::Dim);
     for y in y0..y0 + height {
@@ -493,9 +511,6 @@ pub(super) fn frame(
         }
         grid.put_str(end - 1, y, end, right, border);
     }
-    grid.put_str(x0 + 2, y0, end - 1, title, theme.style(Role::FileHeader));
-    let close = end.saturating_sub(CLOSE.width() + 2);
-    grid.put_str(close, y0, end - 1, CLOSE, border);
 }
 
 /// A scrollbar down column `x` from row `top`, `rows` tall, for a list of
@@ -581,6 +596,18 @@ mod tests {
         let mut help = Help::default();
         press(&mut help, &keys, "2");
         insta::assert_snapshot!(shown(&mut help, &keys, 100, 20));
+    }
+
+    /// Moving a thread to this branch is a key of its own, listed as any
+    /// other, not one that a focused thread takes over.
+    #[test]
+    fn moving_a_thread_here_is_listed_with_its_key() {
+        let keys = Keys::default();
+        let mut help = Help::default();
+        press(&mut help, &keys, "/move thread");
+        let text = shown(&mut help, &keys, 100, 20);
+        let row = text.lines().find(|l| l.contains("move thread here"));
+        assert!(row.is_some_and(|r| r.contains("V ")), "{text}");
     }
 
     #[test]

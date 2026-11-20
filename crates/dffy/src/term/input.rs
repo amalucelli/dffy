@@ -42,9 +42,12 @@ impl Mods {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Input {
     Key(Key, Mods),
+    /// Text pasted while bracketed paste is on, whole, its line ends as
+    /// the terminal sent them.
+    Paste(String),
     /// A wheel step: negative scrolls up. Cells are 0-based.
     Scroll {
         delta: i8,
@@ -56,8 +59,19 @@ pub(crate) enum Input {
         x: u16,
         y: u16,
     },
+    /// A left-button press with shift held, from terminals that report it
+    /// rather than keep it for their own selection.
+    ShiftClick {
+        x: u16,
+        y: u16,
+    },
     /// The pointer moved with the left button held.
     Drag {
+        x: u16,
+        y: u16,
+    },
+    /// A right-button press, with or without modifiers.
+    RightClick {
         x: u16,
         y: u16,
     },
@@ -97,11 +111,18 @@ pub(super) struct Parser {
     /// It stays, waiting for the rest with no timeout: read as Alt with
     /// the key, the reply's rest would arrive as keys.
     introduced: bool,
+    /// A bracketed paste started: its text so far. Read to its end with
+    /// no timeout and no length limit, since it's text, not a sequence.
+    pasting: Option<Vec<u8>>,
 }
+
+const PASTE_END: &[u8] = b"\x1b[201~";
 
 enum Parsed {
     /// Bytes consumed and what they meant, if anything.
     Done(usize, Option<Input>),
+    /// A bracketed paste starts after these bytes.
+    Paste(usize),
     Incomplete,
 }
 
@@ -114,11 +135,33 @@ impl Parser {
         self.buf.extend_from_slice(bytes);
         let mut i = 0;
         while i < self.buf.len() {
+            if let Some(mut text) = self.pasting.take() {
+                let rest = &self.buf[i..];
+                if let Some(at) = rest.windows(PASTE_END.len()).position(|w| w == PASTE_END) {
+                    text.extend_from_slice(&rest[..at]);
+                    i += at + PASTE_END.len();
+                    emit(Input::Paste(String::from_utf8_lossy(&text).into_owned()));
+                    continue;
+                }
+                // What could be the start of the end stays for the next read.
+                let keep = (1..PASTE_END.len())
+                    .rev()
+                    .find(|&n| rest.ends_with(&PASTE_END[..n]))
+                    .unwrap_or(0);
+                text.extend_from_slice(&rest[..rest.len() - keep]);
+                i = self.buf.len() - keep;
+                self.pasting = Some(text);
+                break;
+            }
             match parse(&self.buf[i..]) {
                 Parsed::Done(n, input) => {
                     if let Some(input) = input {
                         emit(input);
                     }
+                    i += n;
+                }
+                Parsed::Paste(n) => {
+                    self.pasting = Some(Vec::new());
                     i += n;
                 }
                 Parsed::Incomplete if self.buf.len() - i > MAX_SEQUENCE => i += 1,
@@ -131,7 +174,7 @@ impl Parser {
     /// Whether the start of a sequence is waiting for more bytes; call
     /// [`Parser::timeout`] when none come within [`ESC_TIMEOUT_MS`].
     pub(super) fn pending(&self) -> bool {
-        !self.buf.is_empty() && !self.introduced
+        !self.buf.is_empty() && !self.introduced && self.pasting.is_none()
     }
 
     /// No more bytes came. A lone ESC is the Escape key, ESC with one byte
@@ -139,6 +182,9 @@ impl Parser {
     /// for its rest, and anything longer is dropped; a string's rest is
     /// dropped too when it comes.
     pub(super) fn timeout(&mut self, emit: &mut impl FnMut(Input)) {
+        if self.pasting.is_some() {
+            return;
+        }
         match self.buf[..] {
             [0x1b, b']' | b'P' | b'_' | b'^'] => {
                 self.introduced = true;
@@ -250,6 +296,7 @@ fn escape(b: &[u8]) -> Parsed {
         _ => match parse(&b[1..]) {
             Parsed::Done(n, Some(Input::Key(k, mods))) => key(n + 1, k, mods.with(Mods::ALT)),
             Parsed::Done(n, other) => Parsed::Done(n + 1, other),
+            Parsed::Paste(n) => Parsed::Paste(n + 1),
             Parsed::Incomplete => Parsed::Incomplete,
         },
     }
@@ -342,6 +389,7 @@ fn csi(b: &[u8]) -> Parsed {
         b'Z' => Key::BackTab,
         b'P'..=b'S' => Key::F(last - b'P' + 1),
         b'~' => match params[0] {
+            Some(200) => return Parsed::Paste(end + 1),
             Some(1 | 7) => Key::Home,
             Some(4 | 8) => Key::End,
             Some(2) => Key::Insert,
@@ -400,12 +448,16 @@ fn x10_mouse(b: &[u8]) -> Parsed {
 }
 
 fn mouse(button: u16, x: u16, y: u16, press: bool) -> Option<Input> {
-    // Bit 6 marks wheel buttons, bit 5 motion; the low bits pick the button.
+    // Bit 6 marks wheel buttons, bit 5 motion; the low bits pick the button,
+    // and the bits between them the modifiers: 4 shift, 8 meta, 16 ctrl.
     // The legacy encoding reports any release as button 3.
+    let shift = button & 0b0001_1100 == 4;
     match (button & 0b1110_0011, press) {
         (64, true) => Some(Input::Scroll { delta: -1, x, y }),
         (65, true) => Some(Input::Scroll { delta: 1, x, y }),
+        (0, true) if shift => Some(Input::ShiftClick { x, y }),
         (0, true) => Some(Input::Click { x, y }),
+        (2, true) => Some(Input::RightClick { x, y }),
         (32, true) => Some(Input::Drag { x, y }),
         (0, false) | (3, true) => Some(Input::Release { x, y }),
         _ => None,
@@ -506,11 +558,34 @@ mod tests {
         );
     }
 
+    /// What macOS terminals send for the text box's word and line keys:
+    /// option as ESC before the key (or an xterm modifier), and command as
+    /// the readline controls it's mapped to.
+    #[test]
+    fn macos_word_and_line_editing_keys() {
+        assert_eq!(
+            keys(&[b"\x1b\x7f\x1b\x08\x1b[3;3~\x1bd\x1bb\x1bf\x1b[1;3D\x1b[1;3C\x15\x17\x01"]),
+            [
+                (Key::Backspace, Mods::ALT),
+                (Key::Backspace, Mods::ALT),
+                (Key::Delete, Mods::ALT),
+                (Key::Char('d'), Mods::ALT),
+                (Key::Char('b'), Mods::ALT),
+                (Key::Char('f'), Mods::ALT),
+                (Key::Left, Mods::ALT),
+                (Key::Right, Mods::ALT),
+                (Key::Char('u'), Mods::CTRL),
+                (Key::Char('w'), Mods::CTRL),
+                (Key::Char('a'), Mods::CTRL),
+            ]
+        );
+    }
+
     #[test]
     fn mouse_wheel_and_click() {
         assert_eq!(
             parse_all(&[
-                b"\x1b[<64;10;5M\x1b[<65;1;1M\x1b[<0;3;4M\x1b[<32;3;6M\x1b[<0;3;6m\x1b[<2;3;4M"
+                b"\x1b[<64;10;5M\x1b[<65;1;1M\x1b[<0;3;4M\x1b[<32;3;6M\x1b[<0;3;6m\x1b[<4;7;8M"
             ]),
             [
                 Input::Scroll {
@@ -526,6 +601,7 @@ mod tests {
                 Input::Click { x: 2, y: 3 },
                 Input::Drag { x: 2, y: 5 },
                 Input::Release { x: 2, y: 5 },
+                Input::ShiftClick { x: 6, y: 7 },
             ]
         );
         assert_eq!(
@@ -538,11 +614,64 @@ mod tests {
         );
     }
 
+    /// A right-button press is its own input whatever modifiers it came
+    /// with; its drags and its release mean nothing.
+    #[test]
+    fn right_button_presses() {
+        assert_eq!(
+            parse_all(&[b"\x1b[<2;3;4M\x1b[<34;3;5M\x1b[<2;3;5m\x1b[<18;7;8M\x1b[<10;1;1M"]),
+            [
+                Input::RightClick { x: 2, y: 3 },
+                Input::RightClick { x: 6, y: 7 },
+                Input::RightClick { x: 0, y: 0 },
+            ]
+        );
+        assert_eq!(
+            parse_all(&[b"\x1b[M\"!!\x1b[M#!!"]),
+            [
+                Input::RightClick { x: 0, y: 0 },
+                Input::Release { x: 0, y: 0 }
+            ]
+        );
+    }
+
+    /// A paste's end with no start, as after one cut short, is swallowed
+    /// like any unknown sequence.
     #[test]
     fn unknown_sequences_are_swallowed_whole() {
         assert_eq!(
-            keys(&[b"\x1b[?1;2c\x1b]2;title\x07\x1b[200~x\x1b[99zq"]),
+            keys(&[b"\x1b[?1;2c\x1b]2;title\x07\x1b[201~x\x1b[99zq"]),
             [(Key::Char('x'), N), (Key::Char('q'), N)]
+        );
+    }
+
+    /// A bracketed paste arrives as one input whatever its length and
+    /// however the reads split it, its terminator included; escapes and
+    /// line ends inside it are text, and the escape timeout never fires
+    /// in the middle of one.
+    #[test]
+    fn a_bracketed_paste_is_one_input() {
+        let mut parser = Parser::default();
+        let mut out = Vec::new();
+        let long = "y".repeat(500);
+        for chunk in [
+            &b"a\x1b[200~li"[..],
+            b"ne\r\n\x1b[Ax",
+            long.as_bytes(),
+            b"\x1b[20",
+        ] {
+            parser.feed(chunk, &mut |i| out.push(i));
+            assert!(!parser.pending(), "no timeout mid-paste");
+        }
+        parser.timeout(&mut |i| out.push(i));
+        parser.feed(b"1~b", &mut |i| out.push(i));
+        assert_eq!(
+            out,
+            [
+                Input::Key(Key::Char('a'), N),
+                Input::Paste(format!("line\r\n\x1b[Ax{long}")),
+                Input::Key(Key::Char('b'), N),
+            ]
         );
     }
 

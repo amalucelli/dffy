@@ -172,10 +172,11 @@ tasks:
       - cargo install --path crates/dffy --root ~/.local
 
   install:plugins:
-    desc: Install the experimental renderer plugins (dffy-render-markdown, dffy-render-mermaid) to ~/.local/bin
+    desc: Install the experimental plugins (dffy-render-markdown, dffy-render-mermaid, dffy-review-github) to ~/.local/bin
     cmds:
       - cargo install --path plugins/markdown --root ~/.local
       - cargo install --path plugins/mermaid --root ~/.local
+      - cargo install --path plugins/review-github --root ~/.local
 
   snapshot:
     desc: Build the release artifacts locally without tagging or publishing

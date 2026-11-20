@@ -3,9 +3,12 @@
 
 mod cli;
 mod config;
+mod control;
 mod daemon;
 mod docs;
 mod doctor;
+mod encode;
+mod fuzzy;
 mod json;
 mod keys;
 mod mcp;
@@ -15,6 +18,7 @@ mod pager;
 mod plugin;
 mod print;
 mod render;
+mod review;
 mod state;
 mod term;
 mod theme;
@@ -26,14 +30,17 @@ pub mod bench;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use std::sync::LazyLock;
+use std::sync::{Arc, LazyLock, Mutex, OnceLock, PoisonError};
 
-use clap::{ColorChoice, CommandFactory, FromArgMatches};
+use clap::{ColorChoice, CommandFactory};
 use dffy_core::cache::Cache;
 use dffy_core::git;
 use dffy_core::highlight::Registry;
 
-use cli::{Cli, Command, CommonArgs, DaemonAction, DiffArgs, ShowArgs, ViewArgs};
+use cli::{
+    BranchArgs, Cli, Command, CommentsAction, CommentsArgs, CommonArgs, DaemonAction, DiffArgs,
+    ShowArgs, ViewArgs,
+};
 use config::{Config, DefaultDiff, Indicators, ModifiedLines, Paging, View, Warning};
 use output::{Output, Term};
 use render::{Canvas, Layout};
@@ -60,7 +67,8 @@ pub(crate) fn grammars() -> &'static Registry {
 pub(crate) enum Error {
     /// The reader of our output went away; exit quietly with success.
     BrokenPipe,
-    /// Ctrl-C while a pager was showing our output; exit quietly.
+    /// Ctrl-C while a pager was showing our output, or before `dffy pr`'s
+    /// viewer opened; exit quietly.
     Interrupted,
     Fatal {
         message: String,
@@ -147,6 +155,13 @@ pub(crate) struct Ctx {
     pub color_err: bool,
     /// `None` when the cache is off or there's nowhere to put it.
     pub cache: Option<Cache>,
+    /// The review plugin set; `None` without one.
+    pub review_name: Option<String>,
+    /// Its description, once [`Ctx::review`] asked for it, or once parsing
+    /// needed its command.
+    pub review: OnceLock<Result<plugin::review::Described, String>>,
+    /// `--comments`, resolved; the viewer defaults to the repository's.
+    pub comments: Option<PathBuf>,
 }
 
 impl Ctx {
@@ -162,6 +177,21 @@ impl Ctx {
 
     fn err_theme(&self) -> Option<&Theme> {
         self.color_err.then_some(&self.theme)
+    }
+
+    /// The review plugin set, described: `None` without one, `Err` with
+    /// why it adds no command. Described on first use, as most runs never
+    /// ask and describing can wait on the plugin.
+    pub(crate) fn review(&self) -> Option<&Result<plugin::review::Described, String>> {
+        let name = self.review_name.as_deref()?;
+        Some(
+            self.review
+                .get_or_init(|| describe_review(name, self.cache.as_ref(), false)),
+        )
+    }
+
+    pub(crate) fn described(&self) -> Option<&plugin::review::Described> {
+        self.review()?.as_ref().ok()
     }
 
     /// The diff layout for this terminal. Off a terminal, unified lines are
@@ -267,15 +297,33 @@ impl Ctx {
 
 /// Runs dffy with the process's arguments.
 pub fn main() -> ExitCode {
-    let args = cli::with_default_subcommand(std::env::args_os().collect());
-    let mut command = Cli::command();
+    let mut raw = std::env::args_os();
+    if raw.nth(1).is_some_and(|a| a == plugin::review::DETACH) {
+        return plugin::review::exec_detached(raw);
+    }
+    let raw: Vec<_> = std::env::args_os().collect();
+    // Read before parsing: the review plugin they name adds a subcommand.
+    let loaded = config::load();
+    let (review_flag, no_cache) = cli::early_flags(&raw);
+    let cache = (loaded.config.cache && !no_cache)
+        .then(Cache::default_dir)
+        .flatten()
+        .map(|dir| Cache::new(dir, loaded.config.cache_size));
+    let builtin = Cli::command();
+    let review_name = review_flag.or_else(|| loaded.config.review.clone());
+    let review = OnceLock::new();
+    if let Some(name) = &review_name
+        && cli::parses_review(&builtin, &raw)
+    {
+        review.get_or_init(|| describe_review(name, cache.as_ref(), false));
+    }
+    let described = review.get().and_then(|r: &Result<_, _>| r.as_ref().ok());
+    let mut command = cli::with_review(builtin, described.map(|d| &d.naming));
+    let args = cli::with_default_subcommand(&command, raw);
     if let Some(choice) = color_flag(&args) {
         command = command.color(choice);
     }
-    let cli = match command
-        .try_get_matches_from(&args)
-        .and_then(|m| Cli::from_arg_matches(&m))
-    {
+    let cli = match cli::parse(command, &args) {
         Ok(cli) => cli,
         Err(e) => {
             e.print().ok();
@@ -287,7 +335,6 @@ pub fn main() -> ExitCode {
         }
     };
 
-    let loaded = config::load();
     let mut config = loaded.config;
     let mut sources = loaded.sources;
     let mut warnings = loaded.warnings;
@@ -306,15 +353,12 @@ pub fn main() -> ExitCode {
     let color_only = matches!(&cli.command, Some(Command::Diff(d)) if d.color_only);
     let color_out = output::use_color(config.color, term.stdout_tty || color_only);
     let theme = load_theme(&config, color_out, &mut warnings);
-    let cache = config
-        .cache
-        .then(Cache::default_dir)
-        .flatten()
-        .map(|dir| Cache::new(dir, config.cache_size));
     let ctx = Ctx {
         color_out,
         color_err: output::use_color(config.color, term.stderr_tty),
         cache,
+        review_name,
+        review,
         context_lines: config.context.hunk_lines(true),
         config,
         sources,
@@ -324,6 +368,11 @@ pub fn main() -> ExitCode {
         config_warnings: warnings,
         theme,
         term,
+        comments: cli
+            .global
+            .comments
+            .as_deref()
+            .and_then(|file| comments_file(cli.global.dir.as_deref(), Some(file), None).ok()),
     };
     let mut canvas = Canvas::default();
     for warning in &ctx.config_warnings {
@@ -349,6 +398,21 @@ pub fn main() -> ExitCode {
             ExitCode::from(FATAL)
         }
     }
+}
+
+/// The review plugin `name`, described from the cache unless `fresh`; see
+/// [`plugin::review::describe`].
+fn describe_review(
+    name: &str,
+    cache: Option<&Cache>,
+    fresh: bool,
+) -> Result<plugin::review::Described, String> {
+    let program = plugin::find(plugin::REVIEW_PREFIX, name)
+        .ok_or_else(|| format!("{}{name} isn't on PATH", plugin::REVIEW_PREFIX))?;
+    let builtin = Cli::command();
+    let reserved = |command: &str| cli::is_subcommand(&builtin, command);
+    let naming = plugin::review::describe(&program, cache, fresh, reserved)?;
+    Ok(plugin::review::Described { program, naming })
 }
 
 /// `--color` decides clap's own colors too, so it is read before parsing.
@@ -392,6 +456,10 @@ fn apply_flags(config: &mut Config, cli: &Cli) -> Vec<&'static str> {
     if g.no_cache {
         config.cache = false;
         set.push("cache");
+    }
+    if let Some(review) = &g.review {
+        config.review = Some(review.clone());
+        set.push("review");
     }
     let (view, watch) = match &cli.command {
         Some(Command::Diff(d)) => (&d.common.view, d.watch),
@@ -483,12 +551,257 @@ fn doctor(ctx: &Ctx, dir: Option<&Path>, json: bool) -> Result<ExitCode, Error> 
     })
 }
 
+/// Where dffy runs: the current directory, or `-C`'s relative to it.
+fn base_dir(dir: Option<&Path>) -> Result<PathBuf, Error> {
+    let cwd = std::env::current_dir()
+        .map_err(|e| Error::fatal(format!("can't read the current directory: {e}")))?;
+    Ok(dir.map_or_else(|| cwd.clone(), |dir| cwd.join(dir)))
+}
+
+/// The comments file: `file` (`--comments`) relative to where dffy runs
+/// (`-C`), or the local review's in `repo`'s shared git directory, moved
+/// there first from the worktree's when it was there.
+fn comments_file(
+    dir: Option<&Path>,
+    file: Option<&Path>,
+    repo: Option<&git::Repo>,
+) -> Result<PathBuf, Error> {
+    let base = base_dir(dir)?;
+    if let Some(file) = file {
+        return Ok(base.join(file));
+    }
+    let local = match repo {
+        Some(repo) => review::local_file(repo).map_err(Error::fatal)?,
+        None => None,
+    };
+    local.ok_or_else(|| Error::Fatal {
+        message: format!(
+            "{} isn't in a git repository, so it has no comments file",
+            base.display()
+        ),
+        hint: Some(
+            "name one with --comments <file>, or run dffy inside a repository or with -C <path>"
+                .to_owned(),
+        ),
+    })
+}
+
+/// The branches `args` names, by default `current`'s and none; outside a
+/// repository there's no branch to keep apart.
+fn branch_scope<'a>(
+    args: &'a BranchArgs,
+    current: Option<&'a str>,
+    in_repo: bool,
+) -> review::Branches<'a> {
+    match (&args.branch, args.all_branches) {
+        (Some(branch), false) => review::Branches::On(Some(branch)),
+        (None, false) if in_repo => review::Branches::On(current),
+        _ => review::Branches::All,
+    }
+}
+
+/// `dffy comments`: the threads listed, the file printed as JSON or
+/// Markdown, or written by `apply` and `rm`.
+fn comments(
+    dir: Option<&Path>,
+    file: Option<&Path>,
+    args: CommentsArgs,
+    ctx: &Ctx,
+) -> Result<ExitCode, Error> {
+    if args.action.is_some() && args.lists() {
+        return Err(Error::Fatal {
+            message: "--json, --markdown, --open, --resolved, --path, --branch and \
+                --all-branches are for listing, not for apply or rm"
+                .to_owned(),
+            hint: Some("rm takes --resolved, --branch and --all-branches after it".to_owned()),
+        });
+    }
+    // An integration's `apply` on its own file, each batch, needs neither
+    // the repository nor the branch.
+    let branchless = matches!(
+        args.action,
+        Some(CommentsAction::Apply | CommentsAction::Import { .. })
+    ) || args.json;
+    let repo = if file.is_some() && branchless {
+        None
+    } else {
+        git::Repo::discover(&base_dir(dir)?).ok()
+    };
+    let path = match (file, args.session) {
+        (Some(_), true) => {
+            return Err(Error::fatal(
+                "--comments and --session both name the comments file; give one",
+            ));
+        }
+        (_, false) => comments_file(dir, file, repo.as_ref())?,
+        (None, true) => {
+            let pointer = match &repo {
+                Some(repo) => review::read_session(repo).map_err(Error::fatal)?,
+                None => None,
+            };
+            pointer.map(|p| p.comments).ok_or_else(|| Error::Fatal {
+                message: "no review session: the viewer hasn't opened one in this repository"
+                    .to_owned(),
+                hint: Some(
+                    "open a review with the review plugin's command, as in dffy pr, then try again"
+                        .to_owned(),
+                ),
+            })?
+        }
+    };
+    let current = repo
+        .as_ref()
+        .filter(|_| !branchless)
+        .and_then(review::current_branch);
+    let scope = |branches| branch_scope(branches, current.as_deref(), repo.is_some());
+    match args.action {
+        Some(CommentsAction::Rm { branches, .. }) => {
+            let select = review::Select {
+                resolved: Some(true),
+                branches: scope(&branches),
+                ..review::Select::default()
+            };
+            let removed = review::remove_threads(&path, &select).map_err(Error::fatal)?;
+            let s = if removed == 1 { "" } else { "s" };
+            writeln!(io::stdout().lock(), "removed {removed} comment{s}")?;
+            Ok(ExitCode::SUCCESS)
+        }
+        Some(CommentsAction::Apply) => {
+            use std::io::{IsTerminal, Read};
+            if io::stdin().is_terminal() {
+                return Err(Error::Fatal {
+                    message:
+                        "dffy comments apply reads operations from stdin, and stdin is a terminal"
+                            .into(),
+                    hint: Some(
+                        "pipe a JSON list in, as in: echo '[…]' | dffy comments apply".into(),
+                    ),
+                });
+            }
+            let mut input = Vec::new();
+            io::stdin().lock().read_to_end(&mut input)?;
+            // Only the local review's file keeps branches apart; an
+            // integration's file is one review's, on no branch.
+            let branch = repo
+                .as_ref()
+                .filter(|_| file.is_none() && !args.session)
+                .and_then(review::current_branch);
+            let answer =
+                review::apply_given(&path, &input, branch.as_deref()).map_err(Error::fatal)?;
+            io::stdout().lock().write_all(answer.as_bytes())?;
+            Ok(ExitCode::SUCCESS)
+        }
+        Some(CommentsAction::Import { from }) => {
+            let from = base_dir(dir)?.join(from);
+            let came = review::import(&from, &path).map_err(Error::fatal)?;
+            let s = if came == 1 { "" } else { "s" };
+            writeln!(io::stdout().lock(), "imported {came} comment{s}")?;
+            Ok(ExitCode::SUCCESS)
+        }
+        None => list_comments(&path, &args, scope(&args.branches), current.as_deref(), ctx),
+    }
+}
+
+/// `dffy comments` without an action: the threads of `branches` that
+/// `args` picks, for reading or as Markdown, or the whole file as JSON.
+/// `current` is the current branch.
+fn list_comments(
+    path: &Path,
+    args: &CommentsArgs,
+    branches: review::Branches,
+    current: Option<&str>,
+    ctx: &Ctx,
+) -> Result<ExitCode, Error> {
+    let file = review::read(path).map_err(Error::fatal)?;
+    if args.json {
+        io::stdout().lock().write_all(file.encode().as_bytes())?;
+        return Ok(ExitCode::SUCCESS);
+    }
+    let select = review::Select {
+        resolved: match (args.open, args.resolved) {
+            (true, _) => Some(false),
+            (_, true) => Some(true),
+            _ => None,
+        },
+        path: args.path.as_deref(),
+        branches,
+    };
+    let listed = review::threads(file.selected(&select));
+    if args.markdown {
+        let text = review::markdown(&listed, file.summary.as_deref());
+        io::stdout().lock().write_all(text.as_bytes())?;
+        return Ok(ExitCode::SUCCESS);
+    }
+    let mut c = Canvas::default();
+    if let Some(notice) = &file.notice {
+        c.push(Role::Warn, "notice:");
+        c.line(
+            Role::Plain,
+            &format!(" {}", render::escape(notice.as_bytes())),
+        );
+        c.end_line();
+    }
+    if let Some(summary) = &file.summary {
+        c.line(Role::FileHeader, "summary, not posted yet");
+        for line in summary.lines() {
+            c.spaces(Role::Plain, 4);
+            c.line(Role::Plain, &render::escape(line.as_bytes()));
+        }
+        c.end_line();
+    }
+    if listed.is_empty() {
+        c.line(Role::Dim, "no comments");
+    }
+    let here = match branches {
+        review::Branches::On(branch) => branch,
+        review::Branches::All => current,
+    };
+    print::comments(&listed, here, &[], &mut c);
+    if branches != review::Branches::All {
+        let everywhere = review::Select {
+            branches: review::Branches::All,
+            ..select
+        };
+        let elsewhere = file.selected(&everywhere).len() - listed.len();
+        if elsewhere > 0 {
+            c.end_line();
+            c.line(
+                Role::Dim,
+                &format!("{elsewhere} more on other branches; --all-branches lists them"),
+            );
+        }
+    }
+    write_stdout(ctx, &c)
+}
+
+/// `e` with why the review plugin's command is missing, when its first
+/// revision was asked about as that command and became a revision because
+/// the plugin couldn't describe itself.
+fn without_review_command(e: Error, args: &DiffArgs, ctx: &Ctx) -> Error {
+    let why = ctx.review.get().and_then(|r| r.as_ref().err());
+    match (e, args.revs.first(), why, ctx.review_name.as_deref()) {
+        (Error::Fatal { message, hint }, Some(first), Some(why), Some(name))
+            if message == format!("unknown revision '{first}'") =>
+        {
+            let ours = format!("{}{name} adds no command: {why}", plugin::REVIEW_PREFIX);
+            Error::Fatal {
+                message,
+                hint: Some(hint.map_or_else(|| ours.clone(), |h| format!("{ours}\n{h}"))),
+            }
+        }
+        (e, ..) => e,
+    }
+}
+
 fn run(cli: Cli, ctx: &Ctx) -> Result<ExitCode, Error> {
     let dir = cli.global.dir.as_deref();
     match cli.command {
         None => diff(dir, &DiffArgs::default(), ctx),
-        Some(Command::Diff(args)) => diff(dir, &args, ctx),
+        Some(Command::Diff(args)) => {
+            diff(dir, &args, ctx).map_err(|e| without_review_command(e, &args, ctx))
+        }
         Some(Command::Show(args)) => show(dir, &args, ctx),
+        Some(Command::Comments(args)) => comments(dir, cli.global.comments.as_deref(), args, ctx),
         Some(Command::Config {
             markdown: Some(page),
             ..
@@ -541,6 +854,7 @@ fn run(cli: Cli, ctx: &Ctx) -> Result<ExitCode, Error> {
             Ok(ExitCode::SUCCESS)
         }
         Some(Command::Doctor { json }) => doctor(ctx, dir, json),
+        Some(Command::Review { id }) => review_command(dir, id, ctx),
         Some(Command::Daemon { action }) => {
             let mut c = Canvas::default();
             match action {
@@ -562,12 +876,14 @@ fn run(cli: Cli, ctx: &Ctx) -> Result<ExitCode, Error> {
             write_stdout(ctx, &c)
         }
         Some(Command::Mcp) => {
-            mcp::serve(dir, ctx)?;
+            mcp::serve(dir, cli.global.comments.as_deref(), ctx)?;
             Ok(ExitCode::SUCCESS)
         }
+        Some(Command::Ctl(args)) => control::client::ctl(dir, &args),
         Some(Command::Completions { shell }) => {
             let mut buf = Vec::new();
-            clap_complete::generate(shell, &mut Cli::command(), "dffy", &mut buf);
+            let mut command = cli::command(ctx.described().map(|d| &d.naming));
+            clap_complete::generate(shell, &mut command, "dffy", &mut buf);
             io::stdout().lock().write_all(&buf)?;
             Ok(ExitCode::SUCCESS)
         }
@@ -620,6 +936,16 @@ fn diff(dir: Option<&Path>, args: &DiffArgs, ctx: &Ctx) -> Result<ExitCode, Erro
         [] => !selects_from_repo(args) && stdin_has_diff(),
         _ => false,
     };
+    // Only `-` reads stdin with it: `--show-comments` selects from the
+    // repository.
+    if reads_stdin && args.common.show_comments {
+        return Err(Error::Fatal {
+            message: "--show-comments places comments on the repository's files; a diff read \
+                from stdin doesn't have them"
+                .into(),
+            hint: Some("name the revisions instead, as in: dffy --show-comments main..HEAD".into()),
+        });
+    }
     if reads_stdin {
         if ctx.term.stdout_tty {
             return piped(ctx);
@@ -638,8 +964,9 @@ fn diff(dir: Option<&Path>, args: &DiffArgs, ctx: &Ctx) -> Result<ExitCode, Erro
     let c = &args.common;
     if args.json {
         let paths = printed_paths(c);
-        let plan = print::prepare(dir, &target, paths, print::Summary::Diff, c.view.reverse)?;
-        let compared = json::Compared {
+        let mut plan = print::prepare(dir, &target, paths, print::Summary::Diff, c.view.reverse)?;
+        plan.comments = shown_comments(&plan, c, ctx)?;
+        let compared = encode::Compared {
             revisions: &args.revs,
             operands: None,
         };
@@ -652,12 +979,216 @@ fn diff(dir: Option<&Path>, args: &DiffArgs, ctx: &Ctx) -> Result<ExitCode, Erro
         let plan = print::prepare(dir, &target, &c.paths, print::Summary::Diff, c.view.reverse)?;
         let focus = c.focus.as_deref().map(|f| plan.relative(f)).transpose()?;
         let description = describe(&revisions, c.view.reverse);
-        return tui::run(&tty, plan, revisions, focus, description, &ctx.viewer());
+        let detect = detect_review(args, &plan, ctx);
+        return tui::run(
+            &tty,
+            plan,
+            revisions,
+            focus,
+            description,
+            detect,
+            &ctx.viewer(),
+        );
     }
     if ctx.config.watch {
         warn(ctx, "--watch needs the viewer on a terminal; printing once");
     }
     run_print(dir, &target, &args.common, args.exit_code, ctx)
+}
+
+/// The review plugin's command (`dffy pr`): the viewer on review `id`, or
+/// the current branch's, or the picker of reviews on the diff `dffy`
+/// shows. It opens once the plugin's `prepare` names the review's commits,
+/// and the plugin goes on downloading threads behind it.
+fn review_command(dir: Option<&Path>, id: Option<String>, ctx: &Ctx) -> Result<ExitCode, Error> {
+    // Only a described plugin adds the command that runs this.
+    let Some(described) = ctx.described() else {
+        return Err(Error::fatal("no review plugin describes this command"));
+    };
+    // The plugin runs in a session of its own, which the terminal's Ctrl-C
+    // doesn't reach: until the viewer handles signals, they kill it here.
+    let phase = Arc::new(Mutex::new(Phase::Waiting));
+    let handler = Arc::clone(&phase);
+    term::on_signals(move |signal| {
+        let mut phase = handler.lock().unwrap_or_else(PoisonError::into_inner);
+        if signal == term::Signal::Interrupt && *phase == Phase::Waiting {
+            *phase = Phase::Interrupted;
+            plugin::stop_all();
+        }
+        *phase == Phase::Waiting
+    })?;
+    let result = open_review(dir, id, described, ctx, &phase);
+    // A `prepare` started before an error is stopped too, not only one the
+    // viewer ran.
+    plugin::stop_all();
+    if *phase.lock().unwrap_or_else(PoisonError::into_inner) == Phase::Interrupted {
+        return Err(Error::Interrupted);
+    }
+    result
+}
+
+/// How far `dffy pr` got, for a signal before its viewer handles them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Phase {
+    Waiting,
+    Interrupted,
+    Viewing,
+}
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "the review command in order: plugin, listing or prepare, viewer"
+)]
+fn open_review(
+    dir: Option<&Path>,
+    id: Option<String>,
+    plugin::review::Described { program, naming }: &plugin::review::Described,
+    ctx: &Ctx,
+    phase: &Mutex<Phase>,
+) -> Result<ExitCode, Error> {
+    use plugin::review::{self, Reason, Said};
+    let plugin = program.name.clone();
+    let terminal = format!(
+        "dffy {} opens the viewer, which needs a terminal",
+        naming.command
+    );
+    let tty = ctx
+        .term
+        .stdout_tty
+        .then(term::Tty::open)
+        .and_then(Result::ok)
+        .ok_or_else(|| Error::fatal(terminal))?;
+    let cwd = std::env::current_dir()
+        .map_err(|e| Error::fatal(format!("can't read the current directory: {e}")))?;
+    let repo = git::Repo::discover(&dir.map_or_else(|| cwd.clone(), |dir| cwd.join(dir)))?;
+    let root = repo.workdir().ok_or(git::Error::NoWorktree)?;
+    let program_name = format!("{}{plugin}", plugin::REVIEW_PREFIX);
+    // One process for the listing, the review's `prepare` and the viewer's
+    // requests after: the viewer takes it over.
+    let reviews = crate::review::reviews_dir(&repo, &plugin);
+    let client = review::Plugin::start(program, (Some(root), reviews), ctx.cache.clone())
+        .map_err(|e| Error::fatal(format!("couldn't start {program_name}: {e}")))?;
+    let start = |request: &review::Request| {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let run = client.request(request, move |said| tx.send(said).is_ok());
+        (run, rx)
+    };
+    // Until the viewer takes the screen.
+    let say = |text: &str| {
+        if ctx.term.stderr_tty {
+            eprint!("\r\x1b[K{text}");
+        }
+    };
+    let viewer = |revisions: git::Revisions, description, start, viewer: &Ctx| {
+        {
+            let mut phase = phase.lock().unwrap_or_else(PoisonError::into_inner);
+            if *phase != Phase::Waiting {
+                return Err(Error::Interrupted);
+            }
+            *phase = Phase::Viewing;
+        }
+        let target = print::Target::Diff(&revisions);
+        let plan = print::prepare(dir, &target, &[], print::Summary::Diff, false)?;
+        tui::run(
+            &tty,
+            plan,
+            revisions,
+            None,
+            description,
+            Some(start),
+            viewer,
+        )
+    };
+    let (label, id) = if let Some(id) = id {
+        (naming.label(&id), id)
+    } else {
+        say(&format!("listing {}…", naming.nouns));
+        let (_, rx) = start(&review::Request::List);
+        let reviews = first_said(&rx, |said| match said {
+            Said::Listed(reviews) => Some(reviews),
+            _ => None,
+        });
+        say("");
+        let reviews = reviews.map_err(|e| {
+            Error::fatal(e.unwrap_or_else(|| format!("{program_name} listed nothing")))
+        })?;
+        if let Some(found) = reviews.iter().find(|p| p.reason == Reason::CurrentBranch) {
+            (naming.label(found.shown()), found.id.clone())
+        } else {
+            let revisions = git::Revisions {
+                unstaged: ctx.config.default_diff == DefaultDiff::Unstaged,
+                ..git::Revisions::default()
+            };
+            let description = describe(&revisions, false);
+            let pick = tui::ReviewStart::Pick {
+                plugin,
+                client,
+                reviews,
+            };
+            return viewer(revisions, description, pick, &ctx.viewer());
+        }
+    };
+    say(&format!("fetching {label}…"));
+    let (run, rx) = start(&review::Request::Prepare { id });
+    let session = first_said(&rx, |said| match said {
+        Said::Session(session) => Some(session),
+        _ => None,
+    });
+    say("");
+    let session = session.map_err(|e| {
+        let e = e.unwrap_or_else(|| format!("{program_name} prepare named no commits"));
+        Error::fatal(format!("{label}: {e}"))
+    })?;
+    let revisions = git::Revisions {
+        revs: vec![format!("{}...{}", session.base, session.head)],
+        ..git::Revisions::default()
+    };
+    let mut ctx = ctx.viewer();
+    ctx.comments = Some(session.comments.clone());
+    let open = tui::ReviewStart::Open {
+        plugin,
+        client,
+        session: Box::new(session),
+        run,
+        rest: rx,
+    };
+    viewer(revisions, label, open, &ctx)
+}
+
+/// Plain `dffy` (no revisions or paths) on a branch, with a review plugin
+/// set: the viewer asks the plugin for the branch's review once it has
+/// described itself.
+fn detect_review(args: &DiffArgs, plan: &print::Plan, ctx: &Ctx) -> Option<tui::ReviewStart> {
+    let unnamed = args.revs.is_empty()
+        && !(args.staged || args.unstaged || args.merge_base || args.common.view.reverse)
+        && args.common.paths.is_empty();
+    let on_branch = || {
+        plan.repo
+            .git_dir()
+            .and_then(|dir| std::fs::read(dir.join("HEAD")).ok())
+            .is_some_and(|head| head.starts_with(b"ref: refs/heads/"))
+    };
+    (ctx.review_name.is_some() && unnamed && on_branch()).then_some(tui::ReviewStart::Detect)
+}
+
+/// The first line on `said` that `pick` takes; `Err` with the run's
+/// error when it ended first, `Err(None)` when it ended well.
+fn first_said<T>(
+    said: &std::sync::mpsc::Receiver<plugin::review::Said>,
+    mut pick: impl FnMut(plugin::review::Said) -> Option<T>,
+) -> Result<T, Option<String>> {
+    use plugin::review::Said;
+    loop {
+        match said.recv() {
+            Ok(Said::Done(result)) => return Err(result.err()),
+            Ok(line) => {
+                if let Some(picked) = pick(line) {
+                    return Ok(picked);
+                }
+            }
+            Err(_) => return Err(None),
+        }
+    }
 }
 
 /// `dffy A B`: two files or folders outside git (see [`no_index`]).
@@ -675,7 +1206,8 @@ fn compare(
         if let Some(focus) = &c.focus {
             plan.paths = vec![plan.relative(focus)?];
         }
-        let compared = json::Compared {
+        plan.comments = shown_comments(&plan, c, ctx)?;
+        let compared = encode::Compared {
             revisions: &[],
             operands: Some(operands),
         };
@@ -688,7 +1220,15 @@ fn compare(
         let plan = print::Plan::compare(repo, base, print::Summary::Diff, c.view.reverse);
         let focus = c.focus.as_deref().map(|f| plan.relative(f)).transpose()?;
         let revisions = git::Revisions::default();
-        return tui::run(&tty, plan, revisions, focus, description, &ctx.viewer());
+        return tui::run(
+            &tty,
+            plan,
+            revisions,
+            focus,
+            description,
+            None,
+            &ctx.viewer(),
+        );
     }
     if ctx.config.watch {
         warn(ctx, "--watch needs the viewer on a terminal; printing once");
@@ -697,6 +1237,7 @@ fn compare(
     if let Some(focus) = &c.focus {
         plan.paths = vec![plan.relative(focus)?];
     }
+    plan.comments = shown_comments(&plan, c, ctx)?;
     print_plan(&plan, args.exit_code, ctx)
 }
 
@@ -851,7 +1392,15 @@ fn show(dir: Option<&Path>, args: &ShowArgs, ctx: &Ctx) -> Result<ExitCode, Erro
             ..git::Revisions::default()
         };
         let description = format!("show {}", args.rev);
-        return tui::run(&tty, plan, revisions, focus, description, &ctx.viewer());
+        return tui::run(
+            &tty,
+            plan,
+            revisions,
+            focus,
+            description,
+            None,
+            &ctx.viewer(),
+        );
     }
     run_print(
         dir,
@@ -870,8 +1419,63 @@ fn run_print(
     ctx: &Ctx,
 ) -> Result<ExitCode, Error> {
     let paths = printed_paths(common);
-    let plan = print::prepare(dir, target, paths, summary(common), common.view.reverse)?;
+    let mut plan = print::prepare(dir, target, paths, summary(common), common.view.reverse)?;
+    plan.comments = shown_comments(&plan, common, ctx)?;
     print_plan(&plan, exit_code, ctx)
+}
+
+/// The threads printed with `plan` with `--show-comments`: those of
+/// `--comments`'s file, or with `--session` of the review session the
+/// viewer has open, else of the repository's local file, read where it is
+/// now (this never moves it), on the current branch and on none. Two files
+/// or folders compared outside git have no branch, nor a file unless
+/// `--comments` names one.
+fn shown_comments(
+    plan: &print::Plan,
+    common: &CommonArgs,
+    ctx: &Ctx,
+) -> Result<Option<review::model::snapshot::Snapshot>, Error> {
+    if !common.show_comments {
+        return Ok(None);
+    }
+    let in_git = !matches!(plan.spec, git::DiffSpec::Paths);
+    let file = match (&ctx.comments, common.session) {
+        (Some(_), true) => {
+            return Err(Error::fatal(
+                "--comments and --session both name the comments file; give one",
+            ));
+        }
+        (Some(file), false) => file.clone(),
+        (None, true) => review::read_session(&plan.repo)
+            .map_err(Error::fatal)?
+            .filter(|_| in_git)
+            .map(|pointer| pointer.comments)
+            .ok_or_else(|| Error::Fatal {
+                message: "no review session: the viewer hasn't opened one in this repository"
+                    .into(),
+                hint: Some(
+                    "open a review with the review plugin's command, as in dffy pr, then try again"
+                        .into(),
+                ),
+            })?,
+        (None, false) => (in_git
+            .then(|| review::local_file_read_only(&plan.repo))
+            .flatten())
+        .ok_or_else(|| Error::Fatal {
+            message: "two paths compared outside git have no comments file".into(),
+            hint: Some("name one with --comments <file>".into()),
+        })?,
+    };
+    let comments = review::read(&file).map_err(Error::fatal)?;
+    let current = in_git.then(|| review::current_branch(&plan.repo)).flatten();
+    let branches = if in_git {
+        review::Branches::On(current.as_deref())
+    } else {
+        review::Branches::All
+    };
+    Ok(Some(review::model::snapshot::Snapshot::new(
+        &comments, branches,
+    )))
 }
 
 /// The paths printed output is limited to. In print mode --focus narrows
@@ -887,16 +1491,16 @@ fn printed_paths(common: &CommonArgs) -> &[PathBuf] {
 /// `--json`: straight to stdout, never paged.
 fn json_diff(
     plan: &print::Plan,
-    compared: &json::Compared,
+    compared: &encode::Compared,
     args: &DiffArgs,
     ctx: &Ctx,
 ) -> Result<ExitCode, Error> {
     let detail = if summary(&args.common) != print::Summary::Diff {
-        json::Detail::Summary
+        encode::Detail::Summary
     } else if args.highlight_spans {
-        json::Detail::Highlights
+        encode::Detail::Highlights
     } else {
-        json::Detail::Hunks
+        encode::Detail::Hunks
     };
     let mut out = Output::stdout();
     let result = json::write(plan, compared, detail, ctx, &mut out);
@@ -948,6 +1552,7 @@ fn selects_from_repo(args: &DiffArgs) -> bool {
         || c.stat
         || c.name_only
         || c.name_status
+        || c.show_comments
         || c.focus.is_some()
         || !c.paths.is_empty()
 }
@@ -980,9 +1585,9 @@ mod tests {
 
     #[test]
     fn a_whitespace_flag_beats_the_other_remembered_whitespace_key() {
-        let args = cli::with_default_subcommand(vec!["dffy".into(), "-b".into()]);
-        let matches = Cli::command().try_get_matches_from(args).expect("parses");
-        let cli = Cli::from_arg_matches(&matches).expect("arguments");
+        let command = cli::command(None);
+        let args = cli::with_default_subcommand(&command, vec!["dffy".into(), "-b".into()]);
+        let cli = cli::parse(command, &args).expect("parses");
         let mut config = Config::default();
         let mut sources = config::Sources::default();
         for key in apply_flags(&mut config, &cli) {
@@ -991,5 +1596,38 @@ mod tests {
         let last_used = [("ignore-all-space".to_owned(), "true".to_owned())];
         config.layer(&mut sources, &last_used, config::Source::LastUsed);
         assert_eq!(config.whitespace, Whitespace::IgnoreChange);
+    }
+
+    /// `--review` wins over the config's `review` for the run, before the
+    /// subcommand too, and nothing remembered replaces it.
+    #[test]
+    fn the_review_flag_beats_the_config() {
+        for args in [
+            &["dffy", "--review", "flag", "HEAD"][..],
+            &["dffy", "--review=flag", "doctor"],
+        ] {
+            let command = cli::command(None);
+            let args = cli::with_default_subcommand(
+                &command,
+                args.iter().map(|a| std::ffi::OsString::from(*a)).collect(),
+            );
+            let cli = cli::parse(command, &args).expect("parses");
+            let mut config = Config::default();
+            let mut sources = config::Sources::default();
+            for key in config.apply_source("review = configured\n", &mut Vec::new()) {
+                sources.set(key, config::Source::Config);
+            }
+            assert_eq!(config.review.as_deref(), Some("configured"));
+            for key in apply_flags(&mut config, &cli) {
+                sources.set(key, config::Source::Flag);
+            }
+            let last_used = [("review".to_owned(), "remembered".to_owned())];
+            config.layer(&mut sources, &last_used, config::Source::LastUsed);
+            assert_eq!(config.review.as_deref(), Some("flag"));
+            assert_eq!(sources.get("review"), config::Source::Flag);
+        }
+        let mut config = Config::default();
+        assert_eq!(config.review, None);
+        assert!(config.set("review", "Not/A-Name").is_err());
     }
 }

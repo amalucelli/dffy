@@ -13,6 +13,10 @@ use std::path::Path;
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 
 #[path = "../src/plugin/json.rs"]
+#[expect(
+    dead_code,
+    reason = "requests are built as text, so no value is written"
+)]
 mod json;
 
 use json::{Value, parse, string};
@@ -102,13 +106,18 @@ struct Server {
 
 impl Server {
     fn start(dir: &Path) -> Self {
+        Self::start_in(dir, dir)
+    }
+
+    /// With `runtime` as where dffyd is, to reach the viewers there.
+    fn start_in(dir: &Path, runtime: &Path) -> Self {
         let mut child = Command::new(env!("CARGO_BIN_EXE_dffy"))
             .current_dir(dir)
             .arg("mcp")
             .env("XDG_CONFIG_HOME", dir.join(".no-config"))
             .env("XDG_CACHE_HOME", dir.join(".git/dffy-test-cache"))
             .env("XDG_STATE_HOME", dir.join(".git/dffy-test-state"))
-            .env("XDG_RUNTIME_DIR", dir)
+            .env("XDG_RUNTIME_DIR", runtime)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .spawn()
@@ -297,7 +306,18 @@ fn changed_files_pages_through_the_list_after_the_handshake() {
         .iter()
         .filter_map(|t| t.get("name").and_then(Value::as_str))
         .collect();
-    assert_eq!(names, ["changed_files", "file_diff", "diff"]);
+    assert_eq!(
+        names,
+        [
+            "changed_files",
+            "file_diff",
+            "diff",
+            "list_comments",
+            "open_in_viewer",
+            "focus_thread",
+            "viewer_selection"
+        ]
+    );
 
     let range = r#""range":"main~1 main""#;
     let first = server.call("changed_files", &format!("{{{range},\"limit\":4}}"));
@@ -494,6 +514,12 @@ fn invalid_input_is_a_tool_error() {
         ("changed_files", r#"{"range":"nope"}"#, "nope"),
         ("changed_files", r#"{"cursor":"garbage"}"#, "start over"),
         ("diff", r#"{"max_line":3}"#, "unknown argument"),
+        ("diff", r#"{"session":true}"#, "needs comments: true"),
+        (
+            "list_comments",
+            r#"{"path":["a"]}"#,
+            "path must be a string",
+        ),
     ] {
         let call = server.call(tool, args);
         assert!(call.is_error(), "{tool} {args}: {}", call.line);
@@ -562,6 +588,260 @@ fn modern_requests_carry_their_version() {
     assert_eq!(requested, Some("2024-01-01"));
 }
 
+/// `list_comments` reads the repository's comments file on each call:
+/// threads in path order, each comment's object as the file has it, a page
+/// at a time; `path` keeps one file's, by its old path too, and a cursor
+/// from before the file changed is refused.
+#[test]
+fn list_comments_pages_through_threads() {
+    let repo = repo();
+    let d = repo.path();
+    let comments = |extra: &str| {
+        format!(
+            r#"{{"version":1,"notice":"comments as of 10:42","comments":[
+{{"id":"c0000000000000a1","path":"lib.rs","side":"new","start":{{"old":null,"new":1}},"end":{{"old":null,"new":1}},"text":"Why i64?","author":"","created":"2026-11-17T10:42:00Z","resolved":false,"anchor":{{"before":[],"lines":["pub fn add(a: i64, b: i64) -> i64 {{"],"after":["    a + b","}}"]}},"distance":0}},
+{{"id":"c0000000000000b2","path":"docs/user/guide.md","old_path":"docs/guide.md","text":"Moved?","author":"octocat","created":"2026-11-17T10:43:00Z","resolved":true}},
+{{"id":"c0000000000000c3","path":"lib.rs","text":"It overflowed.","author":"octocat","created":"2026-11-17T10:44:00Z","in_reply_to":"c0000000000000a1","resolved":false,"ref":"github:PRRC_1"}}{extra}
+]}}
+"#
+        )
+    };
+    write(d, ".git/dffy/comments.json", &comments(""));
+    let mut server = Server::start(d);
+    initialize(&mut server);
+    let ids = |call: &Call| -> Vec<String> {
+        call.structured()
+            .get("comments")
+            .and_then(Value::as_array)
+            .expect("comments")
+            .iter()
+            .filter_map(|c| c.get("id").and_then(Value::as_str).map(str::to_owned))
+            .collect()
+    };
+    let first = server.call("list_comments", r#"{"limit":2}"#);
+    assert_eq!(ids(&first), ["c0000000000000b2", "c0000000000000a1"]);
+    let cursor = first.cursor().expect("more comments").to_owned();
+    let second = server.call(
+        "list_comments",
+        &format!(r#"{{"limit":2,"cursor":"{cursor}"}}"#),
+    );
+    assert_eq!(ids(&second), ["c0000000000000c3"]);
+    assert_eq!(second.cursor(), None);
+    insta::assert_snapshot!(
+        "mcp_list_comments",
+        snapshot(&[
+            first.raw_structured(),
+            first.text().to_owned(),
+            second.text().to_owned(),
+        ])
+    );
+    let lib = server.call("list_comments", r#"{"path":"lib.rs"}"#);
+    assert_eq!(ids(&lib), ["c0000000000000a1", "c0000000000000c3"]);
+    let renamed = server.call("list_comments", r#"{"path":"docs/guide.md"}"#);
+    assert_eq!(ids(&renamed), ["c0000000000000b2"]);
+
+    write(
+        d,
+        ".git/dffy/comments.json",
+        &comments(
+            r#",{"id":"c0000000000000d4","path":"a.rs","text":"New.","author":"","created":"2026-11-17T10:45:00Z","resolved":false}"#,
+        ),
+    );
+    let stale = server.call(
+        "list_comments",
+        &format!(r#"{{"limit":2,"cursor":"{cursor}"}}"#),
+    );
+    assert!(stale.is_error());
+    assert!(stale.text().contains("start over"), "{}", stale.text());
+}
+
+/// `list_comments` takes the current branch's threads and those on none,
+/// or another branch's or all; open or resolved ones, judged by the
+/// thread's first comment; and the review session's file with `session`.
+#[test]
+fn list_comments_filters_by_branch_and_state() {
+    let repo = repo();
+    let d = repo.path();
+    write(
+        d,
+        ".git/dffy/comments.json",
+        r#"{"version":1,"comments":[
+{"id":"m1","path":"lib.rs","text":"Open on main.","author":"","created":"t1","resolved":false,"branch":"main"},
+{"id":"m2","path":"lib.rs","text":"Done on main.","author":"","created":"t2","resolved":true,"branch":"main"},
+{"id":"m3","path":"lib.rs","text":"Reply.","author":"ada","created":"t3","in_reply_to":"m2","resolved":false,"branch":"main"},
+{"id":"t1","path":"lib.rs","text":"On topic.","author":"","created":"t4","resolved":false,"branch":"topic"}
+]}"#,
+    );
+    let mut server = Server::start(d);
+    initialize(&mut server);
+    let ids = |call: &Call| -> Vec<String> {
+        assert!(!call.is_error(), "{}", call.text());
+        call.structured()
+            .get("comments")
+            .and_then(Value::as_array)
+            .expect("comments")
+            .iter()
+            .filter_map(|c| c.get("id").and_then(Value::as_str).map(str::to_owned))
+            .collect()
+    };
+    let here = server.call("list_comments", "{}");
+    assert_eq!(ids(&here), ["m1", "m2", "m3"]);
+    let resolved = server.call("list_comments", r#"{"resolved":true}"#);
+    assert_eq!(ids(&resolved), ["m2", "m3"]);
+    let open = server.call("list_comments", r#"{"open":true}"#);
+    assert_eq!(ids(&open), ["m1"]);
+    assert_eq!(
+        ids(&server.call("list_comments", r#"{"resolved":false}"#)),
+        ["m1"]
+    );
+    let topic = server.call("list_comments", r#"{"branch":"topic"}"#);
+    assert_eq!(ids(&topic), ["t1"]);
+    let all = server.call("list_comments", r#"{"all_branches":true,"open":true}"#);
+    assert_eq!(ids(&all), ["m1", "t1"]);
+    insta::assert_snapshot!(
+        "mcp_list_comments_filtered",
+        snapshot(&[all.raw_structured(), all.text().to_owned()])
+    );
+    for bad in [
+        r#"{"open":true,"resolved":true}"#,
+        r#"{"branch":"topic","all_branches":true}"#,
+        r#"{"session":true}"#,
+    ] {
+        let call = server.call("list_comments", bad);
+        assert!(call.is_error(), "{bad}");
+    }
+
+    let pr = d.join(".git/review/7.json");
+    write(
+        d,
+        ".git/review/7.json",
+        r#"{"version":1,"comments":[{"id":"p1","path":"lib.rs","text":"Posted.","author":"octocat","created":"t1","resolved":false,"ref":"github:1"}]}"#,
+    );
+    write(
+        d,
+        ".git/dffy/session",
+        &format!(
+            r#"{{"version":1,"comments":"{}","review":"7","branch":"main","head":"abc1234"}}"#,
+            pr.display()
+        ),
+    );
+    let session = server.call("list_comments", r#"{"session":true}"#);
+    assert_eq!(ids(&session), ["p1"]);
+}
+
+/// The local review's file of the fixture: a thread with a reply on an
+/// added line of `lib.rs`, one on `long.txt` whose lines are gone, and a
+/// comment on the whole of `math.c`.
+fn placed_comments(d: &Path) {
+    write(
+        d,
+        ".git/dffy/comments.json",
+        r#"{"version":1,"comments":[
+{"id":"a1","path":"lib.rs","side":"new","start":{"old":null,"new":1},"end":{"old":null,"new":1},"text":"Why i64?","author":"ada","created":"2024-03-01T12:00:00Z","resolved":false,"anchor":{"before":[],"lines":["pub fn add(a: i64, b: i64) -> i64 {"],"after":[]}},
+{"id":"a2","path":"lib.rs","text":"It overflowed.\nTwice.","author":"","created":"2024-03-02T12:00:00Z","in_reply_to":"a1","resolved":false},
+{"id":"l1","path":"long.txt","side":"old","start":{"old":4,"new":null},"end":{"old":4,"new":null},"text":"Gone.","author":"","created":"2024-03-01T12:00:00Z","resolved":false,"anchor":{"before":[],"lines":["nowhere"],"after":[]}},
+{"id":"m1","path":"math.c","text":"On the file.","author":"","created":"2024-03-01T12:00:00Z","resolved":false}
+]}"#,
+    );
+}
+
+/// With `comments: true`, `file_diff` and `diff` give each file object its
+/// threads' annotations, as `dffy --json --show-comments` does, and say
+/// them in the text; without it the objects have none.
+#[test]
+fn diff_tools_add_annotations_with_comments() {
+    let repo = repo();
+    let d = repo.path();
+    placed_comments(d);
+    let mut server = Server::start(d);
+    initialize(&mut server);
+    let file = server.call(
+        "file_diff",
+        r#"{"path":"lib.rs","range":"main~1 main","comments":true}"#,
+    );
+    insta::assert_snapshot!(
+        "mcp_file_diff_comments",
+        snapshot(&[file.raw_structured(), file.text().to_owned()])
+    );
+    let annotated = |call: &Call| -> Vec<Option<usize>> {
+        call.structured()
+            .get("files")
+            .and_then(Value::as_array)
+            .expect("files")
+            .iter()
+            .map(|f| {
+                f.get("annotations")
+                    .and_then(Value::as_array)
+                    .map(<[Value]>::len)
+            })
+            .collect()
+    };
+    let both = server.call(
+        "diff",
+        r#"{"range":"main~1 main","paths":["lib.rs","long.txt","math.c"],"comments":true}"#,
+    );
+    assert_eq!(annotated(&both), [Some(1), Some(1), Some(0)]);
+    assert!(both.text().contains("lines not found"), "{}", both.text());
+    let plain = server.call(
+        "diff",
+        r#"{"range":"main~1 main","paths":["lib.rs","long.txt","math.c"]}"#,
+    );
+    assert_eq!(annotated(&plain), [None, None, None]);
+
+    // A file cut short has them in its first part only.
+    let args = r#""path":"long.txt","range":"main~1 main","comments":true,"max_lines":1"#;
+    let annotations = |call: &Call| {
+        (call.structured().get("file"))
+            .and_then(|f| f.get("annotations"))
+            .and_then(Value::as_array)
+            .map(<[Value]>::len)
+    };
+    let first = server.call("file_diff", &format!("{{{args}}}"));
+    assert_eq!(annotations(&first), Some(1));
+    let cursor = first.cursor().expect("cut short").to_owned();
+    let next = server.call("file_diff", &format!(r#"{{{args},"cursor":"{cursor}"}}"#));
+    assert!(!next.is_error(), "{}", next.text());
+    assert_eq!(annotations(&next), None);
+}
+
+/// `list_comments` gives each line thread's place on the range's diff,
+/// by its first comment's id, when its file is in it: with `range`, or
+/// on the uncommitted changes with `placed`. Otherwise nothing is diffed.
+#[test]
+fn list_comments_places_threads_on_the_range() {
+    let repo = repo();
+    let d = repo.path();
+    placed_comments(d);
+    let mut server = Server::start(d);
+    initialize(&mut server);
+    // The `placed` member, as sent.
+    let placed = |call: &Call| {
+        let raw = call.raw_structured();
+        let start = raw.find(r#""placed":"#).expect("placed") + 9;
+        let end = raw.find(r#","total_comments""#).expect("total_comments");
+        raw[start..end].to_owned()
+    };
+    let uncommitted = server.call("list_comments", r#"{"placed":true}"#);
+    assert_eq!(placed(&uncommitted), "{}", "nothing uncommitted");
+    let range = server.call("list_comments", r#"{"range":"main~1 main"}"#);
+    insta::assert_snapshot!(
+        "mcp_list_comments_placed",
+        snapshot(&[range.raw_structured(), range.text().to_owned()])
+    );
+    write(
+        d,
+        "lib.rs",
+        "// moved down\npub fn add(a: i64, b: i64) -> i64 {\n    a + b\n}\n",
+    );
+    let unasked = server.call("list_comments", r#"{"path":"lib.rs"}"#);
+    assert_eq!(placed(&unasked), "{}", "not asked for");
+    let moved = server.call("list_comments", r#"{"path":"lib.rs","placed":true}"#);
+    assert_eq!(
+        placed(&moved),
+        r#"{"a1":{"side":"new","start":2,"end":2,"lost":false}}"#
+    );
+}
+
 /// The repository stays open across calls, and each call sees it as it is
 /// now: a file written and a commit made after startup show on the next
 /// call.
@@ -585,4 +865,126 @@ fn each_call_sees_the_repository_as_it_is_now() {
     git(d, &["commit", "-q", "-m", "later"]);
     assert_eq!(total(&mut server, "{}"), Some(0));
     assert_eq!(total(&mut server, r#"{"range":"HEAD~1"}"#), Some(1));
+}
+
+/// A viewer in a pseudo-terminal, its output drained so it never blocks;
+/// killed on drop.
+struct Viewer {
+    _master: Box<dyn portable_pty::MasterPty + Send>,
+    child: Box<dyn portable_pty::Child + Send + Sync>,
+}
+
+impl Viewer {
+    /// `dffy args` in `dir`, registered with the dffyd at `runtime` once
+    /// this returns.
+    fn start(dir: &Path, runtime: &Path, args: &[&str]) -> Self {
+        let pair = portable_pty::native_pty_system()
+            .openpty(portable_pty::PtySize {
+                rows: 24,
+                cols: 100,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .expect("a pty");
+        let mut cmd = portable_pty::CommandBuilder::new(env!("CARGO_BIN_EXE_dffy"));
+        cmd.args(args);
+        cmd.cwd(dir);
+        cmd.env("TERM", "xterm-256color");
+        cmd.env("XDG_CONFIG_HOME", dir.join(".no-config"));
+        cmd.env("XDG_CACHE_HOME", dir.join(".git/dffy-test-cache"));
+        cmd.env("XDG_STATE_HOME", dir.join(".git/dffy-test-state"));
+        cmd.env("XDG_RUNTIME_DIR", runtime);
+        cmd.env("DFFY_DAEMON_IDLE_SECS", "1");
+        let child = pair.slave.spawn_command(cmd).expect("spawn the viewer");
+        drop(pair.slave);
+        let mut reader = pair.master.try_clone_reader().expect("reader");
+        std::thread::spawn(move || std::io::copy(&mut reader, &mut std::io::sink()));
+        let start = std::time::Instant::now();
+        loop {
+            let out = Command::new(env!("CARGO_BIN_EXE_dffy"))
+                .args(["ctl", "views"])
+                .env("XDG_RUNTIME_DIR", runtime)
+                .output()
+                .expect("dffy ctl views");
+            if String::from_utf8_lossy(&out.stdout).starts_with("view ") {
+                break;
+            }
+            assert!(
+                start.elapsed() < std::time::Duration::from_secs(10),
+                "the viewer never registered"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        Self {
+            _master: pair.master,
+            child,
+        }
+    }
+}
+
+impl Drop for Viewer {
+    fn drop(&mut self) {
+        self.child.kill().ok();
+        self.child.wait().ok();
+    }
+}
+
+/// The viewer tools say so when no viewer runs in the repository, and
+/// drive the one that does.
+#[test]
+fn the_viewer_tools_drive_the_viewer_running_in_the_repository() {
+    let repo = repo();
+    let runtime = tempfile::tempdir().expect("tempdir");
+    let mut server = Server::start_in(repo.path(), runtime.path());
+    initialize(&mut server);
+    for (tool, arguments) in [
+        ("open_in_viewer", r#"{"path":"lib.rs","line":1}"#),
+        ("focus_thread", r#"{"id":"0123"}"#),
+        ("viewer_selection", "{}"),
+    ] {
+        let call = server.call(tool, arguments);
+        assert!(call.is_error(), "{tool}: {}", call.line);
+        assert!(
+            call.text().starts_with("No dffy viewer is running in "),
+            "{tool}: {}",
+            call.text()
+        );
+    }
+
+    let _viewer = Viewer::start(repo.path(), runtime.path(), &["main~1", "main"]);
+    let selection = server.call("viewer_selection", "{}");
+    assert_eq!(selection.structured().get("selection"), Some(&Value::Null));
+    assert!(
+        selection
+            .text()
+            .starts_with("Nothing is selected in the viewer"),
+        "{}",
+        selection.text()
+    );
+    let opened = server.call("open_in_viewer", r#"{"path":"long.txt","line":30}"#);
+    let at = opened.structured();
+    assert_eq!(at.get("path").and_then(Value::as_str), Some("long.txt"));
+    assert_eq!(at.get("line").and_then(Value::as_usize), Some(30));
+    assert_eq!(opened.text(), "The viewer shows long.txt at line 30.");
+    let missing = server.call("open_in_viewer", r#"{"path":"nope.rs"}"#);
+    assert!(missing.is_error());
+    assert!(
+        missing.text().contains("nope.rs isn't in this diff"),
+        "{}",
+        missing.text()
+    );
+    let unknown = server.call("focus_thread", r#"{"id":"0123"}"#);
+    assert!(unknown.is_error());
+    assert!(
+        unknown.text().contains("no comment 0123"),
+        "{}",
+        unknown.text()
+    );
+    let wrong = server.call("open_in_viewer", r#"{"path":"lib.rs","side":"left"}"#);
+    assert!(wrong.is_error());
+    assert!(
+        wrong.text().contains("side must be old or new"),
+        "{}",
+        wrong.text()
+    );
 }

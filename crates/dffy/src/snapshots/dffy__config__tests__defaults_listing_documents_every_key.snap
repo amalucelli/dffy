@@ -62,6 +62,9 @@ expression: text
 <dim># Show files that have a renderer (see render) rendered in the viewer, diffed block by block, instead of as lines; `r` toggles it.</>
 <hint>rendered</><dim> = </>false
 
+<dim># Experimental: the review plugin, the program dffy-review-<name> on PATH. It adds the command it names to open one of the code host's reviews in the viewer, and plain `dffy` asks it for the branch's; empty for none, and no such command. --review <name> sets it for one run. See docs/plugins.md.</>
+<hint>review</><dim> = </>
+
 <dim># Start the viewer in watch mode, refreshing as files, the index or refs change; `w` toggles it. With nothing to show, a watching viewer opens and waits for changes instead of printing that there are none.</>
 <hint>watch</><dim> = </>false
 
@@ -89,7 +92,7 @@ expression: text
 <dim># Show the one-time tip about the command panel on the first run of the viewer.</>
 <hint>tips</><dim> = </>true
 
-<dim># Take mouse input in the viewer: clicks, the wheel, and dragging over code to select and copy it. `M` turns it off for the terminal's own selection (many terminals, Ghostty included, also select natively with shift held while dragging).</>
+<dim># Take mouse input in the viewer: clicks, the wheel, and dragging over code to select and copy it. `M` in the command panel turns it off for the terminal's own selection (many terminals, Ghostty included, also select natively with shift held while dragging).</>
 <hint>mouse</><dim> = </>true
 
 <dim># Keep results that are slow to compute (renames, highlighting of large files) in $XDG_CACHE_HOME/dffy.</>
@@ -98,7 +101,7 @@ expression: text
 <dim># Size the disk cache is trimmed to, least recently used first: bytes, or a number with K, M or G.</>
 <hint>cache-size</><dim> = </>256M
 
-<dim># Keys in the viewer: keybind = <key>=<action>, or <key>=unbind to free a key. A key is a character as typed (n, N, <, ?) or a name (space, enter, tab, shift+tab, esc, backspace, up, down, left, right, home, end, page_up, page_down, insert, delete, f1 to f12), with ctrl+ or alt+ before it. Keys pressed in the file tree look in its own table first, set with tree: before the key (keybind = tree:v=mark_viewed). The command panel the leader key opens has its own table too, set with leader: (keybind = leader:z=toggle_wrap); the menu lists its entries in this order.</>
+<dim># Keys in the viewer: keybind = <key>=<action>, or <key>=unbind to free a key. A key is a character as typed (n, N, <, ?) or a name (space, enter, tab, shift+tab, esc, backspace, up, down, left, right, home, end, page_up, page_down, insert, delete, f1 to f12), with ctrl+ or alt+ before it. Keys pressed in the file tree look in its own table first, set with tree: before the key (keybind = tree:v=mark_viewed), and so do keys pressed while a comment thread is focused, in the thread's table (thread:), then while the file at the cursor has conflicts to resolve, in the conflict's table (conflict:). The command panel the leader key opens has its own table too, set with leader: (keybind = leader:z=toggle_wrap); the menu lists its entries in this order.</>
 
 <dim># leader: open the command panel; its next key runs a command</>
 <hint>keybind</><dim> = </>space=leader
@@ -152,14 +155,14 @@ expression: text
 <hint>keybind</><dim> = </>]=next_file
 <hint>keybind</><dim> = </>alt+f=next_file
 <hint>keybind</><dim> = </>alt+right=next_file
-<hint>keybind</><dim> = </>leader:n=next_file
+<hint>keybind</><dim> = </>leader:f=next_file
 
 <dim># prev_file: previous file</>
 <hint>keybind</><dim> = </>F=prev_file
 <hint>keybind</><dim> = </>[=prev_file
 <hint>keybind</><dim> = </>alt+b=prev_file
 <hint>keybind</><dim> = </>alt+left=prev_file
-<hint>keybind</><dim> = </>leader:p=prev_file
+<hint>keybind</><dim> = </>leader:F=prev_file
 
 <dim># expand: show more of the highlighted ⋯ gap</>
 <hint>keybind</><dim> = </>x=expand
@@ -191,10 +194,19 @@ expression: text
 <hint>keybind</><dim> = </>Y=copy_path
 <hint>keybind</><dim> = </>leader:Y=copy_path
 
+<dim># copy_absolute_path: copy where the file is on disk, from the filesystem's root</>
+<dim># (no key by default)</>
+
+<dim># copy_comment: copy a comment of the focused thread as written, in Markdown: the one last clicked, else its first</>
+<dim># (no key by default)</>
+
+<dim># copy_thread: copy the focused thread: each comment under its author and date, as written</>
+<dim># (no key by default)</>
+
 <dim># cancel: end the selection; in the tree, clear the filter</>
 <hint>keybind</><dim> = </>esc=cancel
 
-<dim># switch_pane: switch between the file tree and the diff</>
+<dim># switch_pane: switch between the left panel (the file tree, or the comments) and the diff</>
 <hint>keybind</><dim> = </>tab=switch_pane
 <hint>keybind</><dim> = </>shift+tab=switch_pane
 
@@ -209,11 +221,10 @@ expression: text
 
 <dim># search: search the diff's text; n/N then go between matches, esc clears</>
 <hint>keybind</><dim> = </>/=search
-<hint>keybind</><dim> = </>leader:S=search
 
 <dim># filter_tree: filter the file tree, fuzzily; f/F and n/N keep to the files it keeps, esc clears</>
 <hint>keybind</><dim> = </>tree:/=filter_tree
-<hint>keybind</><dim> = </>leader:f=filter_tree
+<hint>keybind</><dim> = </>leader:|=filter_tree
 
 <dim># open: open a file, or open or close a folder, in the tree</>
 <hint>keybind</><dim> = </>tree:enter=open
@@ -242,7 +253,7 @@ expression: text
 
 <dim># toggle_wrap: wrap or truncate long lines</>
 <hint>keybind</><dim> = </>W=toggle_wrap
-<hint>keybind</><dim> = </>leader:w=toggle_wrap
+<hint>keybind</><dim> = </>leader:W=toggle_wrap
 
 <dim># toggle_syntax: diff by lines or by syntax</>
 <hint>keybind</><dim> = </>d=toggle_syntax
@@ -253,42 +264,145 @@ expression: text
 <hint>keybind</><dim> = </>leader:r=toggle_rendered
 
 <dim># cycle_indicators: how changed lines are marked: background, bars, classic signs or none</>
-<hint>keybind</><dim> = </>leader:i=cycle_indicators
+<hint>keybind</><dim> = </>leader:K=cycle_indicators
 
 <dim># cycle_modified_lines: a line and its edit in the modified color with red and green tokens, or red and green lines</>
-<hint>keybind</><dim> = </>leader:e=cycle_modified_lines
+<hint>keybind</><dim> = </>leader:%=cycle_modified_lines
 
 <dim># toggle_highlight: syntax highlighting on or off</>
-<hint>keybind</><dim> = </>leader:H=toggle_highlight
+<hint>keybind</><dim> = </>leader:*=toggle_highlight
 
 <dim># toggle_whitespace: ignore whitespace (-w) or not, diffing again</>
-<hint>keybind</><dim> = </>leader:W=toggle_whitespace
+<hint>keybind</><dim> = </>leader:I=toggle_whitespace
 
 <dim># toggle_line_numbers: show or hide line numbers</>
-<hint>keybind</><dim> = </>leader:L=toggle_line_numbers
+<hint>keybind</><dim> = </>leader:#=toggle_line_numbers
 
 <dim># toggle_hunk_headers: show or hide the @@ numbers of hunks</>
-<hint>keybind</><dim> = </>leader:m=toggle_hunk_headers
+<hint>keybind</><dim> = </>leader:@=toggle_hunk_headers
 
 <dim># toggle_status_bar: the status bar in the frame's bottom border or its top one</>
-<hint>keybind</><dim> = </>leader:b=toggle_status_bar
+<hint>keybind</><dim> = </>leader:B=toggle_status_bar
 
 <dim># cycle_theme: the next theme, built-in or yours</>
-<hint>keybind</><dim> = </>leader:c=cycle_theme
+<hint>keybind</><dim> = </>leader:a=cycle_theme
 
 <dim># toggle_watch: watch for changes</>
 <hint>keybind</><dim> = </>w=toggle_watch
-<hint>keybind</><dim> = </>leader:a=toggle_watch
+<hint>keybind</><dim> = </>leader:w=toggle_watch
 
 <dim># toggle_mouse: take mouse input, or leave it to the terminal's own selection (many terminals select natively with shift held while dragging)</>
-<hint>keybind</><dim> = </>M=toggle_mouse
-<hint>keybind</><dim> = </>leader:M=toggle_mouse
+<hint>keybind</><dim> = </>leader:$=toggle_mouse
 
 <dim># toggle_copy_decorations: copies include line numbers and +/- signs, or only the code</>
-<hint>keybind</><dim> = </>leader:D=toggle_copy_decorations
+<hint>keybind</><dim> = </>leader:J=toggle_copy_decorations
 
-<dim># edit: open the file in $EDITOR at the top line</>
+<dim># stage: stage the selected lines, else the hunk of the line last tapped or the first on screen: their working-tree version goes in the index (uncommitted changes only)</>
+<hint>keybind</><dim> = </>A=stage
+<hint>keybind</><dim> = </>leader:A=stage
+
+<dim># unstage: unstage the selected lines, else the hunk of the line last tapped or the first on screen: their HEAD version goes back in the index (uncommitted changes only)</>
+<hint>keybind</><dim> = </>U=unstage
+<hint>keybind</><dim> = </>leader:U=unstage
+
+<dim># discard: discard the selected lines' unstaged changes, else the hunk's, after a y/n: the working tree gets back the index's version, and an untracked file is deleted (uncommitted changes only)</>
+<hint>keybind</><dim> = </>D=discard
+<hint>keybind</><dim> = </>leader:D=discard
+
+<dim># next_conflict: in a conflicted file, the next conflict</>
+<hint>keybind</><dim> = </>conflict:n=next_conflict
+
+<dim># prev_conflict: in a conflicted file, the previous conflict</>
+<hint>keybind</><dim> = </>conflict:N=prev_conflict
+
+<dim># keep_current: resolve the conflict last gone to, else the first on screen, to the current side (ours); again takes the choice back. Choices show as a preview until written</>
+<hint>keybind</><dim> = </>conflict:o=keep_current
+
+<dim># take_incoming: resolve the conflict to the incoming side (theirs); again takes the choice back</>
+<hint>keybind</><dim> = </>conflict:t=take_incoming
+
+<dim># keep_both: resolve the conflict to both sides, the current one first; again takes the choice back</>
+<hint>keybind</><dim> = </>conflict:b=keep_both
+
+<dim># take_base: resolve the conflict to the common ancestor's lines, when git wrote them (merge.conflictStyle diff3 or zdiff3); again takes the choice back</>
+<hint>keybind</><dim> = </>conflict:a=take_base
+
+<dim># write_resolution: write the conflicted file as the choices resolve it, asking first when some conflicts have none; then git add it after a y/n</>
+<hint>keybind</><dim> = </>conflict:w=write_resolution
+
+<dim># edit: open the file in $EDITOR at the line last tapped, else the top line</>
 <hint>keybind</><dim> = </>e=edit
+
+<dim># comment: comment on the selected lines, or the line v would start on, in a text box under them; esc saves it</>
+<hint>keybind</><dim> = </>c=comment
+
+<dim># suggest_change: suggest a change to the selected lines, or the line v would start on: a comment's text box holding them, to edit into what they should be; esc saves it</>
+<hint>keybind</><dim> = </>S=suggest_change
+<hint>keybind</><dim> = </>leader:S=suggest_change
+
+<dim># comment_file: comment on the whole file shown, in a text box under its first row; esc saves it</>
+<hint>keybind</><dim> = </>C=comment_file
+
+<dim># comments: the left panel lists every comment thread in place of the files, or the files again; moving through the threads shows each in the diff, enter or tab goes to it; r, e, x, d and o act on the selected thread</>
+<hint>keybind</><dim> = </>i=comments
+
+<dim># next_thread: next comment thread, on into the next file with comments; it takes the focus, where r replies, e edits, x resolves, d deletes and o opens it on its host</>
+<hint>keybind</><dim> = </>m=next_thread
+
+<dim># prev_thread: previous comment thread, back into the previous file with comments</>
+<hint>keybind</><dim> = </>M=prev_thread
+
+<dim># toggle_thread: fold or unfold the focused comment thread, or the first on screen</>
+<hint>keybind</><dim> = </>z=toggle_thread
+
+<dim># toggle_threads: fold every comment thread to one row, or unfold them all</>
+<hint>keybind</><dim> = </>Z=toggle_threads
+
+<dim># move_thread: move the focused thread, or the comments panel's selected one, from the branch it was written on to the current branch</>
+<hint>keybind</><dim> = </>V=move_thread
+
+<dim># reply: on a thread: reply in a text box under it; esc saves it</>
+<hint>keybind</><dim> = </>thread:r=reply
+
+<dim># edit_draft: on a thread: edit your last draft in it, in a text box; esc saves it</>
+<hint>keybind</><dim> = </>thread:e=edit_draft
+
+<dim># delete_draft: on a thread: delete your last draft in it, the whole thread when that's its first comment, once the key comes again</>
+<hint>keybind</><dim> = </>thread:d=delete_draft
+
+<dim># resolve: on a thread: resolve it, or reopen it</>
+<hint>keybind</><dim> = </>thread:x=resolve
+
+<dim># adopt: on a thread: someone else's comments in it not posted, as an agent's, become your drafts, which posting sends under your name</>
+<hint>keybind</><dim> = </>thread:a=adopt
+
+<dim># open_on_host: on a thread: open it on its code host, in the browser</>
+<hint>keybind</><dim> = </>thread:o=open_on_host
+
+<dim># comment_in_editor: write in $EDITOR: your draft in the focused thread, else a reply to it, else a comment on the line; ctrl+g does it from the text box</>
+<hint>keybind</><dim> = </>E=comment_in_editor
+<hint>keybind</><dim> = </>leader:E=comment_in_editor
+
+<dim># commented_files: the tree shows only the files with comments, or every file; f/F and n/N keep to them</>
+<hint>keybind</><dim> = </>tree:c=commented_files
+<hint>keybind</><dim> = </>leader:!=commented_files
+
+<dim># review_pull: on a review a review plugin opened, fetch its new commits and threads and show them in place (experimental, see review)</>
+<hint>keybind</><dim> = </>p=review_pull
+
+<dim># review_post: on a review a review plugin opened, open the dialog that posts your drafts, replies and resolves as a review (experimental, see review)</>
+<hint>keybind</><dim> = </>P=review_post
+
+<dim># open_review: list the reviews the review plugin offers, such as this branch's, yours and those waiting on you, to open one (experimental, see review)</>
+<hint>keybind</><dim> = </>O=open_review
+<hint>keybind</><dim> = </>leader:O=open_review
+
+<dim># since_last_review: on a review a review plugin opened, show only what changed since the head of your last review posted from dffy, or the whole review again</>
+<hint>keybind</><dim> = </>R=since_last_review
+<hint>keybind</><dim> = </>leader:R=since_last_review
+
+<dim># whole_review: on the branch's review that plain dffy found, show the whole review against the working tree, or the working tree's changes again</>
+<hint>keybind</><dim> = </>leader:Q=whole_review
 
 <dim># help: show or hide this help</>
 <hint>keybind</><dim> = </>?=help

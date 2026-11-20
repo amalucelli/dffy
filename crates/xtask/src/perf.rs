@@ -8,19 +8,20 @@
 //! no per-baseline calibration:
 //! allocations get no noise band, and timings are held to the layout bands,
 //! shared by every baseline, which `--full` measures again when missing or
-//! older than [`LAYOUT_MAX_AGE_DAYS`]. Every tier measures every group;
+//! older than [`LAYOUT_MAX_AGE_DAYS`], and for a group they have no band
+//! of, such as a new one, alone. Every tier measures every group;
 //! `--only` narrows the normal and full tiers.
 
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use crate::ab::{self, GROUPS};
+use crate::ab::{self, GROUPS, TIMINGS_ONLY};
 use crate::results::short;
 use crate::{ROOT, Result};
 
-const USAGE: &str =
-    "usage: cargo xtask perf [--quick | --full] [--rev REV] [--rounds N] [--only GROUP,...]";
+const USAGE: &str = "usage: cargo xtask perf [--quick | --full] [--rev REV] [--rounds N] [--only GROUP,...] [--allow-missing-baseline]";
 
 /// The layouts `--full` builds to measure layout bands.
 const LAYOUTS: usize = 4;
@@ -37,6 +38,7 @@ pub(crate) fn main(args: &[String]) -> Result<bool> {
     let mut rev = None;
     let mut rounds = None;
     let mut only: Option<Vec<String>> = None;
+    let mut allow_missing_baseline = false;
     let mut args = args.iter();
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -44,6 +46,7 @@ pub(crate) fn main(args: &[String]) -> Result<bool> {
             "--full" => tier = "full",
             "--rounds" => rounds = Some(ab::rounds_arg(args.next())?),
             "--only" => only = Some(ab::only_arg(args.next())?),
+            "--allow-missing-baseline" => allow_missing_baseline = true,
             "--rev" => {
                 rev = Some(
                     args.next()
@@ -75,7 +78,7 @@ pub(crate) fn main(args: &[String]) -> Result<bool> {
         "baseline: {rev}, commit {}{}",
         short(commit),
         if default {
-            " (the default; REV=<rev> picks another)"
+            " (the default; --rev <rev> picks another)"
         } else {
             ""
         }
@@ -85,9 +88,11 @@ pub(crate) fn main(args: &[String]) -> Result<bool> {
     if let Some(only) = &only {
         groups.retain(|g| only.iter().any(|o| o == g));
     }
-    if tier == "quick" && groups.contains(&"pty") {
-        eprintln!("quick: pty has only timings, skipped");
-        groups.retain(|&g| g != "pty");
+    if tier == "quick" {
+        for group in TIMINGS_ONLY.iter().filter(|g| groups.contains(g)) {
+            eprintln!("quick: {group} has only timings, skipped");
+        }
+        groups.retain(|g| !TIMINGS_ONLY.contains(g));
     }
     if groups.is_empty() {
         println!("Nothing to measure: --only left no group for this tier.");
@@ -100,14 +105,24 @@ pub(crate) fn main(args: &[String]) -> Result<bool> {
     // A Ctrl-C at the terminal kills the running child too, and the error
     // brings this run to its own cleanup below.
     clean_up(&perf);
-    let result = measure(&perf, commit, tier, rounds, &groups);
+    let result = measure(
+        &perf,
+        commit,
+        (tier, rounds, &groups),
+        allow_missing_baseline,
+    );
     clean_up(&perf);
     result
 }
 
 /// The checkout against a fresh build of `commit`, with the builds under
-/// `perf`.
-fn measure(perf: &Path, commit: &str, tier: &str, rounds: usize, groups: &[&str]) -> Result<bool> {
+/// `perf`; `allow_missing_baseline` as [`ab::run`] takes it.
+fn measure(
+    perf: &Path,
+    commit: &str,
+    (tier, rounds, groups): (&str, usize, &[&str]),
+    allow_missing_baseline: bool,
+) -> Result<bool> {
     let worktree = perf.join("worktree");
     git(&[
         "worktree",
@@ -126,7 +141,24 @@ fn measure(perf: &Path, commit: &str, tier: &str, rounds: usize, groups: &[&str]
     ab::snapshot(&base, None, Some(&worktree))?;
     let layout = perf.join("layout.tsv");
     let age = age_in_days(&layout);
-    if tier == "full" && age.is_none_or(|days| days > LAYOUT_MAX_AGE_DAYS) {
+    let stale = age.is_none_or(|days| days > LAYOUT_MAX_AGE_DAYS);
+    let mut calibrate = Vec::new();
+    if tier == "full" {
+        let lacking: Vec<&str> = (groups.iter().filter_map(|g| ab::needs(g)))
+            .filter(|need| !(need.has)(&base.join("dffy"), perf))
+            .map(|need| {
+                eprintln!(
+                    "warning: the baseline's dffy can't {}, so the {} group gets no layout bands from {}",
+                    need.what,
+                    need.group,
+                    short(commit)
+                );
+                need.group
+            })
+            .collect();
+        calibrate = calibrated(groups, &ab::read_bands(&layout), stale, &lacking);
+    }
+    if stale && !calibrate.is_empty() {
         let why = age.map_or_else(
             || "there are none".to_owned(),
             |days| format!("they're {days} days old"),
@@ -137,7 +169,25 @@ fn measure(perf: &Path, commit: &str, tier: &str, rounds: usize, groups: &[&str]
             LAYOUTS - 1,
             LAYOUTS - 1
         );
-        ab::measure_layouts(&base, LAYOUTS, rounds, groups, Some(&worktree), &layout)?;
+        ab::measure_layouts(&base, LAYOUTS, rounds, &calibrate, Some(&worktree), &layout)?;
+    } else if !calibrate.is_empty() {
+        eprintln!(
+            "calibrating: measuring layout bands of {} on {}, since {} has none for them",
+            calibrate.join(", "),
+            short(commit),
+            layout.display()
+        );
+        // The other groups' bands keep their age.
+        let modified = layout.metadata().and_then(|m| m.modified());
+        ab::measure_layouts(&base, LAYOUTS, rounds, &calibrate, Some(&worktree), &layout)?;
+        if let Ok(time) = modified
+            && let Err(e) = fs::File::options()
+                .write(true)
+                .open(&layout)
+                .and_then(|f| f.set_modified(time))
+        {
+            eprintln!("warning: {}: {e}", layout.display());
+        }
     } else if tier != "quick" {
         let measured = fs::read_to_string(&layout).unwrap_or_default();
         match measured.lines().next().and_then(|l| l.strip_prefix("# ")) {
@@ -145,7 +195,32 @@ fn measure(perf: &Path, commit: &str, tier: &str, rounds: usize, groups: &[&str]
             None => eprintln!("layout bands: none; task perf:full measures them"),
         }
     }
-    ab::run(&base, rounds, groups, tier, &layout, &[])
+    ab::run(
+        &base,
+        rounds,
+        groups,
+        tier,
+        &layout,
+        (&[], allow_missing_baseline),
+    )
+}
+
+/// The groups `--full` measures layout bands of: every group when the bands
+/// are `stale`, else those `bands` has none of; never those whose needs
+/// the baseline's dffy `lacks` ([`ab::Needs`]).
+fn calibrated<'a>(
+    groups: &[&'a str],
+    bands: &HashMap<String, f64>,
+    stale: bool,
+    lacks: &[&str],
+) -> Vec<&'a str> {
+    groups
+        .iter()
+        .copied()
+        .filter(|g| !lacks.contains(g))
+        // Every metric's name starts with its group's.
+        .filter(|g| stale || !bands.keys().any(|m| m.starts_with(g)))
+        .collect()
 }
 
 /// Days since `path` was last written; none when it doesn't exist.
@@ -298,6 +373,34 @@ mod tests {
         left.sort();
         assert_eq!(left, KEPT.map(std::ffi::OsString::from));
         assert!(p.join("runs/2026-11-16-1200/results.json").is_file());
+    }
+
+    #[test]
+    fn full_calibrates_the_groups_without_bands_and_only_those_the_baseline_can_run() {
+        // A metric of each group, named as the group names it.
+        let names = [
+            "frame/full_frame/table",
+            "engine/line_diff/fair.c",
+            "pty/first frame",
+            "count_pass",
+            "paint/range first_1",
+            "print/range",
+            "pager/range",
+            "comments/settled",
+        ];
+        let bands = |names: &[&str]| names.iter().map(|&n| (n.to_owned(), 0.02)).collect();
+        let all = bands(&names);
+        let none: [&str; 0] = [];
+        let lacks = ["comments"];
+        assert_eq!(calibrated(&GROUPS, &all, false, &[]), none);
+        let before_comments = bands(&names[..7]);
+        assert_eq!(
+            calibrated(&GROUPS, &before_comments, false, &[]),
+            ["comments"]
+        );
+        assert_eq!(calibrated(&GROUPS, &before_comments, false, &lacks), none);
+        assert_eq!(calibrated(&GROUPS, &all, true, &[]), GROUPS);
+        assert_eq!(calibrated(&GROUPS, &all, true, &lacks), GROUPS[..7]);
     }
 
     #[test]

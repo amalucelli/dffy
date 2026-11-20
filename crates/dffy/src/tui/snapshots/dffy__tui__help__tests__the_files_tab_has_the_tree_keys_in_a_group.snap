@@ -3,18 +3,20 @@ source: crates/dffy/src/tui/help.rs
 expression: "shown(&mut help, &keys, 100, 20)"
 ---
 
-
-
        ┌─ keybinds ──────────────────────────────────────────────────────────── esc close ─┐
        │  Move  Files  View  Copy  Other                                                   │
-       │                                                                                   │
        │ f ]               next file               in the tree                             │
        │ F [               prev file               /                 filter tree           │
-       │ tab shift+tab     switch tree/diff        enter l           open file or folder   │
+       │ tab shift+tab     switch panel/diff       enter l           open file or folder   │
        │ T t               toggle tree             h left            collapse folder       │
        │ o                 find file               v                 mark viewed           │
        │ /                 search diff             +                 widen tree            │
        │ u                 parent folder           -                 narrow tree           │
+       │                                           c                 files with comments   │
+       │                                                                                   │
+       │                                                                                   │
+       │                                                                                   │
+       │                                                                                   │
        │                                                                                   │
        │ more settings: space · all keys: docs/keys.md                                     │
        │ tab section · / search · esc close                                                │

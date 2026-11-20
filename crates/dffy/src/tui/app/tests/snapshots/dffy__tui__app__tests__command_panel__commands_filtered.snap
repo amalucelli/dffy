@@ -1,6 +1,5 @@
 ---
-source: crates/dffy/src/tui/app.rs
-assertion_line: 3531
+source: crates/dffy/src/tui/app/tests.rs
 expression: screen(&mut app)
 ---
 ┌ Files · 2 +2 -2 ────────────────────┬─ modified · src/some/deeply/nested/module/file.rs · +2 -2 ─────────────────────── @@ -1,7 +1,7 @@ ─┐
@@ -21,7 +20,7 @@ expression: screen(&mut app)
 │                                     │ 52  │ line 52                                    │52  │ line 52                                    ┃
 │                                     │ 53  │ line 53                                    │53  │ line 53                                    ┃
 │                                     │ ⋯┌─ commands ──────────────────────────────── esc close ─┐                                         ┃
-│                                     │  │ [ ] Wrap long lines                              w W  │                                         ┃
+│                                     │  │ [ ] Wrap long lines                              W    │                                         ┃
 │                                     │  │                                                       │                                         ┃
 │                                     │  │ /wrp▏  · clear esc                                    │                                         ┃
 │                                     │  └───────────────────────────────────────────────────────┘                                         ┃

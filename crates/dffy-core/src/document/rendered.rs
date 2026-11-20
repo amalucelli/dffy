@@ -124,6 +124,13 @@ impl Rendered {
         start.zip(end).map_or(0..0, |(s, e)| s as usize..e as usize)
     }
 
+    /// The last rendered line of `side` drawn from source line `line`;
+    /// `None` when none is.
+    pub(super) fn shown_line(&self, side: Side, line: usize) -> Option<usize> {
+        (self.origins[side.index()].iter())
+            .rposition(|o| (o.start as usize..o.end as usize).contains(&line))
+    }
+
     /// Lines of the longer source side, which line numbers go up to.
     #[must_use]
     pub fn source_len(&self) -> usize {

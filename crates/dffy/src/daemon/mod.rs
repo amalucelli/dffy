@@ -1,4 +1,5 @@
-//! dffyd, the per-user watch broker, and the client side of it.
+//! dffyd, the per-user watch broker, and the client side of it. dffyd also
+//! serves the control API ([`crate::control`]) on a socket of its own.
 //!
 //! The Linux inotify limit is per user and costs one watch per directory, so
 //! every dffy view of a repository watching it alone would multiply the
@@ -8,11 +9,13 @@
 //! shared: each view still runs its own engine, and print and pager mode
 //! never touch the broker.
 //!
-//! Lifecycle: the first watching dffy starts the broker, which exits a
-//! minute after its last subscriber leaves. When it can't be reached, or
-//! dies, a view watches by itself. Its socket lives in a private directory
-//! (`$XDG_RUNTIME_DIR/dffy`, else `$TMPDIR/dffy-<uid>`) and is named after
-//! the protocol version, so brokers from different dffy versions never meet.
+//! Lifecycle: the first viewer starts dffyd, to register with the control
+//! API or to watch, and it exits a minute after its last subscriber and
+//! view leave. When it can't be reached, or dies, a view watches by itself.
+//! Its sockets live in a private directory (`$XDG_RUNTIME_DIR/dffy`, else
+//! `$TMPDIR/dffy-<uid>`) and are named after their protocol's version, so
+//! dffyds from different dffy versions never meet; each socket is served
+//! by whichever dffyd holds its lock.
 
 pub(crate) mod broker;
 pub(crate) mod client;
@@ -59,7 +62,7 @@ pub(crate) fn runtime_dir() -> io::Result<PathBuf> {
 }
 
 /// Where [`runtime_dir`] is, without creating it.
-fn runtime_path() -> PathBuf {
+pub(crate) fn runtime_path() -> PathBuf {
     match std::env::var_os("XDG_RUNTIME_DIR").filter(|v| Path::new(v).is_absolute()) {
         Some(base) => PathBuf::from(base).join("dffy"),
         None => std::env::temp_dir().join(format!("dffy-{}", rustix::process::getuid().as_raw())),
@@ -70,11 +73,10 @@ fn socket_path(dir: &Path) -> PathBuf {
     dir.join(format!("broker-v{VERSION}.sock"))
 }
 
-/// Connects to a running broker, `Err` when there's none. The socket must
-/// be this user's.
-fn connect(dir: &Path) -> io::Result<UnixStream> {
-    let path = socket_path(dir);
-    let meta = fs::symlink_metadata(&path)?;
+/// Connects to one of dffyd's sockets, `Err` when nothing serves it. The
+/// socket must be this user's.
+pub(crate) fn connect(path: &Path) -> io::Result<UnixStream> {
+    let meta = fs::symlink_metadata(path)?;
     if !meta.file_type().is_socket() || meta.uid() != rustix::process::getuid().as_raw() {
         return Err(io::Error::other(format!(
             "{} isn't a socket of yours",
@@ -86,7 +88,7 @@ fn connect(dir: &Path) -> io::Result<UnixStream> {
 
 /// Sends a one-shot request to the running broker; `None` when none runs.
 pub(crate) fn request(message: &Message) -> io::Result<Option<Message>> {
-    let Ok(mut stream) = connect(&runtime_path()) else {
+    let Ok(mut stream) = connect(&socket_path(&runtime_path())) else {
         return Ok(None);
     };
     stream.set_read_timeout(Some(Duration::from_secs(5)))?;
@@ -176,7 +178,7 @@ fn unexpected(message: &Message) -> io::Error {
 fn not_running(c: &mut Canvas) {
     c.push(Role::Plain, "dffyd");
     c.push(Role::Dim, " isn't running");
-    c.line(Role::Dim, "; the first dffy --watch starts it");
+    c.line(Role::Dim, "; the first viewer starts it");
 }
 
 fn render(report: &Report, c: &mut Canvas) {

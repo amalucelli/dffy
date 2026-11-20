@@ -1,0 +1,44 @@
+---
+source: crates/dffy/src/tui/app.rs
+expression: screen(&mut app)
+---
+ ‹ 1/13 Conversation ›
+Spell out five
+
+┌ ▾ ana · 2d ago · description ───────────────────────────────────────┐
+│ Spells out five.                                                    │
+│                                                                     │
+│ The count was off by one.                                           │
+└─────────────────────────────────────────────────────────────────────┘
+
+┌ ▾ you · 2d ago ─────────────────────────────────────────────────────┐
+│ Thanks for looking.                                                 │
+└─────────────────────────────────────────────────────────────────────┘
+
+┌ ▾ hubot · 1d ago ───────────────────────────────────────────────────┐
+│ Is this ready?                                                      │
+└─────────────────────────────────────────────────────────────────────┘
+
+┌ ▾ octocat · 1d ago · review · approved ─────────────────────────────┐
+│ Looks good, one question inline.                                    │
+└─────────────────────────────────────────────────────────────────────┘
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+»  review 7   unified  review 7 · 6 threads · 5 drafts       ␣ commands

@@ -1,6 +1,7 @@
 //! `dffy mcp`: a Model Context Protocol server on stdin and stdout, for
 //! coding agents. Its tools return the header and file objects of `--json`
-//! (docs/json.md) a page at a time, each result also rendered as plain text
+//! (docs/json.md), or the review comments (docs/comments.md), a page at a
+//! time, each result also rendered as plain text
 //! for clients that show the model only text. docs/mcp.md is the user's
 //! side of it.
 //!
@@ -24,10 +25,13 @@ use dffy_core::diff::Options;
 use dffy_core::git::{FileChange, Repo, Revisions};
 
 use crate::config::{Context, DefaultDiff};
-use crate::json::{self, Compared, Detail, Files, Window};
-use crate::plugin::json::{Value, parse, string};
+use crate::encode::{self, Compared, Detail, Files, Window};
+use crate::plugin::json::{Value, parse, string, write};
 use crate::print::{Plan, Summary, Target};
-use crate::{Ctx, Error};
+use crate::render::Canvas;
+use crate::review::model::At;
+use crate::review::model::snapshot::Snapshot;
+use crate::{Ctx, Error, control, review};
 
 /// The revision with per-request metadata.
 const MODERN: &str = "2026-07-28";
@@ -58,8 +62,11 @@ const INSTRUCTIONS: &str = "dffy shows the changes in the git repository it was 
     uncommitted edits (omit range), a branch (range: main...HEAD), the last commits \
     (range: HEAD~3..HEAD) or any two revisions. Start with changed_files to see which files changed and by how much, then call file_diff \
     for the files that matter. With syntax: true, files whose changes are only formatting or \
-    only moved code are classified, so you can skip them. Results are paged: pass next_cursor \
-    back as cursor, with the same arguments, to continue.";
+    only moved code are classified, so you can skip them. list_comments returns the review \
+    comments left on the code, with their threads. Results are paged: pass next_cursor \
+    back as cursor, with the same arguments, to continue. When the user has the dffy viewer \
+    open here, open_in_viewer shows them a file at a line, focus_thread a comment thread, and \
+    viewer_selection reads the lines they selected.";
 
 /// The tools, as `tools/list` returns them. Written readable here and
 /// compacted when listed, since a message is one line.
@@ -105,6 +112,8 @@ const TOOLS: &str = r#"[
       "syntax": {"type": "boolean", "default": false, "description": "Diff by syntax: marks moved and reformatted lines."},
       "context": {"type": "integer", "minimum": 0, "maximum": 10000, "default": 3, "description": "Unchanged lines around each change."},
       "max_lines": {"type": "integer", "minimum": 1, "maximum": 20000, "default": 400, "description": "Lines per result, across hunks."},
+      "comments": {"type": "boolean", "default": false, "description": "Add the file's review comment threads, as list_comments lists them by default, as annotations: each thread with the lines it's on in this diff, or lost when they're gone."},
+      "session": {"type": "boolean", "default": false, "description": "With comments: true, the threads of the review session the user has open in the viewer, instead of the local ones."},
       "cursor": {"type": "string", "description": "next_cursor from the previous result."}
     },
     "required": ["path"],
@@ -136,6 +145,8 @@ const TOOLS: &str = r#"[
       "context": {"type": "integer", "minimum": 0, "maximum": 10000, "default": 3, "description": "Unchanged lines around each change."},
       "max_files": {"type": "integer", "minimum": 1, "maximum": 200, "default": 20, "description": "Files per page."},
       "max_lines_per_file": {"type": "integer", "minimum": 1, "maximum": 20000, "default": 100, "description": "Lines per file, across its hunks."},
+      "comments": {"type": "boolean", "default": false, "description": "Add each file's review comment threads as annotations, as for file_diff."},
+      "session": {"type": "boolean", "default": false, "description": "With comments: true, the review session's threads, as for file_diff."},
       "cursor": {"type": "string", "description": "next_cursor from the previous page."}
     },
     "additionalProperties": false
@@ -152,17 +163,117 @@ const TOOLS: &str = r#"[
     "required": ["header", "files", "truncated_files", "total_files", "next_cursor"]
   },
   "annotations": {"readOnlyHint": true, "idempotentHint": true, "openWorldHint": false}
+},
+{
+  "name": "list_comments",
+  "title": "Review comments",
+  "description": "List the review comments on the code: comments people left on lines or files of the diff, with their replies and whether each thread is resolved. By default the user's local comments on the current branch, and those on no branch; session: true lists the code review the user has open in the viewer instead. Comments come in threads, each thread's first comment then its replies, threads in path and line order. Each comment has id, path, the side (old or new) and start and end lines it was written on (1-based; none for a comment on a whole file or a reply), text, author (empty means the user), created, in_reply_to for a reply, resolved, and anchor, the commented lines' text. placed has, by the id of a thread's first comment, the lines it's on now in range's diff, for threads whose file that diff changes; lost when its lines are gone. It's filled with range, or with placed: true on the uncommitted changes; otherwise it's empty and nothing is diffed. Read-only. Paged: when next_cursor isn't null, call again with it as cursor and the same arguments.",
+  "inputSchema": {
+    "type": "object",
+    "properties": {
+      "range": {"type": ["string", "array"], "items": {"type": "string"}, "description": "The diff to place threads on, as for changed_files; placed is filled when it's given."},
+      "placed": {"type": "boolean", "default": false, "description": "Place the threads on the uncommitted changes when range is left out."},
+      "path": {"type": "string", "description": "Only the comments on this file, relative to the repository root. A renamed file's old path works too."},
+      "open": {"type": "boolean", "description": "true for open threads only, false for resolved ones."},
+      "resolved": {"type": "boolean", "description": "true for resolved threads only, false for open ones."},
+      "branch": {"type": "string", "description": "The threads of this branch, and those on no branch, instead of the current branch's."},
+      "all_branches": {"type": "boolean", "default": false, "description": "Every branch's threads."},
+      "session": {"type": "boolean", "default": false, "description": "The comments of the review session the user has open in the viewer, such as a pull request's, instead of the local ones."},
+      "limit": {"type": "integer", "minimum": 1, "maximum": 1000, "default": 100, "description": "Comments per page."},
+      "cursor": {"type": "string", "description": "next_cursor from the previous page."}
+    },
+    "additionalProperties": false
+  },
+  "outputSchema": {
+    "type": "object",
+    "properties": {
+      "notice": {"type": ["string", "null"], "description": "A note from the integration that keeps the comments, such as that they're stale."},
+      "comments": {"type": "array", "items": {"type": "object"}, "description": "Comments as the comments file holds them (docs/comments.md)."},
+      "placed": {"type": "object", "additionalProperties": {"type": "object", "properties": {"side": {"type": "string"}, "start": {"type": ["integer", "null"]}, "end": {"type": ["integer", "null"]}, "lost": {"type": "boolean"}}}, "description": "Where the line threads starting on this page are in range's diff, by first comment id; empty without range or placed."},
+      "total_comments": {"type": "integer"},
+      "next_cursor": {"type": ["string", "null"]}
+    },
+    "required": ["notice", "comments", "placed", "total_comments", "next_cursor"]
+  },
+  "annotations": {"readOnlyHint": true, "idempotentHint": true, "openWorldHint": false}
+},
+{
+  "name": "open_in_viewer",
+  "title": "Show a file in the viewer",
+  "description": "Show a file of the diff in the dffy viewer the user has open in this repository, at a line when given, so the user sees what you're talking about. It answers once the file shows. Fails, saying so, when no viewer runs here, or the file isn't in the diff the viewer shows.",
+  "inputSchema": {
+    "type": "object",
+    "properties": {
+      "path": {"type": "string", "description": "The file, relative to the repository root, as changed_files lists it."},
+      "line": {"type": "integer", "minimum": 1, "description": "The line to show, 1-based, on side's numbering. Omit to show the file from its first change."},
+      "side": {"type": "string", "enum": ["old", "new"], "default": "new", "description": "Which version line numbers: new for the file as changed, old for it before."}
+    },
+    "required": ["path"],
+    "additionalProperties": false
+  },
+  "outputSchema": {
+    "type": "object",
+    "properties": {
+      "view": {"type": "integer"},
+      "path": {"type": "string"},
+      "line": {"type": ["integer", "null"]},
+      "side": {"type": "string"}
+    },
+    "required": ["view", "path", "line", "side"]
+  },
+  "annotations": {"readOnlyHint": false, "destructiveHint": false, "idempotentHint": true, "openWorldHint": false}
+},
+{
+  "name": "focus_thread",
+  "title": "Focus a comment thread in the viewer",
+  "description": "Show and focus a review comment thread in the dffy viewer the user has open in this repository, by the id of any of its comments (list_comments lists them). Fails, saying so, when no viewer runs here, or the viewer doesn't show the thread.",
+  "inputSchema": {
+    "type": "object",
+    "properties": {
+      "id": {"type": "string", "description": "A comment's id, the thread's first or a reply."}
+    },
+    "required": ["id"],
+    "additionalProperties": false
+  },
+  "outputSchema": {
+    "type": "object",
+    "properties": {
+      "view": {"type": "integer"},
+      "thread": {"type": "string", "description": "The id of the thread's first comment."},
+      "path": {"type": "string"},
+      "focused": {"type": "boolean", "description": "false while the thread's place in the diff is on its way; it's focused once there."}
+    },
+    "required": ["view", "thread", "path", "focused"]
+  },
+  "annotations": {"readOnlyHint": false, "destructiveHint": false, "idempotentHint": true, "openWorldHint": false}
+},
+{
+  "name": "viewer_selection",
+  "title": "The viewer's selection",
+  "description": "The lines the user selected in the dffy viewer they have open in this repository: the file, the side (new or old), the first and last line (1-based) and their text. Use it when the user refers to what they selected or are looking at. selection is null when nothing is selected. Fails, saying so, when no viewer runs here.",
+  "inputSchema": {"type": "object", "properties": {}, "additionalProperties": false},
+  "outputSchema": {
+    "type": "object",
+    "properties": {
+      "view": {"type": "integer"},
+      "selection": {"type": ["object", "null"], "properties": {"path": {"type": "string"}, "side": {"type": "string"}, "start": {"type": "integer"}, "end": {"type": "integer"}, "text": {"type": "string"}}}
+    },
+    "required": ["view", "selection"]
+  },
+  "annotations": {"readOnlyHint": true, "idempotentHint": false, "openWorldHint": false}
 }
 ]"#;
 
 /// Serves the protocol until stdin closes. `dir` is where the repository
 /// is looked for, relative to the current directory.
-pub(crate) fn serve(dir: Option<&Path>, ctx: &Ctx) -> Result<(), Error> {
+/// `comments` is `--comments`, relative to `dir`.
+pub(crate) fn serve(dir: Option<&Path>, comments: Option<&Path>, ctx: &Ctx) -> Result<(), Error> {
     let cwd = std::env::current_dir()
         .map_err(|e| Error::fatal(format!("can't read the current directory: {e}")))?;
     let base = dir.map_or_else(|| cwd.clone(), |dir| cwd.join(dir));
     let mut server = Server {
         repo: Repo::discover(&base).ok(),
+        comments: comments.map(|file| base.join(file)),
         base,
         ctx,
         legacy: false,
@@ -190,6 +301,8 @@ struct Server<'a> {
     /// `None` until the repository is found; looked for again on each call
     /// until then.
     repo: Option<Repo>,
+    /// The comments file `--comments` names; else the repository's.
+    comments: Option<PathBuf>,
     /// Where dffy looks for the repository.
     base: PathBuf,
     ctx: &'a Ctx,
@@ -358,6 +471,10 @@ impl Server<'_> {
             "changed_files" => self.changed_files(&args),
             "file_diff" => self.file_diff(&args),
             "diff" => self.diff(&args),
+            "list_comments" => self.list_comments(&args),
+            "open_in_viewer" => self.open_in_viewer(&args),
+            "focus_thread" => self.focus_thread(&args),
+            "viewer_selection" => self.viewer_selection(&args),
             _ => return Err(Fault::new(INVALID_PARAMS, format!("Unknown tool: {name}"))),
         };
         let mut s = String::from(r#""content":[{"type":"text","text":"#);
@@ -462,46 +579,8 @@ fn reply(id: Option<&str>, result: Result<String, Fault>) -> String {
 /// `value` as one line of JSON.
 fn compact(value: &Value) -> String {
     let mut s = String::new();
-    write_value(value, &mut s);
+    write(&mut s, value);
     s
-}
-
-fn write_value(value: &Value, s: &mut String) {
-    match value {
-        Value::Null => s.push_str("null"),
-        Value::Bool(b) => s.push_str(if *b { "true" } else { "false" }),
-        #[expect(
-            clippy::cast_possible_truncation,
-            reason = "checked: whole and below 2^53, where f64 is exact"
-        )]
-        Value::Number(n) if n.fract() == 0.0 && n.abs() < 9e15 => {
-            s.push_str(&(*n as i64).to_string());
-        }
-        Value::Number(n) => s.push_str(&n.to_string()),
-        Value::String(text) => string(s, text),
-        Value::Array(items) => {
-            s.push('[');
-            for (i, item) in items.iter().enumerate() {
-                if i > 0 {
-                    s.push(',');
-                }
-                write_value(item, s);
-            }
-            s.push(']');
-        }
-        Value::Object(fields) => {
-            s.push('{');
-            for (i, (key, item)) in fields.iter().enumerate() {
-                if i > 0 {
-                    s.push(',');
-                }
-                string(s, key);
-                s.push(':');
-                write_value(item, s);
-            }
-            s.push('}');
-        }
-    }
 }
 
 /// A tool's result: the objects, and their text rendering.
@@ -535,10 +614,24 @@ impl Args<'_> {
     }
 
     fn bool(&self, key: &str, default: bool) -> Result<bool, String> {
+        Ok(self.flag(key)?.unwrap_or(default))
+    }
+
+    /// A boolean, `None` when it's left out.
+    fn flag(&self, key: &str) -> Result<Option<bool>, String> {
         match self.get(key) {
-            None => Ok(default),
-            Some(Value::Bool(b)) => Ok(*b),
+            None => Ok(None),
+            Some(Value::Bool(b)) => Ok(Some(*b)),
             Some(_) => Err(format!("{key} must be true or false")),
+        }
+    }
+
+    /// The diff tools' `comments`, and `session` with it: `None` without
+    /// comments, else whether they're the review session's.
+    fn comments(&self) -> Result<Option<bool>, String> {
+        match (self.bool("comments", false)?, self.bool("session", false)?) {
+            (false, true) => Err("session picks the comments file; it needs comments: true".into()),
+            (comments, session) => Ok(comments.then_some(session)),
         }
     }
 
@@ -705,7 +798,7 @@ impl Server<'_> {
             revisions: &range.revisions,
             operands: None,
         };
-        json::header(
+        encode::header(
             &range.plan,
             &compared,
             Context::Lines(context),
@@ -777,7 +870,16 @@ impl Server<'_> {
     }
 
     fn file_diff(&mut self, args: &Args) -> Result<Output, String> {
-        args.only(&["path", "range", "syntax", "context", "max_lines", "cursor"])?;
+        args.only(&[
+            "path",
+            "range",
+            "syntax",
+            "context",
+            "max_lines",
+            "comments",
+            "session",
+            "cursor",
+        ])?;
         let path = args.string("path")?.ok_or(
             "path is required: a file from changed_files, relative to the repository root",
         )?;
@@ -785,6 +887,7 @@ impl Server<'_> {
         let syntax = args.bool("syntax", false)?;
         let context = args.number("context", 3, [0, 10_000])?;
         let max_lines = args.number("max_lines", 400, [1, 20_000])?;
+        let comments = args.comments()?;
         let cursor = args.cursor()?;
         let range = self.range(revisions, &[])?;
         let wanted = range.plan.relative(Path::new(path)).map_err(message)?;
@@ -813,12 +916,20 @@ impl Server<'_> {
             max_lines,
             max_bytes: FILE_BYTES,
         };
-        let files = self.files(context, syntax, Detail::Hunks);
+        let snapshot = comments.map(|session| self.snapshot(session)).transpose()?;
+        let mut files = self.files(context, syntax, Detail::Hunks);
+        files.comments = snapshot.as_ref().map(|s| (s, false));
         let (object, windowed) = files
             .file_object(&range.plan.repo, change.clone(), Some(window))
             .map_err(message)?;
         let windowed = windowed.ok_or("a file diff came back without hunks")?;
-        let fingerprint = file_hash(&range, &change, syntax, context, windowed.digest);
+        let fingerprint = file_hash(
+            &range,
+            &change,
+            (syntax, comments),
+            context,
+            windowed.digest,
+        );
         if let Some(cursor) = cursor {
             cursor.check(fingerprint)?;
         }
@@ -856,6 +967,10 @@ impl Server<'_> {
         Ok(Output { structured, text })
     }
 
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the tool in order: arguments, the page of files, then its result and text"
+    )]
     fn diff(&mut self, args: &Args) -> Result<Output, String> {
         args.only(&[
             "range",
@@ -864,6 +979,8 @@ impl Server<'_> {
             "context",
             "max_files",
             "max_lines_per_file",
+            "comments",
+            "session",
             "cursor",
         ])?;
         let revisions = args.strings("range", true)?;
@@ -872,18 +989,21 @@ impl Server<'_> {
         let context = args.number("context", 3, [0, 10_000])?;
         let max_files = args.number("max_files", 20, [1, 200])?;
         let max_lines = args.number("max_lines_per_file", 100, [1, 20_000])?;
+        let comments = args.comments()?;
         let cursor = args.cursor()?;
         let range = self.range(revisions, &paths)?;
         let changes = self.changes(&range)?;
         let mut h = request_hash("diff", &range);
-        (syntax, context).hash(&mut h);
+        (syntax, context, comments).hash(&mut h);
         list_hash(&changes, &mut h);
         let fingerprint = h.finish();
         let start = cursor.map_or(Ok((0, 0)), |c| c.check(fingerprint))?.0;
         let page = changes
             .get(start..start.saturating_add(max_files).min(changes.len()))
             .ok_or(STALE)?;
-        let files = self.files(context, syntax, Detail::Hunks);
+        let snapshot = comments.map(|session| self.snapshot(session)).transpose()?;
+        let mut files = self.files(context, syntax, Detail::Hunks);
+        files.comments = snapshot.as_ref().map(|s| (s, false));
         let window = Window {
             hunk: 0,
             line: 0,
@@ -909,7 +1029,8 @@ impl Server<'_> {
             if let Some(windowed) = windowed
                 && let Some(cut) = windowed.cut
             {
-                let fingerprint = file_hash(&range, change, syntax, context, windowed.digest);
+                let fingerprint =
+                    file_hash(&range, change, (syntax, comments), context, windowed.digest);
                 let cursor = Cursor {
                     fingerprint,
                     at: cut.at,
@@ -958,6 +1079,214 @@ impl Server<'_> {
         Ok(Output { structured, text })
     }
 
+    /// The comments file `list_comments` reads: the review session's with
+    /// `session`, else `--comments`, else the local review's, where it
+    /// is now: this never moves it.
+    fn comments_file(&mut self, session: bool) -> Result<PathBuf, String> {
+        if session {
+            return review::read_session(&self.repo()?)?
+                .map(|pointer| pointer.comments)
+                .ok_or_else(|| {
+                    "no review session: the viewer hasn't opened one in this repository; \
+                     the user opens one with the review plugin's command, as in dffy pr"
+                        .to_owned()
+                });
+        }
+        if let Some(file) = &self.comments {
+            return Ok(file.clone());
+        }
+        review::local_file_read_only(&self.repo()?)
+            .ok_or_else(|| "the repository has no git directory for a comments file".to_owned())
+    }
+
+    /// The threads `comments: true` adds to the diff tools' file objects:
+    /// those `list_comments` lists with `session` alone.
+    fn snapshot(&mut self, session: bool) -> Result<Snapshot, String> {
+        let file = review::read(&self.comments_file(session)?)?;
+        let current = review::current_branch(&self.repo()?);
+        Ok(Snapshot::new(
+            &file,
+            review::Branches::On(current.as_deref()),
+        ))
+    }
+
+    /// Where each line thread starting on `page` is in the diff of
+    /// `revisions`, by its first comment's id, in page order: the threads
+    /// of `file` that `branches` keeps, on the files that diff changes.
+    /// Only the threads' files are listed and diffed. Outside a repository
+    /// there's no diff, so none is placed.
+    fn placements(
+        &mut self,
+        revisions: Vec<String>,
+        page: &[&review::Comment],
+        file: &review::Review,
+        branches: review::Branches,
+    ) -> Result<Vec<(String, At)>, String> {
+        let roots: Vec<&review::Comment> = (page.iter().copied())
+            .filter(|c| c.in_reply_to.is_none() && c.range().is_some())
+            .collect();
+        if roots.is_empty() || self.repo().is_err() {
+            return Ok(Vec::new());
+        }
+        let mut paths: Vec<String> = (roots.iter())
+            .flat_map(|c| std::iter::once(&c.path).chain(&c.old_path))
+            .cloned()
+            .collect();
+        paths.sort_unstable();
+        paths.dedup();
+        let asked = !revisions.is_empty();
+        let listed =
+            (self.range(revisions, &paths)).and_then(|range| Ok((self.changes(&range)?, range)));
+        let (changes, range) = match listed {
+            Ok(listed) => listed,
+            // Unasked, a diff that can't be made, as without a worktree,
+            // places nothing rather than failing the listing.
+            Err(_) if !asked => return Ok(Vec::new()),
+            Err(e) => return Err(e),
+        };
+        let snapshot = Snapshot::new(file, branches);
+        let changes: Vec<FileChange> = (changes.into_iter())
+            .filter(|c| snapshot.has(c, false))
+            .collect();
+        let options = Options {
+            context: 3,
+            whitespace: self.ctx.config.whitespace,
+        };
+        let placed = each(&range.plan.repo, &changes, |repo, change| {
+            // A file that can't be read places nothing.
+            let Ok(diff) = repo.file_diff(change.clone(), &options) else {
+                return Ok(Vec::new());
+            };
+            Ok((snapshot.on(&change, &diff, false).into_iter())
+                .map(|h| (h.thread[0].id.clone(), h.at))
+                .collect::<Vec<_>>())
+        })
+        .map_err(message)?;
+        let placed: std::collections::HashMap<String, At> = placed.into_iter().flatten().collect();
+        Ok((roots.iter())
+            .filter_map(|c| Some((c.id.clone(), placed.get(&c.id)?.clone())))
+            .collect())
+    }
+
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the tool in order: arguments, the page of threads, then its result and text"
+    )]
+    fn list_comments(&mut self, args: &Args) -> Result<Output, String> {
+        args.only(&[
+            "range",
+            "path",
+            "open",
+            "resolved",
+            "branch",
+            "all_branches",
+            "session",
+            "placed",
+            "limit",
+            "cursor",
+        ])?;
+        let revisions = args.strings("range", true)?;
+        // Placing diffs every file on the page with line threads.
+        let place = !revisions.is_empty() || args.bool("placed", false)?;
+        let path = args.string("path")?;
+        let resolved = match (args.flag("open")?, args.flag("resolved")?) {
+            (Some(open), Some(resolved)) if open == resolved => {
+                return Err("open and resolved contradict each other; give one".to_owned());
+            }
+            (Some(open), _) => Some(!open),
+            (None, resolved) => resolved,
+        };
+        let branch = args.string("branch")?;
+        let all_branches = args.bool("all_branches", false)?;
+        if branch.is_some() && all_branches {
+            return Err("branch and all_branches contradict each other; give one".to_owned());
+        }
+        let session = args.bool("session", false)?;
+        let limit = args.number("limit", 100, [1, 1000])?;
+        let cursor = args.cursor()?;
+        let file = review::read(&self.comments_file(session)?)?;
+        let repo = self.repo().ok();
+        let current = repo.as_ref().and_then(review::current_branch);
+        // Outside a repository there's no branch to keep apart.
+        let branches = match (branch, all_branches) {
+            (Some(branch), false) => review::Branches::On(Some(branch)),
+            (None, false) if repo.is_some() => review::Branches::On(current.as_deref()),
+            _ => review::Branches::All,
+        };
+        let listed = review::threads(file.selected(&review::Select {
+            resolved,
+            path,
+            branches,
+        }));
+        let here = match branches {
+            review::Branches::On(branch) => branch,
+            review::Branches::All => current.as_deref(),
+        };
+        let mut h = DefaultHasher::new();
+        "list_comments".hash(&mut h);
+        (path, resolved, branches, session, &revisions).hash(&mut h);
+        for comment in &listed {
+            comment.id.hash(&mut h);
+        }
+        let fingerprint = h.finish();
+        let start = cursor.map_or(Ok((0, 0)), |c| c.check(fingerprint))?.0;
+        let end = start.saturating_add(limit).min(listed.len());
+        let page = listed.get(start..end).ok_or(STALE)?;
+        let next = (end < listed.len()).then(|| {
+            Cursor {
+                fingerprint,
+                at: (end, 0),
+            }
+            .encode()
+        });
+        let placed = if place {
+            self.placements(revisions, page, &file, branches)?
+        } else {
+            Vec::new()
+        };
+        let mut structured = String::from(r#"{"notice":"#);
+        optional_string(&mut structured, file.notice.as_deref());
+        structured.push_str(r#","comments":["#);
+        for (i, comment) in page.iter().enumerate() {
+            if i > 0 {
+                structured.push(',');
+            }
+            write(&mut structured, &Value::Object(comment.to_fields()));
+        }
+        structured.push_str(r#"],"placed":"#);
+        placed_object(&placed, page, &mut structured);
+        let _ = write!(
+            structured,
+            r#","total_comments":{},"next_cursor":"#,
+            listed.len()
+        );
+        optional_string(&mut structured, next.as_deref());
+        structured.push('}');
+        let mut text = format!("{} comments", listed.len());
+        if let Some(path) = path {
+            let _ = write!(text, " on {path}");
+        }
+        if start > 0 || next.is_some() {
+            let _ = write!(text, ", showing {}-{end}", start + 1);
+        }
+        text.push('\n');
+        if let Some(notice) = &file.notice {
+            let _ = writeln!(text, "notice: {notice}");
+        }
+        let mut canvas = Canvas::default();
+        crate::print::comments(page, here, &placed, &mut canvas);
+        let mut bytes = Vec::new();
+        canvas
+            .write_to(&mut bytes, None)
+            .map_err(|e| e.to_string())?;
+        if !bytes.is_empty() {
+            text.push('\n');
+            text.push_str(&String::from_utf8_lossy(&bytes));
+        }
+        next_line(next.as_deref(), "comments", &mut text);
+        Ok(Output { structured, text })
+    }
+
     /// What `range` compares, in words.
     fn compared(&self, range: &Range) -> String {
         if !range.revisions.is_empty() {
@@ -969,6 +1298,120 @@ impl Server<'_> {
             "the uncommitted changes".to_owned()
         }
     }
+}
+
+/// The viewer tools, through the control API (docs/control.md) to the
+/// viewer running in the repository's working tree.
+impl Server<'_> {
+    /// Asks the viewer `method`; its result, or why there's none in words
+    /// the model can relay.
+    fn viewer(&mut self, method: &str, params: Vec<(&str, Value)>) -> Result<Value, String> {
+        let repo = self.repo()?;
+        let root = repo
+            .workdir()
+            .ok_or("a bare repository has no working tree for a viewer to run in")?;
+        let (mut client, view) =
+            control::client::reach(root, None, control::client::MCP).map_err(|e| {
+                match e.as_str() {
+                    control::client::NO_VIEWER => format!(
+                        "No dffy viewer is running in {}: ask the user to open dffy there; these \
+                     tools drive the viewer they look at.",
+                        root.display()
+                    ),
+                    _ => e,
+                }
+            })?;
+        client.ask(&view, method, params)
+    }
+
+    fn open_in_viewer(&mut self, args: &Args) -> Result<Output, String> {
+        args.only(&["path", "line", "side"])?;
+        let path = args.string("path")?.ok_or("path is needed")?.to_owned();
+        let mut params = vec![("path", control::text(path.clone()))];
+        if args.get("line").is_some() {
+            let line = args.number("line", 1, [1, 1 << 31])?;
+            params.push(("line", control::number(line as u64)));
+        }
+        if let Some(side) = args.string("side")? {
+            params.push(("side", control::text(side)));
+        }
+        let result = self.viewer("view/open", params)?;
+        let text = match result.get("line").and_then(Value::as_usize) {
+            Some(line) => format!("The viewer shows {path} at line {line}."),
+            None => format!("The viewer shows {path}."),
+        };
+        Ok(Output {
+            structured: compact(&result),
+            text,
+        })
+    }
+
+    fn focus_thread(&mut self, args: &Args) -> Result<Output, String> {
+        args.only(&["id"])?;
+        let id = args.string("id")?.ok_or("id is needed")?.to_owned();
+        let result = self.viewer("view/focusThread", vec![("id", control::text(id.clone()))])?;
+        let path = result
+            .get("path")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let text = if result.get("focused") == Some(&Value::Bool(true)) {
+            format!("The viewer focused the thread of comment {id}, on {path}.")
+        } else {
+            format!(
+                "The viewer shows {path}, and focuses the thread of comment {id} once it's placed there."
+            )
+        };
+        Ok(Output {
+            structured: compact(&result),
+            text,
+        })
+    }
+
+    fn viewer_selection(&mut self, args: &Args) -> Result<Output, String> {
+        args.only(&[])?;
+        let result = self.viewer("view/selection", Vec::new())?;
+        let text = match result.get("selection") {
+            Some(s @ Value::Object(_)) => {
+                let field = |key: &str| s.get(key).and_then(Value::as_str).unwrap_or_default();
+                let line = |key: &str| s.get(key).and_then(Value::as_usize).unwrap_or(0);
+                format!(
+                    "{} lines {}-{} ({} side):\n{}",
+                    field("path"),
+                    line("start"),
+                    line("end"),
+                    field("side"),
+                    field("text")
+                )
+            }
+            _ => {
+                "Nothing is selected in the viewer: the user selects lines there with v.".to_owned()
+            }
+        };
+        Ok(Output {
+            structured: compact(&result),
+            text,
+        })
+    }
+}
+
+/// `list_comments`' `placed`: each of `placed`'s threads, starting on
+/// `page`, by its first comment's id, as an annotation of `--json` says
+/// where it is.
+fn placed_object(placed: &[(String, At)], page: &[&review::Comment], s: &mut String) {
+    s.push('{');
+    let roots = placed
+        .iter()
+        .filter_map(|(id, at)| Some((id, at, page.iter().find(|c| c.id == *id)?)));
+    for (i, (id, at, root)) in roots.enumerate() {
+        if i > 0 {
+            s.push(',');
+        }
+        string(s, id);
+        s.push_str(":{");
+        encode::placement(at, root, false, s);
+        s.push('}');
+    }
+    s.push('}');
 }
 
 /// The text rendering's legend for the syntax diff's marks.
@@ -998,14 +1441,21 @@ fn list_hash(changes: &[FileChange], h: &mut DefaultHasher) {
 
 /// The fingerprint of `file_diff` on `change` with `digest` (of its
 /// sides), shared by the cursors `diff` hands out for files it cut short.
-fn file_hash(range: &Range, change: &FileChange, syntax: bool, context: usize, digest: u64) -> u64 {
+/// `flags` are `syntax` and `comments` (with `session`).
+fn file_hash(
+    range: &Range,
+    change: &FileChange,
+    flags: (bool, Option<bool>),
+    context: usize,
+    digest: u64,
+) -> u64 {
     let mut h = DefaultHasher::new();
     "file_diff".hash(&mut h);
     range.revisions.hash(&mut h);
     range.plan.spec.hash(&mut h);
     change.path.hash(&mut h);
     change.old_path().hash(&mut h);
-    (syntax, context, digest).hash(&mut h);
+    (flags, context, digest).hash(&mut h);
     h.finish()
 }
 
@@ -1131,7 +1581,7 @@ fn summary_line(file: &Value, text: &mut String) {
 }
 
 /// A file object with hunks as unified-diff text: a sign, a mark, then
-/// the line.
+/// the line; then its annotations' threads, when it has any.
 fn file_text(file: &Value, text: &mut String) {
     summary_line(file, text);
     for hunk in field(file, "hunks").as_array().unwrap_or_default() {
@@ -1164,6 +1614,40 @@ fn file_text(file: &Value, text: &mut String) {
             text.push('\n');
             if field(line, "no_newline") == &Value::Bool(true) {
                 text.push_str("\\ No newline at end of file\n");
+            }
+        }
+    }
+    let annotations = field(file, "annotations").as_array().unwrap_or_default();
+    if !annotations.is_empty() {
+        text.push_str("comments:\n");
+    }
+    for annotation in annotations {
+        let id = field(annotation, "id").as_str().unwrap_or_default();
+        let side = field(annotation, "side").as_str().unwrap_or_default();
+        let _ = match (
+            field(annotation, "start").as_usize(),
+            field(annotation, "end").as_usize(),
+        ) {
+            (Some(first), Some(last)) if first == last => {
+                writeln!(text, "  {id} on {side} line {first}:")
+            }
+            (Some(first), Some(last)) => writeln!(text, "  {id} on {side} lines {first}-{last}:"),
+            _ => writeln!(text, "  {id} on the {side} side, lines not found:"),
+        };
+        for comment in field(annotation, "thread").as_array().unwrap_or_default() {
+            let author = match field(comment, "author").as_str().unwrap_or_default() {
+                "" => "you",
+                author => author,
+            };
+            let created = field(comment, "created").as_str().unwrap_or_default();
+            let mut lines = field(comment, "text").as_str().unwrap_or_default().lines();
+            let _ = writeln!(
+                text,
+                "    {author}, {created}: {}",
+                lines.next().unwrap_or_default()
+            );
+            for line in lines {
+                let _ = writeln!(text, "      {line}");
             }
         }
     }
@@ -1252,6 +1736,17 @@ mod tests {
             .iter()
             .filter_map(|t| t.get("name").and_then(Value::as_str).map(str::to_owned))
             .collect();
-        assert_eq!(names, ["changed_files", "file_diff", "diff"]);
+        assert_eq!(
+            names,
+            [
+                "changed_files",
+                "file_diff",
+                "diff",
+                "list_comments",
+                "open_in_viewer",
+                "focus_thread",
+                "viewer_selection"
+            ]
+        );
     }
 }

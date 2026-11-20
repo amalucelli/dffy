@@ -102,7 +102,21 @@ The file tree and the picker show only the status letter, `U` for a conflicted f
 
 A conflicted file is listed once, as `U`, by `dffy`, `--staged`, `--unstaged` and `dffy <rev>`, even where `git diff` names it twice or by its content (`A`, `M`). With `--unstaged` it's compared with our side of the conflict, as `git diff` does.
 
+The viewer stages, unstages and discards hunks and picked lines of these diffs itself: `A`, `U` and `D` ([viewer.md](viewer.md#staging)). It builds the patch from its own diff of the index, `HEAD` and the working tree as they are when you press the key, and hands it to `git apply` (`--cached` for the index, `-R` to take changes back out), which keeps the index's cached trees and the working tree's filters right. A discard is worked out the same way before it asks, so its question counts only the lines that differ from the index, and it's refused when a picked working-tree line changed since the diff was shown.
+
+Conflicts are resolved from the viewer too ([Merge conflicts](#merge-conflicts)).
+
 `--staged` (`git diff --cached`) and `--unstaged` (`git diff`) show one side each. `default-diff = unstaged` in the [config](config.md) makes plain `dffy` behave like plain `git diff`, and `dffy --all` brings back everything for one run. In printed output, untracked files get an `untracked file:` header.
+
+## Merge conflicts
+
+In a conflicted file shown as its working-tree file (plain `dffy`, `--unstaged`, `dffy <rev>`), the viewer resolves each conflict to a side, both, or the base ([viewer.md](viewer.md#merge-conflicts) has the keys). It's git-level: nothing depends on how the merge started or where the branches come from.
+
+- **Conflicts:** read from the markers git wrote in the file: `<<<<<<<`, `=======` and `>>>>>>>`, and `|||||||` before the base's lines with `merge.conflictStyle` `diff3` or `zdiff3`. A marker is seven characters at the start of a line, then the line's end or a space and a label (none for `=======`); a `\r` before the newline doesn't count, so CRLF files read the same. A marker line outside a conflict, or a `<<<<<<<` nothing closes, is the file's own text. Markers of another length (the `conflict-marker-size` attribute) aren't read.
+- **Lines that look like markers:** where a side's own text has a marker-like line, such as a Markdown heading underlined with seven `=`, the markers read more than one way. The index's sides of the conflict (stages 1, 2 and 3) settle it: the first reading whose every side is a run of lines of that side in the index wins, and with none, the first `=======` and the first `>>>>>>>` after it.
+- **Writing:** the file is read again from disk, its bytes as they are, line endings included, and must still have the conflicts the choices were made on; otherwise nothing is written and the status bar says the conflicts changed. Each chosen conflict is replaced by the lines it keeps, and one without a choice keeps its markers. When the last conflict ends the file and its `>>>>>>>` line has no newline, the resolved file's last line has none either. The file is written beside itself and renamed over it, keeping its permissions. A file that became a symbolic link or anything but a regular file since is refused, so nothing is written through a link.
+- **`git add`:** offered once no markers are left, and run as `git --literal-pathspecs add -- <path>`, which marks the conflict resolved in the index. The list is then read again.
+- **Not by conflict:** a file deleted on one side and changed on the other (said with the side that deleted it), a binary file, a symbolic link or submodule, a file too large to diff and one shown as on disk because its filter failed. git resolves those: `git checkout --ours` or `--theirs`, `git add`, `git rm`.
 
 ## Repositories without commits
 
@@ -131,6 +145,6 @@ A tracked file under a directory that has been replaced by a symbolic link is sh
 
 ## What dffy doesn't read
 
-dffy reads the repository with its own code, not by running git.
+dffy reads the repository with its own code, not by running git. Staging from the viewer is the exception: `git apply` writes it.
 
 - **Paths after `--`** are prefixes, not git pathspecs with globs.

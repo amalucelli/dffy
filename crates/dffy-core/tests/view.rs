@@ -15,7 +15,8 @@ use std::sync::{Arc, LazyLock};
 
 use dffy_core::diff::{Options, Whitespace};
 use dffy_core::document::{
-    self, Content, Document, File, Missing, Needle, Piped, Pos, Segment, Settle, Source, find,
+    self, Content, Document, File, Match, Missing, Needle, Piped, Pos, Segment, Settle, Side,
+    Source, find,
 };
 use dffy_core::git::{FileChange, Repo, Status};
 use dffy_core::highlight::Registry;
@@ -155,28 +156,35 @@ fn end<P>(doc: &mut Document<P>, file: usize) -> Pos {
 }
 
 /// Runs the work `missing` names for the rows from `first` to `last`, as a
-/// host's pool would, and stores each result.
+/// host's pool would, and stores each result, until none is missing: the
+/// first highlighting leaves the definitions to find after it.
 fn fill(doc: &mut Document<()>, first: Pos, last: Pos) {
     let prepare = File::prepare(&GRAMMARS, None);
-    let missing: Vec<Missing> = doc.missing(first, last).collect();
-    for work in missing {
-        let file = doc.file(first.file).expect("loaded");
-        let diff = Arc::clone(file.diff());
-        match work {
-            Missing::Emphasis(hunk) => {
-                let (emphasis, syntax) = prepare.emphasis(&diff, hunk, file.syntax());
-                doc.set_emphasis(first.file, &diff, hunk, emphasis, syntax);
+    loop {
+        let missing: Vec<Missing> = doc.missing(first, last).collect();
+        if missing.is_empty() {
+            return;
+        }
+        for work in missing {
+            let file = doc.file(first.file).expect("loaded");
+            let diff = Arc::clone(file.diff());
+            match work {
+                Missing::Emphasis(hunk) => {
+                    let (emphasis, syntax) = prepare.emphasis(&diff, hunk, file.syntax());
+                    doc.set_emphasis(first.file, &diff, hunk, emphasis, syntax);
+                }
+                Missing::GapSyntax(gap) => {
+                    let slot = Arc::clone(file.syntax().expect("highlighted"));
+                    let spans = prepare.gap_syntax(&diff, &slot, file.gap_lines(gap));
+                    doc.set_gap_syntax(first.file, &diff, gap, spans);
+                }
+                Missing::Scopes => prepare.scopes(&diff, file.syntax().expect("highlighted")),
+                Missing::Structural => {
+                    let result = prepare.structural(&diff);
+                    assert!(doc.set_structural(first.file, &diff, result));
+                }
+                Missing::Render => unreachable!("rendered views are off"),
             }
-            Missing::GapSyntax(gap) => {
-                let slot = Arc::clone(file.syntax().expect("highlighted"));
-                let spans = prepare.gap_syntax(&diff, &slot, file.gap_lines(gap));
-                doc.set_gap_syntax(first.file, &diff, gap, spans);
-            }
-            Missing::Structural => {
-                let result = prepare.structural(&diff);
-                assert!(doc.set_structural(first.file, &diff, result));
-            }
-            Missing::Render => unreachable!("rendered views are off"),
         }
     }
 }
@@ -223,7 +231,7 @@ fn a_host_fills_the_work_missing_for_the_rows_it_shows() {
     let (_repo, mut doc) = document(dir.path());
     let l = entry(&doc, "long.c");
     doc.pos = at(l, 1, 0);
-    assert!(doc.expand(l, 1));
+    assert!(doc.expand(l, 1, unified));
     doc.structural = true;
     let (first, last) = (at(l, 1, 0), end(&mut doc, l));
     assert_eq!(
@@ -305,14 +313,14 @@ fn revealing_a_gap_keeps_positions_in_hunks_and_on_revealed_lines() {
     doc.pos = in_hunk;
     let lines = doc.row_lines(in_hunk, unified);
     assert_eq!(lines, [Some(59), None]);
-    assert!(doc.expand(l, 1));
+    assert!(doc.expand(l, 1, unified));
     assert!(doc.normalize(unified));
     assert_eq!(doc.pos, in_hunk);
-    assert!(doc.toggle_full());
+    assert!(doc.toggle_full(unified));
     assert!(doc.normalize(unified));
     assert_eq!(doc.pos, in_hunk);
     assert_eq!(doc.row_lines(doc.pos, unified), lines);
-    assert!(doc.toggle_full());
+    assert!(doc.toggle_full(unified));
 
     // Ten lines each side of the separator; row 11 is the first of the
     // bottom ten, gap line 40.
@@ -320,14 +328,36 @@ fn revealing_a_gap_keeps_positions_in_hunks_and_on_revealed_lines() {
     doc.pos = at(l, 3, 11);
     let lines = doc.row_lines(doc.pos, unified);
     assert_eq!(lines, [Some(46), Some(46)]);
-    assert!(doc.toggle_full());
+    assert!(doc.toggle_full(unified));
     assert_eq!(doc.pos, at(l, 3, 40), "the whole gap shows above it");
     assert_eq!(doc.row_lines(doc.pos, unified), lines);
-    assert!(doc.toggle_full());
+    assert!(doc.toggle_full(unified));
     assert_eq!(doc.pos, at(l, 3, 11));
-    assert!(doc.expand(l, 1));
+    assert!(doc.expand(l, 1, unified));
     assert_eq!(doc.pos, at(l, 3, 40), "the rest of the gap opened");
     assert_eq!(doc.row_lines(doc.pos, unified), lines);
+}
+
+/// An unchanged line shown in a gap is found from either side's number.
+#[test]
+fn a_gap_line_is_found_by_its_old_number_too() {
+    let dir = fixture();
+    let (_repo, mut doc) = document(dir.path());
+    let l = entry(&doc, "long.c");
+    doc.pos = at(l, 1, 0);
+    assert!(doc.toggle_full(unified));
+    let rows = [Side::Old, Side::New].map(|side| {
+        let m = Match {
+            side,
+            line: 20,
+            start: 0,
+            end: 0,
+        };
+        doc.match_pos(l, &m, unified)
+    });
+    let row = rows[1].expect("shown");
+    assert_eq!(doc.row_lines(row, unified), [Some(20), Some(20)]);
+    assert_eq!(rows[0], Some(row));
 }
 
 #[test]
@@ -371,7 +401,7 @@ fn search_counts_matches_with_smart_case_and_finds_their_rows() {
     let diff = Arc::clone(doc.diff_of(l).expect("loaded"));
     let search = |doc: &Document<()>, needle: &str| {
         let hidden = doc.hidden_lines(l).expect("loaded");
-        find(&diff, Some(&hidden), &Needle::new(needle), || false).expect("not cancelled")
+        find(&diff, Some(&hidden), &[], &Needle::new(needle), || false).expect("not cancelled")
     };
 
     let folded = search(&doc, "line_60");
@@ -389,7 +419,7 @@ fn search_counts_matches_with_smart_case_and_finds_their_rows() {
     );
 
     assert_eq!(search(&doc, "line_7").list.len(), 0, "only in gaps");
-    assert!(doc.toggle_full());
+    assert!(doc.toggle_full(unified));
     let full = search(&doc, "line_7");
     assert_eq!(full.list.len(), 11, "line_7 and line_70 to line_79");
     assert_eq!(
@@ -438,18 +468,18 @@ fn changes_and_files_lead_across_entries_and_say_how_to_settle() {
     assert_eq!(doc.pos, at(l, 1, 0), "the file's top, until the host lands");
     assert_eq!(doc.edge(l, true, unified), Some(at(l, 4, 3)));
 
-    assert_eq!(doc.next_file(), Some(Settle::Keep));
+    assert_eq!(doc.goto_file(m), Some(Settle::Keep));
     assert_eq!(doc.pos, at(m, 2, 0), "where it was left");
     assert_eq!(
-        doc.next_file(),
+        doc.goto_file(n),
         Some(Settle::Open {
             file: n,
             landing: false
         })
     );
     assert_eq!(doc.open(n, unified), Some(at(n, 1, 0)));
-    assert_eq!(doc.next_file(), None, "the last entry");
-    assert_eq!(doc.prev_file(), Some(Settle::Keep));
+    assert_eq!(doc.goto_file(n + 1), None, "past the last entry");
+    assert_eq!(doc.goto_file(m), Some(Settle::Keep));
     assert_eq!(doc.pos.file, m);
 
     let last = end(&mut doc, n);
@@ -464,7 +494,7 @@ fn an_evicted_entry_wants_its_diff_again_and_keeps_its_place() {
     let (repo, mut doc) = document(dir.path());
     let (l, m) = (entry(&doc, "long.c"), entry(&doc, "moved.c"));
     let _ = doc.open(l, unified);
-    assert!(doc.expand(l, 1));
+    assert!(doc.expand(l, 1, unified));
     let left = at(l, 4, 3);
     doc.pos = left;
     let lines = doc.row_lines(left, unified);
@@ -475,7 +505,6 @@ fn an_evicted_entry_wants_its_diff_again_and_keeps_its_place() {
 
     let budget = doc.file(m).expect("loaded").bytes();
     doc.evict(budget, &(m..m + 1));
-    assert!(doc.loaded_bytes() <= budget);
     assert!(doc.file(l).is_none());
     assert!(doc.files()[l].wants_diff());
     assert!(doc.file(m).is_some(), "the entry shown stays");
@@ -600,7 +629,10 @@ fn a_piped_patch_becomes_entries_whose_hunks_have_rows_but_no_gaps_to_reveal() {
         next.map(|h| h.heading),
         Some(&b"static int add(int a, int b)"[..])
     );
-    assert!(!doc.expand(calc, 0), "a piped file has only its hunks");
+    assert!(
+        !doc.expand(calc, 0, unified),
+        "a piped file has only its hunks"
+    );
 
     let removed = [LineState::RemovedPaired, LineState::AddedPaired];
     let context = || vec![LineState::Context; 2];

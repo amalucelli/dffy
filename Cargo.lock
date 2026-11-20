@@ -431,8 +431,10 @@ dependencies = [
  "dffy-core",
  "divan",
  "insta",
+ "nix",
  "portable-pty",
  "proptest",
+ "pulldown-cmark",
  "rustix",
  "signal-hook",
  "tempfile",
@@ -506,6 +508,14 @@ dependencies = [
  "insta",
  "serde_json",
  "unicode-width",
+]
+
+[[package]]
+name = "dffy-review-github"
+version = "0.2.1"
+dependencies = [
+ "serde_json",
+ "tempfile",
 ]
 
 [[package]]
@@ -1670,6 +1680,7 @@ dependencies = [
  "cfg-if",
  "cfg_aliases 0.1.1",
  "libc",
+ "memoffset",
 ]
 
 [[package]]

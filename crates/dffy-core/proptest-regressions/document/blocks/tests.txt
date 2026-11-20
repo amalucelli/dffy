@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 3c8f27f0ee7501b98a52ff2401e7583d0f8778effc665b02d4feb38365f3c43e # shrinks to case = Case { old: "line 0\nline 1\nline 2\nline 3\nline 4\nline 5\nline 6\n", new: "line 0\nline 1\nchanged 2\nline 3\nline 4\nline 5\nline 6\n", blocks: [(End, 1), (Start, 1), (Start, 1), (End, 1), (End, 3)], parting: 1, reveals: [], split: true }, at = Index(12297829382473034411), ops = [Expand(2)]

@@ -3,6 +3,7 @@
 //! are separate so the report's shape can be tested with fixed facts; the
 //! same checks print as text or as one JSON object.
 
+use std::borrow::Cow;
 use std::fmt::Write as _;
 use std::ops::ControlFlow;
 use std::os::unix::ffi::OsStrExt;
@@ -73,6 +74,19 @@ pub(crate) struct Facts {
     /// The `render` setting's extensions and renderers, with where each
     /// renderer's executable is, if it's on PATH.
     pub renderers: Vec<(String, String, Option<PathBuf>)>,
+    pub review: Option<ReviewFacts>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ReviewFacts {
+    pub name: String,
+    /// Where its executable is, if it's on PATH. The rest is `None` when
+    /// it isn't.
+    pub path: Option<PathBuf>,
+    /// The command it describes, or why it adds none.
+    pub command: Option<Result<String, String>>,
+    /// Its own checks, from its `doctor`, or why they couldn't be read.
+    pub checks: Option<Result<Vec<crate::plugin::review::Check>, String>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -213,6 +227,7 @@ impl Facts {
                 })
             }),
             renderers: renderers(&ctx.config.render),
+            review: ctx.config.review.as_ref().map(|name| review(name, ctx)),
         }
     }
 
@@ -227,7 +242,7 @@ impl Facts {
                 Mark::Info => ("·", Role::Dim),
             };
             c.push(role, symbol);
-            c.push_fmt(Role::Plain, format_args!(" {:<12}", check.label));
+            c.push_fmt(Role::Plain, format_args!(" {:<11} ", check.label));
             // Details quote paths, config values and environment variables.
             c.line(Role::Plain, &escape_lines(&check.detail));
             for note in &check.notes {
@@ -254,7 +269,7 @@ impl Facts {
             .iter()
             .map(|check| {
                 Json::Object(vec![
-                    ("name", Json::str(check.label)),
+                    ("name", Json::str(&check.label)),
                     ("status", Json::str(check.mark.name())),
                     ("detail", Json::str(&check.detail)),
                     ("notes", Json::strings(&check.notes)),
@@ -325,6 +340,10 @@ impl Facts {
                         })
                         .collect(),
                 ),
+            ),
+            (
+                "review",
+                self.review.as_ref().map_or(Json::Null, review_json),
             ),
         ]);
         let mut out = String::new();
@@ -640,7 +659,7 @@ impl Facts {
             Ok(None) => checks.push(Check::new(
                 Mark::Info,
                 label,
-                "not running; the first dffy --watch starts it",
+                "not running; the first viewer starts it",
             )),
             Ok(Some(report)) => {
                 let subscribers: u32 = report.roots.iter().map(|root| root.subscribers).sum();
@@ -824,7 +843,101 @@ impl Facts {
                 .hint("install it, or see docs/plugins.md; files of this type show as lines"),
             });
         }
+        if let Some(review) = &self.review {
+            self.review_checks(review, checks);
+        }
     }
+
+    /// The review plugin's line, then a line per check of its own.
+    fn review_checks(&self, review: &ReviewFacts, checks: &mut Vec<Check>) {
+        let program = format!("{}{}", crate::plugin::REVIEW_PREFIX, review.name);
+        let Some(path) = &review.path else {
+            checks.push(
+                Check::new(Mark::Warn, "review", format!("{program} isn't on PATH"))
+                    .hint("install it, or see docs/plugins.md; until then the review keys say so"),
+            );
+            return;
+        };
+        let at = format!("{program}: {}", self.short(path));
+        let mut check = match &review.command {
+            Some(Ok(command)) => {
+                Check::new(Mark::Ok, "review", format!("{at}, adds dffy {command}"))
+            }
+            Some(Err(why)) => Check::new(Mark::Warn, "review", format!("{at}, adds no command"))
+                .note(why.clone())
+                .hint("see docs/plugins.md; a plugin names its command with describe"),
+            None => Check::new(Mark::Ok, "review", at),
+        };
+        if let Some(Err(why)) = &review.checks {
+            check = check.note(format!("its checks: {why}"));
+        }
+        checks.push(check);
+        for own in review.checks.iter().flatten().flatten() {
+            let mark = if own.ok { Mark::Ok } else { Mark::Warn };
+            // Details are escaped when drawn, labels aren't, and this label
+            // comes from the plugin.
+            checks.push(Check::new(
+                mark,
+                format!("review {}", escape(own.name.as_bytes())),
+                own.detail.clone(),
+            ));
+        }
+    }
+}
+
+/// The review plugin `name`: the command it describes and its own checks,
+/// both asked now. What it describes replaces the cached answer, so a
+/// failure kept from before is asked again.
+fn review(name: &str, ctx: &Ctx) -> ReviewFacts {
+    let found = crate::plugin::find(crate::plugin::REVIEW_PREFIX, name);
+    let command = found
+        .as_ref()
+        .map(|_| crate::describe_review(name, ctx.cache.as_ref(), true).map(|d| d.naming.command));
+    ReviewFacts {
+        name: name.to_owned(),
+        command,
+        checks: found.as_ref().map(crate::plugin::review::doctor),
+        path: found.map(|p| p.path),
+    }
+}
+
+fn review_json(review: &ReviewFacts) -> Json {
+    let (command, checks) = (review.command.as_ref(), review.checks.as_ref());
+    let listed = checks
+        .and_then(|r| r.as_ref().ok())
+        .map_or(Json::Null, |checks| {
+            Json::Array(
+                checks
+                    .iter()
+                    .map(|c| {
+                        Json::Object(vec![
+                            ("name", Json::str(&c.name)),
+                            ("ok", Json::Bool(c.ok)),
+                            ("detail", Json::str(&c.detail)),
+                        ])
+                    })
+                    .collect(),
+            )
+        });
+    Json::Object(vec![
+        ("name", Json::str(&review.name)),
+        ("path", review.path.as_ref().map_or(Json::Null, Json::path)),
+        (
+            "command",
+            command
+                .and_then(|r| r.as_ref().ok())
+                .map_or(Json::Null, Json::str),
+        ),
+        (
+            "command_error",
+            command.map_or(Json::Null, |r| Json::error(r.as_ref())),
+        ),
+        ("checks", listed),
+        (
+            "checks_error",
+            checks.map_or(Json::Null, |r| Json::error(r.as_ref())),
+        ),
+    ])
 }
 
 /// Each configured renderer with its executable, if it's on PATH.
@@ -833,7 +946,7 @@ fn renderers(render: &crate::plugin::Renderers) -> Vec<(String, String, Option<P
         .pairs()
         .iter()
         .map(|(ext, name)| {
-            let found = crate::plugin::find(name).map(|p| p.path);
+            let found = crate::plugin::find(crate::plugin::PREFIX, name).map(|p| p.path);
             (ext.clone(), name.clone(), found)
         })
         .collect()
@@ -1032,7 +1145,8 @@ impl Mark {
 /// One line of the report, with the lines under it.
 struct Check {
     mark: Mark,
-    label: &'static str,
+    /// dffy's own, or `review <name>` for one of the review plugin's.
+    label: Cow<'static, str>,
     detail: String,
     /// Indented lines in the warning color.
     notes: Vec<String>,
@@ -1040,10 +1154,10 @@ struct Check {
 }
 
 impl Check {
-    fn new(mark: Mark, label: &'static str, detail: impl Into<String>) -> Self {
+    fn new(mark: Mark, label: impl Into<Cow<'static, str>>, detail: impl Into<String>) -> Self {
         Self {
             mark,
-            label,
+            label: label.into(),
             detail: detail.into(),
             notes: Vec::new(),
             hints: Vec::new(),
@@ -1225,6 +1339,7 @@ mod tests {
                 ),
                 ("csv".to_owned(), "csv".to_owned(), None),
             ],
+            review: None,
         }
     }
 
@@ -1390,6 +1505,72 @@ mod tests {
             (speed.largest, speed.largest_skipped) = (None, true);
         }
         insta::assert_snapshot!(check(&text(&facts).0, "speed").join("\n"));
+    }
+
+    /// The review plugin set, found or not, with the command it adds or
+    /// why it adds none, then its own checks; nothing without one.
+    #[test]
+    fn the_review_plugin_is_listed_with_its_command_and_checks() {
+        use crate::plugin::review::Check as Own;
+        let review = |found: bool, command: Result<&str, &str>, checks: Result<&[Own], &str>| {
+            let facts = Facts {
+                review: Some(ReviewFacts {
+                    name: "github".to_owned(),
+                    path: found.then(|| PathBuf::from("/home/u/bin/dffy-review-github")),
+                    command: found.then(|| command.map(str::to_owned).map_err(str::to_owned)),
+                    checks: found.then(|| checks.map(<[Own]>::to_vec).map_err(str::to_owned)),
+                }),
+                ..facts()
+            };
+            let json = facts.json().0;
+            let at = json.find("\"review\":").expect("the review key");
+            let shown = text(&facts).0;
+            let at_text = shown.find(" review ").expect("the review line");
+            let line_start = shown[..at_text].rfind('\n').map_or(0, |i| i + 1);
+            let lines: Vec<&str> = shown[line_start..]
+                .lines()
+                .take_while(|l| !l.contains(" dffyd "))
+                .collect();
+            [lines.join("\n"), json[at..].trim_end().to_owned()].join("\n")
+        };
+        let own = [
+            Own {
+                name: "gh".to_owned(),
+                ok: true,
+                detail: "gh version 2.62.0".to_owned(),
+            },
+            Own {
+                name: "auth".to_owned(),
+                ok: false,
+                detail: "gh isn't logged in to github.com; run `gh auth login`".to_owned(),
+            },
+        ];
+        insta::assert_snapshot!(
+            [
+                review(true, Ok("pr"), Ok(&own)),
+                review(true, Err("its command 'diff' is one of dffy's own"), Err("it doesn't know doctor; it may be older than this dffy")),
+                review(false, Ok("pr"), Ok(&own)),
+            ]
+            .join("\n\n"),
+            @r#"
+        <ok>✓</> review      dffy-review-github: ~/bin/dffy-review-github, adds dffy pr
+        <ok>✓</> review gh   gh version 2.62.0
+        <warn>!</> review auth gh isn't logged in to github.com; run `gh auth login`
+        "review":{"name":"github","path":"/home/u/bin/dffy-review-github","command":"pr","command_error":null,"checks":[{"name":"gh","ok":true,"detail":"gh version 2.62.0"},{"name":"auth","ok":false,"detail":"gh isn't logged in to github.com; run `gh auth login`"}],"checks_error":null}}
+
+        <warn>!</> review      dffy-review-github: ~/bin/dffy-review-github, adds no command
+          <warn>its command 'diff' is one of dffy's own</>
+          <warn>its checks: it doesn't know doctor; it may be older than this dffy</>
+          <hint>hint:</> see docs/plugins.md; a plugin names its command with describe
+        "review":{"name":"github","path":"/home/u/bin/dffy-review-github","command":null,"command_error":"its command 'diff' is one of dffy's own","checks":null,"checks_error":"it doesn't know doctor; it may be older than this dffy"}}
+
+        <warn>!</> review      dffy-review-github isn't on PATH
+          <hint>hint:</> install it, or see docs/plugins.md; until then the review keys say so
+        "review":{"name":"github","path":null,"command":null,"command_error":null,"checks":null,"checks_error":null}}
+        "#
+        );
+        assert_eq!(check(&text(&facts()).0, "review"), Vec::<&str>::new());
+        assert!(facts().json().0.contains("\"review\":null"));
     }
 
     /// The JSON's keys, with every value as text shows it; a path with a

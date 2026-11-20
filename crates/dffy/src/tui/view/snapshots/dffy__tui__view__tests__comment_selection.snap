@@ -1,0 +1,28 @@
+---
+source: crates/dffy/src/tui/view/tests.rs
+expression: reversed_box(&mut doc)
+---
+     │  ┌ ▾ bot · 3h ago ─────────────┐
+     │  │ Needs changes               │
+     │  │                             │
+     │  │ @ana [two blockers at]        │
+     │  │ [03f1ba, see the guide:]      │
+     │  │                             │
+     │  │ ☑ [test]s pass                │
+     │  │ ☐ scope.ts:382 reads every  │
+     │  │   project                   │
+     │  │   • and session chats too   │
+     │  │                             │
+     │  │ │ Default to the chat's own │
+     │  │ │ project.                  │
+     │  │                             │
+     │  │   let scope = Scope::Own;   │
+     │  │                             │
+     │  │ ana · 2h ago                │
+     │  │ ┌──────────┬──────┬───────… │
+     │  │ │ file     │ line │ verdic… │
+     │  │ ├──────────┼──────┼───────… │
+     │  │ │ scope.ts │  382 │ blocke… │
+     │  │ │ chats.go │  223 │ fine b… │
+     │  │ └──────────┴──────┴───────… │
+     │  └─────────────────────────────┘

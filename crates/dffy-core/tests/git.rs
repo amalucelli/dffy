@@ -1090,3 +1090,27 @@ fn file_diff_loads_both_sides() {
     let fd = repo.file_diff(change, &Options::default()).expect("diff");
     assert!(fd.binary && fd.hunks.is_empty());
 }
+
+#[test]
+fn git_dir_is_the_worktrees_own() {
+    let dir = init();
+    write(dir.path(), "a.txt", "a\n");
+    git(dir.path(), &["add", "-A"]);
+    git(dir.path(), &["commit", "-q", "-m", "init"]);
+    let linked = dir.path().join("linked");
+    let linked_path = linked.to_str().expect("utf-8 path");
+    git(dir.path(), &["worktree", "add", "-q", linked_path]);
+    for root in [dir.path(), &linked] {
+        let expected = git(root, &["rev-parse", "--absolute-git-dir"]);
+        let repo = Repo::discover(root).expect("repo");
+        let git_dir = repo.git_dir().expect("a repository has one");
+        assert_eq!(
+            git_dir.canonicalize().expect("exists"),
+            Path::new(expected.trim()).canonicalize().expect("exists")
+        );
+    }
+    assert_ne!(
+        Repo::discover(dir.path()).expect("repo").git_dir(),
+        Repo::discover(&linked).expect("repo").git_dir()
+    );
+}

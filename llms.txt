@@ -6,17 +6,19 @@ It runs on Linux and macOS. `docs/keys.md` and the settings table in `docs/confi
 
 ## Docs
 
-- [Install](docs/install.md): Homebrew, the install script, mise, building from source, renderer plugins, shell completions, the man page, platforms.
+- [Install](docs/install.md): Homebrew, the install script, mise, building from source, renderer and review plugins, shell completions, the man page, platforms.
 - [Usage](docs/usage.md): every subcommand and flag, revision and path syntax, reading a diff from stdin, comparing two files or folders outside git (`dffy a b`, `--no-index`), exit codes, environment variables.
 - [JSON output](docs/json.md): `dffy --json`, the diff as JSON Lines (a header, an object per file, an end object), versioned; files, hunks, lines with their kind, moved/reformatted/modified marks, emphasis byte ranges, `formatting_only`/`moved_only` classification, optional highlight spans, non-UTF-8 handling.
-- [MCP server](docs/mcp.md): `dffy mcp`, a Model Context Protocol server over stdio for coding agents (Claude Code, Cursor, Zed); tools `changed_files`, `file_diff` and `diff` return the `--json` objects a page at a time, with opaque cursors, truncation at hunk or line boundaries, and a plain-text rendering.
-- [Viewer](docs/viewer.md): the full-screen viewer's layout, panels, search, selection and copy, small screens.
+- [MCP server](docs/mcp.md): `dffy mcp`, a Model Context Protocol server over stdio for coding agents (Claude Code, Cursor, Zed); tools `changed_files`, `file_diff` and `diff` return the `--json` objects a page at a time, with opaque cursors, truncation at hunk or line boundaries, and a plain-text rendering; `list_comments` returns the review comments; `open_in_viewer`, `focus_thread` and `viewer_selection` drive the viewer the user has open.
+- [Control API](docs/control.md): `dffy ctl`, driving a running viewer (open a file at a line, focus a thread, add a comment, read the selection and the view); the newline-delimited JSON protocol over dffyd's per-user Unix socket, its handshake, messages, subscriptions and JSON Schema, and the security model.
+- [Review comments](docs/comments.md): experimental; the comments file (format version 1, anchors, distance), where it lives, `dffy comments` to list it and `dffy comments apply` to write it with a JSON list of operations under a lock.
+- [Viewer](docs/viewer.md): the full-screen viewer's layout, panels, search, selection and copy, review comments, pull requests (`dffy pr`: the picker, updating in place, posting a review), small screens.
 - [Keys](docs/keys.md): every viewer action with its default keys, the tree and command-panel keys, and `keybind` syntax.
 - [Configuration](docs/config.md): the config file format, every setting with its default and values, remembered settings and precedence.
 - [Themes](docs/themes.md): built-in themes, custom theme files and their roles.
 - [Git integration](docs/git.md): pager setup, `interactive.diffFilter`, `git difftool`, `diff.external`, piped input, staging, unborn repositories.
 - [Watch mode](docs/watch.md): what's watched, the `dffyd` broker, inotify limits, macOS FSEvents.
-- [Renderer plugins](docs/plugins.md): experimental `dffy-render-<name>` programs that show files rendered, diffed block by block, and the Markdown and Mermaid plugins (Mermaid flowcharts and sequence diagrams drawn in text); the `render` setting, `r`, the versioned JSON protocol over stdin and stdout, a minimal Python renderer, timeouts and caching.
+- [Plugins](docs/plugins.md): experimental `dffy-render-<name>` programs that show files rendered, diffed block by block, and the Markdown and Mermaid plugins (Mermaid flowcharts and sequence diagrams drawn in text); the `render` setting, `r`, the versioned JSON protocol over stdin and stdout, a minimal Python renderer, timeouts and caching. Review plugins, `dffy-review-<name>`: the `review` setting and `--review`, `dffy pr`, review protocol 1 (verbs run in the background as JSON lines, when dffy runs each, environment variables, exit codes), and `dffy-review-github` for GitHub pull requests.
 - [Troubleshooting](docs/troubleshooting.md): `dffy doctor` checks, clipboard and OSC 52, mouse selection, colors, terminal reset.
 
 ## Contributing

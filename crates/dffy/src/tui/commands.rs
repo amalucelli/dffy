@@ -100,6 +100,7 @@ fn title(group: Group) -> &'static str {
         Group::Files => "Files",
         Group::View => "View",
         Group::Copy => "Copy",
+        Group::Changes => "Changes",
         Group::Modes => "Modes",
         Group::Other => "Help",
     }
@@ -119,7 +120,7 @@ impl Commands {
         let mut scored: Vec<(i64, &Entry, Vec<usize>)> = entries
             .iter()
             .filter_map(|e| {
-                let label = fuzzy::score_close(&self.filter, &e.label);
+                let label = crate::fuzzy::score_close(&self.filter, &e.label);
                 // A key typed whole is the best match there is.
                 let key = (e.key.to_lowercase() == self.filter).then_some(1000);
                 match (label, key) {
@@ -533,7 +534,7 @@ impl ThemeList {
             .iter()
             .enumerate()
             .filter_map(|(i, (name, _))| {
-                fuzzy::score_close(&self.filter, name).map(|(s, at)| (s, i, at))
+                crate::fuzzy::score_close(&self.filter, name).map(|(s, at)| (s, i, at))
             })
             .collect();
         scored.sort_by_key(|&(s, ..)| std::cmp::Reverse(s));

@@ -19,10 +19,31 @@ dffy main..HEAD        # any revision git understands
 brew install --cask amalucelli/tap/dffy
 # or
 curl -fsSL https://raw.githubusercontent.com/amalucelli/dffy/main/install.sh | sh
-# plus the experimental renderers: … | sh -s -- --plugin markdown --plugin mermaid
+# plus the experimental plugins: … | sh -s -- --plugin markdown --plugin mermaid --plugin review-github
 ```
 
 Then try it in any repository: `dffy HEAD~10`.
+
+## Plugins
+
+Plugins are separate programs that dffy runs when your config names them. All are experimental.
+
+| Plugin | What it adds | Homebrew |
+|---|---|---|
+| `dffy-render-markdown` | Markdown files diffed as rendered text, with Mermaid fences drawn | `brew install --cask amalucelli/tap/dffy-render-markdown` |
+| `dffy-render-mermaid` | `.mmd` and `.mermaid` flowcharts and sequence diagrams drawn in the terminal | `brew install --cask amalucelli/tap/dffy-render-mermaid` |
+| `dffy-review-github` | GitHub pull request reviews: `dffy pr 123`, threads inline, post your review. Needs [`gh`](https://cli.github.com), logged in. | `brew install --cask amalucelli/tap/dffy-review-github` |
+
+Or with the install script: `… | sh -s -- --plugin markdown --plugin mermaid --plugin review-github`.
+
+Then turn them on in `~/.config/dffy/config`:
+
+```
+render = md:markdown mmd:mermaid mermaid:mermaid
+review = github
+```
+
+`r` switches a Markdown or Mermaid file between its lines and its rendered form. `dffy pr 123` opens a pull request, and plain `dffy` on a branch with an open PR brings in its comments. `dffy doctor` checks that each plugin is found and, for `dffy-review-github`, that `gh` is logged in. [plugins.md](docs/plugins.md) has the details.
 
 ## About
 
@@ -53,6 +74,11 @@ It fits into how you already work. Every action is a single key, the layout adap
 - 🎯 [Each file opens at its first change](docs/viewer.md#where-a-file-opens), and `n`/`N` jump between changes.
 - ⌨️ [Single-key actions](docs/keys.md), with a [command panel](docs/viewer.md#panels) on `space`.
 
+**Reviewing**
+- 💬 [Review comments](docs/comments.md) on lines and files, drawn inline under their code with replies, resolve and suggestions, and kept in a plain file in the repository's git directory.
+- 🗒️ A [Comments panel](docs/viewer.md#comments) beside the file tree: picking a thread takes the diff to it.
+- 🔀 [Code host reviews](docs/viewer.md#code-host-reviews) (experimental): with the `dffy-review-github` plugin, `dffy pr 123` opens a GitHub pull request with its threads, posts your review, and follows new pushes.
+
 **Git**
 - 🧾 [Staged, unstaged and untracked](docs/git.md#staged-unstaged-and-untracked) changes in one view, or [any revision](docs/usage.md#what-to-compare).
 - ⚔️ [Conflicted files](docs/git.md#staged-unstaged-and-untracked) from a merge, rebase or cherry-pick, with their conflict markers highlighted.
@@ -63,11 +89,12 @@ It fits into how you already work. Every action is a single key, the layout adap
 - 📱 [Works on phones over SSH](docs/viewer.md#phones-and-small-screens), with plain-letter keys and a frameless layout.
 - 🖱️ [Mouse selection](docs/viewer.md#selection-and-copy) that copies over SSH.
 - 🎨 [16 themes](docs/themes.md) and a [config file](docs/config.md) for your dotfiles.
-- 🧩 [Renderer plugins](docs/plugins.md) (experimental): Markdown diffed as rendered text, and Mermaid flowcharts and sequence diagrams drawn in the terminal.
+- 🧩 [Plugins](docs/plugins.md) (experimental): renderers that diff Markdown as rendered text and draw Mermaid flowcharts and sequence diagrams, and review plugins that connect dffy to a code host.
 
 **Scripts and agents**
 - 🧱 [`--json`](docs/json.md): the diff as JSON Lines, with each line's kind and whether it moved or was only reformatted.
-- 🤖 [`dffy mcp`](docs/mcp.md): an MCP server that lets coding agents list a change's files and read its diffs a page at a time.
+- 🤖 [`dffy mcp`](docs/mcp.md): an MCP server that lets coding agents list a change's files, read its diffs a page at a time, and read your review comments.
+- ✍️ [`dffy comments`](docs/comments.md): review comments as JSON, and `dffy comments apply` for scripts and agents to add their own, shown inline with their author.
 
 ## Usage
 
@@ -84,6 +111,8 @@ dffy --syntax v6.0 v6.1     # diff by syntax
 dffy --stat main..          # also --name-only, --name-status, --exit-code
 dffy --json main..          # JSON Lines for scripts and agents
 dffy mcp                    # an MCP server for coding agents
+dffy comments --json        # the review comments in this repository
+dffy pr 123                 # a GitHub pull request, with dffy-review-github
 ```
 
 With git:
@@ -111,7 +140,9 @@ In the viewer, `n`/`N` move between changes, `f`/`F` between files, `/` searches
 | Compares files outside a repository | ✅ | 🟡 | ❌ | ✅ | ✅ | 🟡 | ✅ |
 | Plugins or extensions | 🟡 | 🟡 | ❌ | ❌ | ❌ | ❌ | ❌ |
 | Single native binary | ✅ | 🟡 | ✅ | ✅ | ✅ | ❌ | ✅ |
-| AI or agent annotations | ❌ | ✅ | 🟡 | ❌ | ❌ | ❌ | ❌ |
+| Your own line comments | ✅ | 🟡 | ✅ | ❌ | ❌ | ❌ | ❌ |
+| GitHub pull request review | 🟡 | 🟡 | 🟡 | ❌ | ❌ | ❌ | ❌ |
+| AI or agent annotations | 🟡 | ✅ | 🟡 | ❌ | ❌ | ❌ | ❌ |
 | Other VCSs (Jujutsu, Mercurial, Sapling) | ❌ | ✅ | ✅ | ✅ | ✅ | 🟡 | — |
 
 🟡 means partial support. All seven are open source. GNU diff is GPL-3.0-or-later and the rest are MIT. Checked against `hunk` 0.25.0, `lumen` 2.32.0, `difftastic` 0.72.0, `delta` 0.20.1, `diff-so-fancy` 1.4.14 and GNU diffutils 3.10, with [a source for every cell](docs/benchmarks.md#feature-comparison-sources).
@@ -138,9 +169,11 @@ As git's pager, `dffy` streams the whole 48MB patch in 3.1MB of its own memory, 
 - 🌊 [Streamed input and output](docs/architecture.md#data-flow), so the first screen doesn't wait for the whole diff.
 - 🛰️ [One shared watcher per repository](docs/architecture.md#watcher-and-broker), however many views are open.
 
+[docs/design.md](docs/design.md) has the approach a change follows, for contributors and coding agents.
+
 ## Docs
 
-The [documentation](docs/README.md) covers every key, flag and setting: [installation](docs/install.md), [usage](docs/usage.md), [the viewer](docs/viewer.md), [keys](docs/keys.md), [configuration](docs/config.md), [themes](docs/themes.md), [git integration](docs/git.md), [watch mode](docs/watch.md), [renderer plugins](docs/plugins.md), [JSON output](docs/json.md), [the MCP server](docs/mcp.md), [troubleshooting](docs/troubleshooting.md), [architecture](docs/architecture.md) and [benchmarks](docs/benchmarks.md).
+The [documentation](docs/README.md) covers every key, flag and setting: [installation](docs/install.md), [usage](docs/usage.md), [the viewer](docs/viewer.md), [keys](docs/keys.md), [configuration](docs/config.md), [themes](docs/themes.md), [git integration](docs/git.md), [watch mode](docs/watch.md), [review comments](docs/comments.md), [plugins](docs/plugins.md), [JSON output](docs/json.md), [the MCP server](docs/mcp.md), [troubleshooting](docs/troubleshooting.md), [architecture](docs/architecture.md) and [benchmarks](docs/benchmarks.md).
 
 ## License
 

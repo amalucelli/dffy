@@ -15,12 +15,16 @@ keybind = ctrl+d=page_down
 keybind = q=unbind
 # Only while the file tree has focus
 keybind = tree:x=mark_viewed
+# Only on a focused comment thread
+keybind = thread:R=reply
+# Only in a file with conflicts to resolve
+keybind = conflict:O=keep_current
 # A key in the command panel
 keybind = leader:z=toggle_wrap
 ```
 
 - **Keys:** a character as typed (`n`, `N`, `<`, `?`) or a name: `space`, `enter`, `tab`, `shift+tab`, `esc`, `backspace`, `up`, `down`, `left`, `right`, `home`, `end`, `page_up`, `page_down`, `insert`, `delete`, `f1` to `f12`. `ctrl+` and `alt+` go before the key. `shift+` works with letters (`shift+n` is `N`) and `tab`; for other characters, bind the shifted character itself.
-- **Tables:** there are three. Keys pressed while the tree has focus look in the tree's table (`tree:`) first, then in the main one. The command panel has its own table (`leader:`); rebinding a key there keeps the entry's place in the panel.
+- **Tables:** there are five. Keys pressed while the tree has focus look in the tree's table (`tree:`) first, then in the main one. Keys pressed on a comment thread look in the thread's table (`thread:`) first, then, in a file with conflicts to resolve, in the conflict's (`conflict:`). The command panel has its own table (`leader:`); rebinding a key there keeps the entry's place in the panel. By default a panel key the main table binds too does the same thing there.
 - **Fallbacks:** a key pressed with `alt` or `shift` that has no binding of its own acts as the plain key.
 - **`esc`:** it always backs out first (closes a panel, ends a search or filter, cancels a selection, leaves the tree). Bound to another action, as in `keybind = esc=quit`, it runs that action only when there's nothing left to back out of.
 - **Mistakes:** a line with an unknown key or action is skipped with a warning that suggests the closest name.
@@ -45,24 +49,27 @@ keybind = leader:z=toggle_wrap
 | `scroll_right` | `>` `L` |  | Scroll the code right, without wrapping |
 | `scroll_left` | `<` `H` |  | Scroll the code left |
 | `scroll_reset` | `0` |  | Scroll the code back to its first column |
+| `next_thread` | `m` |  | Next comment thread, on into the next file with comments; it takes the focus, where r replies, e edits, x resolves, d deletes and o opens it on its host |
+| `prev_thread` | `M` |  | Previous comment thread, back into the previous file with comments |
 
 ### Files/tree
 
 | Action | Keys | Command panel | Description |
 |---|---|---|---|
-| `next_file` | `f` `]` `alt+f` `alt+right` | `n` | Next file |
-| `prev_file` | `F` `[` `alt+b` `alt+left` | `p` | Previous file |
-| `switch_pane` | `tab` `shift+tab` |  | Switch between the file tree and the diff |
+| `next_file` | `f` `]` `alt+f` `alt+right` | `f` | Next file |
+| `prev_file` | `F` `[` `alt+b` `alt+left` | `F` | Previous file |
+| `switch_pane` | `tab` `shift+tab` |  | Switch between the left panel (the file tree, or the comments) and the diff |
 | `toggle_tree` | `T` `t` | `t` | Show or hide the file tree |
 | `open_picker` | `o` | `o` | Find a file: type part of its path, enter opens it |
-| `search` | `/` | `S` | Search the diff's text; n/N then go between matches, esc clears |
-| `filter_tree` | `/` in the tree | `f` | Filter the file tree, fuzzily; f/F and n/N keep to the files it keeps, esc clears |
+| `search` | `/` |  | Search the diff's text; n/N then go between matches, esc clears |
+| `filter_tree` | `/` in the tree | `\|` | Filter the file tree, fuzzily; f/F and n/N keep to the files it keeps, esc clears |
 | `open` | `enter` `l` `right` in the tree |  | Open a file, or open or close a folder, in the tree |
 | `collapse` | `h` `left` in the tree |  | Collapse a folder in the tree |
 | `parent_folder` | `u` |  | Go to the folder holding the file, in the tree |
 | `mark_viewed` | `v` in the tree |  | Mark a file in the tree viewed |
 | `tree_wider` | `+` in the tree |  | Widen the tree |
 | `tree_narrower` | `-` in the tree |  | Narrow the tree |
+| `commented_files` | `c` in the tree | `!` | The tree shows only the files with comments, or every file; f/F and n/N keep to them |
 
 ### View
 
@@ -71,17 +78,19 @@ keybind = leader:z=toggle_wrap
 | `expand` | `x` | `x` | Show more of the highlighted ⋯ gap |
 | `toggle_full` | `X` | `X` | Whole files or changes only, for every file |
 | `cycle_layout` | `s` | `s` | Layout: split, unified, then auto (split on wide screens); while selecting, the side copied |
-| `toggle_wrap` | `W` | `w` | Wrap or truncate long lines |
+| `toggle_wrap` | `W` | `W` | Wrap or truncate long lines |
 | `toggle_syntax` | `d` | `d` | Diff by lines or by syntax |
 | `toggle_rendered` | `r` | `r` | Files with a renderer plugin rendered, or as lines (experimental, see render) |
-| `cycle_indicators` |  | `i` | How changed lines are marked: background, bars, classic signs or none |
-| `cycle_modified_lines` |  | `e` | A line and its edit in the modified color with red and green tokens, or red and green lines |
-| `toggle_highlight` |  | `H` | Syntax highlighting on or off |
-| `toggle_whitespace` |  | `W` | Ignore whitespace (-w) or not, diffing again |
-| `toggle_line_numbers` |  | `L` | Show or hide line numbers |
-| `toggle_hunk_headers` |  | `m` | Show or hide the @@ numbers of hunks |
-| `toggle_status_bar` |  | `b` | The status bar in the frame's bottom border or its top one |
-| `cycle_theme` |  | `c` | The next theme, built-in or yours |
+| `cycle_indicators` |  | `K` | How changed lines are marked: background, bars, classic signs or none |
+| `cycle_modified_lines` |  | `%` | A line and its edit in the modified color with red and green tokens, or red and green lines |
+| `toggle_highlight` |  | `*` | Syntax highlighting on or off |
+| `toggle_whitespace` |  | `I` | Ignore whitespace (-w) or not, diffing again |
+| `toggle_line_numbers` |  | `#` | Show or hide line numbers |
+| `toggle_hunk_headers` |  | `@` | Show or hide the @@ numbers of hunks |
+| `toggle_status_bar` |  | `B` | The status bar in the frame's bottom border or its top one |
+| `cycle_theme` |  | `a` | The next theme, built-in or yours |
+| `toggle_thread` | `z` |  | Fold or unfold the focused comment thread, or the first on screen |
+| `toggle_threads` | `Z` |  | Fold every comment thread to one row, or unfold them all |
 
 ### Selection & copy
 
@@ -90,22 +99,57 @@ keybind = leader:z=toggle_wrap
 | `select` | `v` |  | Select lines, from the top line or the one tapped |
 | `copy` | `y` | `y` | Copy the selected lines' code |
 | `copy_path` | `Y` | `Y` | Copy the file's path |
+| `copy_absolute_path` |  |  | Copy where the file is on disk, from the filesystem's root |
+| `copy_comment` |  |  | Copy a comment of the focused thread as written, in Markdown: the one last clicked, else its first |
+| `copy_thread` |  |  | Copy the focused thread: each comment under its author and date, as written |
 | `cancel` | `esc` |  | End the selection; in the tree, clear the filter |
-| `toggle_copy_decorations` |  | `D` | Copies include line numbers and +/- signs, or only the code |
+| `toggle_copy_decorations` |  | `J` | Copies include line numbers and +/- signs, or only the code |
+
+### Stage, discard & resolve
+
+| Action | Keys | Command panel | Description |
+|---|---|---|---|
+| `stage` | `A` | `A` | Stage the selected lines, else the hunk of the line last tapped or the first on screen: their working-tree version goes in the index (uncommitted changes only) |
+| `unstage` | `U` | `U` | Unstage the selected lines, else the hunk of the line last tapped or the first on screen: their HEAD version goes back in the index (uncommitted changes only) |
+| `discard` | `D` | `D` | Discard the selected lines' unstaged changes, else the hunk's, after a y/n: the working tree gets back the index's version, and an untracked file is deleted (uncommitted changes only) |
+| `next_conflict` | `n` in a conflicted file |  | In a conflicted file, the next conflict |
+| `prev_conflict` | `N` in a conflicted file |  | In a conflicted file, the previous conflict |
+| `keep_current` | `o` in a conflicted file |  | Resolve the conflict last gone to, else the first on screen, to the current side (ours); again takes the choice back. Choices show as a preview until written |
+| `take_incoming` | `t` in a conflicted file |  | Resolve the conflict to the incoming side (theirs); again takes the choice back |
+| `keep_both` | `b` in a conflicted file |  | Resolve the conflict to both sides, the current one first; again takes the choice back |
+| `take_base` | `a` in a conflicted file |  | Resolve the conflict to the common ancestor's lines, when git wrote them (merge.conflictStyle diff3 or zdiff3); again takes the choice back |
+| `write_resolution` | `w` in a conflicted file |  | Write the conflicted file as the choices resolve it, asking first when some conflicts have none; then git add it after a y/n |
 
 ### Watch & modes
 
 | Action | Keys | Command panel | Description |
 |---|---|---|---|
-| `toggle_watch` | `w` | `a` | Watch for changes |
-| `toggle_mouse` | `M` | `M` | Take mouse input, or leave it to the terminal's own selection (many terminals select natively with shift held while dragging) |
+| `toggle_watch` | `w` | `w` | Watch for changes |
+| `toggle_mouse` |  | `$` | Take mouse input, or leave it to the terminal's own selection (many terminals select natively with shift held while dragging) |
 
 ### Other
 
 | Action | Keys | Command panel | Description |
 |---|---|---|---|
 | `leader` | `space` |  | Open the command panel; its next key runs a command |
-| `edit` | `e` |  | Open the file in $EDITOR at the top line |
+| `edit` | `e` |  | Open the file in $EDITOR at the line last tapped, else the top line |
+| `comment` | `c` |  | Comment on the selected lines, or the line v would start on, in a text box under them; esc saves it |
+| `suggest_change` | `S` | `S` | Suggest a change to the selected lines, or the line v would start on: a comment's text box holding them, to edit into what they should be; esc saves it |
+| `comment_file` | `C` |  | Comment on the whole file shown, in a text box under its first row; esc saves it |
+| `comments` | `i` |  | The left panel lists every comment thread in place of the files, or the files again; moving through the threads shows each in the diff, enter or tab goes to it; r, e, x, d and o act on the selected thread |
+| `move_thread` | `V` |  | Move the focused thread, or the comments panel's selected one, from the branch it was written on to the current branch |
+| `reply` | `r` on a thread |  | On a thread: reply in a text box under it; esc saves it |
+| `edit_draft` | `e` on a thread |  | On a thread: edit your last draft in it, in a text box; esc saves it |
+| `delete_draft` | `d` on a thread |  | On a thread: delete your last draft in it, the whole thread when that's its first comment, once the key comes again |
+| `resolve` | `x` on a thread |  | On a thread: resolve it, or reopen it |
+| `adopt` | `a` on a thread |  | On a thread: someone else's comments in it not posted, as an agent's, become your drafts, which posting sends under your name |
+| `open_on_host` | `o` on a thread |  | On a thread: open it on its code host, in the browser |
+| `comment_in_editor` | `E` | `E` | Write in $EDITOR: your draft in the focused thread, else a reply to it, else a comment on the line; ctrl+g does it from the text box |
+| `review_pull` | `p` |  | On a review a review plugin opened, fetch its new commits and threads and show them in place (experimental, see review) |
+| `review_post` | `P` |  | On a review a review plugin opened, open the dialog that posts your drafts, replies and resolves as a review (experimental, see review) |
+| `open_review` | `O` | `O` | List the reviews the review plugin offers, such as this branch's, yours and those waiting on you, to open one (experimental, see review) |
+| `since_last_review` | `R` | `R` | On a review a review plugin opened, show only what changed since the head of your last review posted from dffy, or the whole review again |
+| `whole_review` |  | `Q` | On the branch's review that plain dffy found, show the whole review against the working tree, or the working tree's changes again |
 | `help` | `?` | `?` | Show or hide this help |
 | `quit` | `q` `ctrl+c` |  | Quit |
 
@@ -121,6 +165,34 @@ While the file tree has focus, these keys come first; every other key does what 
 | `v` | `mark_viewed` | Mark a file in the tree viewed |
 | `+` | `tree_wider` | Widen the tree |
 | `-` | `tree_narrower` | Narrow the tree |
+| `c` | `commented_files` | The tree shows only the files with comments, or every file; f/F and n/N keep to them |
+
+## On a thread
+
+While a comment thread is focused in the diff, or selected in the comments panel, these keys come first and act on it; every other key does what it does without one. `esc` takes the focus off the thread.
+
+| Keys | Action | Description |
+|---|---|---|
+| `r` | `reply` | On a thread: reply in a text box under it; esc saves it |
+| `e` | `edit_draft` | On a thread: edit your last draft in it, in a text box; esc saves it |
+| `d` | `delete_draft` | On a thread: delete your last draft in it, the whole thread when that's its first comment, once the key comes again |
+| `x` | `resolve` | On a thread: resolve it, or reopen it |
+| `a` | `adopt` | On a thread: someone else's comments in it not posted, as an agent's, become your drafts, which posting sends under your name |
+| `o` | `open_on_host` | On a thread: open it on its code host, in the browser |
+
+## In a conflicted file
+
+While the file at the cursor has conflicts to resolve, these keys come after a thread's and before every other; the rest do what they do elsewhere. While a search goes on, `n` and `N` keep stepping through its matches, and past the last conflict that way they go on to the next change.
+
+| Keys | Action | Description |
+|---|---|---|
+| `n` | `next_conflict` | In a conflicted file, the next conflict |
+| `N` | `prev_conflict` | In a conflicted file, the previous conflict |
+| `o` | `keep_current` | Resolve the conflict last gone to, else the first on screen, to the current side (ours); again takes the choice back. Choices show as a preview until written |
+| `t` | `take_incoming` | Resolve the conflict to the incoming side (theirs); again takes the choice back |
+| `b` | `keep_both` | Resolve the conflict to both sides, the current one first; again takes the choice back |
+| `a` | `take_base` | Resolve the conflict to the common ancestor's lines, when git wrote them (merge.conflictStyle diff3 or zdiff3); again takes the choice back |
+| `w` | `write_resolution` | Write the conflicted file as the choices resolve it, asking first when some conflicts have none; then git add it after a y/n |
 
 ## Command panel
 
@@ -129,28 +201,36 @@ While the file tree has focus, these keys come first; every other key does what 
 | Key | Entry | Action |
 |---|---|---|
 | `s` | Layout | `cycle_layout` |
-| `w` | Wrap long lines | `toggle_wrap` |
+| `W` | Wrap long lines | `toggle_wrap` |
 | `d` | Syntax diff | `toggle_syntax` |
 | `r` | Rendered view | `toggle_rendered` |
 | `x` | More context | `expand` |
 | `X` | Whole file | `toggle_full` |
-| `i` | Indicators | `cycle_indicators` |
-| `e` | Modified lines | `cycle_modified_lines` |
-| `H` | Syntax highlighting | `toggle_highlight` |
-| `W` | Ignore whitespace | `toggle_whitespace` |
-| `L` | Line numbers | `toggle_line_numbers` |
-| `m` | Hunk headers | `toggle_hunk_headers` |
-| `b` | Status bar | `toggle_status_bar` |
+| `K` | Indicators | `cycle_indicators` |
+| `%` | Modified lines | `cycle_modified_lines` |
+| `*` | Syntax highlighting | `toggle_highlight` |
+| `I` | Ignore whitespace | `toggle_whitespace` |
+| `#` | Line numbers | `toggle_line_numbers` |
+| `@` | Hunk headers | `toggle_hunk_headers` |
+| `B` | Status bar | `toggle_status_bar` |
 | `o` | Find file… | `open_picker` |
-| `f` | Filter tree… | `filter_tree` |
-| `S` | Search in diff… | `search` |
+| `\|` | Filter tree… | `filter_tree` |
+| `!` | Files with comments | `commented_files` |
 | `t` | File tree | `toggle_tree` |
-| `n` | Next file | `next_file` |
-| `p` | Previous file | `prev_file` |
+| `f` | Next file | `next_file` |
+| `F` | Previous file | `prev_file` |
 | `y` | Copy selection | `copy` |
 | `Y` | Copy file path | `copy_path` |
-| `D` | Copy with line numbers and signs | `toggle_copy_decorations` |
-| `M` | Mouse selection | `toggle_mouse` |
-| `a` | Watch for changes | `toggle_watch` |
-| `c` | Theme | `cycle_theme` |
+| `J` | Copy with line numbers and signs | `toggle_copy_decorations` |
+| `A` | Stage lines | `stage` |
+| `U` | Unstage lines | `unstage` |
+| `D` | Discard lines… | `discard` |
+| `$` | Mouse selection | `toggle_mouse` |
+| `w` | Watch for changes | `toggle_watch` |
+| `a` | Theme | `cycle_theme` |
+| `E` | Continue in editor | `comment_in_editor` |
+| `S` | Suggest change | `suggest_change` |
+| `O` | Open review… | `open_review` |
+| `R` | Since last review | `since_last_review` |
+| `Q` | Show whole review | `whole_review` |
 | `?` | All keys | `help` |

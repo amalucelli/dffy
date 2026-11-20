@@ -1,12 +1,15 @@
 //! Git access: revision resolution, streaming change enumeration, and content
-//! loading. gix provides the object database, packs, refs and rev-parse;
-//! tree diffs, the index/worktree scan and the untracked walk are our own so
-//! they can stream in path order and stop early.
+//! loading, and staging lines of uncommitted changes. gix provides the
+//! object database, packs, refs and rev-parse; tree diffs, the
+//! index/worktree scan and the untracked walk are our own so they can
+//! stream in path order and stop early.
 
 mod changes;
+mod conflict;
 mod paths;
 mod rename;
 mod spec;
+mod stage;
 mod stats;
 mod status;
 mod tree;
@@ -24,6 +27,7 @@ pub use changes::{ChangeSet, Update};
 pub use gix::ObjectId;
 pub use paths::{Compare, Endpoint};
 pub use spec::{DiffSpec, Revisions};
+pub use stage::{Applied, Edit, Picked};
 pub use stats::StatStore;
 pub(crate) use status::excludes_file;
 
@@ -96,6 +100,14 @@ pub enum Error {
         #[source]
         source: std::io::Error,
     },
+    /// A stage, unstage or discard that doesn't apply to the file or the
+    /// lines given; the message says why.
+    #[error("{0}")]
+    Refused(String),
+    /// `git apply` couldn't run, or refused the patch, as when the file
+    /// changed since it was diffed; what it said.
+    #[error("git apply: {0}")]
+    Apply(String),
     /// Any other failure inside gix: a corrupt object, an unreadable index.
     #[error(transparent)]
     Git(#[from] gix::Error),
@@ -367,7 +379,7 @@ pub enum Head {
 }
 
 /// A file's diff, ready to render.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FileDiff {
     /// The change this diff is of.
     pub change: FileChange,
@@ -519,6 +531,22 @@ impl Repo {
             Backend::Git(repo) => repo.workdir(),
             Backend::Paths(_) => None,
         }
+    }
+
+    /// In a linked worktree, its own git directory (under the shared one's
+    /// `worktrees/`), not the shared one. `None` for paths compared outside
+    /// git.
+    #[must_use]
+    pub fn git_dir(&self) -> Option<&Path> {
+        self.git().ok().map(gix::Repository::git_dir)
+    }
+
+    /// The git directory every worktree of the repository shares; the same
+    /// as [`Repo::git_dir`] outside a linked worktree. `None` for paths
+    /// compared outside git.
+    #[must_use]
+    pub fn common_dir(&self) -> Option<&Path> {
+        self.git().ok().map(gix::Repository::common_dir)
     }
 
     /// Streams the changed files of `spec` to `emit`, which can stop the

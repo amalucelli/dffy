@@ -5,6 +5,7 @@
 //! rows; the host fetches content, runs the work [`Document::missing`] names
 //! and keeps the screen.
 
+use std::cell::Ref;
 use std::collections::HashMap;
 use std::ops::Range;
 use std::sync::Arc;
@@ -12,16 +13,33 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use gix::bstr::BString;
 
+use super::blocks::{Arrange, At, Attach, Block, BlockId, Blocks, Placed};
 use super::{
-    Content, Context, Counts, File, Headings, Mark, Match, Matches, Pos, Segment, Shape, Shown,
-    file_status,
+    Anchor, Content, Context, Counts, File, Headings, Hit, Mark, Match, Matches, Pos, Reveal,
+    Segment, Shape, Shown, Side, file_status,
 };
+use crate::annotation::{Placement, REVEAL_CONTEXT};
+use crate::conflict::{Choice, Choices};
 use crate::diff::Emphasis;
 use crate::git::{FileChange, FileDiff, Status, Update};
 use crate::highlight::HunkSyntax;
 use crate::patch::Commit;
 use crate::structural::{Structural, Unavailable};
-use crate::view::{Arrangement, FileStatus, HunkHeader, Spans};
+use crate::view::{Arrangement, FileStatus, Spans};
+
+/// What a row shows, to find it again once rows are laid out anew (see
+/// [`Document::relayout`]).
+#[derive(Clone, Copy)]
+enum Spot {
+    /// Row `line` of a block.
+    Block { id: BlockId, line: usize },
+    /// A line of `side`, `down` rows below the row.
+    Line {
+        side: Side,
+        line: usize,
+        down: usize,
+    },
+}
 
 /// A file of a piped diff as its patch described it. The patch's hunks are
 /// the host's to keep and read back (`patch`); [`File::piped`] prepares them.
@@ -51,6 +69,13 @@ pub enum Source<P> {
     /// A commit's header, or text from a piped diff: no diff of its own. A
     /// commit's files are the entries after it, up to the next commit.
     Commit(Arc<Commit>),
+    /// A page the host draws, such as a review's conversation: `rows` rows
+    /// in part 0, no diff and no files of its own. It's always the first
+    /// entry (see [`Document::set_page`]).
+    Page {
+        /// At least 1.
+        rows: usize,
+    },
 }
 
 /// An entry's diff.
@@ -105,8 +130,13 @@ pub struct Entry<P> {
     /// The file changed since `counts` were taken.
     recount: bool,
     viewed: bool,
-    /// Lines revealed from the top and bottom edge of each gap.
-    reveal: Vec<(usize, usize)>,
+    /// What's revealed of each gap, by gap. Gaps past its end show nothing,
+    /// so a file nothing was revealed in holds none.
+    reveal: Vec<Reveal>,
+    /// What [`Document::reveal_lines`] revealed of each of the line diff's
+    /// gaps, kept apart from `reveal`: a swap back to the line diff shows
+    /// these again without what the user revealed.
+    host_reveal: Vec<Reveal>,
     /// Where the file was left when another was shown.
     saved: Option<Pos>,
     /// Shown with a diff since it arrived: opened at its first change, or
@@ -115,6 +145,16 @@ pub struct Entry<P> {
     /// The frame that last showed it (see [`Document::touch`]).
     last_shown: u64,
     version: u64,
+    /// The choices made on a conflicted file's regions, which its diff
+    /// previews once loaded (see [`Document::choose`]). Kept apart from the
+    /// diff, which eviction may drop.
+    choices: Option<Arc<Choices>>,
+    /// The host's blocks among its rows (see [`Document::set_blocks`]);
+    /// kept apart from the diff, which eviction may drop.
+    blocks: Option<Box<Blocks>>,
+    /// The host holds blocks for it, given or not (see
+    /// [`Document::set_held_blocks`]).
+    held_blocks: bool,
 }
 
 /// A version no entry has had (see [`Entry::version`]).
@@ -128,7 +168,7 @@ impl<P> Entry<P> {
         let counts = match &source {
             Source::Repo => None,
             Source::Piped(file) => Some(file.counts),
-            Source::Commit(_) => Some(Counts::default()),
+            Source::Commit(_) | Source::Page { .. } => Some(Counts::default()),
         };
         let mut entry = Self {
             change,
@@ -140,10 +180,14 @@ impl<P> Entry<P> {
             recount: false,
             viewed: false,
             reveal: Vec::new(),
+            host_reveal: Vec::new(),
             saved: None,
             placed: false,
             last_shown: 0,
             version: next_version(),
+            choices: None,
+            blocks: None,
+            held_blocks: false,
         };
         // A sheet is never diffed, so nothing would place it.
         entry.placed = entry.is_sheet();
@@ -230,20 +274,27 @@ impl<P> Entry<P> {
         !self.is_sheet() && (self.stale || matches!(self.state, State::Pending))
     }
 
-    /// A commit's header or a piped text block, not a file.
+    /// Not a file: a commit's header, a piped text block, or a page.
     #[inline]
     #[must_use]
     pub fn is_commit(&self) -> bool {
-        matches!(self.source, Source::Commit(_))
+        matches!(self.source, Source::Commit(_) | Source::Page { .. })
     }
 
-    /// Shown as rows of text in part 0 rather than hunks: a commit, or a
+    /// The page the host draws (see [`Source::Page`]).
+    #[inline]
+    #[must_use]
+    pub fn is_page(&self) -> bool {
+        matches!(self.source, Source::Page { .. })
+    }
+
+    /// Shown as rows in part 0 rather than hunks: a commit, a page, or a
     /// piped combined diff, which is shown as it came.
     #[inline]
     #[must_use]
     pub fn is_sheet(&self) -> bool {
         match &self.source {
-            Source::Commit(_) => true,
+            Source::Commit(_) | Source::Page { .. } => true,
             Source::Piped(file) => file.combined.is_some(),
             Source::Repo => false,
         }
@@ -254,7 +305,9 @@ impl<P> Entry<P> {
     pub fn status(&self) -> FileStatus {
         match &self.source {
             Source::Piped(file) => file.status,
-            Source::Repo | Source::Commit(_) => file_status(&self.change.status),
+            Source::Repo | Source::Commit(_) | Source::Page { .. } => {
+                file_status(&self.change.status)
+            }
         }
     }
 
@@ -272,9 +325,22 @@ impl<P> Entry<P> {
     #[must_use]
     pub fn wants_render(&self) -> Option<&Arc<FileDiff>> {
         match (&self.state, &self.render, &self.source) {
-            (State::Loaded(file), None, Source::Repo) if !self.stale => Some(file.diff()),
+            // A conflicted file shows its conflicts, not a rendering.
+            (State::Loaded(file), None, Source::Repo)
+                if !self.stale && file.conflicted().is_none() =>
+            {
+                Some(file.diff())
+            }
             _ => None,
         }
+    }
+
+    /// The choices made on its conflicts, which the host's diff of it
+    /// previews: see [`super::Prepare::conflicted`].
+    #[inline]
+    #[must_use]
+    pub fn choices(&self) -> Option<&Arc<Choices>> {
+        self.choices.as_ref()
     }
 
     fn render_bytes(&self) -> usize {
@@ -297,8 +363,11 @@ impl<P> Entry<P> {
             }
             (render, _) => render,
         }));
-        if let State::Loaded(file) = &self.state {
-            self.reveal = vec![(0, 0); file.gaps().len()];
+        if matches!(self.state, State::Loaded(_)) {
+            match self.render.as_deref() {
+                Some(Render::Hidden(_)) => self.reveal.clone_from(&self.host_reveal),
+                _ => self.reveal.clear(),
+            }
         }
         self.saved = None;
         self.placed = false;
@@ -324,6 +393,9 @@ pub struct Found {
     /// The lines that were hidden when they were found (see
     /// [`Document::hidden_lines`]): revealing more means searching again.
     pub hidden: Vec<Range<usize>>,
+    /// The version of the file's blocks they were found in (see
+    /// [`Document::blocks_version`]): other blocks mean searching again.
+    pub blocks_version: u64,
     /// The matches.
     pub matches: Arc<Matches>,
     /// The one the view last went to.
@@ -370,6 +442,22 @@ pub enum Settle {
     },
 }
 
+/// Where [`Document::step_block`] goes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BlockStep {
+    /// To block `id`, whose first row is at `pos`.
+    At {
+        /// Its first row.
+        pos: Pos,
+        /// The block.
+        id: BlockId,
+    },
+    /// To the entry `file`, the nearest that way with blocks, which may not
+    /// be diffed yet: the host shows it, and once it is, goes to its first
+    /// block (or last, going back) with [`Document::edge_block`].
+    File(usize),
+}
+
 /// Work a host does for the rows it shows (see [`Document::missing`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Missing {
@@ -379,6 +467,10 @@ pub enum Missing {
     /// Gap `n` shows lines and has no syntax runs:
     /// [`super::Prepare::gap_syntax`], then [`Document::set_gap_syntax`].
     GapSyntax(usize),
+    /// The file's highlighting is prepared and the definitions it leaves
+    /// to find, for the scope line, aren't yet: [`super::Prepare::scopes`],
+    /// which stores them in the file's syntax slot.
+    Scopes,
     /// The syntax diff shows and the file has none yet:
     /// [`super::Prepare::structural`], then [`Document::set_structural`].
     Structural,
@@ -455,13 +547,6 @@ impl<P> Document<P> {
         &self.commits
     }
 
-    /// Bytes the loaded diffs hold, as [`File::bytes`] counts them.
-    #[inline]
-    #[must_use]
-    pub fn loaded_bytes(&self) -> usize {
-        self.loaded_bytes
-    }
-
     /// Whether rendered views show where they're ready.
     #[inline]
     #[must_use]
@@ -498,8 +583,54 @@ impl<P> Document<P> {
         commit + 1..self.commits.get(next).copied().unwrap_or(self.files.len())
     }
 
-    /// Commits at the head of the list (`dffy show`'s), which stay first
-    /// when the files after them are sorted or replaced.
+    /// Puts a page of `rows` rows (see [`Source::Page`]) first in the list,
+    /// or with `None` takes away the one there; a page there already takes
+    /// the new count of rows. Returns how far every other entry moved: 1
+    /// when the page was put first, -1 when it was taken away, else 0. The
+    /// position moves with its file, or from the page taken away to the
+    /// first file; the search's file moves too, and other positions held in
+    /// files are dropped ([`Document::forget_positions`]). The host
+    /// normalizes the position.
+    pub fn set_page(&mut self, page: Option<(FileChange, usize)>) -> isize {
+        let present = self.files.first().is_some_and(Entry::is_page);
+        let moved: isize = match (page, present) {
+            (Some((_, rows)), true) => {
+                self.files[0].source = Source::Page { rows };
+                return 0;
+            }
+            (None, false) => return 0,
+            (Some((change, rows)), false) => {
+                self.files
+                    .insert(0, Entry::new(change, Source::Page { rows }));
+                // An empty list's position becomes the page's.
+                if self.files.len() > 1 {
+                    self.pos.file += 1;
+                }
+                1
+            }
+            (None, true) => {
+                self.files.remove(0);
+                if self.pos.file == 0 {
+                    self.pos = Pos::default();
+                } else {
+                    self.pos.file -= 1;
+                }
+                -1
+            }
+        };
+        for c in &mut self.commits {
+            *c = c.saturating_add_signed(moved);
+        }
+        if let Some(found) = &mut self.search {
+            found.file = found.file.saturating_add_signed(moved);
+        }
+        self.forget_positions();
+        moved
+    }
+
+    /// Commits and the page at the head of the list (`dffy show`'s, or a
+    /// review's), which stay first when the files after them are sorted or
+    /// replaced.
     fn head(&self) -> usize {
         self.files.iter().take_while(|e| e.is_commit()).count()
     }
@@ -652,6 +783,7 @@ impl<P> Document<P> {
         }
         if !keep_reveal {
             entry.reveal.clear();
+            entry.host_reveal.clear();
         }
         entry.stale = false;
         entry.recount = false;
@@ -659,7 +791,23 @@ impl<P> Document<P> {
             Ok(loaded) => {
                 self.loaded_bytes += loaded.bytes();
                 entry.counts = Some(loaded.counts());
-                entry.reveal.resize(loaded.gaps().len(), (0, 0));
+                // Choices the new diff doesn't preview no longer fit the
+                // file: its conflicts changed.
+                let previewed = loaded.conflicted().and_then(super::Conflicted::choices);
+                if entry
+                    .choices
+                    .as_ref()
+                    .is_some_and(|c| previewed.is_none_or(|p| p != c))
+                {
+                    entry.choices = None;
+                }
+                // A diff of the same file may cut its gaps differently.
+                for reveal in [&mut entry.reveal, &mut entry.host_reveal] {
+                    reveal.truncate(loaded.gaps().len());
+                    for (reveal, gap) in reveal.iter_mut().zip(loaded.gaps()) {
+                        reveal.settle(gap.len);
+                    }
+                }
                 State::Loaded(loaded)
             }
             Err(e) => {
@@ -683,6 +831,81 @@ impl<P> Document<P> {
         } else {
             Settle::Keep
         })
+    }
+
+    /// Makes `choice` on region `region` of `file`, a conflicted file whose
+    /// diff is loaded, or with `None` takes its choice back. The file then
+    /// wants its diff again ([`Entry::wants_diff`]): the preview of its
+    /// choices, or its line diff once none is left. The diff shown stays,
+    /// with the position, until that's loaded. Returns the choices now.
+    ///
+    /// # Errors
+    ///
+    /// Why the choice can't be made, in words for the user: the file has
+    /// no such region or can't be resolved by region, or the choice is the
+    /// base of a region without one.
+    pub fn choose(
+        &mut self,
+        file: usize,
+        region: usize,
+        choice: Option<Choice>,
+    ) -> Result<Option<Arc<Choices>>, String> {
+        let entry = self
+            .files
+            .get_mut(file)
+            .ok_or_else(|| "no such file".to_owned())?;
+        let conflicted = entry
+            .file()
+            .and_then(File::conflicted)
+            .ok_or_else(|| "this file has no conflicts".to_owned())?;
+        if let Some(why) = conflicted.refused() {
+            return Err(why.to_owned());
+        }
+        let regions = conflicted.regions();
+        let Some(at) = regions.get(region) else {
+            return Err("no conflict here".to_owned());
+        };
+        if choice.is_some_and(|c| at.kept(c).is_none()) {
+            return Err(
+                "no base in this conflict: merge.conflictStyle diff3 writes one".to_owned(),
+            );
+        }
+        let mut choices = match &entry.choices {
+            Some(c) => Choices::clone(c),
+            None => Choices::new(regions.to_vec()),
+        };
+        if choices.picks[region] == choice {
+            return Ok(entry.choices.clone());
+        }
+        choices.picks[region] = choice;
+        entry.choices = (choices.chosen() > 0).then(|| Arc::new(choices));
+        entry.stale = true;
+        entry.version = next_version();
+        Ok(entry.choices.clone())
+    }
+
+    /// Drops `file`'s choices, as once they were written: it wants its
+    /// diff again.
+    pub fn forget_choices(&mut self, file: usize) {
+        if let Some(entry) = self.files.get_mut(file)
+            && entry.choices.take().is_some()
+        {
+            entry.stale = true;
+            entry.version = next_version();
+        }
+    }
+
+    /// The row a view on conflict region `region` of `file` puts at its
+    /// top: the region's first line, or in a preview the first line it
+    /// became, or its `<<<<<<<` line when it became nothing.
+    pub fn conflict_pos(
+        &mut self,
+        file: usize,
+        region: usize,
+        arrange: impl Arrange,
+    ) -> Option<Pos> {
+        let m = self.file(file)?.conflict_match(region)?;
+        self.match_pos(file, &m, arrange)
     }
 
     /// Whether `file` is still at `version`: work asked for it then is
@@ -924,7 +1147,8 @@ impl<P> Document<P> {
             structural: self.structural,
             full: self.full,
             reveal: &entry.reveal,
-            arrange: (),
+            arrange: &(),
+            blocks: entry.blocks.as_deref(),
         };
         Some((loaded, shape))
     }
@@ -933,10 +1157,10 @@ impl<P> Document<P> {
     /// while it has no diff. What `f` adds to the diff's memory (rows for a
     /// second arrangement) counts toward [`Document::loaded_bytes`].
     #[inline]
-    fn with_file<A: Fn(&HunkHeader<'_>) -> Arrangement, R>(
+    fn with_file<A: Arrange, R>(
         &mut self,
         file: usize,
-        arrange: A,
+        arrange: &A,
         f: impl FnOnce(&mut File, &Shape<'_, A>) -> R,
     ) -> Option<R> {
         let entry = self.files.get_mut(file)?;
@@ -948,11 +1172,44 @@ impl<P> Document<P> {
             full: self.full,
             reveal: &entry.reveal,
             arrange,
+            blocks: entry.blocks.as_deref(),
         };
         let before = loaded.bytes();
         let result = f(loaded, &shape);
         self.loaded_bytes += loaded.bytes() - before;
         Some(result)
+    }
+
+    /// The blocks of an entry without a diff to place them in, a sheet or a
+    /// file not diffed yet or whose diff failed: those under its first row
+    /// and under its last, in part 0. `None` for any other entry, and one
+    /// without blocks.
+    #[inline]
+    fn edge_layout<A: Arrange>(&self, file: usize, arrange: &A) -> Option<Ref<'_, Placed>> {
+        let entry = self.files.get(file)?;
+        let blocks = entry.blocks.as_deref()?;
+        if !entry.is_sheet() && matches!(entry.state, State::Loaded(_)) {
+            return None;
+        }
+        blocks.edges(self.sheet_rows(file).unwrap_or(1), arrange)
+    }
+
+    /// Runs `f` on part `part` of `file`'s blocks, placed; `None` while it
+    /// has none there.
+    fn with_layout<A: Arrange, R>(
+        &mut self,
+        file: usize,
+        part: usize,
+        arrange: &A,
+        f: impl FnOnce(&Placed) -> R,
+    ) -> Option<R> {
+        if let Some(edges) = self.edge_layout(file, arrange) {
+            return (part == 0).then(|| f(&edges));
+        }
+        self.with_file(file, arrange, |loaded, shape| {
+            loaded.ensure_part(shape, part);
+            loaded.placed(shape, part).map(f)
+        })?
     }
 
     /// Parts of `file`, part 0 included.
@@ -990,34 +1247,41 @@ impl<P> Document<P> {
                 None => commit.lines.len().max(1),
             }),
             Source::Piped(piped) => Some(piped.combined.as_ref().map_or(0, Vec::len).max(1)),
+            Source::Page { rows } => Some((*rows).max(1)),
             Source::Repo => None,
         }
     }
 
-    /// Rows in part `part` of `file`, at least 1.
+    /// Rows in part `part` of `file`, its blocks' included; at least 1.
     #[inline]
-    pub fn rows(
-        &mut self,
-        file: usize,
-        part: usize,
-        arrange: impl Fn(&HunkHeader<'_>) -> Arrangement,
-    ) -> usize {
-        if part == 0 {
+    pub fn rows(&mut self, file: usize, part: usize, arrange: impl Arrange) -> usize {
+        self.rows_in(file, part, &arrange)
+    }
+
+    fn rows_in<A: Arrange>(&mut self, file: usize, part: usize, arrange: &A) -> usize {
+        if let Some(edges) = self.edge_layout(file, arrange) {
+            return if part == 0 { edges.rows() } else { 1 };
+        }
+        if part == 0 && self.file(file).is_none() {
             return self.sheet_rows(file).unwrap_or(1);
         }
         self.with_file(file, arrange, |f, shape| f.part_rows(shape, part))
             .unwrap_or(1)
     }
 
-    /// What the row at `pos` shows; `None` for part 0 (a sheet's rows and
-    /// the blank row are the host's to draw) and while the file has no
-    /// diff. Its offset is ignored.
+    /// What the row at `pos` shows; `None` past its file's last part and
+    /// while it has no diff, except in part 0. Its offset is ignored.
     #[inline]
-    pub fn row(
-        &mut self,
-        pos: Pos,
-        arrange: impl Fn(&HunkHeader<'_>) -> Arrangement,
-    ) -> Option<Content<'_>> {
+    pub fn row(&mut self, pos: Pos, arrange: impl Arrange) -> Option<Content<'_>> {
+        if pos.part == 0 && self.file(pos.file).is_none() {
+            let at = self.edge_layout(pos.file, &arrange);
+            return Some(match at.map(|p| p.at(pos.row)) {
+                Some(At::Block { id, line, .. }) => Content::Block { id, line },
+                Some(At::Parting { id, .. }) => Content::Parting { id },
+                Some(At::Own(row)) => Content::Sheet(row),
+                None => Content::Sheet(pos.row),
+            });
+        }
         let (structural, full) = (self.structural, self.full);
         let entry = self.files.get_mut(pos.file)?;
         let State::Loaded(file) = &mut entry.state else {
@@ -1027,7 +1291,8 @@ impl<P> Document<P> {
             structural,
             full,
             reveal: &entry.reveal,
-            arrange,
+            arrange: &arrange,
+            blocks: entry.blocks.as_deref(),
         };
         let before = file.bytes();
         file.ensure_part(&shape, pos.part);
@@ -1037,21 +1302,17 @@ impl<P> Document<P> {
 
     /// Moves `pos` to the next row of its file, offset 0; false at the end.
     #[inline]
-    pub fn next_row(
-        &mut self,
-        pos: &mut Pos,
-        arrange: impl Fn(&HunkHeader<'_>) -> Arrangement,
-    ) -> bool {
+    pub fn next_row(&mut self, pos: &mut Pos, arrange: impl Arrange) -> bool {
         let at = *pos;
         let next = self
-            .with_file(at.file, arrange, |f, shape| {
+            .with_file(at.file, &arrange, |f, shape| {
                 let mut at = at;
                 f.next_row(shape, &mut at).then_some(at)
             })
             .unwrap_or_else(|| {
                 // A sheet's rows, or the blank row of a file without a diff.
                 let rows = if at.part == 0 {
-                    self.sheet_rows(at.file).unwrap_or(1)
+                    self.rows_in(at.file, 0, &arrange)
                 } else {
                     1
                 };
@@ -1071,13 +1332,9 @@ impl<P> Document<P> {
     /// Moves `pos` to the previous row of its file, offset 0; false at the
     /// start.
     #[inline]
-    pub fn prev_row(
-        &mut self,
-        pos: &mut Pos,
-        arrange: impl Fn(&HunkHeader<'_>) -> Arrangement,
-    ) -> bool {
+    pub fn prev_row(&mut self, pos: &mut Pos, arrange: impl Arrange) -> bool {
         let at = *pos;
-        let prev = match self.with_file(at.file, arrange, |f, shape| {
+        let prev = match self.with_file(at.file, &arrange, |f, shape| {
             let mut at = at;
             f.prev_row(shape, &mut at).then_some(at)
         }) {
@@ -1099,7 +1356,7 @@ impl<P> Document<P> {
     /// under it (a diff loaded, the arrangement changed); its offset is the
     /// host's to keep. Returns false for an empty document, whose position
     /// is the default.
-    pub fn normalize(&mut self, arrange: impl Fn(&HunkHeader<'_>) -> Arrangement) -> bool {
+    pub fn normalize(&mut self, arrange: impl Arrange) -> bool {
         if self.files.is_empty() {
             self.pos = Pos::default();
             return false;
@@ -1167,16 +1424,6 @@ impl<P> Document<P> {
         )
     }
 
-    /// [`Document::goto_file`] for the next entry.
-    pub fn next_file(&mut self) -> Option<Settle> {
-        self.goto_file(self.pos.file + 1)
-    }
-
-    /// [`Document::goto_file`] for the previous entry.
-    pub fn prev_file(&mut self) -> Option<Settle> {
-        self.goto_file(self.pos.file.checked_sub(1)?)
-    }
-
     /// Shows `file` from its top, keeping the current file's place.
     fn open_at_top(&mut self, file: usize) {
         if let Some(entry) = self.files.get_mut(file) {
@@ -1191,11 +1438,7 @@ impl<P> Document<P> {
     /// the view unless the change shows from the top anyway; it then calls
     /// [`Document::landed`] with it if the view moved, or if it opened with
     /// `landing`.
-    pub fn open(
-        &mut self,
-        file: usize,
-        arrange: impl Fn(&HunkHeader<'_>) -> Arrangement,
-    ) -> Option<Pos> {
+    pub fn open(&mut self, file: usize, arrange: impl Arrange) -> Option<Pos> {
         if let Some(entry) = self.files.get_mut(file) {
             entry.placed = true;
         }
@@ -1237,16 +1480,13 @@ impl<P> Document<P> {
     /// goes on to its files). `arrange` is the arrangement of
     /// [`Document::change_file`]. `None` at the last change of the last
     /// file.
-    pub fn next_change(
-        &mut self,
-        arrange: impl Fn(&HunkHeader<'_>) -> Arrangement,
-    ) -> Option<Settle> {
+    pub fn next_change(&mut self, arrange: impl Arrange) -> Option<Settle> {
         let start = self.change_cursor();
         if start.file >= self.files.len() {
             return None;
         }
         if let Some(Some(at)) =
-            self.with_file(start.file, arrange, |f, shape| f.next_change(shape, start))
+            self.with_file(start.file, &arrange, |f, shape| f.next_change(shape, start))
         {
             return Some(Settle::Land(at));
         }
@@ -1286,10 +1526,7 @@ impl<P> Document<P> {
     /// its first the previous file's last, which this shows. Before the
     /// first file's first change, the position goes to its top and this
     /// returns `None`. `arrange` is as for [`Document::next_change`].
-    pub fn prev_change(
-        &mut self,
-        arrange: impl Fn(&HunkHeader<'_>) -> Arrangement,
-    ) -> Option<Settle> {
+    pub fn prev_change(&mut self, arrange: impl Arrange) -> Option<Settle> {
         let start = self.change_cursor();
         if start.file >= self.files.len() {
             return None;
@@ -1297,7 +1534,7 @@ impl<P> Document<P> {
         // Within the row the view is in, below its first screen row, the
         // row's own change counts as before the view.
         if let Some(Some(at)) =
-            self.with_file(start.file, arrange, |f, shape| f.prev_change(shape, start))
+            self.with_file(start.file, &arrange, |f, shape| f.prev_change(shape, start))
         {
             return Some(Settle::Land(at));
         }
@@ -1320,24 +1557,14 @@ impl<P> Document<P> {
     }
 
     /// The first (or `last`) block of changes of `file`.
-    pub fn edge(
-        &mut self,
-        file: usize,
-        last: bool,
-        arrange: impl Fn(&HunkHeader<'_>) -> Arrangement,
-    ) -> Option<Pos> {
-        self.with_file(file, arrange, |f, shape| f.edge(shape, file, last))?
+    pub fn edge(&mut self, file: usize, last: bool, arrange: impl Arrange) -> Option<Pos> {
+        self.with_file(file, &arrange, |f, shape| f.edge(shape, file, last))?
     }
 
     /// The first block of changes of `file` whose new-side line number
     /// (1-based) is past `line`, or with none the last block.
-    pub fn change_after(
-        &mut self,
-        file: usize,
-        line: usize,
-        arrange: impl Fn(&HunkHeader<'_>) -> Arrangement,
-    ) -> Option<Pos> {
-        self.with_file(file, arrange, |f, shape| f.change_after(shape, file, line))?
+    pub fn change_after(&mut self, file: usize, line: usize, arrange: impl Arrange) -> Option<Pos> {
+        self.with_file(file, &arrange, |f, shape| f.change_after(shape, file, line))?
     }
 
     /// The hunk at the position and how many the file has: the one its row
@@ -1349,43 +1576,37 @@ impl<P> Document<P> {
 
     /// The new-side line number (1-based) the row at `pos` shows, or the
     /// first after it; 1 while its file has no diff.
-    pub fn line_of(&mut self, pos: Pos, arrange: impl Fn(&HunkHeader<'_>) -> Arrangement) -> usize {
-        self.with_file(pos.file, arrange, |f, shape| f.line_of(shape, pos))
+    pub fn line_of(&mut self, pos: Pos, arrange: impl Arrange) -> usize {
+        self.with_file(pos.file, &arrange, |f, shape| f.line_of(shape, pos))
             .unwrap_or(1)
     }
 
     /// The old and new lines (0-based) the row at `pos` shows; `None` on a
     /// side without one, and on rows that aren't code.
     #[inline]
-    pub fn row_lines(
-        &mut self,
-        pos: Pos,
-        arrange: impl Fn(&HunkHeader<'_>) -> Arrangement,
-    ) -> [Option<usize>; 2] {
-        self.with_file(pos.file, arrange, |f, shape| f.row_lines(shape, pos))
+    pub fn row_lines(&mut self, pos: Pos, arrange: impl Arrange) -> [Option<usize>; 2] {
+        self.with_file(pos.file, &arrange, |f, shape| f.row_lines(shape, pos))
             .unwrap_or([None, None])
     }
 
     /// The arrangement of the rows of the hunk at `pos`; `None` for a part
     /// that isn't a hunk.
     #[inline]
-    pub fn arrangement(
-        &mut self,
-        pos: Pos,
-        arrange: impl Fn(&HunkHeader<'_>) -> Arrangement,
-    ) -> Option<Arrangement> {
-        self.with_file(pos.file, arrange, |f, shape| f.arrangement(shape, pos.part))?
+    pub fn arrangement(&mut self, pos: Pos, arrange: impl Arrange) -> Option<Arrangement> {
+        self.with_file(pos.file, &arrange, |f, shape| {
+            f.arrangement(shape, pos.part)
+        })?
     }
 
     /// How much of gap `gap` of `file` shows.
     #[must_use]
-    pub fn shown(&self, file: usize, gap: usize) -> Option<Shown> {
+    pub fn shown(&self, file: usize, gap: usize) -> Option<Shown<'_>> {
         let (loaded, shape) = self.view(file)?;
         Some(loaded.shown(&shape, gap))
     }
 
-    /// The new lines each gap of `file` hides under its separator, by gap,
-    /// for [`super::find`]; `None` until it's diffed.
+    /// The new lines the gaps of `file` hide under their separators, in
+    /// order, for [`super::find`]; `None` until it's diffed.
     #[must_use]
     pub fn hidden_lines(&self, file: usize) -> Option<Vec<Range<usize>>> {
         let (loaded, shape) = self.view(file)?;
@@ -1393,34 +1614,183 @@ impl<P> Document<P> {
     }
 
     /// The row of `file` showing match `m`.
-    pub fn match_pos(
+    pub fn match_pos(&mut self, file: usize, m: &Match, arrange: impl Arrange) -> Option<Pos> {
+        self.with_file(file, &arrange, |f, shape| f.match_pos(shape, file, m))?
+    }
+
+    /// What the row at `pos` shows, to find it again once rows change
+    /// around it.
+    fn anchor<A: Arrange>(&mut self, pos: Pos, arrange: &A) -> Anchor {
+        if let Some(anchor) = self.with_file(pos.file, arrange, |f, shape| f.anchor(shape, pos)) {
+            return anchor;
+        }
+        match self.with_layout(pos.file, pos.part, arrange, |p| p.at(pos.row)) {
+            Some(At::Block { id, line, after }) => Anchor::Block { id, line, after },
+            Some(At::Parting { id, after }) => Anchor::Block { id, line: 0, after },
+            Some(At::Own(own)) => Anchor::Own(own),
+            None => Anchor::Own(pos.row),
+        }
+    }
+
+    /// `pos` moved to the row showing `anchor` now.
+    fn unanchor<A: Arrange>(&mut self, pos: Pos, anchor: Anchor, arrange: &A) -> Pos {
+        if let Some(pos) =
+            self.with_file(pos.file, arrange, |f, shape| f.unanchor(shape, pos, anchor))
+        {
+            return pos;
+        }
+        let row = self.with_layout(pos.file, pos.part, arrange, |placed| match anchor {
+            Anchor::Own(own) | Anchor::Line(own) => placed.row(own),
+            Anchor::Block { id, line, after } => match placed.block(id) {
+                Some(block) => block.top + line.min(block.rows - 1),
+                None => placed.row(after.saturating_sub(1)),
+            },
+        });
+        row.map_or(pos, |row| Pos { row, ..pos })
+    }
+
+    /// Runs `change` on the document, then puts the position, `file`'s
+    /// saved place and the change the view landed on in it back on the
+    /// rows they showed: a gap's line, a block's row, else the same row of
+    /// their part.
+    fn keep_place<A: Arrange>(&mut self, file: usize, arrange: &A, change: impl FnOnce(&mut Self)) {
+        // The saved place's index is stale once the list moved under it
+        // (a page put first, a re-sort).
+        let saved = self.files[file].saved.map(|p| Pos { file, ..p });
+        let here = (self.pos.file == file).then(|| self.anchor(self.pos, arrange));
+        let there = saved.map(|p| (p, self.anchor(p, arrange)));
+        let landed = (self.landed)
+            .filter(|(change, _)| change.file == file)
+            .map(|(c, v)| ((c, self.anchor(c, arrange)), (v, self.anchor(v, arrange))));
+        change(self);
+        if let Some(anchor) = here {
+            self.pos = self.unanchor(self.pos, anchor, arrange);
+        }
+        if let Some((saved, anchor)) = there {
+            self.files[file].saved = Some(self.unanchor(saved, anchor, arrange));
+        }
+        if let Some(((change, c), (view, v))) = landed {
+            let change = self.unanchor(change, c, arrange);
+            self.landed = Some((change, self.unanchor(view, v, arrange)));
+        }
+    }
+
+    /// Runs `change` on the document, as when the host lays rows out anew
+    /// (another width or arrangement) or the syntax diff turns on or off,
+    /// then puts the position back on what it showed as `before` laid rows
+    /// out, now that `after` does: the line it showed (the new side's on a
+    /// row with both), a block's row, or a header or separator as far
+    /// above the line under it; the change the view landed on goes with it.
+    /// The file's blocks are measured anew. A position none of those holds
+    /// is left for the host to normalize.
+    pub fn relayout(
+        &mut self,
+        before: impl Arrange,
+        after: impl Arrange,
+        change: impl FnOnce(&mut Self),
+    ) {
+        let pos = self.pos;
+        let spot = (pos.file < self.files.len()).then(|| self.spot(pos, &before));
+        let landed = (self.landed.take())
+            .filter(|(change, view)| change.file == pos.file && *view == pos)
+            .map(|(change, _)| self.spot(change, &before));
+        change(self);
+        let Some(entry) = self.files.get_mut(pos.file) else {
+            return;
+        };
+        if let Some(blocks) = &mut entry.blocks {
+            blocks.remeasure(None);
+        }
+        let Some(at) = spot
+            .flatten()
+            .and_then(|s| self.find_spot(pos.file, s, after))
+        else {
+            return;
+        };
+        self.pos = Pos {
+            offset: pos.offset,
+            ..at
+        };
+        let landed = landed
+            .flatten()
+            .and_then(|s| self.find_spot(pos.file, s, after));
+        self.landed = landed.map(|change| (change, self.pos));
+    }
+
+    /// What the row at `pos` shows, for [`Document::relayout`].
+    fn spot<A: Arrange>(&mut self, pos: Pos, arrange: &A) -> Option<Spot> {
+        match self.row(pos, *arrange)? {
+            Content::Block { id, line } => return Some(Spot::Block { id, line }),
+            Content::Parting { id } => return Some(Spot::Block { id, line: 0 }),
+            _ => {}
+        }
+        // A separator, then a header: a line is at most two own rows on.
+        let mut at = pos;
+        let mut down = 0;
+        while down < 3 {
+            let (side, line) = match self.row_lines(at, *arrange) {
+                [_, Some(new)] => (Side::New, new),
+                [Some(old), None] => (Side::Old, old),
+                [None, None] => {
+                    down += usize::from(!self.in_block(at, *arrange));
+                    if !self.next_row(&mut at, *arrange) {
+                        return None;
+                    }
+                    continue;
+                }
+            };
+            return Some(Spot::Line { side, line, down });
+        }
+        None
+    }
+
+    /// The row of `file` showing `spot` as `arrange` lays rows out.
+    fn find_spot(&mut self, file: usize, spot: Spot, arrange: impl Arrange) -> Option<Pos> {
+        match spot {
+            Spot::Block { id, line } => self.block_row(file, id, &arrange).map(|(at, rows)| Pos {
+                row: at.row + line.min(rows - 1),
+                ..at
+            }),
+            Spot::Line { side, line, down } => {
+                let m = Match {
+                    side,
+                    line: u32::try_from(line).unwrap_or(u32::MAX),
+                    start: 0,
+                    end: 0,
+                };
+                let mut at = self.match_pos(file, &m, arrange)?;
+                let mut up = 0;
+                while up < down && self.prev_row(&mut at, arrange) {
+                    up += usize::from(!self.in_block(at, arrange));
+                }
+                Some(at)
+            }
+        }
+    }
+
+    /// Whether the row at `pos` is a block's or parts two.
+    fn in_block(&mut self, pos: Pos, arrange: impl Arrange) -> bool {
+        matches!(
+            self.row(pos, arrange),
+            Some(Content::Block { .. } | Content::Parting { .. })
+        )
+    }
+
+    /// Stores `reveal` for gap `gap` of `file`, keeping the position and
+    /// the file's saved place on their rows.
+    fn set_reveal<A: Arrange>(
         &mut self,
         file: usize,
-        m: &Match,
-        arrange: impl Fn(&HunkHeader<'_>) -> Arrangement,
-    ) -> Option<Pos> {
-        self.with_file(file, arrange, |f, shape| f.match_pos(shape, file, m))?
-    }
-
-    /// The line of gap `gap` the position is on, when it's in that gap (the
-    /// separator counts as its first hidden line).
-    fn gap_anchor(&self, file: usize, gap: usize) -> Option<usize> {
-        if self.pos.file != file {
-            return None;
-        }
-        let (loaded, shape) = self.view(file)?;
-        let (at, line) = loaded.gap_anchor(&shape, self.pos)?;
-        (at == gap).then_some(line)
-    }
-
-    /// Puts the position back on gap line `line` after the gap changed.
-    fn reanchor(&mut self, file: usize, gap: usize, line: Option<usize>) {
-        if let Some(line) = line
-            && let Some((loaded, shape)) = self.view(file)
-        {
-            self.pos.row = loaded.shown(&shape, gap).row(line);
-            self.pos.offset = 0;
-        }
+        gap: usize,
+        gaps: usize,
+        reveal: Reveal,
+        arrange: &A,
+    ) {
+        self.keep_place(file, arrange, |doc| {
+            let entry = &mut doc.files[file];
+            entry.reveal.resize(gaps, Reveal::default());
+            entry.reveal[gap] = reveal;
+        });
     }
 
     /// Reveals more of gap `gap` of `file`, keeping a position in the gap
@@ -1429,54 +1799,357 @@ impl<P> Document<P> {
     /// of each otherwise; up to 40 hidden lines open whole. A piped file's
     /// gaps never open. Returns whether any line was hidden; the host then
     /// normalizes the position.
-    pub fn expand(&mut self, file: usize, gap: usize) -> bool {
-        let Some((gaps, edges)) = self.view(file).and_then(|(loaded, shape)| {
+    pub fn expand(&mut self, file: usize, gap: usize, arrange: impl Arrange) -> bool {
+        let Some((gaps, reveal)) = self.view(file).and_then(|(loaded, shape)| {
             Some((loaded.gaps().len(), loaded.reveal_more(&shape, gap)?))
         }) else {
             return false;
         };
-        let anchor = self.gap_anchor(file, gap);
-        let entry = &mut self.files[file];
-        entry.reveal.resize(gaps, (0, 0));
-        entry.reveal[gap] = edges;
-        self.reanchor(file, gap, anchor);
+        self.set_reveal(file, gap, gaps, reveal, &arrange);
         true
     }
 
-    /// Switches every file between its changes and its full text, keeping a
-    /// position in a gap on its line. Returns false for an empty document;
-    /// otherwise the host then normalizes the position.
-    pub fn toggle_full(&mut self) -> bool {
+    /// Reveals the lines of `side` in `lines` (0-based) of `file` that its
+    /// gaps hide, with `context` lines around them, leaving the rest of
+    /// each gap hidden. Positions in the gaps stay on their lines, as with
+    /// [`Document::expand`]. Hunks and piped files are left as they are.
+    /// While the rendered view shows, the lines are kept for the line diff
+    /// behind it and the view is left as it is. They show whenever the line
+    /// diff comes back from the rendered view, which drops what
+    /// [`Document::expand`] revealed. Returns whether any line was hidden
+    /// in the view shown; the host then normalizes the position.
+    pub fn reveal_lines(
+        &mut self,
+        file: usize,
+        side: Side,
+        lines: Range<usize>,
+        context: usize,
+        arrange: impl Arrange,
+    ) -> bool {
+        self.reveal_lines_in(file, side, &lines, context, &arrange)
+    }
+
+    fn reveal_lines_in<A: Arrange>(
+        &mut self,
+        file: usize,
+        side: Side,
+        lines: &Range<usize>,
+        context: usize,
+        arrange: &A,
+    ) -> bool {
+        let Some(entry) = self.files.get(file) else {
+            return false;
+        };
+        let (loaded, on_lines) = match (&entry.state, entry.render.as_deref()) {
+            (State::Loaded(_), Some(Render::Shown(line))) => (line, false),
+            (State::Loaded(loaded), _) => (loaded, true),
+            (State::Pending | State::Failed(_), _) => return false,
+        };
+        let gaps = loaded.gaps().len();
+        let revealed: Vec<_> = (0..gaps)
+            .filter_map(|g| {
+                let host = loaded.reveal_lines(entry.host_reveal.get(g), g, side, lines, context);
+                let shown = on_lines
+                    .then(|| loaded.reveal_lines(entry.reveal.get(g), g, side, lines, context))
+                    .flatten();
+                (host.is_some() || shown.is_some()).then_some((g, host, shown))
+            })
+            .collect();
+        let mut any = false;
+        for (gap, host, shown) in revealed {
+            if let Some(host) = host {
+                let entry = &mut self.files[file];
+                entry.host_reveal.resize(gaps, Reveal::default());
+                entry.host_reveal[gap] = host;
+            }
+            if let Some(shown) = shown {
+                self.set_reveal(file, gap, gaps, shown, arrange);
+                any = true;
+            }
+        }
+        any
+    }
+
+    /// Reveals the lines of each annotation `placements` places on `file`
+    /// that its gaps hide, with two lines around them, as
+    /// [`Document::reveal_lines`] does, so the annotation shows under its
+    /// own line. Returns whether any line was hidden in the view shown.
+    pub fn reveal_annotations(
+        &mut self,
+        file: usize,
+        placements: &[Placement],
+        arrange: impl Arrange,
+    ) -> bool {
+        let mut any = false;
+        for placement in placements {
+            if let Placement::Placed { side, lines, .. } = placement {
+                any |= self.reveal_lines_in(file, *side, lines, REVEAL_CONTEXT, &arrange);
+            }
+        }
+        any
+    }
+
+    /// Switches every file between its changes and its full text, keeping
+    /// the position on its row: a gap's line, a block's row. Returns false
+    /// for an empty document; otherwise the host then normalizes the
+    /// position.
+    pub fn toggle_full(&mut self, arrange: impl Arrange) -> bool {
         let file = self.pos.file;
         if file >= self.files.len() {
             return false;
         }
-        let gap = match self.segment(file, self.pos.part) {
-            Some(Segment::Gap(g)) => Some((g, self.gap_anchor(file, g))),
-            _ => None,
-        };
+        let anchor = self.anchor(self.pos, &arrange);
         self.full = !self.full;
-        if let Some((g, line)) = gap {
-            self.reanchor(file, g, line);
-        }
+        self.pos = self.unanchor(self.pos, anchor, &arrange);
         true
     }
 
-    /// Where the position is, for a title (see [`Context`]). `None` before
-    /// the first hunk and for a whole added or deleted file.
-    pub fn context(&mut self) -> Option<Context<'_>> {
+    /// Where the position is, for a title (see [`Context`]); a block's row
+    /// is where the row it hangs under is. `None` before the first hunk and
+    /// for a whole added or deleted file.
+    pub fn context(&mut self, arrange: impl Arrange) -> Option<Context<'_>> {
         let pos = self.pos;
-        let entry = self.files.get(pos.file)?;
-        let State::Loaded(loaded) = &entry.state else {
+        let entry = self.files.get_mut(pos.file)?;
+        let State::Loaded(loaded) = &mut entry.state else {
             return None;
         };
         let shape = Shape {
             structural: self.structural,
             full: self.full,
             reveal: &entry.reveal,
-            arrange: (),
+            arrange: &arrange,
+            blocks: entry.blocks.as_deref(),
         };
+        let before = loaded.bytes();
+        loaded.ensure_part(&shape, pos.part);
+        self.loaded_bytes += loaded.bytes() - before;
         loaded.context(&shape, pos, &mut self.headings)
+    }
+
+    /// Puts `blocks` among `file`'s rows in place of those it had, keeping
+    /// the position, the file's saved place and the change the view landed
+    /// on there on the rows they showed. Blocks on lines show once the
+    /// file's diff is loaded; until then, and on a sheet or a failed diff,
+    /// only those under its first row and under its last do. Heights are
+    /// measured anew.
+    pub fn set_blocks(&mut self, file: usize, blocks: Vec<Block>, arrange: impl Arrange) {
+        if file >= self.files.len() {
+            return;
+        }
+        self.keep_place(file, &arrange, |doc| {
+            let entry = &mut doc.files[file];
+            match (&mut entry.blocks, blocks.is_empty()) {
+                (slot, true) => *slot = None,
+                (Some(held), false) => held.replace(blocks),
+                (slot @ None, false) => *slot = Some(Box::new(Blocks::new(blocks))),
+            }
+        });
+    }
+
+    /// Measures block `id` of `file` again, or with `None` every block of
+    /// it, as when it looks different (folded, edited, another theme)
+    /// without its width changing. Positions stay on their rows, as with
+    /// [`Document::set_blocks`].
+    pub fn remeasure(&mut self, file: usize, id: Option<BlockId>, arrange: impl Arrange) {
+        if self.files.get(file).is_none_or(|e| e.blocks.is_none()) {
+            return;
+        }
+        self.keep_place(file, &arrange, |doc| {
+            if let Some(blocks) = &mut doc.files[file].blocks {
+                blocks.remeasure(id);
+            }
+        });
+    }
+
+    /// `file`'s blocks, as last set.
+    #[must_use]
+    pub fn blocks(&self, file: usize) -> &[Block] {
+        (self.files.get(file))
+            .and_then(|e| e.blocks.as_deref())
+            .map_or(&[], |b| &b.list)
+    }
+
+    /// Moves on whenever `file`'s blocks are set to a list unlike the one it
+    /// had, though not when they're measured again; 0 while it has none. Matches found in blocks of
+    /// another version are stale.
+    #[must_use]
+    pub fn blocks_version(&self, file: usize) -> u64 {
+        (self.files.get(file))
+            .and_then(|e| e.blocks.as_deref())
+            .map_or(0, |b| b.version)
+    }
+
+    /// `file`'s blocks, on the lines of the diff it shows, for
+    /// [`super::find`] to search with that diff: a rendered view's blocks
+    /// are on its own lines. Blocks on lines it doesn't show are left out.
+    #[must_use]
+    pub fn search_blocks(&self, file: usize) -> Vec<Block> {
+        let blocks = self.blocks(file);
+        let Some(loaded) = self.file(file).filter(|f| f.rendered().is_some()) else {
+            return blocks.to_vec();
+        };
+        (blocks.iter())
+            .filter_map(|b| match b.at {
+                Attach::Line { side, line } => Some(Block {
+                    at: Attach::Line {
+                        side,
+                        line: loaded.shown_line(side, line)?,
+                    },
+                    ..b.clone()
+                }),
+                Attach::Start | Attach::End => Some(b.clone()),
+            })
+            .collect()
+    }
+
+    /// The part of `file` `block` hangs in; `None` when it has no rows.
+    fn block_part(&self, file: usize, block: &Block) -> Option<usize> {
+        let entry = self.files.get(file)?;
+        let Some(loaded) = entry.file() else {
+            let edges = entry.is_sheet() || !matches!(entry.state, State::Loaded(_));
+            return (edges && matches!(block.at, Attach::Start | Attach::End)).then_some(0);
+        };
+        match block.at {
+            Attach::Start => Some(loaded.first_part()),
+            Attach::End => Some(loaded.parts() - 1),
+            Attach::Line { side, line } => {
+                let line = loaded.shown_line(side, line)?;
+                loaded.line_part(self.structural, side, line)
+            }
+        }
+    }
+
+    /// The first row of block `id` of `file`; `None` when it has no rows.
+    pub fn block_pos(&mut self, file: usize, id: BlockId, arrange: impl Arrange) -> Option<Pos> {
+        self.block_row(file, id, &arrange).map(|(pos, _)| pos)
+    }
+
+    /// The first row of block `id` of `file` and how many rows it takes;
+    /// `None` when it has no rows.
+    pub fn block_span(
+        &mut self,
+        file: usize,
+        id: BlockId,
+        arrange: impl Arrange,
+    ) -> Option<(Pos, usize)> {
+        self.block_row(file, id, &arrange)
+    }
+
+    /// Block `id`'s first row and its rows.
+    fn block_row<A: Arrange>(
+        &mut self,
+        file: usize,
+        id: BlockId,
+        arrange: &A,
+    ) -> Option<(Pos, usize)> {
+        let block = self.files.get(file)?.blocks.as_deref()?.get(id)?;
+        let part = self.block_part(file, block)?;
+        let block = self.with_layout(file, part, arrange, |p| p.block(id))??;
+        let pos = Pos {
+            file,
+            part,
+            row: block.top,
+            offset: 0,
+        };
+        Some((pos, block.rows))
+    }
+
+    /// The row of `file` showing `hit`: a line's match as
+    /// [`Document::match_pos`] finds it, a block's on the row of the block
+    /// the host locates its line on ([`Arrange::locate`]).
+    pub fn hit_pos(&mut self, file: usize, hit: &Hit, arrange: impl Arrange) -> Option<Pos> {
+        match hit {
+            Hit::Line(m) => self.match_pos(file, m, arrange),
+            Hit::Block(m) => {
+                let (pos, rows) = self.block_row(file, m.block, &arrange)?;
+                let line = arrange.locate(m.block, arrange.width(), m.line as usize);
+                Some(Pos {
+                    row: pos.row + line.min(rows - 1),
+                    ..pos
+                })
+            }
+        }
+    }
+
+    /// The blocks of `file` with their first rows, in the order they show.
+    /// Only the parts holding blocks are laid out.
+    fn placed_blocks<A: Arrange>(&mut self, file: usize, arrange: &A) -> Vec<(Pos, BlockId)> {
+        let blocks = self.blocks(file);
+        let mut parts: Vec<usize> = (blocks.iter())
+            .filter_map(|b| self.block_part(file, b))
+            .collect();
+        parts.sort_unstable();
+        parts.dedup();
+        let mut out = Vec::new();
+        for part in parts {
+            self.with_layout(file, part, arrange, |placed| {
+                out.extend(placed.inserts.iter().map(|i| {
+                    let pos = Pos {
+                        file,
+                        part,
+                        row: i.top,
+                        offset: 0,
+                    };
+                    (pos, i.id)
+                }));
+            });
+        }
+        out
+    }
+
+    /// The first (or `last`) block of `file`, by its first row.
+    pub fn edge_block(
+        &mut self,
+        file: usize,
+        last: bool,
+        arrange: impl Arrange,
+    ) -> Option<(Pos, BlockId)> {
+        let placed = self.placed_blocks(file, &arrange);
+        if last { placed.last() } else { placed.first() }.copied()
+    }
+
+    /// Says which entries the host holds blocks for, by index, given with
+    /// [`Document::set_blocks`] or not: a host that gives an entry its
+    /// blocks only when it shows, as they're measured to show, still has
+    /// [`Document::step_block`] step into the others.
+    pub fn set_held_blocks(&mut self, files: &[usize]) {
+        for entry in &mut self.files {
+            entry.held_blocks = false;
+        }
+        for &f in files {
+            if let Some(entry) = self.files.get_mut(f) {
+                entry.held_blocks = true;
+            }
+        }
+    }
+
+    /// The block after `from` (or before it, without `forward`) in its
+    /// file, by first row: a block whose rows `from` is in counts as before
+    /// it. Past the file's last (or first), the nearest entry that way with
+    /// blocks, given or held ([`Document::set_held_blocks`]). `None` when
+    /// there's none that way.
+    pub fn step_block(
+        &mut self,
+        from: Pos,
+        forward: bool,
+        arrange: impl Arrange,
+    ) -> Option<BlockStep> {
+        let placed = self.placed_blocks(from.file, &arrange);
+        let here = if forward {
+            placed.iter().find(|(pos, _)| *pos > from)
+        } else {
+            placed.iter().rev().find(|(pos, _)| *pos < from)
+        };
+        if let Some(&(pos, id)) = here {
+            return Some(BlockStep::At { pos, id });
+        }
+        let has = |f: &usize| self.files[*f].blocks.is_some() || self.files[*f].held_blocks;
+        let file = if forward {
+            (from.file + 1..self.files.len()).find(has)
+        } else {
+            (0..from.file).rev().find(has)
+        };
+        file.map(BlockStep::File)
     }
 
     /// The overview's marks of `file` (see [`File::marks`]); none while it
@@ -1492,8 +2165,9 @@ impl<P> Document<P> {
     /// The work missing for the rows from `first` to `last` of one file, as
     /// they show now: emphasis of the hunks among them, syntax runs of the
     /// gaps whose lines are among them (a gap's separator alone shows no
-    /// lines), then the file's syntax diff and rendered view when those
-    /// show. Builds no rows; nothing for rows of different files.
+    /// lines), the file's definitions once its highlighting is ready, then
+    /// its syntax diff and rendered view when those show. Builds no rows;
+    /// nothing for rows of different files.
     pub fn missing(&self, first: Pos, last: Pos) -> impl Iterator<Item = Missing> + '_ {
         let entry = self
             .files
@@ -1520,19 +2194,32 @@ impl<P> Document<P> {
                 return None;
             }
             let shown = file.shown(shape, g);
-            let from = if part == first.part { first.row } else { 0 };
+            // The gap's own rows, as the rows drawn placed its blocks.
+            let own = |row: usize| file.at(shape, part, row).own();
+            let from = if part == first.part {
+                own(first.row)
+            } else {
+                0
+            };
             let to = if part == last.part {
-                last.row
+                own(last.row)
             } else {
                 shown.rows().saturating_sub(1)
             };
-            let separator = shown.hidden() > 0 && from == shown.top && to == shown.top;
+            let separator = from == to && shown.line(from).is_none();
             (from <= to && !separator).then_some(Missing::GapSyntax(g))
         });
+        let scopes = loaded
+            .is_some_and(File::wants_scopes)
+            .then_some(Missing::Scopes);
         let structural = (self.structural && loaded.is_some_and(File::wants_structural))
             .then_some(Missing::Structural);
         let render = (self.rendered && entry.is_some_and(|e| e.wants_render().is_some()))
             .then_some(Missing::Render);
-        emphasis.chain(gaps).chain(structural).chain(render)
+        emphasis
+            .chain(gaps)
+            .chain(scopes)
+            .chain(structural)
+            .chain(render)
     }
 }

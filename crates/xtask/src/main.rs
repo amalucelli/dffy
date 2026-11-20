@@ -11,11 +11,13 @@
 
 mod ab;
 mod bump;
+mod comments;
 mod compare;
 mod harness;
 mod perf;
 mod results;
 
+use std::cell::RefCell;
 use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
@@ -23,20 +25,22 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 
 const USAGE: &str = "\
-usage: cargo xtask perf [--quick | --full] [--rev REV] [--rounds N] [--only GROUP,...]
+usage: cargo xtask perf [--quick | --full] [--rev REV] [--rounds N] [--only GROUP,...] [--allow-missing-baseline]
        cargo xtask compare [--scenarios S,...] [--runs N] [--slow-runs N] [--mem-runs N]
        cargo xtask report <run-dir>
        cargo xtask bump <version>
 advanced:
        cargo xtask bench-baseline <dir>
-       cargo xtask bench-ab <base-dir> [--quick] [--rounds N] [--only GROUP,...] [--instructions METRIC,...]
+       cargo xtask bench-ab <base-dir> [--quick] [--rounds N] [--only GROUP,...] [--instructions METRIC,...] [--allow-missing-baseline]
        cargo xtask bench-noise <base-dir> [--rounds N] [--only GROUP,...]
        cargo xtask bench-layouts <base-dir> [--layouts N] [--rounds N] [--only GROUP,...]
 
 perf measures the checkout against a build of --rev (default HEAD~1), every
 group unless --only narrows it; --quick (Linux) only instruction and
 allocation counts, of every group; --full with fresh layout bands.
-GROUP is one of frame, engine, pty, count, paint, print, pager.
+A baseline that can't open the comments group's file fails the run unless
+--allow-missing-baseline runs that group on the checkout alone.
+GROUP is one of frame, engine, pty, count, paint, print, pager, comments.
 S is one of range, renames, file, syntax, tui; tui is every viewer table.
 compare's defaults come from SCENARIOS, RUNS (10), SLOW_RUNS (3) and
 MEM_RUNS (3), and its tools from DFFY, DELTA, DIFFT, DIFF_SO_FANCY, HUNK,
@@ -260,16 +264,19 @@ fn peak_rss(stderr: &str) -> Option<f64> {
     })
 }
 
-/// An empty home, config, state, cache, data and temporary directory, and
-/// git without global or system config. Commands get only these variables,
-/// `TERM`, `DFFY_BENCH_REPO` and `PATH`: divan's allocation counts change
-/// with the environment. With `terminal`, they also get a UTF-8 locale and
-/// true color, as in a user's terminal, so third-party tools draw as they
-/// would there. Removed on drop.
+/// An empty home, config, state, cache, data and temporary directory, a
+/// runtime directory per program, and git without global or system
+/// config. Commands get only these variables, `TERM`, `DFFY_BENCH_REPO`
+/// and `PATH`: divan's allocation counts change with the environment. With
+/// `terminal`, they also get a UTF-8 locale and true color, as in a user's
+/// terminal, so third-party tools draw as they would there. Removed on
+/// drop.
 struct Sandbox {
     root: PathBuf,
     repo: PathBuf,
     terminal: bool,
+    /// The programs run, in order: each one's runtime directory.
+    programs: RefCell<Vec<OsString>>,
 }
 
 const SANDBOX_DIRS: [(&str, &str); 6] = [
@@ -291,6 +298,7 @@ impl Sandbox {
             root,
             repo,
             terminal,
+            programs: RefCell::default(),
         };
         let gitconfig = sandbox.path("gitconfig");
         fs::write(&gitconfig, "").map_err(|e| format!("{}: {e}", gitconfig.display()))?;
@@ -331,11 +339,25 @@ impl Sandbox {
         }
     }
 
-    fn vars(&self) -> Vec<(&'static str, OsString)> {
+    /// The environment `program` runs in. Its runtime directory, where
+    /// dffy's viewer starts dffyd, is kept for the session: emptied with
+    /// every run, it would leave a dffyd idling per run. Each program has
+    /// its own, so a build never talks to another build's dffyd.
+    fn vars(&self, program: &OsStr) -> Vec<(&'static str, OsString)> {
         let mut vars: Vec<_> = SANDBOX_DIRS
             .iter()
             .map(|&(var, dir)| (var, self.path(dir).into_os_string()))
             .collect();
+        let mut programs = self.programs.borrow_mut();
+        let k = (programs.iter().position(|p| p == program)).unwrap_or_else(|| {
+            programs.push(program.to_owned());
+            programs.len() - 1
+        });
+        // Short and of fixed width: dffyd's sockets in it must fit a
+        // socket address under macOS's long temporary directory.
+        let runtime = self.path(&format!("r{k:02}"));
+        fs::create_dir_all(&runtime).ok();
+        vars.push(("XDG_RUNTIME_DIR", runtime.into_os_string()));
         vars.extend([
             ("GIT_CONFIG_GLOBAL", self.path("gitconfig").into_os_string()),
             ("GIT_CONFIG_NOSYSTEM", "1".into()),
@@ -356,8 +378,9 @@ impl Sandbox {
 
     /// `program` run in the kernel clone with only the sandbox's environment.
     fn command(&self, program: impl AsRef<OsStr>) -> Command {
+        let vars = self.vars(program.as_ref());
         let mut cmd = Command::new(program);
-        cmd.env_clear().envs(self.vars()).current_dir(&self.repo);
+        cmd.env_clear().envs(vars).current_dir(&self.repo);
         cmd
     }
 }
@@ -365,5 +388,28 @@ impl Sandbox {
 impl Drop for Sandbox {
     fn drop(&mut self) {
         fs::remove_dir_all(&self.root).ok();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A program's runs share its runtime directory, which emptying the
+    /// sandbox for a run keeps; another program's is its own.
+    #[test]
+    fn a_programs_runtime_directory_outlives_its_runs() {
+        let sandbox = Sandbox::new(std::env::temp_dir(), false).expect("sandbox");
+        let runtime = |program: &str| {
+            let vars = sandbox.vars(OsStr::new(program));
+            let dir = vars.into_iter().find(|(var, _)| *var == "XDG_RUNTIME_DIR");
+            PathBuf::from(dir.expect("set").1)
+        };
+        let dir = runtime("before/dffy");
+        fs::create_dir(dir.join("dffy")).expect("dffyd's");
+        sandbox.reset().expect("emptied");
+        assert!(dir.join("dffy").is_dir(), "kept");
+        assert_eq!(runtime("before/dffy"), dir);
+        assert_ne!(runtime("after/dffy"), dir);
     }
 }

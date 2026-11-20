@@ -2,12 +2,13 @@
 
 use std::sync::Arc;
 
+use dffy_core::bstr::ByteSlice;
 use dffy_core::cache::Cache;
 use dffy_core::diff::Options;
 use dffy_core::diff::{Emphasis, Whitespace, emphasize};
 use dffy_core::document::{self, Counts, File, Prepare};
 use dffy_core::git::{FileChange, FileDiff, Repo};
-use dffy_core::highlight::HunkSyntax;
+use dffy_core::highlight::{Highlighter, HunkSyntax, Scopes, Source};
 
 use crate::config::{Config, Indicators};
 use crate::term::{Input, Key, Mods};
@@ -77,6 +78,7 @@ impl Frame {
             file: 0,
             version,
             result: Ok(Box::new(loaded)),
+            placed: None,
         }));
         for (hunk, (emphasis, syntax)) in hunks.into_iter().enumerate() {
             app.event(Event::Diffed(Done::Emphasis {
@@ -152,6 +154,7 @@ impl Frame {
             file,
             version,
             result: Ok(Box::new(prepare().file(diff, Whitespace::Exact, false))),
+            placed: None,
         }));
         for _ in 0..file {
             app.event(Event::Input(Input::Key(Key::Char('f'), Mods::NONE)));
@@ -225,7 +228,7 @@ impl Frame {
     #[must_use]
     pub fn search(diff: &FileDiff, pattern: &str) -> usize {
         let needle = document::Needle::new(pattern);
-        document::find(diff, None, &needle, || false).map_or(0, |m| m.list.len())
+        document::find(diff, None, &[], &needle, || false).map_or(0, |m| m.list.len())
     }
 
     /// Does the diff search's scan of the file shown on this thread, as a
@@ -237,18 +240,22 @@ impl Frame {
                 version,
                 diff,
                 hidden,
+                blocks,
+                blocks_version,
                 needle,
                 id,
                 ..
             } = job
             {
-                let matches = document::find(&diff, Some(&hidden), &needle, || false);
+                let matches =
+                    crate::tui::worker::find(diff.as_deref(), &hidden, &blocks, &needle, || false);
                 self.app.event(Event::Diffed(Done::Found {
                     file,
                     version,
                     id,
                     diff,
                     hidden,
+                    blocks_version,
                     matches,
                 }));
             }
@@ -280,6 +287,47 @@ impl Frame {
     /// Forgets what the terminal shows, so the next frame is drawn whole.
     pub fn invalidate(&mut self) {
         self.app.invalidate();
+    }
+}
+
+/// Both sides of a file parsed for highlighting, as the first emphasis job
+/// leaves them, for timing the scope job's walk of their trees alone.
+pub struct Trees {
+    diff: FileDiff,
+    sides: [Option<Highlighter>; 2],
+}
+
+impl Trees {
+    /// Parses both sides of `diff` and compiles their scope query.
+    #[must_use]
+    pub fn new(diff: FileDiff) -> Self {
+        let source = |path, text| Source {
+            path,
+            text,
+            id: None,
+        };
+        let prepare = prepare();
+        let sides = [
+            prepare.highlighter(source(diff.change.old_path().as_bytes(), &diff.old)),
+            prepare.highlighter(source(diff.change.path.as_bytes(), &diff.new)),
+        ];
+        let trees = Self { diff, sides };
+        std::hint::black_box(trees.scopes());
+        trees
+    }
+
+    /// What the scope job does for the file (see [`Prepare::scopes`]):
+    /// each parsed side's definitions, found in its tree.
+    #[must_use]
+    pub fn scopes(&self) -> [Option<Scopes>; 2] {
+        let find = |side: &Option<Highlighter>, text| match side {
+            Some(Highlighter::Tree(parsed, _)) => parsed.scopes(text),
+            _ => None,
+        };
+        [
+            find(&self.sides[0], &self.diff.old),
+            find(&self.sides[1], &self.diff.new),
+        ]
     }
 }
 

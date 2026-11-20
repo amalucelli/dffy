@@ -1,16 +1,20 @@
 # Usage
 
 ```
-dffy [options] [<rev>...] [-- <path>...]
+dffy [options] [--show-comments] [<rev>...] [-- <path>...]
 dffy [options] [--no-index] <path> <path>
-dffy --json [options] [<rev>...] [-- <path>...]
+dffy --json [--show-comments] [options] [<rev>...] [-- <path>...]
 dffy show [<rev>] [-- <path>...]
 dffy config [--default]
+dffy comments [--json | --markdown] [--session] [--open | --resolved] [--path <path>] [--branch <name> | --all-branches]
+dffy comments apply | comments import <file> | comments rm --resolved [--branch <name> | --all-branches]
+dffy <review-command> [<number>]    # e.g. dffy pr, with a review plugin set
 dffy mcp
+dffy ctl views | open <path>[:<line>[:old]] | focus <id> | selection | state | comment <path>:<line> <text> | schema
 dffy themes | doctor | daemon status|stop | completions <shell>
 ```
 
-Without a subcommand dffy runs `diff`, so `dffy main..HEAD` is `dffy diff main..HEAD`. A revision with the same name as a subcommand needs the explicit form: `dffy diff config`.
+Without a subcommand dffy runs `diff`, so `dffy main..HEAD` is `dffy diff main..HEAD`. A revision with the same name as a subcommand needs the explicit form: `dffy diff config`, `dffy diff comments`.
 
 ## Viewer or printed output
 
@@ -33,10 +37,13 @@ Otherwise dffy prints.
 |---|---|
 | `diff` | Changes between the working tree, the index and revisions. The default. |
 | `show [<rev>]` | A commit against its first parent, with the commit header. `<rev>` defaults to `HEAD`; a root commit is compared with the empty tree. |
+| `comments` | The review comments, as threads: the current branch's and those on no branch, or `--branch <name>`'s, or `--all-branches`; `--open`, `--resolved` and `--path <path>` narrow them. `--markdown` prints them as Markdown, `--json` prints the whole comments file, and `--session` reads the review session the viewer has open. `comments apply` changes the file with a JSON list of operations on stdin; `comments import <file>` adds another comments file's comments it doesn't have; `comments rm --resolved` removes resolved threads. See [comments.md](comments.md#reading-dffy-comments). |
+| `<review command> [<id>]` | Experimental, and only with a review plugin set (`review` or `--review`) that describes itself: the plugin's command, named by the plugin, e.g. `dffy pr` for dffy-review-github (a GitLab plugin could name it `mr`). One of the code host's reviews in the viewer: `<base>...<head>` with its review threads, which you answer and post from there. Without an id, the current branch's review, or a list to pick from. It needs a terminal. Without such a plugin, `pr` is a revision like any other. See [viewer.md](viewer.md#code-host-reviews) and [plugins.md](plugins.md#the-review-command). |
 | `config` | The effective settings, each marked with where its value comes from. `--default` prints every key with its documentation and default instead. See [config.md](config.md). |
 | `themes` | The available themes, with a preview. `--dump <name>` prints a built-in theme as a theme file to copy and edit. See [themes.md](themes.md). |
 | `doctor` | Checks git, the repository, the watches it needs, the terminal, the config, the cache and `dffyd`, and times dffy on the repository; `--json` prints it all as one object. See [troubleshooting.md](troubleshooting.md#dffy-doctor). |
-| `mcp` | A Model Context Protocol server on stdin and stdout, for coding agents: tools that list changed files and return diffs as the objects of `--json`, a page at a time. Register it with `claude mcp add dffy -- dffy mcp`. See [mcp.md](mcp.md). |
+| `mcp` | A Model Context Protocol server on stdin and stdout, for coding agents: tools that list changed files and return diffs as the objects of `--json`, a page at a time, and tools that drive the viewer the user has open. Register it with `claude mcp add dffy -- dffy mcp`. See [mcp.md](mcp.md). |
+| `ctl` | Drives a running viewer: `ctl open src/lib.rs:42` shows a line, `ctl focus <id>` a comment thread, `ctl comment src/lib.rs:42 <text>` adds a comment, `ctl selection` and `ctl state` print what's selected and shown, `ctl views` lists the viewers. It goes to the viewer in this working tree, or `--view <id>`; `--json` prints the protocol's result. See [control.md](control.md). |
 | `daemon status`, `daemon stop` | Inspect or stop the watch broker. See [watch.md](watch.md#dffyd). |
 | `completions <shell>` | A completion script for `bash`, `zsh`, `fish`, `elvish` or `powershell`. See [install.md](install.md#shell-completions). |
 
@@ -89,7 +96,7 @@ dffy - < change.patch
 - **When stdin is read:** with no revisions, a pipe or a file on stdin is read as a diff.
 - **`-` alone** reads stdin explicitly and can't be combined with revisions. Next to a file, `-` is that file's other side instead (see [Comparing files and folders](#comparing-files-and-folders)).
 - **Never read:** a terminal, `/dev/null` or a socket on stdin, so dffy run from scripts and CI doesn't wait on it.
-- **Ignored:** with flags that only make sense against a repository (`--staged`, `--stat`, paths after `--` and so on).
+- **Ignored:** with flags that only make sense against a repository (`--staged`, `--stat`, `--show-comments`, paths after `--` and so on).
 
 A diff read this way has only its hunks. `x`/`X` can't reveal more lines, the syntax diff isn't available and code isn't highlighted. When output is a terminal, input that isn't a diff goes to the pager unchanged; [git.md](git.md#piped-input) has the details.
 
@@ -166,6 +173,23 @@ Each of these has a config key, and the flag wins for that run. [config.md](conf
 
 Binary files, and files of 64MB or more, get a one-line summary instead of a diff. Content that isn't UTF-8 is shown lossily.
 
+## Review comments in printed output
+
+```sh
+dffy --show-comments main..
+dffy --json --show-comments main..
+dffy --comments pr.json --show-comments main...feature
+```
+
+The viewer always shows review comments ([viewer.md](viewer.md#comments)). Printed output and `--json` show them only with `--show-comments`, so output without it stays the same whether a comments file exists or not.
+
+- **Which threads:** those of `--comments <file>`, or with `--session` of the review session the viewer has open ([comments.md](comments.md#the-session-pointer)), else of the repository's local file; on the current branch or on none ([comments.md](comments.md#branches)). The file is read once, where it is; it's never written or moved. General comments, which aren't on a file, aren't shown.
+- **Where they go:** each thread is placed by its anchor on the file's diff, as the viewer places it ([comments.md](comments.md#anchors)), and printed as a box under the row of its last line, unified or side by side. A thread on a line no hunk shows goes under the header of the gap that hides it, or after the file's last row below the last hunk, its border naming the line. A comment on the whole file goes under the file's header, and a thread whose lines are gone at the end of its file, with the lines it was written on.
+- **The box:** the author, age and state (`resolved`, `outdated`, `pending`, `on the file`, `line 9 not found`) in its top border, then each comment's text with its Markdown as plain text, wrapped to the output's width (80 columns off a terminal), and a suggested change as `-` and `+` lines. Colors come from the theme's roles.
+- **With `--json`:** each file object gets an `annotations` array instead ([json.md](json.md#annotations)).
+- **Not with:** `--stat`, `--name-only` and `--name-status`, which have no lines to put threads under. A diff on stdin has only its hunks, not the files' text threads are placed on: like `--stat`, `--show-comments` reads the repository and leaves stdin unread, and with `-` it's an error. So it's no setting for git's pager. A file that `-w` or `-b` finds unchanged isn't printed, nor are its threads.
+- **On a terminal** the viewer opens as without it; `--paging=never` prints.
+
 ## Summaries and exit status
 
 | Option | Prints |
@@ -210,6 +234,8 @@ These can go before or after the subcommand.
 | `--color auto\|always\|never` | When to color output. `auto` colors terminals, and follows `NO_COLOR` and `CLICOLOR_FORCE`. |
 | `--paging auto\|always\|never` | `never` writes straight to the terminal and also keeps the viewer from opening. `always` opens the viewer for a piped diff that fits one screen, which `auto` prints; see [git.md](git.md#piped-input). |
 | `--theme <name>` | A built-in theme or a file in the config's `themes/` directory. See [themes.md](themes.md). |
+| `--comments <file>` | The review comments file, relative to `-C`'s directory; the default is `dffy/comments.json` in the git directory the repository's worktrees share. See [comments.md](comments.md#where-the-file-is). |
+| `--review <name>` | The review plugin, `dffy-review-<name>`, over the `review` setting; it adds the plugin's command (`dffy pr`) for the run. See [plugins.md](plugins.md#review-plugins). |
 | `-h`, `--help` | Help; `dffy diff --help` lists the diff options. |
 | `-V`, `--version` | The version. |
 
@@ -231,5 +257,5 @@ These can go before or after the subcommand.
 | `COLORTERM` | `truecolor` or `24bit` makes `indicators = auto` tint changed lines; otherwise they get a bar. |
 | `DFFY_PAGER`, `PAGER` | The pager for printed output; see [above](#viewer-or-printed-output). `LESS` defaults to `FRX` when unset. |
 | `VISUAL`, `EDITOR` | The editor `e` opens, in that order, then `vi`. |
-| `XDG_CONFIG_HOME`, `XDG_STATE_HOME`, `XDG_CACHE_HOME`, `XDG_RUNTIME_DIR` | Where the config, remembered state, cache and broker socket live. See [config.md](config.md) and [watch.md](watch.md#dffyd). |
+| `XDG_CONFIG_HOME`, `XDG_STATE_HOME`, `XDG_CACHE_HOME`, `XDG_RUNTIME_DIR` | Where the config, remembered state, cache and dffyd's sockets live. See [config.md](config.md), [watch.md](watch.md#dffyd) and [control.md](control.md). |
 | `COLUMNS` | The width for printed output when neither stdout nor stderr is a terminal. |

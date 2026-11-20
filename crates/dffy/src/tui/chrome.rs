@@ -157,6 +157,9 @@ pub(super) struct Status {
     pub middle: Option<String>,
     /// `middle` is a note: cut short rather than dropped.
     pub note: bool,
+    /// The review's comments: `18 threads · 2 drafts`. Dropped with the
+    /// search, after the modes and the hints.
+    pub review: Option<String>,
     /// Where the diff search is (`match 3/17`) and whether the tree has a
     /// filter: kept longer than the other mode words.
     pub search: Option<String>,
@@ -228,6 +231,7 @@ fn place_status(status: &Status, segments: &[Range<usize>]) -> Placed {
     let [long, medium, short] = &status.hints;
     let hints = [None, dim(short), dim(medium), dim(long)];
     let (extra, search) = (dim(&status.extra), dim(&status.search));
+    let review = dim(&status.review);
     // (extra, middle whole, hints, search, hunk) kept, from all down to
     // none; the hints shorten before they go. A note outlasts the hints
     // and the search, and is then cut rather than dropped.
@@ -278,6 +282,7 @@ fn place_status(status: &Status, segments: &[Range<usize>]) -> Placed {
         let right = hints.as_ref().map_or(0, |h| group_width(h));
         let room = main.end.saturating_sub(x + right);
         let others: Vec<Spans> = [
+            review.clone().filter(|_| with_search),
             search.clone().filter(|_| with_search),
             extra.clone().filter(|_| with_extra),
         ]
@@ -343,7 +348,10 @@ pub(super) struct Chrome {
     /// The tree's bottom border shows its filter being typed.
     pub tree_editing: bool,
     pub heading: Option<Heading>,
-    pub context: Option<Spans>,
+    /// Where the view is: the hunk's numbers and heading, cut on the
+    /// right, or the scope line, cut on the left so the innermost
+    /// definition stays.
+    pub context: Option<(Spans, Cut)>,
     pub status: Status,
 }
 
@@ -465,7 +473,7 @@ impl Chrome {
                     .context
                     .as_ref()
                     .filter(|_| context_room >= MIN_CONTEXT + 3)
-                    .and_then(|c| cut_spans(c, context_room - 3));
+                    .and_then(|(c, cut)| cut_spans(c, *cut, context_room - 3));
                 let context_width = context.as_ref().map_or(0, |c| group_width(c) + 1);
                 let spans = title.fit(room.saturating_sub(context_width + 2));
                 (Some((spans, context)), None)
@@ -478,7 +486,7 @@ impl Chrome {
                     .context
                     .as_ref()
                     .filter(|_| context_room >= MIN_CONTEXT + 3)
-                    .and_then(|c| cut_spans(c, context_room - 3));
+                    .and_then(|(c, cut)| cut_spans(c, *cut, context_room - 3));
                 (Some((spans, context)), Some(taps))
             }
             None => (None, None),
@@ -509,7 +517,17 @@ impl Chrome {
 
 /// `spans` within `room` columns, cut on the right; hunk numbers cut
 /// short would read as other numbers, so they go whole or not at all.
-fn cut_spans(spans: &[(String, Role)], room: usize) -> Option<Spans> {
+/// Cut on the left, they're one run of text.
+fn cut_spans(spans: &[(String, Role)], cut: Cut, room: usize) -> Option<Spans> {
+    if cut == Cut::Left {
+        let (text, role) = spans.first()?;
+        let text = if text.width() <= room {
+            text.clone()
+        } else {
+            fit_left(text, room)
+        };
+        return (text.width() > 0).then(|| vec![(text, *role)]);
+    }
     let mut out = Vec::new();
     let mut left = room;
     for (text, role) in spans {

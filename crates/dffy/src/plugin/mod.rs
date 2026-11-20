@@ -10,8 +10,11 @@
 //! is killed whole on timeout, on cancellation and when dffy exits, its
 //! group is killed once it exits, and its answer is checked against the
 //! sides before anything uses it.
+//!
+//! Review plugins, the other kind, are in [`review`].
 
 pub(crate) mod json;
+pub(crate) mod review;
 
 use std::fmt::Write as _;
 use std::io::{Read as _, Write as _};
@@ -43,8 +46,27 @@ const MAX_ANSWER: u64 = 64 << 20;
 /// How often a running renderer is checked for cancellation.
 const POLL: Duration = Duration::from_millis(5);
 
-/// Executables are named this, then the renderer's name.
+/// Renderer executables are named this, then the renderer's name.
 pub(crate) const PREFIX: &str = "dffy-render-";
+
+/// Review plugin executables are named this, then the plugin's name (see
+/// [`review`]).
+pub(crate) const REVIEW_PREFIX: &str = "dffy-review-";
+
+/// Checks a plugin's name: lowercase letters, digits, `-` and `_`, so a
+/// setting can only ever name a program on PATH with the plugin's prefix.
+pub(crate) fn check_name(name: &str) -> Result<(), String> {
+    if name.is_empty()
+        || !name
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b"_-".contains(&b))
+    {
+        return Err(format!(
+            "'{name}' is not a plugin name: lowercase letters, digits, - and _"
+        ));
+    }
+    Ok(())
+}
 
 /// The `render` setting: which renderer each file extension gets.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -52,8 +74,7 @@ pub(crate) struct Renderers(Vec<(String, String)>);
 
 impl Renderers {
     /// Parses `md:markdown csv:csv`: space-separated `extension:name`
-    /// pairs. Names are lowercase letters, digits, `-` and `_`, so a
-    /// setting can only ever name a `dffy-render-` program on PATH.
+    /// pairs, each name as [`check_name`] takes it.
     pub(crate) fn parse(value: &str) -> Result<Self, String> {
         let mut pairs = Vec::new();
         for pair in value.split_whitespace() {
@@ -68,15 +89,7 @@ impl Renderers {
             {
                 return Err(format!("'{ext}' is not a file extension"));
             }
-            if name.is_empty()
-                || !name
-                    .bytes()
-                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b"_-".contains(&b))
-            {
-                return Err(format!(
-                    "'{name}' is not a renderer name: lowercase letters, digits, - and _"
-                ));
-            }
+            check_name(name)?;
             pairs.push((ext.to_ascii_lowercase(), name.to_owned()));
         }
         Ok(Self(pairs))
@@ -121,7 +134,7 @@ pub(crate) fn extension(path: &[u8]) -> Option<&[u8]> {
     Some(&name[dot + 1..]).filter(|ext| !ext.is_empty())
 }
 
-/// An installed renderer: its executable, and a stamp of it (modification
+/// An installed plugin: its executable, and a stamp of it (modification
 /// time and size) that changes when it's replaced, for the disk cache.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Program {
@@ -130,11 +143,11 @@ pub(crate) struct Program {
     stamp: (u128, u64),
 }
 
-/// The first executable `dffy-render-<name>` in an absolute directory of
+/// The first executable `<prefix><name>` in an absolute directory of
 /// `PATH`. Empty and relative entries are skipped: they'd resolve inside
 /// the repository being viewed, which could then supply the program.
-pub(crate) fn find(name: &str) -> Option<Program> {
-    let file = format!("{PREFIX}{name}");
+pub(crate) fn find(prefix: &str, name: &str) -> Option<Program> {
+    let file = format!("{prefix}{name}");
     std::env::split_paths(&std::env::var_os("PATH")?).find_map(|dir| {
         if !dir.is_absolute() {
             return None;
@@ -296,13 +309,15 @@ pub(crate) fn render(
     {
         return Ok(sides);
     }
-    let (answer, failed) = run(program, request.encode().into_bytes(), cancelled)?;
-    match (decode(&answer, lines), failed) {
+    let mut command = Command::new(&program.path);
+    command.process_group(0);
+    let (answer, status) = run(command, request.encode().into_bytes(), TIMEOUT, cancelled)?;
+    match (decode(&answer, lines), status.success()) {
         // The renderer's own message says more than how it exited.
         (Err(said @ Failure::Said(_)), _) => Err(said),
-        (Err(_) | Ok(_), Some(status)) => Err(Failure::Exited(status)),
-        (Err(failure), None) => Err(failure),
-        (Ok(sides), None) => {
+        (Err(_) | Ok(_), false) => Err(Failure::Exited(exited(status))),
+        (Err(failure), true) => Err(failure),
+        (Ok(sides), true) => {
             if let (Some(cache), Some(key)) = (cache, &key) {
                 cache.put(cache::Kind::Rendered, key, &answer);
             }
@@ -383,20 +398,22 @@ fn reap(child: &mut Child) -> std::io::Result<Option<ExitStatus>> {
     Ok(status)
 }
 
-/// Runs the renderer on `input` and returns what it printed, and how it
-/// exited when that wasn't a success.
+/// Runs `command`, a renderer, on `input` within `timeout`, and returns
+/// what it printed and how it exited. `command` puts the renderer in a
+/// process group of its own, through `process_group`, which is killed with
+/// it.
 fn run(
-    program: &Program,
+    mut command: Command,
     input: Vec<u8>,
+    timeout: Duration,
     cancelled: impl Fn() -> bool,
-) -> Result<(Vec<u8>, Option<String>), Failure> {
-    let deadline = Instant::now() + TIMEOUT;
-    let mut child = Command::new(&program.path)
+) -> Result<(Vec<u8>, ExitStatus), Failure> {
+    let deadline = Instant::now() + timeout;
+    let mut child = command
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         // Its messages would land on the viewer's screen.
         .stderr(Stdio::null())
-        .process_group(0)
         .spawn()
         .map_err(|e| Failure::Spawn(e.to_string()))?;
     {
@@ -482,11 +499,15 @@ fn run(
             "its exit status went missing".to_owned(),
         ));
     };
-    let failed = (!status.success()).then(|| match status.code() {
+    Ok((out, status))
+}
+
+/// How a plugin that failed exited, as words.
+fn exited(status: ExitStatus) -> String {
+    match status.code() {
         Some(code) => format!("exited with status {code}"),
         None => "was killed by a signal".to_owned(),
-    });
-    Ok((out, failed))
+    }
 }
 
 /// Reads an answer, checking it against the request, whose sides had

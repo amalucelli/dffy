@@ -1,0 +1,25 @@
+---
+source: crates/dffy/src/tui/view/tests.rs
+expression: shown
+---
+     │  ┌ ▾ bot · 3h ago ─────────────────────────────────────────────┐
+     │  │ Needs changes                                               │
+     │  │                                                             │
+     │  │ @ana two blockers at 03f1ba, see the guide:                 │
+     │  │                                                             │
+     │  │ ☑ tests pass                                                │
+     │  │ ☐ scope.ts:382 reads every project                          │
+     │  │   • and session chats too                                   │
+     │  │                                                             │
+     │  │ │ Default to the chat's own project.                        │
+     │  │                                                             │
+     │  │   let scope = Scope::Own;                                   │
+     │  │                                                             │
+     │  │ ana · 2h ago                                                │
+     │  │ ┌──────────┬──────┬──────────────┐                          │
+     │  │ │ file     │ line │ verdict      │                          │
+     │  │ ├──────────┼──────┼──────────────┤                          │
+     │  │ │ scope.ts │  382 │ blocker      │                          │
+     │  │ │ chats.go │  223 │ fine blocker │                          │
+     │  │ └──────────┴──────┴──────────────┘                          │
+     │  └─────────────────────────────────────────────────────────────┘

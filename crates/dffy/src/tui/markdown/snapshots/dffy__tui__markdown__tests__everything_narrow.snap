@@ -1,0 +1,50 @@
+---
+source: crates/dffy/src/tui/markdown/tests.rs
+expression: "markup(&render(EVERYTHING, 28, true))"
+---
+<:keyword+bu>Title</>
+
+<:keyword+b>Section</>
+
+<+b>Smaller</>
+
+Some <+b>bold</>, <+i>italic</>, <+d>struck</>
+and <:string>code</>, with <:function+u>a link</> long
+enough to wrap.
+A line break stays.
+
+<dim>• </>one
+<dim>• </>two
+<dim>  • </>nested, long enough that
+    it wraps under its own
+    text
+
+<dim>1. </>first
+<dim>2. </>second
+
+☑ done
+☐ to do
+
+<dim>│ </>quoted
+<dim>│ </>
+<dim>│ │ </>nested
+
+<dim>────────────────────────────</>
+
+<dim>┌────────┬───────┐</>
+<dim>│</> <+b>name</>   <dim>│</> <+b>count</> <dim>│</>
+<dim>├────────┼───────┤</>
+<dim>│</> apples <dim>│</>     3 <dim>│</>
+<dim>│</> pears  <dim>│</>    12 <dim>│</>
+<dim>└────────┴───────┘</>
+
+  <:keyword>fn</> <:function>main</><:punctuation>()</> <:punctuation>{</>
+      <:function>println!</><:punctuation>(</><:string>"hi"</><:punctuation>);</>
+  <:punctuation>}</>
+
+Inline <dim><b></>html<dim></b></> and an
+image <+d>[image: alt]</>.
+
+<dim><details></>
+<dim><summary>More</summary></>
+<dim></details></>

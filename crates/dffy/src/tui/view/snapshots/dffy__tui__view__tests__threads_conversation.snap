@@ -1,0 +1,19 @@
+---
+source: crates/dffy/src/tui/view/tests.rs
+expression: "expected[at..end].join(\"\\n\")"
+---
+  2●+│     let total = items.len() + 1;
+     │  ┏ ▾ ana · 3h ago ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
+     │  ┃ Should this count the items as they arrive, rather than   ┃
+     │  ┃ call len() once at the end?                               ┃
+     │  ┃                                                           ┃
+     │  ┃ octocat · 2h ago                                          ┃
+     │  ┃ It could, but the list is short.                          ┃
+     │  ┃                                                           ┃
+     │  ┃ ana · 30m ago                                             ┃
+     │  ┃ Fair, leaving it.                                         ┃
+     │  ┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛
+     │
+     │  ┌ ▾ octocat · 1h ago ───────────────────────────────────────┐
+     │  │ Name it count?                                            │
+     │  └───────────────────────────────────────────────────────────┘

@@ -201,6 +201,11 @@ tasks:
         msg: "{{.TAG}} doesn't match dffy's version in Cargo.toml; bump it first"
       - sh: test "v$(cargo pkgid -p dffy-core | sed 's/.*[#@]//')" = "{{.TAG}}"
         msg: "{{.TAG}} doesn't match dffy-core's version in crates/dffy-core/Cargo.toml; bump it first"
+      # Every crate and plugin ships at the tag's version.
+      - sh: >-
+          test -z "$(cargo metadata --no-deps --format-version 1
+          | jq -r --arg v '{{trimPrefix "v" .TAG}}' '.packages[] | select(.version != $v) | .name')"
+        msg: 'a workspace crate isn''t at {{.TAG}}; run task bump VERSION={{trimPrefix "v" .TAG}}'
       - sh: grep -q "^## {{trimPrefix "v" .TAG}} " CHANGELOG.md
         msg: "CHANGELOG.md has no section for {{.TAG}}; add one first"
     env:

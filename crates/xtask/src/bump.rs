@@ -1,8 +1,9 @@
 //! `cargo xtask bump <version>`: sets the release version everywhere it's
 //! written, so `task release` finds the tag matching Cargo. That's the
-//! workspace version (dffy, the plugins, xtask), dffy-core's own version,
-//! and the version requirement of every path dependency between workspace
-//! crates. `Cargo.lock` is refreshed for the workspace crates only.
+//! workspace version, the own version of any member that doesn't inherit it
+//! (dffy-core), and the version requirement of every path dependency between
+//! workspace crates, in every manifest of the workspace. `Cargo.lock` is
+//! refreshed for the workspace crates only.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -20,7 +21,10 @@ pub(crate) fn main(args: &[String]) -> Result<()> {
             "{version}: not a version of the form MAJOR.MINOR.PATCH"
         ));
     }
-    let root = Path::new(ROOT);
+    // Canonical, as cargo metadata's manifest paths are.
+    let root = &Path::new(ROOT)
+        .canonicalize()
+        .map_err(|e| format!("{ROOT}: {e}"))?;
     let mut changed = Vec::new();
     for path in manifests(root)? {
         let text = fs::read_to_string(&path).map_err(|e| format!("{}: {e}", path.display()))?;
@@ -57,20 +61,32 @@ fn is_version(s: &str) -> bool {
             .all(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()))
 }
 
-/// The root manifest and every member's.
+/// The root manifest and every workspace member's, as cargo lists them, so a
+/// new crate or plugin is bumped as soon as the workspace includes it.
 fn manifests(root: &Path) -> Result<Vec<PathBuf>> {
+    let (json, _) = output(
+        Command::new("cargo")
+            .args([
+                "metadata",
+                "--no-deps",
+                "--offline",
+                "--format-version",
+                "1",
+            ])
+            .current_dir(root),
+    )?;
+    let metadata: serde_json::Value =
+        serde_json::from_str(&json).map_err(|e| format!("cargo metadata: {e}"))?;
     let mut paths = vec![root.join("Cargo.toml")];
-    for dir in ["crates", "plugins"] {
-        let dir = root.join(dir);
-        let entries = fs::read_dir(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
-        for entry in entries {
-            let manifest = entry.map_err(|e| e.to_string())?.path().join("Cargo.toml");
-            if manifest.is_file() {
-                paths.push(manifest);
-            }
-        }
-    }
+    paths.extend(
+        metadata["packages"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|p| Some(PathBuf::from(p["manifest_path"].as_str()?))),
+    );
     paths.sort();
+    paths.dedup();
     Ok(paths)
 }
 

@@ -355,39 +355,72 @@ fn a_search_on_a_failed_file_goes_on_to_the_others() {
     assert_eq!(current, Some(0), "{}", status(&mut app));
 }
 
+/// A side-by-side viewer of `src/a.rs` changed from `old` to `new`,
+/// searching for `pattern`.
+fn split(old: &[u8], new: &[u8], pattern: &str) -> App {
+    let (old, new) = (Text::new(old.to_vec()), Text::new(new.to_vec()));
+    let side = Some(Side::Worktree {
+        mode: Mode::File,
+        id: None,
+    });
+    let fd = FileDiff {
+        change: FileChange {
+            path: "src/a.rs".into(),
+            status: Status::Modified,
+            old: side,
+            new: side,
+            staging: None,
+        },
+        hunks: hunks(&old, &new, &Options::default()),
+        old,
+        new,
+        binary: false,
+        too_large: false,
+        note: None,
+    };
+    let mut app = app_of(&Config::default(), "working tree", fd, (160, 20));
+    assert!(app.doc.layout.split);
+    typed(&mut app, &format!("/{pattern}"));
+    app
+}
+
+/// The file shown's matches in the order its rows show them, left to
+/// right on one: each one's row, found alone.
+fn row_order(app: &mut App) -> Vec<usize> {
+    let file = app.doc.document.pos.file;
+    let matches = (app.doc.document.search.as_ref())
+        .map(|m| Arc::clone(&m.matches))
+        .expect("found");
+    let mut rows: Vec<_> = (0..matches.len())
+        .filter_map(|i| Some((app.doc.hit_pos(file, &matches.get(i)?)?, i)))
+        .collect();
+    rows.sort_unstable();
+    rows.into_iter().map(|(_, i)| i).collect()
+}
+
+/// From the file's first match, `n` to its last and `N` back: every
+/// match the steps land on, in turn.
+fn steps(app: &mut App, n: usize) -> (Vec<usize>, Vec<usize>) {
+    let current = |app: &App| app.doc.document.search.as_ref().and_then(|m| m.current);
+    let walk = |app: &mut App, key_: char| {
+        let mut seen: Vec<usize> = current(app).into_iter().collect();
+        for _ in 1..n {
+            key(app, key_);
+            seen.extend(current(app));
+        }
+        seen
+    };
+    (walk(app, 'n'), walk(app, 'N'))
+}
+
 /// Side by side, a removed line and the added line beside it share a
 /// row: `n` takes matches in the order the rows show them, left to
 /// right, not in the order of the diff's lines, and `n` into a file
 /// lands on the first row's.
 #[test]
 fn n_goes_through_matches_in_row_order_side_by_side() {
-    let split = |old: &[u8], new: &[u8]| {
-        let (old, new) = (Text::new(old.to_vec()), Text::new(new.to_vec()));
-        let side = Some(Side::Worktree {
-            mode: Mode::File,
-            id: None,
-        });
-        let fd = FileDiff {
-            change: FileChange {
-                path: "src/a.rs".into(),
-                status: Status::Modified,
-                old: side,
-                new: side,
-                staging: None,
-            },
-            hunks: hunks(&old, &new, &Options::default()),
-            old,
-            new,
-            binary: false,
-            too_large: false,
-            note: None,
-        };
-        let mut app = app_of(&Config::default(), "working tree", fd, (160, 20));
-        assert!(app.doc.layout.split);
-        typed(&mut app, "/needle");
-        app
-    };
     let current = |app: &App| app.doc.document.search.as_ref().and_then(|m| m.current);
+    let split = |old: &[u8], new: &[u8]| split(old, new, "needle");
     let mut app = split(b"a needle 1\nb needle 2\n", b"a needle 1!\nb needle 2!\n");
     work(&mut app);
     press(&mut app, Key::Enter);
@@ -406,6 +439,100 @@ fn n_goes_through_matches_in_row_order_side_by_side() {
     }
     work(&mut app);
     assert_eq!(current(&app), Some(1));
+}
+
+/// Side by side, through a run of more removed lines than added, one
+/// of more added than removed, context between them and lines with
+/// several matches, `n` lands on every match once in the rows' order
+/// and `N` goes back the same way; a file entered backward lands on
+/// the last row's match.
+#[test]
+fn n_and_shift_n_take_every_match_in_row_order_through_uneven_runs() {
+    let old = b"c0\na1 x\na2 x x\na3 x\nc4 x\nb5 x\nc6\nc7\n";
+    let new = b"c0\nA1 x\nc4 x\nB1 x\nB2\nB3 x x\nc6 x\nc7\n";
+    let mut app = split(old, new, "x");
+    work(&mut app);
+    press(&mut app, Key::Enter);
+    let order = row_order(&mut app);
+    let n = app.doc.document.search.as_ref().map(|m| m.matches.len());
+    assert_eq!(Some(order.len()), n, "every match has a row");
+    assert_ne!(
+        order,
+        (0..order.len()).collect::<Vec<_>>(),
+        "rows interleave the sides"
+    );
+    let (forward, backward) = steps(&mut app, order.len());
+    assert_eq!(forward, order);
+    assert_eq!(backward, order.iter().rev().copied().collect::<Vec<_>>());
+
+    let mut app = split(old, new, "x");
+    if let Some(search) = &mut app.search {
+        search.pending = Some((0, Land::Last));
+    }
+    work(&mut app);
+    let current = app.doc.document.search.as_ref().and_then(|m| m.current);
+    assert_eq!(current, order.last().copied());
+}
+
+/// With the syntax diff, whose rows can draw a removed line below an
+/// added line that follows it in the diff, `n` and `N` still take the
+/// matches in the rows' order.
+#[test]
+fn n_and_shift_n_take_matches_in_row_order_in_the_syntax_diff() {
+    let old = b"fn f() {\n    call(a, 1);\n    let o = x + x;\n    let c = x;\n}\n";
+    let new = b"fn f() {\n    call(\n        a,\n        x,\n    );\n    let n = x + x;\n    let c = x;\n}\n";
+    let mut app = split(old, new, "x");
+    esc(&mut app);
+    key(&mut app, 'd');
+    app.draw();
+    for job in app.jobs() {
+        if let Job::Structural {
+            file,
+            version,
+            diff,
+        } = job
+        {
+            app.event(Event::Diffed(Done::Structural {
+                file,
+                version,
+                result: File::prepare(crate::grammars(), None).structural(&diff),
+                diff,
+            }));
+        }
+    }
+    typed(&mut app, "/x");
+    work(&mut app);
+    press(&mut app, Key::Enter);
+    let order = row_order(&mut app);
+    let n = app.doc.document.search.as_ref().map(|m| m.matches.len());
+    assert_eq!(Some(order.len()), n, "every match has a row");
+    let (forward, backward) = steps(&mut app, order.len());
+    assert_eq!(forward, order);
+    assert_eq!(backward, order.iter().rev().copied().collect::<Vec<_>>());
+}
+
+/// Side by side with comments, `n` and `N` take the matches in their
+/// boxes in the rows' order with the code's, a comment on a removed
+/// line under the row it shares with an added one.
+#[test]
+fn n_and_shift_n_take_comment_matches_in_row_order_side_by_side() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut app = app(160, 30);
+    let path = dir.path().join("comments.json");
+    std::fs::write(&path, review_json("src/zz9.rs")).expect("write");
+    app.set_comments(path);
+    screen(&mut app);
+    assert!(app.doc.layout.split);
+    typed(&mut app, "/f");
+    work(&mut app);
+    press(&mut app, Key::Enter);
+    let order = row_order(&mut app);
+    let found = app.doc.document.search.as_ref().map(|m| &m.matches);
+    assert!(found.is_some_and(|m| !m.blocks.is_empty() && !m.list.is_empty()));
+    assert_eq!(found.map(|m| m.len()), Some(order.len()));
+    let (forward, backward) = steps(&mut app, order.len());
+    assert_eq!(forward, order);
+    assert_eq!(backward, order.iter().rev().copied().collect::<Vec<_>>());
 }
 
 /// A pattern typed over a running scan stops it: the scan asks, and

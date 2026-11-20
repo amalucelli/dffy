@@ -123,6 +123,13 @@ impl Matches {
             .map(|&i| i as usize)
     }
 
+    /// The matches on `side`, as indices into `list`, in order: by line,
+    /// then left to right.
+    #[must_use]
+    pub fn on_side(&self, side: Side) -> &[u32] {
+        &self.by_side[side.index()]
+    }
+
     /// Matches of both kinds.
     #[must_use]
     pub fn len(&self) -> usize {
@@ -250,10 +257,12 @@ pub fn find(
                     continue;
                 }
                 scan.line(Side::New, line)?;
-                if std::mem::take(&mut lead) {
-                    scan.blocks(edge(Attach::Start))?;
+                if !blocks.is_empty() {
+                    if std::mem::take(&mut lead) {
+                        scan.blocks(edge(Attach::Start))?;
+                    }
+                    scan.blocks(on(to_old(line)..to_old(line) + 1, line..line + 1))?;
                 }
-                scan.blocks(on(to_old(line)..to_old(line) + 1, line..line + 1))?;
                 line += 1;
             }
         } else {
@@ -270,6 +279,10 @@ pub fn find(
                 LineKind::Context => (Side::New, l.new, l.old..l.old + 1, l.new..l.new + 1),
             };
             scan.line(side, line)?;
+            // Most files have no blocks; their lines skip the lookup.
+            if blocks.is_empty() {
+                continue;
+            }
             if std::mem::take(&mut lead) {
                 scan.blocks(edge(Attach::Start))?;
             }

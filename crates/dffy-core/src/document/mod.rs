@@ -512,6 +512,78 @@ fn views(diff: &FileDiff, hunks: &[Hunk]) -> Vec<HunkView> {
         .collect()
 }
 
+/// The row of `view`, a view of `core` with its rows built, showing line
+/// `line` (0-based) of `side`.
+fn line_row(core: &Hunk, view: &HunkView, side: Side, line: usize) -> Option<usize> {
+    // Along the body, a line's number on `side`, or its insertion point
+    // there when it's only on the other side, never goes down; at one
+    // number, the lines only on the other side come first.
+    let key = |b: &BodyLine| {
+        let l = &core.lines[b.line as usize];
+        match side {
+            Side::Old => (l.old, l.kind != LineKind::Added),
+            Side::New => (l.new, l.kind != LineKind::Removed),
+        }
+    };
+    let body = view.body.partition_point(|b| key(b) < (line, true));
+    view.body
+        .get(body)
+        .filter(|b| b.state != LineState::NoNewline && key(b) == (line, true))?;
+    row_of(&view.rows, body)
+}
+
+/// The row of `rows`, built by [`rows`], showing body line `i`, which isn't
+/// a no-newline marker.
+///
+/// Rows follow the body: each row's first line is past the one before's,
+/// and a marker, which names no line, sits where its line would. A line
+/// is its row's first, except an added line paired with a removed one. Its
+/// block's rows pair the removed lines with the added ones in order, so it
+/// is as many rows above the last pair as its line is before that pair's
+/// added line.
+fn row_of(rows: &[Row], i: usize) -> Option<usize> {
+    let first = |mut r: usize| loop {
+        match rows[r] {
+            Row::Line(l) | Row::Pair(Some(l), _) | Row::Pair(None, Some(l)) => return Some(l),
+            Row::Header | Row::Marker | Row::Pair(None, None) => r = r.checked_sub(1)?,
+        }
+    };
+    let shows = |r: usize| match rows[r] {
+        Row::Line(l) => l == i,
+        Row::Pair(old, new) => old == Some(i) || new == Some(i),
+        Row::Header | Row::Marker => false,
+    };
+    // The rows whose first line is at or before `i`, a marker counting as
+    // the row above it.
+    let (mut lo, mut hi) = (0, rows.len());
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2;
+        if first(mid).is_none_or(|l| l <= i) {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    let mut r = lo.checked_sub(1)?;
+    while rows[r] == Row::Marker {
+        r = r.checked_sub(1)?;
+    }
+    if shows(r) {
+        return Some(r);
+    }
+    // `r` is the last row of `i`'s block with a removed line. Steps back
+    // over the removed lines left unpaired one at a time: linear in those
+    // alone.
+    while let Row::Pair(Some(_), None) = rows[r] {
+        r = r.checked_sub(1)?;
+    }
+    let Row::Pair(Some(_), Some(added)) = rows[r] else {
+        return None;
+    };
+    let row = r.checked_sub(added.checked_sub(i)?)?;
+    shows(row).then_some(row)
+}
+
 /// The gaps around `diff`'s hunks; none when it has no hunks.
 fn gaps(diff: &FileDiff) -> Vec<Gap> {
     if diff.hunks.is_empty() {
@@ -1679,20 +1751,7 @@ impl File {
         let part = 1 + self.segments.iter().position(|s| *s == Segment::Hunk(h))?;
         self.ensure_rows(shape, h);
         let (cores, views) = self.shown_hunks(shape.structural);
-        let (core, view) = (&cores[h], &views[h]);
-        let body = view.body.iter().position(|b| {
-            let l = &core.lines[b.line as usize];
-            b.state != LineState::NoNewline
-                && match m.side {
-                    Side::Old => l.kind != LineKind::Added && l.old == line,
-                    Side::New => l.kind != LineKind::Removed && l.new == line,
-                }
-        })?;
-        let own = view.rows.iter().position(|r| match *r {
-            Row::Line(i) => i == body,
-            Row::Pair(old, new) => old == Some(body) || new == Some(body),
-            Row::Header | Row::Marker => false,
-        })?;
+        let own = line_row(&cores[h], &views[h], m.side, line)?;
         self.ensure_blocks(shape, part);
         Some(Pos {
             file,

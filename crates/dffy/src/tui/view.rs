@@ -2647,7 +2647,7 @@ impl Doc {
 
     /// The old and new lines (0-based) a logical row shows; `None` on a
     /// side without one, and on rows that aren't code.
-    fn row_lines(&mut self, pos: Pos) -> [Option<usize>; 2] {
+    pub(crate) fn row_lines(&mut self, pos: Pos) -> [Option<usize>; 2] {
         let layout = self.file_layout(pos.file);
         self.document.row_lines(pos, arrange(&layout, &self.boxes))
     }

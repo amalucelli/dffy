@@ -5,7 +5,7 @@ use std::ops::Range;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
-use dffy_core::document::{Found, Matches, Needle, Pos, Source};
+use dffy_core::document::{Found, Hit, Match, Matches, Needle, Pos, Side, Source};
 use dffy_core::git::FileDiff;
 
 use super::{App, Land, SEARCH_AHEAD, Search};
@@ -119,25 +119,185 @@ impl App {
         let marks = (self.doc.document.search.as_ref())
             .filter(|m| m.file == file && self.doc.layout.split)
             .map(|m| Arc::clone(&m.matches));
-        let by_row = marks.and_then(|matches| {
-            let rows = self.match_rows(file, &matches);
-            if last {
-                rows.iter().max()
-            } else {
-                rows.iter().min()
-            }
-            .map(|&(_, i)| i)
-        });
-        self.land_search(by_row.unwrap_or(if last { usize::MAX } else { 0 }));
+        match marks.and_then(|matches| self.split_edge(file, &matches, last)) {
+            Some((pos, i)) => self.land_search_at(i, pos),
+            None => self.land_search(if last { usize::MAX } else { 0 }),
+        }
     }
 
-    /// Each of `matches`' row and index, those of `file` shown: side by
-    /// side, a removed line and the added line beside it share a row, so
-    /// the diff's order isn't the rows'.
-    fn match_rows(&mut self, file: usize, matches: &Matches) -> Vec<(Pos, usize)> {
-        (0..matches.len())
-            .filter_map(|i| Some((self.doc.hit_pos(file, &matches.get(i)?)?, i)))
-            .collect()
+    /// Line match `j` of `matches`' list, in `file`: its row and its
+    /// index among matches of both kinds.
+    fn line_key(&mut self, file: usize, matches: &Matches, j: usize) -> Option<(Pos, usize)> {
+        let pos = self.doc.hit_pos(file, &Hit::Line(*matches.list.get(j)?))?;
+        Some((pos, matches.of_line(j)))
+    }
+
+    /// The row and index of the first of `matches` in the order the rows
+    /// show them, or the `last`.
+    fn split_edge(&mut self, file: usize, matches: &Matches, last: bool) -> Option<(Pos, usize)> {
+        let mut best = None;
+        for side in [Side::Old, Side::New] {
+            let ids = matches.on_side(side);
+            let n = ids.len();
+            let key = (0..n).find_map(|k| {
+                let k = if last { n - 1 - k } else { k };
+                self.line_key(file, matches, ids[k] as usize)
+            });
+            best = nearer(best, key, !last);
+        }
+        for (k, b) in matches.blocks.iter().enumerate() {
+            let pos = self.doc.hit_pos(file, &Hit::Block(*b));
+            best = nearer(best, pos.map(|p| (p, b.after as usize + k)), !last);
+        }
+        best
+    }
+
+    /// Side by side, the match after `mark` in the order the rows show
+    /// them (before it, going back), with its row. Each side's matches
+    /// are in the order of that side's rows; the sides interleave where
+    /// removed and added lines share rows, so the step finds each side's
+    /// nearest and takes the nearer. A comment's match is looked up one
+    /// by one: comments are few.
+    fn split_step(
+        &mut self,
+        file: usize,
+        matches: &Matches,
+        mark: Mark,
+        forward: bool,
+    ) -> Option<(Pos, usize)> {
+        let mut best = match mark {
+            Mark::Hit(pos, i) => match matches.get(i) {
+                Some(Hit::Line(m)) => self.line_step(file, matches, &m, pos, forward),
+                _ => self.sides_step(file, matches, mark, forward),
+            },
+            Mark::Top { .. } => self.sides_step(file, matches, mark, forward),
+        };
+        for (k, b) in matches.blocks.iter().enumerate() {
+            let key = (self.doc.hit_pos(file, &Hit::Block(*b))).map(|p| (p, b.after as usize + k));
+            best = nearer(best, key.filter(|&key| mark.passed(key, forward)), forward);
+        }
+        best
+    }
+
+    /// [`App::split_step`] among the code's matches from any `mark`: a
+    /// binary search of each side's.
+    fn sides_step(
+        &mut self,
+        file: usize,
+        matches: &Matches,
+        mark: Mark,
+        forward: bool,
+    ) -> Option<(Pos, usize)> {
+        let mut best = None;
+        for side in [Side::Old, Side::New] {
+            let ids = matches.on_side(side);
+            // The first match after the mark going forward, the first not
+            // before it going back; one without a row is passed over.
+            let at = partition_point(ids.len(), |k| {
+                self.line_key(file, matches, ids[k] as usize)
+                    .is_none_or(|key| {
+                        if forward {
+                            !mark.passed(key, true)
+                        } else {
+                            mark.passed(key, false)
+                        }
+                    })
+            });
+            let key = if forward {
+                (at..ids.len()).find_map(|k| self.line_key(file, matches, ids[k] as usize))
+            } else {
+                (0..at)
+                    .rev()
+                    .find_map(|k| self.line_key(file, matches, ids[k] as usize))
+            };
+            best = nearer(best, key, forward);
+        }
+        best
+    }
+
+    /// [`App::split_step`] among the code's matches from `hit`, the code's
+    /// match on the row at `pos`. The next on its line is on the same
+    /// row; the other side's line on that row places that side's matches
+    /// around it; past both, the row of one candidate places the other.
+    /// So a step looks up a row or two, not one per match.
+    fn line_step(
+        &mut self,
+        file: usize,
+        matches: &Matches,
+        hit: &Match,
+        pos: Pos,
+        forward: bool,
+    ) -> Option<(Pos, usize)> {
+        let (side, list) = (hit.side, &matches.list);
+        let (own, other) = (matches.on_side(side), matches.on_side(side.other()));
+        let line = |j: u32| list[j as usize].line as usize;
+        let here = own.partition_point(|&j| {
+            let o = &list[j as usize];
+            (o.line, o.start) < (hit.line, hit.start)
+        });
+        let at = *own.get(here)?;
+        let next = if forward {
+            own.get(here + 1)
+        } else {
+            here.checked_sub(1).map(|k| &own[k])
+        };
+        if let Some(&j) = next.filter(|&&j| line(j) == line(at)) {
+            return Some((pos, matches.of_line(j as usize)));
+        }
+        let across = if let Some(shown) = self.doc.row_lines(pos)[side.other().index()] {
+            let first = other.partition_point(|&j| line(j) < shown);
+            let past = first + other[first..].partition_point(|&j| line(j) == shown);
+            // A line's matches all come before or all after another line's
+            // in the diff.
+            if first < past && (other[first] > at) == forward {
+                let j = if forward {
+                    other[first]
+                } else {
+                    other[past - 1]
+                };
+                return Some((pos, matches.of_line(j as usize)));
+            }
+            if forward {
+                other.get(past)
+            } else {
+                first.checked_sub(1).map(|k| &other[k])
+            }
+        } else {
+            // The row shows this side alone. The other side's matches below
+            // it start near where the diff has them around this one: the
+            // added lines after a removed line begin on rows above, beside
+            // the removed lines before it, and a syntax diff can draw
+            // removed lines below an added line that follows them.
+            let near = other.partition_point(|&j| j < at);
+            let below = gallop(near, other.len(), |k| {
+                self.line_key(file, matches, other[k] as usize)
+                    .is_none_or(|(p, _)| p <= pos)
+            });
+            if forward {
+                other.get(below)
+            } else {
+                below.checked_sub(1).map(|k| &other[k])
+            }
+        };
+        let (next, across) = (next.map(|&j| j as usize), across.map(|&j| j as usize));
+        let (j, across) = match (next, across) {
+            (Some(j), Some(across)) => (j, across),
+            (Some(j), None) | (None, Some(j)) => return self.line_key(file, matches, j),
+            (None, None) => return None,
+        };
+        let Some(there) = self.line_key(file, matches, across) else {
+            return self.line_key(file, matches, j);
+        };
+        // This side's lines are in the order of their rows.
+        let mine = match self.doc.row_lines(there.0)[side.index()] {
+            Some(shown) if list[j].line as usize == shown => (there.0, matches.of_line(j)),
+            Some(shown) if (shown < list[j].line as usize) == forward => return Some(there),
+            _ => match self.line_key(file, matches, j) {
+                Some(key) => key,
+                None => return Some(there),
+            },
+        };
+        nearer(Some(mine), Some(there), forward)
     }
 
     /// Goes to match `i` of the file shown (its last when past the end).
@@ -158,6 +318,14 @@ impl App {
         if let Some(pos) = hit.and_then(|hit| self.doc.hit_pos(file, &hit)) {
             self.doc.goto_match(pos);
         }
+    }
+
+    /// Goes to match `i` of the file shown, on the row at `pos`.
+    fn land_search_at(&mut self, i: usize, pos: Pos) {
+        if let Some(marks) = &mut self.doc.document.search {
+            marks.current = Some(i);
+        }
+        self.doc.goto_match(pos);
     }
 
     /// `n`/`N` while searching: the next or previous match, on into the
@@ -184,19 +352,11 @@ impl App {
             || (self.doc.document.files().get(file)).is_some_and(|e| e.wants_diff() || e.is_page());
         match marks {
             Some((matches, current)) if self.doc.layout.split => {
-                // Each step finds every match's row, left to right on one.
-                let rows = self.match_rows(file, &matches);
-                let from = current.and_then(|c| rows.iter().find(|(_, i)| *i == c).copied());
-                let next = match (from, forward) {
-                    (Some(from), true) => rows.iter().filter(|r| **r > from).min(),
-                    (Some(from), false) => rows.iter().filter(|r| **r < from).max(),
-                    (None, true) => (rows.iter())
-                        .filter(|(p, _)| *p > top || here && *p == top)
-                        .min(),
-                    (None, false) => rows.iter().filter(|(p, _)| *p < top).max(),
-                };
-                if let Some(&(_, i)) = next {
-                    self.land_search(i);
+                // Matches go by row, left to right on one.
+                let at = current.and_then(|c| Some((self.doc.hit_pos(file, &matches.get(c)?)?, c)));
+                let mark = at.map_or(Mark::Top { pos: top, here }, |(pos, c)| Mark::Hit(pos, c));
+                if let Some((pos, i)) = self.split_step(file, &matches, mark, forward) {
+                    self.land_search_at(i, pos);
                     return;
                 }
             }
@@ -370,6 +530,37 @@ impl App {
     }
 }
 
+/// Where a step through the matches starts: the match it's on, at its
+/// row, or the row at the top, `here` counting a match on that row as
+/// the next.
+#[derive(Clone, Copy)]
+enum Mark {
+    Hit(Pos, usize),
+    Top { pos: Pos, here: bool },
+}
+
+impl Mark {
+    /// Whether the match at `key` (its row and index) comes after the
+    /// mark, or before it when not `forward`.
+    fn passed(self, key: (Pos, usize), forward: bool) -> bool {
+        match (self, forward) {
+            (Self::Hit(pos, i), true) => key > (pos, i),
+            (Self::Hit(pos, i), false) => key < (pos, i),
+            (Self::Top { pos, here }, true) => key.0 > pos || here && key.0 == pos,
+            (Self::Top { pos, .. }, false) => key.0 < pos,
+        }
+    }
+}
+
+/// The earlier of two matches (row, then index), or the later when not
+/// `first`.
+fn nearer(a: Option<(Pos, usize)>, b: Option<(Pos, usize)>, first: bool) -> Option<(Pos, usize)> {
+    match (a, b) {
+        (Some(a), Some(b)) => Some(if (a < b) == first { a } else { b }),
+        (a, b) => a.or(b),
+    }
+}
+
 /// The first of `0..n` that `before` is false for, `before` being true for
 /// a run of them from 0 and false after.
 fn partition_point(n: usize, mut before: impl FnMut(usize) -> bool) -> usize {
@@ -383,4 +574,34 @@ fn partition_point(n: usize, mut before: impl FnMut(usize) -> bool) -> usize {
         }
     }
     lo
+}
+
+/// [`partition_point`], probing outward from `near` at doubling distances
+/// first, so an answer near it costs a few calls.
+fn gallop(near: usize, n: usize, mut before: impl FnMut(usize) -> bool) -> usize {
+    let (mut lo, mut hi, mut step) = (0, n, 1);
+    if near < n && before(near) {
+        lo = near + 1;
+        while lo < hi {
+            let probe = (lo + step - 1).min(hi - 1);
+            if !before(probe) {
+                hi = probe;
+                break;
+            }
+            lo = probe + 1;
+            step *= 2;
+        }
+    } else {
+        hi = near.min(n);
+        while lo < hi {
+            let probe = hi.saturating_sub(step).max(lo);
+            if before(probe) {
+                lo = probe + 1;
+                break;
+            }
+            hi = probe;
+            step *= 2;
+        }
+    }
+    lo + partition_point(hi - lo, |k| before(lo + k))
 }

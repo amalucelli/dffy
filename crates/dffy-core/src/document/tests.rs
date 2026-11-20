@@ -413,3 +413,91 @@ fn eviction_drops_the_least_recently_shown_outside_the_kept_range() {
     doc.evict(0, &(0..1));
     assert!(doc.file(0).is_some(), "the kept range stays");
 }
+
+proptest::proptest! {
+    /// A line's row is the one a scan of the body and then of the rows
+    /// finds, in either arrangement, whatever the order of the hunk's
+    /// kinds of line, its blocks and its no-newline markers.
+    #[test]
+    fn a_lines_row_is_the_row_a_scan_finds(
+        kinds in proptest::collection::vec((0..3usize, proptest::bool::ANY), 0..40),
+        no_newline in proptest::bool::ANY,
+        split in proptest::bool::ANY,
+    ) {
+        let (mut old, mut new) = (0, 0);
+        let lines: Vec<diff::Line> = kinds
+            .iter()
+            .map(|&(k, block_start)| {
+                let kind = [LineKind::Context, LineKind::Removed, LineKind::Added][k];
+                let line = diff::Line {
+                    kind,
+                    old,
+                    new,
+                    emphasis: Vec::new(),
+                    unchanged: diff::Unchanged::No,
+                    block_start,
+                    paired: false,
+                };
+                old += usize::from(kind != LineKind::Added);
+                new += usize::from(kind != LineKind::Removed);
+                line
+            })
+            .collect();
+        // The last line of each side may end without a newline.
+        let last = |not: LineKind| lines.iter().rposition(|l| l.kind != not);
+        let marked = [last(LineKind::Added), last(LineKind::Removed)];
+        let mut body = Vec::new();
+        for (i, line) in lines.iter().enumerate() {
+            let line_index = u32::try_from(i).unwrap();
+            body.push(BodyLine { line: line_index, state: LineState::of(line) });
+            if no_newline && marked.contains(&Some(i)) {
+                body.push(BodyLine { line: line_index, state: LineState::NoNewline });
+            }
+        }
+        let arrangement = if split { Arrangement::Split } else { Arrangement::Unified };
+        let mut arranged = Vec::new();
+        let kind = |i: usize| {
+            let BodyLine { line, state } = body[i];
+            let block_start = state != LineState::NoNewline && lines[line as usize].block_start;
+            (state.kind(), block_start)
+        };
+        rows(arrangement, body.len(), kind, &mut arranged);
+        let core = Hunk { old_start: 0, old_len: old, new_start: 0, new_len: new, lines };
+        let view = HunkView {
+            heading: None,
+            body,
+            rows: arranged,
+            starts: Vec::new(),
+            arrangement: Some(arrangement),
+            other: None,
+            emphasis: None,
+            syntax: None,
+        };
+        let scan = |side: Side, line: usize| {
+            let body = view.body.iter().position(|b| {
+                let l = &core.lines[b.line as usize];
+                b.state != LineState::NoNewline
+                    && match side {
+                        Side::Old => l.kind != LineKind::Added && l.old == line,
+                        Side::New => l.kind != LineKind::Removed && l.new == line,
+                    }
+            })?;
+            view.rows.iter().position(|r| match *r {
+                Row::Line(i) => i == body,
+                Row::Pair(old, new) => old == Some(body) || new == Some(body),
+                Row::Header | Row::Marker => false,
+            })
+        };
+        for (side, len) in [(Side::Old, old), (Side::New, new)] {
+            for line in 0..=len {
+                proptest::prop_assert_eq!(
+                    line_row(&core, &view, side, line),
+                    scan(side, line),
+                    "{:?} line {}",
+                    side,
+                    line
+                );
+            }
+        }
+    }
+}

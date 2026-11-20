@@ -14,7 +14,7 @@
   | `paint` | the `first_paint` example: the first and last change found in the range and the working tree |
   | `print` | dffy printing the range, highlighted and not, one file, and the file list |
   | `pager` | dffy reading the range's patch as a pager |
-  | `comments` | the viewer on the range with 300 review threads, then `m` and page down through them ([below](#the-comments-group)) |
+  | `comments` | the viewer on the range with 300 review threads, and with 2,000, then `m` and page down through them ([below](#the-comments-group)) |
 
   dffy's own budgets are in [architecture.md](architecture.md#performance).
 
@@ -73,16 +73,17 @@ Every command runs in the kernel clone with only `PATH` from the environment, an
 
 ### The comments group
 
-The `comments` group ([`crates/xtask`](../crates/xtask/src/comments.rs)) times the viewer with a large review open: `dffy --comments <file> v6.0..v6.1` in a 200×60 pseudo-terminal.
+The `comments` group ([`crates/xtask`](../crates/xtask/src/comments.rs)) times the viewer with a review open: `dffy --comments <file> v6.0..v6.1` in a 200×60 pseudo-terminal, once with a review of 300 threads and once with a large pull request's 2,000.
 
-**The comments file.** At the start of a run, the checkout's own `dffy comments apply` writes it into the run's temporary directory, and both builds open that same file. It's made from the range's diff and the files' text at `v6.1`, so it's the same on every run:
+**The comments files.** At the start of a run, the checkout's own `dffy comments apply` writes them into the run's temporary directory, and both builds open the same files. They're made from the range's diff and the files' text at `v6.1`, so they're the same on every run:
 
-- 300 threads: one on `.clang-format`'s changed line, so the first screen shows one; 250 over `mm/vmscan.c`'s added lines; 49 over `net/core/filter.c`'s.
+- The review: 300 threads. One is on `.clang-format`'s changed line, so the first screen shows one; 250 are over `mm/vmscan.c`'s added lines and 49 over `net/core/filter.c`'s.
+- The large review: 2,000 threads. The first is on `.clang-format` again; the others are over the added lines of 15 C files the range edits, each with 695 to 3,221 added lines, about one thread per ten. `drivers/clk/clk_test.c` comes first, with 160; `mm/vmscan.c` has the most, 400.
 - Every third thread covers up to three lines, every fifth is resolved, and every tenth is unplaced, because its anchor's lines aren't in the file.
-- Thread `i` has `i % 4` replies, 450 in all.
+- Thread `i` has `i % 4` replies: 450 in the review, 3,000 in the large one.
 - The texts range from one line to a paragraph that wraps, or a list with a code block.
 
-**One run.** Each round runs it three times per build and keeps each metric's median:
+**One run.** Each round runs each review three times per build and keeps each metric's median:
 
 | Metric | Measures |
 |---|---|
@@ -91,9 +92,10 @@ The `comments` group ([`crates/xtask`](../crates/xtask/src/comments.rs)) times t
 | `comments/settled` | Time to the last output before a second of silence. |
 | `comments/next thread` | 16 presses of `m`: the first focuses the `.clang-format` thread, the second goes to `mm/vmscan.c`. The median time from a press to the end of the frame it draws. |
 | `comments/page down` | Then 16 presses of page down in `mm/vmscan.c`: the median time from a press to the end of the frame it draws. |
+| `comments/large first frame`, `large first thread`, `large next thread`, `large page down` | The same with the large review, where `m` goes from `.clang-format` to `drivers/clk/clk_test.c` and the paging runs there. Its first screen is the same, so `settled` isn't measured again. |
 
 - **Between presses.** The harness waits for 150ms of silence before the next press, so a late repaint isn't taken for the next key's frame.
-- **Failures.** A run fails if a key draws no frame within 10 seconds, or if no thread's text is on screen after an `m`. It also fails if the last `m` doesn't land on the `mm/vmscan.c` thread it should. `m` walks the placed threads first and the unplaced ones after them, so the 16th press lands on thread 16.
+- **Failures.** A run fails if a key draws no frame within 10 seconds, or if no thread's text is on screen after an `m`. It also fails if the last `m` doesn't land on the thread it should in the second file. `m` walks the placed threads first and the unplaced ones after them, so the 16th press lands on thread 16.
 
 These are timings only, held to the timing rule and to their layout bands, so `perf:quick` leaves the group out. The next `perf:full` adds their bands to `layout.tsv`.
 

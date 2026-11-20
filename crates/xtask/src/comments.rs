@@ -1,16 +1,17 @@
 //! The `comments` group of `cargo xtask perf`: the viewer on the kernel's
-//! v6.0..v6.1 with a comments file of 300 review threads ([`FILES`]), timed in
-//! a 200×60 pseudo-terminal from its start, through `m` over the threads,
-//! to paging through them.
+//! v6.0..v6.1 with a comments file of review threads, timed in a 200×60
+//! pseudo-terminal from its start, through `m` over the threads, to paging
+//! through them. It opens two reviews ([`SCENARIOS`]): 300 threads over 3
+//! files, and a large pull request's 2,000 over 16.
 //!
-//! The comments file is the fixture: written once per measurement through
-//! the candidate's own `dffy comments apply`, from the range's diff and the
-//! commented files' text at v6.1, so both sides open the same file and its
-//! threads are the same on every run. Thread `i`'s first comment starts
-//! with `bench-<i>`, which the script waits for on screen; every third
-//! thread spans up to three lines, every fifth is resolved, every tenth is
-//! unplaced (its anchor's lines aren't in the file), and thread `i` has
-//! `i % 4` replies.
+//! Each review's comments file is a fixture: written once per measurement
+//! through the candidate's own `dffy comments apply`, from the range's diff
+//! and the commented files' text at v6.1, so both sides open the same file
+//! and its threads are the same on every run. Thread `i`'s first comment
+//! starts with `bench-<i>`, which the script waits for on screen; every
+//! third thread spans up to three lines, every fifth is resolved, every
+//! tenth is unplaced (its anchor's lines aren't in the file), and thread
+//! `i` has `i % 4` replies.
 
 use std::io::{Read as _, Write as _};
 use std::num::NonZero;
@@ -26,27 +27,72 @@ use serde_json::{Value, json};
 use crate::harness::{self, COLS, ROWS, TIMEOUT};
 use crate::{Result, Sandbox, describe, median};
 
-/// The files with threads, in the viewer's order, and each one's threads.
-/// The viewer opens on `.clang-format`, whose one thread is on its only
-/// changed line, so the first screen shows a thread. `mm/vmscan.c`, with
-/// 141 hunks and 3,221 added lines, holds most of them: `m` goes there
-/// from the first thread, and the paging runs there.
-const FILES: [(&str, usize); 3] = [
-    (".clang-format", 1),
-    ("mm/vmscan.c", 250),
-    ("net/core/filter.c", 49),
-];
+/// A review the group opens.
+struct Scenario {
+    /// What its rows' names put between `comments/` and the metric's.
+    prefix: &'static str,
+    /// Its comments file's name in the sandbox's root, which survives the
+    /// sandbox's reset before every run.
+    file: &'static str,
+    /// The files with threads, in the viewer's order, and each one's
+    /// threads. Each starts with `.clang-format`, the file the viewer opens
+    /// on, whose one thread is on its only changed line, so the first
+    /// screen shows a thread; `m` goes from there to the next file, where
+    /// the paging runs.
+    files: &'static [(&'static str, usize)],
+    /// Whether it has a `settled` row.
+    settled: bool,
+}
 
-/// The fixture's name in the sandbox's root, which survives the sandbox's
-/// reset before every run.
-pub(crate) const FILE: &str = "comments.json";
+const SCENARIOS: [Scenario; 2] = [
+    Scenario {
+        prefix: "",
+        file: "comments.json",
+        // `mm/vmscan.c`, with 141 hunks and 3,221 added lines, holds most.
+        files: &[
+            (".clang-format", 1),
+            ("mm/vmscan.c", 250),
+            ("net/core/filter.c", 49),
+        ],
+        settled: true,
+    },
+    Scenario {
+        prefix: "large ",
+        file: "comments-large.json",
+        // C files edited in the range with 695 to 3,221 added lines, about
+        // a thread per ten of them.
+        files: &[
+            (".clang-format", 1),
+            ("drivers/clk/clk_test.c", 160),
+            ("drivers/gpu/drm/amd/amdgpu/amdgpu_cs.c", 80),
+            ("drivers/gpu/drm/vc4/vc4_hdmi.c", 80),
+            ("drivers/hwmon/f71882fg.c", 150),
+            ("drivers/iio/pressure/bmp280-core.c", 80),
+            (
+                "drivers/net/ethernet/marvell/prestera/prestera_router.c",
+                110,
+            ),
+            ("drivers/net/wireless/ralink/rt2x00/rt2800lib.c", 170),
+            ("drivers/net/wireless/realtek/rtw89/coex.c", 160),
+            ("drivers/vfio/pci/vfio_pci_core.c", 70),
+            ("fs/btrfs/tree-log.c", 110),
+            ("fs/ext4/super.c", 70),
+            ("mm/khugepaged.c", 80),
+            ("mm/mmap.c", 120),
+            ("mm/vmscan.c", 400),
+            ("tools/testing/memblock/tests/alloc_nid_api.c", 159),
+        ],
+        // The first screen is the same, so its settling is the other's.
+        settled: false,
+    },
+];
 
 /// Runs a round takes the median of.
 const RUNS: usize = 3;
 
 /// `m` presses, then page-downs, per run. The first two `m` focus the
-/// thread on `.clang-format` and then go to the first in `mm/vmscan.c`;
-/// sixteen pages from there stay well inside the file.
+/// thread on `.clang-format` and then go to the first in the next file;
+/// sixteen pages from there stay well inside it.
 const THREAD_KEYS: usize = 16;
 const PAGE_KEYS: usize = 16;
 
@@ -65,16 +111,22 @@ const QUIET: Duration = Duration::from_millis(150);
 /// How long a key's frame, and the screen it should show, may take.
 const KEY_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// The metrics of one run, in ms, each named as its row after `comments/`.
-pub(crate) type Times = [(&'static str, f64); 5];
+/// The metrics of one run, in ms, each named as its row after `comments/`
+/// and its scenario's prefix.
+type Times = [(&'static str, f64); 5];
 
 const AUTHORS: [&str; 4] = ["", "octocat", "hubot", "monalisa"];
 
-/// Writes the fixture with `dffy`'s `comments apply` in the sandbox's
-/// repository, replacing an earlier one.
+/// Writes every scenario's fixture with `dffy`'s `comments apply` in the
+/// sandbox's repository, replacing earlier ones.
 pub(crate) fn fixture(sandbox: &Sandbox, dffy: &Path) -> Result<()> {
-    let file = sandbox.path(FILE);
-    for stale in [file.clone(), sandbox.path(&format!("{FILE}.lock"))] {
+    SCENARIOS.iter().try_for_each(|s| write(sandbox, dffy, s))
+}
+
+fn write(sandbox: &Sandbox, dffy: &Path, scenario: &Scenario) -> Result<()> {
+    let file = sandbox.path(scenario.file);
+    let lock = sandbox.path(&format!("{}.lock", scenario.file));
+    for stale in [file.clone(), lock] {
         match std::fs::remove_file(&stale) {
             Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
                 return Err(format!("{}: {e}", stale.display()));
@@ -83,7 +135,7 @@ pub(crate) fn fixture(sandbox: &Sandbox, dffy: &Path) -> Result<()> {
         }
     }
     let mut targets = Vec::new();
-    for (path, threads) in FILES {
+    for &(path, threads) in scenario.files {
         let git = |args: &[&str]| crate::output(sandbox.command("git").args(args)).map(|(o, _)| o);
         let diff = git(&[
             "diff",
@@ -130,10 +182,10 @@ fn opens(dffy: &Path, file: &Path) -> bool {
     crate::output(&mut cmd).is_ok()
 }
 
-/// [`opens`] for the group's file in `dir`: what the comments group needs
-/// of a build ([`crate::ab::Needs`]).
+/// [`opens`] for every scenario's file in `dir`: what the comments group
+/// needs of a build ([`crate::ab::Needs`]).
 pub(crate) fn opens_in(dffy: &Path, dir: &Path) -> bool {
-    opens(dffy, &dir.join(FILE))
+    SCENARIOS.iter().all(|s| opens(dffy, &dir.join(s.file)))
 }
 
 /// A file the threads go on.
@@ -303,17 +355,24 @@ fn apply(sandbox: &Sandbox, dffy: &Path, file: &Path, ops: &[Value]) -> Result<V
         .collect())
 }
 
-/// Each metric's median over [`RUNS`] runs of `dffy` on the fixture.
-pub(crate) fn measure(sandbox: &Sandbox, dffy: &Path) -> Result<Times> {
-    let file = sandbox.path(FILE);
-    let mut runs = Vec::new();
-    for _ in 0..RUNS {
-        runs.push(run(sandbox, dffy, &file)?);
-    }
-    let mut times = runs[0];
-    for (k, (_, value)) in times.iter_mut().enumerate() {
-        let mut values: Vec<f64> = runs.iter().map(|r| r[k].1).collect();
-        *value = median(&mut values).unwrap_or_default();
+/// Each scenario's metrics, in ms and named as their rows after
+/// `comments/`: their medians over [`RUNS`] runs of `dffy` on its fixture.
+pub(crate) fn measure(sandbox: &Sandbox, dffy: &Path) -> Result<Vec<(String, f64)>> {
+    let mut times = Vec::new();
+    for s in &SCENARIOS {
+        let file = sandbox.path(s.file);
+        let mut runs = Vec::new();
+        for _ in 0..RUNS {
+            runs.push(run(sandbox, dffy, &file).map_err(|e| format!("{}: {e}", s.file))?);
+        }
+        for (k, &(metric, _)) in runs[0].iter().enumerate() {
+            if metric == "settled" && !s.settled {
+                continue;
+            }
+            let mut values: Vec<f64> = runs.iter().map(|r| r[k].1).collect();
+            let ms = median(&mut values).unwrap_or_default();
+            times.push((format!("{}{metric}", s.prefix), ms));
+        }
     }
     Ok(times)
 }
@@ -404,7 +463,7 @@ fn script(term: &mut Term, start: Instant) -> Result<Times> {
     for _ in 0..THREAD_KEYS {
         threads.push(term.press(b"m", Some("bench-"))?);
     }
-    // The paging is meant to run among `mm/vmscan.c`'s threads. `m` walks
+    // The paging is meant to run among the second file's threads. `m` walks
     // the placed threads in order, and the unplaced ones after them, under
     // their file's last row.
     let reached = (0..)

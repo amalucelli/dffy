@@ -195,10 +195,14 @@ impl Scopes {
 /// misses is a definition inside a one-line node, which is on that line
 /// and no other.
 pub(super) fn extract(query: &ScopeQuery, tree: &Tree, text: &Text) -> Scopes {
+    // Highlighted sides are at most `MAX_HIGHLIGHT_BYTES`, so byte offsets
+    // fit a `u32`.
     struct Found {
-        bytes: (usize, usize),
+        bytes: (u32, u32),
         lines: (u32, u32),
-        label: String,
+        /// The bytes of its keyword and of its name.
+        kind: Option<(u32, u32)>,
+        name: Option<(u32, u32)>,
     }
     let source = text.bytes();
     let mut found = Vec::new();
@@ -211,21 +215,17 @@ pub(super) fn extract(query: &ScopeQuery, tree: &Tree, text: &Text) -> Scopes {
             let mut matches = cursor.matches(&query.query, node, source);
             while let Some(m) = matches.next() {
                 let span = |index: Option<u32>| {
-                    let (start, end) = m
-                        .nodes_for_capture_index(index?)
-                        .map(|n| (n.start_byte(), n.end_byte()))
-                        .reduce(|a, b| (a.0.min(b.0), a.1.max(b.1)))?;
-                    Some(first_line(&source[start..end]))
+                    m.nodes_for_capture_index(index?)
+                        .map(|n| (to_u32(n.start_byte()), to_u32(n.end_byte())))
+                        .reduce(|a, b| (a.0.min(b.0), a.1.max(b.1)))
                 };
                 let Some(scope) = m.nodes_for_capture_index(query.scope).next() else {
                     continue;
                 };
-                let label = match (span(query.kind), span(query.name)) {
-                    (Some(kind), Some(name)) => format!("{kind} {name}"),
-                    (Some(kind), None) => kind,
-                    (None, Some(name)) => format!("{name}()"),
-                    (None, None) => continue,
-                };
+                let (kind, name) = (span(query.kind), span(query.name));
+                if kind.is_none() && name.is_none() {
+                    continue;
+                }
                 let (start, end) = (scope.start_position(), scope.end_position());
                 // A node ending at a line's start ends on the line before.
                 let last = if end.column == 0 && end.row > start.row {
@@ -234,9 +234,10 @@ pub(super) fn extract(query: &ScopeQuery, tree: &Tree, text: &Text) -> Scopes {
                     end.row
                 };
                 found.push(Found {
-                    bytes: (scope.start_byte(), scope.end_byte()),
+                    bytes: (to_u32(scope.start_byte()), to_u32(scope.end_byte())),
                     lines: (to_u32(start.row), to_u32(last)),
-                    label,
+                    kind,
+                    name,
                 });
             }
         }
@@ -253,26 +254,42 @@ pub(super) fn extract(query: &ScopeQuery, tree: &Tree, text: &Text) -> Scopes {
     found.sort_by_key(|f| (f.bytes.0, std::cmp::Reverse(f.bytes.1)));
     // Two patterns may match one definition; the first found is kept.
     found.dedup_by_key(|f| f.bytes);
-    let mut scopes = Scopes::default();
-    // The definitions around the next one: index and end byte.
-    let mut open: Vec<(u32, usize)> = Vec::new();
-    for f in found {
-        while open
-            .last()
-            .is_some_and(|&(_, end)| end <= f.bytes.0 || end < f.bytes.1)
-        {
-            open.pop();
+    let mut scopes = Scopes {
+        scopes: Vec::with_capacity(found.len()),
+        labels: String::new(),
+    };
+    let text = |(start, end): (u32, u32)| &source[start as usize..end as usize];
+    for (i, f) in found.iter().enumerate() {
+        // The definitions around this one are the one before it and those
+        // around that, innermost first.
+        let mut parent = i.checked_sub(1).map_or(NONE, to_u32);
+        while parent != NONE && {
+            let (_, end) = found[parent as usize].bytes;
+            end <= f.bytes.0 || end < f.bytes.1
+        } {
+            parent = scopes.scopes[parent as usize].parent;
         }
-        let index = to_u32(scopes.scopes.len());
         let label = to_u32(scopes.labels.len());
-        scopes.labels.push_str(&f.label);
+        let labels = &mut scopes.labels;
+        match (f.kind, f.name) {
+            (Some(kind), Some(name)) => {
+                push_first_line(labels, text(kind));
+                labels.push(' ');
+                push_first_line(labels, text(name));
+            }
+            (Some(kind), None) => push_first_line(labels, text(kind)),
+            (None, Some(name)) => {
+                push_first_line(labels, text(name));
+                labels.push_str("()");
+            }
+            (None, None) => {}
+        }
         scopes.scopes.push(Scope {
             start: f.lines.0,
             end: f.lines.1,
-            parent: open.last().map_or(NONE, |&(p, _)| p),
+            parent,
             label: (label, to_u32(scopes.labels.len())),
         });
-        open.push((index, f.bytes.1));
     }
     scopes
 }
@@ -281,14 +298,16 @@ fn to_u32(n: usize) -> u32 {
     u32::try_from(n).unwrap_or(u32::MAX)
 }
 
-/// The text up to the first line break, its whitespace runs collapsed to
-/// a space.
-fn first_line(bytes: &[u8]) -> String {
+/// Appends the text up to the first line break to `out`, its whitespace
+/// runs collapsed to a space.
+fn push_first_line(out: &mut String, bytes: &[u8]) {
     let line = bytes.split(|&b| b == b'\n').next().unwrap_or(bytes);
-    String::from_utf8_lossy(line)
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
+    for (i, word) in String::from_utf8_lossy(line).split_whitespace().enumerate() {
+        if i > 0 {
+            out.push(' ');
+        }
+        out.push_str(word);
+    }
 }
 
 #[cfg(test)]

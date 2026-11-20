@@ -393,6 +393,9 @@ const MAX_REWRITE_GAP: usize = 4;
 /// Appends the bytes that turn a terminal showing `old` into one showing
 /// `new`, which has the same size. The SGR state is the default on entry
 /// and on return.
+// Out of line: inlined into the frame's drawing, its loops over a row's
+// cells compete with the caller for registers and run longer per cell.
+#[inline(never)]
 pub(super) fn diff(old: &Grid, new: &Grid, out: &mut Vec<u8>) {
     let width = new.width;
     let mut cursor: Option<(usize, usize)> = None;
@@ -400,7 +403,7 @@ pub(super) fn diff(old: &Grid, new: &Grid, out: &mut Vec<u8>) {
     let mut sgr = String::new();
     for y in 0..new.height {
         let (o, n) = (old.row(y), new.row(y));
-        if o == n {
+        if same_row(o, n) {
             continue;
         }
         // From here on the new row is blank, so one erase covers it.
@@ -444,6 +447,14 @@ pub(super) fn diff(old: &Grid, new: &Grid, out: &mut Vec<u8>) {
         }
     }
     set_pen(out, &mut pen, Style::PLAIN, &mut sgr);
+}
+
+/// Whether two rows hold the same cells.
+// Out of line for the same reason as `diff`: every row of every frame goes
+// through this loop, and alone it keeps its values in registers.
+#[inline(never)]
+fn same_row(old: &[Cell], new: &[Cell]) -> bool {
+    old == new
 }
 
 fn move_to(out: &mut Vec<u8>, cursor: Option<(usize, usize)>, x: usize, y: usize) {

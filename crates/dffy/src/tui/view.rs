@@ -34,7 +34,7 @@ use super::comments::{self, CommentRows, Writes, Writing};
 use super::markdown;
 use super::piped::Body;
 use crate::pager;
-use crate::render::{Canvas, Layout};
+use crate::render::{Canvas, Layout, Mapped};
 use crate::review::model::{At, Look, Thread, ThreadComment};
 use crate::term::Grid;
 use crate::theme::{Ink, Role, Style, Theme};
@@ -1421,6 +1421,15 @@ impl Doc {
         if file != self.boxes.file {
             self.set_blocks(self.boxes.file, Vec::new());
         }
+        // Another file, and still no boxes: no rows changed.
+        if threads.is_empty()
+            && self.boxes.threads.is_empty()
+            && self.boxes.new_at.is_none()
+            && self.boxes.writing.is_none()
+        {
+            self.boxes.file = file;
+            return;
+        }
         let boxes = &mut self.boxes;
         boxes.of.clear();
         boxes.starts.clear();
@@ -2299,6 +2308,10 @@ impl Doc {
             }
             let split = self.split_row(logical, layout);
             let Some(map) = mapped.map() else { continue };
+            // Glyphs come in the order of the canvas's rows.
+            let first = map.glyphs.partition_point(|g| g.row < pos.offset);
+            let glyphs = &map.glyphs[first..];
+            let glyphs = &glyphs[..glyphs.partition_point(|g| g.row == pos.offset)];
             for i in here {
                 let found = marks.matches.list[i];
                 let role = if marks.current == Some(marks.matches.of_line(i)) {
@@ -2307,15 +2320,14 @@ impl Doc {
                     Role::SearchMatch
                 };
                 let bytes = found.start as usize..found.end as usize;
-                for g in &map.glyphs {
-                    if g.row == pos.offset
-                        && (!split || g.side == found.side.index())
-                        && bytes.contains(&g.bytes.start)
-                    {
-                        let left = (x + g.col).min(end);
-                        grid.restyle(left, top + y, (left + g.width).min(end), theme.style(role));
-                    }
-                }
+                let side = split.then(|| found.side.index());
+                restyle_match(
+                    grid,
+                    glyphs,
+                    (side, bytes),
+                    (x, end, top + y),
+                    theme.style(role),
+                );
             }
         }
         self.mapped = mapped;
@@ -2768,6 +2780,9 @@ impl Doc {
 
     /// Whether the row at `pos` is a block's, or parts two.
     fn in_block(&mut self, pos: Pos) -> bool {
+        if self.document.blocks(pos.file).is_empty() {
+            return false;
+        }
         let layout = self.file_layout(pos.file);
         matches!(
             self.document.row(pos, arrange(&layout, &self.boxes)),
@@ -2837,6 +2852,9 @@ impl Doc {
 
     /// The block whose row `pos` is, and which of its rows.
     fn block_line_at_pos(&mut self, pos: Pos) -> Option<(BlockId, usize)> {
+        if self.document.blocks(pos.file).is_empty() {
+            return None;
+        }
         let layout = self.file_layout(pos.file);
         match self.document.row(pos, arrange(&layout, &self.boxes))? {
             Content::Block { id, line } => Some((id, line)),
@@ -3067,6 +3085,30 @@ impl Doc {
             }
         }
         widest
+    }
+}
+
+/// Restyles the cells of `glyphs`, a canvas row's, showing `bytes` of
+/// `side`, or of either side with `None`, in screen row `y` of a pane from
+/// `x` to `end`.
+// Out of line: inlined into the frame's drawing, this loop over every glyph
+// of the row, once per match on it, competes with the caller for registers
+// and runs longer per glyph.
+#[inline(never)]
+fn restyle_match(
+    grid: &mut Grid,
+    glyphs: &[Mapped],
+    (side, bytes): (Option<usize>, Range<usize>),
+    (x, end, y): (usize, usize, usize),
+    style: Style,
+) {
+    let len = bytes.len();
+    for g in glyphs {
+        // `bytes.contains`, in one comparison.
+        if g.bytes.start.wrapping_sub(bytes.start) < len && side.is_none_or(|s| g.side == s) {
+            let left = (x + g.col).min(end);
+            grid.restyle(left, y, (left + g.width).min(end), style);
+        }
     }
 }
 

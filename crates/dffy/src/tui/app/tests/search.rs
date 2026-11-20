@@ -161,6 +161,36 @@ fn the_diff_search_marks_jumps_and_counts() {
     assert!(app.search.is_none(), "n goes to changes again");
 }
 
+/// A match a wrapped line takes to its second screen row is lit there,
+/// and only there.
+#[test]
+fn a_match_on_a_wrapped_rows_second_line_is_lit_there() {
+    let text = format!("one\n{}needle\n", "x".repeat(70));
+    let mut config = Config::default();
+    config.apply_source("wrap = true\n", &mut Vec::new());
+    let mut app = app_of(
+        &config,
+        "working tree",
+        searchable("src/a.rs", &text),
+        (60, 12),
+    );
+    typed(&mut app, "/needle");
+    work(&mut app);
+    app.draw();
+    let lit = app.theme.style(Role::SearchMatch);
+    let grid = app.screen.shown_grid();
+    let rows: Vec<(usize, usize)> = (0..grid.height())
+        .map(|y| (y, grid.row(y).iter().filter(|c| c.style() == lit).count()))
+        .filter(|&(_, n)| n > 0)
+        .collect();
+    let [(y, n)] = rows[..] else {
+        panic!("one row lit: {rows:?}");
+    };
+    assert_eq!(n, "needle".len());
+    assert!(grid.row_text(y).contains("needle"), "{}", grid.row_text(y));
+    assert!(grid.row_text(y - 1).contains("xxx"), "the line's first row");
+}
+
 /// `/` finds comments' text with the code's: `enter` goes to the first
 /// match, on the line, and `n` to the next, in the box under it; one
 /// only in a comment is found too.

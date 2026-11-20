@@ -246,10 +246,10 @@ fn draft_again(id: &str, comments: Option<&mut Comments>) -> Vec<Effect> {
     };
     let op = Op::Set {
         target: Target::Id(id.to_owned()),
-        change: Change {
+        change: Box::new(Change {
             author: Some(String::new()),
             ..Change::default()
-        },
+        }),
     };
     match comments.apply(vec![op]) {
         Ok((written, _)) => read_back(written),

@@ -187,6 +187,45 @@ fn an_untouched_suggestion_saves_nothing() {
     assert!(!path.exists() || read_comments(&path).comments.is_empty());
 }
 
+/// Once applied, a suggestion's thread moves to the lines it put there and
+/// stays open, its comment marked applied: drawn so, and `s` won't apply
+/// it again.
+#[test]
+fn an_applied_suggestion_moves_its_thread_and_applies_once() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("comments.json");
+    let mut app = app(100, 30);
+    app.set_comments(path.clone());
+    screen(&mut app);
+    key(&mut app, 'S');
+    typed(&mut app, "Shorter");
+    press(&mut app, Key::Esc);
+    screen(&mut app);
+    let Some(Action::ApplySuggestion(suggestion)) = press(&mut app, Key::Char('s')) else {
+        panic!("not applied: {}", status(&mut app));
+    };
+    let mut moved = Anchor::new(&suggestion.diff.new, 0..1);
+    moved.before = vec!["above".to_owned()];
+    app.event(Event::Applied(Ok(annotation::Applied {
+        replaced: 0..1,
+        lines: 0..1,
+        anchor: Some(moved.clone()),
+    })));
+    let marked = &read_comments(&path).comments[0];
+    assert!(marked.applied.is_some(), "{marked:?}");
+    assert_eq!(
+        (marked.anchor.as_ref(), marked.resolved),
+        (Some(&moved), false),
+        "on the new lines, still open"
+    );
+    let shown = screen(&mut app);
+    assert!(shown.contains("you · just now · applied ━"), "{shown}");
+    assert!(shown.contains("suggested change, applied:"), "{shown}");
+    assert!(!shown.contains("s apply"), "{shown}");
+    assert_eq!(press(&mut app, Key::Char('s')), None);
+    assert!(status(&mut app).contains("this suggestion is applied already"));
+}
+
 /// `s` on a thread applies its last suggestion to the lines it's on, as
 /// the loop writes them; an empty one deletes them, and a thread without
 /// one says so. Another `s` while one is applied waits.
@@ -235,10 +274,17 @@ fn s_on_a_thread_applies_its_suggestion() {
     assert_eq!(press(&mut app, Key::Char('s')), None);
     assert!(status(&mut app).contains("still applying"));
     let said = |app: &App| app.message.as_ref().map(|(m, _)| m.clone());
-    app.event(Event::Applied(Ok(0..1)));
+    let done = |replaced: Range<usize>, lines: Range<usize>, anchor: Option<Anchor>| {
+        Event::Applied(Ok(annotation::Applied {
+            replaced,
+            lines,
+            anchor,
+        }))
+    };
+    app.event(done(0..1, 0..1, None));
     assert_eq!(
         said(&app),
-        Some(format!("applied the suggestion to {FILE}:1"))
+        Some(format!("applied the suggestion to {FILE}:1 · x resolves"))
     );
 
     let empty = Op::Add {
@@ -254,8 +300,11 @@ fn s_on_a_thread_applies_its_suggestion() {
     app.event(Event::Comments);
     screen(&mut app);
     assert_eq!(applied(&mut app).lines, Vec::<String>::new());
-    app.event(Event::Applied(Ok(0..1)));
-    assert_eq!(said(&app), Some(format!("deleted {FILE}:1, as suggested")));
+    app.event(done(0..1, 0..0, None));
+    assert_eq!(
+        said(&app),
+        Some(format!("deleted {FILE}:1, as suggested · x resolves"))
+    );
 
     // Written elsewhere, as through MCP: its line breaks are read as lines,
     // a last one ending the last line rather than adding an empty one.
@@ -276,7 +325,7 @@ fn s_on_a_thread_applies_its_suggestion() {
         app.event(Event::Comments);
         screen(&mut app);
         assert_eq!(applied(&mut app).lines, lines, "{suggestion:?}");
-        app.event(Event::Applied(Ok(0..1)));
+        app.event(done(0..1, 0..lines.len(), None));
     }
 }
 
@@ -1557,7 +1606,7 @@ fn drafts_are_yours_in_a_review_session() {
     app.event(Event::Comments);
     let shown = screen(&mut app);
     assert!(!shown.contains("draft") && !shown.contains('◆'), "{shown}");
-    assert!(!shown.contains("not posted"), "{shown}");
+    assert!(!shown.contains("· local"), "no origin words: {shown}");
     assert_eq!(app.comments.as_ref().map(Comments::counts), Some((6, 0)));
 
     let prepare = app.start_review("test".to_owned(), session(&dir, HEAD, None));
@@ -1565,7 +1614,7 @@ fn drafts_are_yours_in_a_review_session() {
     let shown = screen(&mut app);
     assert!(shown.contains("▾ you · 2h ago · draft"), "{shown}");
     assert!(
-        shown.contains("claude · just now · read-only sandbox · not posted"),
+        shown.contains("claude · just now · read-only sandbox · local"),
         "{shown}"
     );
     assert_eq!(app.comments.as_ref().map(Comments::counts), Some((6, 5)));
@@ -1585,6 +1634,92 @@ fn drafts_are_yours_in_a_review_session() {
         .map(|c| c.author)
         .collect();
     assert!(!authors.contains(&"claude".to_owned()), "{authors:?}");
+}
+
+/// A review session's file: a resolved thread of yours with an agent's
+/// reply, an open one of yours, and a resolved thread on the host holding
+/// your draft reply and the host's.
+fn resolved_mix() -> String {
+    let c = |id: &str, author: &str, rest: &str| {
+        format!(
+            r#"{{"id":"{id}","path":"{FILE}","text":"{id}","author":"{author}","created":"2026-11-17T10:00:00Z"{rest}}}"#
+        )
+    };
+    let comments = [
+        c("l1", "", r#","resolved":true"#),
+        c("l2", "claude", r#","resolved":false,"in_reply_to":"l1""#),
+        c("o1", "", r#","resolved":false"#),
+        c("h1", "octocat", r#","resolved":true,"ref":"github:1""#),
+        c("h2", "", r#","resolved":false,"in_reply_to":"h1""#),
+        c(
+            "h3",
+            "ana",
+            r#","resolved":false,"in_reply_to":"h1","ref":"github:2""#,
+        ),
+        // Yours, deleted on the host, under a reply still there.
+        c(
+            "g1",
+            "",
+            r#","resolved":true,"post_error":"deleted on the host""#,
+        ),
+        c(
+            "g2",
+            "ana",
+            r#","resolved":false,"in_reply_to":"g1","ref":"github:3""#,
+        ),
+    ];
+    format!(r#"{{"version":1,"comments":[{}]}}"#, comments.join(","))
+}
+
+/// `clear_resolved` asks first, naming what goes, and any key but `y`
+/// keeps it all. `y` deletes the resolved threads with nothing on the
+/// host, and from one on the host only what isn't posted, saying the
+/// host's threads stay; open threads stay.
+#[test]
+fn clearing_resolved_threads_deletes_only_what_lives_here() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut app = reviewed(&dir, &resolved_mix(), (120, 30));
+    let path = dir.path().join("comments.json");
+    let ids = || -> Vec<String> {
+        (read_comments(&path).comments.into_iter())
+            .map(|c| c.id)
+            .collect()
+    };
+    let clear = |app: &mut App| {
+        press(app, Key::Char(' '));
+        key(app, '-');
+        status(app)
+    };
+    let asked = "delete 1 resolved thread and 1 local comment in host threads? y/n";
+    assert!(clear(&mut app).contains(asked));
+    key(&mut app, 'n');
+    assert!(status(&mut app).contains("kept"));
+    assert_eq!(ids(), ["l1", "l2", "o1", "h1", "h2", "h3", "g1", "g2"]);
+
+    assert!(clear(&mut app).contains(asked));
+    key(&mut app, 'y');
+    assert_eq!(ids(), ["o1", "h1", "h3", "g1", "g2"]);
+    assert!(status(&mut app).contains(
+        "deleted 1 resolved thread and 1 local comment in host threads · host threads stay"
+    ));
+    assert!(clear(&mut app).contains("no resolved threads to delete · host threads stay"));
+}
+
+/// `d` twice on a resolved thread with nothing on the host deletes it
+/// whole, not only its last comment.
+#[test]
+fn d_deletes_a_resolved_local_thread_whole() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut app = reviewed(&dir, &resolved_mix(), (120, 30));
+    app.follow_thread("l1");
+    key(&mut app, 'd');
+    assert!(status(&mut app).contains("deletes this thread, replies too"));
+    key(&mut app, 'd');
+    let left: Vec<String> = (read_comments(&dir.path().join("comments.json")).comments)
+        .into_iter()
+        .map(|c| c.id)
+        .collect();
+    assert_eq!(left, ["o1", "h1", "h2", "h3", "g1", "g2"]);
 }
 
 /// The local review's file holds every branch's threads: the viewer

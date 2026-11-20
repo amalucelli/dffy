@@ -3,9 +3,10 @@
 //! they're driven with, as the loop and the workers would send them.
 //! Each module takes them, and every name the viewer has, from here.
 
-pub(super) use std::ops::ControlFlow;
+pub(super) use std::ops::{ControlFlow, Range};
 pub(super) use std::path::Path;
 
+pub(super) use dffy_core::annotation::{self, Anchor};
 pub(super) use dffy_core::diff::{Options, Text, Whitespace, hunks};
 pub(super) use dffy_core::document::{self, Counts};
 pub(super) use dffy_core::git::{ChangeSet, FileDiff, Mode, Repo, Side};

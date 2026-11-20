@@ -127,15 +127,16 @@ actions! {
     ToggleThread "toggle_thread" "fold thread" "fold or unfold the focused comment thread, or the first on screen",
     ToggleThreads "toggle_threads" "fold all threads" "fold every comment thread to one row, or unfold them all",
     MoveThread "move_thread" "move thread here" "move the focused thread, or the comments panel's selected one, from the branch it was written on to the current branch",
-    AskAgent "ask_agent" "ask agent" "ask a coding agent, through the agent plugin dffy-agent, about the focused thread, or when an agent's reply ends it, write your follow-up in a reply box, which enter sends to that agent; elsewhere, write the question on the selected lines, or the line v would start on, in a text box, and enter asks. The answer comes as the agent's reply, with a suggestion when it proposes a change; esc on the thread stops it. A comment you write starting @claude, @codex or @pi asks that agent too (experimental, see agent)",
+    AskAgent "ask_agent" "ask agent" "ask a coding agent, through the agent plugin dffy-agent, about the focused thread: write your question in a reply box, which enter sends with the thread to the agent that answered last, else the default one; enter on the empty box asks about the thread as it is, and esc saves the question without asking. Elsewhere, write the question on the selected lines, or the line v would start on, in a text box, and enter asks. The answer comes as the agent's reply, with a suggestion when it proposes a change; esc on the thread stops it. A comment you write starting @claude, @codex or @pi asks that agent too (experimental, see agent)",
     Reply "reply" "reply to thread" "on a thread: reply in a text box under it; enter sends it",
     EditDraft "edit_draft" "edit thread draft" "on a thread: edit your last draft in it, in a text box; enter sends it",
-    DeleteDraft "delete_draft" "delete thread draft" "on a thread: delete your last draft in it, the whole thread when that's its first comment, once the key comes again",
+    DeleteDraft "delete_draft" "delete thread draft" "on a thread: delete your last draft in it, the whole thread when that's its first comment or the thread is resolved with nothing on the host, once the key comes again",
     Resolve "resolve" "resolve thread" "on a thread: resolve it, or reopen it",
     Adopt "adopt" "make thread yours" "on a thread: someone else's comments in it not posted, as an agent's, become your drafts, which posting sends under your name",
     ApplySuggestion "apply_suggestion" "apply suggestion" "on a thread: put its suggestion, the one last clicked or else its last, in place of the lines it's on in the working tree, refused when they changed since; an unstaged change, which discard undoes",
     FixWithAgent "fix_with_agent" "fix with agent" "on a thread, or the selected lines with a note you write first: start your coding agent (claude, codex, pi or amp) in a new tab, or here until it exits, pointed at the thread to change what it asks and reply in it",
     OpenOnHost "open_on_host" "open thread on host" "on a thread: open it on its code host, in the browser",
+    ClearResolved "clear_resolved" "delete resolved threads" "delete the resolved threads shown, after a y/n; on a code host's review only what isn't posted, as the host's threads would come back",
     CommentInEditor "comment_in_editor" "comment in $EDITOR" "write in $EDITOR: your draft in the focused thread, else a reply to it, else a comment on the line; ctrl+g does it from the text box",
     CommentedFiles "commented_files" "files with comments" "the tree shows only the files with comments, or every file; f/F and n/N keep to them",
     ReviewPull "review_pull" "update the review" "on a review a review plugin opened, fetch its new commits and threads and show them in place (experimental, see review)",
@@ -328,6 +329,7 @@ const DEFAULTS: &[(Table, &str, Action)] = &[
     (L, "E", Action::CommentInEditor),
     (L, "a", Action::AskAgent),
     (L, "&", Action::FixWithAgent),
+    (L, "-", Action::ClearResolved),
     (L, ".", Action::OpenTerminal),
     (L, "S", Action::SuggestChange),
     (L, "O", Action::OpenReview),
@@ -458,6 +460,7 @@ impl Action {
             | Self::ApplySuggestion
             | Self::FixWithAgent
             | Self::OpenOnHost
+            | Self::ClearResolved
             | Self::ReviewPull
             | Self::ReviewPost
             | Self::OpenReview
@@ -521,6 +524,7 @@ impl Action {
             Self::MoveThread => "Move thread to this branch",
             Self::AskAgent => "Ask agent",
             Self::FixWithAgent => "Fix with agent",
+            Self::ClearResolved => "Delete resolved threads…",
             Self::Help => "All keys",
             other => other.label(),
         }
@@ -611,6 +615,7 @@ impl Action {
             Self::ApplySuggestion => "apply",
             Self::FixWithAgent => "fix with agent",
             Self::OpenOnHost => "open on host",
+            Self::ClearResolved => "delete resolved threads",
             Self::CommentInEditor => "comment in editor",
             Self::CommentedFiles => "files with comments",
             Self::ReviewPull => "update review",

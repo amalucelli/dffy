@@ -8,7 +8,7 @@ use std::sync::Arc;
 use dffy_core::git::{Applied, Edit, FileChange, FileDiff, Picked, Status};
 use dffy_core::view::Staging;
 
-use super::{Action, App, Event, STILL_EDITING, Uncommitted, escape, menu, session};
+use super::{Action, App, Confirmed, Event, STILL_EDITING, Uncommitted, escape, menu, session};
 use crate::keys::Action as Act;
 
 impl App {
@@ -135,7 +135,7 @@ impl App {
             edit: Edit::Discard,
         };
         self.message = None;
-        self.confirm = Some((prompt, action, "kept"));
+        self.confirm = Some((prompt, Confirmed::Run(action), "kept"));
         self.dirty = true;
     }
 

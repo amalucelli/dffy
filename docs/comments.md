@@ -55,11 +55,11 @@ Without one, `dffy comments --session` fails and says so; a pointer that isn't t
 
 ### Drafts
 
-A **draft** is a comment of yours (an empty `author`) without a `ref` or `local_only`, in a review session's file, the one a review plugin keeps for a review; `P` posts it. A reply of yours in a thread whose first comment is kept local isn't one either: that thread isn't on the host and won't be, so the reply shows `not posted` with it, until `A` on the thread makes it all yours. Elsewhere nothing is posted, so the viewer shows no drafts there and doesn't count any.
+A **draft** is a comment of yours (an empty `author`) without a `ref` or `local_only`, in a review session's file, the one a review plugin keeps for a review; `P` posts it. A reply of yours in a thread whose first comment is kept local isn't one either: that thread isn't on the host and won't be, so the reply shows `local` with it, until `A` on the thread makes it all yours. Elsewhere nothing is posted, so the viewer shows no drafts there and doesn't count any.
 
-A comment without a `ref` whose `author` isn't empty, such as one an agent wrote, is never a draft: posting it would put it out under your name. A comment added through the [control API](control.md) is the client's, by the name its hello gives (`dffy ctl` for `dffy ctl`, `dffy mcp` for the MCP server's tools, `dffy ctl` too for a client that gives none), so it's one of these. In a review session it shows `not posted`, stays out of the counts and of what `P` sends, and a review plugin's `post` leaves it alone. You can still edit or delete it, or make it yours with `set` and an empty `author` (`A` on its thread in the viewer), which makes it a draft. An agent's answer that the viewer writes ([viewer.md](viewer.md#asking-an-agent)) is one of these too, by the agent's name, and so is a reply MCP's `reply_to_thread` writes, by the client's.
+A comment without a `ref` whose `author` isn't empty, such as one an agent wrote, is never a draft: posting it would put it out under your name. A comment added through the [control API](control.md) is the client's, by the name its hello gives (`dffy ctl` for `dffy ctl`, `dffy mcp` for the MCP server's tools, `dffy ctl` too for a client that gives none), so it's one of these. In a review session it shows `local`, stays out of the counts and of what `P` sends, and a review plugin's `post` leaves it alone. You can still edit or delete it, or make it yours with `set` and an empty `author` (`A` on its thread in the viewer), which makes it a draft. An agent's answer that the viewer writes ([viewer.md](viewer.md#asking-an-agent)) is one of these too, by the agent's name, and so is a reply MCP's `reply_to_thread` writes, by the client's.
 
-A comment of yours with `local_only` is kept the same way: not a draft, `not posted`, left out of what `P` sends, until `set` with an empty `author` (`A` on its thread) clears it and makes it a draft. The viewer writes three kinds so ([viewer.md](viewer.md#asking-an-agent)): a comment you start with `@<name>` when it asks a local agent, which posted would mention whoever has that name on the host, or set off the host's own bot; your question to an agent on selected lines, or your follow-up to its answer, which posted without the answer would be a question to an agent out of context; and the note you write on selected lines for Fix with agent ([viewer.md](viewer.md#fixing-with-an-agent)), an instruction to your own agent.
+A comment of yours with `local_only` is kept the same way: not a draft, `local`, left out of what `P` sends, until `set` with an empty `author` (`A` on its thread) clears it and makes it a draft. The viewer writes three kinds so ([viewer.md](viewer.md#asking-an-agent)): a comment you start with `@<name>` when it asks a local agent, which posted would mention whoever has that name on the host, or set off the host's own bot; your question to an agent on selected lines, or your follow-up to its answer, which posted without the answer would be a question to an agent out of context; and the note you write on selected lines for Fix with agent ([viewer.md](viewer.md#fixing-with-an-agent)), an instruction to your own agent.
 
 A thread of yours the host deleted while it holds a draft reply of yours stays for the reply ([`gone`](#gone)), as a draft again, with `deleted on the host` in its `post_error`: posting it would start a new thread, so the post dialog warns of it, as of any draft the host refused, before it goes.
 
@@ -110,6 +110,7 @@ A comment:
 | `local_only` | `true` on a comment of yours that's never posted until you make it yours again, as one that asked a local agent with `@<name>`, a question or a follow-up to an agent, or a note for Fix with agent. See [Drafts](#drafts). Left out when false. |
 | `host_resolved` | Optional, on a posted thread's first comment: whether the host has the thread resolved, as an integration last saw it. A `resolved` that differs is a resolve or reopen not sent yet, which a review plugin's `post` sends; while it differs, an `upsert`'s `resolved` is ignored, so an import doesn't undo it. Left out for a thread the host doesn't resolve, or that no integration said of. |
 | `moved_from` | Optional: the `id` the comment had in the file it came from, when moving the local review's drafts to a review's file, or importing another file over an id this one uses, gave it a new one. A move or import run again after one cut short finds it by this and doesn't copy it twice. |
+| `applied` | Optional: when the comment's `suggestion` was applied to the working tree, RFC 3339. The viewer sets it ([viewer.md](viewer.md#applying-a-suggestion)), refuses to apply it again, and clears it when the `suggestion` changes. It's this file's alone: dffy never sends it to a review plugin, whose `post` leaves it be. |
 
 - `id`, `text`, `author`, `created` and `resolved` are always present, and so is `path` on every comment but a general one. dffy leaves out the other fields when they don't apply; a reader treats a field that's `null` as left out.
 - **Kinds of comment:**
@@ -218,7 +219,7 @@ src/lib.rs:12-14
 
 `dffy comments --session` reads the file the [session pointer](#the-session-pointer) names instead of the local one, without asking the host, so it shows what the review plugin last wrote. It can't be given with `--comments`, and fails when no session was opened in the repository.
 
-`dffy comments rm --resolved` removes the resolved threads the listing would show, each with its replies, under the file's lock, and prints how many comments went: the current branch's and those on no branch, or with `--branch <name>` that branch's and those on none, or with `--all-branches` every resolved thread. `--resolved` is required, so a bare `rm` removes nothing.
+`dffy comments rm --resolved` removes the resolved threads the listing would show, each with its replies, under the file's lock, and prints how many comments went: the current branch's and those on no branch, or with `--branch <name>` that branch's and those on none, or with `--all-branches` every resolved thread. `--resolved` is required, so a bare `rm` removes nothing. It removes posted threads too; the viewer's `clear_resolved` ([viewer.md](viewer.md#writing)) leaves those, as a review plugin's next update would bring them back.
 
 `comments` is a subcommand, so a revision named `comments` needs the explicit form: `dffy diff comments`.
 
@@ -287,11 +288,14 @@ A line comment needs `start`, `end` and an `anchor` with at least one line; `sta
 | Field | Sets |
 |---|---|
 | `text` | The text. Refused on a comment with a `ref`, unless the same `set` removes it: it's posted, and its text is the host's. |
-| `suggestion` | The suggestion; `null` removes it. Refused on a comment with a `ref`, as `text` is. |
+| `suggestion` | The suggestion; `null` removes it. Refused on a comment with a `ref`, as `text` is. It clears `applied`. |
 | `author` | Only `""`: the comment becomes yours, as when you adopt one an agent wrote, which makes it a [draft](#drafts) in a review session; it clears `local_only` too. Refused on a comment with a `ref`, as `text` is. |
 | `resolved` | Whether the thread is resolved; set it on the thread's first comment. |
 | `ref` | The `ref`, after posting the comment; `null` removes it. A comment that has a `ref` takes no other. |
 | `anchor` | The anchor, for a comment placed again on newer text. |
+| `start`, `end` | A line comment's lines, given together, as in [the file](#the-file-version-1): for a thread moved to other lines, with its `anchor`. |
+| `start_side` | The side of the first line; `null` removes it, for a range on `side` alone. |
+| `applied` | When its suggestion was applied; `null` removes it. |
 | `branch` | The thread's [branch](#branches), whichever of its comments the `set` names: it moves the whole thread there, or with `null` to no branch. |
 | `pending` | Whether it's on the host only for you. |
 | `post_error` | Why the host refused it; `null` removes it. |
@@ -334,6 +338,7 @@ An operation fails when:
 - it would give a `ref` to a second comment, or another `ref` to a comment that has one;
 - it sets `text`, `suggestion` or `author` on a comment with a `ref`, or `author` to anything but `""`;
 - it removes a general comment's `ref`;
+- it sets `start` without `end` or the other way, or sets lines on a comment that isn't a line comment;
 - the file is of a version dffy doesn't know, or isn't valid JSON.
 
 ## Importing: `dffy comments import`

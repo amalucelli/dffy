@@ -140,15 +140,16 @@ keybind = leader:z=toggle_wrap
 | `comment_file` | `C` |  | Comment on the whole file shown, in a text box under its first row; enter sends it |
 | `comments` | `i` |  | The left panel lists every comment thread in place of the files, or the files again; moving through the threads shows each in the diff, enter or tab goes to it; the thread keys act on the selected thread, but f, which filters |
 | `move_thread` | `V` |  | Move the focused thread, or the comments panel's selected one, from the branch it was written on to the current branch |
-| `ask_agent` | `a`; `a` on a thread | `a` | Ask a coding agent, through the agent plugin dffy-agent, about the focused thread, or when an agent's reply ends it, write your follow-up in a reply box, which enter sends to that agent; elsewhere, write the question on the selected lines, or the line v would start on, in a text box, and enter asks. The answer comes as the agent's reply, with a suggestion when it proposes a change; esc on the thread stops it. A comment you write starting @claude, @codex or @pi asks that agent too (experimental, see agent) |
+| `ask_agent` | `a`; `a` on a thread | `a` | Ask a coding agent, through the agent plugin dffy-agent, about the focused thread: write your question in a reply box, which enter sends with the thread to the agent that answered last, else the default one; enter on the empty box asks about the thread as it is, and esc saves the question without asking. Elsewhere, write the question on the selected lines, or the line v would start on, in a text box, and enter asks. The answer comes as the agent's reply, with a suggestion when it proposes a change; esc on the thread stops it. A comment you write starting @claude, @codex or @pi asks that agent too (experimental, see agent) |
 | `reply` | `r` on a thread |  | On a thread: reply in a text box under it; enter sends it |
 | `edit_draft` | `e` on a thread |  | On a thread: edit your last draft in it, in a text box; enter sends it |
-| `delete_draft` | `d` on a thread |  | On a thread: delete your last draft in it, the whole thread when that's its first comment, once the key comes again |
+| `delete_draft` | `d` on a thread |  | On a thread: delete your last draft in it, the whole thread when that's its first comment or the thread is resolved with nothing on the host, once the key comes again |
 | `resolve` | `x` on a thread |  | On a thread: resolve it, or reopen it |
 | `adopt` | `A` on a thread |  | On a thread: someone else's comments in it not posted, as an agent's, become your drafts, which posting sends under your name |
 | `apply_suggestion` | `s` on a thread |  | On a thread: put its suggestion, the one last clicked or else its last, in place of the lines it's on in the working tree, refused when they changed since; an unstaged change, which discard undoes |
 | `fix_with_agent` | `f` on a thread | `&` | On a thread, or the selected lines with a note you write first: start your coding agent (claude, codex, pi or amp) in a new tab, or here until it exits, pointed at the thread to change what it asks and reply in it |
 | `open_on_host` | `o` on a thread |  | On a thread: open it on its code host, in the browser |
+| `clear_resolved` |  | `-` | Delete the resolved threads shown, after a y/n; on a code host's review only what isn't posted, as the host's threads would come back |
 | `comment_in_editor` | `E` | `E` | Write in $EDITOR: your draft in the focused thread, else a reply to it, else a comment on the line; ctrl+g does it from the text box |
 | `review_pull` | `p` |  | On a review a review plugin opened, fetch its new commits and threads and show them in place (experimental, see review) |
 | `review_post` | `P` |  | On a review a review plugin opened, open the dialog that posts your drafts, replies and resolves as a review (experimental, see review) |
@@ -178,10 +179,10 @@ While a comment thread is focused in the diff, or selected in the comments panel
 
 | Keys | Action | Description |
 |---|---|---|
-| `a` | `ask_agent` | Ask a coding agent, through the agent plugin dffy-agent, about the focused thread, or when an agent's reply ends it, write your follow-up in a reply box, which enter sends to that agent; elsewhere, write the question on the selected lines, or the line v would start on, in a text box, and enter asks. The answer comes as the agent's reply, with a suggestion when it proposes a change; esc on the thread stops it. A comment you write starting @claude, @codex or @pi asks that agent too (experimental, see agent) |
+| `a` | `ask_agent` | Ask a coding agent, through the agent plugin dffy-agent, about the focused thread: write your question in a reply box, which enter sends with the thread to the agent that answered last, else the default one; enter on the empty box asks about the thread as it is, and esc saves the question without asking. Elsewhere, write the question on the selected lines, or the line v would start on, in a text box, and enter asks. The answer comes as the agent's reply, with a suggestion when it proposes a change; esc on the thread stops it. A comment you write starting @claude, @codex or @pi asks that agent too (experimental, see agent) |
 | `r` | `reply` | On a thread: reply in a text box under it; enter sends it |
 | `e` | `edit_draft` | On a thread: edit your last draft in it, in a text box; enter sends it |
-| `d` | `delete_draft` | On a thread: delete your last draft in it, the whole thread when that's its first comment, once the key comes again |
+| `d` | `delete_draft` | On a thread: delete your last draft in it, the whole thread when that's its first comment or the thread is resolved with nothing on the host, once the key comes again |
 | `x` | `resolve` | On a thread: resolve it, or reopen it |
 | `A` | `adopt` | On a thread: someone else's comments in it not posted, as an agent's, become your drafts, which posting sends under your name |
 | `s` | `apply_suggestion` | On a thread: put its suggestion, the one last clicked or else its last, in place of the lines it's on in the working tree, refused when they changed since; an unstaged change, which discard undoes |
@@ -240,6 +241,7 @@ While the file at the cursor has conflicts to resolve, these keys come after a t
 | `E` | Continue in editor | `comment_in_editor` |
 | `a` | Ask agent | `ask_agent` |
 | `&` | Fix with agent | `fix_with_agent` |
+| `-` | Delete resolved threads… | `clear_resolved` |
 | `.` | Open terminal here | `open_terminal` |
 | `S` | Suggest change | `suggest_change` |
 | `O` | Open review… | `open_review` |

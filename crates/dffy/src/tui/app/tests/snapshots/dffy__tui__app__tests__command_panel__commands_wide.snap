@@ -28,7 +28,7 @@ expression: panel_markup(&mut app)
 <dim>│</>                                     <dim>│</>  <dim>│</>     Status bar <dim>‹</> bottom <dim>›</>                        B   <dim>┃│</>                                         <dim>┃</>
 <dim>│</>                                     <dim>│</>  <dim>│</>     Theme <dim>‹</> default <dim>›</>                            ~   <dim>┃│</>                                         <dim>┃</>
 <dim>│</>                                     <dim>│</>  <dim>│</>                                                      <dim>┃│</>                                         <dim>┃</>
-<dim>│</>                                     <dim>│</>  <dim>│</> Copy                                                 <dim>┃│</>                                         <dim>┃</>
+<dim>│</>                                     <dim>│</>  <dim>│</> Copy                                                 <dim>││</>                                         <dim>┃</>
 <dim>│</>                                     <dim>│</>  <dim>│</>     Copy selection                               y   <dim>││</>                                         <dim>┃</>
 <dim>│</>                                     <dim>│</>  <dim>│</>     Copy file path                               Y   <dim>││</>                                         <dim>┃</>
 <dim>│</>                                     <dim>│</>  <dim>│</>     Copy as prompt                               "   <dim>││</>                                         <dim>┃</>

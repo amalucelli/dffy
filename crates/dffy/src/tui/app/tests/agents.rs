@@ -31,15 +31,33 @@ fn agent_said(app: &mut App, id: u64, said: Said) {
     app.event(Event::Agent { id, said });
 }
 
-/// `a` on a thread asks the default agent with the thread as a prompt,
-/// says what it's doing in the status bar, and its answer shows as its
-/// reply in the thread, with its suggestion.
+/// `a` on the thread with the focus, then `enter` on the empty box: asks
+/// about the thread as it is.
+fn ask(app: &mut App) {
+    key(app, 'a');
+    press(app, Key::Enter);
+}
+
+/// `a` on a thread opens a reply box for a question, saying what each
+/// key does; `enter` on it empty asks the default agent with the thread
+/// as a prompt, says what it's doing in the status bar, and its answer
+/// shows as its reply in the thread, with its suggestion.
 #[test]
 fn a_on_a_thread_asks_and_the_answer_is_the_agents_reply() {
     let dir = tempfile::tempdir().expect("tempdir");
     let (mut app, path) = commented(&dir);
     app.follow_thread("d1");
     key(&mut app, 'a');
+    assert!(app.doc.writing().is_some(), "a box for the question");
+    app.resize(160, 20);
+    let shown = status(&mut app);
+    assert!(
+        shown.contains("enter asks the agent · empty asks about the thread · esc saves, unasked"),
+        "{shown}"
+    );
+    assert_eq!(asked(&mut app, ""), (vec![], vec![]), "nothing asked yet");
+    press(&mut app, Key::Enter);
+    assert_eq!(read_comments(&path).comments.len(), 7, "nothing saved");
     assert_eq!(asked(&mut app, "Why two?"), (vec![(1, None, true)], vec![]));
     assert!(status(&mut app).contains("asking… · esc stops it"));
     agent_said(&mut app, 1, Said::Asking(claude()));
@@ -78,6 +96,78 @@ fn a_on_a_thread_asks_and_the_answer_is_the_agents_reply() {
     );
 }
 
+/// On a thread from the host, `a` takes a question first: written and
+/// sent, it's your reply, kept local, and the ask answers it with the
+/// thread; left with `esc`, it's kept the same way and asks nothing; an
+/// empty box left with `esc` saves and asks nothing.
+#[test]
+fn a_on_a_host_thread_takes_a_question_first() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (mut app, path) = commented(&dir);
+    let prepare = app.start_review("test".to_owned(), session(&dir, HEAD, None));
+    said(&mut app, prepare, plugin::review::Said::Done(Ok(())));
+    app.reviewing.job = None;
+    let last = || read_comments(&path).comments.into_iter().last();
+
+    app.follow_thread("p1");
+    key(&mut app, 'a');
+    assert!(app.doc.writing().is_some(), "a box for the question");
+    typed(&mut app, "Is fifty right?");
+    press(&mut app, Key::Enter);
+    let [(agent, prompt)] = prompts(&mut app).try_into().expect("one ask");
+    assert_eq!(agent, None, "the default agent");
+    assert!(
+        prompt.contains("Fifty?") && prompt.contains("Is fifty right?"),
+        "{prompt}"
+    );
+    assert!(last().is_some_and(|c| {
+        c.local_only && c.in_reply_to.as_deref() == Some("p1") && c.text == "Is fifty right?"
+    }));
+    agent_said(&mut app, 1, answer("Yes."));
+
+    app.follow_thread("p1");
+    key(&mut app, 'a');
+    typed(&mut app, "Later.");
+    press(&mut app, Key::Esc);
+    assert_eq!(prompts(&mut app), [], "esc asks nothing");
+    assert!(last().is_some_and(|c| c.local_only && c.text == "Later."));
+
+    let saved = read_comments(&path).comments.len();
+    app.follow_thread("p1");
+    key(&mut app, 'a');
+    press(&mut app, Key::Esc);
+    assert_eq!(prompts(&mut app), []);
+    assert_eq!(read_comments(&path).comments.len(), saved);
+
+    // Quitting from the box asks nothing either.
+    app.follow_thread("p1");
+    key(&mut app, 'a');
+    let quit = app.event(Event::Input(Input::Key(Key::Char('c'), Mods::CTRL)));
+    assert_eq!((quit, prompts(&mut app)), (Some(Action::Quit), vec![]));
+}
+
+/// On a thread the diff doesn't show, selected in the comments panel, `a`
+/// takes the question in the editor; what it leaves empty asks about the
+/// thread, as the box does.
+#[test]
+fn a_on_a_thread_off_the_diff_asks_from_the_editor() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (mut app, path) = commented(&dir);
+    key(&mut app, 'i');
+    while app.target_thread().is_none_or(|t| t.root != "g1") {
+        key(&mut app, 'j');
+    }
+    assert_eq!(
+        press(&mut app, Key::Char('a')),
+        Some(Action::Compose(String::new()))
+    );
+    app.composed(Some(String::new()));
+    let [(agent, prompt)] = prompts(&mut app).try_into().expect("one ask");
+    assert_eq!(agent, None);
+    assert!(prompt.contains("Gone"), "{prompt}");
+    assert_eq!(read_comments(&path).comments.len(), 7, "nothing saved");
+}
+
 /// Asks `a` left for the plugin, as their agent and prompt.
 fn prompts(app: &mut App) -> Vec<(Option<String>, String)> {
     let (asks, _) = app.take_agent_work();
@@ -103,8 +193,8 @@ fn listed(app: &mut App) {
 }
 
 /// A reply that isn't an agent's answer, as an MCP client's, ends a thread
-/// before the plugin listed its agents: `a` asks about the thread rather
-/// than opening a follow-up to it.
+/// before the plugin listed its agents: `a` asks the default agent, not
+/// that reply's author.
 #[test]
 fn a_follows_up_only_on_a_listed_agents_answer() {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -120,8 +210,7 @@ fn a_follows_up_only_on_a_listed_agents_answer() {
     review::apply(&path, vec![client]).expect("applies");
     app.event(Event::Comments);
     app.follow_thread("d1");
-    key(&mut app, 'a');
-    assert!(app.doc.writing().is_none(), "no follow-up box");
+    ask(&mut app);
     assert_eq!(
         asked(&mut app, "Changed it."),
         (vec![(1, None, true)], vec![])
@@ -136,7 +225,7 @@ fn a_after_an_answer_follows_up_with_the_same_agent() {
     let dir = tempfile::tempdir().expect("tempdir");
     let (mut app, path) = commented(&dir);
     app.follow_thread("d1");
-    key(&mut app, 'a');
+    ask(&mut app);
     prompts(&mut app);
     listed(&mut app);
     agent_said(&mut app, 1, Said::Asking(claude()));
@@ -188,7 +277,7 @@ fn an_answer_during_a_post_lands_after_it() {
     app.start_review("test".to_owned(), session(&dir, HEAD, None));
     app.reviewing.job = None;
     app.follow_thread("d1");
-    key(&mut app, 'a');
+    ask(&mut app);
     prompts(&mut app);
     listed(&mut app);
     agent_said(&mut app, 1, Said::Asking(claude()));
@@ -219,7 +308,7 @@ fn a_mention_in_a_follow_up_switches_the_agent() {
     let dir = tempfile::tempdir().expect("tempdir");
     let (mut app, _path) = commented(&dir);
     app.follow_thread("d1");
-    key(&mut app, 'a');
+    ask(&mut app);
     prompts(&mut app);
     let codex = Agent {
         name: "codex".to_owned(),
@@ -245,7 +334,7 @@ fn esc_stops_an_ask() {
     let dir = tempfile::tempdir().expect("tempdir");
     let (mut app, path) = commented(&dir);
     app.follow_thread("d1");
-    key(&mut app, 'a');
+    ask(&mut app);
     asked(&mut app, "");
     agent_said(&mut app, 1, Said::Asking(claude()));
     esc(&mut app);
@@ -263,11 +352,11 @@ fn esc_stops_an_ask() {
     assert_eq!(read_comments(&path).comments.len(), 7);
 
     // Stopped before it went, it's never asked.
-    key(&mut app, 'a');
+    ask(&mut app);
     esc(&mut app);
     assert_eq!(asked(&mut app, ""), (vec![], vec![2]));
 
-    key(&mut app, 'a');
+    ask(&mut app);
     asked(&mut app, "");
     app.doc.set_focus(None);
     app.message = None;
@@ -305,7 +394,7 @@ fn a_suggestion_applies_only_from_the_viewer_while_an_ask_runs() {
         (action, answer.try_recv().ok())
     };
     app.follow_thread("d1");
-    key(&mut app, 'a');
+    ask(&mut app);
     asked(&mut app, "");
     let (action, answer) = control_apply(&mut app);
     assert!(action.is_none());
@@ -317,7 +406,8 @@ fn a_suggestion_applies_only_from_the_viewer_while_an_ask_runs() {
     app.follow_thread("d1");
     let applied = press(&mut app, Key::Char('s'));
     assert!(matches!(applied, Some(Action::ApplySuggestion(_))));
-    app.event(Event::Applied(Ok(1..2)));
+    // Not applied after all, so it's still to apply.
+    app.event(Event::Applied(Err("its lines changed".to_owned())));
 
     esc(&mut app);
     let (action, _) = control_apply(&mut app);
@@ -340,7 +430,7 @@ fn a_on_a_selection_asks_the_question_written() {
     assert!(status(&mut app).contains("your question for the agent · enter asks"));
     assert_eq!(asked(&mut app, ""), (vec![], vec![]));
     typed(&mut app, "Is this safe?");
-    press(&mut app, Key::Esc);
+    press(&mut app, Key::Enter);
     let saved = read_comments(&path);
     assert_eq!(saved.comments.len(), 1);
     assert!(saved.comments[0].local_only, "a question to an agent");
@@ -365,7 +455,7 @@ fn a_on_a_selection_asks_the_question_written() {
     key(&mut app, 'a');
     assert!(app.commands.is_none() && app.doc.writing().is_some());
     typed(&mut app, "And these?");
-    press(&mut app, Key::Esc);
+    press(&mut app, Key::Enter);
     assert_eq!(read_comments(&path).comments.len(), 3);
     assert_eq!(
         asked(&mut app, "And these?"),
@@ -404,7 +494,7 @@ fn a_mention_you_write_asks_that_agent() {
 }
 
 /// A mention that asked an agent stays out of what `P` posts: it shows
-/// `not posted`, until `A` on its thread makes it a draft.
+/// `local`, until `A` on its thread makes it a draft.
 #[test]
 fn a_mention_that_asked_is_never_posted() {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -420,7 +510,7 @@ fn a_mention_that_asked_is_never_posted() {
     asked(&mut app, "");
     agent_said(&mut app, 1, Said::Asking(claude()));
     let shown = screen(&mut app);
-    assert!(shown.contains("you · just now · not posted"), "{shown}");
+    assert!(shown.contains("you · just now · local"), "{shown}");
     assert_eq!(app.sending(true).comments, drafts);
     app.follow_thread("d1");
     key(&mut app, 'A');
@@ -440,7 +530,7 @@ fn a_follow_up_to_an_agent_is_never_posted() {
     said(&mut app, prepare, plugin::review::Said::Done(Ok(())));
     app.reviewing.job = None;
     app.follow_thread("d1");
-    key(&mut app, 'a');
+    ask(&mut app);
     prompts(&mut app);
     listed(&mut app);
     agent_said(&mut app, 1, Said::Asking(claude()));
@@ -484,7 +574,7 @@ fn a_reply_in_a_thread_kept_local_is_never_posted() {
     let last = read_comments(&path).comments.into_iter().last();
     assert!(last.is_some_and(|c| c.text == "And its tests?" && !c.local_only));
     assert_eq!(app.sending(true).comments, drafts);
-    assert!(screen(&mut app).contains("you · just now · not posted"));
+    assert!(screen(&mut app).contains("you · just now · local"));
     key(&mut app, 'A');
     assert_eq!(app.sending(true).comments, drafts + 2);
 }

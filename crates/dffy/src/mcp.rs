@@ -16,6 +16,7 @@
 //! listed or diffed, so a cursor from another request, or from before the
 //! diff changed, is refused instead of continuing at the wrong place.
 
+use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::io::{self, BufRead, Write};
@@ -193,10 +194,11 @@ const TOOLS: &str = r#"[
       "notice": {"type": ["string", "null"], "description": "A note from the integration that keeps the comments, such as that they're stale."},
       "comments": {"type": "array", "items": {"type": "object"}, "description": "Comments as the comments file holds them (docs/comments.md)."},
       "placed": {"type": "object", "additionalProperties": {"type": "object", "properties": {"side": {"type": "string"}, "start": {"type": ["integer", "null"]}, "end": {"type": ["integer", "null"]}, "lost": {"type": "boolean"}}}, "description": "Where the line threads starting on this page are in range's diff, by first comment id; empty without range or placed."},
+      "standing": {"type": "object", "additionalProperties": {"type": "string", "enum": ["posted", "draft", "local"]}, "description": "With session, where each comment on this page lives, by id: posted on the host, a draft of yours that posting sends, or local, kept here; empty without session."},
       "total_comments": {"type": "integer"},
       "next_cursor": {"type": ["string", "null"]}
     },
-    "required": ["notice", "comments", "placed", "total_comments", "next_cursor"]
+    "required": ["notice", "comments", "placed", "standing", "total_comments", "next_cursor"]
   },
   "annotations": {"readOnlyHint": true, "idempotentHint": true, "openWorldHint": false}
 },
@@ -1257,7 +1259,7 @@ impl Server<'_> {
                 .collect::<Vec<_>>())
         })
         .map_err(message)?;
-        let placed: std::collections::HashMap<String, At> = placed.into_iter().flatten().collect();
+        let placed: HashMap<String, At> = placed.into_iter().flatten().collect();
         Ok((roots.iter())
             .filter_map(|c| Some((c.id.clone(), placed.get(&c.id)?.clone())))
             .collect())
@@ -1350,6 +1352,22 @@ impl Server<'_> {
         }
         structured.push_str(r#"],"placed":"#);
         placed_object(&placed, page, &mut structured);
+        structured.push_str(r#","standing":{"#);
+        if session {
+            let by_id: HashMap<&str, &review::Comment> =
+                (file.comments.iter()).map(|c| (c.id.as_str(), c)).collect();
+            for (i, comment) in page.iter().enumerate() {
+                let root = (comment.in_reply_to.as_deref()).and_then(|r| by_id.get(r).copied());
+                let standing = review::model::standing(comment, root, true);
+                if i > 0 {
+                    structured.push(',');
+                }
+                string(&mut structured, &comment.id);
+                structured.push(':');
+                string(&mut structured, standing.name().unwrap_or_default());
+            }
+        }
+        structured.push('}');
         let _ = write!(
             structured,
             r#","total_comments":{},"next_cursor":"#,

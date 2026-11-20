@@ -150,8 +150,10 @@ Each filter judges a thread by its first comment, so a thread is in or out whole
 The result:
 
 ```json
-{"notice":null,"comments":[{"id":"9f3c2a71b04e5d18","path":"src/lib.rs","side":"new",…},…],"placed":{"9f3c2a71b04e5d18":{"side":"new","start":15,"end":17,"lost":false}},"total_comments":14,"next_cursor":null}
+{"notice":null,"comments":[{"id":"9f3c2a71b04e5d18","path":"src/lib.rs","side":"new",…},…],"placed":{"9f3c2a71b04e5d18":{"side":"new","start":15,"end":17,"lost":false}},"standing":{},"total_comments":14,"next_cursor":null}
 ```
+
+- **`standing`:** with `session`, where each comment on this page lives, by its `id`: `posted` on the host (it has a `ref`), `draft` for yours that posting sends, `local` for one kept here, such as an agent's answer or a question to an agent ([comments.md](comments.md#drafts)). Empty without `session`, as nothing in the local review's file is posted. Kept apart from `comments`, whose objects are as the file holds them.
 
 - **`placed`:** where each line thread starting on this page is in `range`'s diff, by its first comment's `id`, as an annotation of `dffy --json --show-comments` gives it ([json.md](json.md#annotations)): the side and 1-based lines its anchor finds now, or `lost: true` with null lines when its lines are gone. A thread whose file the diff doesn't change, a comment on a whole file and a reply have no entry. It's filled only with `range`, or with `placed: true` on the uncommitted changes; otherwise it's empty and nothing is diffed. It costs a diff per file on the page with line threads: only the threads' files are listed and diffed. It's empty outside a repository, and with `placed: true` when the uncommitted changes can't be diffed, as without a worktree; a `range` given that can't be diffed is an error. It's kept apart from `comments`, whose objects are as the file holds them.
 - **`comments`:** each comment as the file holds it ([comments.md](comments.md#the-file-version-1)), unknown fields included, in thread order: a thread's first comment, then its replies in the order they were added. [General comments](comments.md#general-comments), which have no `path`, come first; then threads by path and first line, file comments first. With `path`, general comments are left out. A page may end inside a thread; the next page continues it.
@@ -199,7 +201,7 @@ The result:
 {"id":"e2a05d7c1f9b4836","thread":"9f3c2a71b04e5d18","author":"claude-code"}
 ```
 
-- **Author:** the client's name, as its `initialize` gives it in `clientInfo`, without control characters, up to 64 characters; `dffy mcp` when it gives none, as a client of the 2026-07-28 revision, which has no `initialize`, and when the name is `you`, as your own comments show. Never yours: on a review from a code host the reply shows `not posted`, and `P` leaves it until `A` on its thread makes it yours ([comments.md](comments.md#drafts)).
+- **Author:** the client's name, as its `initialize` gives it in `clientInfo`, without control characters, up to 64 characters; `dffy mcp` when it gives none, as a client of the 2026-07-28 revision, which has no `initialize`, and when the name is `you`, as your own comments show. Never yours: on a review from a code host the reply shows `local`, and `P` leaves it until `A` on its thread makes it yours ([comments.md](comments.md#drafts)).
 - **Never an ask:** a reply starting `@claude` asks no agent, as nothing but a comment typed in the viewer does.
 - An id no comment has is a tool error that says so; nothing is written.
 

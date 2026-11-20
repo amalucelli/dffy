@@ -82,14 +82,15 @@ impl Repo {
     }
 
     /// Puts the `replacement` lines in place of those `find` picks from the
-    /// working-tree file of `shown`, as git reads it, and returns them.
+    /// working-tree file of `shown`, as git reads it, and returns them with
+    /// the file as git reads it after.
     pub(crate) fn replace_lines(
         &self,
         shown: &FileDiff,
         new_side: NewSide,
         find: impl FnOnce(&Text) -> Result<Range<usize>>,
         replacement: &[&str],
-    ) -> Result<Range<usize>> {
+    ) -> Result<(Range<usize>, Text)> {
         check_suggestion(shown, new_side)?;
         let path = shown.change.path.as_bstr();
         let read = self.worktree_path(path).and_then(|full| {
@@ -129,7 +130,8 @@ impl Repo {
         let bytes = splice(&raw, lines.clone(), replacement);
         worktree::replace(&full, &bytes, permissions)
             .map_err(|source| Error::Io { path: full, source })?;
-        Ok(lines)
+        let after = Text::new(splice(&converted, lines.clone(), replacement));
+        Ok((lines, after))
     }
 }
 

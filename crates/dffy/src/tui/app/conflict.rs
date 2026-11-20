@@ -10,7 +10,7 @@ use dffy_core::conflict::{Choice, Region};
 use dffy_core::document::Pos;
 use dffy_core::git::Status;
 
-use super::{Action, App, escape, menu};
+use super::{Action, App, Confirmed, escape, menu};
 use crate::keys::Action as Act;
 use crate::review::session::plural;
 
@@ -240,7 +240,7 @@ impl App {
             return Some(action);
         }
         self.message = None;
-        self.confirm = Some((prompt, action, "nothing written"));
+        self.confirm = Some((prompt, Confirmed::Run(action), "nothing written"));
         None
     }
 
@@ -274,7 +274,7 @@ impl App {
         self.message = None;
         self.confirm = Some((
             format!("wrote {shown}; git add it to mark it resolved? y/n"),
-            Action::GitAdd(path),
+            Confirmed::Run(Action::GitAdd(path)),
             "not added; git add marks it resolved",
         ));
     }

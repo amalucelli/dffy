@@ -920,10 +920,10 @@ fn refused_drafts_say_why_and_the_post_says_how_it_went() {
             path,
             vec![Op::Set {
                 target: Target::Id("d1".to_owned()),
-                change: Change {
+                change: Box::new(Change {
                     post_error: Some(Some(why.to_owned())),
                     ..Change::default()
-                },
+                }),
             }],
         )
         .expect("applies");

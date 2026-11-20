@@ -139,6 +139,9 @@ pub(crate) struct Comment {
     /// id is another's here: a move or import cut short and run again
     /// finds it by this instead of copying it twice.
     pub moved_from: Option<String>,
+    /// When its suggestion was applied to the working tree, RFC 3339. Kept
+    /// here only: never sent to a host.
+    pub applied: Option<String>,
     /// Fields dffy doesn't know, in file order, written back as read: on a
     /// comment from a host, the integration's own.
     pub extra: Fields,
@@ -181,6 +184,11 @@ pub(crate) struct Change {
     pub branch: Option<Option<String>>,
     pub pending: Option<bool>,
     pub post_error: Option<Option<String>>,
+    /// A line comment's lines, `start` and `end` given together.
+    pub start: Option<LineNumbers>,
+    pub end: Option<LineNumbers>,
+    pub start_side: Option<Option<Side>>,
+    pub applied: Option<Option<String>>,
 }
 
 /// One of `dffy comments apply`'s operations.
@@ -195,7 +203,7 @@ pub(crate) enum Op {
     },
     Set {
         target: Target,
-        change: Change,
+        change: Box<Change>,
     },
     /// The comment's fields as given, a `ref` among them. They're merged
     /// into the comment with that ref field by field, so imports work on
@@ -899,7 +907,7 @@ impl Review {
             Op::Add { comment, reply_to } => self
                 .insert(*comment, reply_to.as_ref(), now, places)
                 .map(Some),
-            Op::Set { target, change } => self.set(&target, change, places).map(Some),
+            Op::Set { target, change } => self.set(&target, *change, places).map(Some),
             Op::Upsert { fields, reply_to } => {
                 if fields.iter().any(|(k, _)| k == "id") {
                     return Err("dffy assigns the id".to_owned());
@@ -1033,6 +1041,13 @@ impl Review {
         if change.reference == Some(None) && named.path.is_empty() && named.in_reply_to.is_none() {
             return Err("a general comment keeps its ref".to_owned());
         }
+        let moves = change.start.is_some() || change.end.is_some() || change.start_side.is_some();
+        if moves && named.end.is_none() {
+            return Err("only a line comment has lines to move".to_owned());
+        }
+        if change.start.is_some() != change.end.is_some() {
+            return Err("`start` and `end` are set together".to_owned());
+        }
         if let Some(branch) = change.branch {
             let named = &self.comments[i];
             let root = named.in_reply_to.as_ref().unwrap_or(&named.id).clone();
@@ -1071,6 +1086,15 @@ impl Review {
         }
         if let Some(suggestion) = change.suggestion {
             comment.suggestion = suggestion;
+            comment.applied = None;
+        }
+        if let Some(applied) = change.applied {
+            comment.applied = applied;
+        }
+        comment.start = change.start.or(comment.start);
+        comment.end = change.end.or(comment.end);
+        if let Some(start_side) = change.start_side {
+            comment.start_side = start_side;
         }
         if let Some(author) = change.author {
             comment.author = author;
@@ -1359,6 +1383,7 @@ impl Comment {
                 "branch" => c.branch = string(&key, value)?,
                 "post_error" => c.post_error = string(&key, value)?,
                 "moved_from" => c.moved_from = string(&key, value)?,
+                "applied" => c.applied = string(&key, value)?,
                 "host_resolved" => {
                     c.host_resolved = match value {
                         Value::Null => None,
@@ -1457,6 +1482,7 @@ impl Comment {
         );
         put(&mut f, "host_resolved", self.host_resolved.map(Value::Bool));
         put(&mut f, "moved_from", self.moved_from.as_deref().map(text));
+        put(&mut f, "applied", self.applied.as_deref().map(text));
         f.extend(self.extra.iter().cloned());
         f
     }
@@ -1594,7 +1620,7 @@ fn parse_op(item: Value, branch: Option<&str>) -> Result<Op, String> {
         }
         Some("set") => Ok(Op::Set {
             target: target(take(&mut fields, "id"), take(&mut fields, "ref"))?,
-            change: change(take(&mut fields, "fields"))?,
+            change: Box::new(change(take(&mut fields, "fields"))?),
         }),
         Some("upsert") => {
             let (fields, reply_to) = comment_fields(take(&mut fields, "comment"))?;
@@ -1680,10 +1706,16 @@ fn change(value: Option<Value>) -> Result<Change, String> {
             "branch" => change.branch = Some(string(&key, value)?),
             "pending" => change.pending = flag(&key, value)?,
             "post_error" => change.post_error = Some(string(&key, value)?),
+            "start" => {
+                change.start = Some(line_numbers(&key, &value)?.ok_or("`start` can't be null")?);
+            }
+            "end" => change.end = Some(line_numbers(&key, &value)?.ok_or("`end` can't be null")?),
+            "start_side" => change.start_side = Some(side(&key, value)?),
+            "applied" => change.applied = Some(string(&key, value)?),
             _ => {
                 return Err(format!(
                     "`{key}` can't be set; set changes text, resolved, ref, anchor, author, \
-                     suggestion, branch, pending and post_error"
+                     suggestion, branch, pending, post_error, start, end, start_side and applied"
                 ));
             }
         }
@@ -1845,7 +1877,7 @@ fn fence(text: &str, min: usize) -> String {
 }
 
 /// `t` in RFC 3339, UTC, to the second.
-fn timestamp(t: SystemTime) -> String {
+pub(crate) fn timestamp(t: SystemTime) -> String {
     let secs = t.duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs());
     let (days, rem) = (secs / 86_400, secs % 86_400);
     // Howard Hinnant's civil_from_days, for days on or after 1970.

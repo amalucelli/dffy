@@ -11,7 +11,7 @@ use std::os::unix::fs::PermissionsExt as _;
 use std::path::Path;
 use std::process::Command;
 
-use dffy_core::annotation::{Anchor, apply_suggestion, check_suggestion};
+use dffy_core::annotation::{Anchor, Applied, apply_suggestion, check_suggestion};
 use dffy_core::diff::{LineKind, Options};
 use dffy_core::git::{Error, FileDiff, NewSide, Repo, Revisions};
 
@@ -99,7 +99,7 @@ fn on(diff: &FileDiff, lines: Range<usize>) -> (usize, Anchor) {
 
 /// Refused, and nothing written: the file is as it was and no temporary
 /// file is left beside it.
-fn refused(dir: &Path, path: &str, result: Result<Range<usize>, Error>, before: &[u8]) -> String {
+fn refused(dir: &Path, path: &str, result: Result<Applied, Error>, before: &[u8]) -> String {
     let why = match result {
         Err(e @ Error::Refused(_)) => e.to_string(),
         other => panic!("not refused: {other:?}"),
@@ -164,7 +164,17 @@ fn a_suggestion_replaces_its_lines_in_the_working_tree_only() {
         &["five", "six", "more"],
     )
     .expect("applies");
-    assert_eq!(placed, 4..6);
+    let lines = |l: &[&str]| l.iter().map(|&s| s.to_owned()).collect::<Vec<_>>();
+    assert_eq!((placed.replaced, placed.lines), (4..6, 4..7));
+    assert_eq!(
+        placed.anchor,
+        Some(Anchor {
+            before: lines(&["3", "4"]),
+            lines: lines(&["five", "six", "more"]),
+            after: lines(&["7", "8"]),
+        }),
+        "the new lines, in the file as written"
+    );
     assert_eq!(
         String::from_utf8(read(d, "f.txt")).expect("utf-8"),
         "1\ntwo\n3\n4\nfive\nsix\nmore\n7\n8\n9\n10\n"
@@ -173,7 +183,6 @@ fn a_suggestion_replaces_its_lines_in_the_working_tree_only() {
     assert_eq!(leftovers(d), Vec::<String>::new());
 
     let (_, after) = shown(d, View::Unstaged, "f.txt");
-    let lines = |l: &[&str]| l.iter().map(|&s| s.to_owned()).collect::<Vec<_>>();
     assert_eq!(
         changed(&after),
         (lines(&["5", "6"]), lines(&["five", "six", "more"]))
@@ -192,7 +201,7 @@ fn a_suggestion_follows_its_lines_when_they_moved() {
     write(d, "f.txt", &format!("new\nnewer\n{edited}"));
     let placed =
         apply_suggestion(&repo, &diff, NewSide::AsShown, at, &anchor, &["five"]).expect("applies");
-    assert_eq!(placed, 6..7);
+    assert_eq!((placed.replaced, placed.lines), (6..7, 6..7));
     assert_eq!(
         String::from_utf8(read(d, "f.txt")).expect("utf-8"),
         format!("new\nnewer\n{}", edited.replace("5\n", "five\n"))
@@ -259,7 +268,7 @@ fn crlf_line_endings_are_kept() {
     let (repo, diff) = shown(d, View::Plain, "f.txt");
     assert_eq!(diff.new.bytes(), b"a\nB\nc\n");
     let (at, anchor) = on(&diff, 1..2);
-    apply_suggestion(
+    let applied = apply_suggestion(
         &repo,
         &diff,
         NewSide::AsShown,
@@ -269,6 +278,15 @@ fn crlf_line_endings_are_kept() {
     )
     .expect("applies");
     assert_eq!(read(d, "f.txt"), b"a\r\nbee\r\nbuzz\r\nc\r\n");
+    assert_eq!(
+        applied.anchor.map(|a| (a.before, a.lines, a.after)),
+        Some((
+            vec!["a".to_owned()],
+            vec!["bee".to_owned(), "buzz".to_owned()],
+            vec!["c".to_owned()]
+        )),
+        "as git reads the file, the diff's text"
+    );
 }
 
 /// A file without a newline at the end keeps it that way, whether its last
@@ -284,8 +302,14 @@ fn a_missing_newline_at_the_end_stays_missing() {
 
     let (repo, diff) = shown(d, View::Plain, "f.txt");
     let (at, anchor) = on(&diff, 1..3);
-    apply_suggestion(&repo, &diff, NewSide::AsShown, at, &anchor, &[]).expect("applies");
+    let deleted =
+        apply_suggestion(&repo, &diff, NewSide::AsShown, at, &anchor, &[]).expect("applies");
     assert_eq!(read(d, "f.txt"), b"a");
+    assert_eq!(
+        (deleted.lines, deleted.anchor),
+        (1..1, None),
+        "no lines left to anchor"
+    );
 }
 
 #[test]

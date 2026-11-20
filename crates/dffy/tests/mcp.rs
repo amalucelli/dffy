@@ -769,7 +769,9 @@ fn list_comments_filters_by_branch_and_state() {
     write(
         d,
         ".git/review/7.json",
-        r#"{"version":1,"comments":[{"id":"p1","path":"lib.rs","text":"Posted.","author":"octocat","created":"t1","resolved":false,"ref":"github:1"}]}"#,
+        r#"{"version":1,"comments":[{"id":"p1","path":"lib.rs","text":"Posted.","author":"octocat","created":"t1","resolved":false,"ref":"github:1"},
+{"id":"p2","path":"lib.rs","text":"Mine.","author":"","created":"t2","in_reply_to":"p1","resolved":false},
+{"id":"p3","path":"lib.rs","text":"An answer.","author":"claude","created":"t3","in_reply_to":"p1","resolved":false}]}"#,
     );
     write(
         d,
@@ -780,7 +782,23 @@ fn list_comments_filters_by_branch_and_state() {
         ),
     );
     let session = server.call("list_comments", r#"{"session":true}"#);
-    assert_eq!(ids(&session), ["p1"]);
+    assert_eq!(ids(&session), ["p1", "p2", "p3"]);
+    let standing = |call: &Call, id: &str| {
+        (call.structured().get("standing"))
+            .and_then(|s| s.get(id))
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+    };
+    assert_eq!(
+        ["p1", "p2", "p3"].map(|id| standing(&session, id)),
+        [
+            Some("posted".to_owned()),
+            Some("draft".to_owned()),
+            Some("local".to_owned())
+        ],
+        "where each lives in a review session"
+    );
+    assert_eq!(standing(&here, "m1"), None, "nothing is posted from here");
 }
 
 /// The local review's file of the fixture: a thread with a reply on an
@@ -872,7 +890,7 @@ fn list_comments_places_threads_on_the_range() {
     let placed = |call: &Call| {
         let raw = call.raw_structured();
         let start = raw.find(r#""placed":"#).expect("placed") + 9;
-        let end = raw.find(r#","total_comments""#).expect("total_comments");
+        let end = raw.find(r#","standing""#).expect("standing");
         raw[start..end].to_owned()
     };
     let uncommitted = server.call("list_comments", r#"{"placed":true}"#);
@@ -1121,7 +1139,9 @@ fn a_reply_is_by_the_clients_printable_name_never_yours() {
 }
 
 /// `apply_suggestion` has the viewer put a thread's suggestion in the
-/// working tree, saying where; a thread without one says so.
+/// working tree, saying where. The thread moves to the lines it put there,
+/// placed rather than lost, and its suggestion is marked applied, which a
+/// second apply refuses.
 #[test]
 fn apply_suggestion_writes_the_working_tree_through_the_viewer() {
     let repo = repo();
@@ -1151,7 +1171,26 @@ fn apply_suggestion_writes_the_working_tree_through_the_viewer() {
         text,
         long_file(|i| i == 3).replace("line 10\n", "line ten\n")
     );
+    let listed = server.call("list_comments", r#"{"placed":true}"#);
+    let listed = listed.structured();
+    let s1 = (listed.get("comments").and_then(Value::as_array))
+        .and_then(|c| c.first())
+        .expect("s1");
+    assert!(s1.get("applied").and_then(Value::as_str).is_some());
+    assert_eq!(
+        (s1.get("anchor").and_then(|a| a.get("lines")))
+            .and_then(Value::as_array)
+            .and_then(|l| l.first())
+            .and_then(Value::as_str),
+        Some("line ten")
+    );
+    let placed = (listed.get("placed").and_then(|p| p.get("s1"))).expect("placed");
+    let number = |key: &str| placed.get(key).and_then(Value::as_usize);
+    assert_eq!(
+        (number("start"), number("end"), placed.get("lost")),
+        (Some(10), Some(10), Some(&Value::Bool(false)))
+    );
     let again = server.call("apply_suggestion", r#"{"id":"s1"}"#);
-    assert!(again.is_error(), "its lines changed: {}", again.line);
-    assert!(again.text().contains("changed since"), "{}", again.text());
+    assert!(again.is_error(), "{}", again.line);
+    assert!(again.text().contains("applied already"), "{}", again.text());
 }

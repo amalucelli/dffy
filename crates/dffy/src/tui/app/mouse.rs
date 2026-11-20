@@ -267,7 +267,7 @@ impl App {
             key("Reply", Act::Reply),
             key(&self.ask_label(), Act::AskAgent),
         ];
-        if thread.comments.iter().any(|n| n.suggestion.is_some()) {
+        if thread.suggests() {
             entries.push(key("Apply suggestion", Act::ApplySuggestion));
         }
         entries.push(key("Fix with agent", Act::FixWithAgent));

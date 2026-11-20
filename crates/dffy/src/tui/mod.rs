@@ -26,7 +26,6 @@ pub(crate) mod worker;
 use std::collections::HashMap;
 use std::ffi::OsString;
 use std::io::{self, Write};
-use std::ops::Range;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::process::CommandExt;
@@ -138,9 +137,10 @@ pub(crate) enum Event {
         dir: PathBuf,
         opened: Result<String, String>,
     },
-    /// A suggestion went in place of these lines of its file, 0-based as
-    /// they were, or why not.
-    Applied(Result<Range<usize>, String>),
+    /// A suggestion went in place of lines of its file, or why not. Its
+    /// anchor is left out when the diff shown doesn't have the new lines:
+    /// HEAD's version of the file, which the write didn't change.
+    Applied(Result<dffy_core::annotation::Applied, String>),
     /// The coding agent a thread was handed to started, as the note says,
     /// or why not.
     HandedOff(Result<String, String>),
@@ -174,7 +174,7 @@ fn checked_out(repo: &Repo, checkout: Option<&Checkout>) -> Result<(), String> {
 /// Puts `s` in place of its lines in the working tree, once HEAD is its
 /// review's head when it has one. A review, or a range ending at HEAD,
 /// shows HEAD's version of the file, which the working tree was made from.
-fn apply(repo: &Repo, s: &Suggestion) -> Result<Range<usize>, String> {
+fn apply(repo: &Repo, s: &Suggestion) -> Result<dffy_core::annotation::Applied, String> {
     checked_out(repo, s.checkout.as_ref())?;
     let change = &s.diff.change;
     let at_head = match change.new {
@@ -191,8 +191,13 @@ fn apply(repo: &Repo, s: &Suggestion) -> Result<Range<usize>, String> {
         NewSide::AsShown
     };
     let lines: Vec<&str> = s.lines.iter().map(String::as_str).collect();
-    dffy_core::annotation::apply_suggestion(repo, &s.diff, new_side, s.at, &s.anchor, &lines)
-        .map_err(|e| e.to_string())
+    let mut applied =
+        dffy_core::annotation::apply_suggestion(repo, &s.diff, new_side, s.at, &s.anchor, &lines)
+            .map_err(|e| e.to_string())?;
+    if at_head {
+        applied.anchor = None;
+    }
+    Ok(applied)
 }
 
 /// The theme the TUI draws with: attributes only when color is off, since
@@ -1993,7 +1998,15 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&file).expect("read"), "a\nb\nc\n");
 
         git(&["checkout", "-q", &head]);
-        assert_eq!(apply(&repo, &suggestion(&head)), Ok(1..2));
+        assert_eq!(
+            apply(&repo, &suggestion(&head)),
+            Ok(dffy_core::annotation::Applied {
+                replaced: 1..2,
+                lines: 1..2,
+                anchor: None,
+            }),
+            "the review's diff shows its head, which keeps the old lines"
+        );
         assert_eq!(std::fs::read_to_string(&file).expect("read"), "a\nbee\nc\n");
     }
 
@@ -2068,7 +2081,11 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&file).expect("read"), "a\nX\nC\n");
 
         std::fs::write(&file, "a\nB\nC\nd\n").expect("write");
-        assert_eq!(apply(&repo, &on_head), Ok(1..2));
+        assert_eq!(
+            apply(&repo, &on_head).map(|a| (a.replaced, a.anchor)),
+            Ok((1..2, None)),
+            "the diff shows HEAD's version, which keeps the old lines"
+        );
         assert_eq!(
             std::fs::read_to_string(&file).expect("read"),
             "a\nbee\nC\nd\n"

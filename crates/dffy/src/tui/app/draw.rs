@@ -568,13 +568,18 @@ pub(super) fn note(app: &mut App) -> Option<String> {
         .cloned()
         .or_else(|| {
             if app.doc.writing().is_some() {
-                let send = match app.on_save {
-                    OnSave::Ask => format!("enter asks {}", app.asks_whom()),
-                    _ => "enter sends".to_owned(),
-                };
-                return Some(format!(
-                    "{send} · shift+enter new line · ctrl+g continues in $EDITOR"
-                ));
+                // A question's keys only, as the box's others may not fit.
+                return Some(match (app.on_save, &app.composing) {
+                    (OnSave::Ask, Some(super::Compose::Reply(_))) => format!(
+                        "enter asks {} · empty asks about the thread · esc saves, unasked",
+                        app.asks_whom()
+                    ),
+                    (OnSave::Ask, _) => {
+                        format!("enter asks {} · esc saves, unasked", app.asks_whom())
+                    }
+                    _ => "enter sends · shift+enter new line · ctrl+g continues in $EDITOR"
+                        .to_owned(),
+                });
             }
             let panel = app.panel.as_ref().filter(|_| app.pane == Pane::Tree);
             let thread = match panel {
@@ -601,11 +606,7 @@ pub(super) fn note(app: &mut App) -> Option<String> {
                 (Act::Resolve, resolve, true),
                 (Act::OpenOnHost, "open", thread.url.is_some()),
                 (Act::Adopt, "make it yours", thread.unposted()),
-                (
-                    Act::ApplySuggestion,
-                    "apply",
-                    thread.comments.iter().any(|n| n.suggestion.is_some()),
-                ),
+                (Act::ApplySuggestion, "apply", thread.suggests()),
             ];
             let mut keys: Vec<String> = (thread_keys.into_iter())
                 .filter(|&(.., shown)| shown)

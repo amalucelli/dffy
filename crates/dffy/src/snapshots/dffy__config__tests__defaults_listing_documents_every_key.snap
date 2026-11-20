@@ -370,7 +370,7 @@ expression: text
 <dim># move_thread: move the focused thread, or the comments panel's selected one, from the branch it was written on to the current branch</>
 <hint>keybind</><dim> = </>V=move_thread
 
-<dim># ask_agent: ask a coding agent, through the agent plugin dffy-agent, about the focused thread, or when an agent's reply ends it, write your follow-up in a reply box, which enter sends to that agent; elsewhere, write the question on the selected lines, or the line v would start on, in a text box, and enter asks. The answer comes as the agent's reply, with a suggestion when it proposes a change; esc on the thread stops it. A comment you write starting @claude, @codex or @pi asks that agent too (experimental, see agent)</>
+<dim># ask_agent: ask a coding agent, through the agent plugin dffy-agent, about the focused thread: write your question in a reply box, which enter sends with the thread to the agent that answered last, else the default one; enter on the empty box asks about the thread as it is, and esc saves the question without asking. Elsewhere, write the question on the selected lines, or the line v would start on, in a text box, and enter asks. The answer comes as the agent's reply, with a suggestion when it proposes a change; esc on the thread stops it. A comment you write starting @claude, @codex or @pi asks that agent too (experimental, see agent)</>
 <hint>keybind</><dim> = </>a=ask_agent
 <hint>keybind</><dim> = </>thread:a=ask_agent
 <hint>keybind</><dim> = </>leader:a=ask_agent
@@ -381,7 +381,7 @@ expression: text
 <dim># edit_draft: on a thread: edit your last draft in it, in a text box; enter sends it</>
 <hint>keybind</><dim> = </>thread:e=edit_draft
 
-<dim># delete_draft: on a thread: delete your last draft in it, the whole thread when that's its first comment, once the key comes again</>
+<dim># delete_draft: on a thread: delete your last draft in it, the whole thread when that's its first comment or the thread is resolved with nothing on the host, once the key comes again</>
 <hint>keybind</><dim> = </>thread:d=delete_draft
 
 <dim># resolve: on a thread: resolve it, or reopen it</>
@@ -399,6 +399,9 @@ expression: text
 
 <dim># open_on_host: on a thread: open it on its code host, in the browser</>
 <hint>keybind</><dim> = </>thread:o=open_on_host
+
+<dim># clear_resolved: delete the resolved threads shown, after a y/n; on a code host's review only what isn't posted, as the host's threads would come back</>
+<hint>keybind</><dim> = </>leader:-=clear_resolved
 
 <dim># comment_in_editor: write in $EDITOR: your draft in the focused thread, else a reply to it, else a comment on the line; ctrl+g does it from the text box</>
 <hint>keybind</><dim> = </>E=comment_in_editor

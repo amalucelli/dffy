@@ -1211,6 +1211,7 @@ fn thread_comment(id: &str, author: &str, at: &str, text: &str, draft: bool) -> 
         },
         pending: false,
         posting: None,
+        applied: false,
     }
 }
 

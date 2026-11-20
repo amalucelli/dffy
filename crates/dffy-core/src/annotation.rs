@@ -122,9 +122,22 @@ pub fn check_suggestion(shown: &FileDiff, new_side: NewSide) -> git::Result<()> 
     git::check_suggestion(shown, new_side)
 }
 
+/// What [`apply_suggestion`] wrote, in 0-based lines of the file as git
+/// reads it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Applied {
+    /// Where the anchored lines were, before the write.
+    pub replaced: Range<usize>,
+    /// Where the replacement is, after it: empty where lines were deleted.
+    pub lines: Range<usize>,
+    /// `lines` anchored in the file as written, to hold on to them; `None`
+    /// when they're empty.
+    pub anchor: Option<Anchor>,
+}
+
 /// Puts `replacement`'s lines in place of the lines `anchor` holds, in the
 /// working-tree file that `shown` is a diff of, and returns where they
-/// were: 0-based lines of the file before the write.
+/// were and where the new ones are.
 ///
 /// `new_side` says whether `shown`'s new side may be a commit's tree: with
 /// [`NewSide::Head`], the caller checked it's HEAD's version of the file
@@ -162,7 +175,7 @@ pub fn apply_suggestion(
     at: usize,
     anchor: &Anchor,
     replacement: &[&str],
-) -> git::Result<Range<usize>> {
+) -> git::Result<Applied> {
     let find = |text: &Text| {
         anchor.find(text, at).map_err(|missing| {
             git::Error::Refused(
@@ -179,7 +192,13 @@ pub fn apply_suggestion(
             )
         })
     };
-    repo.replace_lines(shown, new_side, find, replacement)
+    let (replaced, after) = repo.replace_lines(shown, new_side, find, replacement)?;
+    let lines = replaced.start..replaced.start + replacement.len();
+    Ok(Applied {
+        anchor: (!lines.is_empty()).then(|| Anchor::new(&after, lines.clone())),
+        replaced,
+        lines,
+    })
 }
 
 fn matches_at(text: &Text, at: usize, lines: &[String]) -> bool {

@@ -334,6 +334,25 @@ impl Frame<'_> {
         self.body::<Role>(&[]);
     }
 
+    /// A suggested change: the commented `lines` it replaces, then its own.
+    /// Once applied, the thread's lines are its own, so only those show,
+    /// dimmed.
+    fn suggestion(&mut self, lines: &[String], suggestion: &str, applied: bool) {
+        if applied {
+            self.body(&[(Role::Dim, "suggested change, applied:")]);
+            for line in suggestion.lines() {
+                self.body(&[(Role::Dim, "  "), (Role::Dim, &plain(line))]);
+            }
+            return;
+        }
+        self.body(&[(Role::Dim, "suggested change:")]);
+        let old = lines.iter().map(|l| (Role::Removed, "- ", l.as_str()));
+        let new = suggestion.lines().map(|l| (Role::Added, "+ ", l));
+        for (role, sign, text) in old.chain(new) {
+            self.body(&[(role, sign), (role, &plain(text))]);
+        }
+    }
+
     /// The text box's wrapped rows, its cursor a bar in the text.
     fn text_box(&mut self, text: &mut TextBox) {
         // A column for the cursor.
@@ -351,20 +370,25 @@ impl Frame<'_> {
     }
 }
 
-/// What a comment's heading says of where it stands, when that's news: a
-/// comment shows posted by its link, and outside a review session nothing
-/// is posted.
+/// The model's word for where a comment lives, in the role it's drawn in.
 fn standing_tag(standing: Standing) -> Option<(Role, &'static str)> {
-    match standing {
-        Standing::Draft => Some((Role::Warn, "draft")),
-        Standing::Unposted => Some((Role::Dim, "not posted")),
-        Standing::Posted | Standing::Kept => None,
-    }
+    let role = if standing == Standing::Draft {
+        Role::Warn
+    } else {
+        Role::Dim
+    };
+    standing.word().map(|word| (role, word))
+}
+
+/// The model's word for where a thread's first comment lives, on its row
+/// in the comments panel, where the gutter's mark says a draft.
+fn row_word(standing: Standing) -> Option<&'static str> {
+    standing.word().filter(|_| standing != Standing::Draft)
 }
 
 /// The words after a comment's author: its label, as an agent's mark,
-/// where it stands, what posting it does, and whether it's on the host for
-/// you only.
+/// where it lives, what posting it does, whether it's on the host for you
+/// only, and whether its suggestion is applied.
 fn comment_tags(comment: &ThreadComment) -> impl Iterator<Item = (Role, Cow<'_, str>)> {
     (comment.label.as_deref())
         .map(|label| (Role::Dim, Cow::Owned(escape(label.as_bytes()))))
@@ -379,6 +403,11 @@ fn comment_tags(comment: &ThreadComment) -> impl Iterator<Item = (Role, Cow<'_, 
                 .pending
                 .then_some((Role::Hint, Cow::Borrowed("pending"))),
         )
+        .chain(
+            comment
+                .applied
+                .then_some((Role::Dim, Cow::Borrowed("applied"))),
+        )
 }
 
 /// The words after a thread's first author: its state, then where it is
@@ -386,8 +415,11 @@ fn comment_tags(comment: &ThreadComment) -> impl Iterator<Item = (Role, Cow<'_, 
 fn tags<'a>(thread: &'a Thread, first: &'a ThreadComment) -> Vec<(Role, Cow<'a, str>)> {
     let mut out: Vec<(Role, Cow<'a, str>)> = comment_tags(first).collect();
     let mut tag = |role: Role, tag: &'a str| out.push((role, Cow::Borrowed(tag)));
+    if !first.applied && thread.comments.iter().any(|c| c.applied) {
+        tag(Role::Dim, "applied");
+    }
     if thread.local {
-        tag(Role::Hint, "local");
+        tag(Role::Hint, "local file");
     }
     if thread.resolved {
         tag(Role::Dim, "resolved");
@@ -528,15 +560,7 @@ pub(crate) fn thread_rows(
             text: from..frame.c.len() - top,
         });
         if let Some(suggestion) = &comment.suggestion {
-            frame.body(&[(Role::Dim, "suggested change:")]);
-            let old = thread
-                .lines
-                .iter()
-                .map(|l| (Role::Removed, "- ", l.as_str()));
-            let new = suggestion.lines().map(|l| (Role::Added, "+ ", l));
-            for (role, sign, text) in old.chain(new) {
-                frame.body(&[(role, sign), (role, &plain(text))]);
-            }
+            frame.suggestion(&thread.lines, suggestion, comment.applied);
         }
     }
     if let Some(writing) = writing.filter(|w| matches!(w.at, Writes::Reply(_))) {
@@ -901,8 +925,8 @@ fn list_row(c: &mut Canvas, (list, keys): (&Listing, &Keys), row: &Row, width: u
                 (thread.at == At::Lost && !list.files[item.group].absent)
                     .then_some((moved, "moved")),
                 branch.as_deref().map(|b| (ink(Role::Hint), b)),
-                thread.local.then_some((ink(Role::Hint), "local")),
-                (first.standing == Standing::Unposted).then_some((ink(Role::Dim), "not posted")),
+                thread.local.then_some((ink(Role::Hint), "local file")),
+                row_word(first.standing).map(|word| (ink(Role::Dim), word)),
                 kind.map(|k| (ink(Role::Dim), k)),
                 label.as_deref().map(|l| (ink(Role::Hint), l)),
             ];

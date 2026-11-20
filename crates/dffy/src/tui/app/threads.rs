@@ -6,15 +6,15 @@ use std::fmt::Write as _;
 use std::ops::{ControlFlow, Range};
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Instant, SystemTime};
 
-use dffy_core::annotation::AnnotationSet;
+use dffy_core::annotation::{self, AnnotationSet};
 use dffy_core::bstr::BString;
 use dffy_core::document::{Side, Source, State};
 
 use super::{
-    Action, App, Applying, Checkout, Handoff, OnSave, POSTING, Pane, STILL_EDITING, Seek,
-    Suggestion, WHEEL_ROWS, Watch,
+    Action, App, Applying, Checkout, Confirmed, Handoff, OnSave, POSTING, Pane, STILL_EDITING,
+    Seek, Suggestion, WHEEL_ROWS, Watch,
 };
 use crate::control::Fault;
 use crate::control::viewer::Reply;
@@ -378,13 +378,17 @@ impl App {
         let retry = at.map(|at| (compose.clone(), at));
         // Kept local like a mention: posted, a question or a note to an
         // agent is out of context.
-        let to_agent = matches!(after, OnSave::Ask | OnSave::Fix);
+        let to_agent = matches!(after, OnSave::Ask | OnSave::Keep | OnSave::Fix);
         let Some((mut op, note)) = compose.into_op(text) else {
-            self.message(if edit {
-                "nothing changed; nothing saved"
-            } else {
-                "nothing written; nothing saved"
-            });
+            match (&root, after) {
+                // Sent empty, a question's reply asks about the thread as it is.
+                (Some(root), OnSave::Ask) if !edit => {
+                    let answered = self.answered_by(root);
+                    self.ask_about((root, None), (answered, None));
+                }
+                _ if edit => self.message("nothing changed; nothing saved"),
+                _ => self.message("nothing written; nothing saved"),
+            }
             return true;
         };
         if let Op::Add { comment, .. } = &mut op
@@ -402,10 +406,10 @@ impl App {
             self.sync_threads();
             if let Some(root) = root.as_deref() {
                 match (mention, after) {
+                    (_, OnSave::Keep) | (None, OnSave::Nothing) => {}
                     (Some(agent), _) => self.ask_about((root, None), (Some(agent), written)),
                     (None, OnSave::Ask) => self.ask_about((root, None), (answered, None)),
                     (None, OnSave::Fix) => self.fix(root),
-                    (None, OnSave::Nothing) => {}
                 }
             }
             // A thread on new lines shows once the pool placed it.
@@ -446,8 +450,9 @@ impl App {
     }
 
     /// Input while the text box is open: every key edits it but `enter`,
-    /// which sends it (saves it, and asks when it's for an agent), `esc`,
-    /// which saves it too (an empty text discards it, and so does a second
+    /// which sends it (saves it, and asks when it's for an agent; empty, a
+    /// question's reply asks about the thread), `esc`, which saves it
+    /// without asking (an empty text discards it, and so does a second
     /// `esc` after a save failed), `ctrl+g`, which hands it to the editor,
     /// and `ctrl+c`, which saves it and quits. The wheel still scrolls.
     pub(super) fn writing_input(&mut self, input: Input) -> Option<Action> {
@@ -460,7 +465,8 @@ impl App {
                 self.on_save = OnSave::Nothing;
                 self.message("discarded");
             }
-            Input::Key(Key::Esc, _) | Input::Key(Key::Enter, Mods::NONE) => self.close_box(),
+            Input::Key(Key::Esc, _) => self.close_box(),
+            Input::Key(Key::Enter, Mods::NONE) => self.send_box(),
             Input::Key(Key::Char('c'), mods) if ctrl(mods) => {
                 self.close_box();
                 return Some(Action::Quit);
@@ -487,8 +493,18 @@ impl App {
         None
     }
 
-    /// Closes the text box, saving its text.
+    /// Closes the text box, saving its text. Only `enter` sends a question
+    /// ([`App::send_box`]): closed any other way, it's kept, local only, and
+    /// asks nothing.
     pub(super) fn close_box(&mut self) {
+        if self.on_save == OnSave::Ask {
+            self.on_save = OnSave::Keep;
+        }
+        self.send_box();
+    }
+
+    /// Closes the text box, saving its text and doing what saving it does.
+    fn send_box(&mut self) {
         let Some(writing) = self.doc.stop_writing() else {
             return;
         };
@@ -496,7 +512,9 @@ impl App {
             return;
         };
         let text = writing.text.text().to_owned();
-        if text.trim().is_empty() && !matches!(compose, Compose::Edit { .. }) {
+        // An empty question's reply goes on to ask about the thread.
+        let asks = matches!(compose, Compose::Reply(_)) && self.on_save == OnSave::Ask;
+        if text.trim().is_empty() && !matches!(compose, Compose::Edit { .. }) && !asks {
             self.on_save = OnSave::Nothing;
             self.message("empty; nothing saved");
             return;
@@ -757,6 +775,12 @@ impl App {
     pub(super) fn thread_act(&mut self, action: Act, deleting: bool) -> Result<Option<Action>, ()> {
         let thread = self.target_thread().ok_or(())?;
         let draft = thread.comments.iter().rev().find(|n| !n.posted());
+        // A resolved thread with nothing on the host goes whole.
+        let deletes = if thread.resolved && thread.comments.iter().all(|n| !n.posted()) {
+            thread.comments.first()
+        } else {
+            draft
+        };
         let general = matches!(thread.at, model::At::Conversation { .. });
         let mut done = None;
         match action {
@@ -774,7 +798,8 @@ impl App {
                     None => read_only.to_owned(),
                 });
             }
-            Act::AskAgent if self.answered_by(&thread.root).is_some() => {
+            // The box takes a question first; one ask a thread at a time.
+            Act::AskAgent if !self.asking.asking(&thread.root) => {
                 let root = thread.root.clone();
                 done = self.write_in(
                     &thread.root,
@@ -841,12 +866,12 @@ impl App {
                 };
                 let op = Op::Set {
                     target: Target::Id(thread.root.clone()),
-                    change,
+                    change: Box::new(change),
                 };
                 self.write_comments(vec![op], note).ok();
             }
             Act::Adopt if thread.unposted() => self.adopt(&thread),
-            Act::DeleteDraft => match draft {
+            Act::DeleteDraft => match deletes {
                 None => self.message("no draft here to delete; posted comments are the host's"),
                 Some(comment) if deleting => {
                     let gone = if comment.id == thread.root {
@@ -1022,6 +1047,9 @@ impl App {
             .filter(has)
             .or_else(|| thread.iter().rev().find(has))
             .ok_or("this thread has no suggestion to apply")?;
+        if picked.applied.is_some() {
+            return Err("this suggestion is applied already".to_owned());
+        }
         let first = thread.first().copied();
         let (Some(anchor), Some((side, written))) = (
             first.and_then(|c| c.anchor.clone()),
@@ -1067,38 +1095,80 @@ impl App {
         })
     }
 
-    /// What came of the suggestion the loop applied: said, and answered to
-    /// the control API when it asked.
-    pub(crate) fn applied(&mut self, result: Result<Range<usize>, String>) {
+    /// What came of the suggestion the loop applied: the comment marked
+    /// applied and its thread moved to the new lines when the diff shows
+    /// them, said, and answered to the control API when it asked.
+    pub(crate) fn applied(&mut self, result: Result<annotation::Applied, String>) {
         self.editing = false;
         let Some(applying) = self.applying.take() else {
             return;
         };
-        let lines = |r: &Range<usize>| match r.len() {
-            0 | 1 => format!("{}:{}", applying.path, r.start + 1),
-            _ => format!("{}:{}-{}", applying.path, r.start + 1, r.end),
-        };
-        let said = result.as_ref().map(|replaced| {
-            if applying.lines == 0 {
-                format!("deleted {}, as suggested", lines(replaced))
-            } else {
-                format!("applied the suggestion to {}", lines(replaced))
-            }
-        });
-        match said {
-            Ok(note) => self.message(escape(note.as_bytes())),
+        match &result {
+            Ok(applied) => self.mark_applied(&applying, applied),
             Err(why) => self.failed(why.to_owned()),
         }
         if let Some(reply) = applying.reply {
             reply.send(match result {
-                Ok(replaced) => Ok(crate::control::viewer::applied(
+                Ok(applied) => Ok(crate::control::viewer::applied(
                     (applying.thread, applying.comment),
                     applying.path,
-                    replaced,
+                    applied.replaced,
                     applying.lines,
                 )),
                 Err(why) => Err(Fault::new("failed", why)),
             });
+        }
+    }
+
+    /// Marks `applying`'s comment applied and moves its thread to the lines
+    /// `applied` put there, when it has them anchored, saying so. The thread
+    /// stays open: resolving it is the user's.
+    fn mark_applied(&mut self, applying: &Applying, applied: &annotation::Applied) {
+        let lines = |r: &Range<usize>| match r.len() {
+            0 | 1 => format!("{}:{}", applying.path, r.start + 1),
+            _ => format!("{}:{}-{}", applying.path, r.start + 1, r.end),
+        };
+        let mut note = if applying.lines == 0 {
+            format!("deleted {}, as suggested", lines(&applied.replaced))
+        } else {
+            format!("applied the suggestion to {}", lines(&applied.lines))
+        };
+        let open = (self.comments.as_ref()).and_then(|c| {
+            c.thread(&applying.thread)
+                .first()
+                .map(|root| !root.resolved)
+        });
+        if open == Some(true)
+            && let Some(key) = self.thread_key_name(Act::Resolve)
+        {
+            let _ = write!(note, " · {key} resolves");
+        }
+        let mut ops = vec![Op::Set {
+            target: Target::Id(applying.comment.clone()),
+            change: Box::new(Change {
+                applied: Some(Some(crate::review::timestamp(SystemTime::now()))),
+                ..Change::default()
+            }),
+        }];
+        if let Some(anchor) = &applied.anchor {
+            let at = |line: usize| crate::review::LineNumbers {
+                old: None,
+                new: Some(line),
+            };
+            ops.push(Op::Set {
+                target: Target::Id(applying.thread.clone()),
+                change: Box::new(Change {
+                    anchor: Some(anchor.clone()),
+                    start: Some(at(applied.lines.start)),
+                    end: Some(at(applied.lines.end - 1)),
+                    start_side: Some(None),
+                    ..Change::default()
+                }),
+            });
+        }
+        let note = escape(note.as_bytes());
+        if let Err(why) = self.write_comments(ops, &note) {
+            self.message(format!("{note}, but it isn't marked applied: {why}"));
         }
     }
 
@@ -1172,6 +1242,38 @@ impl App {
         Some(self.thread_prompt(root, &at)?.map(|(made, _)| made))
     }
 
+    /// `clear_resolved`: asks before deleting the resolved threads shown,
+    /// naming what goes ([`Comments::clear_resolved`] has which).
+    pub(super) fn clear_resolved(&mut self) {
+        let Some(comments) = &self.comments else {
+            self.message("no comments file here");
+            return;
+        };
+        if self.writes_held() {
+            self.message(POSTING);
+            return;
+        }
+        let cleared = comments.clear_resolved();
+        if cleared.threads + cleared.comments == 0 {
+            self.message(with_kept("no resolved threads to delete", &cleared));
+            return;
+        }
+        self.message = None;
+        let prompt = format!("delete {}? y/n", cleared_words(&cleared));
+        self.confirm = Some((prompt, Confirmed::Clear(cleared), "kept"));
+    }
+
+    /// Deletes what [`App::clear_resolved`] asked about, in one write per
+    /// file it's in.
+    pub(super) fn cleared(&mut self, cleared: model::Cleared) {
+        let note = with_kept(&format!("deleted {}", cleared_words(&cleared)), &cleared);
+        for ops in cleared.ops.into_iter().filter(|ops| !ops.is_empty()) {
+            if self.write_comments(ops, &note).is_err() {
+                return;
+            }
+        }
+    }
+
     /// `A`: someone else's comments in `thread`, an agent's, become yours:
     /// drafts that posting sends under your name.
     fn adopt(&mut self, thread: &model::Thread) {
@@ -1179,10 +1281,10 @@ impl App {
             .filter(|n| n.standing == model::Standing::Unposted)
             .map(|n| Op::Set {
                 target: Target::Id(n.id.clone()),
-                change: Change {
+                change: Box::new(Change {
                     author: Some(String::new()),
                     ..Change::default()
-                },
+                }),
             })
             .collect();
         let note = format!("now yours: {}", session::plural(ops.len(), "draft"));
@@ -1202,10 +1304,10 @@ impl App {
         }
         let op = Op::Set {
             target: Target::Id(thread.root),
-            change: Change {
+            change: Box::new(Change {
                 branch: Some(self.branch.clone()),
                 ..Change::default()
-            },
+            }),
         };
         let note = match &self.branch {
             Some(branch) => format!("moved to {}", escape(branch.as_bytes())),
@@ -1472,4 +1574,30 @@ impl App {
         }
         Some(self.comments.as_ref()?.annotations().clone())
     }
+}
+
+/// What clearing the resolved threads removes: `3 resolved threads and 1
+/// local comment in host threads`.
+fn cleared_words(cleared: &model::Cleared) -> String {
+    let threads =
+        (cleared.threads > 0).then(|| session::plural(cleared.threads, "resolved thread"));
+    let comments = (cleared.comments > 0).then(|| {
+        format!(
+            "{} in host threads",
+            session::plural(cleared.comments, "local comment")
+        )
+    });
+    threads
+        .into_iter()
+        .chain(comments)
+        .collect::<Vec<_>>()
+        .join(" and ")
+}
+
+/// `said`, and why the host's resolved threads stay when there are some.
+fn with_kept(said: &str, cleared: &model::Cleared) -> String {
+    if cleared.kept == 0 {
+        return said.to_owned();
+    }
+    format!("{said} · host threads stay; resolve hides them")
 }

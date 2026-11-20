@@ -192,6 +192,14 @@ pub(crate) struct Suggestion {
     pub comment: String,
 }
 
+/// What `y` to a question in the status bar does.
+enum Confirmed {
+    /// The loop runs it.
+    Run(Action),
+    /// Delete what clearing the resolved threads found when it asked.
+    Clear(model::Cleared),
+}
+
 /// A suggestion being applied: what's said of it once it is, and the
 /// control API's request waiting on it.
 struct Applying {
@@ -230,6 +238,9 @@ pub(crate) enum OnSave {
     #[default]
     Nothing,
     Ask,
+    /// A question's box left with `esc`: kept local only, as a question to
+    /// an agent is, without asking.
+    Keep,
     Fix,
 }
 
@@ -544,7 +555,7 @@ pub(crate) struct App {
     uncommitted: Option<Uncommitted>,
     /// A question in the status bar waiting for `y`, what `y` does, and
     /// what's said when any other input drops it.
-    confirm: Option<(String, Action, &'static str)>,
+    confirm: Option<(String, Confirmed, &'static str)>,
     /// A git operation on the working tree or the index went to the loop
     /// and hasn't said how it went: one runs at a time, so two quick
     /// presses can't race on the same lines.
@@ -1704,12 +1715,18 @@ impl App {
 
     /// The input after a question in the status bar: `y` does what it
     /// asked about, and anything else keeps things as they are.
-    fn answer(&mut self, input: &Input, action: Action, declined: &str) -> Option<Action> {
-        if *input == Input::Key(Key::Char('y'), Mods::NONE) {
-            return Some(action);
+    fn answer(&mut self, input: &Input, then: Confirmed, declined: &str) -> Option<Action> {
+        if *input != Input::Key(Key::Char('y'), Mods::NONE) {
+            self.message(declined);
+            return None;
         }
-        self.message(declined);
-        None
+        match then {
+            Confirmed::Run(action) => Some(action),
+            Confirmed::Clear(cleared) => {
+                self.cleared(cleared);
+                None
+            }
+        }
     }
 
     #[expect(
@@ -2184,6 +2201,7 @@ impl App {
                     Err(()) => {}
                 }
             }
+            Act::ClearResolved => self.clear_resolved(),
             Act::ReviewPull => return self.update_review(),
             Act::ReviewPost => return self.open_post(),
             Act::OpenReview => return self.open_review_picker(),

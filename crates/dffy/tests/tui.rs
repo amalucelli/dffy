@@ -4491,7 +4491,7 @@ impl Agents {
     }
 
     /// The viewer on `repo`, a comment written on its first line and
-    /// focused, then `a` asking about it.
+    /// focused, then `a` and `enter` on the empty box asking about it.
     fn ask(&self, repo: &Path) -> Term {
         let path = format!("{}:/usr/bin:/bin", self.bin.path().display());
         let stub = self.stub.path().to_str().expect("utf-8 path");
@@ -4502,6 +4502,8 @@ impl Agents {
         term.send("\x1b");
         term.wait_for("the thread", |t| t.contains("you · just now"));
         term.send("a");
+        term.wait_for("the question's box", |t| t.status().contains("enter asks"));
+        term.send("\r");
         term
     }
 
@@ -4537,6 +4539,39 @@ fn gone(pids: &[String]) {
         Command::new("kill").args(["-9", pid]).status().ok();
     }
     assert!(left.is_empty(), "still running: {left:?}");
+}
+
+/// `s` puts a suggestion in the working tree; the list is read again, and
+/// its thread moves to the line the suggestion put there, shown applied
+/// rather than lost.
+#[test]
+fn an_applied_suggestions_thread_stays_on_its_new_lines() {
+    let repo = repo();
+    let mut term = Term::spawn(repo.path(), 120, 30, &[]);
+    term.wait_for("the diffs", |t| t.contains("More."));
+    term.send("S");
+    term.wait_for("the box", |t| t.contains("```suggestion"));
+    // Past the two blank lines and the fence, to the end of the suggested
+    // line.
+    term.send("\x1b[B\x1b[B\x1b[B\x1b[F!");
+    term.send("\x1b");
+    term.wait_for("the thread", |t| t.contains("+ # demo!"));
+    term.send("s");
+    term.wait_for("the apply", |t| {
+        t.status()
+            .contains("applied the suggestion to README.md:1 · x resolves")
+    });
+    term.wait_for("the list read again", |t| t.contains("README.md · +3 -1"));
+    term.wait_for("the thread on its new line", |t| {
+        t.contains("you · just now · applied") && t.contains("suggested change, applied:")
+    });
+    assert!(!term.contains("not found"));
+    assert_eq!(
+        std::fs::read_to_string(repo.path().join("README.md")).expect("read"),
+        "# demo!\n\nMore.\n"
+    );
+    term.send("q");
+    assert!(term.wait_exit().success());
 }
 
 /// `a` on a thread asks Claude Code through dffy-agent, which runs it able
@@ -4716,6 +4751,8 @@ fn only_your_mention_asks_and_the_agents_are_asked_each_run() {
     term.wait_for("the threads", |t| t.contains("More."));
     term.send("m");
     term.send("a");
+    term.wait_for("the question's box", |t| t.status().contains("enter asks"));
+    term.send("\r");
     term.wait_for("the answer", |t| t.contains("codex · just now"));
     assert!(calls().contains("ask {\"agent\":\"codex\","), "{}", calls());
     term.send("q");

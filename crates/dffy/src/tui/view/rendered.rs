@@ -1342,6 +1342,7 @@ mod tests {
             standing: crate::review::model::Standing::Kept,
             pending: false,
             posting: None,
+            applied: false,
         };
         let thread = crate::review::model::Thread {
             root: "f".to_owned(),

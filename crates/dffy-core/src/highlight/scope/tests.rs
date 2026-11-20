@@ -395,8 +395,35 @@ fn a_language_without_a_scope_query_has_none() {
     );
 }
 
+/// Preparing a file's highlighting leaves a parsed side's definitions to
+/// their own step, found from the tree it holds; a side with nothing to
+/// look in needs no step.
+#[test]
+fn a_parsed_sides_scopes_are_a_step_after_its_highlighting() {
+    let text = Text::new(RUST.into());
+    let side = Source {
+        path: b"a.rs",
+        text: &text,
+        id: None,
+    };
+    let syntax = FileSyntax::new(&GRAMMARS, [side, side], &[], None, false);
+    assert_eq!(syntax.scopes(), None);
+    syntax.find_scopes(&text, &text);
+    let fresh = scopes_of("rust", RUST);
+    assert_eq!(syntax.scopes(), Some([Some(&fresh), Some(&fresh)]));
+
+    let toml = Text::new(b"[a]\nb = 1\n".to_vec());
+    let side = Source {
+        path: b"Cargo.toml",
+        text: &toml,
+        id: None,
+    };
+    let syntax = FileSyntax::new(&GRAMMARS, [side, side], &[], None, false);
+    assert_eq!(syntax.scopes(), Some([None, None]));
+}
+
 /// A large side's definitions go to the disk cache with its spans, so a
-/// hit, which parses nothing, still has them.
+/// hit, which parses nothing, still has them, without a step after.
 #[test]
 fn a_cached_side_keeps_its_scopes() {
     let mut source = String::from("impl A {\n");
@@ -419,13 +446,13 @@ fn a_cached_side_keeps_its_scopes() {
         let syntax = FileSyntax::new(&GRAMMARS, [side, side], &[], Some(&cache), store);
         assert_eq!(
             syntax.scopes(),
-            [Some(&fresh), Some(&fresh)],
+            Some([Some(&fresh), Some(&fresh)]),
             "store {store}"
         );
     }
     assert!(matches!(
         Highlighter::for_side(&GRAMMARS, side, Some(&cache), false),
-        Some(Highlighter::Cached(_, Some(_)))
+        Some(Highlighter::Cached(cached)) if cached.1.is_some()
     ));
 }
 

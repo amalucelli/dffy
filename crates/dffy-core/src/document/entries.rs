@@ -467,6 +467,10 @@ pub enum Missing {
     /// Gap `n` shows lines and has no syntax runs:
     /// [`super::Prepare::gap_syntax`], then [`Document::set_gap_syntax`].
     GapSyntax(usize),
+    /// The file's highlighting is prepared and the definitions it leaves
+    /// to find, for the scope line, aren't yet: [`super::Prepare::scopes`],
+    /// which stores them in the file's syntax slot.
+    Scopes,
     /// The syntax diff shows and the file has none yet:
     /// [`super::Prepare::structural`], then [`Document::set_structural`].
     Structural,
@@ -2161,8 +2165,9 @@ impl<P> Document<P> {
     /// The work missing for the rows from `first` to `last` of one file, as
     /// they show now: emphasis of the hunks among them, syntax runs of the
     /// gaps whose lines are among them (a gap's separator alone shows no
-    /// lines), then the file's syntax diff and rendered view when those
-    /// show. Builds no rows; nothing for rows of different files.
+    /// lines), the file's definitions once its highlighting is ready, then
+    /// its syntax diff and rendered view when those show. Builds no rows;
+    /// nothing for rows of different files.
     pub fn missing(&self, first: Pos, last: Pos) -> impl Iterator<Item = Missing> + '_ {
         let entry = self
             .files
@@ -2204,10 +2209,17 @@ impl<P> Document<P> {
             let separator = from == to && shown.line(from).is_none();
             (from <= to && !separator).then_some(Missing::GapSyntax(g))
         });
+        let scopes = loaded
+            .is_some_and(File::wants_scopes)
+            .then_some(Missing::Scopes);
         let structural = (self.structural && loaded.is_some_and(File::wants_structural))
             .then_some(Missing::Structural);
         let render = (self.rendered && entry.is_some_and(|e| e.wants_render().is_some()))
             .then_some(Missing::Render);
-        emphasis.chain(gaps).chain(structural).chain(render)
+        emphasis
+            .chain(gaps)
+            .chain(scopes)
+            .chain(structural)
+            .chain(render)
     }
 }

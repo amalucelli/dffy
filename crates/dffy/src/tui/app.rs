@@ -1422,6 +1422,8 @@ impl App {
                 self.doc.document.set_gap_syntax(file, &diff, gap, spans);
                 self.dirty |= self.visible.contains(&file);
             }
+            // The definitions are in the file's syntax slot already.
+            Done::Scopes { file, .. } => self.dirty |= self.visible.contains(&file),
             Done::Structural {
                 file, diff, result, ..
             } => {
@@ -2829,7 +2831,8 @@ impl App {
     /// Work for the pool, most wanted first: diffs of files on screen,
     /// comments placed again on files loaded, the search's scan of the
     /// file shown, emphasis for hunks on screen,
-    /// highlighting of revealed lines on screen, syntax diffs of files on
+    /// highlighting of revealed lines on screen, the definitions of the
+    /// file shown once it's highlighted, syntax diffs of files on
     /// screen when that view is on, diffs of nearby files, then the
     /// search's counts of the other files.
     pub(crate) fn jobs(&self) -> Vec<Job> {
@@ -2884,6 +2887,14 @@ impl App {
                         version,
                         gap,
                         lines: loaded.gap_lines(gap),
+                        diff,
+                        syntax: Arc::clone(syntax),
+                    }));
+                }
+                Missing::Scopes => {
+                    jobs.extend(loaded.syntax().map(|syntax| Job::Scopes {
+                        file,
+                        version,
                         diff,
                         syntax: Arc::clone(syntax),
                     }));

@@ -113,6 +113,32 @@ fn missing_names_the_work_for_the_rows_shown() {
     );
 }
 
+/// A file's definitions are their own step, asked for once its
+/// highlighting is ready: until then it has no scopes, as before the
+/// highlighting.
+#[test]
+fn scopes_are_missing_once_the_highlighting_is_ready() {
+    let mut doc = Document::<()>::default();
+    doc.push(long_diff("long.c").change, Source::Repo);
+    let _ = doc.load(0, Ok(prepared(long_diff("long.c"))));
+    let missing = |doc: &Document<()>| doc.missing(at(0, 1, 0), at(0, 5, 0)).collect::<Vec<_>>();
+    assert_eq!(missing(&doc), [Missing::Emphasis(0), Missing::Emphasis(1)]);
+
+    let prepare = File::prepare(&GRAMMARS, None);
+    let file = doc.file(0).expect("loaded");
+    let (diff, slot) = (Arc::clone(file.diff()), file.syntax().cloned());
+    let (emphasis, syntax) = prepare.emphasis(&diff, 0, slot.as_ref());
+    doc.set_emphasis(0, &diff, 0, emphasis, syntax);
+    assert_eq!(missing(&doc), [Missing::Emphasis(1), Missing::Scopes]);
+    let file = doc.file(0).expect("loaded");
+    assert_eq!(file.scopes(Side::New, 2), None);
+
+    prepare.scopes(&diff, slot.as_ref().expect("highlighted"));
+    assert_eq!(missing(&doc), [Missing::Emphasis(1)]);
+    let file = doc.file(0).expect("loaded");
+    assert_eq!(file.scopes(Side::New, 2), Some(Vec::new()));
+}
+
 /// Each separator counts the lines it hides, and only the last carries the
 /// hunk's numbers; search scans the revealed lines. A position on a
 /// separator stays on its line, one on a line moves with it, and so does

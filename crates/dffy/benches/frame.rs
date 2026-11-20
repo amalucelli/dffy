@@ -12,7 +12,7 @@ use std::ops::ControlFlow;
 use std::path::PathBuf;
 use std::sync::LazyLock;
 
-use dffy::bench::Frame;
+use dffy::bench::{Frame, Trees};
 use dffy_core::diff::Options;
 use dffy_core::git::{FileChange, FileDiff, Repo};
 
@@ -138,6 +138,15 @@ fn prepare_file(bencher: divan::Bencher, case: &str) {
                 case.ends_with("syntax diff"),
             )
         });
+}
+
+/// The scope job's share of opening a highlighted file, after the parse
+/// `prepare_file` counts: finding each side's definitions in its tree.
+#[divan::bench(args = ["fair.c"])]
+fn scopes(bencher: divan::Bencher, _case: &str) {
+    let (_, highlighted) = DIFFS.clone().expect("checked in main");
+    let trees = Trees::new(highlighted);
+    bencher.bench_local(|| trees.scopes());
 }
 
 const FULL: [&str; 2] = ["table", "fair.c"];

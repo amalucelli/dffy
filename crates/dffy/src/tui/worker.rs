@@ -2,8 +2,8 @@
 //! as the core finds them, pairs renames once it has them all, and then
 //! keeps them current; and a small pool that diffs files and places their
 //! annotations on them, computes emphasis and syntax spans for the hunks on
-//! screen, and syntax-diffs the
-//! files on screen when that view is on. When it has nothing else to do,
+//! screen and then the shown file's definitions for the scope line, and
+//! syntax-diffs the files on screen when that view is on. When it has nothing else to do,
 //! the pool compiles the highlight queries of the languages in the list,
 //! so a language's first file doesn't wait for its query, then counts
 //! every file's lines for the file tree. Results come back as [`Event`]s.
@@ -224,6 +224,14 @@ pub(crate) enum Job {
         diff: Arc<FileDiff>,
         syntax: SyntaxSlot,
     },
+    /// The definitions the file's highlighting, ready in `syntax`, left to
+    /// find; they land in the slot itself.
+    Scopes {
+        file: usize,
+        version: u64,
+        diff: Arc<FileDiff>,
+        syntax: SyntaxSlot,
+    },
     Render(RenderJob),
 }
 
@@ -278,6 +286,7 @@ enum Of {
     Emphasis(usize),
     Structural,
     GapSyntax(usize),
+    Scopes,
     /// With the search's id: a running scan for an older search doesn't
     /// hold back one for the new.
     Search(u64),
@@ -300,6 +309,7 @@ impl Job {
             Self::GapSyntax {
                 file, version, gap, ..
             } => (file, version, Of::GapSyntax(*gap)),
+            Self::Scopes { file, version, .. } => (file, version, Of::Scopes),
             Self::Search {
                 file, version, id, ..
             } => (file, version, Of::Search(*id)),
@@ -361,6 +371,8 @@ pub(crate) enum Done {
         gap: usize,
         spans: Option<Spans>,
     },
+    /// The file's definitions are found, in its syntax slot.
+    Scopes { file: usize, version: u64 },
     /// A file's matches of search `id`; `None` when it can't be read.
     Search {
         file: usize,
@@ -418,6 +430,7 @@ impl Done {
             Self::GapSyntax {
                 file, version, gap, ..
             } => (file, version, Of::GapSyntax(gap)),
+            Self::Scopes { file, version } => (file, version, Of::Scopes),
             Self::Search {
                 file, version, id, ..
             } => (file, version, Of::Search(id)),
@@ -930,6 +943,15 @@ fn run(job: Job, repo: Option<&Repo>, settings: &Settings) -> Done {
             spans: settings.prepare().gap_syntax(&diff, &syntax, lines),
             diff,
         },
+        Job::Scopes {
+            file,
+            version,
+            diff,
+            syntax,
+        } => {
+            settings.prepare().scopes(&diff, &syntax);
+            Done::Scopes { file, version }
+        }
         Job::Render(job) => Done::Rendered {
             file: job.file,
             version: job.version,

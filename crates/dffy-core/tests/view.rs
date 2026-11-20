@@ -156,28 +156,35 @@ fn end<P>(doc: &mut Document<P>, file: usize) -> Pos {
 }
 
 /// Runs the work `missing` names for the rows from `first` to `last`, as a
-/// host's pool would, and stores each result.
+/// host's pool would, and stores each result, until none is missing: the
+/// first highlighting leaves the definitions to find after it.
 fn fill(doc: &mut Document<()>, first: Pos, last: Pos) {
     let prepare = File::prepare(&GRAMMARS, None);
-    let missing: Vec<Missing> = doc.missing(first, last).collect();
-    for work in missing {
-        let file = doc.file(first.file).expect("loaded");
-        let diff = Arc::clone(file.diff());
-        match work {
-            Missing::Emphasis(hunk) => {
-                let (emphasis, syntax) = prepare.emphasis(&diff, hunk, file.syntax());
-                doc.set_emphasis(first.file, &diff, hunk, emphasis, syntax);
+    loop {
+        let missing: Vec<Missing> = doc.missing(first, last).collect();
+        if missing.is_empty() {
+            return;
+        }
+        for work in missing {
+            let file = doc.file(first.file).expect("loaded");
+            let diff = Arc::clone(file.diff());
+            match work {
+                Missing::Emphasis(hunk) => {
+                    let (emphasis, syntax) = prepare.emphasis(&diff, hunk, file.syntax());
+                    doc.set_emphasis(first.file, &diff, hunk, emphasis, syntax);
+                }
+                Missing::GapSyntax(gap) => {
+                    let slot = Arc::clone(file.syntax().expect("highlighted"));
+                    let spans = prepare.gap_syntax(&diff, &slot, file.gap_lines(gap));
+                    doc.set_gap_syntax(first.file, &diff, gap, spans);
+                }
+                Missing::Scopes => prepare.scopes(&diff, file.syntax().expect("highlighted")),
+                Missing::Structural => {
+                    let result = prepare.structural(&diff);
+                    assert!(doc.set_structural(first.file, &diff, result));
+                }
+                Missing::Render => unreachable!("rendered views are off"),
             }
-            Missing::GapSyntax(gap) => {
-                let slot = Arc::clone(file.syntax().expect("highlighted"));
-                let spans = prepare.gap_syntax(&diff, &slot, file.gap_lines(gap));
-                doc.set_gap_syntax(first.file, &diff, gap, spans);
-            }
-            Missing::Structural => {
-                let result = prepare.structural(&diff);
-                assert!(doc.set_structural(first.file, &diff, result));
-            }
-            Missing::Render => unreachable!("rendered views are off"),
         }
     }
 }

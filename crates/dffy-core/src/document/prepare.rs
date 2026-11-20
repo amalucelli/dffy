@@ -23,8 +23,9 @@ pub type SyntaxSlot = Arc<OnceLock<FileSyntax>>;
 /// call at the granularity a host draws: a viewer builds a [`File`] with
 /// [`Prepare::file`] (no side parsed), then asks for
 /// [`Prepare::emphasis`] for each hunk it draws, [`Prepare::gap_syntax`]
-/// for each gap whose lines it draws, and [`Prepare::structural`] for the
-/// files on screen while the syntax diff is on. Print streams a file
+/// for each gap whose lines it draws, [`Prepare::scopes`] once the file's
+/// highlighting is ready, and [`Prepare::structural`] for the files on
+/// screen while the syntax diff is on. Print streams a file
 /// without building a [`File`]: [`super::whitespace_only`], a
 /// [`Prepare::highlighter`] per side on threads it schedules, or on one
 /// thread the old side's then [`Prepare::highlighter_after`],
@@ -117,6 +118,15 @@ impl Prepare<'_> {
     ) -> Option<Spans> {
         slot.get_or_init(|| self.syntax(diff, true))
             .new_spans(&diff.new, lines)
+    }
+
+    /// Finds the definitions `slot`'s highlighting of `diff` left to find
+    /// (see [`FileSyntax::find_scopes`]), for [`File::scopes`]. Does
+    /// nothing before the slot is filled: it never parses.
+    pub fn scopes(&self, diff: &FileDiff, slot: &SyntaxSlot) {
+        if let Some(syntax) = slot.get() {
+            syntax.find_scopes(&diff.old, &diff.new);
+        }
     }
 
     /// `diff`'s syntax diff, through the cache for large files: `None` for

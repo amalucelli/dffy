@@ -148,6 +148,7 @@ fn the_title_names_the_definitions_around_the_top_line() {
             let file = prepare.file(scope_diff(), Whitespace::Exact, highlight);
             if let Some(slot) = file.syntax() {
                 slot.get_or_init(|| prepare.syntax(file.diff(), false));
+                prepare.scopes(file.diff(), slot);
             }
             let mut app = app_with(&Config::default(), "uncommitted", file, (160, 18));
             app.tree_width = Some(160 - diff_width);

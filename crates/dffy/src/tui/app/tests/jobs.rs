@@ -27,6 +27,83 @@ fn added(lines: usize) -> FileDiff {
     }
 }
 
+/// The scope line is a job of its own, asked for once the file's
+/// highlighting is ready: until it's done the title keeps the hunk's
+/// heading, then it shows the definitions.
+#[test]
+fn the_scope_line_fills_in_when_its_job_is_done() {
+    let body = (1..=30)
+        .map(|i| format!("        let x{i} = {i};\n"))
+        .collect::<Vec<_>>()
+        .concat();
+    let old = format!("impl Thing {{\n    fn run(&self) {{\n{body}    }}\n}}\n");
+    let new = old.replace("let x15 = 15;", "let x15 = 16;");
+    let side = Some(Side::Worktree {
+        mode: Mode::File,
+        id: None,
+    });
+    let (old, new) = (Text::new(old.into()), Text::new(new.into()));
+    let fd = FileDiff {
+        change: FileChange {
+            path: "src/thing.rs".into(),
+            status: Status::Modified,
+            old: side,
+            new: side,
+            staging: None,
+        },
+        hunks: hunks(&old, &new, &Options::default()),
+        old,
+        new,
+        binary: false,
+        too_large: false,
+        note: None,
+    };
+    let prepare = File::prepare(crate::grammars(), None);
+    let loaded = prepare.file(fd, Whitespace::Exact, true);
+    let mut app = app_with(&Config::default(), "working tree", loaded, (100, 20));
+    screen(&mut app);
+    let Some(Job::Emphasis {
+        file,
+        version,
+        hunk,
+        diff,
+        syntax,
+    }) = app
+        .jobs()
+        .into_iter()
+        .find(|j| matches!(j, Job::Emphasis { .. }))
+    else {
+        panic!("emphasis for the hunk shown");
+    };
+    let (emphasis, spans) = prepare.emphasis(&diff, hunk, syntax.as_ref());
+    app.event(Event::Diffed(Done::Emphasis {
+        file,
+        version,
+        diff,
+        hunk,
+        emphasis,
+        syntax: spans,
+    }));
+    let scope = "impl Thing › fn run";
+    assert!(!screen(&mut app).contains(scope));
+    let Some(Job::Scopes {
+        file,
+        version,
+        diff,
+        syntax,
+    }) = app
+        .jobs()
+        .into_iter()
+        .find(|j| matches!(j, Job::Scopes { .. }))
+    else {
+        panic!("the scope job, once the highlighting is ready");
+    };
+    prepare.scopes(&diff, &syntax);
+    app.event(Event::Diffed(Done::Scopes { file, version }));
+    assert!(screen(&mut app).contains(scope), "{}", screen(&mut app));
+    assert!(!app.jobs().iter().any(|j| matches!(j, Job::Scopes { .. })));
+}
+
 /// Each language in the list goes to the pool to compile ahead once, as
 /// its first file is listed. With highlighting off none do, until it's
 /// turned on.

@@ -2579,8 +2579,9 @@ fn after() {
 ";
 
 /// A document showing `fd` loaded with highlighting, its syntax prepared
-/// as the first emphasis job does.
-fn scoped_doc(fd: FileDiff, layout: Layout, height: usize) -> Doc {
+/// as the first emphasis job does, then with `scopes` its definitions
+/// found as the scope job does.
+fn highlighted_doc(fd: FileDiff, layout: Layout, height: usize, scopes: bool) -> Doc {
     let prepare = File::prepare(crate::grammars(), None);
     let loaded = prepare.file(fd, Whitespace::Exact, true);
     let slot = loaded.syntax().cloned();
@@ -2590,8 +2591,15 @@ fn scoped_doc(fd: FileDiff, layout: Layout, height: usize) -> Doc {
     assert!(doc.load(0, Ok(Box::new(loaded))));
     if let Some(slot) = slot {
         slot.get_or_init(|| prepare.syntax(&diff, false));
+        if scopes {
+            prepare.scopes(&diff, &slot);
+        }
     }
     doc
+}
+
+fn scoped_doc(fd: FileDiff, layout: Layout, height: usize) -> Doc {
+    highlighted_doc(fd, layout, height, true)
 }
 
 /// Scrolls until the top row shows `needle`.
@@ -2787,12 +2795,16 @@ fn an_old_side_selection_on_context_lines_keeps_them_when_boxes_arrive_above() {
     assert_eq!(after, before);
 }
 
-/// Before the highlighting is ready, and for a language without a scope
-/// query, there's no scope line: the title keeps the hunk's heading.
+/// Before the highlighting is ready, until the definitions are found
+/// after it, and for a language without a scope query, there's no scope
+/// line: the title keeps the hunk's heading.
 #[test]
 fn without_scopes_the_title_keeps_the_heading() {
     let fd = file_diff("src/error.rs", SCOPE_OLD, SCOPE_NEW);
-    let mut doc = doc_of(fd, layout(false, false), 4);
+    let mut doc = doc_of(fd.clone(), layout(false, false), 4);
+    assert_eq!(scope(&mut doc), None);
+    let mut doc = highlighted_doc(fd, layout(false, false), 4, false);
+    doc.document.top();
     assert_eq!(scope(&mut doc), None);
     let toml = file_diff("Cargo.toml", "[a]\nb = 1\n", "[a]\nb = 2\n");
     let mut doc = scoped_doc(toml, layout(false, false), 4);

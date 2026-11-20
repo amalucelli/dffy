@@ -725,16 +725,25 @@ impl File {
     /// The labels of the definitions around `line` (0-based) of `side`,
     /// outermost first, such as `["impl Error", "fn fatal"]`; empty at
     /// the top level. `None` until the file's highlighting is prepared
-    /// (see [`Prepare::emphasis`]), and when that side has no definitions
-    /// to look in: its language has no scope query, it isn't highlighted,
-    /// or the file shows rendered. Never waits or parses.
+    /// (see [`Prepare::emphasis`]) and its definitions found after it
+    /// ([`Prepare::scopes`]), and when that side has no definitions to
+    /// look in: its language has no scope query, it isn't highlighted, or
+    /// the file shows rendered. Never waits or parses.
     #[must_use]
     pub fn scopes(&self, side: Side, line: usize) -> Option<Vec<&str>> {
         if self.rendered.is_some() {
             return None;
         }
         let syntax = self.syntax.as_ref()?.get()?;
-        Some(syntax.scopes()[side.index()]?.at(line))
+        Some(syntax.scopes()?[side.index()]?.at(line))
+    }
+
+    /// Whether the highlighting is prepared and the definitions it leaves
+    /// to find aren't yet (see [`Prepare::scopes`]).
+    #[must_use]
+    pub(crate) fn wants_scopes(&self) -> bool {
+        let syntax = self.syntax.as_ref().and_then(|slot| slot.get());
+        self.rendered.is_none() && syntax.is_some_and(|s| s.scopes().is_none())
     }
 
     /// Its added and removed lines. A rendered view counts the source

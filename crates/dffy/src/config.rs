@@ -306,6 +306,11 @@ pub(crate) const KEYS: &[Key] = &[
         default: "",
     },
     Key {
+        name: "agent",
+        doc: "Experimental: which coding agent the agent plugin, dffy-agent on PATH, asks about a thread (`a`, or a comment starting @<name>), handed to it unread: claude, codex or pi picks the default, and a command with arguments, split at spaces, runs in their place with the prompt on its stdin. Empty leaves the pick to the plugin, Claude Code first. Fix with agent (`f`) starts the one this names when it's claude, codex, pi or amp, else the first of them on PATH. See docs/plugins.md.",
+        default: "",
+    },
+    Key {
         name: "watch",
         doc: "Start the viewer in watch mode, refreshing as files, the index or refs change; `w` toggles it. With nothing to show, a watching viewer opens and waits for changes instead of printing that there are none.",
         default: "false",
@@ -394,6 +399,8 @@ pub(crate) struct Config {
     pub render: Renderers,
     pub rendered: bool,
     pub review: Option<String>,
+    /// Handed to the agent plugin unread.
+    pub agent: Option<String>,
     pub watch: bool,
     pub tree: TreeMode,
     /// `None` follows the terminal's width.
@@ -438,6 +445,7 @@ impl Default for Config {
             render: Renderers::default(),
             rendered: false,
             review: None,
+            agent: None,
             watch: false,
             tree: TreeMode::Auto,
             tree_width: None,
@@ -510,6 +518,7 @@ impl Config {
                 crate::plugin::check_name(value)?;
                 self.review = Some(value.to_owned());
             }
+            "agent" => self.agent = Some(value.to_owned()).filter(|v| !v.is_empty()),
             "watch" => self.watch = boolean(value)?,
             "tree" => self.tree = choice(value)?,
             "tree-width" => {
@@ -556,6 +565,7 @@ impl Config {
             "render" => self.render.to_string(),
             "rendered" => self.rendered.to_string(),
             "review" => self.review.clone().unwrap_or_default(),
+            "agent" => self.agent.clone().unwrap_or_default(),
             "watch" => self.watch.to_string(),
             "tree" => choice_name(&self.tree),
             "tree-width" => self

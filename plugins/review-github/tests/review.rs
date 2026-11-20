@@ -181,12 +181,18 @@ mod carry {
         )
     }
 
-    /// `dryRun`'s and `post`'s `drafts`.
+    /// `dryRun`'s and `post`'s `drafts`: a reply only in a thread not kept
+    /// local.
     pub(crate) fn drafts(file: &Value) -> Vec<Value> {
         let all = comments(file);
-        let drafts = all
-            .iter()
-            .filter(|c| c["ref"].is_null() && c["author"].as_str().unwrap_or_default().is_empty());
+        let drafts = all.iter().filter(|c| {
+            let root =
+                (c["in_reply_to"].as_str()).and_then(|id| all.iter().find(|r| r["id"] == id));
+            c["ref"].is_null()
+                && c["author"].as_str().unwrap_or_default().is_empty()
+                && c["local_only"] != true
+                && root.is_none_or(|r| r["local_only"] != true)
+        });
         drafts
             .map(|c| {
                 let mut draft = Map::new();
@@ -2006,6 +2012,37 @@ fn a_dry_run_plans_each_draft_without_asking_github() {
         ]
     );
     assert_eq!((f.requests().len(), f.rest().len(), f.comments()), before);
+}
+
+/// A reply under a comment kept local, as a mention that asked an agent,
+/// has no thread on GitHub, and won't until it's yours: dffy doesn't send
+/// it, so neither a dry run nor `post` plans it, and GitHub gets nothing
+/// for it.
+#[test]
+fn a_reply_to_a_comment_kept_local_is_never_sent() {
+    let f = Fixture::new();
+    f.prepare();
+    let root = f.apply(&json!([
+        {"op": "add", "comment": {"path": "src/lib.rs", "text": "@claude why?", "local_only": true}},
+    ]));
+    let reply = f.apply(&json!([
+        {"op": "add", "comment": {"in_reply_to": root["ids"][0], "text": "And its tests?"}},
+    ]));
+    let reply = reply["ids"][0].as_str().expect("an id").to_owned();
+    let run = f.run(&["post", PR, "--dry-run"]);
+    run.ok();
+    assert_eq!(run.lines, Vec::<Value>::new());
+
+    f.reply("PostState", None, "post_state.json");
+    let before = f.operations().len();
+    let run = f.post("pending", "");
+    run.ok();
+    assert_eq!(
+        run.lines,
+        [json!({"posted": 0, "failed": 0, "pending": 0, "url": URL})]
+    );
+    assert_eq!(f.operations()[before..], ["PostState"]);
+    assert!(f.draft(&reply).get("ref").is_none());
 }
 
 /// `--drafts` plans another comments file's drafts after the PR's own, as

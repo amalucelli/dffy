@@ -28,6 +28,9 @@ use crate::review::who;
 use crate::term::{Grid, Key, Mods};
 use crate::theme::{Ink, Role, Theme};
 
+/// The text box's keys, in its heading.
+const BOX_KEYS: &str = " · enter sends · shift+enter new line · ctrl+g editor";
+
 /// The panel's key listing the threads on other branches, or folding them.
 pub(super) const OTHER_BRANCHES: char = 'b';
 
@@ -359,12 +362,14 @@ fn standing_tag(standing: Standing) -> Option<(Role, &'static str)> {
     }
 }
 
-/// The words after a comment's author: where it stands, what posting it
-/// does, and whether it's on the host for you only.
+/// The words after a comment's author: its label, as an agent's mark,
+/// where it stands, what posting it does, and whether it's on the host for
+/// you only.
 fn comment_tags(comment: &ThreadComment) -> impl Iterator<Item = (Role, Cow<'_, str>)> {
-    standing_tag(comment.standing)
-        .map(|(role, tag)| (role, Cow::Borrowed(tag)))
+    (comment.label.as_deref())
+        .map(|label| (Role::Dim, Cow::Owned(escape(label.as_bytes()))))
         .into_iter()
+        .chain(standing_tag(comment.standing).map(|(role, tag)| (role, Cow::Borrowed(tag))))
         .chain(comment.posting.as_ref().map(|posting| {
             let words = escape(posting.words.as_bytes());
             (posting_role(posting), Cow::Owned(words))
@@ -494,7 +499,7 @@ pub(crate) fn thread_rows(
             .as_deref_mut()
             .filter(|w| matches!(&w.at, Writes::Edit { id, .. } if *id == comment.id));
         if editing.is_some() {
-            spans.push((Role::Dim.into(), " · esc saves · ctrl+g editor"));
+            spans.push((Role::Dim.into(), BOX_KEYS));
         }
         // A reply's heading is under a blank row.
         let heading = frame.c.len() - top + usize::from(i > 0);
@@ -535,10 +540,8 @@ pub(crate) fn thread_rows(
         }
     }
     if let Some(writing) = writing.filter(|w| matches!(w.at, Writes::Reply(_))) {
-        frame.heading(&[
-            (AUTHOR, "you"),
-            (Role::Dim.into(), " · reply · esc saves · ctrl+g editor"),
-        ]);
+        let dim = Role::Dim.into();
+        frame.heading(&[(AUTHOR, "you"), (dim, " · reply"), (dim, BOX_KEYS)]);
         frame.text_box(&mut writing.text);
     }
     frame.bottom();
@@ -556,10 +559,8 @@ pub(crate) fn new_rows(text: &mut TextBox, width: usize, c: &mut Canvas) {
     frame.top(&[
         (Role::Dim.into(), "▾ "),
         (AUTHOR, "you"),
-        (
-            Role::Dim.into(),
-            " · new comment · esc saves, empty discards · ctrl+g editor",
-        ),
+        (Role::Dim.into(), " · new comment"),
+        (Role::Dim.into(), BOX_KEYS),
     ]);
     frame.text_box(text);
     frame.bottom();

@@ -1,0 +1,62 @@
+---
+source: crates/dffy/src/review/prompt/tests.rs
+expression: least.text
+---
+A review thread on src/lib.rs:12-20 (the new version of the file).
+
+ana:
+First.
+
+[1 reply omitted]
+
+you:
+Kept for its suggestion.
+
+Suggested change, in place of the commented lines:
+
+```suggestion
+line 12
+```
+
+bo:
+Another middle reply.
+
+ana:
+Last.
+
+The commented lines, marked >, and the lines around them:
+
+```
+[… 2 lines …]
+   9  line 9
+  10  line 10
+  11  line 11
+> 12  line 12 edited
+[… 7 lines …]
+> 20  line 20 edited
+  21  line 21 edited
+  22  line 22 edited
+  23  line 23 edited
+[… 2 lines …]
+```
+
+The file's changes near them:
+
+```diff
+@@ -9,25 +9,25 @@
+ line 9
+ line 10
+ line 11
+[… 19 lines …]
++line 12 edited
+[… 7 lines …]
++line 20 edited
++line 21 edited
++line 22 edited
++line 23 edited
+[… 10 lines …]
+```
+
+[2 other hunks of this file omitted]
+
+Answer the thread's last comment. To propose a change to the commented lines, end with the lines that replace them in a fenced block opened with ```suggestion.

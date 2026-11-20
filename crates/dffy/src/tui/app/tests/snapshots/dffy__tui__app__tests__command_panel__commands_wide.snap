@@ -1,5 +1,5 @@
 ---
-source: crates/dffy/src/tui/app/tests.rs
+source: crates/dffy/src/tui/app/tests/command_panel.rs
 expression: panel_markup(&mut app)
 ---
 <dim>┌</> Files <dim>·</> <dim>2</> +2 -2 <dim>────────────────────┬─</> modified <dim>·</> <dim>src/some/deeply/nested/module/</>file.rs <dim>·</> +2 -2 <dim>───────────────────────</> @@ -1,7 +1,7 @@ <dim>─┐</>
@@ -26,19 +26,19 @@ expression: panel_markup(&mut app)
 <dim>│</>                                     <dim>│</>  <dim>│</> [x] Line numbers                                 #   <dim>┃│</>                                         <dim>┃</>
 <dim>│</>                                     <dim>│</>  <dim>│</> [x] Hunk headers                                 @   <dim>┃│</>                                         <dim>┃</>
 <dim>│</>                                     <dim>│</>  <dim>│</>     Status bar <dim>‹</> bottom <dim>›</>                        B   <dim>┃│</>                                         <dim>┃</>
-<dim>│</>                                     <dim>│</>  <dim>│</>     Theme <dim>‹</> default <dim>›</>                            a   <dim>┃│</>                                         <dim>┃</>
+<dim>│</>                                     <dim>│</>  <dim>│</>     Theme <dim>‹</> default <dim>›</>                            ~   <dim>┃│</>                                         <dim>┃</>
 <dim>│</>                                     <dim>│</>  <dim>│</>                                                      <dim>┃│</>                                         <dim>┃</>
 <dim>│</>                                     <dim>│</>  <dim>│</> Copy                                                 <dim>┃│</>                                         <dim>┃</>
-<dim>│</>                                     <dim>│</>  <dim>│</>     Copy selection                               y   <dim>┃│</>                                         <dim>┃</>
-<dim>│</>                                     <dim>│</>  <dim>│</>     Copy file path                               Y   <dim>┃│</>                                         <dim>┃</>
+<dim>│</>                                     <dim>│</>  <dim>│</>     Copy selection                               y   <dim>││</>                                         <dim>┃</>
+<dim>│</>                                     <dim>│</>  <dim>│</>     Copy file path                               Y   <dim>││</>                                         <dim>┃</>
+<dim>│</>                                     <dim>│</>  <dim>│</>     Copy as prompt                               "   <dim>││</>                                         <dim>┃</>
 <dim>│</>                                     <dim>│</>  <dim>│</> [ ] Copy with line numbers and signs             J   <dim>││</>                                         <dim>┃</>
 <dim>│</>                                     <dim>│</>  <dim>│</>                                                      <dim>││</>                                         <dim>┃</>
-<dim>│</>                                     <dim>│</>  <dim>│</> Changes                                              <dim>││</>                                         <dim>┃</>
-<dim>│</>                                     <dim>│</>  <dim>│</>     Stage lines                                  A   <dim>││</>                                         █
+<dim>│</>                                     <dim>│</>  <dim>│</> Changes                                              <dim>││</>                                         █
+<dim>│</>                                     <dim>│</>  <dim>│</>     Stage lines                                  A   <dim>││</>                                         <dim>┃</>
 <dim>│</>                                     <dim>│</>  <dim>│</>     Unstage lines                                U   <dim>││</>                                         <dim>┃</>
 <dim>│</>                                     <dim>│</>  <dim>│</>     Discard lines…                               D   <dim>││</>                                         <dim>┃</>
-<dim>│</>                                     <dim>│</>  <dim>│</>                                                      <dim>││</>                                         <dim>┃</>
-<dim>│</>                                     <dim>│</>  <dim>│</> Modes                                                <dim>││</>                                         <dim>│</>
+<dim>│</>                                     <dim>│</>  <dim>│</>                                                      <dim>││</>                                         <dim>│</>
 <dim>│</>                                     <dim>│</>  <dim>│</> <dim>key</> <dim>or</> <dim>enter</> <dim>runs</> <dim>·</> <dim>j/k</> <dim>move</> <dim>·</> <dim>/</> <dim>search</> <dim>·</> <dim>esc</> <dim>close</>   <dim>│</>                                         <dim>│</>
 <dim>│</>                                     <dim>│</>  <dim>└───────────────────────────────────────────────────────┘</>                                         <dim>│</>
 <dim>└──</>  working tree  1/2 <dim>·</> 1/2 hunk <dim>────┴─</> <dim>split</> <dim>─────────────────────────────────────────────────────</> <dim>/</> <dim>search</> <dim>·</> <dim>tab</> <dim>tree</> <dim>·</> <dim>space</> <dim>commands</> <dim>─┘</>

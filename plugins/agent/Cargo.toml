@@ -1,0 +1,29 @@
+[package]
+name = "dffy-agent"
+description = "An experimental dffy plugin that asks Claude Code, Codex or a command of yours about a review thread, read-only"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+readme.workspace = true
+keywords = ["diff", "review", "agent", "terminal", "dffy"]
+categories = ["command-line-utilities", "development-tools"]
+
+[lints]
+workspace = true
+
+# No benchmarks: `cargo bench` builds it as a harness without the tests,
+# where the tests' `tempfile` would warn as unused.
+[[bin]]
+name = "dffy-agent"
+path = "src/main.rs"
+bench = false
+
+[dependencies]
+rustix = { version = "1.1.6", features = ["process"] }
+serde_json = "1.0.154"
+
+[dev-dependencies]
+tempfile = "3.27.0"

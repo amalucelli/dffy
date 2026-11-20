@@ -12,6 +12,7 @@ mod spec;
 mod stage;
 mod stats;
 mod status;
+mod suggestion;
 mod tree;
 mod worktree;
 
@@ -30,6 +31,8 @@ pub use spec::{DiffSpec, Revisions};
 pub use stage::{Applied, Edit, Picked};
 pub use stats::StatStore;
 pub(crate) use status::excludes_file;
+pub use suggestion::NewSide;
+pub(crate) use suggestion::check_suggestion;
 
 use crate::diff::{self, Hunk, Options, Text};
 use crate::view::Staging;
@@ -100,8 +103,8 @@ pub enum Error {
         #[source]
         source: std::io::Error,
     },
-    /// A stage, unstage or discard that doesn't apply to the file or the
-    /// lines given; the message says why.
+    /// A stage, unstage, discard or suggestion that doesn't apply to the
+    /// file or the lines given; the message says why.
     #[error("{0}")]
     Refused(String),
     /// `git apply` couldn't run, or refused the patch, as when the file

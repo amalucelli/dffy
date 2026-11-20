@@ -2,20 +2,27 @@
 //! placed on each file's diff, writing comments in the text box or the
 //! editor, the thread's keys, and the comments panel.
 
-use std::ops::ControlFlow;
+use std::fmt::Write as _;
+use std::ops::{ControlFlow, Range};
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Instant;
 
 use dffy_core::annotation::AnnotationSet;
 use dffy_core::bstr::BString;
 use dffy_core::document::{Side, Source, State};
 
-use super::{Action, App, POSTING, Pane, Seek, WHEEL_ROWS};
+use super::{
+    Action, App, Applying, Checkout, Handoff, OnSave, POSTING, Pane, STILL_EDITING, Seek,
+    Suggestion, WHEEL_ROWS, Watch,
+};
+use crate::control::Fault;
+use crate::control::viewer::Reply;
 use crate::keys::Action as Act;
 use crate::render::escape;
 use crate::review::model::compose::Compose;
 use crate::review::model::{self, Comments};
-use crate::review::{Change, Op, Target, session};
+use crate::review::{Change, Op, Target, prompt, session};
 use crate::term::{Input, Key, Mods};
 use crate::tui::comments::{self, Panel, Writes, Writing};
 use crate::tui::textbox::TextBox;
@@ -287,7 +294,7 @@ impl App {
     }
 
     /// Whether writes to the comments wait for a post to end.
-    fn writes_held(&self) -> bool {
+    pub(super) fn writes_held(&self) -> bool {
         self.posting_now() && !self.leaving
     }
 
@@ -302,7 +309,9 @@ impl App {
         let compose = self.composing.take()?;
         let Some(text) = text else {
             if let Some((text, at)) = handed {
+                let after = self.on_save;
                 self.open_box(compose, at, &text);
+                self.on_save = after;
             }
             return None;
         };
@@ -353,16 +362,24 @@ impl App {
             Compose::Edit { id, .. } => self.comments.as_ref().and_then(|c| c.thread_root(id)),
         };
         let edit = matches!(compose, Compose::Edit { .. });
+        // Only a comment you write here asks: one that comes any other way
+        // never runs an agent.
+        let after = std::mem::take(&mut self.on_save);
+        let mention = (!edit).then(|| self.asking.mentioned(text)).flatten();
         if self.writes_held() {
             // Kept as typed, to save once the post is done.
             if let Some(at) = at {
                 self.open_box(compose, at, text);
+                self.on_save = after;
             }
             self.message(POSTING);
             return false;
         }
         let retry = at.map(|at| (compose.clone(), at));
-        let Some((op, note)) = compose.into_op(text) else {
+        // Kept local like a mention: posted, a question or a note to an
+        // agent is out of context.
+        let to_agent = matches!(after, OnSave::Ask | OnSave::Fix);
+        let Some((mut op, note)) = compose.into_op(text) else {
             self.message(if edit {
                 "nothing changed; nothing saved"
             } else {
@@ -370,9 +387,27 @@ impl App {
             });
             return true;
         };
+        if let Op::Add { comment, .. } = &mut op
+            && (mention.is_some() || to_agent)
+        {
+            comment.local_only = true;
+        }
+        // A follow-up goes to the agent whose answer it follows.
+        let answered = (after == OnSave::Ask)
+            .then(|| root.as_deref().and_then(|r| self.answered_by(r)))
+            .flatten();
         if let Ok(ids) = self.write_comments(vec![op], note) {
-            let root = root.or_else(|| ids.into_iter().next().flatten());
+            let written = ids.into_iter().next().flatten();
+            let root = root.or_else(|| written.clone());
             self.sync_threads();
+            if let Some(root) = root.as_deref() {
+                match (mention, after) {
+                    (Some(agent), _) => self.ask_about((root, None), (Some(agent), written)),
+                    (None, OnSave::Ask) => self.ask_about((root, None), (answered, None)),
+                    (None, OnSave::Fix) => self.fix(root),
+                    (None, OnSave::Nothing) => {}
+                }
+            }
             // A thread on new lines shows once the pool placed it.
             if let Some(root) = root
                 && !self.doc.focus_thread(&root)
@@ -383,6 +418,7 @@ impl App {
         }
         if let Some((compose, at)) = retry {
             self.open_box(compose, at, text);
+            self.on_save = after;
             self.save_failed = true;
             if let Some((message, _)) = &mut self.message {
                 *message = format!("not saved, esc again discards · {message}");
@@ -392,6 +428,7 @@ impl App {
     }
 
     fn open_box(&mut self, compose: Compose, at: Writes, text: &str) {
+        self.on_save = OnSave::Nothing;
         self.composing = Some(compose);
         self.doc.selection = None;
         self.doc.write(Writing {
@@ -408,8 +445,9 @@ impl App {
         }
     }
 
-    /// Input while the text box is open: every key edits it but `esc`,
-    /// which saves it (an empty text discards it, and so does a second
+    /// Input while the text box is open: every key edits it but `enter`,
+    /// which sends it (saves it, and asks when it's for an agent), `esc`,
+    /// which saves it too (an empty text discards it, and so does a second
     /// `esc` after a save failed), `ctrl+g`, which hands it to the editor,
     /// and `ctrl+c`, which saves it and quits. The wheel still scrolls.
     pub(super) fn writing_input(&mut self, input: Input) -> Option<Action> {
@@ -419,9 +457,10 @@ impl App {
             Input::Key(Key::Esc, _) if failed => {
                 self.doc.stop_writing();
                 self.composing = None;
+                self.on_save = OnSave::Nothing;
                 self.message("discarded");
             }
-            Input::Key(Key::Esc, _) => self.close_box(),
+            Input::Key(Key::Esc, _) | Input::Key(Key::Enter, Mods::NONE) => self.close_box(),
             Input::Key(Key::Char('c'), mods) if ctrl(mods) => {
                 self.close_box();
                 return Some(Action::Quit);
@@ -458,6 +497,7 @@ impl App {
         };
         let text = writing.text.text().to_owned();
         if text.trim().is_empty() && !matches!(compose, Compose::Edit { .. }) {
+            self.on_save = OnSave::Nothing;
             self.message("empty; nothing saved");
             return;
         }
@@ -630,7 +670,7 @@ impl App {
     /// The command panel's "Continue in editor": your last draft in the
     /// focused thread (or the one selected in the comments panel), else a
     /// reply to it, else a new comment on the line, written in the editor.
-    /// The text box is the way in from a phone: `esc` saves it and focuses
+    /// The text box is the way in from a phone: `enter` saves it and focuses
     /// its thread, and this takes it from there.
     fn comment_in_editor(&mut self) -> Option<Action> {
         if !self.can_comment() {
@@ -666,6 +706,7 @@ impl App {
             None => (self.new_comment()?.0, String::new()),
         };
         self.composing = Some(compose);
+        self.on_save = OnSave::Nothing;
         Some(Action::Compose(text))
     }
 
@@ -688,8 +729,13 @@ impl App {
         deleting: bool,
     ) -> Result<Option<Action>, ()> {
         if (key, mods) == (Key::Esc, Mods::NONE) {
-            self.target_thread().ok_or(())?;
-            // The selection ends alone; the focus stays for the next `esc`.
+            let thread = self.target_thread().ok_or(())?;
+            // An ask on it stops first, the selection ends alone, and the
+            // focus stays for the next `esc`.
+            if self.asking.asking(&thread.root) {
+                let effects = self.asking.stop(Some(&thread.root));
+                return Ok(self.review_effects(effects));
+            }
             if self.doc.comment_selection.take().is_none() {
                 self.doc.set_focus(None);
             }
@@ -707,19 +753,45 @@ impl App {
     /// Does `action`, of the thread's table, on [`App::target_thread`].
     /// `Err` when it doesn't act on that thread, which leaves its key to
     /// the main table.
+    #[expect(clippy::too_many_lines, reason = "a dispatch: an arm per thread key")]
     pub(super) fn thread_act(&mut self, action: Act, deleting: bool) -> Result<Option<Action>, ()> {
         let thread = self.target_thread().ok_or(())?;
         let draft = thread.comments.iter().rev().find(|n| !n.posted());
         let general = matches!(thread.at, model::At::Conversation { .. });
         let mut done = None;
         match action {
-            Act::Reply | Act::Resolve if general => {
+            // An ask's answer is a reply.
+            Act::Reply
+            | Act::Resolve
+            | Act::AskAgent
+            | Act::ApplySuggestion
+            | Act::FixWithAgent
+                if general =>
+            {
                 let read_only = "the conversation is read-only here for now";
                 self.message(match self.thread_key_name(Act::OpenOnHost) {
                     Some(key) => format!("{read_only}; {key} opens it on the host"),
                     None => read_only.to_owned(),
                 });
             }
+            Act::AskAgent if self.answered_by(&thread.root).is_some() => {
+                let root = thread.root.clone();
+                done = self.write_in(
+                    &thread.root,
+                    Compose::Reply(root.clone()),
+                    Writes::Reply(root),
+                    "",
+                );
+                self.on_save = OnSave::Ask;
+                // The box's keys say who it asks, in place of the answer's
+                // news.
+                self.message = None;
+            }
+            Act::AskAgent => self.ask_about((&thread.root, Some(thread.at.clone())), (None, None)),
+            Act::ApplySuggestion => {
+                done = self.apply_suggestion((&thread.root, Some(&thread.at)), None, None);
+            }
+            Act::FixWithAgent => self.fix(&thread.root),
             Act::Reply => {
                 let warning = (self.reviewing.naming())
                     .and_then(|n| n.outdated_reply_warning.as_deref())
@@ -808,7 +880,299 @@ impl App {
         Ok(done)
     }
 
-    /// `a`: someone else's comments in `thread`, an agent's, become yours:
+    /// `a`: opens the text box for a question on the selected lines, which
+    /// asks once it's saved, else asks about the thread the thread keys act
+    /// on, else opens the box on the line `v` would start on.
+    pub(super) fn ask_agent(&mut self) -> Option<Action> {
+        let selected = self.doc.selection.is_some() && self.pane == Pane::Diff;
+        if !selected && self.target_thread().is_some() {
+            return self.thread_act(Act::AskAgent, false).ok().flatten();
+        }
+        if !self.can_comment() {
+            return None;
+        }
+        let (compose, at) = self.new_comment()?;
+        self.doc.set_focus(None);
+        self.open_box(compose, at, "");
+        self.on_save = OnSave::Ask;
+        let agent = self.asking.default_agent().unwrap_or("the agent");
+        self.message(format!("your question for {agent} · enter asks"));
+        None
+    }
+
+    /// `fix_with_agent`: on the selected lines, opens the text box for a
+    /// note on them, which hands its thread to your coding agent once
+    /// saved; else hands it the thread the thread keys act on.
+    pub(super) fn fix_with_agent(&mut self) -> Option<Action> {
+        let selected = self.doc.selection.is_some() && self.pane == Pane::Diff;
+        if !selected && self.target_thread().is_some() {
+            return self.thread_act(Act::FixWithAgent, false).ok().flatten();
+        }
+        if !selected {
+            self.message("fix with agent works on a thread, or on selected lines");
+            return None;
+        }
+        if !self.can_comment() {
+            return None;
+        }
+        let (compose, at) = self.new_comment()?;
+        self.doc.set_focus(None);
+        self.open_box(compose, at, "");
+        self.on_save = OnSave::Fix;
+        self.message("what should change here · enter sends it and starts your agent");
+        None
+    }
+
+    /// Hands the thread with first comment `root` to the user's coding
+    /// agent, which the loop starts once a frame is out.
+    fn fix(&mut self, root: &str) {
+        let Some(comments) = &self.comments else {
+            return;
+        };
+        let (file, session) = comments.file_with(root);
+        self.handoff = Some(Handoff {
+            thread: root.to_owned(),
+            file: file.to_owned(),
+            session,
+            checkout: self.checkout(),
+        });
+    }
+
+    /// The thread handed to the user's coding agent, for the loop.
+    pub(crate) fn take_handoff(&mut self) -> Option<Handoff> {
+        self.handoff.take()
+    }
+
+    /// The agent the loop handed a thread to started, or why not.
+    pub(crate) fn handed_off(&mut self, started: Result<String, String>) {
+        match started {
+            Ok(mut note) => {
+                let watch = self.key_for(false, Act::ToggleWatch);
+                if let (Watch::Off, Some(key)) = (&self.watch, watch) {
+                    let _ = write!(note, " · {key} shows its edits live");
+                }
+                self.message(note);
+            }
+            Err(why) => self.failed(why),
+        }
+    }
+
+    /// The review session checked out, when changing the working tree for
+    /// it needs HEAD on its head: one opened by its id. The review plain
+    /// `dffy` found is the branch's own, checked out already.
+    fn checkout(&self) -> Option<Checkout> {
+        let mode = self.reviewing.mode.as_ref().filter(|m| m.plain.is_none())?;
+        Some(Checkout {
+            label: mode.label.clone(),
+            head: mode.session.head.clone(),
+        })
+    }
+
+    /// `s`: puts a suggestion of the thread with first comment `root`,
+    /// placed `at` on its diff when it is, in place of its lines in the
+    /// working tree: comment `id`'s, else the comment's last clicked when
+    /// it has one, else its last comment's with one. `reply`, a control
+    /// API request, is answered with what came of it.
+    pub(super) fn apply_suggestion(
+        &mut self,
+        (root, at): (&str, Option<&model::At>),
+        id: Option<&str>,
+        reply: Option<Reply>,
+    ) -> Option<Action> {
+        let picked = if self.editing {
+            Err(STILL_EDITING.to_owned())
+        } else {
+            self.suggestion((root, at), id)
+        };
+        match picked {
+            Ok(suggestion) => {
+                self.applying = Some(Applying {
+                    thread: suggestion.thread.clone(),
+                    comment: suggestion.comment.clone(),
+                    path: String::from_utf8_lossy(&suggestion.diff.change.path).into_owned(),
+                    lines: suggestion.lines.len(),
+                    reply,
+                });
+                Some(Action::ApplySuggestion(Box::new(suggestion)))
+            }
+            Err(why) => {
+                match reply {
+                    Some(reply) => reply.send(Err(Fault::new("failed", why))),
+                    None => self.message(why),
+                }
+                None
+            }
+        }
+    }
+
+    fn suggestion(
+        &self,
+        (root, at): (&str, Option<&model::At>),
+        id: Option<&str>,
+    ) -> Result<Suggestion, String> {
+        let comments = self.comments.as_ref().ok_or("no comments file here")?;
+        let thread = comments.thread(root);
+        let clicked = id.or_else(|| {
+            (self.tapped_comment.as_ref())
+                .filter(|(tapped, _)| tapped == root)
+                .map(|(_, id)| id.as_str())
+        });
+        let has = |c: &&&crate::review::Comment| c.suggestion.is_some();
+        let picked = (clicked.and_then(|id| thread.iter().find(|c| c.id == id)))
+            .filter(has)
+            .or_else(|| thread.iter().rev().find(has))
+            .ok_or("this thread has no suggestion to apply")?;
+        let first = thread.first().copied();
+        let (Some(anchor), Some((side, written))) = (
+            first.and_then(|c| c.anchor.clone()),
+            first.and_then(crate::review::Comment::range),
+        ) else {
+            return Err("this thread is on its whole file: a suggestion replaces lines".to_owned());
+        };
+        if side == crate::review::Side::Old {
+            return Err(
+                "this thread is on the old version's lines, which the working tree doesn't have"
+                    .to_owned(),
+            );
+        }
+        let at = match at {
+            Some(model::At::Line {
+                side: Side::New,
+                lines,
+            }) => lines.start,
+            _ => written.start,
+        };
+        let file = (comments.home_of(root))
+            .and_then(|path| comments.file_of(path.as_bytes()))
+            .ok_or("its file isn't in this diff")?;
+        let diff = (self.doc.document.file(file))
+            .map(model::line_diff)
+            .ok_or("its file's diff isn't loaded yet")?;
+        // Writers other than dffy may end lines with CRLF, or end the last
+        // line too; empty is no lines, which deletes them.
+        let text = (picked.suggestion.as_deref().unwrap_or_default()).replace("\r\n", "\n");
+        Ok(Suggestion {
+            diff: Arc::clone(diff),
+            at,
+            anchor,
+            lines: if text.is_empty() {
+                Vec::new()
+            } else {
+                let text = text.strip_suffix('\n').unwrap_or(&text);
+                text.split('\n').map(str::to_owned).collect()
+            },
+            checkout: self.checkout(),
+            thread: root.to_owned(),
+            comment: picked.id.clone(),
+        })
+    }
+
+    /// What came of the suggestion the loop applied: said, and answered to
+    /// the control API when it asked.
+    pub(crate) fn applied(&mut self, result: Result<Range<usize>, String>) {
+        self.editing = false;
+        let Some(applying) = self.applying.take() else {
+            return;
+        };
+        let lines = |r: &Range<usize>| match r.len() {
+            0 | 1 => format!("{}:{}", applying.path, r.start + 1),
+            _ => format!("{}:{}-{}", applying.path, r.start + 1, r.end),
+        };
+        let said = result.as_ref().map(|replaced| {
+            if applying.lines == 0 {
+                format!("deleted {}, as suggested", lines(replaced))
+            } else {
+                format!("applied the suggestion to {}", lines(replaced))
+            }
+        });
+        match said {
+            Ok(note) => self.message(escape(note.as_bytes())),
+            Err(why) => self.failed(why.to_owned()),
+        }
+        if let Some(reply) = applying.reply {
+            reply.send(match result {
+                Ok(replaced) => Ok(crate::control::viewer::applied(
+                    (applying.thread, applying.comment),
+                    applying.path,
+                    replaced,
+                    applying.lines,
+                )),
+                Err(why) => Err(Fault::new("failed", why)),
+            });
+        }
+    }
+
+    /// Asks `agent`, or the default one, about the thread with first
+    /// comment `root`, shown `at` when that's known, as a prompt made now;
+    /// `mention` is the comment whose `@<name>` asks.
+    fn ask_about(
+        &mut self,
+        (root, at): (&str, Option<model::At>),
+        (agent, mention): (Option<String>, Option<String>),
+    ) {
+        let made = match self.root_prompt(root, at) {
+            Some(Ok(made)) => made,
+            Some(Err(why)) => {
+                self.message(why);
+                return;
+            }
+            None => return,
+        };
+        let effects = self
+            .asking
+            .ask(root.to_owned(), made.text, (agent, mention));
+        self.review_effects(effects);
+    }
+
+    /// The agent whose answer ends the thread with first comment `root`:
+    /// its last comment, when that has no ref and is by an agent the
+    /// plugin listed. Until it has, no thread ends in an answer.
+    pub(super) fn answered_by(&self, root: &str) -> Option<String> {
+        let last = *self.comments.as_ref()?.thread(root).last()?;
+        (last.reference.is_none() && self.asking.lists(&last.author)).then(|| last.author.clone())
+    }
+
+    /// Who `enter` in the text box asks, when it's to ask: the agent a
+    /// follow-up answers, else the default one.
+    pub(super) fn asks_whom(&self) -> String {
+        let answered = match self.doc.writing().map(|w| &w.at) {
+            Some(Writes::Reply(root)) => self.answered_by(root),
+            _ => None,
+        };
+        answered
+            .or_else(|| self.asking.default_agent().map(str::to_owned))
+            .unwrap_or_else(|| "the agent".to_owned())
+    }
+
+    /// The thread with first comment `root`, shown `at`, as a prompt; without
+    /// `at`, where the diff shows it, or for one just written and not placed
+    /// yet, on its own lines.
+    fn root_prompt(
+        &self,
+        root: &str,
+        at: Option<model::At>,
+    ) -> Option<Result<prompt::Prompt, &'static str>> {
+        let placed = (self.doc.threads().iter()).find(|t| t.root == root);
+        let at = if let Some(at) = at.or_else(|| placed.map(|t| t.at.clone())) {
+            at
+        } else {
+            let comments = self.comments.as_ref()?;
+            let first = comments.thread(root).first().copied()?;
+            match first.range() {
+                Some((side, lines)) => model::At::Line {
+                    side: match side {
+                        crate::review::Side::Old => Side::Old,
+                        crate::review::Side::New => Side::New,
+                    },
+                    lines,
+                },
+                None => model::At::File,
+            }
+        };
+        Some(self.thread_prompt(root, &at)?.map(|(made, _)| made))
+    }
+
+    /// `A`: someone else's comments in `thread`, an agent's, become yours:
     /// drafts that posting sends under your name.
     fn adopt(&mut self, thread: &model::Thread) {
         let ops: Vec<Op> = (thread.comments.iter())
@@ -869,6 +1233,7 @@ impl App {
             return None;
         }
         self.composing = Some(compose);
+        self.on_save = OnSave::Nothing;
         Some(Action::Compose(text.to_owned()))
     }
 

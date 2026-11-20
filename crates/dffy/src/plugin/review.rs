@@ -2,66 +2,33 @@
 //! keep the comments file in step with a code host, since dffy never
 //! touches the network. A plugin runs as one long-lived process per
 //! repository, a [`Plugin`], speaking JSON-RPC 2.0 over its stdin and
-//! stdout, one message a line; docs/plugins.md has the messages.
-//!
-//! The process has no terminal: it starts in a session of its own (through
-//! [`exec_detached`]), so a passphrase or password prompt fails instead of
-//! drawing over the viewer. Like a renderer, it runs in its own process
-//! group, killed with everything it started when dffy exits.
+//! stdout through an [`rpc::Client`]; docs/plugins.md has the messages.
 
-use std::collections::HashMap;
-use std::ffi::OsString;
-use std::fmt::Write as _;
-use std::io::{self, BufRead as _, BufReader, Read, Write as _};
+use std::io;
+#[cfg(test)]
 use std::os::unix::process::CommandExt as _;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, ExitCode, ExitStatus, Stdio};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak, mpsc};
+#[cfg(test)]
+use std::process::Command;
+#[cfg(test)]
+use std::sync::Mutex;
+use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
-use dffy_core::cache::{self, Cache};
-use rustix::process::{Pid, WaitId, WaitIdOptions};
+use dffy_core::cache::Cache;
+#[cfg(test)]
+use rustix::process::Pid;
 
+use super::Program;
 use super::json::{self, Value};
-use super::{Program, kill_group, running};
+use super::rpc::{self, Pending};
 
 /// The protocol version, sent in `initialize` and named in its answer; a
 /// plugin of another version is refused.
 pub(crate) const PROTOCOL: usize = 1;
 
-/// The first argument that makes `dffy` run a review plugin in its place,
-/// in a session of its own (see [`exec_detached`]).
-pub(crate) const DETACH: &str = "__review-plugin";
-
-/// `dffy __review-plugin <program> <args>…`: leaves the terminal's
-/// session, then becomes `program`. std starts a process in a new session
-/// only from `pre_exec`, which needs unsafe code; this costs an exec, once
-/// per plugin process.
-pub(crate) fn exec_detached(mut args: impl Iterator<Item = OsString>) -> ExitCode {
-    let _ = rustix::process::setsid();
-    let Some(program) = args.next() else {
-        return ExitCode::from(2);
-    };
-    let e = Command::new(&program).args(args).exec();
-    eprintln!("can't run {}: {e}", Path::new(&program).display());
-    ExitCode::from(127)
-}
-
-/// How long `initialize` may take when only the naming is wanted. Until
-/// its answer is cached it runs before dffy parses arguments that could
-/// name the review command, so a hung plugin can't hold every such start.
-const DESCRIBE_TIMEOUT: Duration = Duration::from_secs(2);
-
 /// How long the plugin's `doctor` may take: its checks may ask the host.
 const DOCTOR_TIMEOUT: Duration = Duration::from_secs(10);
-
-/// A process that exits this many times in a row, each within
-/// [`STEADY`] of starting, isn't started again.
-const MAX_CRASHES: u32 = 5;
-
-/// A process that ran this long before exiting starts the count of
-/// crashes over.
-const STEADY: Duration = Duration::from_secs(60);
 
 /// What a plugin's `initialize` says: the subcommand dffy adds for it, the
 /// words for what it reviews, which dffy's screens use, and the events the
@@ -184,7 +151,7 @@ impl Naming {
 /// An `initialize` answer: the naming, and what the plugin does beyond the
 /// requests every plugin answers.
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct Init {
+pub(crate) struct Init {
     naming: Naming,
     /// It pushes `head/moved` and `comments/changed` for the review dffy
     /// says it shows, so dffy tells it which, and when you're idle.
@@ -338,58 +305,22 @@ pub(crate) struct Described {
     pub naming: Naming,
 }
 
-/// The disk cache's key for `program`'s `initialize` answer: the program
-/// as installed, by path, modification time and size.
-fn cache_key(program: &Program) -> Vec<u8> {
-    let mut key = Vec::with_capacity(64);
-    key.extend_from_slice(&PROTOCOL.to_le_bytes());
-    key.extend_from_slice(program.path.as_os_str().as_encoded_bytes());
-    key.push(0);
-    key.extend_from_slice(&program.stamp.0.to_le_bytes());
-    key.extend_from_slice(&program.stamp.1.to_le_bytes());
-    key
-}
-
-/// The answer kept in the cache: the `initialize` response's line, or
-/// `{"failed":…}` with why there was none; `None` for an entry that's
-/// neither.
-fn cached_init(line: &[u8]) -> Option<Result<Naming, String>> {
-    let value = json::parse(line).ok()?;
-    if let Some(why) = value.get("failed").and_then(Value::as_str) {
-        return Some(Err(why.to_owned()));
-    }
-    Init::decode(value.get("result")?)
-        .ok()
-        .map(|i| Ok(i.naming))
-}
-
-/// `program`'s naming. Its `initialize` answer, or why it had none, is
-/// kept in the disk cache while the program is the same file, so dffy
-/// doesn't start the plugin, or wait out its timeout, on every run; a
-/// session started with the cache keeps its answer too. `fresh` asks the
-/// plugin even so, and keeps what it says, as `dffy doctor` does. A
-/// command `reserved` says is dffy's own is refused, cached or not.
+/// `program`'s naming, from its `initialize` answer as [`rpc::describe`]
+/// keeps it. A command `reserved` says is dffy's own is refused, cached
+/// or not.
 pub(crate) fn describe(
     program: &Program,
     cache: Option<&Cache>,
     fresh: bool,
     reserved: impl Fn(&str) -> bool,
 ) -> Result<Naming, String> {
-    let key = cache_key(program);
-    let cached = (cache.filter(|_| !fresh))
-        .and_then(|c| c.get(cache::Kind::Described, &key))
-        .and_then(|answer| cached_init(&answer));
-    let naming = match cached {
-        Some(answer) => answer.map_err(|why| format!("{why} (kept; dffy doctor asks again)"))?,
-        None => initialize(program, cache).inspect_err(|why| {
-            if let Some(cache) = cache {
-                let mut line = String::from("{\"failed\":");
-                json::string(&mut line, why);
-                line.push('}');
-                cache.put(cache::Kind::Described, &key, line.as_bytes());
-            }
-        })?,
-    };
+    let decode = |result: &Value| Init::decode(result).map(|i| i.naming);
+    let naming = rpc::describe((program, PROTOCOL), (cache, fresh), decode, || {
+        Plugin::start(program, (None, None), cache.cloned())
+            .map_err(|e| format!("couldn't start it: {e}"))?
+            .0
+            .wait_initialized(|init| init.naming.clone())
+    })?;
     if reserved(&naming.command) {
         return Err(format!(
             "its command '{}' is one of dffy's own",
@@ -397,25 +328,6 @@ pub(crate) fn describe(
         ));
     }
     Ok(naming)
-}
-
-/// Starts `program` for its `initialize` alone; a session started with
-/// `cache` keeps a good answer there.
-fn initialize(program: &Program, cache: Option<&Cache>) -> Result<Naming, String> {
-    let (tx, rx) = mpsc::channel();
-    let plugin = Plugin::start(program, (None, None), cache.cloned())
-        .map_err(|e| format!("couldn't start it: {e}"))?;
-    plugin.on_ready(move |naming| {
-        tx.send(naming).ok();
-    });
-    let answer = rx.recv_timeout(DESCRIBE_TIMEOUT);
-    plugin.close();
-    answer.unwrap_or_else(|_| {
-        Err(format!(
-            "its initialize took over {}s",
-            DESCRIBE_TIMEOUT.as_secs()
-        ))
-    })
 }
 
 /// One of the plugin's own checks, from its `doctor`.
@@ -782,8 +694,8 @@ fn drafts(review: &crate::review::Review) -> Vec<Value> {
         );
         Value::Object(to)
     };
-    (review.comments.iter())
-        .filter(|c| c.reference.is_none() && c.author.is_empty())
+    review
+        .drafts()
         .map(|c| {
             let fields = c
                 .to_fields()
@@ -909,11 +821,7 @@ fn session(value: &Value, reviews: Option<&Path>) -> Result<Session, String> {
 /// Your drafts in review `id`'s comments file, in `reviews`.
 fn drafts_in(reviews: &Path, id: &str) -> usize {
     let file = crate::review::review_file(reviews, id);
-    crate::review::read(&file).map_or(0, |review| {
-        (review.comments.iter())
-            .filter(|c| c.reference.is_none() && c.author.is_empty())
-            .count()
-    })
+    crate::review::read(&file).map_or(0, |review| review.drafts().count())
 }
 
 fn listed(value: &Value) -> Result<Listed, String> {
@@ -1019,39 +927,26 @@ fn answer(
             });
             said
         }
-        "doctor" => {
-            let checks = result.get("checks").and_then(Value::as_array);
-            let checks = checks.ok_or("its doctor has no checks")?;
-            vec![Said::Checks(
-                checks
-                    .iter()
-                    .map(|check| {
-                        Ok(Check {
-                            name: text(check, "name").ok_or("a check without a name")?,
-                            ok: check.get("ok") == Some(&Value::Bool(true)),
-                            detail: text(check, "detail").unwrap_or_default(),
-                        })
-                    })
-                    .collect::<Result<_, String>>()?,
-            )]
-        }
+        "doctor" => vec![Said::Checks(checks(result)?)],
         _ => Vec::new(),
     })
 }
 
-/// JSON-RPC's code for a method the server doesn't have.
-const METHOD_NOT_FOUND: f64 = -32601.0;
-
-/// The words for a failed request's error object.
-fn error_message(name: &str, method: &str, error: &Value) -> String {
-    if error.get("code") == Some(&Value::Number(METHOD_NOT_FOUND)) {
-        return format!("{name} doesn't know {method}; it may be older than this dffy");
-    }
-    error
-        .get("message")
-        .and_then(Value::as_str)
-        .unwrap_or("an error without a message")
-        .to_owned()
+/// The checks of a `doctor` result, a review plugin's or the agent
+/// plugin's.
+pub(crate) fn checks(result: &Value) -> Result<Vec<Check>, String> {
+    let checks = result.get("checks").and_then(Value::as_array);
+    let checks = checks.ok_or("its doctor has no checks")?;
+    checks
+        .iter()
+        .map(|check| {
+            Ok(Check {
+                name: text(check, "name").ok_or("a check without a name")?,
+                ok: check.get("ok") == Some(&Value::Bool(true)),
+                detail: text(check, "detail").unwrap_or_default(),
+            })
+        })
+        .collect()
 }
 
 type Deliver = Box<dyn FnMut(Said) -> bool + Send>;
@@ -1060,64 +955,50 @@ type Deliver = Box<dyn FnMut(Said) -> bool + Send>;
 /// answers requests and pushes what changes on the host. Requests made
 /// before it has initialized wait for it. Cloning shares the process.
 #[derive(Clone)]
-pub(crate) struct Plugin(Arc<Shared>);
+pub(crate) struct Plugin(rpc::Client<Init, PluginState, Ask>);
 
-struct Shared {
-    /// `dffy-review-<name>`, for messages.
-    name: String,
-    /// A new process's command.
-    command: Box<dyn Fn() -> io::Result<Command> + Send + Sync>,
-    /// Where its `initialize` answer is kept, under which key.
-    cache: Option<(Cache, Vec<u8>)>,
+/// A request made, to cancel: it still ends with its `Done`, which says so.
+pub(crate) type Run = rpc::Run<Init, PluginState, Ask>;
+
+type Shared = rpc::Shared<Init, PluginState, Ask>;
+type Inner = rpc::Inner<Init, PluginState, Ask>;
+type Guard<'a> = rpc::Guard<'a, Init, PluginState, Ask>;
+
+const KIND: rpc::Kind<Init, PluginState, Ask> = rpc::Kind {
+    thread: "dffy-review",
+    protocol: PROTOCOL,
+    init_params: |_| String::new(),
+    // What it starts is in its group.
+    grace: Duration::ZERO,
+    initialized,
+    answered: response,
+    notified,
+    failed: |mut pending, why| {
+        pending.deliver(Said::Done(Err(why)));
+    },
+};
+
+/// What dffy keeps of a review plugin, under its client's lock.
+pub(crate) struct PluginState {
     /// Where its reviews' comments files are, in a repository.
     reviews: Option<PathBuf>,
-    state: Mutex<Inner>,
-}
-
-struct Inner {
-    phase: Phase,
-    /// The process now; `None` while one restarts.
-    process: Option<Process>,
-    next_id: u64,
-    pending: HashMap<u64, Pending>,
-    /// Requests made before the process initialized, by id, in order.
-    queued: Vec<(u64, Line)>,
     /// The review dffy shows, for a plugin that watches.
     watch: Option<String>,
     idle: bool,
-    /// Exits in a row, each soon after its start.
-    crashes: u32,
-    /// The naming, once a process initialized.
-    naming: Option<Naming>,
-    on_ready: Option<OnReady>,
     on_push: Option<Box<dyn FnMut(Push) -> bool + Send>>,
     /// Pushes that came before anything took them, as a `prepare` started
     /// before the viewer may bring.
     pushed: Vec<Push>,
 }
 
-type OnReady = Box<dyn FnOnce(Result<Naming, String>) + Send>;
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum Phase {
-    Starting,
-    /// Initialized; it watches when `true`.
-    Ready(bool),
-    /// It won't run again: requests fail with this.
-    Failed(String),
-    Closed,
+/// Whether the plugin is initialized and watches, so it's told what dffy
+/// shows and whether you're idle as that changes.
+fn watching(inner: &Inner) -> bool {
+    inner.ready() && inner.init.as_ref().is_some_and(|i| i.watch)
 }
 
-struct Process {
-    leader: Pid,
-    /// Lines for its stdin, written by a thread of its own.
-    input: mpsc::Sender<Line>,
-    /// Its `initialize` request's id.
-    init: u64,
-    started: Instant,
-}
-
-struct Pending {
+/// A review request, waiting for its answer.
+pub(crate) struct Ask {
     method: &'static str,
     /// The comments file its `comments/apply` go to: the review's.
     comments: Option<PathBuf>,
@@ -1127,48 +1008,23 @@ struct Pending {
     event: Option<String>,
     /// Why operations it sent couldn't be written: it ends saying so.
     unwritten: Option<String>,
-    /// dffy ended it before the plugin answered, and asked the plugin to
-    /// stop: nothing more is delivered, but its operations are still
-    /// written until it answers, so a post's refs aren't lost.
-    ended: bool,
     /// A post's lock on its review (see [`crate::review::lock_post`]),
     /// let go of as it ends, however it does.
     posting: Option<std::fs::File>,
     deliver: Deliver,
 }
 
-impl Pending {
+impl Pending<Ask> {
     /// Hands `said` on, unless the request ended here; whether it's still
-    /// wanted. A post lets go of its lock before its `Done` is handed on,
-    /// so whoever hears of the end can post again at once.
+    /// wanted. An ended request's operations are still written until the
+    /// plugin answers, so a post's refs aren't lost. A post lets go of its
+    /// lock before its `Done` is handed on, so whoever hears of the end can
+    /// post again at once.
     fn deliver(&mut self, said: Said) -> bool {
         if matches!(said, Said::Done(_)) {
-            self.posting = None;
+            self.request.posting = None;
         }
-        !self.ended && (self.deliver)(said)
-    }
-}
-
-/// A request made, to cancel.
-#[derive(Debug)]
-pub(crate) struct Run {
-    plugin: Weak<Shared>,
-    id: u64,
-}
-
-impl std::fmt::Debug for Shared {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.name)
-    }
-}
-
-impl Run {
-    /// Asks the plugin to stop the request; it still ends with its
-    /// `Done`, which says so.
-    pub(crate) fn cancel(&self) {
-        if let Some(shared) = self.plugin.upgrade() {
-            Plugin(shared).cancel(self.id);
-        }
+        !self.ended && (self.request.deliver)(said)
     }
 }
 
@@ -1181,76 +1037,47 @@ impl Plugin {
         (root, reviews): (Option<&Path>, Option<PathBuf>),
         cache: Option<Cache>,
     ) -> io::Result<Self> {
-        let (path, root) = (program.path.clone(), root.map(Path::to_owned));
-        let command = move || {
-            let exe = std::env::current_exe()?;
-            let mut command = Command::new(&exe);
-            command.arg(DETACH).arg(&path).env("DFFY", exe);
-            if let Some(root) = &root {
-                command.current_dir(root);
-            }
-            Ok(command)
-        };
         Self::spawn(
             format!("{}{}", super::REVIEW_PREFIX, program.name),
-            Box::new(command),
-            (reviews, cache.map(|c| (c, cache_key(program)))),
+            rpc::detached(program, root),
+            (
+                reviews,
+                cache.map(|c| (c, rpc::cache_key(PROTOCOL, program))),
+            ),
         )
     }
 
-    /// Starts the process `command` makes, which must put it in a process
-    /// group of its own.
     fn spawn(
         name: String,
-        command: Box<dyn Fn() -> io::Result<Command> + Send + Sync>,
+        command: rpc::MakeCommand,
         (reviews, cache): (Option<PathBuf>, Option<(Cache, Vec<u8>)>),
     ) -> io::Result<Self> {
-        let shared = Arc::new(Shared {
-            name,
-            command,
-            cache,
+        let state = PluginState {
             reviews,
-            state: Mutex::new(Inner {
-                phase: Phase::Starting,
-                process: None,
-                next_id: 0,
-                pending: HashMap::new(),
-                queued: Vec::new(),
-                watch: None,
-                idle: false,
-                crashes: 0,
-                naming: None,
-                on_ready: None,
-                on_push: None,
-                pushed: Vec::new(),
-            }),
-        });
-        launch(&shared)?;
-        Ok(Self(shared))
+            watch: None,
+            idle: false,
+            on_push: None,
+            pushed: Vec::new(),
+        };
+        rpc::Client::spawn(name, command, cache, KIND, state).map(Self)
     }
 
     /// Hands the naming to `ready` once the plugin has initialized, or why
     /// it can't: now, if it has.
     pub(crate) fn on_ready(&self, ready: impl FnOnce(Result<Naming, String>) + Send + 'static) {
-        let mut inner = self.0.lock();
-        match (&inner.phase, &inner.naming) {
-            (Phase::Failed(e), _) => ready(Err(e.clone())),
-            (Phase::Closed, _) => {}
-            (_, Some(naming)) => ready(Ok(naming.clone())),
-            (_, None) => inner.on_ready = Some(Box::new(ready)),
-        }
+        (self.0).on_ready(move |init| ready(init.map(|i| i.naming.clone())));
     }
 
     /// Hands what the plugin pushes to `push`, what it pushed before first,
     /// until it returns false.
     pub(crate) fn on_push(&self, mut push: impl FnMut(Push) -> bool + Send + 'static) {
         let mut inner = self.0.lock();
-        for pushed in std::mem::take(&mut inner.pushed) {
+        for pushed in std::mem::take(&mut inner.kind.pushed) {
             if !push(pushed) {
                 return;
             }
         }
-        inner.on_push = Some(Box::new(push));
+        inner.kind.on_push = Some(Box::new(push));
     }
 
     /// Sends `request`, and each thing it says to `deliver` from a thread of
@@ -1261,20 +1088,16 @@ impl Plugin {
     pub(crate) fn request(
         &self,
         request: &Request,
-        mut deliver: impl FnMut(Said) -> bool + Send + 'static,
+        deliver: impl FnMut(Said) -> bool + Send + 'static,
     ) -> Run {
-        let mut inner = self.0.lock();
-        inner.next_id += 1;
-        let id = inner.next_id;
-        let run = Run {
-            plugin: Arc::downgrade(&self.0),
-            id,
+        let comments = {
+            let inner = self.0.lock();
+            (request.review())
+                .zip(inner.kind.reviews.as_deref())
+                .map(|(review, dir)| crate::review::review_file(dir, review))
         };
-        let comments = (request.review())
-            .zip(self.0.reviews.as_deref())
-            .map(|(review, dir)| crate::review::review_file(dir, review));
-        let (shared, asked, file) = (Arc::downgrade(&self.0), request.clone(), comments.clone());
-        let line: Line = Box::new(move || {
+        let (asked, file) = (request.clone(), comments.clone());
+        let params = move |shared: &Shared, id: u64| {
             // Taken before the drafts are read, and held until the post ends:
             // two viewers posting one review would each post its drafts.
             let posting = match (&asked, file.as_deref()) {
@@ -1286,321 +1109,137 @@ impl Plugin {
                     .map(|params| (params, posting))
                     .map_err(|e| format!("the comments: {e}"))
             });
-            let shared = shared.upgrade()?;
             let mut inner = shared.lock();
             match params {
                 Ok(((params, sent), posting)) => {
                     if let Some(pending) = inner.pending.get_mut(&id) {
-                        pending.sent = sent;
-                        pending.posting = posting;
+                        pending.request.sent = sent;
+                        pending.request.posting = posting;
                     }
-                    Some(message(Some(id), asked.method(), &params))
+                    Some(params)
                 }
                 Err(e) => {
                     if let Some(mut pending) = inner.pending.remove(&id) {
-                        (pending.deliver)(Said::Done(Err(e)));
+                        (pending.request.deliver)(Said::Done(Err(e)));
                     }
                     None
                 }
             }
-        });
-        match &inner.phase {
-            Phase::Failed(e) => {
-                deliver(Said::Done(Err(e.clone())));
-                return run;
-            }
-            Phase::Closed => {
-                deliver(Said::Done(Err(format!("{} was stopped", self.0.name))));
-                return run;
-            }
-            Phase::Ready(_) => inner.send(line),
-            Phase::Starting => inner.queued.push((id, line)),
-        }
-        inner.pending.insert(
-            id,
-            Pending {
-                method: request.method(),
-                comments,
-                sent: Sent::default(),
-                event: match request {
-                    Request::Post { event, .. } => Some(event.clone()),
-                    _ => None,
-                },
-                unwritten: None,
-                ended: false,
-                posting: None,
-                deliver: Box::new(deliver),
+        };
+        let ask = Ask {
+            method: request.method(),
+            comments,
+            sent: Sent::default(),
+            event: match request {
+                Request::Post { event, .. } => Some(event.clone()),
+                _ => None,
             },
-        );
-        run
-    }
-
-    fn cancel(&self, id: u64) {
-        let mut inner = self.0.lock();
-        if inner.pending.get(&id).is_none_or(|p| p.ended) {
-            return;
-        }
-        if let Some(at) = inner.queued.iter().position(|(q, _)| *q == id) {
-            drop(inner.queued.remove(at));
-            if let Some(mut pending) = inner.pending.remove(&id) {
-                (pending.deliver)(Said::Done(Err("cancelled".to_owned())));
-            }
-            return;
-        }
-        inner.send(text_line(cancel_message(id)));
+            unwritten: None,
+            posting: None,
+            deliver: Box::new(deliver),
+        };
+        self.0.request(request.method(), ask, params)
     }
 
     /// Tells a plugin that watches which review dffy shows now, if any.
     pub(crate) fn watch(&self, review: Option<&str>) {
         let mut inner = self.0.lock();
-        if inner.watch.as_deref() == review {
+        if inner.kind.watch.as_deref() == review {
             return;
         }
-        inner.watch = review.map(str::to_owned);
-        if inner.phase == Phase::Ready(true) {
-            let line = watch_message(inner.watch.as_deref());
-            inner.send(text_line(line));
+        inner.kind.watch = review.map(str::to_owned);
+        if watching(&inner) {
+            inner.notify("watch", &watch_params(inner.kind.watch.as_deref()));
         }
     }
 
     /// Tells a plugin that watches whether you're away, when that changes.
     pub(crate) fn idle(&self, idle: bool) {
         let mut inner = self.0.lock();
-        if inner.idle == idle {
+        if inner.kind.idle == idle {
             return;
         }
-        inner.idle = idle;
-        if inner.phase == Phase::Ready(true) {
-            inner.send(text_line(idle_message(idle)));
+        inner.kind.idle = idle;
+        if watching(&inner) {
+            inner.notify("idle/changed", &idle_params(idle));
         }
     }
 
     /// Asks the plugin to shut down and exit, then kills it with whatever
     /// it started: nothing it does from here on is waited for.
     pub(crate) fn close(&self) {
-        let mut inner = self.0.lock();
-        inner.phase = Phase::Closed;
-        inner.queued.clear();
-        if let Some(process) = inner.process.take() {
-            let id = inner.next_id + 1;
-            inner.next_id = id;
-            let input = &process.input;
-            input
-                .send(text_line(message(Some(id), "shutdown", "{}")))
-                .ok();
-            input.send(text_line(message(None, "exit", "{}"))).ok();
-            kill_group(process.leader);
-            // Before the detached process leaves dffy's group, it has none.
-            rustix::process::kill_process(process.leader, rustix::process::Signal::KILL).ok();
-        }
+        self.0.close();
     }
 }
 
-impl Shared {
-    fn lock(&self) -> MutexGuard<'_, Inner> {
-        self.state.lock().unwrap_or_else(PoisonError::into_inner)
-    }
-}
-
-/// A message for the plugin's stdin, made on the thread that writes it,
-/// as one with a comments file has the file read; `None` sends nothing.
-type Line = Box<dyn FnOnce() -> Option<String> + Send>;
-
-fn text_line(text: String) -> Line {
-    Box::new(move || Some(text))
-}
-
-impl Inner {
-    fn send(&self, line: Line) {
-        if let Some(process) = &self.process {
-            process.input.send(line).ok();
-        }
-    }
-
-    /// Ends every request with `why`.
-    fn fail_all(&mut self, why: &str) {
-        self.queued.clear();
-        for (_, mut pending) in self.pending.drain() {
-            pending.deliver(Said::Done(Err(why.to_owned())));
-        }
-    }
-
-    /// Ends request `id` here, before the plugin answers it: the plugin is
-    /// asked to stop, and what it sends until it answers is still written.
-    fn end(&mut self, id: u64) {
-        if let Some(pending) = self.pending.get_mut(&id).filter(|p| !p.ended) {
-            pending.ended = true;
-            self.send(text_line(cancel_message(id)));
-        }
-    }
-}
-
-fn cancel_message(id: u64) -> String {
-    message(None, "$/cancelRequest", &format!("{{\"id\":{id}}}"))
-}
-
-/// A JSON-RPC message: a request with `id`, else a notification.
-fn message(id: Option<u64>, method: &str, params: &str) -> String {
-    let mut out = String::from("{\"jsonrpc\":\"2.0\",");
-    if let Some(id) = id {
-        let _ = write!(out, "\"id\":{id},");
-    }
-    out.push_str("\"method\":");
-    json::string(&mut out, method);
-    let _ = write!(out, ",\"params\":{params}}}");
-    out
-}
-
-fn watch_message(review: Option<&str>) -> String {
+fn watch_params(review: Option<&str>) -> String {
     let mut params = String::from("{\"id\":");
     match review {
         Some(id) => json::string(&mut params, id),
         None => params.push_str("null"),
     }
     params.push('}');
-    message(None, "watch", &params)
+    params
 }
 
-fn idle_message(idle: bool) -> String {
-    message(None, "idle/changed", &format!("{{\"idle\":{idle}}}"))
+fn idle_params(idle: bool) -> String {
+    format!("{{\"idle\":{idle}}}")
 }
 
-/// Starts a process for `shared` and sends it `initialize`; its reader
-/// takes it from there.
-fn launch(shared: &Arc<Shared>) -> io::Result<()> {
-    let mut child = (shared.command)()?
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()?;
-    let leader = Pid::from_child(&child);
-    {
-        let mut running = running();
-        if running.stopped {
-            drop(running);
-            super::kill(&mut child);
-            return Err(io::Error::other("dffy is exiting"));
+/// The answer to `initialize`, for a process that's ready.
+fn initialized(inner: &mut Inner, result: &Value) -> Result<Init, String> {
+    let init = Init::decode(result)?;
+    // What dffy shows before what it asks, so the requests are answered
+    // knowing it.
+    if init.watch {
+        if inner.kind.watch.is_some() {
+            inner.notify("watch", &watch_params(inner.kind.watch.as_deref()));
         }
-        running.groups.push(leader);
-    }
-    let (Some(mut stdin), Some(stdout), Some(stderr)) =
-        (child.stdin.take(), child.stdout.take(), child.stderr.take())
-    else {
-        super::kill(&mut child);
-        return Err(io::Error::other("no pipes"));
-    };
-    let (input, lines) = mpsc::channel::<Line>();
-    // A plugin that stops reading blocks this thread, never the caller; nor
-    // does reading a comments file for a request.
-    let writer = std::thread::Builder::new()
-        .name("dffy-review-in".into())
-        .spawn(move || {
-            for line in lines {
-                let Some(mut line) = line() else { continue };
-                line.push('\n');
-                if stdin.write_all(line.as_bytes()).is_err() {
-                    return;
-                }
-            }
-        });
-    let last_said = writer.and_then(|_| {
-        std::thread::Builder::new()
-            .name("dffy-review-err".into())
-            .spawn(move || last_line(stderr))
-    });
-    let last_said = match last_said {
-        Ok(thread) => thread,
-        Err(e) => {
-            super::kill(&mut child);
-            return Err(e);
+        if inner.kind.idle {
+            inner.notify("idle/changed", &idle_params(true));
         }
-    };
-    let mut inner = shared.lock();
-    // Closed while this one was starting, as after a crash: it's not kept.
-    if inner.phase == Phase::Closed {
-        drop(inner);
-        super::kill(&mut child);
-        return Err(io::Error::other(format!("{} was stopped", shared.name)));
     }
-    inner.next_id += 1;
-    let init = inner.next_id;
-    let mut params =
-        format!("{{\"protocol\":{PROTOCOL},\"client\":{{\"name\":\"dffy\",\"version\":");
-    json::string(&mut params, env!("CARGO_PKG_VERSION"));
-    params.push_str("}}");
-    input
-        .send(text_line(message(Some(init), "initialize", &params)))
-        .ok();
-    inner.process = Some(Process {
-        leader,
-        input,
-        init,
-        started: Instant::now(),
+    Ok(init)
+}
+
+/// A response to `pending`'s request: what it says, then its `Done`.
+fn response(shared: &Shared, inner: Guard<'_>, mut pending: Pending<Ask>, value: &Value) {
+    let submits = pending.request.event.as_ref().is_some_and(|event| {
+        (inner.init.iter())
+            .flat_map(|i| &i.naming.events)
+            .any(|e| e.id == *event && e.submits)
     });
-    inner.phase = Phase::Starting;
+    let reviews = inner.kind.reviews.clone();
+    // What the answer reads, it reads without holding up requests.
     drop(inner);
-    let reading = Arc::clone(shared);
-    let reader = std::thread::Builder::new()
-        .name("dffy-review".into())
-        .spawn(move || read(&reading, stdout, child, leader, last_said));
-    if let Err(e) = reader {
-        kill_group(leader);
-        return Err(e);
-    }
-    Ok(())
-}
-
-/// Reads the process's messages until it exits, then ends what it left
-/// unanswered and starts another, unless it shouldn't.
-fn read(
-    shared: &Arc<Shared>,
-    stdout: impl Read,
-    mut child: Child,
-    leader: Pid,
-    last_said: std::thread::JoinHandle<Option<String>>,
-) {
-    let mut failure = None;
-    for line in BufReader::new(stdout).split(b'\n') {
-        let Ok(line) = line else { break };
-        if line.trim_ascii().is_empty() {
-            continue;
-        }
-        if let Err(e) = handle(shared, &line) {
-            let why = format!("{}: {e}", shared.name);
-            let mut inner = shared.lock();
-            // Before it initialized, it's refused rather than crashed.
-            if inner.phase == Phase::Starting {
-                inner.phase = Phase::Failed(why.clone());
-                if let Some(ready) = inner.on_ready.take() {
-                    ready(Err(why.clone()));
-                }
-            }
-            drop(inner);
-            failure = Some(why);
-            kill_group(leader);
+    let said = answered(
+        (shared.name(), reviews.as_deref()),
+        &mut pending.request,
+        value,
+        submits,
+    );
+    for said in said {
+        if !pending.deliver(said) {
             break;
         }
     }
-    let status = reap(&mut child, leader);
-    let stderr = last_said.join().ok().flatten();
-    let why = failure.unwrap_or_else(|| {
-        let said = stderr.map(|s| format!(": {s}")).unwrap_or_default();
-        let how = status.map_or_else(|| "was killed".to_owned(), super::exited);
-        format!("{} {how}{said}", shared.name)
-    });
-    exited(shared, &why);
 }
 
-/// What a response to `pending`'s request says, then its `Done`: failed
-/// when what it sent couldn't be written. A post whose event `submits`
-/// that ends well leaves nothing in the review for you only.
-fn answered(shared: &Shared, pending: &mut Pending, value: &Value, submits: bool) -> Vec<Said> {
-    let mut said = read_answer(shared, pending, value);
-    if let (Some(why), Some(done)) = (pending.unwritten.take(), said.last_mut()) {
+/// What a response to `ask` says, then its `Done`: failed when what it
+/// sent couldn't be written. A post whose event `submits` that ends well
+/// leaves nothing in the review for you only.
+fn answered(
+    (name, reviews): (&str, Option<&Path>),
+    ask: &mut Ask,
+    value: &Value,
+    submits: bool,
+) -> Vec<Said> {
+    let mut said = read_answer((name, reviews), ask, value);
+    if let (Some(why), Some(done)) = (ask.unwritten.take(), said.last_mut()) {
         *done = Said::Done(Err(why));
     }
     if let (true, Some(file), Some(done @ Said::Done(Ok(())))) =
-        (submits, &pending.comments, said.last_mut())
+        (submits, &ask.comments, said.last_mut())
         && let Err(e) = crate::review::submitted(file)
     {
         *done = Said::Done(Err(format!(
@@ -1610,17 +1249,18 @@ fn answered(shared: &Shared, pending: &mut Pending, value: &Value, submits: bool
     said
 }
 
-/// What a response to `pending`'s request says, as the plugin answered.
-fn read_answer(shared: &Shared, pending: &Pending, value: &Value) -> Vec<Said> {
-    let known = (shared.reviews.as_deref(), pending.sent);
-    let (name, method) = (&shared.name, pending.method);
+/// What a response to `ask` says, as the plugin answered; `name` is the
+/// plugin's, and `reviews` its directory of comments files.
+fn read_answer((name, reviews): (&str, Option<&Path>), ask: &Ask, value: &Value) -> Vec<Said> {
+    let known = (reviews, ask.sent);
+    let method = ask.method;
     match (value.get("result"), value.get("error")) {
         (_, Some(error)) if *error != Value::Null => {
             let mut said = error
                 .get("data")
                 .and_then(|data| answer(method, data, known).ok())
                 .unwrap_or_default();
-            said.push(Said::Done(Err(error_message(name, method, error))));
+            said.push(Said::Done(Err(rpc::error_message(name, method, error))));
             said
         }
         (Some(result), _) => match answer(method, result, known) {
@@ -1648,228 +1288,69 @@ fn write_comments(shared: &Shared, (id, file): (u64, &Path), ops: Option<&Value>
         return;
     };
     let mut inner = shared.lock();
-    let Some(pending) = inner.pending.get_mut(&id).filter(|p| p.unwritten.is_none()) else {
+    let Some(pending) = (inner.pending.get_mut(&id)).filter(|p| p.request.unwritten.is_none())
+    else {
         return;
     };
-    pending.unwritten = Some(format!("{}'s comments not written: {e}", shared.name));
+    pending.request.unwritten = Some(format!("{}'s comments not written: {e}", shared.name()));
     if !pending.ended {
-        inner.send(text_line(cancel_message(id)));
+        inner.send_cancel(id);
     }
 }
 
-/// Takes one message from the plugin. An error is one dffy can't trust,
-/// which stops the process.
-fn handle(shared: &Shared, line: &[u8]) -> Result<(), String> {
-    let value = json::parse(line)?;
-    if !matches!(value, Value::Object(_)) {
-        return Err("a message isn't a JSON object".to_owned());
+/// A notification from the plugin: about a request, or pushed.
+fn notified(shared: &Shared, mut inner: Guard<'_>, method: &str, params: &Value) {
+    let request = params.get("request").and_then(rpc::request_id);
+    if let (Some(id), "comments/apply") = (request, method) {
+        let Some(file) = (inner.pending.get(&id)).and_then(|p| p.request.comments.clone()) else {
+            return;
+        };
+        drop(inner);
+        write_comments(shared, (id, &file), params.get("ops"));
+        return;
     }
-    let mut inner = shared.lock();
-    let reviews = shared.reviews.as_deref();
-    match (value.get("id"), value.get("method").and_then(Value::as_str)) {
-        // A request of the plugin's, which dffy answers none of, or neither.
-        (Some(_), Some(_)) | (None, None) => {}
-        (Some(id), None) => {
-            let Some(id) = id.as_usize().and_then(|id| u64::try_from(id).ok()) else {
-                return Ok(());
+    let said = match method {
+        "progress" => text(params, "progress").map(Said::Progress),
+        "session" => {
+            let Some(session) = params.get("session") else {
+                return;
             };
-            if inner.process.as_ref().is_some_and(|p| p.init == id) {
-                return initialized(shared, &mut inner, &value);
-            }
-            let Some(mut pending) = inner.pending.remove(&id) else {
-                return Ok(());
-            };
-            let submits = pending.event.as_ref().is_some_and(|event| {
-                (inner.naming.iter())
-                    .flat_map(|n| &n.events)
-                    .any(|e| e.id == *event && e.submits)
-            });
-            // What the answer reads, it reads without holding up requests.
-            drop(inner);
-            for said in answered(shared, &mut pending, &value, submits) {
-                if !pending.deliver(said) {
-                    break;
-                }
-            }
+            Some(
+                match self::session(session, inner.kind.reviews.as_deref()) {
+                    Ok(session) => Said::Session(session),
+                    Err(e) => Said::Done(Err(format!("{}: {e}", shared.name()))),
+                },
+            )
         }
-        (None, Some(method)) => {
-            let params = value.get("params").unwrap_or(&Value::Null);
-            let request = params
-                .get("request")
-                .and_then(Value::as_usize)
-                .and_then(|id| u64::try_from(id).ok());
-            if let (Some(id), "comments/apply") = (request, method) {
-                let Some(file) = inner.pending.get(&id).and_then(|p| p.comments.clone()) else {
-                    return Ok(());
-                };
-                drop(inner);
-                write_comments(shared, (id, &file), params.get("ops"));
-                return Ok(());
-            }
-            let said = match method {
-                "progress" => text(params, "progress").map(Said::Progress),
-                "session" => {
-                    let Some(session) = params.get("session") else {
-                        return Ok(());
-                    };
-                    Some(match self::session(session, reviews) {
-                        Ok(session) => Said::Session(session),
-                        Err(e) => Said::Done(Err(format!("{}: {e}", shared.name))),
-                    })
-                }
-                _ => None,
-            };
-            if let (Some(said), Some(id)) = (said, request) {
-                let done = matches!(said, Said::Done(_));
-                if let Some(pending) = inner.pending.get_mut(&id)
-                    && (!pending.deliver(said) || done)
-                {
-                    inner.end(id);
-                }
-                return Ok(());
-            }
-            let review = || text(params, "id");
-            let push = match method {
-                "head/moved" => review()
-                    .zip(params.get("head").and_then(commit))
-                    .map(|(id, head)| Push::HeadMoved { id, head }),
-                "comments/changed" => review().map(|id| Push::CommentsChanged { id }),
-                "log" => text(params, "message").map(Push::Log),
-                _ => None,
-            };
-            match (push, &mut inner.on_push) {
-                (Some(push), Some(on_push)) => {
-                    if !on_push(push) {
-                        inner.on_push = None;
-                    }
-                }
-                (Some(push), None) => inner.pushed.push(push),
-                (None, _) => {}
-            }
-        }
-    }
-    Ok(())
-}
-
-/// The answer to `initialize`: the process is ready for what waited, or
-/// refused, and isn't started again.
-fn initialized(shared: &Shared, inner: &mut Inner, value: &Value) -> Result<(), String> {
-    let init = match (value.get("result"), value.get("error")) {
-        (_, Some(error)) if *error != Value::Null => {
-            Err(error_message(&shared.name, "initialize", error))
-        }
-        (Some(result), _) => Init::decode(result),
-        (None, _) => Err("its initialize answered nothing".to_owned()),
+        _ => None,
     };
-    match init {
-        Ok(init) => {
-            if let Some((cache, key)) = &shared.cache {
-                cache.put(cache::Kind::Described, key, value_line(value).as_bytes());
-            }
-            inner.phase = Phase::Ready(init.watch);
-            // What dffy shows before what it asks, so the requests are
-            // answered knowing it.
-            if init.watch {
-                if inner.watch.is_some() {
-                    inner.send(text_line(watch_message(inner.watch.as_deref())));
-                }
-                if inner.idle {
-                    inner.send(text_line(idle_message(true)));
-                }
-            }
-            for (_, line) in std::mem::take(&mut inner.queued) {
-                inner.send(line);
-            }
-            if let Some(ready) = inner.on_ready.take() {
-                ready(Ok(init.naming.clone()));
-            }
-            inner.naming = Some(init.naming);
-            Ok(())
+    if let (Some(said), Some(id)) = (said, request) {
+        let done = matches!(said, Said::Done(_));
+        if let Some(pending) = inner.pending.get_mut(&id)
+            && (!pending.deliver(said) || done)
+        {
+            inner.end(id);
         }
-        Err(e) => {
-            inner.phase = Phase::Failed(e.clone());
-            inner.fail_all(&e);
-            if let Some(ready) = inner.on_ready.take() {
-                ready(Err(e.clone()));
-            }
-            Err(e)
-        }
-    }
-}
-
-/// The `initialize` response as the cache keeps it: its result alone, in
-/// a response's shape.
-fn value_line(value: &Value) -> String {
-    let mut out = String::from("{\"result\":");
-    json::write(&mut out, value.get("result").unwrap_or(&Value::Null));
-    out.push('}');
-    out
-}
-
-/// The process is gone: what it left unanswered ends with `why`, and
-/// another starts after a pause that doubles with each crash in a row,
-/// unless dffy is exiting, the plugin was closed or refused, or it keeps
-/// crashing.
-fn exited(shared: &Arc<Shared>, why: &str) {
-    let mut inner = shared.lock();
-    let uptime = inner.process.take().map(|p| p.started.elapsed());
-    inner.fail_all(why);
-    if !matches!(inner.phase, Phase::Starting | Phase::Ready(_)) || running().stopped {
         return;
     }
-    inner.crashes = if uptime.is_some_and(|up| up >= STEADY) {
-        1
-    } else {
-        inner.crashes + 1
+    let review = || text(params, "id");
+    let push = match method {
+        "head/moved" => review()
+            .zip(params.get("head").and_then(commit))
+            .map(|(id, head)| Push::HeadMoved { id, head }),
+        "comments/changed" => review().map(|id| Push::CommentsChanged { id }),
+        "log" => text(params, "message").map(Push::Log),
+        _ => None,
     };
-    if inner.crashes > MAX_CRASHES {
-        let e = format!("{why}; not started again after {MAX_CRASHES} exits in a row");
-        inner.phase = Phase::Failed(e.clone());
-        if let Some(ready) = inner.on_ready.take() {
-            ready(Err(e));
+    match (push, &mut inner.kind.on_push) {
+        (Some(push), Some(on_push)) => {
+            if !on_push(push) {
+                inner.kind.on_push = None;
+            }
         }
-        return;
+        (Some(push), None) => inner.kind.pushed.push(push),
+        (None, _) => {}
     }
-    inner.phase = Phase::Starting;
-    let pause = Duration::from_secs(1 << (inner.crashes - 1));
-    drop(inner);
-    std::thread::sleep(pause);
-    if shared.lock().phase != Phase::Starting {
-        return;
-    }
-    if let Err(e) = launch(shared) {
-        let mut inner = shared.lock();
-        let e = format!("couldn't start {} again: {e}", shared.name);
-        inner.fail_all(&e);
-        if inner.phase == Phase::Starting {
-            inner.phase = Phase::Failed(e);
-        }
-    }
-}
-
-/// Waits for the process to exit, then kills what it left in its group and
-/// reaps it in one step under the list's lock, so [`super::stop_all`]
-/// never signals a reused id.
-fn reap(child: &mut Child, leader: Pid) -> Option<ExitStatus> {
-    let exited = WaitIdOptions::EXITED | WaitIdOptions::NOWAIT;
-    while let Err(rustix::io::Errno::INTR) = rustix::process::waitid(WaitId::Pid(leader), exited) {}
-    let mut running = running();
-    kill_group(leader);
-    running.groups.retain(|&g| g != leader);
-    child.wait().ok()
-}
-
-/// The last line a stream holds that isn't blank, read to its end.
-fn last_line(stream: impl Read) -> Option<String> {
-    let mut last = None;
-    for line in BufReader::new(stream).split(b'\n') {
-        let Ok(line) = line else { break };
-        let line = String::from_utf8_lossy(line.trim_ascii());
-        if !line.is_empty() {
-            last = Some(line.chars().take(200).collect());
-        }
-    }
-    last
 }
 
 #[cfg(test)]

@@ -1,5 +1,5 @@
 ---
-source: crates/dffy/src/tui/app/tests.rs
+source: crates/dffy/src/tui/app/tests/command_panel.rs
 expression: screen(&mut phone)
 ---
 ┌─ commands ───────────────────────── esc close ─┐
@@ -17,15 +17,15 @@ expression: screen(&mut phone)
 │ [ ] Syntax diff                           d   ┃│
 │ [ ] Rendered view                         r   ┃│
 │     More context                          x   ┃│
-│ [ ] Whole file                            X   ┃│
-│     Indicators ‹ classic ›                K   ┃│
+│ [ ] Whole file                            X   ││
+│     Indicators ‹ classic ›                K   ││
 │     Modified lines ‹ changed ›            %   ││
 │ [x] Syntax highlighting                   *   ││
 │ [ ] Ignore whitespace                     I   ││
 │ [x] Line numbers                          #   ││
 │ [x] Hunk headers                          @   ││
 │     Status bar ‹ bottom ›                 B   ││
-│     Theme ‹ default ›                     a   ││
+│     Theme ‹ default ›                     ~   ││
 │                                               ││
 │ Copy                                          ││
 │     Copy selection                        y   ││

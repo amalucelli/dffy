@@ -538,6 +538,8 @@ fn running_out_of_watches_falls_back_to_polling() {
     let runtime = Runtime::new();
     let doctor = runtime
         .dffy(&["--color=never", "doctor"])
+        // Without the user's plugins: an installed dffy-agent probes agents.
+        .env("PATH", "/usr/bin:/bin")
         .output()
         .expect("doctor");
     let doctor = String::from_utf8_lossy(&doctor.stdout).into_owned();

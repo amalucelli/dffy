@@ -106,7 +106,8 @@ pub(crate) enum Standing {
     /// Yours, in a review session, not posted yet: what `P` posts.
     Draft,
     /// Someone else's, an agent's, in a review session, without a `ref`:
-    /// `P` leaves it, since it would post under your name.
+    /// `P` leaves it, since it would post under your name. Or yours, kept
+    /// local, as a mention that asked an agent.
     Unposted,
     /// Outside a review session.
     Kept,
@@ -142,6 +143,10 @@ pub(crate) struct ThreadComment {
     /// [`summary`] of the text.
     pub summary: String,
     pub suggestion: Option<String>,
+    /// Words after its author, as given: how an agent's reply was made,
+    /// `read-only sandbox`. A general comment's are its thread's, in
+    /// [`At::Conversation`].
+    pub label: Option<String>,
     pub standing: Standing,
     /// On the host, but only for you: in a review not submitted yet.
     pub pending: bool,
@@ -192,8 +197,8 @@ pub(crate) struct Thread {
 }
 
 impl Thread {
-    /// Whether it holds someone else's comment not posted, as an agent's,
-    /// that `a` makes yours.
+    /// Whether it holds a comment that posting leaves, as an agent's, that
+    /// `A` makes yours.
     pub(crate) fn unposted(&self) -> bool {
         self.comments
             .iter()
@@ -444,12 +449,15 @@ impl Comments {
         self.highlight
     }
 
+    /// Where `c` stands, a reply a draft only as [`crate::review::Review::drafts`]
+    /// has it.
     fn standing(&self, c: &Comment) -> Standing {
-        match (&c.reference, self.session, c.author.is_empty()) {
-            (Some(_), ..) => Standing::Posted,
-            (None, false, _) => Standing::Kept,
-            (None, true, true) => Standing::Draft,
-            (None, true, false) => Standing::Unposted,
+        let root = c.in_reply_to.as_deref().and_then(|r| self.find(r));
+        match (&c.reference, self.session) {
+            (Some(_), _) => Standing::Posted,
+            (None, false) => Standing::Kept,
+            (None, true) if c.draft() && root.is_none_or(Comment::takes_replies) => Standing::Draft,
+            (None, true) => Standing::Unposted,
         }
     }
 
@@ -469,6 +477,17 @@ impl Comments {
     /// [`Comments::homes`]); empty for a general comment's.
     pub(crate) fn home_of(&self, root: &str) -> Option<&str> {
         self.find(root).map(|c| self.home(c))
+    }
+
+    /// The file the thread with root `root` is in, and whether that's a
+    /// review session's.
+    pub(crate) fn file_with(&self, root: &str) -> (&Path, bool) {
+        match &self.local {
+            Some(local) if self.from_local.contains(root) || self.others_local.contains(root) => {
+                (local, false)
+            }
+            _ => (&self.path, self.session),
+        }
     }
 
     /// Whether `root` starts a thread on another branch.
@@ -776,6 +795,7 @@ impl Comments {
                     text: c.text.clone(),
                     summary: summary(&c.text),
                     suggestion: c.suggestion.clone(),
+                    label: c.label.clone().filter(|_| !c.path.is_empty()),
                     standing: self.standing(c),
                     pending: c.pending,
                     posting: self.posting(c),

@@ -1,0 +1,38 @@
+---
+source: crates/dffy/tests/cli.rs
+expression: stdout(&out)
+---
+A review thread on src/lib.rs:3 (the new version of the file).
+
+ana:
+Overflow?
+
+you:
+Checked now.
+
+Suggested change, in place of the commented lines:
+
+```suggestion
+    a.checked_add(b)
+```
+
+The commented lines, marked >, and the lines around them:
+
+```
+  1  // Adds.
+  2  pub fn add(a: i64, b: i64) -> i64 {
+> 3      a + b
+  4  }
+```
+
+The file's changes near them:
+
+```diff
+@@ -1,3 +1,4 @@
++// Adds.
+ pub fn add(a: i64, b: i64) -> i64 {
+     a + b
+ }
+```
+
+Answer the thread's last comment. To propose a change to the commented lines, end with the lines that replace them in a fenced block opened with ```suggestion.

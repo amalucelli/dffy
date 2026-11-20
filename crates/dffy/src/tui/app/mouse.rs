@@ -140,6 +140,9 @@ impl App {
         if editable {
             entries.push(self.menu_entry(true, "Open in editor", Act::Edit));
         }
+        if !self.piped {
+            entries.push(self.menu_entry(true, "Open terminal here", Act::OpenTerminal));
+        }
         let mark = if entry.viewed() {
             "Mark unviewed"
         } else {
@@ -206,9 +209,14 @@ impl App {
             };
             entries.push(self.menu_entry(false, label, Act::Comment));
             entries.push(self.menu_entry(false, "Suggest change", Act::SuggestChange));
+            if selected {
+                entries.push(self.menu_entry(false, &self.ask_label(), Act::AskAgent));
+                entries.push(self.menu_entry(false, "Fix with agent", Act::FixWithAgent));
+            }
         }
         if selected {
             entries.push(self.menu_entry(false, "Copy selection", Act::Copy));
+            entries.push(self.menu_entry(false, "Copy as prompt", Act::CopyPrompt));
         } else {
             let key = match (
                 self.key_for(false, Act::Select),
@@ -228,6 +236,9 @@ impl App {
         if editable {
             entries.push(self.menu_entry(false, "Open in editor", Act::Edit));
         }
+        if !self.piped {
+            entries.push(self.menu_entry(false, "Open terminal here", Act::OpenTerminal));
+        }
         entries
     }
 
@@ -242,6 +253,7 @@ impl App {
         let copies = [
             self.menu_entry(false, "Copy comment", Act::CopyComment),
             self.menu_entry(false, "Copy thread", Act::CopyThread),
+            self.menu_entry(false, "Copy as prompt", Act::CopyPrompt),
         ];
         // The conversation is read-only, and never folds.
         if matches!(thread.at, model::At::Conversation { .. }) {
@@ -251,7 +263,14 @@ impl App {
                 .chain(copies)
                 .collect();
         }
-        let mut entries = vec![key("Reply", Act::Reply)];
+        let mut entries = vec![
+            key("Reply", Act::Reply),
+            key(&self.ask_label(), Act::AskAgent),
+        ];
+        if thread.comments.iter().any(|n| n.suggestion.is_some()) {
+            entries.push(key("Apply suggestion", Act::ApplySuggestion));
+        }
+        entries.push(key("Fix with agent", Act::FixWithAgent));
         if thread.comments.iter().any(|n| !n.posted()) {
             entries.push(key("Edit draft", Act::EditDraft));
             entries.push(key("Delete draft", Act::DeleteDraft));
@@ -279,6 +298,12 @@ impl App {
         }
         entries.extend(copies);
         entries
+    }
+
+    /// The ask's entry: `Ask claude` once the agent plugin said which
+    /// agent answers, which it says only once asked.
+    fn ask_label(&self) -> String {
+        format!("Ask {}", self.asking.default_agent().unwrap_or("agent"))
     }
 
     /// An entry running `action` as its key does, in the tree (`tree`) or

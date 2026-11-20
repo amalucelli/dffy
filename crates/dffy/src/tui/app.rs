@@ -27,11 +27,12 @@ mod threads;
 use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::ops::{ControlFlow, Range};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
+use dffy_core::annotation::Anchor;
 use dffy_core::bstr::BString;
 use dffy_core::conflict::Choices;
 use dffy_core::diff::Whitespace;
@@ -55,14 +56,18 @@ use crate::config::{
     self, Background, Config, Context, DefaultDiff, Indicators, ModifiedLines, StatusBar, TreeMode,
     View,
 };
+use crate::control::viewer::Reply;
 use crate::daemon::client;
 use crate::keys::{Action as Act, Keys};
+use crate::plugin::agent::Said as AgentSaid;
 use crate::plugin::review::Naming;
 use crate::plugin::{self, Program, Renderers};
 use crate::print;
 use crate::render::{Layout, escape, thousands};
+use crate::review::ask::Asking;
 use crate::review::model::compose::Compose;
 use crate::review::model::{self, Comments, Hint, Part};
+use crate::review::prompt;
 use crate::review::session::{self, Reviewing};
 use crate::term::{self, Input, Key, Mods, Screen};
 use crate::theme::{self, Theme};
@@ -124,6 +129,9 @@ pub(crate) enum Action {
     Compose(String),
     /// Open this http(s) link with the platform's opener.
     Browse(String),
+    /// Open a tab in the user's terminal at the working tree's root; what
+    /// came of it arrives as [`Event::Terminal`].
+    OpenTerminal,
     /// Ask the review plugin `request`; what it says comes back as
     /// [`Event::Review`] under `id`. A `prepare`, `pull` or `post` cancels
     /// the one before it.
@@ -161,6 +169,68 @@ pub(crate) enum Action {
     /// `git add` the working-tree file `path`, marking its conflict
     /// resolved; what came of it arrives as [`Event::Edited`].
     GitAdd(BString),
+    /// Put a thread's suggestion in place of its lines in the working tree;
+    /// what came of it arrives as [`Event::Edited`].
+    ApplySuggestion(Box<Suggestion>),
+}
+
+/// A suggestion to apply, as [`dffy_core::annotation::apply_suggestion`]
+/// takes it.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct Suggestion {
+    /// The diff shown of the file the thread is on.
+    pub diff: Arc<FileDiff>,
+    /// The first of the thread's lines on the diff's new side, 0-based.
+    pub at: usize,
+    pub anchor: Anchor,
+    /// The lines that go in their place; none deletes them.
+    pub lines: Vec<String>,
+    /// The review checked out: HEAD must be its head.
+    pub checkout: Option<Checkout>,
+    /// The thread's first comment, and the comment the suggestion is of.
+    pub thread: String,
+    pub comment: String,
+}
+
+/// A suggestion being applied: what's said of it once it is, and the
+/// control API's request waiting on it.
+struct Applying {
+    thread: String,
+    comment: String,
+    path: String,
+    lines: usize,
+    reply: Option<Reply>,
+}
+
+/// A review session's head, which HEAD must be to change the working tree
+/// for it: its changes are there only once it's checked out.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Checkout {
+    /// What the review is called, as `PR #7`.
+    pub label: String,
+    pub head: String,
+}
+
+/// A thread handed to the user's own coding agent, which the loop starts
+/// interactively.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Handoff {
+    /// The thread's first comment.
+    pub thread: String,
+    /// The comments file it's in.
+    pub file: PathBuf,
+    /// That file is the review session's.
+    pub session: bool,
+    pub checkout: Option<Checkout>,
+}
+
+/// What saving the text box does after, with the thread it's in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum OnSave {
+    #[default]
+    Nothing,
+    Ask,
+    Fix,
 }
 
 /// Which uncommitted changes the diff shows: the diffs whose lines can be
@@ -405,6 +475,22 @@ pub(crate) struct App {
     /// The review plugin's session: the plugin, the review shown, and what
     /// runs.
     reviewing: Reviewing,
+    /// The threads asked about an agent, and what they wait on.
+    asking: Asking,
+    /// Asks for the agent plugin, and asks to stop, by id, for the loop to
+    /// take once a frame is out.
+    agent_asks: Vec<(u64, plugin::agent::Request)>,
+    agent_stops: Vec<u64>,
+    /// The ends of asks that came while a post runs, by id, in order: what
+    /// they write waits for the post to end.
+    held_agents: Vec<(u64, AgentSaid)>,
+    /// What saving the text box open does to its thread after.
+    on_save: OnSave,
+    /// A thread to hand to the user's coding agent, for the loop to take
+    /// once a frame is out.
+    handoff: Option<Handoff>,
+    /// The suggestion being applied.
+    applying: Option<Applying>,
     /// The reviews to pick from.
     reviews: Option<review::Picker>,
     /// The dialog that posts the review.
@@ -614,6 +700,13 @@ impl App {
             thread_pending: None,
             annotations_changed: false,
             reviewing: Reviewing::new(config.review.clone()),
+            asking: Asking::default(),
+            agent_asks: Vec::new(),
+            agent_stops: Vec::new(),
+            held_agents: Vec::new(),
+            on_save: OnSave::Nothing,
+            handoff: None,
+            applying: None,
             reviews: None,
             posting: None,
             new_threads: Vec::new(),
@@ -1052,6 +1145,7 @@ impl App {
             self.reviewing.input();
         }
         let mut action = self.handle(event);
+        self.release_held_agents();
         if matches!(
             action,
             Some(
@@ -1059,6 +1153,7 @@ impl App {
                     | Action::PlanDiscard { .. }
                     | Action::WriteResolution { .. }
                     | Action::GitAdd(_)
+                    | Action::ApplySuggestion(_)
             )
         ) {
             if self.editing {
@@ -1095,6 +1190,18 @@ impl App {
         self.leaving = true;
         self.close_post();
         self.close_box();
+        self.release_held_agents();
+    }
+
+    /// What asks said while a post ran, now that writes go on.
+    fn release_held_agents(&mut self) {
+        if self.held_agents.is_empty() || self.writes_held() {
+            return;
+        }
+        for said in std::mem::take(&mut self.held_agents) {
+            let effects = self.asking.said(said, self.comments.as_mut());
+            self.review_effects(effects);
+        }
     }
 
     /// Gives the diff the threads of the file shown, as placed now.
@@ -1140,6 +1247,10 @@ impl App {
         self.review_tick()
     }
 
+    #[expect(
+        clippy::too_many_lines,
+        reason = "a dispatch: an arm per event or group of them"
+    )]
     fn handle(&mut self, event: Event) -> Option<Action> {
         match event {
             Event::Input(input) => return self.input(input),
@@ -1231,7 +1342,25 @@ impl App {
             Event::ReviewPush(push) => self.review_pushed(push),
             Event::ReviewMoved(count) => self.review_updated(count),
             Event::ReviewRebased { last, head } => self.reviewed_head_rebased(&last, &head),
-            Event::Control(inbound) => self.control(inbound),
+            // An ask's end writes the comments file, so it waits for a post.
+            Event::Agent { id, said }
+                if self.writes_held()
+                    && matches!(said, AgentSaid::Answered(_) | AgentSaid::NotInstalled) =>
+            {
+                self.held_agents.push((id, said));
+            }
+            Event::Agent { id, said } => {
+                let effects = self.asking.said((id, said), self.comments.as_mut());
+                self.review_effects(effects);
+            }
+            Event::Agents(agents) => {
+                let effects = self.asking.listed(agents);
+                self.review_effects(effects);
+            }
+            Event::Control(inbound) => return self.control(inbound),
+            Event::Applied(result) => self.applied(result),
+            Event::HandedOff(started) => self.handed_off(started),
+            Event::Terminal { dir, opened } => return self.terminal_opened(&dir, opened),
             // The loop handles these: they need the terminal, or may start
             // the plugin's `detect`.
             Event::Resize | Event::Interrupt | Event::Described(_) => {}
@@ -1602,6 +1731,14 @@ impl App {
             self.asked = None;
             return None;
         }
+        // Legacy ctrl+j is the line feed, which some terminals send for
+        // enter; only the text box takes it as a key of its own.
+        let input = match input {
+            Input::Key(Key::Char('j'), Mods::CTRL) if self.doc.writing().is_none() => {
+                Input::Key(Key::Enter, Mods::NONE)
+            }
+            input => input,
+        };
         self.dirty = true;
         self.focus = None;
         self.unseen = None;
@@ -1869,6 +2006,13 @@ impl App {
                 }
                 return Ok(done);
             }
+            Act::CopyPrompt => {
+                let done = self.copy_prompt();
+                if done.is_some() {
+                    self.doc.selection = None;
+                }
+                return Ok(done);
+            }
             Act::CycleLayout => {
                 if !self.doc.select_other_side() {
                     self.message("these rows have no lines on the other side");
@@ -1878,6 +2022,8 @@ impl App {
             // The panel's copy acts on the selection, so opening it keeps it;
             // a comment goes on it, and staging takes its lines.
             Act::Comment
+            | Act::AskAgent
+            | Act::FixWithAgent
             | Act::Stage
             | Act::Unstage
             | Act::Discard
@@ -1888,6 +2034,7 @@ impl App {
             | Act::ScrollReset
             | Act::CopyPath
             | Act::CopyAbsolutePath
+            | Act::OpenTerminal
             | Act::Help
             | Act::Leader
             | Act::Quit => return Ok(self.act(action)),
@@ -1906,6 +2053,13 @@ impl App {
         let half = (height / 2).max(1);
         let tree = self.pane == Pane::Tree;
         match action {
+            // Nothing else to back out of: the asks running stop.
+            Act::Cancel if !tree && self.asking.busy() => {
+                let effects = self.asking.stop(None);
+                return self.review_effects(effects);
+            }
+            Act::AskAgent => return self.ask_agent(),
+            Act::FixWithAgent => return self.fix_with_agent(),
             Act::ScrollDown
             | Act::ScrollUp
             | Act::PageDown
@@ -1985,6 +2139,7 @@ impl App {
             }
             Act::ToggleMouse => return Some(self.toggle_mouse()),
             Act::Edit => return self.edit(),
+            Act::OpenTerminal => return Some(Action::OpenTerminal),
             Act::Stage => return self.edit_lines(Edit::Stage),
             Act::Unstage => return self.edit_lines(Edit::Unstage),
             Act::Discard => return self.edit_lines(Edit::Discard),
@@ -2018,6 +2173,7 @@ impl App {
             | Act::DeleteDraft
             | Act::Resolve
             | Act::Adopt
+            | Act::ApplySuggestion
             | Act::OpenOnHost => {
                 let deleting = std::mem::take(&mut self.deleting);
                 match self.thread_act(action, deleting) {
@@ -2050,6 +2206,7 @@ impl App {
             Act::CopyComment | Act::CopyThread => {
                 return self.copy_thread(action == Act::CopyThread);
             }
+            Act::CopyPrompt => return self.copy_prompt(),
             Act::HalfPageDown => self.scroll_diff(half),
             Act::HalfPageUp => self.scroll_diff(-half),
         }
@@ -2661,6 +2818,81 @@ impl App {
             .text
             .trim_end_matches(['\n', '\r']);
         self.copy_text(text.to_owned(), "copied a comment".to_owned())
+    }
+
+    /// `copy_prompt`: the focused thread, else the selected lines, as a
+    /// prompt for a coding agent.
+    fn copy_prompt(&mut self) -> Option<Action> {
+        let made = if let Some(thread) = self.target_thread() {
+            (self.thread_prompt(&thread.root, &thread.at))
+                .map(|made| made.map(|(made, what)| (made, what.to_owned())))
+        } else if self.doc.selection.is_some() {
+            self.doc
+                .comment_target(None)
+                .and_then(|(file, side, lines)| {
+                    let n = lines.len();
+                    let loaded = self.doc.document.file(file)?;
+                    let made = prompt::selection(model::line_diff(loaded), side, lines);
+                    Some(Ok((made, session::plural(n, "line"))))
+                })
+        } else {
+            Some(Err(
+                "nothing to copy as a prompt: focus a thread, or v selects lines",
+            ))
+        };
+        match made? {
+            Ok((made, what)) => {
+                let mut note = format!("copied {what} as a prompt");
+                if made.trimmed {
+                    let _ = write!(note, ", cut to fit {}KB", prompt::MAX_BYTES >> 10);
+                }
+                self.copy_text(made.text, note)
+            }
+            Err(why) => {
+                self.message(why);
+                None
+            }
+        }
+    }
+
+    /// The thread with first comment `root`, shown `at`, as a prompt, on
+    /// its file's diff when it's loaded.
+    fn thread_prompt(
+        &self,
+        root: &str,
+        at: &model::At,
+    ) -> Option<Result<(prompt::Prompt, &'static str), &'static str>> {
+        let comments = self.comments.as_ref()?;
+        let list = comments.thread(root);
+        if list.is_empty() {
+            return Some(Err(
+                "a thread on another branch can't be made a prompt; move it here first",
+            ));
+        }
+        let diff = (comments.home_of(root))
+            .and_then(|path| comments.file_of(path.as_bytes()))
+            .and_then(|file| self.doc.document.file(file))
+            .map(model::line_diff);
+        let made = prompt::thread(&list, at, diff.map(|d| &**d));
+        Some(Ok((made, "a thread")))
+    }
+
+    /// What came of `open_terminal`: where no tab opened at `dir`, a `cd`
+    /// there goes on the clipboard instead.
+    fn terminal_opened(&mut self, dir: &Path, opened: Result<String, String>) -> Option<Action> {
+        match opened {
+            Ok(note) => {
+                self.message(note);
+                None
+            }
+            Err(why) => {
+                let cd = crate::terminal::cd(dir);
+                Some(Action::Copy {
+                    note: format!("{why}; copied {}", escape(&cd)),
+                    text: cd,
+                })
+            }
+        }
     }
 
     /// `Y`: the path of the file shown, as the repository has it.

@@ -1203,6 +1203,7 @@ fn thread_comment(id: &str, author: &str, at: &str, text: &str, draft: bool) -> 
         text: text.to_owned(),
         summary: model::text::summary(text),
         suggestion: None,
+        label: None,
         standing: if draft {
             model::Standing::Draft
         } else {
@@ -2196,7 +2197,7 @@ fn the_text_box_is_boxed_where_the_thread_sits() {
     insta::assert_snapshot!(rows[at..at + 6].join("\n"), @"
          │  ┃ Simpler.                                        ┃
          │  ┃                                                 ┃
-         │  ┃ you · reply · esc saves · ctrl+g editor         ┃
+         │  ┃ you · reply · enter sends · shift+enter new li… ┃
          │  ┃ Sure, and a reply long enough to wrap in its    ┃
          │  ┃ box▏                                            ┃
          │  ┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛
@@ -2210,7 +2211,7 @@ fn the_text_box_is_boxed_where_the_thread_sits() {
         .expect("the line");
     insta::assert_snapshot!(rows[at..at + 4].join("\n"), @"
       4 +│     eprintln!(\"done\");
-         │  ┏ ▾ you · new comment · esc saves, empty discard… ┓
+         │  ┏ ▾ you · new comment · enter sends · shift+ente… ┓
          │  ┃ New▏                                            ┃
          │  ┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛
     ");

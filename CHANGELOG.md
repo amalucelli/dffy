@@ -2,6 +2,23 @@
 
 The big changes in each release. Plugins and features marked experimental can still change between releases.
 
+## Unreleased
+
+### Added
+
+- **Ask** (experimental). With the new `dffy-agent` plugin on `PATH`, `a` on a thread asks Claude Code, Codex or Pi about it, read-only, and the answer lands in the thread as the agent's reply, with a suggestion when it proposes a change. `a` on selected lines asks a question you write, `a` again after an answer writes a follow-up to the same agent, and a comment you write starting `@claude`, `@codex` or `@pi` asks that agent. Agents' answers, mentions and follow-ups aren't posted to a code host until `A` on the thread makes them yours. The `agent` setting picks the agent or names a command of yours. See [docs/viewer.md](docs/viewer.md#asking-an-agent) and [docs/plugins.md](docs/plugins.md#agent-plugins).
+- **Apply suggestion**: `s` on a thread puts its suggestion in the working tree as an unstaged change, refused when the lines changed since. Also the control API's `comments/applySuggestion` and the MCP tool `apply_suggestion`.
+- **Fix with agent**: `f` on a thread, or `space` then `&` on selected lines, starts your own `claude`, `codex`, `pi` or `amp` in a new terminal tab, pointed at the thread, to change what it asks and reply in it.
+- **Copy as prompt**: `space` then `"` copies a thread, or the selected lines, as a prompt for a coding agent. `dffy comments prompt <id>` prints it, and the MCP tool `thread_prompt` returns it.
+- **Open terminal here**: `space` then `.` opens a new tab at the working tree's root, in tmux, zellij, WezTerm, kitty, Ghostty, iTerm2, Rex, herdr, Terminal.app or Alacritty.
+- The MCP tool `reply_to_thread` writes a reply in a thread under the MCP client's name.
+
+### Changed
+
+- On a focused thread, `a` asks an agent, `A` makes comments not posted yours (adopt, which was `a`), `s` applies a suggestion and `f` fixes with agent. There they no longer stage (`A`), switch the layout (`s`) or go to the next file (`f`); those keep working everywhere else.
+- In the command panel, the theme moved from `a` to `~`.
+- In the text box, `enter` sends the comment and `esc` still saves it. A new line is `shift+enter` where the terminal reports it, and `alt+enter` or `ctrl+j` everywhere.
+
 ## 0.3.0 (2026-11-20)
 
 ### Added

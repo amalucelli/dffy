@@ -1279,6 +1279,8 @@ fn doctor_reports_each_check() {
     let repo = repo();
     let out = dffy_cmd(repo.path(), &["--color=never", "doctor"])
         .env("TERM", "xterm-256color")
+        // Without the user's plugins, an installed dffy-agent among them.
+        .env("PATH", "/usr/bin:/bin")
         .env_remove("TMUX")
         .env_remove("ZELLIJ")
         .env_remove("STY")
@@ -1311,8 +1313,13 @@ fn doctor_reports_each_check() {
             "theme",
             "pager",
             "cache",
+            "agent",
             "dffyd"
         ],
+        "{text}"
+    );
+    assert!(
+        text.contains("· agent       dffy-agent isn't on PATH"),
         "{text}"
     );
     assert!(text.contains("TERM=xterm-256color"), "{text}");
@@ -1330,7 +1337,13 @@ fn doctor_reports_each_check() {
 #[test]
 fn doctor_json_and_outside_a_repository() {
     let repo = repo();
-    let json = stdout(&dffy(repo.path(), &["doctor", "--json"]));
+    let doctor = |args: &[&str]| {
+        dffy_cmd(repo.path(), args)
+            .env("PATH", "/usr/bin:/bin")
+            .output()
+            .expect("spawn dffy")
+    };
+    let json = stdout(&doctor(&["doctor", "--json"]));
     assert!(
         json.starts_with("{\"build\":\"") && json.ends_with("}\n"),
         "{json}"
@@ -1346,7 +1359,7 @@ fn doctor_json_and_outside_a_repository() {
 
     let outside = tempfile::tempdir().expect("tempdir");
     let dir = outside.path().to_str().expect("utf-8 path");
-    let out = dffy(repo.path(), &["--color=never", "-C", dir, "doctor"]);
+    let out = doctor(&["--color=never", "-C", dir, "doctor"]);
     let text = stdout(&out);
     assert!(
         text.contains("· repository  not in a git repository (-C <path>)"),
@@ -2102,6 +2115,44 @@ fn comments_are_listed_and_removed_by_branch_state_and_path() {
         assert!(!out.status.success(), "{args:?}");
         assert!(stderr(&out).contains(error), "{args:?}: {}", stderr(&out));
     }
+}
+
+/// `dffy comments prompt <id>` prints the thread of any of its comments as
+/// a prompt: placed on the uncommitted changes when they change its file,
+/// with the hunk near it; else its lines as written. An id no comment has
+/// fails.
+#[test]
+fn comments_prompt_prints_a_thread_with_its_lines_and_changes() {
+    let repo = repo();
+    let d = repo.path();
+    write(
+        d,
+        ".git/dffy/comments.json",
+        r##"{"version":1,"comments":[
+{"id":"c1","path":"src/lib.rs","side":"new","start":{"old":null,"new":2},"end":{"old":null,"new":2},"text":"Overflow?","author":"ana","created":"t1","resolved":false,"anchor":{"before":["pub fn add(a: i64, b: i64) -> i64 {"],"lines":["    a + b"],"after":["}"]}},
+{"id":"c2","path":"src/lib.rs","text":"Checked now.","suggestion":"    a.checked_add(b)","author":"","created":"t2","in_reply_to":"c1","resolved":false},
+{"id":"r1","path":"README.md","side":"new","start":{"old":null,"new":3},"end":{"old":null,"new":3},"text":"Say more.","author":"","created":"t3","resolved":false,"anchor":{"before":["# demo",""],"lines":["A tiny crate."],"after":[]}}
+]}"##,
+    );
+    write(
+        d,
+        "src/lib.rs",
+        "// Adds.\npub fn add(a: i64, b: i64) -> i64 {\n    a + b\n}\n",
+    );
+    let out = dffy(d, &["comments", "prompt", "c2"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    insta::assert_snapshot!(stdout(&out));
+    let out = dffy(d, &["comments", "prompt", "r1"]);
+    assert!(
+        stdout(&out).starts_with(
+            "A review thread on README.md:3 (the new version of the file), as written.\n"
+        ),
+        "{}",
+        stdout(&out)
+    );
+    let missing = dffy(d, &["comments", "prompt", "nope"]);
+    assert_eq!(missing.status.code(), Some(128));
+    assert!(stderr(&missing).contains("no comment has the id nope"));
 }
 
 /// `--session` reads the comments file of the review session the viewer

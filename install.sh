@@ -6,7 +6,8 @@
 #
 # Options:
 #   --plugin NAME     also install a plugin next to dffy; repeatable. Plugins: markdown
-#                     and mermaid (dffy-render-NAME), review-github (dffy-review-github)
+#                     and mermaid (dffy-render-NAME), review-github (dffy-review-github),
+#                     agent (dffy-agent)
 #
 # Environment:
 #   DFFY_PLUGINS      plugins to install, separated by spaces or commas; adds to --plugin
@@ -91,8 +92,8 @@ sha256() {
 # add_plugin NAME
 add_plugin() {
 	case "$1" in
-	markdown | mermaid | review-github) ;;
-	*) die "unknown plugin '$1'; available: markdown, mermaid, review-github" ;;
+	markdown | mermaid | review-github | agent) ;;
+	*) die "unknown plugin '$1'; available: markdown, mermaid, review-github, agent" ;;
 	esac
 	case " $plugins " in
 	*" $1 "*) ;;
@@ -184,7 +185,7 @@ main() {
 	binaries=dffy
 	for name in $plugins; do
 		case "$name" in
-		review-*) binaries="$binaries dffy-$name" ;;
+		review-* | agent) binaries="$binaries dffy-$name" ;;
 		*) binaries="$binaries dffy-render-$name" ;;
 		esac
 	done
@@ -211,6 +212,12 @@ main() {
 	*" review-github "*)
 		command -v gh >/dev/null 2>&1 ||
 			say "dffy-review-github needs the GitHub CLI (gh): https://cli.github.com"
+		;;
+	esac
+	case " $plugins " in
+	*" agent "*)
+		command -v claude >/dev/null 2>&1 || command -v codex >/dev/null 2>&1 ||
+			say "dffy-agent needs Claude Code (claude) or Codex (codex) on your PATH"
 		;;
 	esac
 }

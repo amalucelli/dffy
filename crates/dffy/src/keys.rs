@@ -78,6 +78,7 @@ actions! {
     CopyAbsolutePath "copy_absolute_path" "copy absolute path" "copy where the file is on disk, from the filesystem's root",
     CopyComment "copy_comment" "copy comment" "copy a comment of the focused thread as written, in Markdown: the one last clicked, else its first",
     CopyThread "copy_thread" "copy thread" "copy the focused thread: each comment under its author and date, as written",
+    CopyPrompt "copy_prompt" "copy as prompt" "copy the focused thread, else the selected lines, as a prompt for a coding agent: the comments, the lines with those around them and the file's changes near them",
     Cancel "cancel" "cancel selection" "end the selection; in the tree, clear the filter",
     SwitchPane "switch_pane" "switch panel/diff" "switch between the left panel (the file tree, or the comments) and the diff",
     ToggleTree "toggle_tree" "toggle tree" "show or hide the file tree",
@@ -116,20 +117,24 @@ actions! {
     TakeBase "take_base" "take base" "resolve the conflict to the common ancestor's lines, when git wrote them (merge.conflictStyle diff3 or zdiff3); again takes the choice back",
     WriteResolution "write_resolution" "write resolved" "write the conflicted file as the choices resolve it, asking first when some conflicts have none; then git add it after a y/n",
     Edit "edit" "open in editor" "open the file in $EDITOR at the line last tapped, else the top line",
-    Comment "comment" "comment on lines" "comment on the selected lines, or the line v would start on, in a text box under them; esc saves it",
-    SuggestChange "suggest_change" "suggest change" "suggest a change to the selected lines, or the line v would start on: a comment's text box holding them, to edit into what they should be; esc saves it",
-    CommentFile "comment_file" "comment on file" "comment on the whole file shown, in a text box under its first row; esc saves it",
-    Comments "comments" "comments panel" "the left panel lists every comment thread in place of the files, or the files again; moving through the threads shows each in the diff, enter or tab goes to it; r, e, x, d and o act on the selected thread",
+    OpenTerminal "open_terminal" "open terminal here" "open a new tab in your terminal, or a window where that's all it offers, at the working tree's root; where dffy can't, it copies a cd there instead",
+    Comment "comment" "comment on lines" "comment on the selected lines, or the line v would start on, in a text box under them; enter sends it",
+    SuggestChange "suggest_change" "suggest change" "suggest a change to the selected lines, or the line v would start on: a comment's text box holding them, to edit into what they should be; enter sends it",
+    CommentFile "comment_file" "comment on file" "comment on the whole file shown, in a text box under its first row; enter sends it",
+    Comments "comments" "comments panel" "the left panel lists every comment thread in place of the files, or the files again; moving through the threads shows each in the diff, enter or tab goes to it; the thread keys act on the selected thread, but f, which filters",
     NextThread "next_thread" "next thread" "next comment thread, on into the next file with comments; it takes the focus, where r replies, e edits, x resolves, d deletes and o opens it on its host",
     PrevThread "prev_thread" "prev thread" "previous comment thread, back into the previous file with comments",
     ToggleThread "toggle_thread" "fold thread" "fold or unfold the focused comment thread, or the first on screen",
     ToggleThreads "toggle_threads" "fold all threads" "fold every comment thread to one row, or unfold them all",
     MoveThread "move_thread" "move thread here" "move the focused thread, or the comments panel's selected one, from the branch it was written on to the current branch",
-    Reply "reply" "reply to thread" "on a thread: reply in a text box under it; esc saves it",
-    EditDraft "edit_draft" "edit thread draft" "on a thread: edit your last draft in it, in a text box; esc saves it",
+    AskAgent "ask_agent" "ask agent" "ask a coding agent, through the agent plugin dffy-agent, about the focused thread, or when an agent's reply ends it, write your follow-up in a reply box, which enter sends to that agent; elsewhere, write the question on the selected lines, or the line v would start on, in a text box, and enter asks. The answer comes as the agent's reply, with a suggestion when it proposes a change; esc on the thread stops it. A comment you write starting @claude, @codex or @pi asks that agent too (experimental, see agent)",
+    Reply "reply" "reply to thread" "on a thread: reply in a text box under it; enter sends it",
+    EditDraft "edit_draft" "edit thread draft" "on a thread: edit your last draft in it, in a text box; enter sends it",
     DeleteDraft "delete_draft" "delete thread draft" "on a thread: delete your last draft in it, the whole thread when that's its first comment, once the key comes again",
     Resolve "resolve" "resolve thread" "on a thread: resolve it, or reopen it",
     Adopt "adopt" "make thread yours" "on a thread: someone else's comments in it not posted, as an agent's, become your drafts, which posting sends under your name",
+    ApplySuggestion "apply_suggestion" "apply suggestion" "on a thread: put its suggestion, the one last clicked or else its last, in place of the lines it's on in the working tree, refused when they changed since; an unstaged change, which discard undoes",
+    FixWithAgent "fix_with_agent" "fix with agent" "on a thread, or the selected lines with a note you write first: start your coding agent (claude, codex, pi or amp) in a new tab, or here until it exits, pointed at the thread to change what it asks and reply in it",
     OpenOnHost "open_on_host" "open thread on host" "on a thread: open it on its code host, in the browser",
     CommentInEditor "comment_in_editor" "comment in $EDITOR" "write in $EDITOR: your draft in the focused thread, else a reply to it, else a comment on the line; ctrl+g does it from the text box",
     CommentedFiles "commented_files" "files with comments" "the tree shows only the files with comments, or every file; f/F and n/N keep to them",
@@ -267,12 +272,16 @@ const DEFAULTS: &[(Table, &str, Action)] = &[
     (M, "z", Action::ToggleThread),
     (M, "Z", Action::ToggleThreads),
     (M, "V", Action::MoveThread),
+    (M, "a", Action::AskAgent),
     (M, "E", Action::CommentInEditor),
+    (Th, "a", Action::AskAgent),
     (Th, "r", Action::Reply),
     (Th, "e", Action::EditDraft),
     (Th, "d", Action::DeleteDraft),
     (Th, "x", Action::Resolve),
-    (Th, "a", Action::Adopt),
+    (Th, "A", Action::Adopt),
+    (Th, "s", Action::ApplySuggestion),
+    (Th, "f", Action::FixWithAgent),
     (Th, "o", Action::OpenOnHost),
     (T, "c", Action::CommentedFiles),
     (M, "p", Action::ReviewPull),
@@ -308,14 +317,18 @@ const DEFAULTS: &[(Table, &str, Action)] = &[
     (L, "F", Action::PrevFile),
     (L, "y", Action::Copy),
     (L, "Y", Action::CopyPath),
+    (L, "\"", Action::CopyPrompt),
     (L, "J", Action::ToggleCopyDecorations),
     (L, "A", Action::Stage),
     (L, "U", Action::Unstage),
     (L, "D", Action::Discard),
     (L, "$", Action::ToggleMouse),
     (L, "w", Action::ToggleWatch),
-    (L, "a", Action::CycleTheme),
+    (L, "~", Action::CycleTheme),
     (L, "E", Action::CommentInEditor),
+    (L, "a", Action::AskAgent),
+    (L, "&", Action::FixWithAgent),
+    (L, ".", Action::OpenTerminal),
     (L, "S", Action::SuggestChange),
     (L, "O", Action::OpenReview),
     (L, "R", Action::SinceLastReview),
@@ -413,6 +426,7 @@ impl Action {
             | Self::CopyAbsolutePath
             | Self::CopyComment
             | Self::CopyThread
+            | Self::CopyPrompt
             | Self::Cancel
             | Self::ToggleCopyDecorations => Group::Copy,
             Self::Stage
@@ -428,17 +442,21 @@ impl Action {
             Self::ToggleWatch | Self::ToggleMouse => Group::Modes,
             Self::Leader
             | Self::Edit
+            | Self::OpenTerminal
             | Self::Comment
             | Self::SuggestChange
             | Self::CommentFile
             | Self::Comments
             | Self::CommentInEditor
             | Self::MoveThread
+            | Self::AskAgent
             | Self::Reply
             | Self::EditDraft
             | Self::DeleteDraft
             | Self::Resolve
             | Self::Adopt
+            | Self::ApplySuggestion
+            | Self::FixWithAgent
             | Self::OpenOnHost
             | Self::ReviewPull
             | Self::ReviewPost
@@ -479,6 +497,7 @@ impl Action {
             Self::CopyAbsolutePath => "Copy absolute path",
             Self::CopyComment => "Copy comment",
             Self::CopyThread => "Copy thread",
+            Self::CopyPrompt => "Copy as prompt",
             Self::ToggleCopyDecorations => "Copy with line numbers and signs",
             Self::Stage => "Stage lines",
             Self::Unstage => "Unstage lines",
@@ -493,12 +512,15 @@ impl Action {
             Self::ToggleMouse => "Mouse selection",
             Self::ToggleWatch => "Watch for changes",
             Self::CommentInEditor => "Continue in editor",
+            Self::OpenTerminal => "Open terminal here",
             Self::SuggestChange => "Suggest change",
             Self::CommentedFiles => "Files with comments",
             Self::OpenReview => "Open review…",
             Self::SinceLastReview => "Since last review",
             Self::WholeReview => "Show whole review",
             Self::MoveThread => "Move thread to this branch",
+            Self::AskAgent => "Ask agent",
+            Self::FixWithAgent => "Fix with agent",
             Self::Help => "All keys",
             other => other.label(),
         }
@@ -531,6 +553,7 @@ impl Action {
             Self::CopyAbsolutePath => "copy absolute path",
             Self::CopyComment => "copy comment",
             Self::CopyThread => "copy thread",
+            Self::CopyPrompt => "copy as prompt",
             Self::Cancel => "cancel",
             Self::SwitchPane => "switch pane",
             Self::ToggleTree => "tree",
@@ -569,6 +592,7 @@ impl Action {
             Self::TakeBase => "take base",
             Self::WriteResolution => "write resolved file",
             Self::Edit => "edit",
+            Self::OpenTerminal => "open terminal",
             Self::Comment => "comment",
             Self::SuggestChange => "suggest change",
             Self::CommentFile => "comment on file",
@@ -578,11 +602,14 @@ impl Action {
             Self::ToggleThread => "fold thread",
             Self::ToggleThreads => "fold threads",
             Self::MoveThread => "move thread here",
+            Self::AskAgent => "ask agent",
             Self::Reply => "reply",
             Self::EditDraft => "edit draft",
             Self::DeleteDraft => "delete draft",
             Self::Resolve => "resolve",
             Self::Adopt => "make it yours",
+            Self::ApplySuggestion => "apply",
+            Self::FixWithAgent => "fix with agent",
             Self::OpenOnHost => "open on host",
             Self::CommentInEditor => "comment in editor",
             Self::CommentedFiles => "files with comments",

@@ -11,10 +11,13 @@
 //! group is killed once it exits, and its answer is checked against the
 //! sides before anything uses it.
 //!
-//! Review plugins, the other kind, are in [`review`].
+//! Review plugins are in [`review`] and the agent plugin in [`agent`], each
+//! over the long-lived JSON-RPC process of [`rpc`].
 
+pub(crate) mod agent;
 pub(crate) mod json;
 pub(crate) mod review;
+pub(crate) mod rpc;
 
 use std::fmt::Write as _;
 use std::io::{Read as _, Write as _};
@@ -360,11 +363,28 @@ fn stop(running: &mut Running) {
     }
 }
 
+/// What a panic runs before it kills what's running: each a plugin asked
+/// to stop on its own (see [`rpc::Client::shut_down_on_panic`]).
+type OnPanic = Box<dyn Fn() + Send>;
+
+static ON_PANIC: Mutex<Vec<OnPanic>> = Mutex::new(Vec::new());
+
+fn on_panic(run: impl Fn() + Send + 'static) {
+    ON_PANIC
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .push(Box::new(run));
+}
+
 /// Makes a panic run [`stop_all`] before the hook installed before, unless
-/// another thread holds the list of renderers then.
+/// another thread holds the list of renderers then. Plugins that asked to
+/// are asked to stop first, unless another thread holds their list.
 pub(crate) fn stop_on_panic() {
     let previous = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
+        if let Ok(runs) = ON_PANIC.try_lock() {
+            runs.iter().for_each(|run| run());
+        }
         match RUNNING.try_lock() {
             Ok(mut running) => stop(&mut running),
             Err(TryLockError::Poisoned(e)) => stop(&mut e.into_inner()),

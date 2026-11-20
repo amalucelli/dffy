@@ -313,6 +313,9 @@ fn changed_files_pages_through_the_list_after_the_handshake() {
             "file_diff",
             "diff",
             "list_comments",
+            "thread_prompt",
+            "reply_to_thread",
+            "apply_suggestion",
             "open_in_viewer",
             "focus_thread",
             "viewer_selection"
@@ -655,6 +658,57 @@ fn list_comments_pages_through_threads() {
     assert!(stale.text().contains("start over"), "{}", stale.text());
 }
 
+/// `thread_prompt` gives the thread of any of its comments as one prompt,
+/// placed on the uncommitted changes, with the file's hunk near it; an id
+/// no comment has is a tool error.
+#[test]
+fn thread_prompt_gives_a_thread_with_its_lines_and_changes() {
+    let repo = repo();
+    let d = repo.path();
+    write(
+        d,
+        ".git/dffy/comments.json",
+        r#"{"version":1,"comments":[
+{"id":"c1","path":"lib.rs","side":"new","start":{"old":null,"new":1},"end":{"old":null,"new":1},"text":"Why i64?","author":"ana","created":"t1","resolved":false,"anchor":{"before":[],"lines":["pub fn add(a: i64, b: i64) -> i64 {"],"after":["    a + b","}"]}},
+{"id":"c2","path":"lib.rs","text":"It overflowed.","author":"","created":"t2","in_reply_to":"c1","resolved":false}
+]}"#,
+    );
+    write(
+        d,
+        "lib.rs",
+        "pub fn add(a: i64, b: i64) -> i64 {\n    a.wrapping_add(b)\n}\n",
+    );
+    let mut server = Server::start(d);
+    initialize(&mut server);
+    let call = server.call("thread_prompt", r#"{"id":"c2"}"#);
+    let structured = call.structured();
+    let field = |key: &str| structured.get(key).and_then(Value::as_str);
+    assert_eq!(
+        (field("thread"), field("path")),
+        (Some("c1"), Some("lib.rs"))
+    );
+    assert_eq!(structured.get("trimmed"), Some(&Value::Bool(false)));
+    let prompt = field("prompt").expect("a prompt");
+    assert_eq!(prompt, call.text());
+    for part in [
+        "A review thread on lib.rs:1 (the new version of the file).",
+        "ana:\nWhy i64?",
+        "you:\nIt overflowed.",
+        "> 1  pub fn add(a: i64, b: i64) -> i64 {",
+        "+    a.wrapping_add(b)",
+        "Answer the thread's last comment.",
+    ] {
+        assert!(prompt.contains(part), "{part}: {prompt}");
+    }
+    let missing = server.call("thread_prompt", r#"{"id":"nope"}"#);
+    assert!(missing.is_error());
+    assert!(
+        missing.text().contains("No comment has the id nope"),
+        "{}",
+        missing.text()
+    );
+}
+
 /// `list_comments` takes the current branch's threads and those on none,
 /// or another branch's or all; open or resolved ones, judged by the
 /// thread's first comment; and the review session's file with `session`.
@@ -987,4 +1041,117 @@ fn the_viewer_tools_drive_the_viewer_running_in_the_repository() {
         "{}",
         wrong.text()
     );
+}
+
+/// A comments file with thread `s1` on new line 10 of long.txt, whose
+/// suggestion is `line ten`.
+fn suggested(d: &Path) {
+    write(
+        d,
+        ".git/dffy/comments.json",
+        r#"{"version":1,"comments":[
+{"id":"s1","path":"long.txt","side":"new","start":{"old":10,"new":10},"end":{"old":10,"new":10},"text":"Spell it out.","suggestion":"line ten","author":"","created":"2026-11-17T10:00:00Z","resolved":false,"anchor":{"before":["line 8","line 9"],"lines":["line 10"],"after":["line 11","line 12"]}}
+]}
+"#,
+    );
+}
+
+/// `reply_to_thread` writes a reply by the client, never the user's, with
+/// its suggestion; an id no comment has is a tool error.
+#[test]
+fn reply_to_thread_writes_a_reply_by_the_client() {
+    let repo = repo();
+    let d = repo.path();
+    suggested(d);
+    let mut server = Server::start(d);
+    initialize(&mut server);
+    let reply = server.call(
+        "reply_to_thread",
+        r#"{"id":"s1","text":"@claude Spelled out.","suggestion":"line ten"}"#,
+    );
+    assert!(!reply.is_error(), "{}", reply.line);
+    let reply = reply.structured();
+    assert_eq!(
+        (
+            reply.get("thread").and_then(Value::as_str),
+            reply.get("author").and_then(Value::as_str)
+        ),
+        (Some("s1"), Some("test"))
+    );
+    let file = std::fs::read_to_string(d.join(".git/dffy/comments.json")).expect("read");
+    let last = file.lines().rev().nth(1).expect("the reply");
+    for field in [
+        r#""author":"test""#,
+        r#""in_reply_to":"s1""#,
+        r#""suggestion":"line ten""#,
+    ] {
+        assert!(last.contains(field), "{field} in {last}");
+    }
+    assert!(!last.contains("local_only"), "{last}");
+    let missing = server.call("reply_to_thread", r#"{"id":"nope","text":"Hm."}"#);
+    assert!(missing.is_error(), "{}", missing.line);
+}
+
+/// The client's name loses its control characters, and one that would
+/// pass for the user's own comments is `dffy mcp`.
+#[test]
+fn a_reply_is_by_the_clients_printable_name_never_yours() {
+    let repo = repo();
+    let d = repo.path();
+    suggested(d);
+    for (name, author) in [
+        (r"my\u001b[31m\nbot", "my[31mbot"),
+        (" You ", "dffy mcp"),
+        (r"\u0007", "dffy mcp"),
+    ] {
+        let mut server = Server::start(d);
+        let info = format!(
+            r#""protocolVersion":"2025-11-25","capabilities":{{}},"clientInfo":{{"name":"{name}","version":"1"}}"#
+        );
+        let (line, value) = server.request("initialize", &info);
+        assert!(value.get("result").is_some(), "{line}");
+        let reply = server.call("reply_to_thread", r#"{"id":"s1","text":"Done."}"#);
+        let structured = reply.structured();
+        assert_eq!(
+            structured.get("author").and_then(Value::as_str),
+            Some(author),
+            "{name}"
+        );
+    }
+}
+
+/// `apply_suggestion` has the viewer put a thread's suggestion in the
+/// working tree, saying where; a thread without one says so.
+#[test]
+fn apply_suggestion_writes_the_working_tree_through_the_viewer() {
+    let repo = repo();
+    let d = repo.path();
+    write(d, "long.txt", &long_file(|i| i == 3));
+    suggested(d);
+    let runtime = tempfile::tempdir().expect("tempdir");
+    let mut server = Server::start_in(d, runtime.path());
+    initialize(&mut server);
+    let _viewer = Viewer::start(d, runtime.path(), &[]);
+    let opened = server.call("open_in_viewer", r#"{"path":"long.txt"}"#);
+    assert!(!opened.is_error(), "{}", opened.line);
+    let applied = server.call("apply_suggestion", r#"{"id":"s1"}"#);
+    assert!(!applied.is_error(), "{}", applied.line);
+    let at = applied.structured();
+    let number = |key: &str| at.get(key).and_then(Value::as_usize);
+    assert_eq!(
+        (number("start"), number("end"), number("lines")),
+        (Some(10), Some(10), Some(1))
+    );
+    assert_eq!(
+        applied.text(),
+        "Applied comment s1's suggestion to long.txt:10: an unstaged change."
+    );
+    let text = std::fs::read_to_string(d.join("long.txt")).expect("read");
+    assert_eq!(
+        text,
+        long_file(|i| i == 3).replace("line 10\n", "line ten\n")
+    );
+    let again = server.call("apply_suggestion", r#"{"id":"s1"}"#);
+    assert!(again.is_error(), "its lines changed: {}", again.line);
+    assert!(again.text().contains("changed since"), "{}", again.text());
 }

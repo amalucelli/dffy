@@ -1,10 +1,11 @@
 #!/bin/sh
-# A review plugin for dffy's tests, installed as dffy-review-test: a
+# A plugin for dffy's tests, installed as dffy-review-test or dffy-agent: a
 # JSON-RPC server on stdin and stdout, one message a line, answering from
 # files beside it that the test writes. Each start adds a line to
 # `started`: its working directory, tty or notty (whether it had a
 # terminal) and what dffy set in DFFY. Each `initialize` adds tty or notty
-# to `described`; every other message adds `<method> <params>` to `calls`.
+# to `described` and its params to `initialized`; every other message adds
+# `<method> <params>` to `calls`.
 #
 # A message is answered from files named by a stem, its method with `/`
 # as `_` and without `$` (`$/cancelRequest` is `_cancelRequest`):
@@ -43,6 +44,7 @@ while IFS= read -r line; do
   stem=$(printf '%s' "$method" | tr '/' '_' | tr -d '$')
   if [ "$method" = initialize ]; then
     echo "$tty" >> "$d/described"
+    printf '%s\n' "$params" >> "$d/initialized"
   else
     printf '%s %s\n' "$method" "$params" >> "$d/calls"
   fi

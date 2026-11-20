@@ -3,12 +3,15 @@
 //! contract). This module owns the format and the operations that write the
 //! file under a lock; a comment's anchor is the core's
 //! [`dffy_core::annotation::Anchor`], which places it. Its submodules are the review layer frontends share: the threads made
-//! from the file ([`model`]), the comments panel's list ([`listing`]) and
-//! a review session with a plugin ([`session`]). Nothing here knows about
-//! the viewer.
+//! from the file ([`model`]), the comments panel's list ([`listing`]), a
+//! thread or a selection as a prompt for a coding agent ([`prompt`]), a
+//! review session with a plugin ([`session`]) and asking an agent about a
+//! thread ([`ask`]). Nothing here knows about the viewer.
 
+pub(crate) mod ask;
 pub(crate) mod listing;
 pub(crate) mod model;
+pub(crate) mod prompt;
 pub(crate) mod session;
 
 use std::collections::{HashMap, HashSet};
@@ -72,6 +75,10 @@ impl LineNumbers {
 /// `anchor`; file comments and replies have none of them. A general
 /// comment, on the review rather than a file, has no path either.
 #[derive(Debug, Clone, PartialEq, Default)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "the file's flags, each its own field"
+)]
 pub(crate) struct Comment {
     pub id: String,
     /// Empty for a general comment.
@@ -117,6 +124,12 @@ pub(crate) struct Comment {
     pub pending: bool,
     /// Set by an integration: why the host refused to take the comment.
     pub post_error: Option<String>,
+    /// Yours, but never posted until you make it yours again (`set` with an
+    /// empty author): one that asked a local agent with `@<name>`, which
+    /// on the host would mention someone, or set off the host's own bot;
+    /// a question or follow-up to an agent, out of context there; and a
+    /// note for Fix with agent.
+    pub local_only: bool,
     /// Set by an integration on a thread's first comment: whether the host
     /// last said the thread is resolved. A `resolved` that differs is a
     /// resolve or reopen not sent yet; `None` for a thread the host doesn't
@@ -761,6 +774,19 @@ fn fresh_id(taken: impl Fn(&str) -> bool) -> String {
 }
 
 impl Review {
+    /// The drafts a review session's post sends, in file order: each
+    /// [`Comment::draft`], a reply only in a thread that
+    /// [`Comment::takes_replies`].
+    pub(crate) fn drafts(&self) -> impl Iterator<Item = &Comment> {
+        let closed: HashSet<&str> = (self.comments.iter())
+            .filter(|c| c.in_reply_to.is_none() && !c.takes_replies())
+            .map(|c| c.id.as_str())
+            .collect();
+        (self.comments.iter()).filter(move |c| {
+            c.draft() && (c.in_reply_to.as_deref()).is_none_or(|root| !closed.contains(root))
+        })
+    }
+
     /// Parses a file. Blank bytes are no comments; any `version` but 1 is
     /// refused, so a newer file is never rewritten in this one's format.
     pub(crate) fn parse(bytes: &[u8]) -> Result<Self, String> {
@@ -1048,6 +1074,7 @@ impl Review {
         }
         if let Some(author) = change.author {
             comment.author = author;
+            comment.local_only = false;
         }
         if let Some(resolved) = change.resolved {
             comment.resolved = resolved;
@@ -1197,6 +1224,18 @@ impl Review {
             })
             .collect()
     }
+
+    /// The thread comment `id` is in: its first comment, then its replies
+    /// in file order. `None` when no comment has that id.
+    pub(crate) fn thread(&self, id: &str) -> Option<Vec<&Comment>> {
+        let named = self.comments.iter().find(|c| c.id == id)?;
+        let root = (named.in_reply_to.as_deref())
+            .and_then(|root| self.comments.iter().find(|c| c.id == root))
+            .unwrap_or(named);
+        let replies = (self.comments.iter())
+            .filter(|c| c.in_reply_to.as_ref() == Some(&root.id) && c.path == root.path);
+        Some(std::iter::once(root).chain(replies).collect())
+    }
 }
 
 /// Which threads a listing or a removal takes, each judged by its first
@@ -1251,6 +1290,20 @@ impl Comment {
     /// on no branch shows on every one. For a thread, ask its first comment.
     pub(crate) fn on_branch(&self, branch: Option<&str>) -> bool {
         self.branch.is_none() || self.branch.as_deref() == branch
+    }
+
+    /// Yours, without a ref and not kept local: what a review session's
+    /// post sends, a reply only in a thread that [`Comment::takes_replies`].
+    pub(crate) fn draft(&self) -> bool {
+        self.reference.is_none() && self.author.is_empty() && !self.local_only
+    }
+
+    /// A thread's first comment that a post may put a draft reply under:
+    /// any but one kept local, which isn't on the host and won't be until
+    /// you make it yours. Under another not on the host, the review
+    /// plugin's plan says why the reply can't go.
+    pub(crate) fn takes_replies(&self) -> bool {
+        !self.local_only
     }
 
     /// A posted thread's first comment resolved or reopened here since the
@@ -1313,16 +1366,16 @@ impl Comment {
                         _ => return Err("`host_resolved` must be true or false".to_owned()),
                     };
                 }
-                "outdated" | "pending" => {
+                "outdated" | "pending" | "local_only" => {
                     let flag = match value {
                         Value::Null => false,
                         Value::Bool(b) => b,
                         _ => return Err(format!("`{key}` must be true or false")),
                     };
-                    if key == "outdated" {
-                        c.outdated = flag;
-                    } else {
-                        c.pending = flag;
+                    match key.as_str() {
+                        "outdated" => c.outdated = flag,
+                        "pending" => c.pending = flag,
+                        _ => c.local_only = flag,
                     }
                 }
                 "distance" => {
@@ -1397,6 +1450,11 @@ impl Comment {
         put(&mut f, "branch", self.branch.as_deref().map(text));
         put(&mut f, "pending", self.pending.then_some(Value::Bool(true)));
         put(&mut f, "post_error", self.post_error.as_deref().map(text));
+        put(
+            &mut f,
+            "local_only",
+            self.local_only.then_some(Value::Bool(true)),
+        );
         put(&mut f, "host_resolved", self.host_resolved.map(Value::Bool));
         put(&mut f, "moved_from", self.moved_from.as_deref().map(text));
         f.extend(self.extra.iter().cloned());

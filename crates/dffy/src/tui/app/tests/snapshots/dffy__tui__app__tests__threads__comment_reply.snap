@@ -1,5 +1,5 @@
 ---
-source: crates/dffy/src/tui/app.rs
+source: crates/dffy/src/tui/app/tests/threads.rs
 expression: screen(&mut app)
 ---
 ┌ Files · 12 +2 -2 ────────┬─ modified · src/some/deeply/nested/module/file.rs · +2 -2 ────────────┐
@@ -15,7 +15,7 @@ expression: screen(&mut app)
 │   M zz5.rs               │        │  ┃ you · 1h ago                                            ┃ │
 │   M zz6.rs               │        │  ┃ Because.                                                ┃ │
 │   M zz7.rs               │        │  ┃                                                         ┃ │
-│   M zz8.rs               │        │  ┃ you · reply · esc saves · ctrl+g editor                 ┃ │
+│   M zz8.rs               │        │  ┃ you · reply · enter sends · shift+enter new line · ctr… ┃ │
 │   M zz9.rs   1           │        │  ┃ Sure▏                                                   ┃ │
 │                          │        │  ┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛ ▐
 │                          │  3  3  │ line 3                                                       │

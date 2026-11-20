@@ -1,0 +1,8 @@
+{"type":"session","version":3,"id":"01a1fa21-3264-713b-a9e2-bbc29df88f2f","timestamp":"2026-11-20T18:04:02.021Z","cwd":"/work"}
+{"type":"agent_start"}
+{"type":"turn_start"}
+{"type":"message_update","usage":{"input":10,"output":1,"totalTokens":11},"assistantMessageEvent":{"type":"text_delta","contentIndex":0,"delta":"Yes"}}
+{"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":"Yes: `x + y` overflows past `u32::MAX`."},{"type":"text","text":"```suggestion\nlet total = x\n    .checked_add(y)?;\n```"}],"stopReason":"stop","timestamp":1795000000001}}
+{"type":"turn_end","message":{"role":"assistant","content":[],"stopReason":"stop"},"toolResults":[]}
+{"type":"agent_end","messages":[],"willRetry":false}
+{"type":"agent_settled","aborted":false}

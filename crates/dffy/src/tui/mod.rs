@@ -23,9 +23,13 @@ mod tree;
 pub(crate) mod view;
 pub(crate) mod worker;
 
+use std::collections::HashMap;
+use std::ffi::OsString;
 use std::io::{self, Write};
+use std::ops::Range;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -37,18 +41,21 @@ use dffy_core::bstr::{BString, ByteSlice};
 use dffy_core::conflict::Choices;
 use dffy_core::diff::Options;
 use dffy_core::git::{
-    Applied, ChangeSet, DiffSpec, Edit, FileChange, FileDiff, Picked, Repo, Revisions, Update,
+    Applied, ChangeSet, DiffSpec, Edit, FileChange, FileDiff, NewSide, Picked, Repo, Revisions,
+    Side, Update,
 };
 use dffy_core::watch::{Change, Notice, Plain, Root, Watcher};
 
-pub(crate) use app::{Action, App, Uncommitted};
+pub(crate) use app::{Action, App, Checkout, Handoff, Suggestion, Uncommitted};
 pub(crate) use worker::Done;
 
 use crate::daemon::client::{self, Subscription};
 use crate::pager::stdin::Stdin;
+use crate::plugin::agent;
 use crate::plugin::review::{self, Listed, Said};
 use crate::print::{self, Plan};
 use crate::render::{Canvas, escape};
+use crate::review::prompt;
 use crate::state;
 use crate::term::{self, Input, Reader, Signal, Tty};
 use crate::theme::{BUILTIN, Role, Theme};
@@ -116,8 +123,27 @@ pub(crate) enum Event {
     /// The review plugin's naming, asked for after the first frame; `None`
     /// when it can't initialize.
     Described(Option<review::Described>),
+    /// The agent plugin's ask `id` said this.
+    Agent {
+        id: u64,
+        said: agent::Said,
+    },
+    /// The agent plugin initialized, listing these agents, or couldn't.
+    Agents(Result<Vec<agent::Agent>, String>),
     /// A request from the control API, or what's subscribed to now.
     Control(crate::control::viewer::Inbound),
+    /// A tab opened in the user's terminal at `dir`, as the note says, or
+    /// why not.
+    Terminal {
+        dir: PathBuf,
+        opened: Result<String, String>,
+    },
+    /// A suggestion went in place of these lines of its file, 0-based as
+    /// they were, or why not.
+    Applied(Result<Range<usize>, String>),
+    /// The coding agent a thread was handed to started, as the note says,
+    /// or why not.
+    HandedOff(Result<String, String>),
     /// Nothing happened before the app's deadline.
     Tick,
 }
@@ -128,6 +154,46 @@ const BATCH_TIME: Duration = Duration::from_millis(8);
 
 /// Why a git operation on the working tree can't run.
 const NO_WORKTREE: &str = "there's no working tree to change";
+
+/// Why the working tree isn't for changing on `checkout`'s behalf: HEAD
+/// isn't the review's head, so its changes aren't what's there.
+fn checked_out(repo: &Repo, checkout: Option<&Checkout>) -> Result<(), String> {
+    let Some(checkout) = checkout else {
+        return Ok(());
+    };
+    let head = repo.resolve_show("HEAD").map(|(id, _)| id.to_string());
+    if head.is_ok_and(|head| head == checkout.head) {
+        return Ok(());
+    }
+    Err(format!(
+        "check out {} first: HEAD isn't its head",
+        checkout.label
+    ))
+}
+
+/// Puts `s` in place of its lines in the working tree, once HEAD is its
+/// review's head when it has one. A review, or a range ending at HEAD,
+/// shows HEAD's version of the file, which the working tree was made from.
+fn apply(repo: &Repo, s: &Suggestion) -> Result<Range<usize>, String> {
+    checked_out(repo, s.checkout.as_ref())?;
+    let change = &s.diff.change;
+    let at_head = match change.new {
+        _ if s.checkout.is_some() => true,
+        Some(Side::Object { id, .. }) => {
+            let head = repo.head_blob(change.path.as_ref());
+            head.map_err(|e| e.to_string())? == Some(id)
+        }
+        _ => false,
+    };
+    let new_side = if at_head {
+        NewSide::Head
+    } else {
+        NewSide::AsShown
+    };
+    let lines: Vec<&str> = s.lines.iter().map(String::as_str).collect();
+    dffy_core::annotation::apply_suggestion(repo, &s.diff, new_side, s.at, &s.anchor, &lines)
+        .map_err(|e| e.to_string())
+}
 
 /// The theme the TUI draws with: attributes only when color is off, since
 /// the grid has no "plain" mode the way print output does.
@@ -378,6 +444,9 @@ pub(crate) fn run(
         gate: None,
         register,
         control: None,
+        agent: None,
+        agent_config: ctx.config.agent.clone(),
+        asks: HashMap::new(),
     };
     if watch {
         app.set_watching(true);
@@ -488,6 +557,9 @@ pub(crate) fn run_piped(tty: &Tty, stdin: Stdin, ctx: &Ctx) -> Result<ExitCode, 
         gate: Some(gate),
         register: None,
         control: None,
+        agent: None,
+        agent_config: None,
+        asks: HashMap::new(),
     };
     let result = session.interact(&mut app, tx, &rx);
     term::restore();
@@ -740,6 +812,12 @@ struct Session<'a> {
     register: Option<crate::control::viewer::Info>,
     /// The registration, for the viewer's life.
     control: Option<crate::control::viewer::Registration>,
+    /// The agent plugin's process, started on the first ask, for the
+    /// viewer's life, and the config's `agent` it's given.
+    agent: Option<agent::Plugin>,
+    agent_config: Option<String>,
+    /// The asks it runs, by id, to stop.
+    asks: HashMap<u64, agent::Run>,
 }
 
 impl Session<'_> {
@@ -777,6 +855,14 @@ impl Session<'_> {
         let result = self.run(app, rx);
         if let Some(plugin) = &self.plugin {
             plugin.close();
+        }
+        // Before stop_all, which kills the plugin outright: it stops the
+        // agents it runs, in process groups of their own, only as it exits.
+        for run in self.asks.values() {
+            run.cancel();
+        }
+        if let Some(agent) = &self.agent {
+            agent.close();
         }
         crate::plugin::stop_all();
         let remembered = app.take_remembered(true);
@@ -913,8 +999,21 @@ impl Session<'_> {
     }
 
     /// What the app left for the loop once a frame is out: work for the
-    /// pool, settings to remember, and whether you're idle, for the plugin.
-    fn hand_off(&self, app: &mut App) {
+    /// pool, settings to remember, whether you're idle, for the review
+    /// plugin, and asks for the agent plugin.
+    fn hand_off(&mut self, app: &mut App) -> io::Result<()> {
+        if let Some(handoff) = app.take_handoff() {
+            self.hand_to_agent(app, &handoff)?;
+        }
+        let (asks, stops) = app.take_agent_work();
+        for id in stops {
+            if let Some(run) = self.asks.remove(&id) {
+                run.cancel();
+            }
+        }
+        for (id, request) in asks {
+            self.ask(id, &request);
+        }
         if let Some(files) = app.take_count_pass() {
             self.pool.count(files);
         }
@@ -930,6 +1029,7 @@ impl Session<'_> {
         if let (Some(idle), Some(plugin)) = (app.take_idle(), &self.plugin) {
             plugin.idle(idle);
         }
+        Ok(())
     }
 
     fn run(&mut self, app: &mut App, rx: &mpsc::Receiver<Event>) -> io::Result<()> {
@@ -949,7 +1049,7 @@ impl Session<'_> {
                 // before the loop waits.
                 continue;
             }
-            self.hand_off(app);
+            self.hand_off(app)?;
             let first = match app.deadline() {
                 Some(at) => match rx.recv_timeout(at.saturating_duration_since(Instant::now())) {
                     Ok(event) => event,
@@ -966,6 +1066,13 @@ impl Session<'_> {
             while let Some(event) = next {
                 if let Event::Diffed(done) = &event {
                     self.pool.finish(done);
+                }
+                if let Event::Agent {
+                    id,
+                    said: agent::Said::Answered(_) | agent::Said::NotInstalled,
+                } = &event
+                {
+                    self.asks.remove(id);
                 }
                 match event {
                     Event::Resize => {
@@ -988,6 +1095,7 @@ impl Session<'_> {
                         Some(Action::Edit { path, line }) => self.edit(app, &path, line)?,
                         Some(Action::Compose(text)) => self.compose(app, &text)?,
                         Some(Action::Browse(url)) => browse(app, &url),
+                        Some(Action::OpenTerminal) => self.open_terminal(app),
                         Some(Action::Review { id, request }) => self.request(id, &request),
                         Some(Action::Retarget {
                             revisions,
@@ -1015,6 +1123,9 @@ impl Session<'_> {
                             self.write_resolution(path, choices);
                         }
                         Some(Action::GitAdd(path)) => self.git_add(path),
+                        Some(Action::ApplySuggestion(suggestion)) => {
+                            self.apply_suggestion(*suggestion);
+                        }
                         None => {}
                     },
                 }
@@ -1217,6 +1328,63 @@ impl Session<'_> {
         }
     }
 
+    /// Opens a tab in the user's terminal at the working tree's root, on a
+    /// thread of its own: a script driving the terminal can wait on macOS's
+    /// prompt to let it. What came of it arrives as [`Event::Terminal`].
+    fn open_terminal(&self, app: &mut App) {
+        let Some(root) = self.files.as_ref().and_then(Repo::workdir) else {
+            app.message("there's no working tree to open a terminal in");
+            return;
+        };
+        let dir = std::path::absolute(root).unwrap_or_else(|_| root.to_owned());
+        let macos = cfg!(target_os = "macos");
+        let opener = match crate::terminal::opener(|name| std::env::var_os(name), macos, &dir, &[])
+        {
+            Ok(opener) => opener,
+            Err(why) => {
+                let outcome = Event::Terminal {
+                    dir,
+                    opened: Err(why),
+                };
+                self.events.send(outcome).ok();
+                return;
+            }
+        };
+        let events = self.events.clone();
+        let thread = std::thread::Builder::new()
+            .name("dffy-terminal".into())
+            .spawn(move || {
+                let program = Path::new(&opener.program)
+                    .file_name()
+                    .unwrap_or(&opener.program)
+                    .to_string_lossy()
+                    .into_owned();
+                // A process group of its own, with no stdio, so nothing it
+                // does reaches dffy's terminal or its signals.
+                let status = Command::new(&opener.program)
+                    .args(&opener.args)
+                    .stdin(std::process::Stdio::null())
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .process_group(0)
+                    .status();
+                let outcome = match status {
+                    Ok(status) if status.success() => Ok(format!("opened {}", opener.opens)),
+                    Ok(status) => Err(format!("{program} failed ({status})")),
+                    Err(e) => Err(format!("couldn't run {program}: {e}")),
+                };
+                events
+                    .send(Event::Terminal {
+                        dir,
+                        opened: outcome,
+                    })
+                    .ok();
+            });
+        if let Err(e) = thread {
+            app.message(format!("couldn't open a terminal: {e}"));
+        }
+    }
+
     /// Hands the terminal to the editor and takes it back.
     fn edit(&self, app: &mut App, path: &BString, line: usize) -> io::Result<()> {
         let (Some(full), Some(reader)) = (
@@ -1236,22 +1404,18 @@ impl Session<'_> {
         Ok(())
     }
 
-    /// Returns whether the editor exited cleanly; why not goes in the
-    /// status bar.
-    fn in_editor(
+    /// Hands the terminal to `run`, given it, and takes it back once `run`
+    /// returns what it did.
+    fn suspended<T>(
         &self,
         app: &mut App,
         reader: &Reader,
-        path: &Path,
-        line: usize,
-    ) -> io::Result<bool> {
+        run: impl FnOnce(std::fs::File) -> io::Result<T>,
+    ) -> io::Result<io::Result<T>> {
         reader.pause();
         self.suspended.store(true, Ordering::Relaxed);
         term::restore();
-        let status = self
-            .tty
-            .try_clone()
-            .and_then(|tty| editor::open(path, line, tty));
+        let done = self.tty.try_clone().and_then(run);
         self.tty.enter()?;
         if !app.mouse() {
             self.tty.write(term::MOUSE_OFF)?;
@@ -1261,6 +1425,169 @@ impl Session<'_> {
         let (width, height) = self.tty.size();
         app.resize(width, height);
         app.invalidate();
+        Ok(done)
+    }
+
+    /// Puts a thread's suggestion in place of its lines on a thread of its
+    /// own, once HEAD is the review's head when it must be; then the list
+    /// is read again, as watch mode may not be on to do.
+    fn apply_suggestion(&self, suggestion: Suggestion) {
+        let Some(repo) = self.files.as_ref().map(Repo::without_object_cache) else {
+            self.events
+                .send(Event::Applied(Err(NO_WORKTREE.to_owned())))
+                .ok();
+            return;
+        };
+        let (events, requests) = (self.events.clone(), self.requests.clone());
+        let started = std::thread::Builder::new()
+            .name("dffy-suggestion".into())
+            .spawn(move || {
+                let result = apply(&repo, &suggestion);
+                if result.is_ok() {
+                    requests.send(Request::Rescan).ok();
+                }
+                events.send(Event::Applied(result)).ok();
+            });
+        if let Err(e) = started {
+            self.events
+                .send(Event::Applied(Err(format!("couldn't apply it: {e}"))))
+                .ok();
+        }
+    }
+
+    /// Starts the user's coding agent on `handoff`'s thread, as they'd run
+    /// it, with none of dffy's flags: in a new tab of their terminal, or
+    /// where it can't open one running a program, here, the viewer
+    /// suspended until the agent exits, as for the editor.
+    fn hand_to_agent(&self, app: &mut App, handoff: &Handoff) -> io::Result<()> {
+        // Through the channel: the frame is out, and the loop waits next.
+        let refuse = |why: String| {
+            self.events.send(Event::HandedOff(Err(why))).ok();
+            Ok(())
+        };
+        let Some((repo, root)) = (self.files.as_ref()).and_then(|r| Some((r, r.workdir()?))) else {
+            return refuse("there's no working tree for an agent to change".to_owned());
+        };
+        if let Err(why) = checked_out(repo, handoff.checkout.as_ref()) {
+            return refuse(why);
+        }
+        let find = |name: &str| crate::plugin::find("", name).map(|p| p.path);
+        let config = self.agent_config.as_deref();
+        let (name, program) = match agent::interactive(config, find) {
+            Ok(picked) => picked,
+            Err(why) => return refuse(why),
+        };
+        let custom = if config.is_some_and(|c| c != name) {
+            " · the agent setting is a command of yours, which takes no thread"
+        } else {
+            ""
+        };
+        let local = crate::review::local_file(repo).ok().flatten();
+        let local = local.map(|l| std::path::absolute(&l).unwrap_or(l));
+        let kept = if handoff.session {
+            prompt::Kept::Session
+        } else if local.as_deref() == Some(&*handoff.file) {
+            prompt::Kept::Local
+        } else {
+            prompt::Kept::File(&handoff.file)
+        };
+        let seed = prompt::handoff(&handoff.thread, kept);
+        let mut command: Vec<OsString> = vec![program.into_os_string()];
+        let paste = if agent::takes_prompt(name) {
+            command.push(seed.into());
+            ""
+        } else {
+            // Its first message comes from the user: the seed is pasted.
+            self.copy(app, seed.as_bytes(), String::new())?;
+            " · its first message is on the clipboard to paste"
+        };
+        let note = format!("{paste}{custom}");
+        let dir = std::path::absolute(root).unwrap_or_else(|_| root.to_owned());
+        let macos = cfg!(target_os = "macos");
+        let opener = crate::terminal::opener(|var| std::env::var_os(var), macos, &dir, &command);
+        let opener = match opener {
+            Ok(opener) => opener,
+            Err(why) => return self.agent_here(app, (name, &command), &dir, (&why, &note)),
+        };
+        let events = self.events.clone();
+        let started = std::thread::Builder::new()
+            .name("dffy-terminal".into())
+            .spawn(move || {
+                let program = Path::new(&opener.program)
+                    .file_name()
+                    .unwrap_or(&opener.program)
+                    .to_string_lossy()
+                    .into_owned();
+                let status = Command::new(&opener.program)
+                    .args(&opener.args)
+                    .stdin(std::process::Stdio::null())
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .process_group(0)
+                    .status();
+                let started = match status {
+                    Ok(status) if status.success() => {
+                        Ok(format!("started {name} in {}{note}", opener.opens))
+                    }
+                    Ok(status) => Err(format!("{program} failed ({status})")),
+                    Err(e) => Err(format!("couldn't run {program}: {e}")),
+                };
+                events.send(Event::HandedOff(started)).ok();
+            });
+        if let Err(e) = started {
+            return refuse(format!("couldn't start {name}: {e}"));
+        }
+        Ok(())
+    }
+
+    /// Runs the agent `command` names in `dir` on this terminal, as the
+    /// editor runs, `why` no tab could, and says `note` after; then the
+    /// list is read again.
+    fn agent_here(
+        &self,
+        app: &mut App,
+        (name, command): (&str, &[OsString]),
+        dir: &Path,
+        (why, note): (&str, &str),
+    ) -> io::Result<()> {
+        let Some(reader) = &self.reader else {
+            let why = format!("{why}, and there's no terminal to run {name} on here");
+            self.events.send(Event::HandedOff(Err(why))).ok();
+            return Ok(());
+        };
+        // All three on the terminal: dffy's stdout may be piped.
+        let status = self.suspended(app, reader, |tty| {
+            Command::new(&command[0])
+                .args(&command[1..])
+                .current_dir(dir)
+                .stdout(tty.try_clone()?)
+                .stderr(tty.try_clone()?)
+                .stdin(tty)
+                .status()
+        })?;
+        self.requests.send(Request::Rescan).ok();
+        match status {
+            Ok(status) if status.success() => {
+                app.message(format!("{name} exited; it ran here, as {why}{note}"));
+            }
+            Ok(status) => app.message(format!("{name} exited with {status}")),
+            Err(e) => app.message(format!("couldn't start {name}: {e}")),
+        }
+        // Wakes the loop to draw the viewer again.
+        self.events.send(Event::Resize).ok();
+        Ok(())
+    }
+
+    /// Returns whether the editor exited cleanly; why not goes in the
+    /// status bar.
+    fn in_editor(
+        &self,
+        app: &mut App,
+        reader: &Reader,
+        path: &Path,
+        line: usize,
+    ) -> io::Result<bool> {
+        let status = self.suspended(app, reader, |tty| editor::open(path, line, tty))?;
         Ok(match status {
             Ok(status) if status.success() => true,
             Ok(status) => {
@@ -1301,6 +1628,46 @@ impl Session<'_> {
             self.plugin = Some(plugin);
         }
         self.plugin.as_ref().ok_or_else(String::new)
+    }
+
+    /// The agent plugin's process, started in the working tree's root on
+    /// first use, or what an ask says when there's none. The agents it
+    /// lists, once it has initialized, come back as [`Event::Agents`].
+    fn agent(&mut self) -> Result<&agent::Plugin, agent::Said> {
+        if self.agent.is_none() {
+            let program = agent::find().ok_or(agent::Said::NotInstalled)?;
+            let failed = |why: String| agent::Said::Answered(Err(why));
+            let root = (self.files.as_ref().and_then(Repo::workdir))
+                .ok_or_else(|| failed("there's no working tree for an agent to read".to_owned()))?;
+            let root = std::path::absolute(root).unwrap_or_else(|_| root.to_owned());
+            let plugin = agent::Plugin::start(&program, Some(&root), self.agent_config.clone())
+                .map_err(|e| failed(format!("couldn't start {}: {e}", agent::PROGRAM)))?;
+            plugin.close_on_panic();
+            let events = self.events.clone();
+            plugin.on_ready(move |agents| {
+                events.send(Event::Agents(agents)).ok();
+            });
+            self.agent = Some(plugin);
+        }
+        self.agent.as_ref().ok_or(agent::Said::NotInstalled)
+    }
+
+    /// Asks the agent plugin `request` as ask `id`, what it says coming
+    /// back as [`Event::Agent`]. An ask that can't be made says why as its
+    /// end.
+    fn ask(&mut self, id: u64, request: &agent::Request) {
+        let sink = self.events.clone();
+        match self.agent() {
+            Ok(plugin) => {
+                let run = plugin.request(request, move |said| {
+                    sink.send(Event::Agent { id, said }).ok();
+                });
+                self.asks.insert(id, run);
+            }
+            Err(said) => {
+                sink.send(Event::Agent { id, said }).ok();
+            }
+        }
     }
 
     /// Asks the review plugin `request` as request `id`, what it says
@@ -1533,6 +1900,180 @@ fn rewritten(root: &Path, last: &str, head: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Someone else's review is the working tree's to change only while
+    /// HEAD is its head.
+    #[test]
+    fn the_working_tree_is_a_reviews_only_on_its_head() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let git = |args: &[&str]| {
+            let out = Command::new("git")
+                .current_dir(dir.path())
+                .args(["-c", "user.name=t", "-c", "user.email=t@t"])
+                .args(["-c", "commit.gpgsign=false"])
+                .args(args)
+                .output()
+                .expect("git runs");
+            assert!(out.status.success(), "git {args:?}");
+            String::from_utf8_lossy(&out.stdout).trim().to_owned()
+        };
+        git(&["init", "-q", "-b", "main"]);
+        git(&["commit", "-q", "--allow-empty", "-m", "one"]);
+        let head = git(&["rev-parse", "HEAD"]);
+        let repo = Repo::discover(dir.path()).expect("repo");
+        let review = |head: &str| Checkout {
+            label: "PR #7".to_owned(),
+            head: head.to_owned(),
+        };
+        assert_eq!(checked_out(&repo, None), Ok(()));
+        assert_eq!(checked_out(&repo, Some(&review(&head))), Ok(()));
+        assert_eq!(
+            checked_out(&repo, Some(&review(&"0".repeat(40)))),
+            Err("check out PR #7 first: HEAD isn't its head".to_owned())
+        );
+    }
+
+    /// A review shows its head's tree, not the working tree; once its head
+    /// is checked out, a suggestion applies to the file on disk, and on
+    /// another HEAD it's refused, writing nothing.
+    #[test]
+    fn a_suggestion_on_a_review_applies_once_its_head_is_checked_out() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let git = |args: &[&str]| {
+            let out = Command::new("git")
+                .current_dir(dir.path())
+                .args(["-c", "user.name=t", "-c", "user.email=t@t"])
+                .args(["-c", "commit.gpgsign=false"])
+                .args(args)
+                .output()
+                .expect("git runs");
+            assert!(out.status.success(), "git {args:?}");
+            String::from_utf8_lossy(&out.stdout).trim().to_owned()
+        };
+        let file = dir.path().join("f.txt");
+        git(&["init", "-q", "-b", "main"]);
+        std::fs::write(&file, "a\nb\nc\n").expect("write");
+        git(&["add", "f.txt"]);
+        git(&["commit", "-q", "-m", "base"]);
+        std::fs::write(&file, "a\nB\nc\n").expect("write");
+        git(&["commit", "-q", "-am", "head"]);
+        let head = git(&["rev-parse", "HEAD"]);
+        let repo = Repo::discover(dir.path()).expect("repo");
+        let revisions = Revisions {
+            revs: vec!["HEAD~1...HEAD".to_owned()],
+            ..Default::default()
+        };
+        let spec = repo.resolve_revisions(&revisions).expect("resolves");
+        let mut found = None;
+        repo.for_each_change(&spec, &[], |c| {
+            found = Some(c);
+            std::ops::ControlFlow::Break(())
+        })
+        .expect("lists");
+        let diff = (repo.file_diff(found.expect("listed"), &Options::default())).expect("diffs");
+        let diff = Arc::new(diff);
+        let suggestion = |head: &str| Suggestion {
+            anchor: dffy_core::annotation::Anchor::new(&diff.new, 1..2),
+            diff: Arc::clone(&diff),
+            at: 1,
+            lines: vec!["bee".to_owned()],
+            checkout: Some(Checkout {
+                label: "PR #7".to_owned(),
+                head: head.to_owned(),
+            }),
+            thread: "t".to_owned(),
+            comment: "t".to_owned(),
+        };
+
+        git(&["checkout", "-q", "HEAD~1"]);
+        assert_eq!(
+            apply(&repo, &suggestion(&head)),
+            Err("check out PR #7 first: HEAD isn't its head".to_owned())
+        );
+        assert_eq!(std::fs::read_to_string(&file).expect("read"), "a\nb\nc\n");
+
+        git(&["checkout", "-q", &head]);
+        assert_eq!(apply(&repo, &suggestion(&head)), Ok(1..2));
+        assert_eq!(std::fs::read_to_string(&file).expect("read"), "a\nbee\nc\n");
+    }
+
+    /// A range ending at HEAD, as `main..HEAD`, shows the commit the working
+    /// tree was made from: a suggestion there applies to the file on disk,
+    /// unless its lines changed there. A range ending elsewhere is refused.
+    #[test]
+    fn a_suggestion_on_a_range_applies_when_its_new_side_is_heads() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let git = |args: &[&str]| {
+            let out = Command::new("git")
+                .current_dir(dir.path())
+                .args(["-c", "user.name=t", "-c", "user.email=t@t"])
+                .args(["-c", "commit.gpgsign=false"])
+                .args(args)
+                .output()
+                .expect("git runs");
+            assert!(out.status.success(), "git {args:?}");
+        };
+        let file = dir.path().join("f.txt");
+        git(&["init", "-q", "-b", "main"]);
+        std::fs::write(&file, "a\nb\nc\n").expect("write");
+        git(&["add", "f.txt"]);
+        git(&["commit", "-q", "-m", "base"]);
+        git(&["checkout", "-q", "-b", "topic"]);
+        std::fs::write(&file, "a\nB\nc\n").expect("write");
+        git(&["commit", "-q", "-am", "one"]);
+        std::fs::write(&file, "a\nB\nC\n").expect("write");
+        git(&["commit", "-q", "-am", "two"]);
+        let repo = Repo::discover(dir.path()).expect("repo");
+        let suggestion = |range: &str| {
+            let revisions = Revisions {
+                revs: vec![range.to_owned()],
+                ..Default::default()
+            };
+            let spec = repo.resolve_revisions(&revisions).expect("resolves");
+            let mut found = None;
+            repo.for_each_change(&spec, &[], |c| {
+                found = Some(c);
+                std::ops::ControlFlow::Break(())
+            })
+            .expect("lists");
+            let diff =
+                (repo.file_diff(found.expect("listed"), &Options::default())).expect("diffs");
+            Suggestion {
+                anchor: dffy_core::annotation::Anchor::new(&diff.new, 1..2),
+                diff: Arc::new(diff),
+                at: 1,
+                lines: vec!["bee".to_owned()],
+                checkout: None,
+                thread: "t".to_owned(),
+                comment: "t".to_owned(),
+            }
+        };
+
+        assert_eq!(
+            apply(&repo, &suggestion("main..HEAD~1")),
+            Err(
+                "can't apply a suggestion: it works on the working tree or HEAD, \
+                 and this file's new side is neither"
+                    .to_owned()
+            )
+        );
+        assert_eq!(std::fs::read_to_string(&file).expect("read"), "a\nB\nC\n");
+
+        let on_head = suggestion("main..HEAD");
+        std::fs::write(&file, "a\nX\nC\n").expect("write");
+        assert_eq!(
+            apply(&repo, &on_head),
+            Err("can't apply the suggestion: its lines changed since it was written".to_owned())
+        );
+        assert_eq!(std::fs::read_to_string(&file).expect("read"), "a\nX\nC\n");
+
+        std::fs::write(&file, "a\nB\nC\nd\n").expect("write");
+        assert_eq!(apply(&repo, &on_head), Ok(1..2));
+        assert_eq!(
+            std::fs::read_to_string(&file).expect("read"),
+            "a\nbee\nC\nd\n"
+        );
+    }
 
     /// How many events a write makes is the backend's; the app's reload
     /// skips those that changed nothing.

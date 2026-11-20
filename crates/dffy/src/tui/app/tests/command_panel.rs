@@ -230,7 +230,7 @@ fn the_theme_list_tries_themes_live_and_esc_restores() {
     assert!(app.commands.as_ref().is_some_and(|c| !c.themes_open()));
     // The row's key steps forward and puts the cursor on it; there,
     // left steps back, without the list.
-    key(&mut app, 'a');
+    key(&mut app, '~');
     assert_eq!(app.theme_name, "gruvbox-light");
     app.event(Event::Input(Input::Key(Key::Left, Mods::NONE)));
     assert_eq!(app.theme_name, "catppuccin-latte");

@@ -1,6 +1,6 @@
 # Plugins
 
-dffy has two kinds of plugin, each a program on `PATH`: renderer plugins draw files in their rendered form, and [review plugins](#review-plugins) connect review comments to a code host.
+dffy has three kinds of plugin, each a program on `PATH`: renderer plugins draw files in their rendered form, [review plugins](#review-plugins) connect review comments to a code host, and the [agent plugin](#agent-plugins) asks a coding agent about a review thread.
 
 **Experimental.** The protocols and the settings may change. dffy has no plugin built in, and none is installed by default.
 
@@ -464,3 +464,94 @@ For `post`:
 - Both sides ignore fields and notifications they don't know. A request a plugin doesn't have answers `-32601`.
 - A plugin that can't initialize adds no command and isn't asked for the branch's review, and `dffy doctor` says so; one without `doctor` shows no checks of its own.
 - While the protocol is experimental, it changes in place, without a new version number, and dffy and the plugins from this repository change with it.
+
+## Agent plugins
+
+The agent plugin, `dffy-agent`, asks a coding agent you already run about a review thread: Claude Code (`claude`), Codex (`codex`), Pi (`pi`), or a command of yours. It hands back the answer and, when the answer proposes a change, its suggestion, for dffy to put in the thread as a reply authored by the agent. The agent can read and search, but not write, run arbitrary commands or reach the network, because of how it's run, its recipe, not because the prompt asks it to. The plugin writes no file, and neither does the agent.
+
+`dffy-agent` comes from this repository; [install.md](install.md#plugins) covers it. It needs `claude`, `codex` or `pi` on `PATH`, logged in, and nothing else: no SDK, no Node.
+
+### The agents and their recipes
+
+The recipes target the current release of each CLI. An agent is available when its program is on `PATH`; no version is checked, and a CLI release that breaks a recipe gets the recipe fixed in the plugin. `--version` runs only for `doctor`, to show what it says. Every recipe gets the prompt on stdin, never in its arguments, and runs in the working tree.
+
+- **Claude**: `claude -p --verbose --output-format stream-json --tools "Read,Grep,Glob" --disallowedTools "mcp__*" --strict-mcp-config --setting-sources user --no-session-persistence --permission-mode dontAsk`.
+  - It can read and search files, and nothing else: `--tools` leaves only Read, Grep and Glob of the built-in tools, so no edits, no shell and no web. MCP servers' tools are denied apart, and `--strict-mcp-config` loads no server. `--setting-sources user` keeps the reviewed repository's settings, and so its hooks, from loading. Nothing is saved as a session.
+  - The answer is the final `result` event; one with `is_error` is a failure, its `result` the reason.
+  - Replies carry no mark.
+- **Codex**: `codex exec --json --sandbox read-only --ephemeral -c web_search="disabled" -C <worktree>`.
+  - It can read and search files, and may run commands to do it, inside the read-only sandbox, which the operating system holds to no writes and no network. Web search is off. Nothing is saved as a session. Replies are marked `read-only sandbox`.
+  - Codex runs with your own Codex setup: your MCP servers, hooks, profiles and trusted project config load as in your normal use. MCP servers run outside its sandbox.
+  - The answer is the last completed item of type `agent_message`; `turn.failed` is a failure, and so is an `error` event when no answer came.
+- **Pi**: `pi --mode json --no-session --tools read,grep,find,ls --no-mcp --no-approve --offline`.
+  - It can read and search files, and nothing else: `--tools` leaves only the `read`, `grep`, `find` and `ls` tools, so no edits and no shell. `--no-mcp` connects no MCP server, `--no-approve` ignores the reviewed repository's trust-gated `.pi` config, extensions and skills, and `--offline` turns off Pi's own network use; the model's provider is still reached. Nothing is saved as a session. Replies are marked `read-only tools`.
+  - Pi has no sandbox: the limit is the tools it's given, not the operating system.
+  - With `--offline`, Pi doesn't download the programs its `grep` and `find` tools run, so they work only with `rg` and `fd` installed.
+  - The answer is the last assistant message's text. Pi retries a failed message itself, so the last one decides: one that stopped on an error, an abort or the length limit is a failure, its `errorMessage` the reason. Pi exits with status 0 either way.
+  - Pi's own login check (`pi auth check`) needs a provider named, which the recipe leaves to your Pi settings, so the plugin doesn't run it. A run that can't start because no model has a key says `No API key found` or `No models available` on stderr, and that's taken as not logged in.
+- **A command of yours**: a configured value with a space, its first word a name on `PATH` or an absolute path, the rest its arguments, split at spaces with no shell. Its stdout is the reply, and a non-zero exit a failure. Replies are marked `custom`. Nothing is enforced: the command's flags are yours.
+
+A failure's reason, when the agent's output gives none, is its stderr's first line that starts with `error:`, as a usage error's does, else its last line. When a run of Claude or Codex fails, the plugin asks `claude auth status` or `codex login status`; exit status 1 means it isn't logged in, and the error says how to log in. It runs no login flow.
+
+Amp isn't a built-in agent: it has no read-only mode an ask could rely on, as it runs tools without asking and a repository's `.amp/settings.json` and plugins override restrictions. You can still name it as a command of yours (`agent = amp …`), at your own risk, and Fix with agent can hand it a thread, since it starts an agent in its normal interactive mode rather than read-only.
+
+**What stays possible.**
+
+- Every agent can read files outside the working tree, such as `~/.ssh`: no recipe limits reading to the repository.
+- The prompt carries the reviewed code, so it can steer what the agent reads and says. With no writes and no network, what it read leaves only in the answer: a reply shown in dffy, on your machine, never posted to a code host unless you adopt it, and a suggestion only you apply.
+- Codex's MCP servers are the exception: the model can call their tools, and they run outside the sandbox, so a server that writes or reaches the network is a way out for an injected prompt.
+- dffy's own MCP server is reachable that way when it's one of your Codex servers, and so is the viewer behind it. Its `reply_to_thread` writes a reply by the client, never posted until you adopt it. Its `apply_suggestion`, which writes files, is refused while the viewer asks an agent, as is the control API's `comments/applySuggestion`; `s` in the viewer still applies.
+- Your own Claude settings and hooks, in your home directory, load with the user settings.
+- Pi's extensions in your home directory (`~/.pi/agent`) load, and run inside Pi with your permissions: one could register tools that write or reach the network, or turn tools back on.
+- The agent's own instruction files in the repository, such as `AGENTS.md`, are read as text.
+
+The programs are found in absolute `PATH` entries only, so the reviewed repository can't supply one, and `--version` and the login checks run in `/`.
+
+### The agent protocol, version 1
+
+The protocol is experimental, and changes in place as the review protocol does.
+
+**Program.** The executable `dffy-agent`, found on `PATH` as review plugins are.
+
+**Framing.** As [the review protocol's](#the-review-protocol-version-1): JSON-RPC 2.0 on stdin and stdout, one message a line.
+
+**Lifecycle.**
+
+- **dffy's side.** dffy starts the plugin only when it's needed, on the first ask or for `dffy doctor`, never as it starts, so `initialize` never delays its first frame; it keeps the plugin while it runs.
+- **The plugin's side.** Requests run side by side. Each agent runs in a process group of its own, which a cancel kills with everything the agent started; `shutdown`, `exit` and the end of stdin kill every ask still running, as killing the plugin's group doesn't reach them. A plugin that crashes kills none: its agents run on until they next write their output, which has no reader then and fails, or until they end. dffy starts the plugin again, and the asks it was running end as failed.
+
+**Messages.**
+
+| Message | Kind | When |
+|---|---|---|
+| `initialize {protocol, client, agent}` | request | First. dffy passes the config's `agent` value as it is, unread, and leaves `agent` out without one: a name picks the default agent, a value with a space is a command of yours. |
+| `ask {agent, prompt, cwd}` | request | An ask on a thread. `agent` is a listed agent's `name`; `cwd` the working tree, an absolute path. `prompt` is the thread as a prompt ([comments.md](comments.md#as-a-prompt-dffy-comments-prompt)), complete: the plugin sends it to the agent as it is, adding nothing, so the prompt itself ends with the ask for a ```` ```suggestion ```` block. |
+| `doctor` | request | `dffy doctor`. |
+| `shutdown` | request | On quit: every ask still running is killed, and it answers `null`. |
+| `exit` | notification | After `shutdown`: the plugin exits. |
+| `$/cancelRequest {id}` | notification | Cancels an ask: its agent is killed, and the ask answers `-32800`. |
+| `progress {request, progress}` | from the plugin | What the agent is doing: `starting…`, `thinking…`, `writing…`, `running a command…`, `reading…`, `searching…`. Said once each time it changes. |
+
+**Answers.**
+
+| Request | Result |
+|---|---|
+| `initialize` | `{"protocol":1,"agents":[{"name":"claude","default":true,"mark":null},{"name":"codex","default":false,"mark":"read-only sandbox"}],"capabilities":{}}`. `agents` lists only the agents found. `name` is `claude`, `codex`, `pi` or `custom`; one is the `default`: the command of yours when there is one, else the agent the config names, else the first. `mark` is how its replies are labeled, `null` for none. |
+| `ask` | `{"text":"Yes: the sum overflows past u32::MAX.","suggestion":"x.checked_add(y)?"}`. The answer's last ```` ```suggestion ```` fenced block, closed by a fence at least as long as the one that opened it, is taken out of `text` and becomes `suggestion`: its lines, without a final line break, as [the comments file's](comments.md#the-file-version-1) `suggestion`. A fence inside another block opens none. Without one there's no `suggestion`; an empty block is an empty one, which removes the lines. |
+| `doctor` | `{"checks":[{"name":"claude","ok":true,"detail":"2.1.329 (Claude Code)"},{"name":"claude recipe","ok":true,"detail":"read-only: Read, Grep and Glob only, MCP tools denied, user settings only"},{"name":"claude auth","ok":true,"detail":"logged in"},{"name":"codex","ok":true,"detail":"not installed"},{"name":"pi","ok":true,"detail":"not installed"}]}`, looked for again. For each built-in agent: what `--version` says, a failed check when it fails, and how the recipe runs it; for Claude and Codex also whether they're logged in, which Pi can't say without a provider named. One that isn't installed says `not installed`, a failed check only when the config names it or no agent can answer. For a command of yours: whether its program is found. And whether a configured name names an agent. |
+
+**Errors.** As JSON-RPC errors whose message is for the user:
+
+| Code | Meaning |
+|---|---|
+| `-32602` | A request it can't take: a missing field, a `cwd` that isn't a directory, or an agent it doesn't know (`no agent named gemini; claude, codex`). |
+| `-32800` | Cancelled. |
+| `1` | The agent ran and failed: `claude failed: API Error: 529 Overloaded`. |
+| `2` | The agent failed and isn't logged in; the message says how to log in, with `claude auth login`, `codex login` or `pi auth login <provider>`. |
+| `3` | The agent can't run: it isn't installed. |
+
+`crates/dffy/tests/fixtures/agent-protocol/messages.json` holds a request and its answer for each, and dffy-agent's tests hold the plugin to them.
+
+**Compatibility.** `initialize` names the protocol both ways, and dffy-agent refuses another, saying which it speaks. Both sides ignore fields they don't know, and a request the plugin doesn't have answers `-32601`.
+
+**What dffy does with it.** The viewer asks on `a` or a comment of yours starting `@<name>` ([viewer.md](viewer.md#asking-an-agent)), always naming a listed agent, the default for `a`. It writes an answer as a reply in the thread through the comments file's one write: authored by the agent's `name`, with the answer's `suggestion`, and the agent's `mark` as its `label` ([comments.md](comments.md#the-file-version-1)); a reply with an author isn't posted until you adopt it, and neither is your comment that asked, a mention, a question or a follow-up, which is kept [local only](comments.md#drafts). An answer that comes while a review's post runs is written once the post ends. The `initialize` answer isn't cached, so an agent installed since shows. As the viewer quits it cancels the asks running, sends `shutdown` and `exit`, waits up to half a second for the plugin to exit, then kills its process group. `dffy doctor` lists the plugin's checks.

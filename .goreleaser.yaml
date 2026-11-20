@@ -80,6 +80,24 @@ builds:
       - aarch64-unknown-linux-gnu
       - x86_64-unknown-linux-gnu
 
+  - id: agent-darwin
+    builder: rust
+    binary: dffy-agent
+    tool: cargo
+    command: build
+    flags: [--release, --package=dffy-agent]
+    targets:
+      - aarch64-apple-darwin
+      - x86_64-apple-darwin
+
+  - id: agent-linux
+    builder: rust
+    binary: dffy-agent
+    flags: [--release, --package=dffy-agent]
+    targets:
+      - aarch64-unknown-linux-gnu
+      - x86_64-unknown-linux-gnu
+
 archives:
   - id: dffy
     ids: [darwin, linux]
@@ -101,6 +119,11 @@ archives:
   - id: dffy-review-github
     ids: [review-github-darwin, review-github-linux]
     name_template: "dffy-review-github_{{ .Os }}_{{ .Arch }}"
+    formats: [tar.gz]
+
+  - id: dffy-agent
+    ids: [agent-darwin, agent-linux]
+    name_template: "dffy-agent_{{ .Os }}_{{ .Arch }}"
     formats: [tar.gz]
 
 checksum:
@@ -164,6 +187,21 @@ homebrew_casks:
         install_steps: |
           on_macos do
             run "/usr/bin/xattr", args: ["-dr", "com.apple.quarantine", "{{ .StagedPath }}/dffy-review-github"]
+          end
+
+  # No dependency on claude, codex or pi: any one does, and none is a formula to require.
+  - name: dffy-agent
+    ids: [dffy-agent]
+    description: "Experimental agent plugin for dffy: asks Claude Code or Codex about a review thread, read-only"
+    homepage: https://github.com/amalucelli/dffy
+    repository:
+      owner: amalucelli
+      name: homebrew-tap
+    hooks:
+      post:
+        install_steps: |
+          on_macos do
+            run "/usr/bin/xattr", args: ["-dr", "com.apple.quarantine", "{{ .StagedPath }}/dffy-agent"]
           end
 
 changelog:

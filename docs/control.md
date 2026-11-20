@@ -1,6 +1,6 @@
 # Control API
 
-A running viewer can be driven from outside: shown a file at a line, sent to a comment thread, given a comment, and asked what's selected and what it shows. Editors, scripts and coding agents use it through `dffy ctl`, the [MCP server's](mcp.md#viewer-tools) viewer tools, or the protocol below.
+A running viewer can be driven from outside: shown a file at a line, sent to a comment thread, given a comment, asked to apply a thread's suggestion, and asked what's selected and what it shows. Editors, scripts and coding agents use it through `dffy ctl`, the [MCP server's](mcp.md#viewer-tools) viewer tools, or the protocol below.
 
 ```sh
 dffy ctl open src/lib.rs:42        # show line 42 of src/lib.rs
@@ -16,7 +16,8 @@ Unix only: the transport is a Unix socket. Windows isn't supported.
 - **Viewers register.** Every viewer of a working tree registers with dffyd once its first frame is out, starting dffyd if none runs. It stays registered until it exits; a viewer that's killed leaves the list too, as its connection closes. A diff piped on stdin, and files or folders compared outside git, don't register.
 - **One per user.** Every viewer you run, in any repository, is in one list. A command picks the viewer in the working tree it runs in (`-C <path>` or the current directory), or the one `--view <id>` names.
 - **The viewer decides.** dffyd hands each request to its viewer and the answer back; the viewer carries it out between frames, as it would a key. Nothing runs in a viewer that isn't asked, and nothing at all while nobody subscribes to its events.
-- **Comments are written by the viewer.** `comments/add` adds the comment as `c` would, through the same write, to the comments file the viewer shows: the local review's, or a review session's. dffy stays the file's only writer. The comment is the client's, by the name its hello gives (`dffy ctl` when it gives none), not yours: in a review session it's [not posted](comments.md#drafts) until `a` on its thread makes it yours. While a post runs, it's refused, as the viewer's own edits are.
+- **Comments are written by the viewer.** `comments/add` adds the comment as `c` would, through the same write, to the comments file the viewer shows: the local review's, or a review session's. dffy stays the file's only writer. The comment is the client's, by the name its hello gives (`dffy ctl` when it gives none), not yours: in a review session it's [not posted](comments.md#drafts) until `A` on its thread makes it yours. One that starts with `@<name>` never asks an agent, as one you write in the viewer does ([viewer.md](viewer.md#asking-an-agent)). While a post runs, it's refused, as the viewer's own edits are.
+- **Suggestions are applied by the viewer.** `comments/applySuggestion` does what `s` on the thread does ([viewer.md](viewer.md#applying-a-suggestion)), with the same refusals, against the diff the viewer shows: the working tree's file is written only when the anchored lines are still as the suggestion found them, and on someone else's review only once it's checked out. While the viewer asks an agent, it's refused (`an agent ask is running; apply with s in the viewer`): an agent that's only to read may reach the control API through dffy's MCP server, and applying writes files.
 - **A request given up on is called off.** When a client's connection closes before its answer, as `dffy ctl` closes it after 5 seconds, dffyd tells the viewer, which drops the request instead of doing it late.
 - **Clients never start dffyd.** When none runs, no viewer does, and `dffy ctl` and the MCP tools say so.
 
@@ -54,7 +55,7 @@ Each message is one line of JSON (newline-delimited). Lines over 1MB are refused
 
 ```json
 {"version":1,"client":"my-editor 0.3"}
-{"version":1,"server":"dffyd","build":"0.2.1+c2500b15","capabilities":{"methods":["views/list","views/register","subscribe","view/state","view/selection","view/open","view/focusThread","comments/add"],"events":["selection/changed","view/changed"]}}
+{"version":1,"server":"dffyd","build":"0.2.1+c2500b15","capabilities":{"methods":["views/list","views/register","subscribe","view/state","view/selection","view/open","view/focusThread","comments/add","comments/applySuggestion"],"events":["selection/changed","view/changed"]}}
 ```
 
 A hello of another version gets `{"error":{"code":"unsupported_version",…},"versions":[1]}` and dffyd hangs up. The socket's name carries the version too, so dffyds of other versions serve sockets of their own.
@@ -77,6 +78,7 @@ Fields either side doesn't know are ignored, so new ones can come without a new 
 | `view/open` | `view`, `path`, `line`?, `side`? (`new`) | `{"view","path","line","side"}`, once the file shows. A line a gap hides is revealed with a few lines around it. |
 | `view/focusThread` | `view`, `id` | `{"view","thread","path","focused"}`: the thread's first comment and its file. `focused` is false while the thread's place is on its way; it's focused once there. |
 | `comments/add` | `view`, `path`, `line`, `side`? (`new`), `text` | `{"view","id","path","line","side"}`: the new comment's id. |
+| `comments/applySuggestion` | `view`, `id` | `{"view","thread","comment","path","start","end","lines"}`, once it's written: the comment whose suggestion went in (`id`'s, or with none, the last in its thread with one), the lines it replaced as the file was, and how many went in their place (0 deleted them). Refused with `failed` and why, writing nothing. |
 | `subscribe` | `view`, `events` | `{"view","events"}`. The events are pushed to this connection until it closes. |
 
 **Events.** Pushed to subscribers once right after they subscribe, with what's there then, and from then on 50ms after the view stops changing, only when what they say changed:
@@ -106,7 +108,7 @@ Fields either side doesn't know are ignored, so new ones can come without a new 
 ## Security
 
 - **Only you.** The runtime directory must be yours and closed to everyone else (mode `0700`), as for the broker ([watch.md](watch.md#dffyd)); the socket is mode `0600`. dffyd also checks each connection's user (`SO_PEERCRED` on Linux, `getpeereid` on macOS) and hangs up on another's, or on one it can't tell. Elsewhere the directory's and the socket's modes are the check.
-- **What a client can do** is what you can do in the viewer: move the view, read what it shows and what's selected, and add comments to its comments file, as its own rather than yours. It can't run programs, write files other than the comments file, or post a review, nor have its comments posted until you make them yours.
+- **What a client can do** is what you can do in the viewer: move the view, read what it shows and what's selected, add comments to its comments file, as its own rather than yours, and apply a suggestion already in a thread to the working tree, as `s` does. It can't run programs, write other files or other text, or post a review, nor have its comments posted until you make them yours.
 - **Not over the network.** It's a Unix socket on the local machine.
 
 ## Performance

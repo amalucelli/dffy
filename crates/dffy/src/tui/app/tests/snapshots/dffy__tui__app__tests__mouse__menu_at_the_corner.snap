@@ -1,5 +1,5 @@
 ---
-source: crates/dffy/src/tui/app.rs
+source: crates/dffy/src/tui/app/tests/mouse.rs
 expression: screen(&mut app)
 ---
  ‹ 1/2 file.rs › +2 -2                                          @@ -1,7 +1,7 @@
@@ -11,8 +11,8 @@ expression: screen(&mut app)
     4 +│ line four                                                             ┃
  5  5  │ line 5                                                                ┃
  6  6  │ line 6                                                                ┃
- 7  7  │ line 7                                                                ┃
-⋯ 39 unchanged lines  @@ -47,7 +47,7 @@ line 46         ┌──────────────────────┐
-47 47  │ line 47                                        │ Copy line        v y │
-48 48  │ line 48                                        │ Open in editor   e   │
-   working tree  1/2 hunk  unified             / search └──────────────────────┘
+ 7  7  │ line 7                                     ┌──────────────────────────┐
+⋯ 39 unchanged lines  @@ -47,7 +47,7 @@ line 46     │ Copy line            v y │
+47 47  │ line 47                                    │ Open in editor       e   │
+48 48  │ line 48                                    │ Open terminal here       │
+   working tree  1/2 hunk  unified             / sea└──────────────────────────┘

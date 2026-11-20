@@ -1,12 +1,12 @@
 ---
-source: crates/dffy/src/tui/app.rs
+source: crates/dffy/src/tui/app/tests/threads.rs
 expression: screen(&mut app)
 ---
 ┌ Files · 2 +2 -2 ─────────┬─ modified · src/some/deeply/nested/module/file.rs · +2 -2 ────────────┐
 │ ▼ src/                   │ @@ -1,7 +1,7 @@                                                       ┃
 │   ▼ …eply/nested/module/ │  1  1  │ line 1                                                       █
 │     M file.rs    +2   -2 │  2  2  │ line 2                                                       ┃
-│   M zz.rs                │        │  ┏ ▾ you · new comment · esc saves, empty discards · ctrl… ┓ ┃
+│   M zz.rs                │        │  ┏ ▾ you · new comment · enter sends · shift+enter new li… ┓ ┃
 │                          │        │  ┃ Why these?                                              ┃ ┃
 │                          │        │  ┃ Pasted                                                  ┃ ┃
 │                          │        │  ┃ lines▏                                                  ┃ ┃
@@ -21,4 +21,4 @@ expression: screen(&mut app)
 │                          │ 47 47  │ line 47                                                      │
 │                          │ 48 48  │ line 48                                                      │
 │                          │ 49 49  │ line 49                                                      │
-└«─  working tree  ────────┴─ 1/2 · 1/2 hunk  esc saves · ctrl+g continues in $EDITOR ─────────────┘
+└«─  working tree  ────────┴─ 1/2 · 1/2 hunk  enter sends · shift+enter new line · ctrl+g contin… ─┘

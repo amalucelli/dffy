@@ -65,6 +65,9 @@ expression: text
 <dim># Experimental: the review plugin, the program dffy-review-<name> on PATH. It adds the command it names to open one of the code host's reviews in the viewer, and plain `dffy` asks it for the branch's; empty for none, and no such command. --review <name> sets it for one run. See docs/plugins.md.</>
 <hint>review</><dim> = </>
 
+<dim># Experimental: which coding agent the agent plugin, dffy-agent on PATH, asks about a thread (`a`, or a comment starting @<name>), handed to it unread: claude, codex or pi picks the default, and a command with arguments, split at spaces, runs in their place with the prompt on its stdin. Empty leaves the pick to the plugin, Claude Code first. Fix with agent (`f`) starts the one this names when it's claude, codex, pi or amp, else the first of them on PATH. See docs/plugins.md.</>
+<hint>agent</><dim> = </>
+
 <dim># Start the viewer in watch mode, refreshing as files, the index or refs change; `w` toggles it. With nothing to show, a watching viewer opens and waits for changes instead of printing that there are none.</>
 <hint>watch</><dim> = </>false
 
@@ -203,6 +206,9 @@ expression: text
 <dim># copy_thread: copy the focused thread: each comment under its author and date, as written</>
 <dim># (no key by default)</>
 
+<dim># copy_prompt: copy the focused thread, else the selected lines, as a prompt for a coding agent: the comments, the lines with those around them and the file's changes near them</>
+<hint>keybind</><dim> = </>leader:"=copy_prompt
+
 <dim># cancel: end the selection; in the tree, clear the filter</>
 <hint>keybind</><dim> = </>esc=cancel
 
@@ -285,7 +291,7 @@ expression: text
 <hint>keybind</><dim> = </>leader:B=toggle_status_bar
 
 <dim># cycle_theme: the next theme, built-in or yours</>
-<hint>keybind</><dim> = </>leader:a=cycle_theme
+<hint>keybind</><dim> = </>leader:~=cycle_theme
 
 <dim># toggle_watch: watch for changes</>
 <hint>keybind</><dim> = </>w=toggle_watch
@@ -333,17 +339,20 @@ expression: text
 <dim># edit: open the file in $EDITOR at the line last tapped, else the top line</>
 <hint>keybind</><dim> = </>e=edit
 
-<dim># comment: comment on the selected lines, or the line v would start on, in a text box under them; esc saves it</>
+<dim># open_terminal: open a new tab in your terminal, or a window where that's all it offers, at the working tree's root; where dffy can't, it copies a cd there instead</>
+<hint>keybind</><dim> = </>leader:.=open_terminal
+
+<dim># comment: comment on the selected lines, or the line v would start on, in a text box under them; enter sends it</>
 <hint>keybind</><dim> = </>c=comment
 
-<dim># suggest_change: suggest a change to the selected lines, or the line v would start on: a comment's text box holding them, to edit into what they should be; esc saves it</>
+<dim># suggest_change: suggest a change to the selected lines, or the line v would start on: a comment's text box holding them, to edit into what they should be; enter sends it</>
 <hint>keybind</><dim> = </>S=suggest_change
 <hint>keybind</><dim> = </>leader:S=suggest_change
 
-<dim># comment_file: comment on the whole file shown, in a text box under its first row; esc saves it</>
+<dim># comment_file: comment on the whole file shown, in a text box under its first row; enter sends it</>
 <hint>keybind</><dim> = </>C=comment_file
 
-<dim># comments: the left panel lists every comment thread in place of the files, or the files again; moving through the threads shows each in the diff, enter or tab goes to it; r, e, x, d and o act on the selected thread</>
+<dim># comments: the left panel lists every comment thread in place of the files, or the files again; moving through the threads shows each in the diff, enter or tab goes to it; the thread keys act on the selected thread, but f, which filters</>
 <hint>keybind</><dim> = </>i=comments
 
 <dim># next_thread: next comment thread, on into the next file with comments; it takes the focus, where r replies, e edits, x resolves, d deletes and o opens it on its host</>
@@ -361,10 +370,15 @@ expression: text
 <dim># move_thread: move the focused thread, or the comments panel's selected one, from the branch it was written on to the current branch</>
 <hint>keybind</><dim> = </>V=move_thread
 
-<dim># reply: on a thread: reply in a text box under it; esc saves it</>
+<dim># ask_agent: ask a coding agent, through the agent plugin dffy-agent, about the focused thread, or when an agent's reply ends it, write your follow-up in a reply box, which enter sends to that agent; elsewhere, write the question on the selected lines, or the line v would start on, in a text box, and enter asks. The answer comes as the agent's reply, with a suggestion when it proposes a change; esc on the thread stops it. A comment you write starting @claude, @codex or @pi asks that agent too (experimental, see agent)</>
+<hint>keybind</><dim> = </>a=ask_agent
+<hint>keybind</><dim> = </>thread:a=ask_agent
+<hint>keybind</><dim> = </>leader:a=ask_agent
+
+<dim># reply: on a thread: reply in a text box under it; enter sends it</>
 <hint>keybind</><dim> = </>thread:r=reply
 
-<dim># edit_draft: on a thread: edit your last draft in it, in a text box; esc saves it</>
+<dim># edit_draft: on a thread: edit your last draft in it, in a text box; enter sends it</>
 <hint>keybind</><dim> = </>thread:e=edit_draft
 
 <dim># delete_draft: on a thread: delete your last draft in it, the whole thread when that's its first comment, once the key comes again</>
@@ -374,7 +388,14 @@ expression: text
 <hint>keybind</><dim> = </>thread:x=resolve
 
 <dim># adopt: on a thread: someone else's comments in it not posted, as an agent's, become your drafts, which posting sends under your name</>
-<hint>keybind</><dim> = </>thread:a=adopt
+<hint>keybind</><dim> = </>thread:A=adopt
+
+<dim># apply_suggestion: on a thread: put its suggestion, the one last clicked or else its last, in place of the lines it's on in the working tree, refused when they changed since; an unstaged change, which discard undoes</>
+<hint>keybind</><dim> = </>thread:s=apply_suggestion
+
+<dim># fix_with_agent: on a thread, or the selected lines with a note you write first: start your coding agent (claude, codex, pi or amp) in a new tab, or here until it exits, pointed at the thread to change what it asks and reply in it</>
+<hint>keybind</><dim> = </>thread:f=fix_with_agent
+<hint>keybind</><dim> = </>leader:&=fix_with_agent
 
 <dim># open_on_host: on a thread: open it on its code host, in the browser</>
 <hint>keybind</><dim> = </>thread:o=open_on_host

@@ -230,7 +230,8 @@ pub(crate) enum Command {
         With --json, print the whole file in its format; with --markdown, the \
         threads with their lines. `dffy comments apply` reads a JSON list of \
         operations on stdin, applies them all or none, and prints the ids they \
-        touched; `dffy comments rm --resolved` removes resolved threads. See \
+        touched; `dffy comments rm --resolved` removes resolved threads; `dffy \
+        comments prompt <id>` prints a thread as a prompt for a coding agent. See \
         docs/comments.md.")]
     Comments(CommentsArgs),
     /// The review plugin's command, which [`command`] adds and [`parse`]
@@ -276,8 +277,9 @@ pub(crate) enum Command {
         long_about = "Serve diffs to coding agents over the Model Context Protocol.\n\n\
         Speaks MCP on stdin and stdout for the repository at -C or the current \
         directory. changed_files, file_diff and diff return the objects of dffy --json, \
-        and list_comments the review comments, a page at a time; open_in_viewer, \
-        focus_thread and viewer_selection drive the viewer running there. Register it \
+        and list_comments the review comments, a page at a time, thread_prompt one \
+        thread as a prompt to answer, and reply_to_thread a reply in one; open_in_viewer, \
+        focus_thread, viewer_selection and apply_suggestion drive the viewer running there. Register it \
         with an agent, as in: claude mcp add dffy -- dffy mcp. See docs/mcp.md."
     )]
     Mcp,
@@ -375,6 +377,12 @@ pub(crate) enum CommentsAction {
         resolved: bool,
         #[command(flatten)]
         branches: BranchArgs,
+    },
+    /// Print a thread as a prompt for a coding agent: its comments, its lines and the file's changes near them
+    Prompt {
+        /// The id of any comment in the thread
+        #[arg(value_name = "id")]
+        id: String,
     },
 }
 

@@ -68,6 +68,44 @@ fn esc_backs_out_one_layer_at_a_time() {
     assert!(status.contains("press q to quit"), "{status}");
 }
 
+/// Outside the text box `ctrl+j` is `enter`, as the line feed some
+/// terminals send for it: it ends the search, the tree's filter and an
+/// overlay's pick as `enter` does. In the text box it starts a line.
+#[test]
+fn ctrl_j_is_enter_outside_the_text_box() {
+    let mut app = app(100, 20);
+    app.draw();
+    let ctrl_j = |app: &mut App| app.event(Event::Input(Input::Key(Key::Char('j'), Mods::CTRL)));
+    typed(&mut app, "/line");
+    ctrl_j(&mut app);
+    assert!(app.search.as_ref().is_some_and(|s| !s.editing));
+    esc(&mut app);
+    app.event(Event::Input(Input::Key(Key::Tab, Mods::NONE)));
+    typed(&mut app, "/zz");
+    ctrl_j(&mut app);
+    assert!(!app.tree.editing);
+    assert_eq!(app.tree.filter(), "zz");
+    esc(&mut app);
+    esc(&mut app);
+    key(&mut app, ' ');
+    assert!(app.commands.is_some());
+    ctrl_j(&mut app);
+    assert!(app.commands.is_none(), "the command panel ran its first");
+    assert!(app.picker.is_some(), "Find file…");
+    ctrl_j(&mut app);
+    assert!(app.picker.is_none(), "the picker opened its file");
+
+    let path = tempfile::tempdir().expect("tempdir");
+    app.set_comments(path.path().join("comments.json"));
+    screen(&mut app);
+    key(&mut app, 'c');
+    typed(&mut app, "one");
+    ctrl_j(&mut app);
+    typed(&mut app, "two");
+    let text = app.doc.writing().map(|w| w.text.text().to_owned());
+    assert_eq!(text.as_deref(), Some("one\ntwo"));
+}
+
 /// `keybind = esc=quit`: `esc` still backs out of the search, the
 /// selection and the tree first, and quits only with nothing left.
 #[test]
@@ -191,6 +229,30 @@ fn remapped_keys_act_and_the_help_shows_them() {
     assert_eq!(
         app.event(Event::Input(Input::Key(Key::Char('q'), Mods::CTRL))),
         Some(Action::Quit)
+    );
+}
+
+/// A terminal opened says so; one that couldn't be leaves a `cd` to the
+/// working tree on the clipboard, saying why.
+#[test]
+fn a_terminal_that_cant_open_leaves_a_cd_to_paste() {
+    let mut app = app(100, 20);
+    let opened = Event::Terminal {
+        dir: "/src/my repo".into(),
+        opened: Ok("opened a tmux window".to_owned()),
+    };
+    assert_eq!(app.event(opened), None);
+    assert!(status(&mut app).contains("opened a tmux window"));
+    let failed = Event::Terminal {
+        dir: "/src/my repo".into(),
+        opened: Err("tmux failed (exit status: 1)".to_owned()),
+    };
+    assert_eq!(
+        app.event(failed),
+        Some(Action::Copy {
+            text: b"cd '/src/my repo'".to_vec(),
+            note: "tmux failed (exit status: 1); copied cd '/src/my repo'".to_owned(),
+        })
     );
 }
 

@@ -88,7 +88,7 @@ keybind = leader:z=toggle_wrap
 | `toggle_line_numbers` |  | `#` | Show or hide line numbers |
 | `toggle_hunk_headers` |  | `@` | Show or hide the @@ numbers of hunks |
 | `toggle_status_bar` |  | `B` | The status bar in the frame's bottom border or its top one |
-| `cycle_theme` |  | `a` | The next theme, built-in or yours |
+| `cycle_theme` |  | `~` | The next theme, built-in or yours |
 | `toggle_thread` | `z` |  | Fold or unfold the focused comment thread, or the first on screen |
 | `toggle_threads` | `Z` |  | Fold every comment thread to one row, or unfold them all |
 
@@ -102,6 +102,7 @@ keybind = leader:z=toggle_wrap
 | `copy_absolute_path` |  |  | Copy where the file is on disk, from the filesystem's root |
 | `copy_comment` |  |  | Copy a comment of the focused thread as written, in Markdown: the one last clicked, else its first |
 | `copy_thread` |  |  | Copy the focused thread: each comment under its author and date, as written |
+| `copy_prompt` |  | `"` | Copy the focused thread, else the selected lines, as a prompt for a coding agent: the comments, the lines with those around them and the file's changes near them |
 | `cancel` | `esc` |  | End the selection; in the tree, clear the filter |
 | `toggle_copy_decorations` |  | `J` | Copies include line numbers and +/- signs, or only the code |
 
@@ -133,16 +134,20 @@ keybind = leader:z=toggle_wrap
 |---|---|---|---|
 | `leader` | `space` |  | Open the command panel; its next key runs a command |
 | `edit` | `e` |  | Open the file in $EDITOR at the line last tapped, else the top line |
-| `comment` | `c` |  | Comment on the selected lines, or the line v would start on, in a text box under them; esc saves it |
-| `suggest_change` | `S` | `S` | Suggest a change to the selected lines, or the line v would start on: a comment's text box holding them, to edit into what they should be; esc saves it |
-| `comment_file` | `C` |  | Comment on the whole file shown, in a text box under its first row; esc saves it |
-| `comments` | `i` |  | The left panel lists every comment thread in place of the files, or the files again; moving through the threads shows each in the diff, enter or tab goes to it; r, e, x, d and o act on the selected thread |
+| `open_terminal` |  | `.` | Open a new tab in your terminal, or a window where that's all it offers, at the working tree's root; where dffy can't, it copies a cd there instead |
+| `comment` | `c` |  | Comment on the selected lines, or the line v would start on, in a text box under them; enter sends it |
+| `suggest_change` | `S` | `S` | Suggest a change to the selected lines, or the line v would start on: a comment's text box holding them, to edit into what they should be; enter sends it |
+| `comment_file` | `C` |  | Comment on the whole file shown, in a text box under its first row; enter sends it |
+| `comments` | `i` |  | The left panel lists every comment thread in place of the files, or the files again; moving through the threads shows each in the diff, enter or tab goes to it; the thread keys act on the selected thread, but f, which filters |
 | `move_thread` | `V` |  | Move the focused thread, or the comments panel's selected one, from the branch it was written on to the current branch |
-| `reply` | `r` on a thread |  | On a thread: reply in a text box under it; esc saves it |
-| `edit_draft` | `e` on a thread |  | On a thread: edit your last draft in it, in a text box; esc saves it |
+| `ask_agent` | `a`; `a` on a thread | `a` | Ask a coding agent, through the agent plugin dffy-agent, about the focused thread, or when an agent's reply ends it, write your follow-up in a reply box, which enter sends to that agent; elsewhere, write the question on the selected lines, or the line v would start on, in a text box, and enter asks. The answer comes as the agent's reply, with a suggestion when it proposes a change; esc on the thread stops it. A comment you write starting @claude, @codex or @pi asks that agent too (experimental, see agent) |
+| `reply` | `r` on a thread |  | On a thread: reply in a text box under it; enter sends it |
+| `edit_draft` | `e` on a thread |  | On a thread: edit your last draft in it, in a text box; enter sends it |
 | `delete_draft` | `d` on a thread |  | On a thread: delete your last draft in it, the whole thread when that's its first comment, once the key comes again |
 | `resolve` | `x` on a thread |  | On a thread: resolve it, or reopen it |
-| `adopt` | `a` on a thread |  | On a thread: someone else's comments in it not posted, as an agent's, become your drafts, which posting sends under your name |
+| `adopt` | `A` on a thread |  | On a thread: someone else's comments in it not posted, as an agent's, become your drafts, which posting sends under your name |
+| `apply_suggestion` | `s` on a thread |  | On a thread: put its suggestion, the one last clicked or else its last, in place of the lines it's on in the working tree, refused when they changed since; an unstaged change, which discard undoes |
+| `fix_with_agent` | `f` on a thread | `&` | On a thread, or the selected lines with a note you write first: start your coding agent (claude, codex, pi or amp) in a new tab, or here until it exits, pointed at the thread to change what it asks and reply in it |
 | `open_on_host` | `o` on a thread |  | On a thread: open it on its code host, in the browser |
 | `comment_in_editor` | `E` | `E` | Write in $EDITOR: your draft in the focused thread, else a reply to it, else a comment on the line; ctrl+g does it from the text box |
 | `review_pull` | `p` |  | On a review a review plugin opened, fetch its new commits and threads and show them in place (experimental, see review) |
@@ -173,11 +178,14 @@ While a comment thread is focused in the diff, or selected in the comments panel
 
 | Keys | Action | Description |
 |---|---|---|
-| `r` | `reply` | On a thread: reply in a text box under it; esc saves it |
-| `e` | `edit_draft` | On a thread: edit your last draft in it, in a text box; esc saves it |
+| `a` | `ask_agent` | Ask a coding agent, through the agent plugin dffy-agent, about the focused thread, or when an agent's reply ends it, write your follow-up in a reply box, which enter sends to that agent; elsewhere, write the question on the selected lines, or the line v would start on, in a text box, and enter asks. The answer comes as the agent's reply, with a suggestion when it proposes a change; esc on the thread stops it. A comment you write starting @claude, @codex or @pi asks that agent too (experimental, see agent) |
+| `r` | `reply` | On a thread: reply in a text box under it; enter sends it |
+| `e` | `edit_draft` | On a thread: edit your last draft in it, in a text box; enter sends it |
 | `d` | `delete_draft` | On a thread: delete your last draft in it, the whole thread when that's its first comment, once the key comes again |
 | `x` | `resolve` | On a thread: resolve it, or reopen it |
-| `a` | `adopt` | On a thread: someone else's comments in it not posted, as an agent's, become your drafts, which posting sends under your name |
+| `A` | `adopt` | On a thread: someone else's comments in it not posted, as an agent's, become your drafts, which posting sends under your name |
+| `s` | `apply_suggestion` | On a thread: put its suggestion, the one last clicked or else its last, in place of the lines it's on in the working tree, refused when they changed since; an unstaged change, which discard undoes |
+| `f` | `fix_with_agent` | On a thread, or the selected lines with a note you write first: start your coding agent (claude, codex, pi or amp) in a new tab, or here until it exits, pointed at the thread to change what it asks and reply in it |
 | `o` | `open_on_host` | On a thread: open it on its code host, in the browser |
 
 ## In a conflicted file
@@ -221,14 +229,18 @@ While the file at the cursor has conflicts to resolve, these keys come after a t
 | `F` | Previous file | `prev_file` |
 | `y` | Copy selection | `copy` |
 | `Y` | Copy file path | `copy_path` |
+| `"` | Copy as prompt | `copy_prompt` |
 | `J` | Copy with line numbers and signs | `toggle_copy_decorations` |
 | `A` | Stage lines | `stage` |
 | `U` | Unstage lines | `unstage` |
 | `D` | Discard lines… | `discard` |
 | `$` | Mouse selection | `toggle_mouse` |
 | `w` | Watch for changes | `toggle_watch` |
-| `a` | Theme | `cycle_theme` |
+| `~` | Theme | `cycle_theme` |
 | `E` | Continue in editor | `comment_in_editor` |
+| `a` | Ask agent | `ask_agent` |
+| `&` | Fix with agent | `fix_with_agent` |
+| `.` | Open terminal here | `open_terminal` |
 | `S` | Suggest change | `suggest_change` |
 | `O` | Open review… | `open_review` |
 | `R` | Since last review | `since_last_review` |

@@ -32,7 +32,7 @@ use crate::render::{Canvas, escape, plain};
 use crate::review::model::snapshot::{Hung, Snapshot};
 use crate::review::model::text::age;
 use crate::review::model::{self, At};
-use crate::review::who;
+use crate::review::{self, prompt, who};
 use crate::theme::{Ink, Role};
 use crate::{Ctx, Error};
 
@@ -129,6 +129,80 @@ impl Plan {
             base: base.to_owned(),
         }
     }
+}
+
+/// The prompt of the thread comment `id` is in, for `dffy comments prompt`
+/// and MCP's `thread_prompt`: placed on its file's diff in what plain
+/// `dffy` shows in `repo`, else its lines as written. `None` when no
+/// comment has that id.
+pub(crate) fn thread_prompt(
+    repo: Option<Repo>,
+    review: &review::Review,
+    id: &str,
+    ctx: &Ctx,
+) -> Option<prompt::Prompt> {
+    let thread = review.thread(id)?;
+    let root = thread[0];
+    // A diff that can't be made, as without a worktree, places nothing.
+    let placed = repo
+        .filter(|_| !root.path.is_empty())
+        .and_then(|repo| place_thread(repo, review, root, ctx).ok().flatten());
+    if let Some((diff, at)) = placed {
+        return Some(prompt::thread(&thread, &at, Some(&diff)));
+    }
+    let at = if root.path.is_empty() {
+        At::Conversation {
+            kind: root.kind.clone(),
+            label: root.label.clone(),
+        }
+    } else if root.range().is_some() {
+        At::Lost
+    } else {
+        At::File
+    };
+    Some(prompt::thread(&thread, &at, None))
+}
+
+/// `root`'s file's diff in what plain `dffy` shows in `repo`, and where
+/// the thread is on it; `None` when that doesn't change the file.
+fn place_thread(
+    repo: Repo,
+    review: &review::Review,
+    root: &review::Comment,
+    ctx: &Ctx,
+) -> Result<Option<(FileDiff, At)>, Error> {
+    let Some(workdir) = repo.workdir().map(Path::to_owned) else {
+        return Ok(None);
+    };
+    let revisions = Revisions {
+        unstaged: ctx.config.default_diff == DefaultDiff::Unstaged,
+        ..Revisions::default()
+    };
+    let paths: Vec<PathBuf> = (std::iter::once(&root.path).chain(&root.old_path))
+        .map(PathBuf::from)
+        .collect();
+    let target = Target::Diff(&revisions);
+    let plan = Plan::resolve(repo, workdir, &target, &paths, Summary::Diff, false)?;
+    let mut changes = Vec::new();
+    plan.for_each_change(ctx, &mut |change| {
+        changes.extend(change);
+        Ok(())
+    })?;
+    let snapshot = Snapshot::new(review, review::Branches::All);
+    let options = Options {
+        context: 3,
+        whitespace: ctx.config.whitespace,
+    };
+    for change in changes.into_iter().filter(|c| snapshot.has(c, false)) {
+        let diff = plan.repo.file_diff(change.clone(), &options)?;
+        let at = (snapshot.on(&change, &diff, false).into_iter())
+            .find(|hung| hung.thread[0].id == root.id)
+            .map(|hung| hung.at);
+        if let Some(at) = at {
+            return Ok(Some((diff, at)));
+        }
+    }
+    Ok(None)
 }
 
 /// What a terminal shows for an empty diff. `--staged` and `--unstaged` see
@@ -1284,7 +1358,7 @@ const AUTHOR: Ink = Ink {
 /// a page that starts mid-thread, is headed by its thread's id. A thread
 /// `placed` has, by its first comment's id, says where its lines are now.
 pub(crate) fn comments(
-    comments: &[&crate::review::Comment],
+    comments: &[&review::Comment],
     here: Option<&str>,
     placed: &[(String, At)],
     c: &mut Canvas,
@@ -1331,8 +1405,8 @@ pub(crate) fn comments(
                 ),
                 (None, Some((side, lines))) => {
                     let side = match side {
-                        crate::review::Side::Old => Side::Old,
-                        crate::review::Side::New => Side::New,
+                        review::Side::Old => Side::Old,
+                        review::Side::New => Side::New,
                     };
                     c.push(Role::FileHeader, &place(side, &lines));
                 }

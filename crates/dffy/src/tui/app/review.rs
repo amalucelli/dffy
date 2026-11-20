@@ -11,6 +11,7 @@ use unicode_width::UnicodeWidthStr;
 
 use super::{Action, App, escape};
 use crate::keys::Keys;
+use crate::plugin::agent::Request as AgentRequest;
 use crate::plugin::review::{Listed, ReviewEvent, ReviewLabel, Said, Session};
 use crate::review::model;
 use crate::review::session::{
@@ -107,6 +108,8 @@ impl App {
                     });
                 }
                 Effect::Ask { id, request } => action = Some(Action::Review { id, request }),
+                Effect::Agent { id, request } => self.agent_asks.push((id, request)),
+                Effect::StopAgents(ids) => self.agent_stops.extend(ids),
                 Effect::Show {
                     range,
                     comments,
@@ -304,14 +307,30 @@ impl App {
     }
 
     /// The review's part of the program status: a plugin run is work going
-    /// on.
+    /// on, and so is an ask.
     pub(super) fn review_status(&self) -> Option<term::Status> {
-        let work = self.reviewing.work()?;
+        let Some(work) = self.reviewing.work() else {
+            return Some(term::Status {
+                state: term::State::Working,
+                message: Some(self.asking.work()?),
+                progress: None,
+            });
+        };
         Some(term::Status {
             state: term::State::Working,
             message: Some(format!("{} · {}", work.doing, work.label)),
             progress: work.progress,
         })
+    }
+
+    /// What the agent plugin is to be asked, and which asks it's to stop,
+    /// since the last call: for the loop, which runs the plugin. An ask
+    /// stopped before it went isn't asked.
+    pub(crate) fn take_agent_work(&mut self) -> (Vec<(u64, AgentRequest)>, Vec<u64>) {
+        let stops = std::mem::take(&mut self.agent_stops);
+        let mut asks = std::mem::take(&mut self.agent_asks);
+        asks.retain(|(id, _)| !stops.contains(id));
+        (asks, stops)
     }
 
     /// What's left to say once the viewer is gone: drafts in a review

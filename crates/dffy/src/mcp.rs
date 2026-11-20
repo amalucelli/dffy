@@ -63,10 +63,13 @@ const INSTRUCTIONS: &str = "dffy shows the changes in the git repository it was 
     (range: HEAD~3..HEAD) or any two revisions. Start with changed_files to see which files changed and by how much, then call file_diff \
     for the files that matter. With syntax: true, files whose changes are only formatting or \
     only moved code are classified, so you can skip them. list_comments returns the review \
-    comments left on the code, with their threads. Results are paged: pass next_cursor \
+    comments left on the code, with their threads, thread_prompt one thread as a prompt to \
+    answer, with its lines and the changes near them, and reply_to_thread answers in a thread. \
+    Results are paged: pass next_cursor \
     back as cursor, with the same arguments, to continue. When the user has the dffy viewer \
-    open here, open_in_viewer shows them a file at a line, focus_thread a comment thread, and \
-    viewer_selection reads the lines they selected.";
+    open here, open_in_viewer shows them a file at a line, focus_thread a comment thread, \
+    viewer_selection reads the lines they selected, and apply_suggestion applies a thread's \
+    suggested change to the working tree.";
 
 /// The tools, as `tools/list` returns them. Written readable here and
 /// compacted when listed, since a message is one line.
@@ -198,6 +201,84 @@ const TOOLS: &str = r#"[
   "annotations": {"readOnlyHint": true, "idempotentHint": true, "openWorldHint": false}
 },
 {
+  "name": "thread_prompt",
+  "title": "A thread as a prompt",
+  "description": "One review comment thread as a prompt to answer: where it is (path, lines and side), its comments with their authors, any suggested change, the commented lines with the lines around them, and the file's changes near them. Takes the id of any comment in the thread, from list_comments. The thread is placed on the uncommitted changes, as plain dffy shows them; when they don't change its file, its lines come as written. At most 32 KiB, cut farthest from the thread first, every cut marked in the text. Read-only.",
+  "inputSchema": {
+    "type": "object",
+    "properties": {
+      "id": {"type": "string", "description": "A comment's id, the thread's first or a reply."},
+      "session": {"type": "boolean", "default": false, "description": "The thread is in the review session the user has open in the viewer, as list_comments with session: true lists them."}
+    },
+    "required": ["id"],
+    "additionalProperties": false
+  },
+  "outputSchema": {
+    "type": "object",
+    "properties": {
+      "thread": {"type": "string", "description": "The id of the thread's first comment."},
+      "path": {"type": ["string", "null"], "description": "Its file; null for a comment on the review as a whole."},
+      "prompt": {"type": "string"},
+      "trimmed": {"type": "boolean", "description": "Something was cut to fit 32 KiB; the prompt marks where."}
+    },
+    "required": ["thread", "path", "prompt", "trimmed"]
+  },
+  "annotations": {"readOnlyHint": true, "idempotentHint": true, "openWorldHint": false}
+},
+{
+  "name": "reply_to_thread",
+  "title": "Reply in a thread",
+  "description": "Add a reply to a review comment thread, by the id of any of its comments (list_comments lists them), under your client's name. Use it to say what you changed for a thread you were asked to address. A suggestion is the replacement for the thread's lines, without a final newline. The reply is never posted to a code host as the user's: they make it theirs first. It never asks another agent, whatever it says.",
+  "inputSchema": {
+    "type": "object",
+    "properties": {
+      "id": {"type": "string", "description": "A comment's id, the thread's first or a reply."},
+      "text": {"type": "string", "description": "The reply, as Markdown."},
+      "suggestion": {"type": "string", "description": "Lines to put in place of the thread's lines; empty removes them."},
+      "session": {"type": "boolean", "default": false, "description": "The thread is in the review session the user has open in the viewer, as list_comments with session: true lists them."}
+    },
+    "required": ["id", "text"],
+    "additionalProperties": false
+  },
+  "outputSchema": {
+    "type": "object",
+    "properties": {
+      "id": {"type": "string", "description": "The reply's id."},
+      "thread": {"type": "string", "description": "The id of the thread's first comment."},
+      "author": {"type": "string"}
+    },
+    "required": ["id", "thread", "author"]
+  },
+  "annotations": {"readOnlyHint": false, "destructiveHint": false, "idempotentHint": false, "openWorldHint": false}
+},
+{
+  "name": "apply_suggestion",
+  "title": "Apply a suggestion in the viewer",
+  "description": "Put a thread's suggested change in place of its lines in the working tree, through the dffy viewer the user has open in this repository, as its s key does: the suggestion of the comment id names, or of the thread's last comment with one. It's refused, writing nothing, when the lines changed since the suggestion was written, when the viewer doesn't show the working tree, or on someone else's review that isn't checked out. The result is an unstaged change. Fails, saying so, when no viewer runs here.",
+  "inputSchema": {
+    "type": "object",
+    "properties": {
+      "id": {"type": "string", "description": "A comment's id: one with a suggestion, or any of its thread's."}
+    },
+    "required": ["id"],
+    "additionalProperties": false
+  },
+  "outputSchema": {
+    "type": "object",
+    "properties": {
+      "view": {"type": "integer"},
+      "thread": {"type": "string"},
+      "comment": {"type": "string", "description": "The comment whose suggestion went in."},
+      "path": {"type": "string"},
+      "start": {"type": "integer", "description": "The first line replaced, 1-based, as the file was."},
+      "end": {"type": "integer", "description": "The last line replaced, as the file was."},
+      "lines": {"type": "integer", "description": "How many lines went in their place; 0 removed them."}
+    },
+    "required": ["view", "thread", "comment", "path", "start", "end", "lines"]
+  },
+  "annotations": {"readOnlyHint": false, "destructiveHint": true, "idempotentHint": false, "openWorldHint": false}
+},
+{
   "name": "open_in_viewer",
   "title": "Show a file in the viewer",
   "description": "Show a file of the diff in the dffy viewer the user has open in this repository, at a line when given, so the user sees what you're talking about. It answers once the file shows. Fails, saying so, when no viewer runs here, or the file isn't in the diff the viewer shows.",
@@ -277,6 +358,7 @@ pub(crate) fn serve(dir: Option<&Path>, comments: Option<&Path>, ctx: &Ctx) -> R
         base,
         ctx,
         legacy: false,
+        client: None,
     };
     let mut stdin = io::stdin().lock();
     let mut stdout = io::stdout().lock();
@@ -309,6 +391,9 @@ struct Server<'a> {
     /// An `initialize` came: requests without the per-request metadata are
     /// served as the legacy revision it chose.
     legacy: bool,
+    /// The client's name, as `initialize`'s `clientInfo` gives it: who the
+    /// replies it writes are by.
+    client: Option<String>,
 }
 
 /// A JSON-RPC error.
@@ -375,6 +460,13 @@ impl Server<'_> {
     /// The result of request `method`, as the members of its object.
     fn request(&mut self, method: &str, params: Option<&Value>) -> Result<String, Fault> {
         if method == "initialize" {
+            let info = params.and_then(|p| p.get("clientInfo"));
+            // Shown as the author; `you` is how the user's own comments
+            // show.
+            self.client = (info.and_then(|i| i.get("name")).and_then(Value::as_str))
+                .map(|n| n.chars().filter(|c| !c.is_control()).collect::<String>())
+                .map(|n| n.trim().chars().take(64).collect::<String>())
+                .filter(|n| !n.is_empty() && !n.eq_ignore_ascii_case("you"));
             return Ok(self.initialize(params));
         }
         let era = era(params, self.legacy || method == "ping")?;
@@ -472,6 +564,9 @@ impl Server<'_> {
             "file_diff" => self.file_diff(&args),
             "diff" => self.diff(&args),
             "list_comments" => self.list_comments(&args),
+            "thread_prompt" => self.thread_prompt(&args),
+            "reply_to_thread" => self.reply_to_thread(&args),
+            "apply_suggestion" => self.apply_suggestion(&args),
             "open_in_viewer" => self.open_in_viewer(&args),
             "focus_thread" => self.focus_thread(&args),
             "viewer_selection" => self.viewer_selection(&args),
@@ -1287,6 +1382,94 @@ impl Server<'_> {
         Ok(Output { structured, text })
     }
 
+    fn thread_prompt(&mut self, args: &Args) -> Result<Output, String> {
+        args.only(&["id", "session"])?;
+        let id = args
+            .string("id")?
+            .ok_or("id is needed: a comment's id, from list_comments")?;
+        let session = args.bool("session", false)?;
+        let file = review::read(&self.comments_file(session)?)?;
+        let prompt = crate::print::thread_prompt(self.repo().ok(), &file, id, self.ctx)
+            .ok_or_else(|| {
+                let elsewhere = if session {
+                    ""
+                } else {
+                    "; a review session's are listed with session: true"
+                };
+                format!("No comment has the id {id}: list_comments lists them{elsewhere}.")
+            })?;
+        let root = file.thread(id).and_then(|t| t.first().copied());
+        let mut structured = String::from(r#"{"thread":"#);
+        string(&mut structured, root.map_or(id, |c| c.id.as_str()));
+        structured.push_str(r#","path":"#);
+        optional_string(
+            &mut structured,
+            root.map(|c| c.path.as_str()).filter(|p| !p.is_empty()),
+        );
+        structured.push_str(r#","prompt":"#);
+        string(&mut structured, &prompt.text);
+        let _ = write!(structured, r#","trimmed":{}}}"#, prompt.trimmed);
+        Ok(Output {
+            structured,
+            text: prompt.text,
+        })
+    }
+
+    /// Writes a reply by the client, through the comments file's one write,
+    /// as the control API's `comments/add` does: someone else's, so never a
+    /// draft, and never an ask, which only a comment typed in the viewer is.
+    fn reply_to_thread(&mut self, args: &Args) -> Result<Output, String> {
+        args.only(&["id", "text", "suggestion", "session"])?;
+        let id = (args.string("id")?)
+            .ok_or("id is needed: a comment's id, from list_comments")?
+            .to_owned();
+        let text = (args.string("text")?)
+            .map(str::trim)
+            .filter(|t| !t.is_empty())
+            .ok_or("text is needed")?
+            .to_owned();
+        let suggestion = args.string("suggestion")?.map(str::to_owned);
+        let session = args.bool("session", false)?;
+        let file = self.comments_file(session)?;
+        let author = self
+            .client
+            .clone()
+            .unwrap_or_else(|| control::client::MCP.to_owned());
+        let reply = review::Comment {
+            text,
+            suggestion,
+            author: author.clone(),
+            ..review::Comment::default()
+        };
+        let op = review::Op::Add {
+            comment: Box::new(reply),
+            reply_to: Some(review::Target::Id(id.clone())),
+        };
+        let written = review::apply(&file, vec![op]).map_err(|e| {
+            let elsewhere = if session {
+                ""
+            } else {
+                "; a review session's are listed with session: true"
+            };
+            format!("{e}{elsewhere}")
+        })?;
+        let reply = written.into_iter().next().flatten().unwrap_or_default();
+        let thread = (review::read(&file)?.thread(&id))
+            .and_then(|t| t.first().map(|c| c.id.clone()))
+            .unwrap_or_else(|| id.clone());
+        let mut structured = String::from(r#"{"id":"#);
+        string(&mut structured, &reply);
+        structured.push_str(r#","thread":"#);
+        string(&mut structured, &thread);
+        structured.push_str(r#","author":"#);
+        string(&mut structured, &author);
+        structured.push('}');
+        Ok(Output {
+            structured,
+            text: format!("Replied in thread {thread} as {author}: comment {reply}."),
+        })
+    }
+
     /// What `range` compares, in words.
     fn compared(&self, range: &Range) -> String {
         if !range.revisions.is_empty() {
@@ -1360,6 +1543,31 @@ impl Server<'_> {
             format!(
                 "The viewer shows {path}, and focuses the thread of comment {id} once it's placed there."
             )
+        };
+        Ok(Output {
+            structured: compact(&result),
+            text,
+        })
+    }
+
+    fn apply_suggestion(&mut self, args: &Args) -> Result<Output, String> {
+        args.only(&["id"])?;
+        let id = args.string("id")?.ok_or("id is needed")?.to_owned();
+        let result = self.viewer("comments/applySuggestion", vec![("id", control::text(id))])?;
+        let field = |key: &str| result.get(key).and_then(Value::as_str).unwrap_or_default();
+        let number = |key: &str| result.get(key).and_then(Value::as_usize).unwrap_or(0);
+        let (path, start, end) = (field("path"), number("start"), number("end"));
+        let at = if start == end {
+            format!("{path}:{start}")
+        } else {
+            format!("{path}:{start}-{end}")
+        };
+        let text = match number("lines") {
+            0 => format!("Removed {at}, as comment {} suggested.", field("comment")),
+            _ => format!(
+                "Applied comment {}'s suggestion to {at}: an unstaged change.",
+                field("comment")
+            ),
         };
         Ok(Output {
             structured: compact(&result),
@@ -1743,6 +1951,9 @@ mod tests {
                 "file_diff",
                 "diff",
                 "list_comments",
+                "thread_prompt",
+                "reply_to_thread",
+                "apply_suggestion",
                 "open_in_viewer",
                 "focus_thread",
                 "viewer_selection"

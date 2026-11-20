@@ -75,6 +75,19 @@ pub(crate) struct Facts {
     /// renderer's executable is, if it's on PATH.
     pub renderers: Vec<(String, String, Option<PathBuf>)>,
     pub review: Option<ReviewFacts>,
+    /// `None` when not gathered.
+    pub agent: Option<AgentFacts>,
+}
+
+/// The agent plugin, `dffy-agent`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct AgentFacts {
+    /// Where its executable is, if it's on PATH; the checks are `None`
+    /// when it isn't.
+    pub path: Option<PathBuf>,
+    /// Its own checks of the agents, from its `doctor`, or why they
+    /// couldn't be read.
+    pub checks: Option<Result<Vec<crate::plugin::review::Check>, String>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -176,7 +189,8 @@ impl Facts {
         } else if env("STY").is_some() {
             Some("screen")
         } else if env("TERM_PROGRAM").is_some_and(|p| p == "herdr") {
-            // herdr sets no variable of its own; it names itself in TERM_PROGRAM.
+            // herdr names itself in TERM_PROGRAM, and sets HERDR_ENV and
+            // other HERDR_ variables too.
             Some("herdr")
         } else {
             None
@@ -228,6 +242,7 @@ impl Facts {
             }),
             renderers: renderers(&ctx.config.render),
             review: ctx.config.review.as_ref().map(|name| review(name, ctx)),
+            agent: Some(agent(ctx)),
         }
     }
 
@@ -345,6 +360,7 @@ impl Facts {
                 "review",
                 self.review.as_ref().map_or(Json::Null, review_json),
             ),
+            ("agent", self.agent.as_ref().map_or(Json::Null, agent_json)),
         ]);
         let mut out = String::new();
         object.write(&mut out);
@@ -846,6 +862,38 @@ impl Facts {
         if let Some(review) = &self.review {
             self.review_checks(review, checks);
         }
+        if let Some(agent) = &self.agent {
+            self.agent_checks(agent, checks);
+        }
+    }
+
+    /// The agent plugin's line, then a line per check of its own.
+    fn agent_checks(&self, agent: &AgentFacts, checks: &mut Vec<Check>) {
+        let program = crate::plugin::agent::PROGRAM;
+        let Some(path) = &agent.path else {
+            checks.push(
+                Check::new(Mark::Info, "agent", format!("{program} isn't on PATH"))
+                    .hint("asking an agent about a thread needs it; see docs/plugins.md"),
+            );
+            return;
+        };
+        let at = format!("{program}: {}", self.short(path));
+        checks.push(match &agent.checks {
+            Some(Err(why)) => {
+                Check::new(Mark::Warn, "agent", at).note(format!("its checks: {why}"))
+            }
+            _ => Check::new(Mark::Ok, "agent", at),
+        });
+        for own in agent.checks.iter().flatten().flatten() {
+            let mark = if own.ok { Mark::Ok } else { Mark::Warn };
+            // Details are escaped when drawn, labels aren't, and this label
+            // comes from the plugin.
+            checks.push(Check::new(
+                mark,
+                format!("agent {}", escape(own.name.as_bytes())),
+                own.detail.clone(),
+            ));
+        }
     }
 
     /// The review plugin's line, then a line per check of its own.
@@ -901,24 +949,54 @@ fn review(name: &str, ctx: &Ctx) -> ReviewFacts {
     }
 }
 
+/// The agent plugin, found on PATH, and its own checks, asked now: a
+/// process started for them alone, which probes the agents again.
+fn agent(ctx: &Ctx) -> AgentFacts {
+    let found = crate::plugin::agent::find();
+    AgentFacts {
+        checks: (found.as_ref())
+            .map(|program| crate::plugin::agent::doctor(program, ctx.config.agent.clone())),
+        path: found.map(|p| p.path),
+    }
+}
+
+fn agent_json(agent: &AgentFacts) -> Json {
+    let checks = agent.checks.as_ref();
+    Json::Object(vec![
+        ("path", agent.path.as_ref().map_or(Json::Null, Json::path)),
+        (
+            "checks",
+            checks
+                .and_then(|r| r.as_ref().ok())
+                .map_or(Json::Null, |c| checks_json(c)),
+        ),
+        (
+            "checks_error",
+            checks.map_or(Json::Null, |r| Json::error(r.as_ref())),
+        ),
+    ])
+}
+
+fn checks_json(checks: &[crate::plugin::review::Check]) -> Json {
+    Json::Array(
+        checks
+            .iter()
+            .map(|c| {
+                Json::Object(vec![
+                    ("name", Json::str(&c.name)),
+                    ("ok", Json::Bool(c.ok)),
+                    ("detail", Json::str(&c.detail)),
+                ])
+            })
+            .collect(),
+    )
+}
+
 fn review_json(review: &ReviewFacts) -> Json {
     let (command, checks) = (review.command.as_ref(), review.checks.as_ref());
     let listed = checks
         .and_then(|r| r.as_ref().ok())
-        .map_or(Json::Null, |checks| {
-            Json::Array(
-                checks
-                    .iter()
-                    .map(|c| {
-                        Json::Object(vec![
-                            ("name", Json::str(&c.name)),
-                            ("ok", Json::Bool(c.ok)),
-                            ("detail", Json::str(&c.detail)),
-                        ])
-                    })
-                    .collect(),
-            )
-        });
+        .map_or(Json::Null, |checks| checks_json(checks));
     Json::Object(vec![
         ("name", Json::str(&review.name)),
         ("path", review.path.as_ref().map_or(Json::Null, Json::path)),
@@ -1340,6 +1418,7 @@ mod tests {
                 ("csv".to_owned(), "csv".to_owned(), None),
             ],
             review: None,
+            agent: None,
         }
     }
 
@@ -1524,6 +1603,7 @@ mod tests {
             };
             let json = facts.json().0;
             let at = json.find("\"review\":").expect("the review key");
+            let end = json.find(",\"agent\":").expect("the agent key");
             let shown = text(&facts).0;
             let at_text = shown.find(" review ").expect("the review line");
             let line_start = shown[..at_text].rfind('\n').map_or(0, |i| i + 1);
@@ -1531,7 +1611,7 @@ mod tests {
                 .lines()
                 .take_while(|l| !l.contains(" dffyd "))
                 .collect();
-            [lines.join("\n"), json[at..].trim_end().to_owned()].join("\n")
+            [lines.join("\n"), json[at..end].to_owned()].join("\n")
         };
         let own = [
             Own {
@@ -1556,21 +1636,79 @@ mod tests {
         <ok>✓</> review      dffy-review-github: ~/bin/dffy-review-github, adds dffy pr
         <ok>✓</> review gh   gh version 2.62.0
         <warn>!</> review auth gh isn't logged in to github.com; run `gh auth login`
-        "review":{"name":"github","path":"/home/u/bin/dffy-review-github","command":"pr","command_error":null,"checks":[{"name":"gh","ok":true,"detail":"gh version 2.62.0"},{"name":"auth","ok":false,"detail":"gh isn't logged in to github.com; run `gh auth login`"}],"checks_error":null}}
+        "review":{"name":"github","path":"/home/u/bin/dffy-review-github","command":"pr","command_error":null,"checks":[{"name":"gh","ok":true,"detail":"gh version 2.62.0"},{"name":"auth","ok":false,"detail":"gh isn't logged in to github.com; run `gh auth login`"}],"checks_error":null}
 
         <warn>!</> review      dffy-review-github: ~/bin/dffy-review-github, adds no command
           <warn>its command 'diff' is one of dffy's own</>
           <warn>its checks: it doesn't know doctor; it may be older than this dffy</>
           <hint>hint:</> see docs/plugins.md; a plugin names its command with describe
-        "review":{"name":"github","path":"/home/u/bin/dffy-review-github","command":null,"command_error":"its command 'diff' is one of dffy's own","checks":null,"checks_error":"it doesn't know doctor; it may be older than this dffy"}}
+        "review":{"name":"github","path":"/home/u/bin/dffy-review-github","command":null,"command_error":"its command 'diff' is one of dffy's own","checks":null,"checks_error":"it doesn't know doctor; it may be older than this dffy"}
 
         <warn>!</> review      dffy-review-github isn't on PATH
           <hint>hint:</> install it, or see docs/plugins.md; until then the review keys say so
-        "review":{"name":"github","path":null,"command":null,"command_error":null,"checks":null,"checks_error":null}}
+        "review":{"name":"github","path":null,"command":null,"command_error":null,"checks":null,"checks_error":null}
         "#
         );
         assert_eq!(check(&text(&facts()).0, "review"), Vec::<&str>::new());
         assert!(facts().json().0.contains("\"review\":null"));
+    }
+
+    /// The agent plugin, found or not, then its own checks of the agents;
+    /// a check that failed warns.
+    #[test]
+    fn the_agent_plugin_is_listed_with_its_checks() {
+        use crate::plugin::review::Check as Own;
+        let agent = |path: Option<&str>, checks: Option<Result<Vec<Own>, String>>| {
+            let facts = Facts {
+                agent: Some(AgentFacts {
+                    path: path.map(PathBuf::from),
+                    checks,
+                }),
+                ..facts()
+            };
+            let json = facts.json().0;
+            let at = json.find("\"agent\":").expect("the agent key");
+            let shown = text(&facts).0;
+            let lines: Vec<&str> = (shown.lines())
+                .skip_while(|l| !l.contains(" agent"))
+                .take_while(|l| !l.contains(" dffyd "))
+                .collect();
+            [lines.join("\n"), json[at..].trim_end().to_owned()].join("\n")
+        };
+        let own = vec![
+            Own {
+                name: "claude".to_owned(),
+                ok: true,
+                detail: "2.1.329 (Claude Code)".to_owned(),
+            },
+            Own {
+                name: "claude auth".to_owned(),
+                ok: false,
+                detail: "not logged in; run `claude auth login`".to_owned(),
+            },
+        ];
+        insta::assert_snapshot!(
+            [
+                agent(Some("/home/u/bin/dffy-agent"), Some(Ok(own))),
+                agent(Some("/home/u/bin/dffy-agent"), Some(Err("its doctor took over 10s".to_owned()))),
+                agent(None, None),
+            ]
+            .join("\n\n"),
+            @r#"
+        <ok>✓</> agent       dffy-agent: ~/bin/dffy-agent
+        <ok>✓</> agent claude 2.1.329 (Claude Code)
+        <warn>!</> agent claude auth not logged in; run `claude auth login`
+        "agent":{"path":"/home/u/bin/dffy-agent","checks":[{"name":"claude","ok":true,"detail":"2.1.329 (Claude Code)"},{"name":"claude auth","ok":false,"detail":"not logged in; run `claude auth login`"}],"checks_error":null}}
+
+        <warn>!</> agent       dffy-agent: ~/bin/dffy-agent
+          <warn>its checks: its doctor took over 10s</>
+        "agent":{"path":"/home/u/bin/dffy-agent","checks":null,"checks_error":"its doctor took over 10s"}}
+
+        <dim>·</> agent       dffy-agent isn't on PATH
+          <hint>hint:</> asking an agent about a thread needs it; see docs/plugins.md
+        "agent":{"path":null,"checks":null,"checks_error":null}}
+        "#
+        );
     }
 
     /// The JSON's keys, with every value as text shows it; a path with a

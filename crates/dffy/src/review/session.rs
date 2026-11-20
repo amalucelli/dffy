@@ -20,6 +20,7 @@ use dffy_core::git::Revisions;
 
 use super::model::reload::{Check, Written};
 use super::model::{self, Comments, Hint, Part, Posting};
+use crate::plugin::agent;
 use crate::plugin::review::{
     self, Listed, Naming, Plan, Push, Reason, Request, ReviewEvent, ReviewLabel, Said, Session,
     State,
@@ -47,6 +48,10 @@ pub(crate) enum Effect {
     Finished(String),
     /// Ask the plugin `request`; what it says comes back under `id`.
     Ask { id: u64, request: Request },
+    /// Ask the agent plugin `request`; what it says comes back under `id`.
+    Agent { id: u64, request: agent::Request },
+    /// Tell the agent plugin to stop these asks.
+    StopAgents(Vec<u64>),
     /// Show `range` when given, and `comments` when it's another file.
     /// `moved` is the review's head before and after, to count commits.
     Show {

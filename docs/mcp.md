@@ -1,6 +1,6 @@
 # MCP server
 
-`dffy mcp` is a [Model Context Protocol](https://modelcontextprotocol.io) server for coding agents such as Claude Code, Cursor and Zed's agent. It lets an agent ask which files a diff changes and read the diffs it needs, a page at a time. The results are the header and file objects of `dffy --json` ([json.md](json.md)), so a long change doesn't land in the agent's context all at once. It also lists the review comments left on the code ([comments.md](comments.md)), and drives the viewer the user has open: it shows them a line or a thread and reads their selection ([Viewer tools](#viewer-tools)).
+`dffy mcp` is a [Model Context Protocol](https://modelcontextprotocol.io) server for coding agents such as Claude Code, Cursor and Zed's agent. It lets an agent ask which files a diff changes and read the diffs it needs, a page at a time. The results are the header and file objects of `dffy --json` ([json.md](json.md)), so a long change doesn't land in the agent's context all at once. It also lists the review comments left on the code ([comments.md](comments.md)), gives a thread as a prompt and takes a reply in it, and drives the viewer the user has open: it shows them a line or a thread, reads their selection and applies a thread's suggestion ([Viewer tools](#viewer-tools)).
 
 It runs over stdio: the agent starts `dffy mcp` and talks to it on stdin and stdout. It serves the repository of the directory it starts in, or the one `-C <path>` names, and the comments file `--comments <file>` names, or the repository's.
 
@@ -52,7 +52,9 @@ In Claude Code, MCP tools can be deferred until the agent searches for them. Tha
 | `file_diff` | One file object with its hunks and lines. | Next, for each file that matters. |
 | `diff` | Several file objects with hunks, in path order. | For a small change, or everything under a few paths. |
 | `list_comments` | Review comments, thread by thread. | To read what reviewers said about the code, or a local review's notes. |
-| `open_in_viewer`, `focus_thread`, `viewer_selection` | What the viewer the user has open shows, or did. | To show the user a line or a thread, or to read what they selected. See [Viewer tools](#viewer-tools). |
+| `thread_prompt` | One thread as a prompt to answer, with its lines and the file's changes near them. | To answer a thread, or propose a change to its lines. |
+| `reply_to_thread` | The reply it wrote in a thread, under the client's name. | To say what you changed for a thread, or answer it, with a suggestion when you propose a change. |
+| `open_in_viewer`, `focus_thread`, `viewer_selection`, `apply_suggestion` | What the viewer the user has open shows, or did. | To show the user a line or a thread, to read what they selected, or to apply a thread's suggestion. See [Viewer tools](#viewer-tools). |
 
 With `syntax: true`, a file whose changes are only formatting gets `classification: "formatting_only"`, and one whose changes are only moved code gets `"moved_only"`. Its lines are marked `reformatted` or `moved`. An agent can skip such files, or read them knowing nothing was edited. [json.md](json.md#files) defines both.
 
@@ -128,7 +130,7 @@ The result:
 
 ### `list_comments`
 
-Read-only: it reads the comments file on every call and never writes it. Writing is `dffy comments apply`'s job ([comments.md](comments.md#writing-dffy-comments-apply)).
+Read-only: it reads the comments file on every call and never writes it. Writing is `dffy comments apply`'s job ([comments.md](comments.md#writing-dffy-comments-apply)), and [`reply_to_thread`](#reply_to_thread)'s for a reply.
 
 | Input | Default | Meaning |
 |---|---|---|
@@ -158,6 +160,49 @@ The result:
 - A missing comments file has no comments. Outside a repository, without `--comments`, the tool returns an error.
 - In a linked worktree whose comments file hasn't [moved to the shared place](comments.md#moving-from-the-worktrees-file) yet, it reads the worktree's own file: it never moves or writes one.
 
+### `thread_prompt`
+
+Read-only, as `list_comments` is: one thread as the prompt `dffy comments prompt` prints ([comments.md](comments.md#as-a-prompt-dffy-comments-prompt)), placed on the uncommitted changes.
+
+| Input | Default | Meaning |
+|---|---|---|
+| `id` | required | Any comment's id from `list_comments`, the thread's first or a reply. |
+| `session` | `false` | The thread is in the review session the viewer has open, as `list_comments` with `session` lists it. |
+
+The result:
+
+```json
+{"thread":"9f3c2a71b04e5d18","path":"src/lib.rs","prompt":"A review thread on src/lib.rs:12-14 (the new version of the file).\n\n…","trimmed":false}
+```
+
+- **`thread`:** the id of the thread's first comment.
+- **`path`:** its file; null for a comment on the review as a whole.
+- **`prompt`:** the prompt, at most 32 KiB unless the thread's own text is longer; also the text result.
+- **`trimmed`:** something was cut to fit, each cut marked in `prompt`.
+
+An id no comment has is a tool error.
+
+### `reply_to_thread`
+
+Writes a reply in a thread of the comments file, as `dffy comments apply` does ([comments.md](comments.md#writing-dffy-comments-apply)). An agent the viewer's Fix with agent started ([viewer.md](viewer.md#fixing-with-an-agent)) says here what it changed.
+
+| Input | Default | Meaning |
+|---|---|---|
+| `id` | required | Any comment's id from `list_comments`, the thread's first or a reply. |
+| `text` | required | The reply, as Markdown. |
+| `suggestion` | | Lines to put in place of the thread's lines, without a final newline; empty removes them. |
+| `session` | `false` | The thread is in the review session the viewer has open, as `list_comments` with `session` lists it. |
+
+The result:
+
+```json
+{"id":"e2a05d7c1f9b4836","thread":"9f3c2a71b04e5d18","author":"claude-code"}
+```
+
+- **Author:** the client's name, as its `initialize` gives it in `clientInfo`, without control characters, up to 64 characters; `dffy mcp` when it gives none, as a client of the 2026-07-28 revision, which has no `initialize`, and when the name is `you`, as your own comments show. Never yours: on a review from a code host the reply shows `not posted`, and `P` leaves it until `A` on its thread makes it yours ([comments.md](comments.md#drafts)).
+- **Never an ask:** a reply starting `@claude` asks no agent, as nothing but a comment typed in the viewer does.
+- An id no comment has is a tool error that says so; nothing is written.
+
 ### Viewer tools
 
 These drive the dffy viewer the user has open in the repository's working tree, through the [control API](control.md). When no viewer runs there, each returns a tool error that says so (`No dffy viewer is running in /path/to/repo: ask the user to open dffy there; …`); with several there, one that lists them. They never start a viewer.
@@ -167,8 +212,13 @@ These drive the dffy viewer the user has open in the repository's working tree, 
 | `open_in_viewer` | `path` (required), `line` (1-based), `side` (`new` or `old`, default `new`) | `{"view","path","line","side"}` once the file shows, at the line when given. A file not in the viewer's diff, or a line it doesn't have, is a tool error. |
 | `focus_thread` | `id`, any comment's id from `list_comments` | `{"view","thread","path","focused"}`: the thread's first comment and its file; `focused` is false while its place is on its way, and it's focused once there. |
 | `viewer_selection` | none | `{"view","selection"}`: `selection` is `{"path","side","start","end","text"}`, or null when nothing is selected. |
+| `apply_suggestion` | `id`: a comment with a suggestion, or any of its thread's | `{"view","thread","comment","path","start","end","lines"}` once it's written, as `comments/applySuggestion` answers ([control.md](control.md)). |
 
 The text says what happened (`The viewer shows src/lib.rs at line 42.`) or, for `viewer_selection`, gives the place and the selected lines.
+
+#### `apply_suggestion`
+
+Puts a suggestion in place of its thread's lines in the working tree, as `s` on the thread does in the viewer ([viewer.md](viewer.md#applying-a-suggestion)): the suggestion of the comment `id` names, or when it has none, of the last comment in its thread with one. The viewer writes it, against the diff it shows, so the result is an unstaged change the user sees at once and can discard. It's a tool error, writing nothing, when the lines changed since the suggestion was written, when the viewer's diff is neither the working tree's nor a review's or doesn't have the file loaded yet (`open_in_viewer` it first), on the old version's lines, or on someone else's review that isn't checked out. It's refused too while the viewer asks an agent: that agent may have this server among its MCP servers, and is to only read.
 
 ## Results
 
@@ -198,7 +248,7 @@ M long.txt +12 -12
 
 With `comments: true`, a file's text ends with its threads: each annotation's place (`a1 on new line 1:`, or `lines not found`), then its comments' authors, times and text.
 
-For `list_comments`, the text is the listing of `dffy comments` ([comments.md](comments.md#reading-dffy-comments)) under a count of the comments, each thread in `placed` headed with where it is now (`src/lib.rs:12-14, now :15-17`, or `lines not found`).
+For `list_comments`, the text is the listing of `dffy comments` ([comments.md](comments.md#reading-dffy-comments)) under a count of the comments, each thread in `placed` headed with where it is now (`src/lib.rs:12-14, now :15-17`, or `lines not found`). For `thread_prompt`, the text is the prompt.
 
 ## Paging and truncation
 

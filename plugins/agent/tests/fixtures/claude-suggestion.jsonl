@@ -1,0 +1,4 @@
+{"type":"system","subtype":"init","cwd":"/work","session_id":"s1","tools":[],"mcp_servers":[],"model":"claude-opus","permissionMode":"dontAsk"}
+{"type":"assistant","message":{"role":"assistant","content":[{"type":"thinking","thinking":"The sum is unchecked."}]},"session_id":"s1"}
+{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"Yes."}]},"session_id":"s1"}
+{"type":"result","subtype":"success","is_error":false,"result":"Yes: `x + y` overflows past `u32::MAX`.\n\n```suggestion\nlet total = x\n    .checked_add(y)?;\n```\n","session_id":"s1"}

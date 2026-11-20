@@ -1,7 +1,7 @@
 use super::support::*;
 
 /// `c` on a selection opens a text box right under it, where every key
-/// types, `enter` and a paste included; `esc` saves the text on the
+/// types, shift+enter and a paste included; `enter` saves the text on the
 /// selected lines with their anchor and distance, and the new thread
 /// shows there, focused, with its mark in the gutter.
 #[test]
@@ -17,11 +17,11 @@ fn c_writes_a_comment_in_a_box_under_the_selection() {
     assert!(app.doc.selection.is_none());
     typed(&mut app, "Why these? q");
     press(&mut app, Key::Backspace);
-    press(&mut app, Key::Enter);
+    app.event(Event::Input(Input::Key(Key::Enter, Mods::SHIFT)));
     app.event(Event::Input(Input::Paste("Pasted\r\nlines".to_owned())));
     insta::assert_snapshot!("comment_box", screen(&mut app));
     assert!(!path.exists(), "nothing saved while writing");
-    press(&mut app, Key::Esc);
+    press(&mut app, Key::Enter);
     assert!(app.doc.writing().is_none());
     let saved = read_comments(&path);
     let [comment] = saved.comments.as_slice() else {
@@ -185,6 +185,99 @@ fn an_untouched_suggestion_saves_nothing() {
     key(&mut app, 'S');
     press(&mut app, Key::Esc);
     assert!(!path.exists() || read_comments(&path).comments.is_empty());
+}
+
+/// `s` on a thread applies its last suggestion to the lines it's on, as
+/// the loop writes them; an empty one deletes them, and a thread without
+/// one says so. Another `s` while one is applied waits.
+#[test]
+fn s_on_a_thread_applies_its_suggestion() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("comments.json");
+    let mut app = app(100, 30);
+    app.set_comments(path.clone());
+    screen(&mut app);
+    key(&mut app, 'c');
+    typed(&mut app, "No suggestion");
+    press(&mut app, Key::Esc);
+    screen(&mut app);
+    assert_eq!(press(&mut app, Key::Char('s')), None);
+    assert!(status(&mut app).contains("this thread has no suggestion to apply"));
+    esc(&mut app);
+    key(&mut app, 'S');
+    typed(&mut app, "Shorter");
+    press(&mut app, Key::Esc);
+    screen(&mut app);
+    let root = read_comments(&path).comments[1].id.clone();
+    let applied = |app: &mut App| match press(app, Key::Char('s')) {
+        Some(Action::ApplySuggestion(suggestion)) => suggestion,
+        other => panic!("{other:?}: {}", status(app)),
+    };
+    let suggestion = applied(&mut app);
+    assert_eq!(
+        (
+            suggestion.at,
+            &suggestion.anchor.lines[..],
+            &suggestion.lines[..],
+            &suggestion.checkout,
+            &suggestion.comment,
+            &suggestion.diff.change.path
+        ),
+        (
+            0,
+            &["line 1".to_owned()][..],
+            &["line 1".to_owned()][..],
+            &None,
+            &root,
+            &FILE.into()
+        )
+    );
+    assert_eq!(press(&mut app, Key::Char('s')), None);
+    assert!(status(&mut app).contains("still applying"));
+    let said = |app: &App| app.message.as_ref().map(|(m, _)| m.clone());
+    app.event(Event::Applied(Ok(0..1)));
+    assert_eq!(
+        said(&app),
+        Some(format!("applied the suggestion to {FILE}:1"))
+    );
+
+    let empty = Op::Add {
+        comment: Box::new(review::Comment {
+            text: "Drop it".to_owned(),
+            suggestion: Some(String::new()),
+            author: "octocat".to_owned(),
+            ..review::Comment::default()
+        }),
+        reply_to: Some(Target::Id(root.clone())),
+    };
+    review::apply(&path, vec![empty]).expect("applies");
+    app.event(Event::Comments);
+    screen(&mut app);
+    assert_eq!(applied(&mut app).lines, Vec::<String>::new());
+    app.event(Event::Applied(Ok(0..1)));
+    assert_eq!(said(&app), Some(format!("deleted {FILE}:1, as suggested")));
+
+    // Written elsewhere, as through MCP: its line breaks are read as lines,
+    // a last one ending the last line rather than adding an empty one.
+    for (suggestion, lines) in [
+        ("line 1\r\nline 1b\r\n", &["line 1", "line 1b"][..]),
+        ("\n", &[""][..]),
+    ] {
+        let written = Op::Add {
+            comment: Box::new(review::Comment {
+                text: "This way".to_owned(),
+                suggestion: Some(suggestion.to_owned()),
+                author: "an-mcp-client".to_owned(),
+                ..review::Comment::default()
+            }),
+            reply_to: Some(Target::Id(root.clone())),
+        };
+        review::apply(&path, vec![written]).expect("applies");
+        app.event(Event::Comments);
+        screen(&mut app);
+        assert_eq!(applied(&mut app).lines, lines, "{suggestion:?}");
+        app.event(Event::Applied(Ok(0..1)));
+    }
 }
 
 /// Threads show under the lines they're on, each comment with its
@@ -670,7 +763,7 @@ fn thread_keys_follow_the_thread_table() {
     }
     screen(&mut app);
     assert_eq!(
-        note(&app).as_deref(),
+        note(&mut app).as_deref(),
         Some("r reply · e edit · d delete · R resolve")
     );
     key(&mut app, 'x');
@@ -704,7 +797,7 @@ fn the_comments_panel_acts_on_a_thread_not_in_the_diff() {
     );
     screen(&mut app);
     assert_eq!(
-        note(&app).as_deref(),
+        note(&mut app).as_deref(),
         Some("r reply · e edit · d delete · x resolve")
     );
     app.resize(200, 30);
@@ -718,7 +811,7 @@ fn the_comments_panel_acts_on_a_thread_not_in_the_diff() {
     assert_eq!((app.pane, selected(&app)), (Pane::Tree, "g1".to_owned()));
     app.message = None;
     screen(&mut app);
-    assert!(note(&app).is_some_and(|n| n.ends_with("x reopen")));
+    assert!(note(&mut app).is_some_and(|n| n.ends_with("x reopen")));
     key(&mut app, 'x');
     assert!(find("g1").is_some_and(|c| !c.resolved));
 
@@ -759,7 +852,10 @@ fn the_comments_panel_acts_on_a_thread_not_in_the_diff() {
     app.message = None;
     key(&mut app, '/');
     assert_eq!(selected(&app), "m1");
-    assert!(!note(&app).is_some_and(|n| n.contains("r reply")), "typing");
+    assert!(
+        !note(&mut app).is_some_and(|n| n.contains("r reply")),
+        "typing"
+    );
     typed(&mut app, "rexdo");
     assert!(app.panel.as_ref().is_some_and(|p| p.editing));
     assert!(left(&mut app).contains("no thread matches /rexdo"));
@@ -1160,10 +1256,10 @@ fn a_focused_thread_takes_its_keys_only_while_focused() {
         shown.contains("r reply · e edit · d delete · x resolve"),
         "{shown}"
     );
-    let hint = note(&app).unwrap_or_default();
+    let hint = note(&mut app).unwrap_or_default();
     assert!(hint.ends_with("z fold · esc"), "{hint}");
     key(&mut app, 'z');
-    let hint = note(&app).unwrap_or_default();
+    let hint = note(&mut app).unwrap_or_default();
     assert!(hint.ends_with("z unfold · esc"), "{hint}");
     key(&mut app, 'z');
     key(&mut app, 'x');
@@ -1438,8 +1534,8 @@ fn a_review_runs_progress_reads_the_comments_file_again() {
 
 /// Only a review session's file has drafts: your comments not posted
 /// in it. In a local review nothing is posted, so nothing is a draft,
-/// and an agent's comment in a session is left for you, marked, rather
-/// than posted under your name.
+/// and an agent's reply in a session, with how the agent ran, is left for
+/// you, marked, rather than posted under your name.
 #[test]
 fn drafts_are_yours_in_a_review_session() {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -1451,6 +1547,7 @@ fn drafts_are_yours_in_a_review_session() {
                 path: FILE.to_owned(),
                 text: "From the agent".to_owned(),
                 author: "claude".to_owned(),
+                label: Some("read-only sandbox".to_owned()),
                 ..review::Comment::default()
             }),
             reply_to: Some(Target::Id("d1".to_owned())),
@@ -1467,7 +1564,10 @@ fn drafts_are_yours_in_a_review_session() {
     said(&mut app, prepare, Said::Done(Ok(())));
     let shown = screen(&mut app);
     assert!(shown.contains("▾ you · 2h ago · draft"), "{shown}");
-    assert!(shown.contains("claude · just now · not posted"), "{shown}");
+    assert!(
+        shown.contains("claude · just now · read-only sandbox · not posted"),
+        "{shown}"
+    );
     assert_eq!(app.comments.as_ref().map(Comments::counts), Some((6, 5)));
     assert_eq!(
         app.sending(true).comments,
@@ -1475,10 +1575,10 @@ fn drafts_are_yours_in_a_review_session() {
         "the agent's reply isn't sent"
     );
 
-    // `a` on its thread makes it yours: a draft, sent with the rest.
+    // `A` on its thread makes it yours: a draft, sent with the rest.
     app.reviewing.job = None;
     app.follow_thread("d1");
-    key(&mut app, 'a');
+    key(&mut app, 'A');
     assert!(status(&mut app).contains("now yours: 1 draft"));
     assert_eq!(app.sending(true).comments, 6);
     let authors: Vec<String> = (read_comments(&path).comments.into_iter())

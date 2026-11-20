@@ -21,6 +21,7 @@ mod render;
 mod review;
 mod state;
 mod term;
+mod terminal;
 mod theme;
 mod tui;
 
@@ -298,8 +299,8 @@ impl Ctx {
 /// Runs dffy with the process's arguments.
 pub fn main() -> ExitCode {
     let mut raw = std::env::args_os();
-    if raw.nth(1).is_some_and(|a| a == plugin::review::DETACH) {
-        return plugin::review::exec_detached(raw);
+    if raw.nth(1).is_some_and(|a| a == plugin::rpc::DETACH) {
+        return plugin::rpc::exec_detached(raw);
     }
     let raw: Vec<_> = std::env::args_os().collect();
     // Read before parsing: the review plugin they name adds a subcommand.
@@ -611,7 +612,7 @@ fn comments(
     if args.action.is_some() && args.lists() {
         return Err(Error::Fatal {
             message: "--json, --markdown, --open, --resolved, --path, --branch and \
-                --all-branches are for listing, not for apply or rm"
+                --all-branches are for listing, not for apply, import, prompt or rm"
                 .to_owned(),
             hint: Some("rm takes --resolved, --branch and --all-branches after it".to_owned()),
         });
@@ -696,6 +697,17 @@ fn comments(
             let came = review::import(&from, &path).map_err(Error::fatal)?;
             let s = if came == 1 { "" } else { "s" };
             writeln!(io::stdout().lock(), "imported {came} comment{s}")?;
+            Ok(ExitCode::SUCCESS)
+        }
+        Some(CommentsAction::Prompt { id }) => {
+            let file = review::read(&path).map_err(Error::fatal)?;
+            let prompt = print::thread_prompt(repo.clone(), &file, &id, ctx).ok_or_else(|| {
+                Error::Fatal {
+                    message: format!("no comment has the id {id}"),
+                    hint: Some("dffy comments lists them with their ids".to_owned()),
+                }
+            })?;
+            io::stdout().lock().write_all(prompt.text.as_bytes())?;
             Ok(ExitCode::SUCCESS)
         }
         None => list_comments(&path, &args, scope(&args.branches), current.as_deref(), ctx),

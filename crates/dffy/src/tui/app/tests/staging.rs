@@ -45,7 +45,7 @@ fn stage_unstage_and_discard_take_the_hunk_or_the_selection() {
     };
     plan(&mut app);
     assert_eq!(
-        note(&app).as_deref(),
+        note(&mut app).as_deref(),
         Some("discard 1 line at line 4 of src/some/deeply/nested/module/file.rs? y/n")
     );
     key(&mut app, 'j');

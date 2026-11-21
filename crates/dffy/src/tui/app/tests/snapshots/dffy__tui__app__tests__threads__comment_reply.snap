@@ -15,7 +15,7 @@ expression: screen(&mut app)
 │   M zz5.rs               │        │  ┃ you · 1h ago                                            ┃ │
 │   M zz6.rs               │        │  ┃ Because.                                                ┃ │
 │   M zz7.rs               │        │  ┃                                                         ┃ │
-│   M zz8.rs               │        │  ┃ you · reply · enter sends · shift+enter new line · ctr… ┃ │
+│   M zz8.rs               │        │  ┃ you · reply · enter saves · alt+enter new line · ctrl+… ┃ │
 │   M zz9.rs   1           │        │  ┃ Sure▏                                                   ┃ │
 │                          │        │  ┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛ ▐
 │                          │  3  3  │ line 3                                                       │

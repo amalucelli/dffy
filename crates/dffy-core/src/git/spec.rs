@@ -3,7 +3,7 @@
 use gix::bstr::{BStr, ByteSlice};
 use gix::revision::plumbing::Spec;
 
-use super::{Error, ObjectId, Repo, Result};
+use super::{Error, ObjectId, Repo, Result, WhichCheckpoint};
 
 /// The two sides of a diff, with revisions resolved to trees.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -42,6 +42,16 @@ pub enum DiffSpec {
     /// Two files or directories outside git, as the handle from
     /// [`Repo::compare`] holds them; no other handle lists anything for it.
     Paths,
+    /// What changed since a checkpoint ([`Repo::take_checkpoint`]): its
+    /// tree against the working tree as [`DiffSpec::Uncommitted`] sees it,
+    /// untracked files included, staged or not alike. A file untracked
+    /// both then and now is compared with its checkpointed content; one
+    /// untracked only now is [`Status::Untracked`](super::Status::Untracked).
+    /// Nested repositories aren't in a checkpoint and aren't listed.
+    Checkpoint {
+        /// The checkpoint's tree.
+        tree: ObjectId,
+    },
 }
 
 /// `git diff` arguments as typed, kept to resolve them again once refs move.
@@ -58,6 +68,10 @@ pub struct Revisions {
     /// `--merge-base`: the old side is the merge base of the revision and
     /// `HEAD` (or of the two revisions).
     pub merge_base: bool,
+    /// `--since-checkpoint`: the checkpoint's tree against the working
+    /// tree ([`DiffSpec::Checkpoint`]); takes nothing else. Resolved again
+    /// on each rescan, so [`WhichCheckpoint::Latest`] follows new ones.
+    pub since_checkpoint: Option<WhichCheckpoint>,
 }
 
 impl Repo {
@@ -68,6 +82,18 @@ impl Repo {
     /// As [`Repo::resolve`]; [`Error::UnsupportedRevision`] for `unstaged`
     /// with revisions, `staged` or `merge_base`.
     pub fn resolve_revisions(&self, r: &Revisions) -> Result<DiffSpec> {
+        if let Some(which) = r.since_checkpoint {
+            if !r.revs.is_empty() || r.staged || r.unstaged || r.merge_base {
+                return Err(Error::UnsupportedRevision {
+                    rev: r.revs.first().cloned().unwrap_or_default(),
+                    reason: "--since-checkpoint compares a checkpoint with the working tree; \
+                             it takes no revisions, --staged, --unstaged or --merge-base",
+                });
+            }
+            return Ok(DiffSpec::Checkpoint {
+                tree: self.checkpoint(which)?.tree,
+            });
+        }
         if r.unstaged {
             return match r.revs.first() {
                 None if !r.staged && !r.merge_base => {
@@ -227,7 +253,7 @@ impl Repo {
         Ok(self.git()?.find_object(id)?.peel_to_tree()?.id)
     }
 
-    fn head_tree(&self) -> Result<ObjectId> {
+    pub(super) fn head_tree(&self) -> Result<ObjectId> {
         Ok(self.git()?.head_tree_id_or_empty()?.detach())
     }
 

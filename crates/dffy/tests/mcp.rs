@@ -288,6 +288,52 @@ fn initialize(server: &mut Server) {
     server.send(r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#);
 }
 
+/// `since_checkpoint` shows only what changed since a checkpoint, the
+/// latest or one by number, in place of `range`; with `range` it's refused.
+#[test]
+fn since_checkpoint_shows_only_what_changed_after_it() {
+    let repo = repo();
+    let d = repo.path();
+    write(d, "lib.rs", "// before the checkpoint\n");
+    let taken = Command::new(env!("CARGO_BIN_EXE_dffy"))
+        .current_dir(d)
+        .arg("checkpoint")
+        .env("XDG_CONFIG_HOME", d.join(".no-config"))
+        .output()
+        .expect("dffy checkpoint");
+    assert!(taken.status.success(), "{taken:?}");
+    write(d, "math.c", "// after it\n");
+    let mut server = Server::start(d);
+    initialize(&mut server);
+    let paths = |call: &Call| -> Vec<String> {
+        (call.structured().get("files").and_then(Value::as_array))
+            .expect("files")
+            .iter()
+            .filter_map(|f| f.get("path").and_then(Value::as_str).map(str::to_owned))
+            .collect()
+    };
+    let latest = server.call("changed_files", r#"{"since_checkpoint":"latest"}"#);
+    assert_eq!(paths(&latest), ["math.c"]);
+    assert!(
+        latest.text().contains("since the latest checkpoint"),
+        "{}",
+        latest.text()
+    );
+    let one = server.call("file_diff", r#"{"path":"math.c","since_checkpoint":1}"#);
+    assert!(one.text().contains("+ // after it"), "{}", one.text());
+    let both = server.call(
+        "changed_files",
+        r#"{"since_checkpoint":"latest","range":"HEAD"}"#,
+    );
+    assert!(
+        both.is_error() && both.text().contains("range"),
+        "{}",
+        both.text()
+    );
+    let gone = server.call("changed_files", r#"{"since_checkpoint":9}"#);
+    assert!(gone.is_error(), "{}", gone.text());
+}
+
 /// The handshake, the tool list, a page of changed files and the next,
 /// and `dffy --json`'s file objects in the results.
 #[test]
@@ -1193,4 +1239,44 @@ fn apply_suggestion_writes_the_working_tree_through_the_viewer() {
     let again = server.call("apply_suggestion", r#"{"id":"s1"}"#);
     assert!(again.is_error(), "{}", again.line);
     assert!(again.text().contains("applied already"), "{}", again.text());
+}
+
+/// `dffy ctl apply-suggestion` does what the MCP tool does, for an agent
+/// with a shell: the viewer applies the suggestion, and refuses it again.
+#[test]
+fn ctl_apply_suggestion_writes_the_working_tree_through_the_viewer() {
+    let repo = repo();
+    let d = repo.path();
+    write(d, "long.txt", &long_file(|i| i == 3));
+    suggested(d);
+    let runtime = tempfile::tempdir().expect("tempdir");
+    let _viewer = Viewer::start(d, runtime.path(), &[]);
+    let ctl = |args: &[&str]| {
+        let out = Command::new(env!("CARGO_BIN_EXE_dffy"))
+            .arg("ctl")
+            .args(args)
+            .current_dir(d)
+            .env("XDG_RUNTIME_DIR", runtime.path())
+            .env("XDG_CONFIG_HOME", d.join(".no-config"))
+            .output()
+            .expect("dffy ctl");
+        let text = |b: &[u8]| String::from_utf8_lossy(b).into_owned();
+        (out.status.code(), text(&out.stdout), text(&out.stderr))
+    };
+    let (code, _, said) = ctl(&["open", "long.txt"]);
+    assert_eq!(code, Some(0), "{said}");
+    let (code, out, said) = ctl(&["apply-suggestion", "s1"]);
+    assert_eq!(code, Some(0), "{said}");
+    assert!(
+        out.ends_with(" applied comment s1's suggestion to long.txt:10: an unstaged change\n"),
+        "{out}"
+    );
+    let text = std::fs::read_to_string(d.join("long.txt")).expect("read");
+    assert_eq!(
+        text,
+        long_file(|i| i == 3).replace("line 10\n", "line ten\n")
+    );
+    let (code, _, said) = ctl(&["apply-suggestion", "s1"]);
+    assert_eq!(code, Some(128));
+    assert!(said.contains("applied already"), "{said}");
 }

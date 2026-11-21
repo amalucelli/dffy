@@ -104,6 +104,8 @@ actions! {
     ToggleStatusBar "toggle_status_bar" "move status bar" "the status bar in the frame's bottom border or its top one",
     CycleTheme "cycle_theme" "next theme" "the next theme, built-in or yours",
     ToggleWatch "toggle_watch" "toggle watch" "watch for changes",
+    TakeCheckpoint "take_checkpoint" "take checkpoint" "take a checkpoint of the working tree: its files as plain dffy lists them, staged or not and untracked, kept under a local ref of this worktree, the last 5 of them; starting Fix with agent takes one too",
+    SinceCheckpoint "since_checkpoint" "since checkpoint" "show only what changed since the latest checkpoint, such as an agent's turn since Fix with agent started it, or the diff shown before again; the status bar says how long ago it was taken",
     ToggleMouse "toggle_mouse" "toggle mouse" "take mouse input, or leave it to the terminal's own selection (many terminals select natively with shift held while dragging)",
     ToggleCopyDecorations "toggle_copy_decorations" "copy decorations" "copies include line numbers and +/- signs, or only the code",
     Stage "stage" "stage lines" "stage the selected lines, else the hunk of the line last tapped or the first on screen: their working-tree version goes in the index (uncommitted changes only)",
@@ -121,28 +123,29 @@ actions! {
     Comment "comment" "comment on lines" "comment on the selected lines, or the line v would start on, in a text box under them; enter sends it",
     SuggestChange "suggest_change" "suggest change" "suggest a change to the selected lines, or the line v would start on: a comment's text box holding them, to edit into what they should be; enter sends it",
     CommentFile "comment_file" "comment on file" "comment on the whole file shown, in a text box under its first row; enter sends it",
-    Comments "comments" "comments panel" "the left panel lists every comment thread in place of the files, or the files again; moving through the threads shows each in the diff, enter or tab goes to it; the thread keys act on the selected thread, but f, which filters",
+    Comments "comments" "comments panel" "the left panel lists every comment thread in place of the files, or the files again; moving through the threads shows each in the diff, enter or tab goes to it; the thread keys act on the selected thread, and c filters them by state",
     NextThread "next_thread" "next thread" "next comment thread, on into the next file with comments; it takes the focus, where r replies, e edits, x resolves, d deletes and o opens it on its host",
     PrevThread "prev_thread" "prev thread" "previous comment thread, back into the previous file with comments",
     ToggleThread "toggle_thread" "fold thread" "fold or unfold the focused comment thread, or the first on screen",
     ToggleThreads "toggle_threads" "fold all threads" "fold every comment thread to one row, or unfold them all",
     MoveThread "move_thread" "move thread here" "move the focused thread, or the comments panel's selected one, from the branch it was written on to the current branch",
-    AskAgent "ask_agent" "ask agent" "ask a coding agent, through the agent plugin dffy-agent, about the focused thread: write your question in a reply box, which enter sends with the thread to the agent that answered last, else the default one; enter on the empty box asks about the thread as it is, and esc saves the question without asking. Elsewhere, write the question on the selected lines, or the line v would start on, in a text box, and enter asks. The answer comes as the agent's reply, with a suggestion when it proposes a change; esc on the thread stops it. A comment you write starting @claude, @codex or @pi asks that agent too (experimental, see agent)",
+    AskAgent "ask_agent" "ask agent" "ask a coding agent, through the agent plugin dffy-agent, about the focused thread: write your question in a reply box, which enter sends with the thread to the agent that answered last, else the default one; enter on the empty box asks about the thread as it is, and esc keeps the question without asking. Elsewhere, write the question on the selected lines, or the line v would start on, in a text box, and enter asks. The answer comes as the agent's reply, with a suggestion when it proposes a change; esc on the thread stops it. A comment you write starting @ and an agent's name, as @name, asks that agent too (experimental, see agent)",
     Reply "reply" "reply to thread" "on a thread: reply in a text box under it; enter sends it",
     EditDraft "edit_draft" "edit thread draft" "on a thread: edit your last draft in it, in a text box; enter sends it",
     DeleteDraft "delete_draft" "delete thread draft" "on a thread: delete your last draft in it, the whole thread when that's its first comment or the thread is resolved with nothing on the host, once the key comes again",
     Resolve "resolve" "resolve thread" "on a thread: resolve it, or reopen it",
-    Adopt "adopt" "make thread yours" "on a thread: someone else's comments in it not posted, as an agent's, become your drafts, which posting sends under your name",
-    ApplySuggestion "apply_suggestion" "apply suggestion" "on a thread: put its suggestion, the one last clicked or else its last, in place of the lines it's on in the working tree, refused when they changed since; an unstaged change, which discard undoes",
-    FixWithAgent "fix_with_agent" "fix with agent" "on a thread, or the selected lines with a note you write first: start your coding agent (claude, codex, pi or amp) in a new tab, or here until it exits, pointed at the thread to change what it asks and reply in it",
+    Adopt "adopt" "make it yours" "on a thread: someone else's comments in it not posted, as an agent's, become your drafts, which posting sends under your name",
+    ApplySuggestion "apply_suggestion" "apply suggestion" "on a thread: put its suggestion, the one last clicked or else its last, in place of the lines it's on in the working tree, refused when they changed since; an unstaged change, which discard undoes. On one applied already, put back the lines it replaced",
+    FixWithAgent "fix_with_agent" "fix with agent" "on a thread, or the selected lines with a note you write first: start your coding agent in a new tab, or here until it exits, pointed at the thread to change what it asks and reply in it",
+    SendOpenThreads "send_open_threads" "send open threads" "take a checkpoint, then start your coding agent as fix with agent does, pointed at every open thread of yours in view (those you started or replied in) to change what each asks and reply in each; since checkpoint then shows its turn",
     OpenOnHost "open_on_host" "open thread on host" "on a thread: open it on its code host, in the browser",
     ClearResolved "clear_resolved" "delete resolved threads" "delete the resolved threads shown, after a y/n; on a code host's review only what isn't posted, as the host's threads would come back",
-    CommentInEditor "comment_in_editor" "comment in $EDITOR" "write in $EDITOR: your draft in the focused thread, else a reply to it, else a comment on the line; ctrl+g does it from the text box",
-    CommentedFiles "commented_files" "files with comments" "the tree shows only the files with comments, or every file; f/F and n/N keep to them",
+    CommentInEditor "comment_in_editor" "continue in editor" "write in $EDITOR: your draft in the focused thread, else a reply to it, else a comment on the line; ctrl+g does it from the text box",
+    CommentedFiles "commented_files" "files with comments" "the tree shows only the files with comments, or every file; f/F and n/N keep to them. In the comments panel, it steps through all threads, open ones, drafts and resolved ones, and its capital steps back",
     ReviewPull "review_pull" "update the review" "on a review a review plugin opened, fetch its new commits and threads and show them in place (experimental, see review)",
     ReviewPost "review_post" "post the review" "on a review a review plugin opened, open the dialog that posts your drafts, replies and resolves as a review (experimental, see review)",
     OpenReview "open_review" "open a review…" "list the reviews the review plugin offers, such as this branch's, yours and those waiting on you, to open one (experimental, see review)",
-    SinceLastReview "since_last_review" "since last review" "on a review a review plugin opened, show only what changed since the head of your last review posted from dffy, or the whole review again",
+    SinceLastReview "since_last_review" "since last review" "on a review a review plugin opened, show only what changed since the head of your last review, as the review plugin records it, or the whole review again",
     WholeReview "whole_review" "show the whole review" "on the branch's review that plain dffy found, show the whole review against the working tree, or the working tree's changes again",
     Help "help" "show this help" "show or hide this help",
     Quit "quit" "quit" "quit",
@@ -183,8 +186,8 @@ impl Table {
 
 use Table::{Conflict as Cf, Leader as L, Main as M, Thread as Th, Tree as T};
 
-/// The defaults: `(table, key, action)`. The leader's are in the order its
-/// menu shows them, grouped by [`Group`].
+/// The defaults: `(table, key, action)`. The leader's are in the order the
+/// command panel lists them within a group.
 const DEFAULTS: &[(Table, &str, Action)] = &[
     (M, "space", Action::Leader),
     (M, "j", Action::ScrollDown),
@@ -253,6 +256,7 @@ const DEFAULTS: &[(Table, &str, Action)] = &[
     (M, "d", Action::ToggleSyntax),
     (M, "r", Action::ToggleRendered),
     (M, "w", Action::ToggleWatch),
+    (M, "'", Action::SinceCheckpoint),
     (M, "A", Action::Stage),
     (M, "U", Action::Unstage),
     (M, "D", Action::Discard),
@@ -275,6 +279,8 @@ const DEFAULTS: &[(Table, &str, Action)] = &[
     (M, "V", Action::MoveThread),
     (M, "a", Action::AskAgent),
     (M, "E", Action::CommentInEditor),
+    // In the order of the actions, as `dffy config --default` lists them.
+    (Th, "y", Action::CopyPrompt),
     (Th, "a", Action::AskAgent),
     (Th, "r", Action::Reply),
     (Th, "e", Action::EditDraft),
@@ -325,10 +331,13 @@ const DEFAULTS: &[(Table, &str, Action)] = &[
     (L, "D", Action::Discard),
     (L, "$", Action::ToggleMouse),
     (L, "w", Action::ToggleWatch),
+    (L, ";", Action::TakeCheckpoint),
+    (L, "'", Action::SinceCheckpoint),
     (L, "~", Action::CycleTheme),
     (L, "E", Action::CommentInEditor),
     (L, "a", Action::AskAgent),
     (L, "&", Action::FixWithAgent),
+    (L, "^", Action::SendOpenThreads),
     (L, "-", Action::ClearResolved),
     (L, ".", Action::OpenTerminal),
     (L, "S", Action::SuggestChange),
@@ -338,7 +347,8 @@ const DEFAULTS: &[(Table, &str, Action)] = &[
     (L, "?", Action::Help),
 ];
 
-/// The command panel's groups and the `?` list's sections, in order.
+/// The kinds of action, in order: the sections of docs/keys.md, and the
+/// groups the `?` overlay and the command panel list under their tabs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum Group {
     Navigation,
@@ -347,29 +357,79 @@ pub(crate) enum Group {
     Copy,
     Changes,
     Modes,
-    Other,
+    Comments,
+    Agents,
+    Review,
+    General,
 }
 
 impl Group {
-    pub(crate) const ALL: [Self; 7] = [
+    pub(crate) const ALL: [Self; 10] = [
         Self::Navigation,
         Self::Files,
         Self::View,
         Self::Copy,
         Self::Changes,
         Self::Modes,
-        Self::Other,
+        Self::Comments,
+        Self::Agents,
+        Self::Review,
+        Self::General,
     ];
 
-    pub(crate) fn name(self) -> &'static str {
+    pub(crate) fn title(self) -> &'static str {
         match self {
-            Self::Navigation => "navigation",
-            Self::Files => "files/tree",
-            Self::View => "view",
-            Self::Copy => "selection & copy",
-            Self::Changes => "stage, discard & resolve",
-            Self::Modes => "watch & modes",
-            Self::Other => "other",
+            Self::Navigation => "Navigation",
+            Self::Files => "Files/tree",
+            Self::View => "View",
+            Self::Copy => "Selection & copy",
+            Self::Changes => "Stage, discard & resolve",
+            Self::Modes => "Watch & checkpoints",
+            Self::Comments => "Comments",
+            Self::Agents => "Agents",
+            Self::Review => "Review",
+            Self::General => "General",
+        }
+    }
+
+    /// The tab it's listed in, in `?` and the command panel; a tab of
+    /// several groups titles each with its name.
+    pub(crate) fn tab(self) -> Tab {
+        match self {
+            Self::Navigation => Tab::Move,
+            Self::Files => Tab::Files,
+            Self::View => Tab::View,
+            Self::Changes | Self::Modes => Tab::Git,
+            Self::Copy => Tab::Copy,
+            Self::Comments | Self::Agents | Self::Review => Tab::Review,
+            Self::General => Tab::General,
+        }
+    }
+}
+
+/// The tabs of `?` and the command panel, each listing those it has room
+/// for in an order of its own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum Tab {
+    Move,
+    Files,
+    View,
+    Git,
+    Copy,
+    Review,
+    General,
+}
+
+impl Tab {
+    pub(crate) fn title(self) -> &'static str {
+        match self {
+            Self::Move => "Move",
+            Self::Files => "Files",
+            Self::View => "View",
+            Self::Git => "Git",
+            Self::Copy => "Copy",
+            Self::Review => "Review",
+            Self::General => "General",
         }
     }
 }
@@ -426,11 +486,10 @@ impl Action {
             | Self::Copy
             | Self::CopyPath
             | Self::CopyAbsolutePath
-            | Self::CopyComment
-            | Self::CopyThread
-            | Self::CopyPrompt
             | Self::Cancel
-            | Self::ToggleCopyDecorations => Group::Copy,
+            | Self::CopyPrompt
+            | Self::ToggleCopyDecorations
+            | Self::ToggleMouse => Group::Copy,
             Self::Stage
             | Self::Unstage
             | Self::Discard
@@ -441,33 +500,32 @@ impl Action {
             | Self::KeepBoth
             | Self::TakeBase
             | Self::WriteResolution => Group::Changes,
-            Self::ToggleWatch | Self::ToggleMouse => Group::Modes,
-            Self::Leader
-            | Self::Edit
-            | Self::OpenTerminal
-            | Self::Comment
+            Self::ToggleWatch | Self::TakeCheckpoint | Self::SinceCheckpoint => Group::Modes,
+            Self::Comment
             | Self::SuggestChange
             | Self::CommentFile
             | Self::Comments
-            | Self::CommentInEditor
             | Self::MoveThread
-            | Self::AskAgent
+            | Self::CommentInEditor
             | Self::Reply
             | Self::EditDraft
             | Self::DeleteDraft
             | Self::Resolve
             | Self::Adopt
-            | Self::ApplySuggestion
-            | Self::FixWithAgent
             | Self::OpenOnHost
-            | Self::ClearResolved
-            | Self::ReviewPull
+            | Self::ApplySuggestion
+            | Self::CopyComment
+            | Self::CopyThread
+            | Self::ClearResolved => Group::Comments,
+            Self::AskAgent | Self::FixWithAgent | Self::SendOpenThreads | Self::OpenTerminal => {
+                Group::Agents
+            }
+            Self::ReviewPull
             | Self::ReviewPost
             | Self::OpenReview
             | Self::SinceLastReview
-            | Self::WholeReview
-            | Self::Help
-            | Self::Quit => Group::Other,
+            | Self::WholeReview => Group::Review,
+            Self::Leader | Self::Help | Self::Edit | Self::Quit => Group::General,
         }
     }
 
@@ -514,16 +572,22 @@ impl Action {
             Self::WriteResolution => "Write resolved file…",
             Self::ToggleMouse => "Mouse selection",
             Self::ToggleWatch => "Watch for changes",
+            Self::TakeCheckpoint => "Take checkpoint",
+            Self::SinceCheckpoint => "Since checkpoint",
             Self::CommentInEditor => "Continue in editor",
+            Self::Adopt => "Make it yours",
             Self::OpenTerminal => "Open terminal here",
             Self::SuggestChange => "Suggest change",
             Self::CommentedFiles => "Files with comments",
             Self::OpenReview => "Open review…",
             Self::SinceLastReview => "Since last review",
             Self::WholeReview => "Show whole review",
+            Self::ReviewPost => "Post review…",
+            Self::ReviewPull => "Pull updates",
             Self::MoveThread => "Move thread to this branch",
             Self::AskAgent => "Ask agent",
             Self::FixWithAgent => "Fix with agent",
+            Self::SendOpenThreads => "Send open threads to agent",
             Self::ClearResolved => "Delete resolved threads…",
             Self::Help => "All keys",
             other => other.label(),
@@ -583,6 +647,8 @@ impl Action {
             Self::ToggleStatusBar => "status bar at the top",
             Self::CycleTheme => "theme",
             Self::ToggleWatch => "watch",
+            Self::TakeCheckpoint => "take checkpoint",
+            Self::SinceCheckpoint => "since checkpoint",
             Self::ToggleMouse => "mouse",
             Self::ToggleCopyDecorations => "copy decorations",
             Self::Stage => "stage",
@@ -612,11 +678,12 @@ impl Action {
             Self::DeleteDraft => "delete draft",
             Self::Resolve => "resolve",
             Self::Adopt => "make it yours",
-            Self::ApplySuggestion => "apply",
+            Self::ApplySuggestion => "apply suggestion",
             Self::FixWithAgent => "fix with agent",
+            Self::SendOpenThreads => "send open threads",
             Self::OpenOnHost => "open on host",
             Self::ClearResolved => "delete resolved threads",
-            Self::CommentInEditor => "comment in editor",
+            Self::CommentInEditor => "continue in editor",
             Self::CommentedFiles => "files with comments",
             Self::ReviewPull => "update review",
             Self::ReviewPost => "post review",
@@ -961,7 +1028,7 @@ pub(crate) fn render_defaults(c: &mut Canvas) {
          do keys pressed while a comment thread is focused, in the thread's table (thread:), \
          then while the file at the cursor has conflicts to resolve, in the conflict's table \
          (conflict:). The command panel the leader key opens has its own table too, set with \
-         leader: (keybind = leader:z=toggle_wrap); the menu lists its entries in this order.",
+         leader: (keybind = leader:z=toggle_wrap); within a group, the panel lists its entries in this order.",
     );
     let defaults = Keys::default();
     for &action in Action::ALL {

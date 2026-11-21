@@ -1180,6 +1180,18 @@ impl Reviewing {
         (self.mode.as_ref()).is_none_or(|m| m.plain.is_some() && !m.whole && !m.since_last)
     }
 
+    /// Whether a review is open: what pulling, posting and "Since last
+    /// review" act on, and refuse without.
+    pub(crate) fn on_review(&self) -> bool {
+        self.mode.is_some()
+    }
+
+    /// Whether the review open is the one plain `dffy` found, which "Show
+    /// whole review" switches; it refuses on any other.
+    pub(crate) fn found_plain(&self) -> bool {
+        self.mode.as_ref().is_some_and(|m| m.plain.is_some())
+    }
+
     pub(crate) fn since_review(&self) -> bool {
         self.mode.as_ref().is_some_and(|p| p.since_last)
     }
@@ -1674,7 +1686,7 @@ impl Reviewing {
             Some(Err(e)) => {
                 let noun = self.noun(false);
                 return Err(vec![Effect::Say(format!(
-                    "nothing posted: local drafts not moved to the {noun}: {e}"
+                    "nothing posted: branch drafts not moved to the {noun}: {e}"
                 ))]);
             }
             None => {}

@@ -14,5 +14,5 @@ expression: screen(&mut app)
  7  7  │ line 7                                     ┌──────────────────────────┐
 ⋯ 39 unchanged lines  @@ -47,7 +47,7 @@ line 46     │ Copy line            v y │
 47 47  │ line 47                                    │ Open in editor       e   │
-48 48  │ line 48                                    │ Open terminal here       │
+48 48  │ line 48                                    │ Open terminal here   ␣ . │
    working tree  1/2 hunk  unified             / sea└──────────────────────────┘

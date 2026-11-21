@@ -2,23 +2,32 @@
 
 ## `dffy doctor`
 
-`dffy doctor` checks git, the repository, file watching, the terminal and multiplexer, copying, color, the config, the theme, the pager, the cache and `dffyd`, and times dffy on the repository. Run it inside a repository, or point it at one with `-C <path>`.
+`dffy doctor` checks git, the repository, file watching, the terminal and multiplexer, copying, color, the config, the theme, the pager, the cache, `dffyd`, the plugins, the agents and dffy's skill for them, and times dffy on the repository. Run it inside a repository, or point it at one with `-C <path>`.
 
 ```
-✓ git         git version 2.43.0
-✓ repository  ~/src/linux · master · 2 staged, 5 unstaged, 1 untracked
-✓ watch       6,345 needed here · 159 of 129,194 in use
-· speed       repo 1ms · first change 31ms · all 8 changes 127ms · untracked 67ms · largest diff 3ms (mm/vmscan.c)
-✓ terminal    TERM=xterm-256color, COLORTERM=truecolor, 160 columns
-✓ multiplexer tmux; dffy's one query (the background color) falls back to dark if it isn't relayed
-✓ copy        tmux passes copies (y, Y) to the terminal: set-clipboard is on
-✓ color       on; the default theme uses the 16 ANSI colors, truecolor themes work too
-· config      /home/me/.config/dffy/config (not present; using defaults)
-✓ theme       default
-✓ pager       less -RFX
-✓ cache       /home/me/.cache/dffy: 12.0MB in 40 entries, trimmed at 256.0MB
-· dffyd       not running; the first viewer starts it
+dffy 0.3.0
+  ✓ git          2.43.0
+  ✓ repository   ~/src/linux · master · 2 staged, 5 unstaged, 1 untracked
+  ✓ watch        6,345 needed here · 159 of 129,194 in use
+  · speed        repo 1ms · first change 31ms · 8 changes 127ms · untracked 67ms
+  · dffyd        not running
+terminal
+  ✓ terminal     xterm-256color · truecolor · 160 columns
+  ✓ multiplexer  tmux
+  ✓ copy         tmux set-clipboard on
+  ✓ color        on · 16-color theme, truecolor works
+  ✓ config       ~/.config/dffy/config (not present) · theme default · pager less -RFX
+  ✓ cache        ~/.cache/dffy · 12.0MB of 256.0MB
+plugins
+  ✓ render       markdown .md
+  ✓ review       github · gh 2.62.0 · logged in as octocat
+agents           dffy-agent ~/.local/bin/dffy-agent
+  ✓ claude       2.1.329 · read-only: Read, Grep, Glob · logged in
+  ! codex        0.44.0 · doesn't know --ephemeral: upgrade codex · logged in
+  ✓ skill        current in ~/.claude/skills, ~/.agents/skills
 ```
+
+Each row is a thing dffy uses, with what was found about it in a few words: a plugin's or an agent's checks share its row. `dffy doctor --verbose` prints each check on a line of its own, with all it found (`! agent codex recipe  doesn't know --ephemeral: upgrade codex`).
 
 | Mark | Meaning |
 |---|---|
@@ -32,7 +41,7 @@ Problems come with a `hint:` line. dffy exits with 1 when a check fails, and 0 o
 `dffy doctor --json` prints the same checks as one JSON object, without color, for bug reports and scripts:
 
 - **`checks`:** a list, each with `name`, `status` (`ok`, `warn`, `fail` or `info`), `detail`, `notes` and `hints`.
-- The data behind them, under `git`, `repository`, `watch`, `speed`, `terminal`, `config`, `cache` and `dffyd`.
+- The data behind them, under `git`, `repository`, `watch`, `speed`, `terminal`, `config`, `cache`, `dffyd`, `renderers`, `skills`, `review` and `agent`.
 - Every key is always present, `null` when it doesn't apply.
 - Durations are milliseconds as numbers (`"all_changes_ms": 127.4`).
 
@@ -51,6 +60,9 @@ Problems come with a `hint:` line. dffy exits with 1 when a check fails, and 0 o
 | `pager` | The pager printed output goes through | Never. |
 | `cache` | The disk cache's location, size and budget | It can't be read. |
 | `dffyd` | The watch broker, its build, and repositories it polls; brokers of other dffy versions | The broker doesn't answer (a stale socket), or comes from another build of dffy than the one running doctor. See [An old broker](#an-old-broker). |
+| `render`, `review` | The renderer and review plugins set, and the review plugin's own checks ([plugins.md](plugins.md)) | A plugin isn't on `PATH`, or one of its checks fails. |
+| `agents`, an agent's name | The agent plugin, then each agent it knows: its version, its recipe, and whether it's logged in ([plugins.md](plugins.md#the-agents-and-their-recipes)) | The agent's CLI doesn't know a flag of its recipe (upgrade it), it isn't logged in, or the config names one that isn't installed. |
+| `skill` | dffy's skill in each place agents read skills, in the home directory and the repository ([agents.md](agents.md)) | It's outdated: `dffy agents setup` updates it. A missing one is information only. |
 
 ### Repository counts
 

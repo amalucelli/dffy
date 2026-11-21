@@ -10,7 +10,7 @@ const INIT: &str = r#"{"jsonrpc":"2.0","id":@ID@,"result":{"protocol":1,"command
 const BASE: &str = "a1b2c3d000000000000000000000000000000000";
 const HEAD: &str = "e4f5a6b000000000000000000000000000000000";
 
-const SESSION: &str = r#"{"id":"7","title":"Spell out five","url":"https://github.com/acme/widgets/pull/7","base":"a1b2c3d000000000000000000000000000000000","head":"e4f5a6b000000000000000000000000000000000","last_reviewed_head":null}"#;
+const SESSION: &str = r#"{"id":"7","title":"Spell out five","url":"https://github.com/acme/widgets/pull/7","base":"a1b2c3d000000000000000000000000000000000","head":"e4f5a6b000000000000000000000000000000000","last_reviewed_head":null,"checkout":"gh pr checkout 7"}"#;
 
 /// The session [`SESSION`] names, its comments file in `reviews`.
 fn seven(reviews: &Path) -> Session {
@@ -25,6 +25,7 @@ fn seven(reviews: &Path) -> Session {
         state: None,
         labels: Vec::new(),
         comments: reviews.join("7.json"),
+        checkout: Some("gh pr checkout 7".to_owned()),
     }
 }
 

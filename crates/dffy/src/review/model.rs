@@ -128,8 +128,14 @@ impl Standing {
 
     /// The word a comment's heading says of where it lives, when that's
     /// news: a posted comment is the usual case, so only the others say.
+    /// One kept here is `private`, as nobody else sees it until it's made
+    /// a draft.
     pub(crate) fn word(self) -> Option<&'static str> {
-        self.name().filter(|_| self != Self::Posted)
+        match self {
+            Self::Draft => Some("draft"),
+            Self::Unposted => Some("private"),
+            Self::Posted | Self::Kept => None,
+        }
     }
 }
 
@@ -239,12 +245,17 @@ impl Thread {
             .any(|n| n.standing == Standing::Unposted)
     }
 
-    /// Whether its last suggestion, the one applying picks by default, is
-    /// still to apply.
-    pub(crate) fn suggests(&self) -> bool {
-        (self.comments.iter().rev())
-            .find(|n| n.suggestion.is_some())
-            .is_some_and(|n| !n.applied)
+    /// Its last comment with a suggestion, the one applying picks by
+    /// default.
+    pub(crate) fn suggestion(&self) -> Option<&ThreadComment> {
+        (self.comments.iter().rev()).find(|n| n.suggestion.is_some())
+    }
+
+    /// Whether applying takes back its last suggestion, applied already,
+    /// its lines where the thread is; lost, as after a discard, it applies
+    /// again.
+    pub(crate) fn reverts(&self) -> bool {
+        self.at != At::Lost && self.suggestion().is_some_and(|n| n.applied)
     }
 }
 
@@ -318,7 +329,8 @@ pub(super) struct Placed {
 
 /// The comments file shown and, on a review session's, the drafts of the
 /// local review's file (your comments without a ref, and their threads).
-/// A local draft shows only where it places on this diff, marked `local`;
+/// A local draft shows only where it places on this diff, marked `branch
+/// draft`;
 /// edits, replies and deletes in its thread go to the local file, and
 /// posting moves it to the session's first (see [`Comments::move_local`]).
 ///
@@ -525,6 +537,27 @@ impl Comments {
             }
             _ => (&self.path, self.session),
         }
+    }
+
+    /// The comments file, and whether it's a review session's.
+    pub(crate) fn file(&self) -> (&Path, bool) {
+        (&self.path, self.session)
+    }
+
+    /// The local review's file, when it's read beside [`Comments::file`].
+    pub(crate) fn local_file(&self) -> Option<&Path> {
+        self.local.as_deref()
+    }
+
+    /// How many open threads of yours are in view, by the file each is in:
+    /// [`Comments::file`], then [`Comments::local_file`]. `dffy comments
+    /// prompt --open` gives one file's.
+    pub(crate) fn open_threads_of_yours(&self) -> (usize, usize) {
+        let threads = self.review.open_threads_of_yours(review::Branches::All);
+        let local = (threads.iter())
+            .filter(|thread| self.from_local.contains(&thread[0].id))
+            .count();
+        (threads.len() - local, local)
     }
 
     /// Whether `root` starts a thread on another branch.

@@ -11,8 +11,8 @@ use std::process::{Command, Output, Stdio};
 
 const FIXTURE: &[u8] = include_bytes!("fixtures/git-diff.diff");
 
-/// Runs dffy in `dir` with an empty config directory and no color
-/// variables, so the user's environment can't leak into results.
+/// Runs dffy in `dir` with an empty config directory and home, and no
+/// color variables, so the user's environment can't leak into results.
 fn dffy(dir: &Path, args: &[&str]) -> Output {
     dffy_cmd(dir, args).output().expect("spawn dffy")
 }
@@ -25,6 +25,8 @@ fn dffy_cmd(dir: &Path, args: &[&str]) -> Command {
         // Inside the git directory, so the cache never shows as a change.
         .env("XDG_CACHE_HOME", dir.join(".git/dffy-test-cache"))
         .env("XDG_STATE_HOME", dir.join(".git/dffy-test-state"))
+        // Skills are installed and checked under the home directory.
+        .env("HOME", dir.join(".git/dffy-test-home"))
         // A broker of the user's own is never asked or started.
         .env("XDG_RUNTIME_DIR", dir)
         .env_remove("NO_COLOR")
@@ -574,6 +576,77 @@ fn show_comments_reads_the_repository_not_stdin() {
     ] {
         assert_eq!(dffy(d, args).status.code(), Some(128), "{args:?}");
     }
+}
+
+/// `dffy checkpoint` prints the number of the one it took; with
+/// `--since-checkpoint` the diff holds only what changed after the latest,
+/// or after the one named, read from the repository even with stdin a pipe,
+/// as an agent's shell has it.
+#[test]
+fn since_checkpoint_shows_only_what_changed_after_it() {
+    let repo = repo();
+    let d = repo.path();
+    let none = dffy(d, &["--since-checkpoint", "--name-status"]);
+    assert_eq!(none.status.code(), Some(128));
+    assert!(stderr(&none).contains("no checkpoint"), "{}", stderr(&none));
+    write(d, "README.md", "# demo\n\nEdited before.\n");
+    let first = dffy(d, &["checkpoint"]);
+    assert!(first.status.success(), "{}", stderr(&first));
+    assert_eq!(stdout(&first), "1\n");
+    write(
+        d,
+        "src/lib.rs",
+        "pub fn add(a: u8, b: u8) -> u8 {\n    a + b\n}\n",
+    );
+    assert_eq!(stdout(&dffy(d, &["checkpoint"])), "2\n");
+    write(d, "notes.txt", "later\n");
+
+    let piped = |args: &[&str]| {
+        let mut child = dffy_cmd(d, args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn dffy");
+        let mut stdin = child.stdin.take().expect("stdin");
+        stdin.write_all(FIXTURE).ok();
+        drop(stdin);
+        child.wait_with_output().expect("wait")
+    };
+    let latest = piped(&["--color=never", "--since-checkpoint"]);
+    assert!(latest.status.success(), "{}", stderr(&latest));
+    insta::assert_snapshot!(stdout(&latest), @r"
+    untracked file: notes.txt
+    ─────────────────────────
+    @@ -0,0 +1 @@
+    1 │+later
+    ");
+    let first = dffy(
+        d,
+        &["--color=never", "--since-checkpoint=1", "--name-status"],
+    );
+    assert_eq!(stdout(&first), "M\tsrc/lib.rs\n?\tnotes.txt\n");
+    let json = stdout(&dffy(d, &["--json", "--since-checkpoint", "--name-only"]));
+    let tree = git(d, &["rev-parse", "refs/worktree/dffy/checkpoints/2^{tree}"]);
+    let header = json.lines().next().unwrap_or_default();
+    assert!(
+        header.contains(&format!(
+            r#""old":{{"kind":"tree","id":"{}"}},"new":{{"kind":"worktree"}},"untracked":true"#,
+            tree.trim()
+        )),
+        "{header}"
+    );
+    assert_eq!(
+        stdout(&dffy(d, &["--color=never", "--name-only"])),
+        "README.md\nsrc/lib.rs\nnotes.txt\n",
+        "plain dffy still shows every uncommitted change"
+    );
+    let with_rev = dffy(d, &["--since-checkpoint", "main~1"]);
+    assert!(
+        stderr(&with_rev).contains("cannot be used with"),
+        "{}",
+        stderr(&with_rev)
+    );
 }
 
 #[test]
@@ -1287,17 +1360,15 @@ fn doctor_reports_each_check() {
         .output()
         .expect("spawn dffy");
     let text = stdout(&out);
-    let labels: Vec<String> = text
+    // A section's heading, or a check's label after its mark.
+    let labels: Vec<&str> = text
         .lines()
-        .map(|l| {
-            l.chars()
-                .skip(2)
-                .take(12)
-                .collect::<String>()
-                .trim()
-                .to_owned()
+        .skip(1)
+        .filter_map(|l| match l.strip_prefix("  ") {
+            Some(row) => row.split_once(' ')?.1.split("  ").next(),
+            None => l.split("  ").next(),
         })
-        .filter(|l| !l.starts_with("hint"))
+        .filter(|l| !l.is_empty())
         .collect();
     assert_eq!(
         labels,
@@ -1306,30 +1377,53 @@ fn doctor_reports_each_check() {
             "repository",
             "watch",
             "speed",
+            "dffyd",
+            "terminal",
             "terminal",
             "multiplexer",
             "color",
             "config",
-            "theme",
-            "pager",
             "cache",
-            "agent",
-            "dffyd"
+            "agents",
+            "skill",
         ],
         "{text}"
     );
     assert!(
-        text.contains("· agent       dffy-agent isn't on PATH"),
+        text.starts_with(&format!("dffy {}\n", env!("CARGO_PKG_VERSION"))),
         "{text}"
     );
-    assert!(text.contains("TERM=xterm-256color"), "{text}");
-    let repository = text.lines().nth(1).unwrap_or_default();
+    assert!(
+        text.contains("\nagents           dffy-agent isn't on PATH\n"),
+        "{text}"
+    );
+    assert!(
+        text.contains("  ✓ terminal     xterm-256color · "),
+        "{text}"
+    );
+    assert!(
+        text.contains("· skill        missing in ~/.claude/skills, ~/.agents/skills"),
+        "{text}"
+    );
+    let repository = text.lines().nth(2).unwrap_or_default();
     let path = repo.path().canonicalize().expect("canonical");
     assert!(
         repository.contains(&format!("{} · ", path.display())),
         "{repository}"
     );
-    assert!(text.contains(" · all "), "{text}");
+    assert!(text.contains(" changes "), "{text}");
+
+    let verbose = dffy_cmd(repo.path(), &["--color=never", "doctor", "--verbose"])
+        .env("PATH", "/usr/bin:/bin")
+        .output()
+        .expect("spawn dffy");
+    let verbose = stdout(&verbose);
+    assert!(verbose.contains(" theme "), "a row per check: {verbose}");
+    assert!(verbose.contains(" · all "), "the whole detail: {verbose}");
+    assert!(
+        verbose.contains("~/.agents/skills/dffy/SKILL.md (Codex, Pi, Amp): missing"),
+        "{verbose}"
+    );
 }
 
 /// `--json` is one object, with the measurement as numbers; outside a
@@ -1362,7 +1456,7 @@ fn doctor_json_and_outside_a_repository() {
     let out = doctor(&["--color=never", "-C", dir, "doctor"]);
     let text = stdout(&out);
     assert!(
-        text.contains("· repository  not in a git repository (-C <path>)"),
+        text.contains("· repository   not in a git repository (-C <path>)"),
         "{text}"
     );
     assert!(!text.contains(" speed "), "{text}");
@@ -1417,7 +1511,7 @@ fn doctor_finds_the_review_plugin_on_path() {
     );
     let text = doctor(format!("{}:{system}", renderers.path().display()), false);
     assert!(
-        text.contains("! review      dffy-review-test isn't on PATH"),
+        text.contains("! review       dffy-review-test isn't on PATH"),
         "{text}"
     );
 }
@@ -1449,6 +1543,53 @@ fn describing_plugin(answer: &str) -> tempfile::TempDir {
 
 const MERGE_REQUEST: &str =
     r#"{"protocol":1,"command":"mr","noun":"merge request","nouns":"merge requests"}"#;
+
+/// Each plugin's `doctor` runs beside the other's and beside dffy's own
+/// checks, and one that doesn't answer is said after 3 seconds rather than
+/// waited for: two plugins that never answer cost one wait, not two.
+#[test]
+fn doctor_asks_the_plugins_side_by_side_and_says_who_didnt_answer() {
+    use std::os::unix::fs::PermissionsExt as _;
+    use std::time::{Duration, Instant};
+    let repo = repo();
+    let review = describing_plugin(MERGE_REQUEST);
+    std::fs::write(review.path().join("doctor.gate"), "").expect("write");
+    let agent = tempfile::tempdir().expect("tempdir");
+    let plugin = agent.path().join("dffy-agent");
+    std::fs::write(&plugin, include_str!("fixtures/stubs/review-plugin.sh")).expect("write");
+    std::fs::set_permissions(&plugin, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    std::fs::write(
+        agent.path().join("initialize.out"),
+        "{\"jsonrpc\":\"2.0\",\"id\":@ID@,\"result\":{\"protocol\":1,\"agents\":[]}}\n",
+    )
+    .expect("write");
+    std::fs::write(agent.path().join("doctor.gate"), "").expect("write");
+    let path = format!(
+        "{}:{}:/usr/bin:/bin",
+        review.path().display(),
+        agent.path().display()
+    );
+    let start = Instant::now();
+    let out = dffy_cmd(
+        repo.path(),
+        &["--color=never", "--review", "test", "doctor", "--verbose"],
+    )
+    .env("PATH", path)
+    .output()
+    .expect("spawn dffy");
+    let took = start.elapsed();
+    let text = stdout(&out);
+    assert!(text.contains("dffy-review-test: "), "{text}");
+    assert!(text.contains(", adds dffy mr"), "{text}");
+    assert_eq!(
+        text.matches("its checks: its doctor didn't answer in 3s")
+            .count(),
+        2,
+        "{text}"
+    );
+    assert!(text.contains(" repository "), "{text}");
+    assert!(took < Duration::from_millis(5_000), "took {took:?}");
+}
 
 /// The review command is the one the plugin describes, in help and in
 /// completions: `dffy mr` reaches the review code (which then wants a
@@ -1485,8 +1626,13 @@ fn the_review_command_is_the_one_the_plugin_describes() {
     let zsh = stdout(&run(&["completions", "zsh"]));
     assert!(zsh.contains("'mr:Review a merge request"), "{zsh}");
     let doctor = stdout(&run(&["--color=never", "doctor"]));
+    assert!(
+        doctor.contains("! review       test · not set up\n"),
+        "{doctor}"
+    );
+    let doctor = stdout(&run(&["--color=never", "doctor", "--verbose"]));
     assert!(doctor.contains(", adds dffy mr\n"), "{doctor}");
-    assert!(doctor.contains("! review thing not set up"), "{doctor}");
+    assert!(doctor.contains("! review thing  not set up"), "{doctor}");
 }
 
 /// `describe` runs once per installed version of the program.
@@ -1561,7 +1707,7 @@ fn a_failed_describe_is_cached_until_doctor_asks_again() {
         format!("{{\"jsonrpc\":\"2.0\",\"id\":@ID@,\"result\":{MERGE_REQUEST}}}\n"),
     )
     .expect("write");
-    let doctor = stdout(&run(&["doctor"]));
+    let doctor = stdout(&run(&["doctor", "--verbose"]));
     assert!(doctor.contains(", adds dffy mr\n"), "{doctor}");
     let help = stdout(&run(&["--help"]));
     assert!(help.contains("Review a merge request"), "{help}");
@@ -1598,7 +1744,13 @@ fn without_a_described_plugin_there_is_no_review_command() {
         "--stat",
     ]);
     assert!(diff.status.success(), "{}", stderr(&diff));
-    let doctor = stdout(&run(&["--review", "test", "--color=never", "doctor"]));
+    let doctor = stdout(&run(&[
+        "--review",
+        "test",
+        "--color=never",
+        "doctor",
+        "--verbose",
+    ]));
     assert!(doctor.contains(", adds no command\n"), "{doctor}");
     assert!(
         doctor.contains("its command 'diff' is one of dffy's own"),
@@ -2155,6 +2307,46 @@ fn comments_prompt_prints_a_thread_with_its_lines_and_changes() {
     assert!(stderr(&missing).contains("no comment has the id nope"));
 }
 
+/// `dffy comments prompt --open` prints the open threads of yours on this
+/// branch in one prompt, each under its id with its lines: one you started
+/// and one you replied to, not a resolved one or someone else's alone; a
+/// thread of yours on another branch is left out and counted. `--json`
+/// gives the ids.
+#[test]
+fn comments_prompt_open_holds_every_open_thread_of_yours() {
+    let repo = repo();
+    let d = repo.path();
+    write(
+        d,
+        ".git/dffy/comments.json",
+        r##"{"version":1,"comments":[
+{"id":"c1","path":"src/lib.rs","side":"new","start":{"old":null,"new":2},"end":{"old":null,"new":2},"text":"Overflow?","author":"ana","created":"t1","resolved":false,"anchor":{"before":["pub fn add(a: i64, b: i64) -> i64 {"],"lines":["    a + b"],"after":["}"]}},
+{"id":"c2","path":"src/lib.rs","text":"Use checked_add.","author":"","created":"t2","in_reply_to":"c1","resolved":false},
+{"id":"r1","path":"README.md","side":"new","start":{"old":null,"new":3},"end":{"old":null,"new":3},"text":"Say more.","author":"","created":"t3","resolved":false,"anchor":{"before":["# demo",""],"lines":["A tiny crate."],"after":[]}},
+{"id":"x1","path":"README.md","text":"Done already.","author":"","created":"t4","resolved":true},
+{"id":"a1","path":"README.md","text":"Not yours.","author":"ana","created":"t5","resolved":false},
+{"id":"o1","path":"README.md","text":"On another branch.","author":"","created":"t6","resolved":false,"branch":"elsewhere"}
+]}"##,
+    );
+    write(
+        d,
+        "src/lib.rs",
+        "// Adds.\npub fn add(a: i64, b: i64) -> i64 {\n    a + b\n}\n",
+    );
+    let out = dffy(d, &["comments", "prompt", "--open"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    insta::assert_snapshot!(stdout(&out));
+    let json = dffy(d, &["comments", "prompt", "--open", "--json"]);
+    assert!(json.status.success(), "{}", stderr(&json));
+    let text = stdout(&json);
+    assert!(
+        text.starts_with(r#"{"threads":["r1","c1"],"elsewhere":1,"prompt":"#),
+        "{text}"
+    );
+    let both = dffy(d, &["comments", "prompt", "--open", "c1"]);
+    assert!(!both.status.success());
+}
+
 /// `--session` reads the comments file of the review session the viewer
 /// has open, as the session pointer in the shared git directory names it,
 /// and says so when there's none.
@@ -2221,4 +2413,287 @@ fn ctl_without_a_viewer_says_so() {
         text.contains(r#""view/open""#) && text.contains(r#""$defs""#),
         "{text}"
     );
+}
+
+/// dffy in `dir` with `home` as the home directory.
+fn dffy_home(dir: &Path, home: &Path, args: &[&str]) -> Output {
+    dffy_cmd(dir, args)
+        .env("HOME", home)
+        .output()
+        .expect("spawn dffy")
+}
+
+const MARKER: &str =
+    r#"<!-- Installed by "dffy agents setup". Remove it with "dffy agents remove". -->"#;
+
+/// The skill's two places in the home directory: Claude Code's, then the
+/// one Codex, Pi and Amp read.
+fn skills(home: &Path) -> [std::path::PathBuf; 2] {
+    [
+        home.join(".claude/skills/dffy/SKILL.md"),
+        home.join(".agents/skills/dffy/SKILL.md"),
+    ]
+}
+
+/// `setup` writes the stub to both places, `status` reads each as
+/// current, outdated or missing, and `remove` takes back only its own.
+#[test]
+fn agents_setup_status_and_remove_in_the_home_directory() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let home = tempfile::tempdir().expect("home");
+    let (d, h) = (dir.path(), home.path());
+    let status = |args: &[&str]| stdout(&dffy_home(d, h, &[&["agents", "status"], args].concat()));
+    insta::assert_snapshot!(status(&[]), @r"
+    missing   ~/.claude/skills/dffy/SKILL.md  Claude Code
+    missing   ~/.agents/skills/dffy/SKILL.md  Codex, Pi, Amp
+    ");
+    let dry = dffy_home(d, h, &["agents", "setup", "--dry-run"]);
+    assert!(dry.status.success(), "{}", stderr(&dry));
+    insta::assert_snapshot!(stdout(&dry), @r"
+    would create ~/.claude/skills/dffy/SKILL.md  Claude Code
+    would create ~/.agents/skills/dffy/SKILL.md  Codex, Pi, Amp
+    ");
+    assert!(!h.join(".claude").exists() && !h.join(".agents").exists());
+
+    let setup = dffy_home(d, h, &["agents", "setup"]);
+    assert!(setup.status.success(), "{}", stderr(&setup));
+    insta::assert_snapshot!(stdout(&setup), @r"
+    created   ~/.claude/skills/dffy/SKILL.md  Claude Code
+    created   ~/.agents/skills/dffy/SKILL.md  Codex, Pi, Amp
+    ");
+    let [claude, agents] = skills(h);
+    let stub = std::fs::read_to_string(&claude).expect("written");
+    assert_eq!(std::fs::read_to_string(&agents).expect("written"), stub);
+    assert!(stub.starts_with("---\nname: dffy\ndescription: "), "{stub}");
+    for line in [
+        "allowed-tools: Bash(dffy *)",
+        "metadata:\n  dffy-skill: \"1\"\n---\n",
+        MARKER,
+        "dffy agents show",
+    ] {
+        assert!(stub.contains(line), "{line}: {stub}");
+    }
+    let again = dffy_home(d, h, &["agents", "setup"]);
+    assert!(
+        stdout(&again).starts_with("current   ~/.claude"),
+        "{}",
+        stdout(&again)
+    );
+
+    std::fs::write(
+        &agents,
+        stub.replace("dffy-skill: \"1\"", "dffy-skill: \"0\""),
+    )
+    .expect("edit");
+    insta::assert_snapshot!(status(&[]), @r"
+    current   ~/.claude/skills/dffy/SKILL.md  Claude Code
+    outdated  ~/.agents/skills/dffy/SKILL.md  Codex, Pi, Amp
+    ");
+    let json = status(&["--json", "--agent", "pi"]);
+    let agents_path = agents.display();
+    assert_eq!(
+        json,
+        format!(
+            "{{\"dry_run\":false,\"locations\":[{{\"path\":\"{agents_path}\",\"agents\":[\"codex\",\"pi\",\"amp\"],\"status\":\"outdated\",\"action\":null}}]}}\n"
+        )
+    );
+    let updated = dffy_home(d, h, &["agents", "setup", "--agent", "codex"]);
+    assert_eq!(
+        stdout(&updated),
+        "updated   ~/.agents/skills/dffy/SKILL.md  Codex, Pi, Amp\n"
+    );
+    assert_eq!(std::fs::read_to_string(&agents).expect("rewritten"), stub);
+
+    let removed = dffy_home(d, h, &["agents", "remove"]);
+    assert!(removed.status.success(), "{}", stderr(&removed));
+    insta::assert_snapshot!(stdout(&removed), @r"
+    removed   ~/.claude/skills/dffy/SKILL.md  Claude Code
+    removed   ~/.agents/skills/dffy/SKILL.md  Codex, Pi, Amp
+    ");
+    assert!(!h.join(".claude/skills/dffy").exists());
+    assert!(!h.join(".agents/skills/dffy").exists());
+    assert!(h.join(".claude/skills").is_dir(), "only dffy/ goes");
+}
+
+/// A `dffy/SKILL.md` dffy didn't write stops `setup` before it writes
+/// anywhere, unless `--force`; `remove` leaves it.
+#[test]
+fn agents_setup_refuses_a_foreign_skill_without_force() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let home = tempfile::tempdir().expect("home");
+    let (d, h) = (dir.path(), home.path());
+    let [claude, agents] = skills(h);
+    write(
+        h,
+        ".agents/skills/dffy/SKILL.md",
+        "---\nname: dffy\n---\nMine.\n",
+    );
+    let refused = dffy_home(d, h, &["agents", "setup"]);
+    assert_eq!(refused.status.code(), Some(128));
+    insta::assert_snapshot!(stderr(&refused), @r"
+    error: ~/.agents/skills/dffy/SKILL.md is a dffy skill dffy didn't write; nothing was written
+    hint: dffy agents setup --force replaces it
+    ");
+    assert!(!claude.exists(), "nothing was written");
+    let status = dffy_home(d, h, &["agents", "status", "--agent", "amp"]);
+    assert_eq!(
+        stdout(&status),
+        "foreign   ~/.agents/skills/dffy/SKILL.md  Codex, Pi, Amp: dffy didn't write it\n"
+    );
+    let kept = dffy_home(d, h, &["agents", "remove"]);
+    assert!(kept.status.success(), "{}", stderr(&kept));
+    insta::assert_snapshot!(stdout(&kept), @r"
+    missing   ~/.claude/skills/dffy/SKILL.md  Claude Code
+    kept      ~/.agents/skills/dffy/SKILL.md  Codex, Pi, Amp: dffy didn't write it
+    ");
+    assert!(agents.exists());
+    let forced = dffy_home(d, h, &["agents", "setup", "--force"]);
+    assert!(forced.status.success(), "{}", stderr(&forced));
+    assert!(
+        stdout(&forced).contains("replaced  ~/.agents/skills/dffy/SKILL.md"),
+        "{}",
+        stdout(&forced)
+    );
+    assert!(
+        std::fs::read_to_string(&agents)
+            .expect("read")
+            .contains(MARKER)
+    );
+}
+
+/// Skill directories kept elsewhere and linked in, as dotfiles are, are
+/// written through and stay links.
+#[test]
+fn agents_setup_writes_through_a_linked_skills_directory() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let home = tempfile::tempdir().expect("home");
+    let (d, h) = (dir.path(), home.path());
+    std::fs::create_dir_all(h.join("dotfiles/skills")).expect("mkdir");
+    std::fs::create_dir(h.join(".claude")).expect("mkdir");
+    std::os::unix::fs::symlink(h.join("dotfiles/skills"), h.join(".claude/skills")).expect("link");
+    let setup = dffy_home(d, h, &["agents", "setup", "--agent", "claude"]);
+    assert!(setup.status.success(), "{}", stderr(&setup));
+    assert!(h.join("dotfiles/skills/dffy/SKILL.md").is_file());
+    assert!(h.join(".claude/skills").is_symlink());
+    assert!(
+        !h.join(".agents").exists(),
+        "--agent claude writes only its place"
+    );
+    let removed = dffy_home(d, h, &["agents", "remove", "--agent", "claude"]);
+    assert!(removed.status.success(), "{}", stderr(&removed));
+    assert!(!h.join("dotfiles/skills/dffy").exists());
+    assert!(h.join(".claude/skills").is_symlink());
+}
+
+/// `--project` puts the skill at the repository's root, from any
+/// directory in it, and needs a repository.
+#[test]
+fn agents_setup_project_writes_at_the_repository_root() {
+    let repo = repo();
+    let home = tempfile::tempdir().expect("home");
+    let d = repo.path();
+    let setup = dffy_home(
+        &d.join("src"),
+        home.path(),
+        &["agents", "setup", "--project"],
+    );
+    assert!(setup.status.success(), "{}", stderr(&setup));
+    assert!(d.join(".claude/skills/dffy/SKILL.md").is_file());
+    assert!(d.join(".agents/skills/dffy/SKILL.md").is_file());
+    assert!(!home.path().join(".claude").exists());
+    let status = stdout(&dffy_home(
+        d,
+        home.path(),
+        &["agents", "status", "--project"],
+    ));
+    assert_eq!(
+        status.lines().filter(|l| l.starts_with("current ")).count(),
+        2,
+        "{status}"
+    );
+
+    let outside = tempfile::tempdir().expect("tempdir");
+    let out = dffy_home(
+        outside.path(),
+        home.path(),
+        &["agents", "setup", "--project"],
+    );
+    assert_eq!(out.status.code(), Some(128));
+    assert!(
+        stderr(&out).contains("not a git repository") || stderr(&out).contains("repository"),
+        "{}",
+        stderr(&out)
+    );
+}
+
+/// The guide `dffy agents show` prints is the one the skill points to,
+/// and its reply example works as printed, by the agent `--as` names.
+#[test]
+fn agents_show_guides_a_reply_that_comments_apply_takes() {
+    let repo = repo();
+    let d = repo.path();
+    let shown = dffy(d, &["agents", "show"]);
+    assert!(shown.status.success(), "{}", stderr(&shown));
+    let guide = stdout(&shown);
+    assert!(guide.starts_with("# dffy for agents\n"), "{guide}");
+    let reply = guide
+        .lines()
+        .map(str::trim)
+        .find(|l| l.starts_with(r#"[{"op":"add""#))
+        .expect("a reply example");
+    let root = comments_apply(
+        d,
+        &["comments", "apply"],
+        r#"[{"op":"add","comment":{"path":"README.md","text":"Say more."}}]"#,
+    );
+    let id = &answer_ids(&root)[0];
+    let replied = comments_apply(
+        d,
+        &["comments", "apply", "--as", "claude"],
+        &reply.replace("<id>", id),
+    );
+    answer_ids(&replied);
+    let file = stdout(&dffy(d, &["comments", "--json"]));
+    let reply_line = file
+        .lines()
+        .find(|l| l.contains(&format!(r#""in_reply_to":"{id}""#)))
+        .expect("the reply");
+    assert!(reply_line.contains(r#""author":"claude""#), "{reply_line}");
+    let root_line = file
+        .lines()
+        .find(|l| l.contains(&format!(r#""id":"{id}""#)))
+        .expect("root");
+    assert!(
+        root_line.contains(r#""author":"""#),
+        "without --as it's yours: {root_line}"
+    );
+    let suggested = reply
+        .replace("<id>", id)
+        .replace("\"}}]", "\",\"suggestion\":\"# Demo\"}}]");
+    answer_ids(&comments_apply(
+        d,
+        &["comments", "apply", "--as", "codex"],
+        &suggested,
+    ));
+    let file = stdout(&dffy(d, &["comments", "--json"]));
+    assert!(
+        file.lines()
+            .any(|l| l.contains(r##""suggestion":"# Demo""##) && l.contains(r#""author":"codex""#)),
+        "{file}"
+    );
+    let session = comments_apply(
+        d,
+        &["comments", "--session", "apply", "--as", "claude"],
+        "[]",
+    );
+    assert!(
+        stderr(&session).contains("no review session"),
+        "{}",
+        stderr(&session)
+    );
+
+    for name in ["you", " ", "a\u{7}b"] {
+        let refused = comments_apply(d, &["comments", "apply", "--as", name], "[]");
+        assert_eq!(refused.status.code(), Some(128), "{name:?}");
+    }
 }

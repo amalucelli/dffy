@@ -44,8 +44,16 @@ pub(crate) struct Prompt {
 
 /// The thread of `comments`, its first comment first, shown `at` on
 /// `diff`, its file's line diff; without one, its lines as written.
-pub(crate) fn thread(comments: &[&Comment], at: &At, diff: Option<&FileDiff>) -> Prompt {
-    thread_within(comments, at, diff, MAX_BYTES)
+/// `elsewhere` when HEAD isn't the head of the review the thread is on, so
+/// the files on disk aren't the version the thread is about: the prompt
+/// says so, for an agent that reads them.
+pub(crate) fn thread(
+    comments: &[&Comment],
+    at: &At,
+    diff: Option<&FileDiff>,
+    elsewhere: bool,
+) -> Prompt {
+    thread_within(elsewhere, comments, at, diff, MAX_BYTES)
 }
 
 /// Lines `lines` (0-based) of `side` of `diff`, a line diff, selected.
@@ -90,13 +98,106 @@ pub(crate) fn handoff(id: &str, kept: Kept) -> String {
     )
 }
 
-fn thread_within(comments: &[&Comment], at: &At, diff: Option<&FileDiff>, cap: usize) -> Prompt {
-    let Some(&root) = comments.first() else {
+/// What an agent handed every open thread of yours starts with: where to
+/// read them, as [`handoff`] says for one.
+pub(crate) fn open_handoff(kept: Kept) -> String {
+    let comments = match kept {
+        Kept::Local => "dffy comments".to_owned(),
+        Kept::Session => "dffy comments --session".to_owned(),
+        Kept::File(path) => {
+            let file = crate::terminal::quote(path.as_os_str().as_bytes());
+            format!(
+                "dffy --comments {} comments",
+                String::from_utf8_lossy(&file)
+            )
+        }
+    };
+    format!(
+        "Address the open dffy review threads: run {comments} prompt --open, change only what \
+         each thread asks, reply in each thread with what you changed ({comments} apply --as \
+         <you>)."
+    )
+}
+
+/// A thread for [`open_threads`]: its comments, its first comment first,
+/// where it's shown, and its file's line diff when there's one.
+pub(crate) type Open<'a> = (&'a [&'a Comment], &'a At, Option<&'a FileDiff>);
+
+/// Every thread of `threads` in one prompt, each under its first comment's
+/// id as [`thread`] gives it, then one ask for them all; `others`, threads
+/// left out as on other branches, are counted. `elsewhere` as for
+/// [`thread`], said once. The cap grows with the threads, [`MAX_BYTES`]
+/// for each of the first 4, and each thread is trimmed alone to its share
+/// of it; as for one thread, what's never cut can make a longer prompt.
+pub(crate) fn open_threads(threads: &[Open], others: usize, elsewhere: bool) -> Prompt {
+    let n = threads.len();
+    let mut text = if n == 0 {
+        String::from("No open review threads of yours.\n\n")
+    } else {
+        format!(
+            "{} of yours, each under its id.\n\n",
+            count(n, "open review thread")
+        )
+    };
+    if elsewhere && n > 0 {
+        text.push_str(
+            "The files on disk aren't this review's version (HEAD isn't its head); rely on the \
+             hunks quoted.\n\n",
+        );
+    }
+    let share = MAX_BYTES * n.min(4) / n.max(1);
+    let mut trimmed = false;
+    for &(comments, at, diff) in threads {
+        let Some(root) = comments.first() else {
+            continue;
+        };
+        let _ = write!(text, "## Thread {}\n\n", root.id);
+        let mut parts = thread_parts(false, comments, at, diff);
+        parts.tail = String::new();
+        let one = parts.fit(share);
+        trimmed |= one.trimmed;
+        text.push_str(&one.text);
+    }
+    if others > 0 {
+        let s = if others == 1 { "" } else { "s" };
+        let _ = write!(
+            text,
+            "[{others} open thread{s} of yours on other branches left out]\n\n"
+        );
+    }
+    if n > 0 {
+        text.push_str(
+            "For each thread, change only what its last comment asks, then reply in that thread, \
+             by its id, with what you changed.\n",
+        );
+    }
+    Prompt { text, trimmed }
+}
+
+fn thread_within(
+    elsewhere: bool,
+    comments: &[&Comment],
+    at: &At,
+    diff: Option<&FileDiff>,
+    cap: usize,
+) -> Prompt {
+    if comments.is_empty() {
         return Prompt {
             text: String::new(),
             trimmed: false,
         };
-    };
+    }
+    thread_parts(elsewhere, comments, at, diff).fit(cap)
+}
+
+/// [`thread_within`]'s parts, before trimming; `comments` isn't empty.
+fn thread_parts<'a>(
+    elsewhere: bool,
+    comments: &'a [&'a Comment],
+    at: &At,
+    diff: Option<&FileDiff>,
+) -> Parts<'a> {
+    let root = comments[0];
     let mut head = String::from("A review thread on ");
     let mut code = None;
     let mut anchor = None;
@@ -139,6 +240,12 @@ fn thread_within(comments: &[&Comment], at: &At, diff: Option<&FileDiff>, cap: u
         head.push_str(", outdated on its host");
     }
     head.push_str(".\n\n");
+    if elsewhere {
+        head.push_str(
+            "The files on disk aren't this review's version (HEAD isn't its head); rely on the \
+             hunks quoted.\n\n",
+        );
+    }
     let mut tail = String::from("Answer the thread's last comment.");
     if code.is_some() {
         tail.push_str(
@@ -160,7 +267,6 @@ fn thread_within(comments: &[&Comment], at: &At, diff: Option<&FileDiff>, cap: u
         hunks,
         tail,
     }
-    .fit(cap)
 }
 
 fn selection_within(diff: &FileDiff, side: Side, lines: Range<usize>, cap: usize) -> Prompt {

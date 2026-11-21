@@ -299,7 +299,7 @@ The protocol is experimental, and may change while it is. It knows nothing of an
 - **`initialize` first.** Requests made before its answer wait for it. A plugin that answers it with an error, or writes something that isn't a JSON object before answering, is refused: its requests fail saying why, and it isn't started again.
 - **Crashes.** A process that exits otherwise ends the requests it hadn't answered with how it exited, and is started again after 1 second, then 2, 4, 8 and 16 for crashes in a row; one that ran a minute starts the count over, and after 5 in a row it isn't started again. The new one is told again which review dffy shows and whether you're idle. A request it was running isn't sent again: a `post` resumes at the next `P`.
 - **Quitting.** dffy sends `shutdown` and `exit`, then kills the process group without waiting. While a `post` runs, it cancels the post and waits for it to end first, up to 30 seconds, after a signal as after the second quit: the plugin stops between drafts, so what it posted until then gets its refs.
-- **Short sessions.** dffy also starts the plugin to answer `initialize` alone, when it needs the naming and the cache has none ([The review command](#the-review-command)), and for `doctor` (`dffy doctor`); these run where dffy runs, in a repository or not, and are killed once answered or past their time (2 and 10 seconds).
+- **Short sessions.** dffy also starts the plugin to answer `initialize` alone, when it needs the naming and the cache has none ([The review command](#the-review-command)), and for `doctor` (`dffy doctor`); these run where dffy runs, in a repository or not, and are killed once answered or past their time (2 and 3 seconds). `dffy doctor` runs the two side by side, beside the agent plugin's `doctor` and its own checks, and one that runs out of time says it didn't answer.
 
 **Environment.** dffy passes its own environment on, with `DFFY` set to the path of the dffy that started the plugin.
 
@@ -340,7 +340,7 @@ dffy drops a push about a review it doesn't show. Of `prepare`, `pull` and `post
 | `pull` | As `prepare`, after fetching the head: a session with the new head. |
 | `dryRun` | `{"drafts":[…]}`: a [plan](#a-plan) for each draft, in the order they came. dffy counts them, and what's pending on the host and the resolves waiting, itself. It shouldn't send or write anything. |
 | `post` | `{"unposted":[…],"posted":9,"failed":3,"pending":4,"url":"https://github.com/acme/widgets/pull/7#pullrequestreview-2001","last_reviewed_head":"<commit>"}`, after `progress` for each draft: a plan for each draft not posted, all `skip`, then the counts, and the review's `labels` when the post changed a vote. With no drafts and an event that `submits`, it submits what's pending on the host. |
-| `doctor` | `{"checks":[{"name":"gh","ok":true,"detail":"gh version 2.62.0"},{"name":"auth","ok":false,"detail":"not logged in"}]}`: what the plugin needs, each with a short `name`, whether it's fine, and a line saying what was found. |
+| `doctor` | `{"checks":[{"name":"gh","ok":true,"detail":"gh version 2.62.0","brief":"gh 2.62.0"},{"name":"auth","ok":false,"detail":"not logged in"}]}`: what the plugin needs, each with a short `name`, whether it's fine, a line saying what was found, optionally `"info":true` on one that's fine but only notes something, which `dffy doctor` marks `·` rather than `✓`, and optionally a `brief`, the few words `dffy doctor` folds into the plugin's one row (`review  github · gh 2.62.0 · logged in as octocat`), in place of the `detail` it shows there otherwise; `dffy doctor --verbose` shows each check on its own line with its `detail`. It should answer within 3 seconds, or dffy says it didn't answer and shows none of its checks. |
 
 **Errors.** A request that fails answers with JSON-RPC's `error`: `{"code":…,"message":"…","data":…}`. dffy shows the message; for `-32601`, a method the plugin doesn't have, it says the plugin doesn't know the request and may be older than dffy. `-32602` is a request the plugin can't take (an unknown event, an id that isn't one of its own), `-32800` one cancelled. `data`, when there is one, says what was done before the failure, in the result's shape: a `post` stopped midway says what it posted. An error after a `session` notification leaves the session good, since the code is in the clone; it says what's missing, such as the threads, and the viewer stays open. Before one, the review command exits with it.
 
@@ -415,7 +415,7 @@ dffy refuses a description that breaks these, and `dffy doctor` says why.
 #### The session
 
 ```json
-{"id":"7","title":"Spell out five","url":"https://github.com/acme/widgets/pull/7","base":"<commit>","head":"<commit>","last_reviewed_head":null,"state":"open"}
+{"id":"7","title":"Spell out five","url":"https://github.com/acme/widgets/pull/7","base":"<commit>","head":"<commit>","last_reviewed_head":null,"state":"open","checkout":"gh pr checkout 7"}
 ```
 
 | Field | Meaning |
@@ -426,6 +426,7 @@ dffy refuses a description that breaks these, and `dffy doctor` says why.
 | `base`, `head` | Commits in the clone, as full ids: 40 hex digits, or 64 in a SHA-256 repository. dffy shows `<base>...<head>`. |
 | `last_reviewed_head` | The head of your last review, a full id, or `null`. The plugin keeps it, and says when a `post` changed it. "Since last review" shows `<last_reviewed_head>..<head>`. |
 | `state` | Optional: `open`, `closed` or `merged`, as the host last said. |
+| `checkout` | Optional: a command that checks the review out, one printable line of up to 200 bytes, such as `gh pr checkout 7`. dffy shows it where something needs HEAD on the review's head, as applying a suggestion does (`check out PR #7 first: gh pr checkout 7`), and never runs it. Any host has some such command, or none. Without it, dffy says HEAD isn't the review's head. |
 | `labels` | Optional: the labels this review is voted on beside the event, up to 9, for a host whose verdict is more than one choice, as a Gerrit change's Code-Review and Verified. They're the review's, so a session names them, not `initialize`: each review may have its own, and your votes on it. Each is `{"name":"Code-Review","values":[{"value":-1,"label":"I would prefer not"},{"value":0,"label":"No score"},{"value":1,"label":"Looks good to me"}],"vote":0}`: a `name` of up to 40 printable characters, 1 to 9 `values` in the order offered, each a whole number with words, and your `vote` on the host now, one of them (the neutral value when you haven't voted). No names or values repeat. The post dialog shows each under the events, starting on your vote, j/k going to it and ←/→ changing it. None when left out. |
 
 dffy refuses a session whose `base`, `head` or `last_reviewed_head` isn't a full commit id, or whose labels break these.
@@ -469,11 +470,13 @@ For `post`:
 
 The agent plugin, `dffy-agent`, asks a coding agent you already run about a review thread: Claude Code (`claude`), Codex (`codex`), Pi (`pi`), or a command of yours. It hands back the answer and, when the answer proposes a change, its suggestion, for dffy to put in the thread as a reply authored by the agent. The agent can read and search, but not write, run arbitrary commands or reach the network, because of how it's run, its recipe, not because the prompt asks it to. The plugin writes no file, and neither does the agent.
 
+It also says how to start each agent you have on a thread, interactively in its normal mode, for [Fix with agent](viewer.md#fixing-with-an-agent): Claude Code, Codex and Pi on the thread's prompt as their argument, Amp with it on the clipboard. dffy knows no agent by name: it runs what the plugin says, so Fix with agent needs the plugin too.
+
 `dffy-agent` comes from this repository; [install.md](install.md#plugins) covers it. It needs `claude`, `codex` or `pi` on `PATH`, logged in, and nothing else: no SDK, no Node.
 
 ### The agents and their recipes
 
-The recipes target the current release of each CLI. An agent is available when its program is on `PATH`; no version is checked, and a CLI release that breaks a recipe gets the recipe fixed in the plugin. `--version` runs only for `doctor`, to show what it says. Every recipe gets the prompt on stdin, never in its arguments, and runs in the working tree.
+The recipes target the current release of each CLI. An agent is available when its program is on `PATH`; no version is checked, and a CLI release that breaks a recipe gets the recipe fixed in the plugin. `--version` and `--help` run only for `doctor`, to show what the CLI says and whether it knows the recipe's flags. Every recipe gets the prompt on stdin, never in its arguments, and runs in the working tree.
 
 - **Claude**: `claude -p --verbose --output-format stream-json --tools "Read,Grep,Glob" --disallowedTools "mcp__*" --strict-mcp-config --setting-sources user --no-session-persistence --permission-mode dontAsk`.
   - It can read and search files, and nothing else: `--tools` leaves only Read, Grep and Glob of the built-in tools, so no edits, no shell and no web. MCP servers' tools are denied apart, and `--strict-mcp-config` loads no server. `--setting-sources user` keeps the reviewed repository's settings, and so its hooks, from loading. Nothing is saved as a session.
@@ -493,7 +496,7 @@ The recipes target the current release of each CLI. An agent is available when i
 
 A failure's reason, when the agent's output gives none, is its stderr's first line that starts with `error:`, as a usage error's does, else its last line. When a run of Claude or Codex fails, the plugin asks `claude auth status` or `codex login status`; exit status 1 means it isn't logged in, and the error says how to log in. It runs no login flow.
 
-Amp isn't a built-in agent: it has no read-only mode an ask could rely on, as it runs tools without asking and a repository's `.amp/settings.json` and plugins override restrictions. You can still name it as a command of yours (`agent = amp …`), at your own risk, and Fix with agent can hand it a thread, since it starts an agent in its normal interactive mode rather than read-only.
+Amp isn't a built-in agent: it has no read-only mode an ask could rely on, as it runs tools without asking and a repository's `.amp/settings.json` and plugins override restrictions. You can still name it as a command of yours (`agent = amp …`), at your own risk, and the plugin lists it among the agents Fix with agent can hand a thread to, since that starts an agent in its normal interactive mode rather than read-only.
 
 **What stays possible.**
 
@@ -505,7 +508,7 @@ Amp isn't a built-in agent: it has no read-only mode an ask could rely on, as it
 - Pi's extensions in your home directory (`~/.pi/agent`) load, and run inside Pi with your permissions: one could register tools that write or reach the network, or turn tools back on.
 - The agent's own instruction files in the repository, such as `AGENTS.md`, are read as text.
 
-The programs are found in absolute `PATH` entries only, so the reviewed repository can't supply one, and `--version` and the login checks run in `/`.
+The programs are found in absolute `PATH` entries only, so the reviewed repository can't supply one, and `--version`, `--help` and the login checks run in `/`.
 
 ### The agent protocol, version 1
 
@@ -517,7 +520,7 @@ The protocol is experimental, and changes in place as the review protocol does.
 
 **Lifecycle.**
 
-- **dffy's side.** dffy starts the plugin only when it's needed, on the first ask or for `dffy doctor`, never as it starts, so `initialize` never delays its first frame; it keeps the plugin while it runs.
+- **dffy's side.** dffy starts the plugin only when it's needed, on the first ask or Fix with agent, or for `dffy doctor`, never as it starts, so `initialize` never delays its first frame; it keeps the plugin while it runs.
 - **The plugin's side.** Requests run side by side. Each agent runs in a process group of its own, which a cancel kills with everything the agent started; `shutdown`, `exit` and the end of stdin kill every ask still running, as killing the plugin's group doesn't reach them. A plugin that crashes kills none: its agents run on until they next write their output, which has no reader then and fails, or until they end. dffy starts the plugin again, and the asks it was running end as failed.
 
 **Messages.**
@@ -536,9 +539,9 @@ The protocol is experimental, and changes in place as the review protocol does.
 
 | Request | Result |
 |---|---|
-| `initialize` | `{"protocol":1,"agents":[{"name":"claude","default":true,"mark":null},{"name":"codex","default":false,"mark":"read-only sandbox"}],"capabilities":{}}`. `agents` lists only the agents found. `name` is `claude`, `codex`, `pi` or `custom`; one is the `default`: the command of yours when there is one, else the agent the config names, else the first. `mark` is how its replies are labeled, `null` for none. |
+| `initialize` | `{"protocol":1,"agents":[{"name":"claude","default":true,"mark":null},{"name":"codex","default":false,"mark":"read-only sandbox"}],"handoffs":[{"name":"claude","program":"/usr/local/bin/claude","args":["{prompt}"]},{"name":"amp","program":"/usr/local/bin/amp","args":[],"prompt":"clipboard"}],"capabilities":{}}`. `agents` lists only the agents found that an ask can go to. `name` is `claude`, `codex`, `pi` or `custom`; one is the `default`: the command of yours when there is one, else the agent the config names, else the first. `mark` is how its replies are labeled, `null` for none. `handoffs`, optional, lists apart the agents found that a thread can be handed to ([below](#handoffs)), some of which no ask goes to. |
 | `ask` | `{"text":"Yes: the sum overflows past u32::MAX.","suggestion":"x.checked_add(y)?"}`. The answer's last ```` ```suggestion ```` fenced block, closed by a fence at least as long as the one that opened it, is taken out of `text` and becomes `suggestion`: its lines, without a final line break, as [the comments file's](comments.md#the-file-version-1) `suggestion`. A fence inside another block opens none. Without one there's no `suggestion`; an empty block is an empty one, which removes the lines. |
-| `doctor` | `{"checks":[{"name":"claude","ok":true,"detail":"2.1.329 (Claude Code)"},{"name":"claude recipe","ok":true,"detail":"read-only: Read, Grep and Glob only, MCP tools denied, user settings only"},{"name":"claude auth","ok":true,"detail":"logged in"},{"name":"codex","ok":true,"detail":"not installed"},{"name":"pi","ok":true,"detail":"not installed"}]}`, looked for again. For each built-in agent: what `--version` says, a failed check when it fails, and how the recipe runs it; for Claude and Codex also whether they're logged in, which Pi can't say without a provider named. One that isn't installed says `not installed`, a failed check only when the config names it or no agent can answer. For a command of yours: whether its program is found. And whether a configured name names an agent. |
+| `doctor` | `{"checks":[{"name":"claude","ok":true,"detail":"2.1.329 (Claude Code)","brief":"2.1.329"},{"name":"claude recipe","ok":true,"detail":"read-only: Read, Grep and Glob only, MCP tools denied, user settings only","brief":"read-only: Read, Grep, Glob"},{"name":"claude auth","ok":true,"detail":"logged in"},{"name":"codex","ok":true,"info":true,"detail":"not installed"},{"name":"pi","ok":true,"info":true,"detail":"not installed"}]}`, looked for again. For each built-in agent: what `--version` says, a failed check when it fails, and how the recipe runs it, a failed check (`doesn't know --ephemeral: upgrade codex`) when the CLI's `--help` for the recipe's command (`codex exec --help`) doesn't list one of its flags, as every ask would then fail; help that can't be read passes. For Claude and Codex also whether they're logged in, which Pi can't say without a provider named. A check's name starts with its agent's, so `dffy doctor` folds them into one row per agent, each by its `brief` when it has one: `claude  2.1.329 · read-only: Read, Grep, Glob · logged in`. One that isn't installed says `not installed`, a note (`"info":true`, `·` in `dffy doctor`), and a failed check only when the config names it or no agent can answer. For a command of yours: whether its program is found. And whether a configured name names an agent: a name only Fix with agent starts, as `amp`, passes with a row saying so and where asks go instead (`amp is used for Fix with agent only; asks go to claude`), and fails while it isn't installed. The agents are probed side by side, each probe for 2 seconds at most: one that takes longer is killed, and its row fails saying so (`` `claude --version` didn't answer in 2s ``). dffy waits 3 seconds for the whole answer. |
 
 **Errors.** As JSON-RPC errors whose message is for the user:
 
@@ -550,8 +553,26 @@ The protocol is experimental, and changes in place as the review protocol does.
 | `2` | The agent failed and isn't logged in; the message says how to log in, with `claude auth login`, `codex login` or `pi auth login <provider>`. |
 | `3` | The agent can't run: it isn't installed. |
 
-`crates/dffy/tests/fixtures/agent-protocol/messages.json` holds a request and its answer for each, and dffy-agent's tests hold the plugin to them.
+`crates/dffy/tests/fixtures/agent-protocol/messages.json` holds a request and its answer for each, and dffy-agent's tests hold the plugin to them. The programs it names are under `@BIN@`, which each side's tests replace with a directory of their own.
+
+#### Handoffs
+
+```json
+{"name":"claude","program":"/usr/local/bin/claude","args":["{prompt}"]}
+{"name":"amp","program":"/usr/local/bin/amp","args":[],"prompt":"clipboard"}
+```
+
+How a thread is handed to an agent for Fix with agent: started as you'd start it, in its normal interactive mode with none of a recipe's flags, in a terminal tab at the working tree or in dffy's own terminal. The plugin lists those found on `PATH`, in the order of its preference; dffy runs the one the config's `agent` names, else the first, and refuses a name that isn't listed. A command of yours in `agent` takes no thread, so the first is run then.
+
+| Field | Meaning |
+|---|---|
+| `name` | The agent, lowercase letters, digits, `-` and `_`. It may be one no ask goes to, as `amp`. |
+| `program` | Its program, by an absolute path. |
+| `args` | Its arguments, as text. One that's exactly `{prompt}` is replaced by the thread's prompt, one line pointing at the thread ([viewer.md](viewer.md#fixing-with-an-agent)). |
+| `prompt` | Optional: `clipboard` for an agent that takes its first message only from you: dffy puts the prompt on the clipboard for you to paste, and its `args` have no `{prompt}`. Without it, `args` must have one. |
+
+dffy refuses an `initialize` whose handoffs break these, saying why.
 
 **Compatibility.** `initialize` names the protocol both ways, and dffy-agent refuses another, saying which it speaks. Both sides ignore fields they don't know, and a request the plugin doesn't have answers `-32601`.
 
-**What dffy does with it.** The viewer asks on `a` or a comment of yours starting `@<name>` ([viewer.md](viewer.md#asking-an-agent)), always naming a listed agent: for `a`, the one whose answer ends the thread, else the default. It writes an answer as a reply in the thread through the comments file's one write: authored by the agent's `name`, with the answer's `suggestion`, and the agent's `mark` as its `label` ([comments.md](comments.md#the-file-version-1)); a reply with an author isn't posted until you adopt it, and neither is your comment that asked, a mention or a question, which is kept [local only](comments.md#drafts). An answer that comes while a review's post runs is written once the post ends. The `initialize` answer isn't cached, so an agent installed since shows. As the viewer quits it cancels the asks running, sends `shutdown` and `exit`, waits up to half a second for the plugin to exit, then kills its process group. `dffy doctor` lists the plugin's checks.
+**What dffy does with it.** The viewer asks on `a` or a comment of yours starting `@<name>` ([viewer.md](viewer.md#asking-an-agent)), always naming a listed agent: for `a`, the one whose answer ends the thread, else the default. It writes an answer as a reply in the thread through the comments file's one write: authored by the agent's `name`, with the answer's `suggestion`, and the agent's `mark` as its `label` ([comments.md](comments.md#the-file-version-1)); a reply with an author isn't posted until you adopt it, and neither is your comment that asked, a mention or a question, which is kept [local only](comments.md#drafts). An answer that comes while a review's post runs is written once the post ends. The `initialize` answer isn't cached, so an agent installed since shows. On an ask or Fix with agent, it starts the plugin if it isn't running, waits for its `initialize` without holding the viewer, saying `starting dffy-agent…` meanwhile, then sends the ask or starts the handoff it picked; an `initialize` that doesn't answer in 2 seconds is said in the status bar, and the ask ends, or the thread isn't handed to anything. As the viewer quits it cancels the asks running, sends `shutdown` and `exit`, waits up to half a second for the plugin to exit, then kills its process group. `dffy doctor` lists the plugin's checks.

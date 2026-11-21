@@ -40,12 +40,12 @@ use dffy_core::bstr::{BString, ByteSlice};
 use dffy_core::conflict::Choices;
 use dffy_core::diff::Options;
 use dffy_core::git::{
-    Applied, ChangeSet, DiffSpec, Edit, FileChange, FileDiff, NewSide, Picked, Repo, Revisions,
-    Side, Update,
+    Applied, ChangeSet, Checkpoint, DiffSpec, Edit, FileChange, FileDiff, NewSide, Picked, Repo,
+    Revisions, Side, Update,
 };
 use dffy_core::watch::{Change, Notice, Plain, Root, Watcher};
 
-pub(crate) use app::{Action, App, Checkout, Handoff, Suggestion, Uncommitted};
+pub(crate) use app::{Action, App, Checkout, Handed, Handoff, Suggestion, Uncommitted};
 pub(crate) use worker::Done;
 
 use crate::daemon::client::{self, Subscription};
@@ -87,6 +87,17 @@ pub(crate) enum Event {
     /// The branch comments are written on now, as read when git's state
     /// changed: HEAD moved to another, or detached (`None`).
     Branch(Option<String>),
+    /// HEAD's commit, read then too, when it moved.
+    Head(Option<String>),
+    /// The working tree's latest checkpoint, read after the list and on
+    /// each rescan, when it changed.
+    Checkpoint(Option<Checkpoint>),
+    /// A checkpoint was taken, by hand or as a Fix with agent `handoff`
+    /// started, or why not.
+    Checkpointed {
+        taken: Result<Checkpoint, String>,
+        handoff: bool,
+    },
     /// Lines were staged, unstaged or discarded, or a file added, as the
     /// note says, or why not.
     Edited(Result<String, String>),
@@ -141,9 +152,26 @@ pub(crate) enum Event {
     /// anchor is left out when the diff shown doesn't have the new lines:
     /// HEAD's version of the file, which the write didn't change.
     Applied(Result<dffy_core::annotation::Applied, String>),
-    /// The coding agent a thread was handed to started, as the note says,
-    /// or why not.
-    HandedOff(Result<String, String>),
+    /// The agent plugin said which agent takes a thread and how to start
+    /// it, or why none: on `seed`, the thread's prompt, in `dir`, the
+    /// working tree; `open` your open threads, how many and how many more
+    /// stay in the other comments file.
+    Handoff {
+        seed: String,
+        dir: PathBuf,
+        to: Result<agent::Handoff, String>,
+        open: Option<(usize, usize)>,
+    },
+    /// The agent plugin hasn't initialized, so a thread handed to it waits
+    /// for it.
+    AgentStarting,
+    /// The coding agent threads were handed to started, as the note says,
+    /// or why not; `left`, when it was handed your open threads, how many
+    /// stay in the other comments file.
+    HandedOff {
+        started: Result<String, String>,
+        left: Option<usize>,
+    },
     /// Nothing happened before the app's deadline.
     Tick,
 }
@@ -155,6 +183,16 @@ const BATCH_TIME: Duration = Duration::from_millis(8);
 /// Why a git operation on the working tree can't run.
 const NO_WORKTREE: &str = "there's no working tree to change";
 
+/// A checkpoint of `repo`'s working tree, taken now, as the event that
+/// says so.
+fn checkpoint(repo: Option<&Repo>, handoff: bool) -> Event {
+    let taken = repo.map_or_else(
+        || Err(NO_WORKTREE.to_owned()),
+        |repo| repo.take_checkpoint().map_err(|e| e.to_string()),
+    );
+    Event::Checkpointed { taken, handoff }
+}
+
 /// Why the working tree isn't for changing on `checkout`'s behalf: HEAD
 /// isn't the review's head, so its changes aren't what's there.
 fn checked_out(repo: &Repo, checkout: Option<&Checkout>) -> Result<(), String> {
@@ -165,10 +203,11 @@ fn checked_out(repo: &Repo, checkout: Option<&Checkout>) -> Result<(), String> {
     if head.is_ok_and(|head| head == checkout.head) {
         return Ok(());
     }
-    Err(format!(
-        "check out {} first: HEAD isn't its head",
-        checkout.label
-    ))
+    // The plugin's command is its words: escaped where it's drawn.
+    Err(match &checkout.command {
+        Some(command) => format!("check out {} first: {command}", checkout.label),
+        None => format!("check out {} first: HEAD isn't its head", checkout.label),
+    })
 }
 
 /// Puts `s` in place of its lines in the working tree, once HEAD is its
@@ -294,7 +333,24 @@ pub(crate) fn run(
             repository: shared.to_owned(),
             diff: description.clone(),
         });
-    let uncommitted = uncommitted(&plan.spec, &revisions, plan.reverse);
+    // Started since a checkpoint, `'` goes to plain `dffy`'s diff, whose
+    // lines stage unless it's reversed.
+    let back = revisions.since_checkpoint.map(|_| {
+        let whole = Revisions {
+            unstaged: ctx.config.default_diff == crate::config::DefaultDiff::Unstaged,
+            ..Revisions::default()
+        };
+        let staged = (!plan.reverse).then_some(if whole.unstaged {
+            Uncommitted::Unstaged
+        } else {
+            Uncommitted::Plain
+        });
+        (crate::describe(&whole, plan.reverse), whole, staged)
+    });
+    let uncommitted = match &back {
+        Some((.., staged)) => *staged,
+        None => uncommitted(&plan.spec, &revisions, plan.reverse),
+    };
     let mut set = ChangeSet::new(plan.repo, plan.spec, revisions, &plan.paths, plan.reverse);
     if ctx.config.renames {
         set = set.with_renames(ctx.cache.clone());
@@ -353,6 +409,9 @@ pub(crate) fn run(
     }
     app.set_selected(selected, ctx.config.default_diff);
     app.set_uncommitted(uncommitted);
+    if let Some((description, whole, _)) = back {
+        app.start_since_checkpoint(whole, description);
+    }
     app.set_repository(
         repo.workdir()
             .and_then(Path::file_name)
@@ -498,7 +557,10 @@ fn uncommitted(spec: &DiffSpec, revisions: &Revisions, reverse: bool) -> Option<
         DiffSpec::Uncommitted { .. } => Some(Uncommitted::Plain),
         DiffSpec::IndexToWorktree { .. } => Some(Uncommitted::Unstaged),
         DiffSpec::TreeToIndex { .. } => Some(Uncommitted::Staged),
-        DiffSpec::TreeToWorktree { .. } | DiffSpec::TreeToTree { .. } | DiffSpec::Paths => None,
+        DiffSpec::TreeToWorktree { .. }
+        | DiffSpec::TreeToTree { .. }
+        | DiffSpec::Paths
+        | DiffSpec::Checkpoint { .. } => None,
     }
 }
 
@@ -991,6 +1053,7 @@ impl Session<'_> {
             if let Some(path) = comments {
                 // HEAD is read here, after the first frame, once.
                 app.set_branch(self.files.as_ref().and_then(crate::review::current_branch));
+                app.set_head(self.files.as_ref().and_then(crate::review::head_commit));
                 let files = app.comment_files(path.clone());
                 app.set_comments(path);
                 self.watching = watch_comments(files, self.events.clone());
@@ -1006,9 +1069,9 @@ impl Session<'_> {
     /// What the app left for the loop once a frame is out: work for the
     /// pool, settings to remember, whether you're idle, for the review
     /// plugin, and asks for the agent plugin.
-    fn hand_off(&mut self, app: &mut App) -> io::Result<()> {
+    fn hand_off(&mut self, app: &mut App) {
         if let Some(handoff) = app.take_handoff() {
-            self.hand_to_agent(app, &handoff)?;
+            self.hand_to_agent(&handoff);
         }
         let (asks, stops) = app.take_agent_work();
         for id in stops {
@@ -1034,9 +1097,12 @@ impl Session<'_> {
         if let (Some(idle), Some(plugin)) = (app.take_idle(), &self.plugin) {
             plugin.idle(idle);
         }
-        Ok(())
     }
 
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the loop: an arm per event or action the viewer hands it"
+    )]
     fn run(&mut self, app: &mut App, rx: &mpsc::Receiver<Event>) -> io::Result<()> {
         loop {
             // Before the frame, which then says where it went.
@@ -1054,7 +1120,7 @@ impl Session<'_> {
                 // before the loop waits.
                 continue;
             }
-            self.hand_off(app)?;
+            self.hand_off(app);
             let first = match app.deadline() {
                 Some(at) => match rx.recv_timeout(at.saturating_duration_since(Instant::now())) {
                     Ok(event) => event,
@@ -1094,13 +1160,19 @@ impl Session<'_> {
                             self.detect = Some(app.detect_review(described.program.name));
                         }
                     }
-                    Event::Described(None) => {}
+                    Event::Handoff {
+                        seed,
+                        dir,
+                        to,
+                        open,
+                    } => self.start_agent(app, (&seed, open), &dir, to)?,
                     event => match app.event(event) {
                         Some(Action::Quit) => return self.quit(app, rx),
                         Some(Action::Edit { path, line }) => self.edit(app, &path, line)?,
                         Some(Action::Compose(text)) => self.compose(app, &text)?,
                         Some(Action::Browse(url)) => browse(app, &url),
                         Some(Action::OpenTerminal) => self.open_terminal(app),
+                        Some(Action::TakeCheckpoint) => self.take_checkpoint(),
                         Some(Action::Review { id, request }) => self.request(id, &request),
                         Some(Action::Retarget {
                             revisions,
@@ -1460,33 +1532,47 @@ impl Session<'_> {
         }
     }
 
-    /// Starts the user's coding agent on `handoff`'s thread, as they'd run
-    /// it, with none of dffy's flags: in a new tab of their terminal, or
-    /// where it can't open one running a program, here, the viewer
-    /// suspended until the agent exits, as for the editor.
-    fn hand_to_agent(&self, app: &mut App, handoff: &Handoff) -> io::Result<()> {
+    /// Takes a checkpoint on a thread of its own; it comes back as
+    /// [`Event::Checkpointed`].
+    fn take_checkpoint(&self) {
+        let repo = self.files.as_ref().map(Repo::without_object_cache);
+        let events = self.events.clone();
+        let started = std::thread::Builder::new()
+            .name("dffy-checkpoint".into())
+            .spawn(move || events.send(checkpoint(repo.as_ref(), false)).ok());
+        if let Err(e) = started {
+            let taken = Err(format!("couldn't take a checkpoint: {e}"));
+            let event = Event::Checkpointed {
+                taken,
+                handoff: false,
+            };
+            self.events.send(event).ok();
+        }
+    }
+
+    /// Hands `handoff`'s thread to the user's coding agent, which the
+    /// agent plugin names and says how to start: once it has, the loop
+    /// starts it from [`Event::Handoff`].
+    fn hand_to_agent(&mut self, handoff: &Handoff) {
         // Through the channel: the frame is out, and the loop waits next.
-        let refuse = |why: String| {
-            self.events.send(Event::HandedOff(Err(why))).ok();
-            Ok(())
+        let open = match handoff.what {
+            Handed::Thread(_) => None,
+            Handed::Open { count, left } => Some((count, left)),
+        };
+        let refuse = |events: &mpsc::Sender<Event>, why: String| {
+            let started = Err(why);
+            let left = open.map(|(_, left)| left);
+            events.send(Event::HandedOff { started, left }).ok();
         };
         let Some((repo, root)) = (self.files.as_ref()).and_then(|r| Some((r, r.workdir()?))) else {
-            return refuse("there's no working tree for an agent to change".to_owned());
+            return refuse(
+                &self.events,
+                "there's no working tree for an agent to change".to_owned(),
+            );
         };
         if let Err(why) = checked_out(repo, handoff.checkout.as_ref()) {
-            return refuse(why);
+            return refuse(&self.events, why);
         }
-        let find = |name: &str| crate::plugin::find("", name).map(|p| p.path);
-        let config = self.agent_config.as_deref();
-        let (name, program) = match agent::interactive(config, find) {
-            Ok(picked) => picked,
-            Err(why) => return refuse(why),
-        };
-        let custom = if config.is_some_and(|c| c != name) {
-            " · the agent setting is a command of yours, which takes no thread"
-        } else {
-            ""
-        };
         let local = crate::review::local_file(repo).ok().flatten();
         let local = local.map(|l| std::path::absolute(&l).unwrap_or(l));
         let kept = if handoff.session {
@@ -1496,51 +1582,128 @@ impl Session<'_> {
         } else {
             prompt::Kept::File(&handoff.file)
         };
-        let seed = prompt::handoff(&handoff.thread, kept);
-        let mut command: Vec<OsString> = vec![program.into_os_string()];
-        let paste = if agent::takes_prompt(name) {
-            command.push(seed.into());
-            ""
+        let seed = match &handoff.what {
+            Handed::Thread(root) => prompt::handoff(root, kept),
+            Handed::Open { .. } => prompt::open_handoff(kept),
+        };
+        let dir = std::path::absolute(root).unwrap_or_else(|_| root.to_owned());
+        let (config, events) = (self.agent_config.clone(), self.events.clone());
+        match self.agent() {
+            Ok(plugin) => {
+                // Before the handoff can come, so it can't be said after.
+                if !plugin.ready() {
+                    events.send(Event::AgentStarting).ok();
+                }
+                plugin.on_handoff(config, move |to| {
+                    let handoff = Event::Handoff {
+                        seed,
+                        dir,
+                        to,
+                        open,
+                    };
+                    events.send(handoff).ok();
+                });
+            }
+            Err(agent::Said::Answered(Err(why))) => refuse(&events, why),
+            Err(_) => refuse(
+                &events,
+                format!(
+                    "{} isn't on PATH, so no agent can take {} (see docs/plugins.md)",
+                    agent::PROGRAM,
+                    if open.is_some() {
+                        "the threads"
+                    } else {
+                        "the thread"
+                    }
+                ),
+            ),
+        }
+    }
+
+    /// Starts the agent `to` says on `seed`, the threads' prompt, as the
+    /// user would run it, with none of dffy's flags: in a new tab of their
+    /// terminal at `dir`, the working tree, or where it can't open one
+    /// running a program, here, the viewer suspended until the agent exits,
+    /// as for the editor. `open`, when `seed` points to your open threads,
+    /// is how many, and how many stay in the other comments file.
+    fn start_agent(
+        &self,
+        app: &mut App,
+        (seed, open): (&str, Option<(usize, usize)>),
+        dir: &Path,
+        to: Result<agent::Handoff, String>,
+    ) -> io::Result<()> {
+        let handoff = match to {
+            Ok(handoff) => handoff,
+            Err(why) => {
+                app.handed_off(Err(why), open.map(|(_, left)| left));
+                return Ok(());
+            }
+        };
+        let custom = if (self.agent_config.as_deref()).is_some_and(|c| c != handoff.name) {
+            " · the agent setting is a command of yours, which takes no thread"
         } else {
-            // Its first message comes from the user: the seed is pasted.
+            ""
+        };
+        let command = handoff.command(seed);
+        let paste = if handoff.clipboard {
             self.copy(app, seed.as_bytes(), String::new())?;
             " · its first message is on the clipboard to paste"
+        } else {
+            ""
         };
         let note = format!("{paste}{custom}");
-        let dir = std::path::absolute(root).unwrap_or_else(|_| root.to_owned());
+        let name = handoff.name;
         let macos = cfg!(target_os = "macos");
-        let opener = crate::terminal::opener(|var| std::env::var_os(var), macos, &dir, &command);
+        let opener = crate::terminal::opener(|var| std::env::var_os(var), macos, dir, &command);
+        // Taken before the agent starts, so its first edits are after it.
+        let repo = self.files.as_ref().map(Repo::without_object_cache);
         let opener = match opener {
             Ok(opener) => opener,
-            Err(why) => return self.agent_here(app, (name, &command), &dir, (&why, &note)),
+            Err(why) => {
+                // The viewer gives the agent the terminal next, and draws
+                // nothing until it exits.
+                self.events.send(checkpoint(repo.as_ref(), true)).ok();
+                return self.agent_here(app, (&name, &command), dir, (&why, &note));
+            }
         };
         let events = self.events.clone();
         let started = std::thread::Builder::new()
             .name("dffy-terminal".into())
-            .spawn(move || {
-                let program = Path::new(&opener.program)
-                    .file_name()
-                    .unwrap_or(&opener.program)
-                    .to_string_lossy()
-                    .into_owned();
-                let status = Command::new(&opener.program)
-                    .args(&opener.args)
-                    .stdin(std::process::Stdio::null())
-                    .stdout(std::process::Stdio::null())
-                    .stderr(std::process::Stdio::null())
-                    .process_group(0)
-                    .status();
-                let started = match status {
-                    Ok(status) if status.success() => {
-                        Ok(format!("started {name} in {}{note}", opener.opens))
-                    }
-                    Ok(status) => Err(format!("{program} failed ({status})")),
-                    Err(e) => Err(format!("couldn't run {program}: {e}")),
-                };
-                events.send(Event::HandedOff(started)).ok();
+            .spawn({
+                let name = name.clone();
+                move || {
+                    events.send(checkpoint(repo.as_ref(), true)).ok();
+                    let program = Path::new(&opener.program)
+                        .file_name()
+                        .unwrap_or(&opener.program)
+                        .to_string_lossy()
+                        .into_owned();
+                    let status = Command::new(&opener.program)
+                        .args(&opener.args)
+                        .stdin(std::process::Stdio::null())
+                        .stdout(std::process::Stdio::null())
+                        .stderr(std::process::Stdio::null())
+                        .process_group(0)
+                        .status();
+                    let started = match (status, open) {
+                        (Ok(status), Some((count, _))) if status.success() => {
+                            let s = if count == 1 { "" } else { "s" };
+                            Ok(format!("sent {count} thread{s} to {name}{note}"))
+                        }
+                        (Ok(status), None) if status.success() => {
+                            Ok(format!("started {name} in {}{note}", opener.opens))
+                        }
+                        (Ok(status), _) => Err(format!("{program} failed ({status})")),
+                        (Err(e), _) => Err(format!("couldn't run {program}: {e}")),
+                    };
+                    let left = open.map(|(_, left)| left);
+                    events.send(Event::HandedOff { started, left }).ok();
+                }
             });
         if let Err(e) = started {
-            return refuse(format!("couldn't start {name}: {e}"));
+            let left = open.map(|(_, left)| left);
+            app.handed_off(Err(format!("couldn't start {name}: {e}")), left);
         }
         Ok(())
     }
@@ -1557,7 +1720,12 @@ impl Session<'_> {
     ) -> io::Result<()> {
         let Some(reader) = &self.reader else {
             let why = format!("{why}, and there's no terminal to run {name} on here");
-            self.events.send(Event::HandedOff(Err(why))).ok();
+            let started = Err(why);
+            let handed = Event::HandedOff {
+                started,
+                left: None,
+            };
+            self.events.send(handed).ok();
             return Ok(());
         };
         // All three on the terminal: dffy's stdout may be piped.
@@ -1664,6 +1832,9 @@ impl Session<'_> {
         let sink = self.events.clone();
         match self.agent() {
             Ok(plugin) => {
+                if !plugin.ready() {
+                    sink.send(Event::AgentStarting).ok();
+                }
                 let run = plugin.request(request, move |said| {
                     sink.send(Event::Agent { id, said }).ok();
                 });
@@ -1929,12 +2100,22 @@ mod tests {
         let review = |head: &str| Checkout {
             label: "PR #7".to_owned(),
             head: head.to_owned(),
+            command: None,
         };
         assert_eq!(checked_out(&repo, None), Ok(()));
         assert_eq!(checked_out(&repo, Some(&review(&head))), Ok(()));
         assert_eq!(
             checked_out(&repo, Some(&review(&"0".repeat(40)))),
             Err("check out PR #7 first: HEAD isn't its head".to_owned())
+        );
+        // The plugin's command, when it gives one, says how.
+        let elsewhere = Checkout {
+            command: Some("gh pr checkout 7".to_owned()),
+            ..review(&"0".repeat(40))
+        };
+        assert_eq!(
+            checked_out(&repo, Some(&elsewhere)),
+            Err("check out PR #7 first: gh pr checkout 7".to_owned())
         );
     }
 
@@ -1985,6 +2166,7 @@ mod tests {
             checkout: Some(Checkout {
                 label: "PR #7".to_owned(),
                 head: head.to_owned(),
+                command: None,
             }),
             thread: "t".to_owned(),
             comment: "t".to_owned(),

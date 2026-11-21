@@ -5,6 +5,7 @@
 //! stream in path order and stop early.
 
 mod changes;
+mod checkpoint;
 mod conflict;
 mod paths;
 mod rename;
@@ -25,6 +26,7 @@ use std::sync::Arc;
 use gix::bstr::{BStr, BString, ByteSlice};
 
 pub use changes::{ChangeSet, Update};
+pub use checkpoint::{Checkpoint, KEPT_CHECKPOINTS, WhichCheckpoint};
 pub use gix::ObjectId;
 pub use paths::{Compare, Endpoint};
 pub use spec::{DiffSpec, Revisions};
@@ -79,6 +81,13 @@ pub enum Error {
         /// Why, in a few words.
         reason: &'static str,
     },
+    /// No checkpoint of the working tree to compare with: none taken, or
+    /// not the one numbered, which pruning may have removed.
+    #[error("{}", match .0 {
+        Some(n) => format!("no checkpoint {n} in this working tree"),
+        None => "no checkpoint in this working tree".to_owned(),
+    })]
+    NoCheckpoint(Option<u64>),
     /// `a...b` or `--merge-base` on commits with no common ancestor.
     #[error("no merge base between {0} and {1}")]
     NoMergeBase(ObjectId, ObjectId),
@@ -239,8 +248,8 @@ pub enum Status {
     /// The file changed between regular file, symlink and submodule.
     TypeChange,
     /// Not in the index and not ignored. Only reported for
-    /// [`DiffSpec::Uncommitted`] and for [`DiffSpec::IndexToWorktree`] with
-    /// `untracked` set.
+    /// [`DiffSpec::Uncommitted`], [`DiffSpec::Checkpoint`] and
+    /// [`DiffSpec::IndexToWorktree`] with `untracked` set.
     Untracked,
     /// Has conflict stages in the index, from a merge, rebase or
     /// cherry-pick that stopped. Reported once in every diff of the index
@@ -615,6 +624,9 @@ impl Repo {
             }
             DiffSpec::Uncommitted { head } => {
                 status::tree_worktree(self, head, index, filter, true, emit)?
+            }
+            DiffSpec::Checkpoint { tree } => {
+                status::checkpoint_worktree(self, tree, index, filter, emit)?
             }
             DiffSpec::TreeToTree { .. } | DiffSpec::Paths => ControlFlow::Continue(()),
         };

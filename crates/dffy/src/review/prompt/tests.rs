@@ -62,9 +62,29 @@ fn a_thread_prompt_holds_its_comments_lines_and_the_changes_near_them() {
     let review = review(THREAD);
     let thread: Vec<&Comment> = review.comments.iter().collect();
     let diff = diff(&numbered(|_| false), &numbered(|i| i == 5 || i == 25));
-    let prompt = thread_within(&thread, &on_new(4..6), Some(&diff), MAX_BYTES);
+    let prompt = thread_within(false, &thread, &on_new(4..6), Some(&diff), MAX_BYTES);
     assert!(!prompt.trimmed);
     insta::assert_snapshot!(prompt.text);
+}
+
+/// Off the review's head, the prompt says so after where the thread is,
+/// before anything a cut could take.
+/// Off the review's head, the prompt warns the files on disk differ, right
+/// after where the thread is, and no cut can take the warning.
+#[test]
+fn a_thread_prompt_off_the_reviews_head_says_the_files_differ() {
+    let review = review(THREAD);
+    let thread = [&review.comments[0]];
+    let prompt = thread_within(true, &thread, &At::Lost, None, 1);
+    assert!(
+        prompt.text.starts_with(
+            "A review thread on src/lib.rs:5-6 (the new version of the file), as written.\n\n\
+             The files on disk aren't this review's version (HEAD isn't its head); rely on the \
+             hunks quoted.\n\n"
+        ),
+        "{}",
+        prompt.text
+    );
 }
 
 /// A selection says where it is, and has no thread to answer.
@@ -82,9 +102,9 @@ fn a_thread_whose_lines_are_gone_shows_them_as_written() {
     let review = review(THREAD);
     let thread = [&review.comments[0]];
     let diff = diff(&numbered(|_| false), &numbered(|i| i == 20));
-    let lost = thread_within(&thread, &At::Lost, Some(&diff), MAX_BYTES);
+    let lost = thread_within(false, &thread, &At::Lost, Some(&diff), MAX_BYTES);
     insta::assert_snapshot!(lost.text);
-    let unseen = thread_within(&thread, &At::Lost, None, MAX_BYTES);
+    let unseen = thread_within(false, &thread, &At::Lost, None, MAX_BYTES);
     assert!(
         unseen.text.starts_with(
             "A review thread on src/lib.rs:5-6 (the new version of the file), as written.\n"
@@ -121,11 +141,11 @@ fn trimming_cuts_in_order_and_marks_each_cut() {
     let (review, diff) = long_thread();
     let thread: Vec<&Comment> = review.comments.iter().collect();
     let at = on_new(11..20);
-    let full = thread_within(&thread, &at, Some(&diff), MAX_BYTES).text;
+    let full = thread_within(false, &thread, &at, Some(&diff), MAX_BYTES).text;
     let has = |text: &str, n: usize| text.contains(&format!("+line {n} edited"));
     assert!(has(&full, 3) && has(&full, 40));
 
-    let one = thread_within(&thread, &at, Some(&diff), full.len() - 1);
+    let one = thread_within(false, &thread, &at, Some(&diff), full.len() - 1);
     assert!(one.trimmed);
     assert!(has(&one.text, 3) && !has(&one.text, 40), "{}", one.text);
     assert!(
@@ -137,7 +157,7 @@ fn trimming_cuts_in_order_and_marks_each_cut() {
     // At every cap between, a step is taken only once those before it are.
     let mut windowed_with_replies = false;
     for cap in (1..full.len()).step_by(40) {
-        let text = thread_within(&thread, &at, Some(&diff), cap).text;
+        let text = thread_within(false, &thread, &at, Some(&diff), cap).text;
         let replies_cut = text.contains("reply omitted");
         let lines_cut = text.contains("> 12  line 12 edited\n[…");
         let windowed = has(&text, 21) && !has(&text, 30);
@@ -157,7 +177,7 @@ fn trimming_cuts_in_order_and_marks_each_cut() {
         "a cap cuts the hunk and keeps the replies"
     );
 
-    let least = thread_within(&thread, &at, Some(&diff), 1);
+    let least = thread_within(false, &thread, &at, Some(&diff), 1);
     assert!(least.trimmed);
     insta::assert_snapshot!(least.text);
 }
@@ -178,7 +198,7 @@ fn trimming_keeps_the_latest_exchange() {
     );
     let thread: Vec<&Comment> = review.comments.iter().collect();
     let diff = diff(&numbered(|_| false), &numbered(|i| i == 5));
-    let least = thread_within(&thread, &on_new(4..5), Some(&diff), 1).text;
+    let least = thread_within(false, &thread, &on_new(4..5), Some(&diff), 1).text;
     for kept in ["Is this safe?", "The latest answer.", "And then?"] {
         assert!(least.contains(kept), "{kept}: {least}");
     }
@@ -199,5 +219,26 @@ fn a_handoff_points_to_where_the_thread_is_kept() {
     assert!(
         handoff("c1", Kept::File(Path::new("/tmp/my notes.json")))
             .contains("run dffy --comments '/tmp/my notes.json' comments prompt c1,")
+    );
+}
+
+/// An agent handed every open thread reads them, and replies, in the file
+/// they're kept in.
+#[test]
+fn an_open_threads_handoff_reads_and_replies_where_they_are_kept() {
+    let file = Path::new("/tmp/my notes.json");
+    assert_eq!(
+        [Kept::Local, Kept::Session, Kept::File(file)].map(open_handoff),
+        [
+            "Address the open dffy review threads: run dffy comments prompt --open, change only \
+             what each thread asks, reply in each thread with what you changed (dffy comments \
+             apply --as <you>).",
+            "Address the open dffy review threads: run dffy comments --session prompt --open, \
+             change only what each thread asks, reply in each thread with what you changed (dffy \
+             comments --session apply --as <you>).",
+            "Address the open dffy review threads: run dffy --comments '/tmp/my notes.json' \
+             comments prompt --open, change only what each thread asks, reply in each thread with \
+             what you changed (dffy --comments '/tmp/my notes.json' comments apply --as <you>).",
+        ]
     );
 }

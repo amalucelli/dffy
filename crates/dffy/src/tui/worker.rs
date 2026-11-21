@@ -22,7 +22,9 @@ use dffy_core::cache::Cache;
 use dffy_core::conflict::Choices;
 use dffy_core::diff::{Emphasis, Options};
 use dffy_core::document::{self, BlockId, Counts, File, Matches, Needle, Prepare, SyntaxSlot};
-use dffy_core::git::{ChangeSet, FileChange, FileDiff, Repo, Revisions, Side, StatStore, Status};
+use dffy_core::git::{
+    ChangeSet, FileChange, FileDiff, Repo, Revisions, Side, StatStore, Status, WhichCheckpoint,
+};
 use dffy_core::highlight::{HunkSyntax, Language, Registry};
 use dffy_core::structural::{Structural, Unavailable};
 use dffy_core::view::Spans;
@@ -102,6 +104,12 @@ pub(crate) fn changes(
             // Read again on each rescan, which git's state changing asks for,
             // so a checkout moves the comments shown to its branch.
             let mut branch = crate::review::current_branch(&selected.repo);
+            let mut head = crate::review::head_commit(&selected.repo);
+            let latest = |repo: &Repo| repo.checkpoint(WhichCheckpoint::Latest).ok();
+            let mut checkpoint = latest(&selected.repo);
+            if checkpoint.is_some() && tx.send(Event::Checkpoint(checkpoint)).is_err() {
+                return;
+            }
             while let Ok(first) = rx.recv() {
                 let mut paths = Vec::new();
                 let mut rescan = false;
@@ -123,6 +131,20 @@ pub(crate) fn changes(
                     if now != branch {
                         branch.clone_from(&now);
                         if tx.send(Event::Branch(now)).is_err() {
+                            return;
+                        }
+                    }
+                    let now = crate::review::head_commit(&selected.repo);
+                    if now != head {
+                        head.clone_from(&now);
+                        if tx.send(Event::Head(now)).is_err() {
+                            return;
+                        }
+                    }
+                    let now = latest(&selected.repo);
+                    if now != checkpoint {
+                        checkpoint = now;
+                        if tx.send(Event::Checkpoint(now)).is_err() {
                             return;
                         }
                     }

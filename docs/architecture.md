@@ -46,6 +46,7 @@ Layer 1 is the exception: `highlight` and `structural` store results through `ca
 | `git::status` | The working-tree side: a parallel stat scan of the index in index order, and the untracked walk. |
 | `git::rename` | Rename detection after enumeration, following git's diffcore-rename so pairs and scores match `git diff -M`. |
 | `git::changes` | A diff's file list kept current for watch mode, with the parsed index kept loaded. |
+| `git::checkpoint` | Checkpoints: the working tree as the uncommitted diff lists it, written as a tree from `HEAD`'s with the status scan's changes and the untracked files, in a commit under `refs/worktree/dffy/checkpoints/<n>`, the last 5 kept per worktree. Never the index, `HEAD` or the working tree. Comparing with one is `DiffSpec::Checkpoint`, the status scan against its tree, untracked files then paired with the tree's by path. |
 | `git::conflict` | A conflicted file's conflicts as the index (stages 1 to 3) and the working tree have them, why one can't be resolved by region, and writing a resolution. |
 | `git::paths` | Two files or folders compared outside git, behind the same `Repo` handle. Walks both trees in step; a worker per core stats and compares files, and results come back in path order. |
 | `watch` | The file watcher: inotify and FSEvents backends, coalescing, ignore rules, polling. |
@@ -83,14 +84,15 @@ The `dffy` binary: CLI, printed output, pager mode, the viewer, the MCP server a
 | `terminal` | Which terminal dffy runs in, innermost first, read from the environment alone, and the command that opens a new tab in it at a directory, running the shell or a program (a coding agent a thread is handed to), the directory and each word of the program always arguments of their own; the shell-quoted `cd` copied where there's none. The viewer runs the command. |
 | `tui` | The viewer (submodules below). |
 | `daemon` | `dffyd`: the broker, its client, and the socket protocol; the process also serves `control`'s socket. |
-| `doctor` | `dffy doctor`. |
+| `doctor` | `dffy doctor`: the facts, gathered side by side, judged into checks that `--json` and `--verbose` list one by one and the text report folds into a row per thing. |
+| `agents` | `dffy agents`: the skill it installs where coding agents read skills, and the guide `dffy agents show` prints, naming only what this build has ([agents.md](agents.md)). |
 | `bench` | Entry points for the benchmarks. |
 
 The viewer's submodules, under `tui`:
 
 | Submodule | What it owns |
 |---|---|
-| `app` | State and event handling: input reaches the overlays, the panels and the key tables in a fixed order, and each action is dispatched from here. `app::threads` is the comment threads (the comments file, placing threads, writing comments, the thread's keys, the comments panel), `app::search` the diff's search, `app::mouse` clicks, drags and the right-click menu, `app::command_panel` the leader key's panel, and `app::draw` a frame's chrome and status bar. `app::staging` hands the lines of uncommitted changes to the loop to stage, unstage or discard, asking before a discard. `app::review` is review mode's keys and overlays, the review picker and the post dialog, over `review::session`, whose effects it carries out. A review's update or another review goes through the change-set thread as a new range, the way watch mode's refreshes do. `app::control` carries out the control API's commands, which arrive as `Event::Control`, answers those waiting for a file's diff once it's in, and pushes the events subscribed to. |
+| `app` | State and event handling: input reaches the overlays, the panels and the key tables in a fixed order, and each action is dispatched from here. `app::threads` is the comment threads (the comments file, placing threads, writing comments, the thread's keys, the comments panel), `app::search` the diff's search, `app::mouse` clicks, drags and the right-click menu, `app::command_panel` the leader key's panel, and `app::draw` a frame's chrome and status bar. `app::staging` hands the lines of uncommitted changes to the loop to stage, unstage or discard, asking before a discard. `app::checkpoint` has the loop take a checkpoint, on a thread of its own and before a Fix with agent starts the agent, and switches the list to the changes since the latest and back, as a new range. `app::review` is review mode's keys and overlays, the review picker and the post dialog, over `review::session`, whose effects it carries out. A review's update or another review goes through the change-set thread as a new range, the way watch mode's refreshes do. `app::control` carries out the control API's commands, which arrive as `Event::Control`, answers those waiting for a file's diff once it's in, and pushes the events subscribed to. |
 | `comments` | Drawing comment threads' boxes, and the comments panel over `review::listing`'s list. |
 | `view` | The screen layer over the core's `Document`: rows' heights when wrapping, scrolling and keeping the screen full, opening a file a few rows above its first change, drawing, the overview column, selections and the mouse. The threads of the file shown and the text box are the core's blocks there: `view::Boxes` measures each box by width (folded or not, with the text box in it) for the core and draws it a row at a time, so frames are copied with boxes on screen until an age on one reads differently. It reports what `Document::missing` names for the rows drawn in the last frame. `view::select` is the selections: lines, text in a comment, what's under the pointer, and copies. `view::rendered` turns a renderer's blocks into a rendered `File`. |
 | `worker` | The change-set thread, and the pool that runs diffs, annotation placement, renderings and the core's `File::prepare` steps off the UI thread. `app` turns the screen's `missing()` into the pool's jobs. |
@@ -199,7 +201,6 @@ dffy's own pass, following git 2.43's diffcore-rename:
 
 - **gix:** the object database, packs, refs and revision parsing.
 - **dffy's own:** tree diffs, the status scan and the untracked walk, so they stream in path order and can stop early.
-
 ## Watcher and broker
 
 ### Watcher

@@ -102,6 +102,8 @@ impl App {
                 self.search_status(),
                 (!self.tree.filter().is_empty() || self.tree.commented())
                     .then(|| "filter".to_owned()),
+                // While the conflict's keys come first.
+                self.has_conflicts().then(|| "conflicts".to_owned()),
             ]
             .into_iter()
             .flatten()
@@ -152,7 +154,6 @@ impl App {
                 format!("  {here} in this file · enter goes · esc cancels"),
             )
         });
-        let entries = self.commands.as_ref().map(|_| self.command_entries());
         let chrome = self.chrome();
         let empty = self
             .doc
@@ -247,8 +248,8 @@ impl App {
             };
             draw_picker(grid, picker, &self.doc, progress, picker_top, &self.theme);
         }
-        if let (Some(commands), Some(entries)) = (&mut self.commands, entries) {
-            commands.draw(grid, &self.theme, &entries);
+        if let Some(commands) = &mut self.commands {
+            commands.draw(grid, &self.theme, &self.keys);
         }
         if let Some(help) = &mut self.help {
             help.draw(grid, &self.theme, &self.keys);
@@ -418,7 +419,7 @@ fn chip(app: &App) -> String {
         Some(c) if doc.document.commits().len() > 1 || app.piped => {
             format!("commit {}/{}{growing}", c + 1, doc.document.commits().len())
         }
-        _ => app.description.clone(),
+        _ => (app.checkpoint_chip()).unwrap_or_else(|| app.description.clone()),
     }
 }
 
@@ -568,17 +569,18 @@ pub(super) fn note(app: &mut App) -> Option<String> {
         .cloned()
         .or_else(|| {
             if app.doc.writing().is_some() {
-                // A question's keys only, as the box's others may not fit.
+                // A question's keys only, short enough to fit beside the
+                // tree on a 100-column screen.
+                let asks = match app.asks_whom() {
+                    Some(agent) => format!("enter asks {agent}"),
+                    None => "enter asks".to_owned(),
+                };
                 return Some(match (app.on_save, &app.composing) {
-                    (OnSave::Ask, Some(super::Compose::Reply(_))) => format!(
-                        "enter asks {} · empty asks about the thread · esc saves, unasked",
-                        app.asks_whom()
-                    ),
-                    (OnSave::Ask, _) => {
-                        format!("enter asks {} · esc saves, unasked", app.asks_whom())
+                    (OnSave::Ask, Some(super::Compose::Reply(_))) => {
+                        format!("{asks} · empty asks now · esc keeps it")
                     }
-                    _ => "enter sends · shift+enter new line · ctrl+g continues in $EDITOR"
-                        .to_owned(),
+                    (OnSave::Ask, _) => format!("{asks} · esc keeps it"),
+                    _ => "enter saves · alt+enter new line · esc keeps it".to_owned(),
                 });
             }
             let panel = app.panel.as_ref().filter(|_| app.pane == Pane::Tree);
@@ -598,15 +600,25 @@ pub(super) fn note(app: &mut App) -> Option<String> {
                 });
             }
             let drafts = thread.comments.iter().any(|n| !n.posted());
+            let open = !matches!(thread.at, model::At::Conversation { .. });
             let resolve = if thread.resolved { "reopen" } else { "resolve" };
+            let reverts = thread.reverts();
+            let apply = if reverts { "revert" } else { "apply" };
+            // Most used first, as a narrow status bar cuts the end.
             let thread_keys = [
-                (Act::Reply, "reply", true),
+                (Act::Reply, "reply", open),
+                (Act::AskAgent, "ask", open),
+                (
+                    Act::ApplySuggestion,
+                    apply,
+                    open && thread.suggestion().is_some(),
+                ),
+                (Act::Resolve, resolve, open),
+                (Act::FixWithAgent, "fix", open),
                 (Act::EditDraft, "edit", drafts),
                 (Act::DeleteDraft, "delete", drafts),
-                (Act::Resolve, resolve, true),
                 (Act::OpenOnHost, "open", thread.url.is_some()),
                 (Act::Adopt, "make it yours", thread.unposted()),
-                (Act::ApplySuggestion, "apply", thread.suggests()),
             ];
             let mut keys: Vec<String> = (thread_keys.into_iter())
                 .filter(|&(.., shown)| shown)
@@ -618,21 +630,6 @@ pub(super) fn note(app: &mut App) -> Option<String> {
                 .key_for(false, Act::MoveThread)
                 .map(|key| format!("{key} move here"));
             keys.extend(move_here.filter(|_| thread.branch.is_some()));
-            // In the panel `esc` goes to the diff, and the thread may not be
-            // in it to fold.
-            if panel.is_some() {
-                return Some(keys.join(" · "));
-            }
-            let fold = if app.doc.fold().collapsed(&thread.root) {
-                "unfold"
-            } else {
-                "fold"
-            };
-            keys.extend(
-                app.key_for(false, Act::ToggleThread)
-                    .map(|key| format!("{key} {fold}")),
-            );
-            keys.push("esc".to_owned());
             Some(keys.join(" · "))
         })
         .or_else(|| {
@@ -698,8 +695,9 @@ fn noted_ask(app: &App) -> Option<&str> {
 }
 
 /// The status bar's key hints for the focused pane, longest first:
-/// `/ search · tab tree · space commands` with the diff focused, `/ filter ·
-/// tab diff · space commands` with the tree; then without the pane switch;
+/// `/ search · tab tree · space commands` with the diff focused (`tab
+/// comments` while the left panel shows them), `/ filter · tab diff ·
+/// space commands` with the tree; then without the pane switch;
 /// then the menu alone. Each key is the first one that runs its action
 /// where the focus is, and a part whose action has none is left out. On a
 /// narrow screen `space` shows as `␣`.
@@ -713,13 +711,16 @@ fn hints(app: &App, narrow: bool) -> [Option<String>; 3] {
             .map(crate::keys::Chord::name)
     };
     let (find, other) = if tree && app.panel.is_some() {
-        let search = key(Act::FilterTree).map(|k| format!("{k} search · "));
-        (
-            Some(format!("{}f filter", search.unwrap_or_default())),
-            "diff",
-        )
+        let parts = [
+            key(Act::FilterTree).map(|k| format!("{k} search")),
+            key(Act::CommentedFiles).map(|k| format!("{k} filter")),
+        ];
+        let parts: Vec<String> = parts.into_iter().flatten().collect();
+        ((!parts.is_empty()).then(|| parts.join(" · ")), "diff")
     } else if tree {
         (key(Act::FilterTree).map(|k| format!("{k} filter")), "diff")
+    } else if app.panel.is_some() {
+        (key(Act::Search).map(|k| format!("{k} search")), "comments")
     } else {
         (key(Act::Search).map(|k| format!("{k} search")), "tree")
     };

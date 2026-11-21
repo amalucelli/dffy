@@ -1,7 +1,8 @@
 //! `dffy-agent`, an experimental agent plugin for dffy: it asks a coding
 //! agent you already run (Claude Code, Codex, Pi, or a command of yours)
 //! about a review thread, and hands its answer back for dffy to put in the
-//! thread. dffy runs it in the background, speaking agent protocol 1 on its
+//! thread; and it says how to start each agent you have on a thread, for
+//! dffy's Fix with agent, so dffy names no agent itself. dffy runs it in the background, speaking agent protocol 1 on its
 //! stdin and stdout (see [`server`]); it never prompts or draws, and never
 //! writes a file. The agent reads the worktree and nothing more because of
 //! how it's run, not because the prompt asks (see [`agent`]).

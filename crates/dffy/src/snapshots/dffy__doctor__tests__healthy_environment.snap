@@ -1,21 +1,23 @@
 ---
 source: crates/dffy/src/doctor.rs
-assertion_line: 1250
 expression: text
 ---
-<ok>✓</> git         git version 2.43.0
-<ok>✓</> repository  ~/src/linux · main · 265 staged, 3 unstaged, 4 untracked
-<ok>✓</> watch       67 needed here · 5,259 of 129,194 in use · dffyd holds them already
-<dim>·</> speed       repo 3ms · first change 9ms · all 270 changes 41ms · untracked 18ms · largest diff 2ms (Cargo.lock)
-<ok>✓</> terminal    TERM=xterm-ghostty, COLORTERM=truecolor, TERM_PROGRAM=ghostty, 160 columns
-<ok>✓</> multiplexer tmux; dffy's one query (the background color) falls back to dark if it isn't relayed
-<ok>✓</> copy        tmux passes copies (y, Y) to the terminal: set-clipboard is on
-<ok>✓</> color       on; the default theme uses the 16 ANSI colors, truecolor themes work too
-<ok>✓</> config      /home/u/.config/dffy/config
-<ok>✓</> theme       default
-<ok>✓</> pager       less
-<ok>✓</> cache       /home/u/.cache/dffy: 12.0MB in 40 entries, trimmed at 256.0MB
-<ok>✓</> renderer    .md → markdown: ~/.local/bin/dffy-render-markdown
-<warn>!</> renderer    .csv → csv: dffy-render-csv isn't on PATH
-  <hint>hint:</> install it, or see docs/plugins.md; files of this type show as lines
-<ok>✓</> dffyd       running (pid 4242), 1 root(s), 3 subscriber(s)
+<file-header>dffy 0.1.0+0123abcd</>
+  <ok>✓</> git          git version 2.43.0
+  <ok>✓</> repository   ~/src/linux · main · 265 staged, 3 unstaged, 4 untracked
+  <ok>✓</> watch        67 needed here · 5,259 of 129,194 in use · dffyd holds them already
+  <dim>·</> speed        repo 3ms · first change 9ms · all 270 changes 41ms · untracked 18ms · largest diff 2ms (Cargo.lock)
+  <ok>✓</> dffyd        running (pid 4242), 1 root(s), 3 subscriber(s)
+<file-header>terminal</>
+  <ok>✓</> terminal     TERM=xterm-ghostty, COLORTERM=truecolor, TERM_PROGRAM=ghostty, 160 columns
+  <ok>✓</> multiplexer  tmux; dffy's one query (the background color) falls back to dark if it isn't relayed
+  <ok>✓</> copy         tmux passes copies (y, Y) to the terminal: set-clipboard is on
+  <ok>✓</> color        on; the default theme uses the 16 ANSI colors, truecolor themes work too
+  <ok>✓</> config       /home/u/.config/dffy/config
+  <ok>✓</> theme        default
+  <ok>✓</> pager        less
+  <ok>✓</> cache        /home/u/.cache/dffy: 12.0MB in 40 entries, trimmed at 256.0MB
+<file-header>plugins</>
+  <ok>✓</> renderer     .md → markdown: ~/.local/bin/dffy-render-markdown
+  <warn>!</> renderer     .csv → csv: dffy-render-csv isn't on PATH
+      <hint>hint:</> install it, or see docs/plugins.md; files of this type show as lines

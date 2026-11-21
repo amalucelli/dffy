@@ -2135,6 +2135,24 @@ fn resolving_a_conflict_from_the_viewer() {
     assert!(term.wait_exit().success());
 }
 
+/// Arriving in a file with conflicts to resolve says once which of how
+/// many is on screen and the keys that choose, and the status bar keeps
+/// a `conflicts` word while the cursor is in it.
+#[test]
+fn arriving_in_a_conflicted_file_says_its_keys() {
+    let dir = conflicted("diff3");
+    let d = dir.path();
+    let mut term = Term::spawn(d, 120, 30, &[]);
+    term.wait_for("the keys", |t| {
+        t.status()
+            .contains("conflict 1/2 · o ours · t theirs · b both · w writes")
+    });
+    term.send("j");
+    assert!(term.status().contains("conflicts"), "{}", term.status());
+    term.send("q");
+    assert!(term.wait_exit().success());
+}
+
 /// `w` with conflicts left unchosen asks first, and keeps their markers;
 /// without a base, `a` says why it can't; a file deleted on one side says
 /// which side and how to resolve it instead.
@@ -2218,7 +2236,8 @@ fn conflict_keys_leave_a_search_and_the_way_out_alone() {
     term.send("/SEVEN\r");
     term.wait_for("the search", |t| t.status().contains("1/"));
     term.send("n");
-    assert!(!term.status().contains("conflict"), "{}", term.status());
+    // Only the status bar's `conflicts` says the file has them.
+    assert!(!term.status().contains("conflict "), "{}", term.status());
     term.send("\x1b");
     term.send("n");
     term.wait_for("the first", |t| t.status().contains("conflict 1/2"));
@@ -3698,8 +3717,9 @@ fn whole_files_whitespace_and_watch_are_remembered() {
         term.wait_for("the diffs", |t| t.contains(" +3 -3"));
         term
     };
+    // The panel's View tab, after Here.
     let panel_row = |term: &mut Term, label: &str| {
-        term.send(" ");
+        term.send("  \t");
         let row = (0..40)
             .map(|y| term.row(y))
             .find(|r| r.contains(label))
@@ -4390,7 +4410,7 @@ fn ctl_open_waits_for_the_diff_and_not_under_the_text_box() {
     });
 
     term.send("c");
-    term.wait_for("the text box", |t| t.status().contains("enter sends"));
+    term.wait_for("the text box", |t| t.status().contains("enter saves"));
     let refused = term.ctl(dir, &["open", "f0.txt"]).expect_err("writing");
     assert!(refused.contains("a comment is being written"), "{refused}");
     assert!(term.status().contains(" 10/10"), "{}", term.status());
@@ -4569,6 +4589,47 @@ fn an_applied_suggestions_thread_stays_on_its_new_lines() {
     assert_eq!(
         std::fs::read_to_string(repo.path().join("README.md")).expect("read"),
         "# demo!\n\nMore.\n"
+    );
+    term.send("q");
+    assert!(term.wait_exit().success());
+}
+
+/// `s` on an applied suggestion puts back the lines it replaced, byte for
+/// byte: in a file with CRLF endings, for a suggestion of more lines than
+/// it replaced.
+#[test]
+fn s_takes_an_applied_suggestion_back_in_the_file() {
+    let repo = repo();
+    let d = repo.path();
+    let readme = d.join("README.md");
+    std::fs::write(&readme, "# demo\r\n\r\nMore.\r\n").expect("write");
+    std::fs::create_dir_all(d.join(".git/dffy")).expect("mkdir");
+    std::fs::write(
+        d.join(".git/dffy/comments.json"),
+        r##"{"version":1,"comments":[{"id":"s1","path":"README.md","side":"new","start":{"old":null,"new":1},"end":{"old":null,"new":1},"text":"Split it","suggestion":"# one\n# two","author":"","created":"2026-11-17T10:00:00Z","anchor":{"before":[],"lines":["# demo\r"],"after":["\r","More.\r"]}}]}"##,
+    )
+    .expect("write");
+    let mut term = Term::spawn(d, 120, 30, &[]);
+    term.wait_for("the thread", |t| t.contains("Split it"));
+    term.send("m");
+    term.wait_for("its keys", |t| t.status().contains("s apply"));
+    term.send("s");
+    term.wait_for("the apply", |t| {
+        t.status()
+            .contains("applied the suggestion to README.md:1-2")
+    });
+    assert_eq!(
+        std::fs::read(&readme).expect("read"),
+        b"# one\r\n# two\r\n\r\nMore.\r\n"
+    );
+    term.wait_for("the list read again", |t| t.contains("README.md · +4 -1"));
+    term.send("s");
+    term.wait_for("taken back", |t| {
+        t.status().contains("took the suggestion back")
+    });
+    assert_eq!(
+        std::fs::read(&readme).expect("read"),
+        b"# demo\r\n\r\nMore.\r\n"
     );
     term.send("q");
     assert!(term.wait_exit().success());
@@ -4815,6 +4876,261 @@ fn f_runs_your_agent_on_the_thread_here() {
     assert!(term.wait_exit().success());
 }
 
+/// `f` runs what the agent plugin's `initialize` says to, an agent dffy
+/// has never heard of among them: its program, and its arguments with the
+/// thread's prompt in place of `{prompt}`.
+#[test]
+fn f_runs_the_handoff_the_agent_plugin_describes() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let repo = repo();
+    let bin = tempfile::tempdir().expect("tempdir");
+    let stub = tempfile::tempdir().expect("tempdir");
+    for (name, script) in [
+        (
+            "dffy-agent",
+            include_str!("fixtures/stubs/review-plugin.sh"),
+        ),
+        ("my-tool", include_str!("fixtures/stubs/claude.sh")),
+    ] {
+        let path = bin.path().join(name);
+        std::fs::write(&path, script).expect("write");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    }
+    std::fs::write(
+        bin.path().join("initialize.out"),
+        format!(
+            "{{\"jsonrpc\":\"2.0\",\"id\":@ID@,\"result\":{{\"protocol\":1,\"agents\":[],\"handoffs\":[{{\"name\":\"my-tool\",\"program\":\"{}\",\"args\":[\"--from-dffy\",\"{{prompt}}\"]}}]}}}}\n",
+            bin.path().join("my-tool").display()
+        ),
+    )
+    .expect("write");
+    let path = format!("{}:/usr/bin:/bin", bin.path().display());
+    let stub_dir = stub.path().to_str().expect("utf-8 path");
+    let mut env = vec![("PATH", path.as_str()), ("STUB", stub_dir)];
+    env.extend(NO_TERMINAL);
+    let mut term = Term::spawn(repo.path(), 120, 30, &env);
+    term.wait_for("the diffs", |t| t.contains("More."));
+    term.send("c");
+    term.send("Spell it out");
+    term.send("\x1b");
+    term.wait_for("the thread", |t| t.contains("you · just now"));
+    term.send("f");
+    let args = || std::fs::read_to_string(stub.path().join("args")).unwrap_or_default();
+    term.wait_for("my-tool's run", |_| !args().is_empty());
+    term.send("\x04");
+    term.wait_for("the viewer", |t| t.status().contains("my-tool exited"));
+    let id = first_comment(repo.path());
+    assert!(
+        args().starts_with(&format!("--from-dffy\nAddress dffy review thread {id}: ")),
+        "{}",
+        args()
+    );
+    term.send("q");
+    assert!(term.wait_exit().success());
+}
+
+/// `f` takes a checkpoint before the agent starts, so `'` then shows the
+/// agent's turn alone, `since checkpoint` in the status bar, and `'` again
+/// the whole diff.
+#[test]
+fn f_takes_a_checkpoint_and_apostrophe_shows_the_agents_turn() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let repo = repo();
+    let bin = tempfile::tempdir().expect("tempdir");
+    let stub = tempfile::tempdir().expect("tempdir");
+    for (name, script) in [
+        (
+            "dffy-agent",
+            include_str!("fixtures/stubs/review-plugin.sh"),
+        ),
+        ("agent-turn", include_str!("fixtures/stubs/agent-turn.sh")),
+    ] {
+        let path = bin.path().join(name);
+        std::fs::write(&path, script).expect("write");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    }
+    std::fs::write(
+        bin.path().join("initialize.out"),
+        format!(
+            "{{\"jsonrpc\":\"2.0\",\"id\":@ID@,\"result\":{{\"protocol\":1,\"agents\":[],\"handoffs\":[{{\"name\":\"agent-turn\",\"program\":\"{}\",\"args\":[\"{{prompt}}\"]}}]}}}}\n",
+            bin.path().join("agent-turn").display()
+        ),
+    )
+    .expect("write");
+    let path = format!("{}:/usr/bin:/bin", bin.path().display());
+    let stub_dir = stub.path().to_str().expect("utf-8 path");
+    let mut env = vec![("PATH", path.as_str()), ("STUB", stub_dir)];
+    env.extend(NO_TERMINAL);
+    let mut term = Term::spawn(repo.path(), 120, 30, &env);
+    term.wait_for("the diffs", |t| t.contains("More."));
+    term.send("c");
+    term.send("Spell it out");
+    term.send("\x1b");
+    term.wait_for("the thread", |t| t.contains("you · just now"));
+    term.send("f");
+    term.wait_for("the viewer", |t| t.status().contains("agent-turn exited"));
+    let refs = std::fs::read_to_string(stub.path().join("refs")).unwrap_or_default();
+    assert_eq!(refs, "refs/worktree/dffy/checkpoints/1\n");
+    term.send("'");
+    term.wait_for("the agent's turn", |t| {
+        t.status().contains("since checkpoint · just now") && t.contains("line from the agent")
+    });
+    assert!(
+        !term.contains("README.md"),
+        "README.md changed before the turn"
+    );
+    term.send("'");
+    term.wait_for("the whole diff", |t| t.contains("README.md"));
+    term.send("q");
+    assert!(term.wait_exit().success());
+}
+
+/// Send open threads (`space` then `^`) takes one checkpoint and starts the
+/// agent pointed at every open thread of yours, so `'` then shows its turn.
+#[test]
+fn sending_open_threads_takes_a_checkpoint_and_points_the_agent_at_them() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let repo = repo();
+    let bin = tempfile::tempdir().expect("tempdir");
+    let stub = tempfile::tempdir().expect("tempdir");
+    for (name, script) in [
+        (
+            "dffy-agent",
+            include_str!("fixtures/stubs/review-plugin.sh"),
+        ),
+        ("agent-turn", include_str!("fixtures/stubs/agent-turn.sh")),
+    ] {
+        let path = bin.path().join(name);
+        std::fs::write(&path, script).expect("write");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    }
+    std::fs::write(
+        bin.path().join("initialize.out"),
+        format!(
+            "{{\"jsonrpc\":\"2.0\",\"id\":@ID@,\"result\":{{\"protocol\":1,\"agents\":[],\"handoffs\":[{{\"name\":\"agent-turn\",\"program\":\"{}\",\"args\":[\"{{prompt}}\"]}}]}}}}\n",
+            bin.path().join("agent-turn").display()
+        ),
+    )
+    .expect("write");
+    let path = format!("{}:/usr/bin:/bin", bin.path().display());
+    let stub_dir = stub.path().to_str().expect("utf-8 path");
+    let mut env = vec![("PATH", path.as_str()), ("STUB", stub_dir)];
+    env.extend(NO_TERMINAL);
+    let mut term = Term::spawn(repo.path(), 120, 30, &env);
+    term.wait_for("the diffs", |t| t.contains("More."));
+    term.send("c");
+    term.send("Spell it out");
+    term.send("\x1b");
+    term.wait_for("the thread", |t| t.contains("you · just now"));
+    term.send(" ");
+    term.send("^");
+    term.wait_for("the viewer", |t| t.status().contains("agent-turn exited"));
+    let read = |name: &str| std::fs::read_to_string(stub.path().join(name)).unwrap_or_default();
+    assert_eq!(read("refs"), "refs/worktree/dffy/checkpoints/1\n");
+    assert!(
+        read("prompt")
+            .starts_with("Address the open dffy review threads: run dffy comments prompt --open, "),
+        "{}",
+        read("prompt")
+    );
+    term.send("'");
+    term.wait_for("the agent's turn", |t| {
+        t.status().contains("since checkpoint") && t.contains("line from the agent")
+    });
+    term.send("q");
+    assert!(term.wait_exit().success());
+}
+
+/// `dffy --since-checkpoint` names the checkpoint's age as `'` does, and
+/// `'` goes to plain `dffy`'s diff.
+#[test]
+fn a_viewer_started_since_a_checkpoint_goes_to_the_plain_diff() {
+    let repo = repo();
+    let taken = Command::new(env!("CARGO_BIN_EXE_dffy"))
+        .current_dir(repo.path())
+        .arg("checkpoint")
+        .env("XDG_CONFIG_HOME", repo.path().join(".no-config"))
+        .output()
+        .expect("dffy checkpoint");
+    assert!(taken.status.success(), "{taken:?}");
+    let lib = repo.path().join("src/lib.rs");
+    let mut text = std::fs::read_to_string(&lib).expect("read");
+    text.push_str("line after the checkpoint\n");
+    std::fs::write(&lib, text).expect("write");
+    let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_dffy"));
+    cmd.arg("--since-checkpoint");
+    let mut term = Term::spawn_command(cmd, repo.path(), 120, 30, &[]);
+    term.wait_for("the turn", |t| {
+        t.status().contains("since checkpoint · just now")
+            && t.contains("line after the checkpoint")
+    });
+    assert!(!term.contains("README.md"), "README.md changed before it");
+    term.send("'");
+    term.wait_for("the plain diff", |t| t.contains("README.md"));
+    term.send("q");
+    assert!(term.wait_exit().success());
+}
+
+/// `f` while the agent plugin is starting says so, and when its
+/// `initialize` doesn't answer in time, says that instead of waiting on.
+#[test]
+fn f_says_the_agent_plugin_is_starting_and_when_it_doesnt_answer() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let repo = repo();
+    let bin = tempfile::tempdir().expect("tempdir");
+    let plugin = bin.path().join("dffy-agent");
+    std::fs::write(&plugin, include_str!("fixtures/stubs/review-plugin.sh")).expect("write");
+    std::fs::set_permissions(&plugin, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    stub_agent(bin.path(), &["claude"]);
+    std::fs::write(bin.path().join("initialize.gate"), "").expect("write");
+    let path = format!("{}:/usr/bin:/bin", bin.path().display());
+    let mut term = Term::spawn(repo.path(), 120, 30, &[("PATH", &path)]);
+    term.wait_for("the diffs", |t| t.contains("More."));
+    term.send("c");
+    term.send("Spell it out");
+    term.send("\x1b");
+    term.wait_for("the thread", |t| t.contains("you · just now"));
+    term.send("f");
+    term.wait_for("the start", |t| t.status().contains("starting dffy-agent…"));
+    term.wait_for("the timeout", |t| {
+        t.status()
+            .contains("dffy-agent's initialize didn't answer in 2s")
+    });
+    term.send("q");
+    assert!(term.wait_exit().success());
+}
+
+/// `a` while the agent plugin is starting says so too, and when its
+/// `initialize` doesn't answer in time, the ask ends saying that.
+#[test]
+fn a_says_the_agent_plugin_is_starting_and_when_it_doesnt_answer() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let repo = repo();
+    let bin = tempfile::tempdir().expect("tempdir");
+    let plugin = bin.path().join("dffy-agent");
+    std::fs::write(&plugin, include_str!("fixtures/stubs/review-plugin.sh")).expect("write");
+    std::fs::set_permissions(&plugin, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    stub_agent(bin.path(), &["claude"]);
+    std::fs::write(bin.path().join("initialize.gate"), "").expect("write");
+    let path = format!("{}:/usr/bin:/bin", bin.path().display());
+    let mut term = Term::spawn(repo.path(), 120, 30, &[("PATH", &path)]);
+    term.wait_for("the diffs", |t| t.contains("More."));
+    term.send("c");
+    term.send("Spell it out");
+    term.send("\x1b");
+    term.wait_for("the thread", |t| t.contains("you · just now"));
+    term.send("a");
+    term.send("Why?");
+    term.send("\r");
+    term.wait_for("the start", |t| t.status().contains("starting dffy-agent…"));
+    term.wait_for("the timeout", |t| {
+        t.status()
+            .contains("dffy-agent's initialize didn't answer in 2s")
+    });
+    term.send("q");
+    assert!(term.wait_exit().success());
+}
+
 /// A reply MCP's `reply_to_thread` writes, starting `@claude`, shows in
 /// the viewer by the client's name and asks no agent.
 #[test]
@@ -4867,9 +5183,10 @@ fn a_reply_through_mcp_asks_no_agent() {
     assert!(term.wait_exit().success());
 }
 
-/// `f` with no agent to start says so at once.
+/// `f` without the agent plugin, which says what agents there are and how
+/// they start, says so at once: dffy knows none by itself.
 #[test]
-fn f_without_an_agent_says_so() {
+fn f_without_the_agent_plugin_says_so() {
     let repo = repo();
     let mut term = Term::spawn(repo.path(), 120, 30, &[("PATH", "/usr/bin:/bin")]);
     term.wait_for("the diffs", |t| t.contains("More."));
@@ -4880,7 +5197,7 @@ fn f_without_an_agent_says_so() {
     term.send("f");
     term.wait_for("the refusal", |t| {
         t.status()
-            .contains("none of claude, codex, pi and amp is on PATH")
+            .contains("dffy-agent isn't on PATH, so no agent can take the thread")
     });
     term.send("q");
     assert!(term.wait_exit().success());

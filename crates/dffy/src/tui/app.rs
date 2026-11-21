@@ -14,6 +14,7 @@
 //! instead of the view, `s` picks the side copied, and any other action
 //! ends the selection first.
 
+mod checkpoint;
 mod command_panel;
 mod conflict;
 mod control;
@@ -37,7 +38,7 @@ use dffy_core::bstr::BString;
 use dffy_core::conflict::Choices;
 use dffy_core::diff::Whitespace;
 use dffy_core::document::{File, Missing, Needle, Pos, Render, Side, Source};
-use dffy_core::git::{Edit, FileChange, FileDiff, Picked, Revisions, Status, Update};
+use dffy_core::git::{Checkpoint, Edit, FileChange, FileDiff, Picked, Revisions, Status, Update};
 use dffy_core::highlight::Language;
 use dffy_core::watch::Notice;
 
@@ -45,7 +46,7 @@ use super::chrome::{self};
 use super::commands::Commands;
 use super::comments::{self, Panel, Writes};
 use super::help::Help;
-use super::menu::{self, Menu};
+use super::menu::Menu;
 use super::picker::Picker;
 use super::piped;
 use super::tree::{self, Item, Tree};
@@ -132,6 +133,9 @@ pub(crate) enum Action {
     /// Open a tab in the user's terminal at the working tree's root; what
     /// came of it arrives as [`Event::Terminal`].
     OpenTerminal,
+    /// Take a checkpoint of the working tree; it arrives as
+    /// [`Event::Checkpointed`].
+    TakeCheckpoint,
     /// Ask the review plugin `request`; what it says comes back as
     /// [`Event::Review`] under `id`. A `prepare`, `pull` or `post` cancels
     /// the one before it.
@@ -207,6 +211,9 @@ struct Applying {
     comment: String,
     path: String,
     lines: usize,
+    /// The lines going out, kept on the comment so they can come back;
+    /// `None` when the suggestion is being taken back.
+    replaced: Option<Vec<String>>,
     reply: Option<Reply>,
 }
 
@@ -217,14 +224,25 @@ pub(crate) struct Checkout {
     /// What the review is called, as `PR #7`.
     pub label: String,
     pub head: String,
+    /// The review plugin's command that checks it out, to show.
+    pub command: Option<String>,
 }
 
-/// A thread handed to the user's own coding agent, which the loop starts
+/// What's handed to the user's own coding agent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Handed {
+    /// The thread with this first comment.
+    Thread(String),
+    /// Every open thread of yours in one comments file, `count` of them;
+    /// `left` more of yours are in the other one the viewer reads.
+    Open { count: usize, left: usize },
+}
+
+/// Threads handed to the user's own coding agent, which the loop starts
 /// interactively.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Handoff {
-    /// The thread's first comment.
-    pub thread: String,
+    pub what: Handed,
     /// The comments file it's in.
     pub file: PathBuf,
     /// That file is the review session's.
@@ -509,6 +527,16 @@ pub(crate) struct App {
     /// Threads an update brought, by root, in list order: `m` goes to
     /// them first.
     new_threads: Vec<String>,
+    /// The thread `enter` in the text box just saved, unfocused, and the
+    /// input count then: `m` right after goes to it.
+    just_saved: Option<(String, u64)>,
+    /// The agent plugin was found on PATH, by `find_agent`, looked up for
+    /// each ask until it is.
+    agent_found: bool,
+    find_agent: fn() -> bool,
+    /// The file the cursor was in when a conflicted file's keys were last
+    /// said, so arriving in one says them once.
+    conflicts_said: Option<usize>,
     /// A quit was asked for while a post runs; the next one stops it.
     quit_armed: bool,
     /// The viewer is stopping: what's being written is saved, even while a
@@ -526,6 +554,9 @@ pub(crate) struct App {
     /// The current branch, which new local comments go on; `None` on a
     /// detached HEAD.
     branch: Option<String>,
+    /// HEAD's commit, as last read: a prompt says when it isn't the
+    /// review's head, so the files on disk aren't the review's.
+    head: Option<String>,
     /// The text box opened again after its save failed: `esc` now
     /// discards it.
     save_failed: bool,
@@ -550,6 +581,11 @@ pub(crate) struct App {
     repository: Option<String>,
     /// What the repository's diff selects, to word an empty list.
     selected: Option<(Revisions, DefaultDiff)>,
+    /// The working tree's latest checkpoint, as last read or taken.
+    checkpoint: Option<Checkpoint>,
+    /// While the diff shows what changed since the latest checkpoint, the
+    /// revisions and description it showed before.
+    since_checkpoint: Option<(Revisions, String)>,
     /// The diff the viewer started on is of uncommitted changes, lines of
     /// which can be staged, unstaged and discarded.
     uncommitted: Option<Uncommitted>,
@@ -620,6 +656,8 @@ impl App {
             modified_lines: config.modified_lines == ModifiedLines::Changed,
         };
         let mut doc = Doc::new(placeholder, height);
+        let share = config.keys.thread_chords(Act::Adopt).next();
+        doc.set_share(share.map(|key| format!("{} shares", key.name())));
         doc.document.structural = config.syntax_diff;
         doc.set_rendered_mode(config.rendered);
         doc.set_highlight(config.highlight);
@@ -721,12 +759,17 @@ impl App {
             reviews: None,
             posting: None,
             new_threads: Vec::new(),
+            just_saved: None,
+            agent_found: false,
+            find_agent: || plugin::agent::find().is_some(),
+            conflicts_said: None,
             quit_armed: false,
             leaving: false,
             last_input: Instant::now(),
             inputs: 0,
             discard_asked: None,
             branch: None,
+            head: None,
             save_failed: false,
             switcher: None,
             tree_button: None,
@@ -738,6 +781,8 @@ impl App {
             titled: None,
             repository: None,
             selected: None,
+            checkpoint: None,
+            since_checkpoint: None,
             uncommitted: None,
             confirm: None,
             editing: false,
@@ -792,6 +837,13 @@ impl App {
     /// with, for the words of an empty list.
     pub(crate) fn set_selected(&mut self, revisions: Revisions, default: DefaultDiff) {
         self.selected = Some((revisions, default));
+    }
+
+    /// The viewer started on what changed since a checkpoint: `'` goes to
+    /// `plain`, plain `dffy`'s diff, described as `description`, as it goes
+    /// back to the diff shown before after `'`.
+    pub(crate) fn start_since_checkpoint(&mut self, plain: Revisions, description: String) {
+        self.since_checkpoint = Some((plain, description));
     }
 
     /// The diff is of uncommitted changes, as `which` shows them.
@@ -1133,6 +1185,7 @@ impl App {
             .chain(self.reviewing.reload_deadline())
             .chain(self.reviewing.plan_deadline(self.comments.as_ref()))
             .chain(self.control.deadline())
+            .chain(self.checkpoint_deadline())
             .min()
     }
 
@@ -1178,6 +1231,7 @@ impl App {
             }
         }
         self.sync_threads();
+        self.arrive_conflicts();
         self.control_settle();
         self.kept = kept && self.scrolled;
         // Stopping a post halfway leaves the review half sent until the
@@ -1240,8 +1294,8 @@ impl App {
     /// Nothing came before the deadline: a flash, a drag at the edge, a
     /// note or the review's wait may be over.
     fn tick(&mut self) -> Option<Action> {
-        // A row's flash ends.
-        self.dirty |= self.commands.is_some();
+        // A row's flash ends, or the checkpoint's age reads differently.
+        self.dirty |= self.commands.is_some() || self.since_checkpoint.is_some();
         if let Some((x, y)) = self.drag_edge {
             self.drag(x, y);
             self.dirty = true;
@@ -1348,6 +1402,9 @@ impl App {
                 }
             }
             Event::Branch(branch) => self.branch_moved(branch),
+            Event::Head(head) => self.head = head,
+            Event::Checkpoint(latest) => self.checkpoint_read(latest),
+            Event::Checkpointed { taken, handoff } => return self.checkpointed(taken, handoff),
             Event::Tick => return self.tick(),
             Event::Review { id, said } => return self.review_event(id, said),
             Event::ReviewPush(push) => self.review_pushed(push),
@@ -1370,11 +1427,14 @@ impl App {
             }
             Event::Control(inbound) => return self.control(inbound),
             Event::Applied(result) => self.applied(result),
-            Event::HandedOff(started) => self.handed_off(started),
+            Event::AgentStarting => {
+                self.message(format!("starting {}…", plugin::agent::PROGRAM));
+            }
+            Event::HandedOff { started, left } => self.handed_off(started, left),
             Event::Terminal { dir, opened } => return self.terminal_opened(&dir, opened),
             // The loop handles these: they need the terminal, or may start
             // the plugin's `detect`.
-            Event::Resize | Event::Interrupt | Event::Described(_) => {}
+            Event::Resize | Event::Interrupt | Event::Described(_) | Event::Handoff { .. } => {}
         }
         None
     }
@@ -2060,6 +2120,24 @@ impl App {
         Ok(None)
     }
 
+    /// Whether `action` can do anything in this view, wherever the keys
+    /// are; the command panel and the menu leave out those that can't, and
+    /// their keys say why when pressed.
+    fn applies(&self, action: Act) -> bool {
+        match action {
+            Act::Stage | Act::Unstage | Act::Discard => self.uncommitted_shown().is_some(),
+            Act::OpenReview => !self.piped && self.reviewing.plugin.is_some(),
+            Act::SinceLastReview => self.reviewing.on_review(),
+            Act::WholeReview => self.reviewing.found_plain(),
+            Act::OpenTerminal | Act::TakeCheckpoint => !self.piped,
+            Act::SendOpenThreads => !self.piped && self.open_threads() > 0,
+            Act::SinceCheckpoint => {
+                !self.piped && (self.checkpoint.is_some() || self.since_checkpoint.is_some())
+            }
+            _ => true,
+        }
+    }
+
     /// Runs `action` for the pane with the keys.
     #[expect(
         clippy::too_many_lines,
@@ -2077,6 +2155,7 @@ impl App {
             }
             Act::AskAgent => return self.ask_agent(),
             Act::FixWithAgent => return self.fix_with_agent(),
+            Act::SendOpenThreads => self.send_open_threads(),
             Act::ScrollDown
             | Act::ScrollUp
             | Act::PageDown
@@ -2147,7 +2226,7 @@ impl App {
             | Act::ToggleHunkHeaders
             | Act::ToggleStatusBar
             | Act::ToggleCopyDecorations => return self.set_view(action),
-            Act::Leader => self.commands = Some(Commands::default()),
+            Act::Leader => self.open_commands(),
             Act::ToggleWatch => {
                 let on = self.watch == Watch::Off;
                 self.watch = if on { Watch::Starting } else { Watch::Off };
@@ -2206,6 +2285,9 @@ impl App {
             Act::ReviewPost => return self.open_post(),
             Act::OpenReview => return self.open_review_picker(),
             Act::SinceLastReview => return self.toggle_since_review(),
+            Act::SinceCheckpoint => return self.toggle_since_checkpoint(),
+            Act::TakeCheckpoint if self.piped => self.message("a piped diff has no working tree"),
+            Act::TakeCheckpoint => return Some(Action::TakeCheckpoint),
             Act::WholeReview => return self.toggle_whole_review(),
             Act::Help => self.help = Some(Help::default()),
             Act::ScrollRight | Act::ScrollLeft | Act::ScrollReset => self.scroll_code(action),
@@ -2737,9 +2819,15 @@ impl App {
 
     /// The row last tapped, if it's still on screen; used once.
     fn take_tapped(&mut self) -> Option<(Pos, Side)> {
-        self.tapped
-            .take()
-            .filter(|(pos, _)| (0..self.doc.height).any(|y| self.doc.row_at(y) == Some(*pos)))
+        let tapped = self.tapped_shown();
+        self.tapped = None;
+        tapped
+    }
+
+    /// The row last tapped, if it's still on screen, kept for its use.
+    fn tapped_shown(&mut self) -> Option<(Pos, Side)> {
+        let tapped = self.tapped;
+        tapped.filter(|(pos, _)| (0..self.doc.height).any(|y| self.doc.row_at(y) == Some(*pos)))
     }
 
     /// `y`: the selected lines on the clipboard, or the Markdown of the
@@ -2891,7 +2979,12 @@ impl App {
             .and_then(|path| comments.file_of(path.as_bytes()))
             .and_then(|file| self.doc.document.file(file))
             .map(model::line_diff);
-        let made = prompt::thread(&list, at, diff.map(|d| &**d));
+        // A review opened by its id, as the changes to the working tree
+        // check: the one plain `dffy` found is the branch checked out.
+        let elsewhere = (self.checkout())
+            .zip(self.head.as_ref())
+            .is_some_and(|(checkout, head)| *head != checkout.head);
+        let made = prompt::thread(&list, at, diff.map(|d| &**d), elsewhere);
         Some(Ok((made, "a thread")))
     }
 

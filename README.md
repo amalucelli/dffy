@@ -46,6 +46,16 @@ review = github
 
 `r` switches a Markdown or Mermaid file between its lines and its rendered form. `dffy pr 123` opens a pull request, and plain `dffy` on a branch with an open PR brings in its comments. `dffy-agent` needs no config line: `a` on a thread asks once it's on `PATH`. `dffy doctor` checks that each plugin is found and, for `dffy-review-github` and `dffy-agent`, that `gh` and the agents are logged in. [plugins.md](docs/plugins.md) has the details.
 
+## Agents
+
+Your coding agent can work with dffy too: read a change a file at a time, answer the review threads you leave it, and show you a line in your viewer.
+
+```sh
+dffy agents setup    # a skill for Claude Code, Codex, Pi and Amp
+```
+
+The skill tells the agent to run `dffy agents show`, which prints how to use the dffy installed, and to reply in your threads under its own name, never resolving or posting them. Agents without a shell use [`dffy mcp`](docs/mcp.md) instead. [agents.md](docs/agents.md) has the details.
+
 ## About
 
 `dffy` is a diff viewer for the terminal. Run it in a git repository and it opens a full-screen view of your changes: a file tree on the left, the diff on the right, split or unified. Pipe it, and it prints the diff instead.
@@ -96,6 +106,7 @@ It fits into how you already work. Every action is a single key, the layout adap
 
 **Scripts and agents**
 - 🧱 [`--json`](docs/json.md): the diff as JSON Lines, with each line's kind and whether it moved or was only reformatted.
+- 🧠 [`dffy agents setup`](docs/agents.md): a skill that teaches Claude Code, Codex, Pi and Amp to read changes and answer your threads with dffy's CLI.
 - 🤖 [`dffy mcp`](docs/mcp.md): an MCP server that lets coding agents list a change's files, read its diffs a page at a time, read your review comments, and reply in a thread or apply its suggestion.
 - ✍️ [`dffy comments`](docs/comments.md): review comments as JSON, and `dffy comments apply` for scripts and agents to add their own, shown inline with their author.
 
@@ -176,7 +187,7 @@ As git's pager, `dffy` streams the whole 48MB patch in 3.1MB of its own memory, 
 
 ## Docs
 
-The [documentation](docs/README.md) covers every key, flag and setting: [installation](docs/install.md), [usage](docs/usage.md), [the viewer](docs/viewer.md), [keys](docs/keys.md), [configuration](docs/config.md), [themes](docs/themes.md), [git integration](docs/git.md), [watch mode](docs/watch.md), [review comments](docs/comments.md), [plugins](docs/plugins.md), [JSON output](docs/json.md), [the MCP server](docs/mcp.md), [troubleshooting](docs/troubleshooting.md), [architecture](docs/architecture.md) and [benchmarks](docs/benchmarks.md). [CHANGELOG.md](CHANGELOG.md) lists what each release changed.
+The [documentation](docs/README.md) covers every key, flag and setting: [installation](docs/install.md), [usage](docs/usage.md), [the viewer](docs/viewer.md), [keys](docs/keys.md), [configuration](docs/config.md), [themes](docs/themes.md), [git integration](docs/git.md), [watch mode](docs/watch.md), [review comments](docs/comments.md), [plugins](docs/plugins.md), [JSON output](docs/json.md), [coding agents](docs/agents.md), [the MCP server](docs/mcp.md), [troubleshooting](docs/troubleshooting.md), [architecture](docs/architecture.md) and [benchmarks](docs/benchmarks.md). [CHANGELOG.md](CHANGELOG.md) lists what each release changed.
 
 ## License
 

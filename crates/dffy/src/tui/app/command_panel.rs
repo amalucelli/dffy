@@ -1,27 +1,68 @@
 //! The command panel the leader key opens: its entries with their states,
-//! and its keys.
+//! where each is listed, and its keys.
 
 use dffy_core::diff::Whitespace;
 
-use super::{Action, App, Watch};
+use super::{Action, App, Pane, Watch};
 use crate::config::{self, View};
-use crate::keys::Action as Act;
+use crate::keys::{Action as Act, Tab, Table};
 use crate::term::Input;
-use crate::tui::commands::{self, Outcome};
+use crate::tui::commands::{self, Commands, Outcome, Place};
+use crate::tui::menu::Offer;
+
+/// Here's actions on a thread, in this order, as far as they act on it.
+const ON_THREAD: [Act; 6] = [
+    Act::AskAgent,
+    Act::FixWithAgent,
+    Act::ApplySuggestion,
+    Act::CopyPrompt,
+    Act::Resolve,
+    Act::Reply,
+];
+
+/// Here's actions on checkpoints, once one is taken.
+const CHECKPOINTS: [Act; 2] = [Act::SinceCheckpoint, Act::TakeCheckpoint];
+
+/// Here's actions with nothing more particular to act on.
+const ANYWHERE: [Act; 5] = [
+    Act::OpenPicker,
+    Act::CycleLayout,
+    Act::ToggleWrap,
+    Act::ToggleWatch,
+    Act::OpenTerminal,
+];
 
 impl App {
+    /// Opens the command panel's quick popup, its entries as things stand.
+    pub(super) fn open_commands(&mut self) {
+        let (title, entries) = self.command_entries();
+        self.commands = Some(Commands::new(title, entries));
+    }
+
     /// Input while the command panel is open: a row's key or `enter` runs
     /// it, toggles keeping the panel open with their new state flashing;
     /// see [`Commands`] for the rest.
     pub(super) fn commands_input(&mut self, input: &Input) -> Option<Action> {
-        let entries = self.command_entries();
         let commands = self.commands.as_mut()?;
         let outcome = match *input {
-            Input::Key(key, mods) => commands.key(&entries, key, mods),
-            Input::Scroll { delta, .. } => commands.scroll(&entries, isize::from(delta)),
-            Input::Click { x, y } => commands.tap(&entries, (usize::from(x), usize::from(y))),
+            Input::Key(key, mods) => commands.key(key, mods),
+            Input::Scroll { delta, .. } => commands.scroll(isize::from(delta)),
+            Input::Click { x, y } => commands.tap((usize::from(x), usize::from(y))),
             _ => Outcome::Stay,
         };
+        let ran = matches!(outcome, Outcome::Run { .. } | Outcome::Theme { .. });
+        let done = self.command_outcome(outcome);
+        if ran && self.commands.is_some() {
+            let (title, entries) = self.command_entries();
+            if let Some(commands) = &mut self.commands {
+                commands.update(title, entries);
+            }
+        }
+        done
+    }
+
+    /// Carries out what a key or tap in the panel asked for.
+    fn command_outcome(&mut self, outcome: Outcome) -> Option<Action> {
         match outcome {
             Outcome::OpenThemes => {
                 if !self.color {
@@ -60,7 +101,7 @@ impl App {
                 None
             }
             Outcome::Run { action, back } => {
-                let stays = entries.iter().any(|e| e.action == action && e.stays);
+                let stays = (self.commands.as_ref()).is_some_and(|c| c.stays(action));
                 if !stays {
                     self.commands = None;
                 }
@@ -100,43 +141,132 @@ impl App {
         }
     }
 
-    /// The command panel's rows as things stand: the leader's table, each
-    /// with its state and the key that does the same directly.
-    pub(super) fn command_entries(&self) -> Vec<commands::Entry> {
-        self.keys
-            .leader_entries()
-            .iter()
-            .map(|&(chord, action)| {
-                let key = chord.name();
-                let direct = self
-                    .key_name(action)
-                    .or_else(|| {
-                        self.keys
-                            .chords(true, action)
-                            .next()
-                            .map(crate::keys::Chord::name)
-                    })
-                    .filter(|d| *d != key);
-                let (on, label, value) = self.panel_state(action);
-                let setting = on.is_some() || value.is_some();
-                commands::Entry {
-                    action,
-                    key,
-                    on,
-                    label,
-                    value,
-                    direct,
-                    // These go somewhere, rather than set a look.
-                    stays: setting
-                        && !matches!(
-                            action,
-                            Act::ToggleTree | Act::CommentedFiles | Act::SinceLastReview
-                        ),
-                }
+    /// The quick popup's title and the command panel's rows as things
+    /// stand: Here's, then the leader's table, each with its state, its key
+    /// in the panel and the key that does the same outside it.
+    pub(super) fn command_entries(&mut self) -> (String, Vec<commands::Entry>) {
+        let (title, here) = self.here();
+        let mut entries: Vec<commands::Entry> = (here.into_iter())
+            .map(|offer| {
+                let key = (self.keys.leader_entries().iter())
+                    .find(|(_, a)| *a == offer.action)
+                    .map(|(chord, _)| chord.name())
+                    .unwrap_or_default();
+                let keys = (key, self.direct_key(offer.action, offer.table));
+                self.command_entry(offer.action, Some(offer.label), keys, Place::Here)
             })
-            .collect()
+            .collect();
+        for &(chord, action) in self.keys.leader_entries() {
+            let place = match action.group().tab() {
+                _ if !self.applies(action) => Place::Hidden,
+                Tab::General => Place::Here,
+                Tab::Move => Place::Tab(Tab::Files),
+                tab => Place::Tab(tab),
+            };
+            let keys = (chord.name(), self.direct_key(action, Table::Main));
+            entries.push(self.command_entry(action, None, keys, place));
+        }
+        (title, entries)
     }
 
+    /// A row for `action` listed at `place`, its words `label` or else the
+    /// panel's own, with its key in the panel, empty for none, and its key
+    /// outside it.
+    fn command_entry(
+        &self,
+        action: Act,
+        label: Option<String>,
+        (key, direct): (String, Option<String>),
+        place: Place,
+    ) -> commands::Entry {
+        let (on, title, value) = self.panel_state(action);
+        let setting = on.is_some() || value.is_some();
+        commands::Entry {
+            action,
+            direct: direct.filter(|d| *d != key),
+            key,
+            on,
+            label: label.unwrap_or(title),
+            value,
+            // These go somewhere, rather than set a look.
+            stays: setting
+                && !matches!(
+                    action,
+                    Act::ToggleTree
+                        | Act::CommentedFiles
+                        | Act::SinceLastReview
+                        | Act::SinceCheckpoint
+                ),
+            place,
+        }
+    }
+
+    /// The key that does `action` outside the panel, in `table`: a
+    /// thread's or a conflict's, else the diff's or the tree's.
+    fn direct_key(&self, action: Act, table: Table) -> Option<String> {
+        match table {
+            Table::Thread => self.thread_key_name(action),
+            Table::Conflict => {
+                (self.keys.conflict_chords(action).next()).map(crate::keys::Chord::name)
+            }
+            _ => self
+                .key_name(action)
+                .or_else(|| (self.keys.chords(true, action).next()).map(crate::keys::Chord::name)),
+        }
+    }
+
+    /// What the panel's Here tab offers, from what the keys act on now: on
+    /// lines selected in the diff, what they do to them; on a thread, a
+    /// few of its keys; in a conflict on screen, its choices; on a review,
+    /// its actions; else a few settings and actions. Sending your open
+    /// threads to your agent joins a thread's, a review's and the rest
+    /// while you have some. With them, what they act on, the quick popup's
+    /// title: `on this thread`, or `commands` with nothing in particular.
+    fn here(&mut self) -> (String, Vec<Offer>) {
+        if self.pane == Pane::Diff
+            && let Some((file, ..)) = self.doc.selected_lines()
+        {
+            let mut offers = self.line_offers(file, true);
+            offers.extend(self.edit_offers(file, true));
+            return ("on these lines".to_owned(), offers);
+        }
+        let send = (self.applies(Act::SendOpenThreads)).then(|| {
+            Offer::new(
+                Act::SendOpenThreads.title(),
+                Act::SendOpenThreads,
+                Table::Main,
+            )
+        });
+        if let Some(thread) = self.target_thread() {
+            let offers = self.thread_offers(&thread, false);
+            let offers = (ON_THREAD.iter())
+                .filter_map(|&a| offers.iter().find(|o| o.action == a).cloned())
+                .chain(send)
+                .collect();
+            return ("on this thread".to_owned(), offers);
+        }
+        // The conflict a choice would act on: the line last tapped's first.
+        let tapped = self.tapped_shown().map(|(pos, _)| pos);
+        let conflict = self.conflict_offers(tapped);
+        if !conflict.is_empty() {
+            return ("in this conflict".to_owned(), conflict);
+        }
+        let review = self.review_offers();
+        if !review.is_empty() {
+            let title = format!("on this {}", self.reviewing.noun(false));
+            return (title, review.into_iter().chain(send).collect());
+        }
+        // The agent loop first: your open threads to hand over, then once
+        // there's a checkpoint, its toggle and the next checkpoint.
+        let checkpoints = self.checkpoint.is_some().then_some(CHECKPOINTS);
+        let offers = (std::iter::once(Act::SendOpenThreads))
+            .chain(checkpoints.into_iter().flatten())
+            .chain(ANYWHERE)
+            .filter(|&a| self.applies(a))
+            .map(|a| Offer::new(a.title(), a, Table::Main))
+            .collect();
+        ("commands".to_owned(), offers)
+    }
     /// A panel row's checkbox, if it's a toggle, its text, and a
     /// multi-value setting's value (`auto (split here)`).
     fn panel_state(&self, action: Act) -> (Option<bool>, String, Option<String>) {
@@ -170,6 +300,7 @@ impl App {
             Act::ToggleTree => toggle(self.tree_shown),
             Act::CommentedFiles => toggle(self.tree.commented()),
             Act::SinceLastReview => toggle(self.reviewing.since_review()),
+            Act::SinceCheckpoint => toggle(self.since_checkpoint.is_some()),
             Act::WholeReview => (None, self.reviewing.whole_title(), None),
             Act::OpenReview => (None, format!("Open {}…", self.reviewing.noun(false)), None),
             Act::ToggleFull => toggle(

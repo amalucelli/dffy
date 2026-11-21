@@ -404,6 +404,9 @@ pub(crate) struct Boxes {
     cache: RefCell<HashMap<usize, Boxed>>,
     /// Fenced code in comments is highlighted.
     highlight: bool,
+    /// What a private comment's heading says after its word: the key that
+    /// makes it a draft, as `A shares`.
+    share: Option<String>,
     fold: Fold,
     /// The text box, while it's open; keys go to it.
     writing: Option<Writing>,
@@ -421,6 +424,7 @@ impl Boxes {
             starts: Vec::new(),
             cache: RefCell::default(),
             highlight: true,
+            share: None,
             fold: Fold::default(),
             writing: None,
             new_at: None,
@@ -592,7 +596,7 @@ impl Boxes {
                     bodies,
                     (collapsed, focused),
                     writing,
-                    (boxed, now),
+                    (boxed, now, self.share.as_deref()),
                     (c, &mut comment_rows),
                 );
                 if !collapsed && !writes {
@@ -1577,6 +1581,12 @@ impl Doc {
         self.clamp_in(&layout);
     }
 
+    /// What follows a private comment's word in its heading, as `A shares`;
+    /// set before any box is drawn.
+    pub(crate) fn set_share(&mut self, words: Option<String>) {
+        self.boxes.share = words;
+    }
+
     /// Highlights fenced code in comments, or stops; their boxes are drawn
     /// again.
     pub(crate) fn set_highlight(&mut self, on: bool) {
@@ -2058,7 +2068,7 @@ impl Doc {
         let reused = previous
             .filter(|_| painted == self.painted)
             .and_then(|previous| self.reuse(grid, previous, area, &layout));
-        let (scrolled, rows, mut pos) = if let Some((by, rows, from)) = reused {
+        let (scrolled, rows, pos) = if let Some((by, rows, from)) = reused {
             (Some(by), rows, from)
         } else {
             self.separators.clear();
@@ -2068,34 +2078,8 @@ impl Doc {
             (None, 0..self.height, self.document.pos)
         };
         let kept = self.separators.len();
-        let mut y = rows.start;
-        let mut last = pos;
         self.box_drawn = None;
-        while y < rows.end {
-            c.clear();
-            let drawn = self.render(pos, &layout, &mut c);
-            if drawn.separator && pos.offset == 0 {
-                self.separators.push((y, pos));
-            }
-            for (i, row) in c.rows().enumerate().skip(pos.offset) {
-                if y == rows.end {
-                    break;
-                }
-                let after = paint(grid, x, top + y, end, row, theme, Attributes::NONE);
-                if let Some(fill) = c.fill(i) {
-                    grid.fill(after, top + y, end, theme.ink_style(fill));
-                }
-                if let Some(card) = &drawn.card {
-                    card.tint(grid, (x, end, top + y), theme);
-                }
-                self.drawn[y] = Some(Pos { offset: i, ..pos });
-                y += 1;
-            }
-            last = pos;
-            if !self.next_row(&mut pos, &layout) {
-                break;
-            }
-        }
+        let (y, last) = self.draw_rows(grid, &mut c, area, rows.clone(), pos, &layout, theme);
         self.box_drawn = None;
         // Rows drawn above the copied ones: their separators come first.
         if rows.start == 0 {
@@ -2135,6 +2119,54 @@ impl Doc {
             file..file + 1,
             scrolled.map(|by| (top..top + self.height, by)),
         )
+    }
+
+    /// Lays out and paints screen rows `rows` from `pos` down, as far as
+    /// the file goes, noting each row in `drawn` and each separator at its
+    /// top. Returns the row after the last painted and the position of the
+    /// last laid out.
+    // Out of line, so the code layout of every scroll's row loop doesn't
+    // shift as `draw` grows.
+    #[inline(never)]
+    #[expect(clippy::too_many_arguments, reason = "draw's state, passed through")]
+    fn draw_rows(
+        &mut self,
+        grid: &mut Grid,
+        c: &mut Canvas,
+        (x, end, top): (usize, usize, usize),
+        rows: Range<usize>,
+        mut pos: Pos,
+        layout: &Layout,
+        theme: &Theme,
+    ) -> (usize, Pos) {
+        let mut y = rows.start;
+        let mut last = pos;
+        while y < rows.end {
+            c.clear();
+            let drawn = self.render(pos, layout, c);
+            if drawn.separator && pos.offset == 0 {
+                self.separators.push((y, pos));
+            }
+            for (i, row) in c.rows().enumerate().skip(pos.offset) {
+                if y == rows.end {
+                    break;
+                }
+                let after = paint(grid, x, top + y, end, row, theme, Attributes::NONE);
+                if let Some(fill) = c.fill(i) {
+                    grid.fill(after, top + y, end, theme.ink_style(fill));
+                }
+                if let Some(card) = &drawn.card {
+                    card.tint(grid, (x, end, top + y), theme);
+                }
+                self.drawn[y] = Some(Pos { offset: i, ..pos });
+                y += 1;
+            }
+            last = pos;
+            if !self.next_row(&mut pos, layout) {
+                break;
+            }
+        }
+        (y, last)
     }
 
     /// Draws the first separator on screen again, highlighted as what `x`
@@ -2255,6 +2287,9 @@ impl Doc {
     /// Paints the search's matches on screen rows `rows`, the current one
     /// in its own color. Only those rows are looked up, however many
     /// matches the file has. `layout` is the drawn file's.
+    // Out of line, so the code layout of the per-row match loop doesn't
+    // shift as `draw` grows.
+    #[inline(never)]
     fn draw_search(
         &mut self,
         grid: &mut Grid,

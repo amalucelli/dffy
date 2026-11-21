@@ -15,10 +15,10 @@ mod server;
 use std::cell::OnceCell;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
-use std::io::Write as _;
+use std::io::{Read as _, Write as _};
 use std::os::unix::fs::OpenOptionsExt as _;
 use std::path::{Path, PathBuf};
-use std::process::{Command, ExitCode, Stdio};
+use std::process::{Command, ExitCode, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -341,7 +341,8 @@ impl Review {
     }
 
     /// `session` as dffy reads it: the PR's number as its id, its state
-    /// lowercase, without the rest of [`KEPT`].
+    /// lowercase, the command that checks it out, without the rest of
+    /// [`KEPT`].
     fn printed(&self, session: &Value) -> Value {
         let mut session = session.clone();
         let state = session["state"].as_str().map(str::to_lowercase);
@@ -354,6 +355,8 @@ impl Review {
             session["state"] = json!(state);
         }
         session["id"] = json!(self.pr.to_string());
+        // What dffy shows where it needs the PR checked out.
+        session["checkout"] = json!(format!("gh pr checkout {}", self.pr));
         if let Some(fields) = session.as_object_mut() {
             fields.remove("comments");
         }
@@ -1027,6 +1030,13 @@ fn prune_daily(remote: &Remote) {
     }
 }
 
+/// How long `doctor`'s `gh --version` and `gh auth status` may each take.
+/// dffy waits 3 seconds for the whole `doctor`, so they run side by side
+/// and one that doesn't answer is said in its own row. Picking the host
+/// may ask gh about a host not yet known to be GitHub's, uncapped, as
+/// other requests do.
+const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
+
 /// For `dffy doctor`: whether gh is installed, and logged in to the host
 /// the API calls go to, the repository's, else gh's own. `gh auth status`
 /// asks that host, so it isn't free; no other request runs it for a host
@@ -1041,14 +1051,18 @@ fn doctor() -> Value {
             .find(|l| !l.is_empty())
             .unwrap_or_default()
     };
-    let gh = |args: &[&str]| {
-        Command::new("gh")
-            .args(args)
-            .env("GH_PROMPT_DISABLED", "1")
-            .stdin(Stdio::null())
-            .output()
-    };
-    let checks = match gh(&["--version"]) {
+    let late = |command: &str| format!("`{command}` didn't answer in {}s", PROBE_TIMEOUT.as_secs());
+    let (version, auth) = std::thread::scope(|scope| {
+        let auth = scope.spawn(|| {
+            let host = Remote::pick(github_host).map_or_else(github::default_host, |r| r.host);
+            github::use_host(&host);
+            probe_gh(&["auth", "status", "--hostname", &host])
+        });
+        let version = probe_gh(&["--version"]);
+        let auth = auth.join().unwrap_or_else(|e| std::panic::resume_unwind(e));
+        (version, auth)
+    });
+    let checks = match version {
         Err(e) => {
             let detail = if e.kind() == std::io::ErrorKind::NotFound {
                 github::NO_GH.to_owned()
@@ -1061,27 +1075,73 @@ fn doctor() -> Value {
             ]
         }
         Ok(version) => {
-            let host = Remote::pick(github_host).map_or_else(github::default_host, |r| r.host);
-            github::use_host(&host);
-            let auth = match gh(&["auth", "status", "--hostname", &host]) {
-                Ok(out) if out.status.success() => {
-                    let said = String::from_utf8_lossy(&out.stdout);
+            let auth = match auth {
+                Ok(Some((status, stdout))) if status.success() => {
+                    let said = String::from_utf8_lossy(&stdout);
                     let line = said
                         .lines()
                         .find(|l| l.contains("Logged in to"))
-                        .map_or_else(|| first_line(&out.stdout), |l| first_line(l.as_bytes()));
-                    check("auth", true, &line)
+                        .map_or_else(|| first_line(&stdout), |l| first_line(l.as_bytes()));
+                    let mut auth = check("auth", true, &line);
+                    // gh says `Logged in to github.com account octocat (keyring)`.
+                    if let Some(account) = line
+                        .split_once(" account ")
+                        .and_then(|(_, rest)| rest.split_whitespace().next())
+                    {
+                        auth["brief"] = json!(format!("logged in as {account}"));
+                    }
+                    auth
                 }
-                Ok(_) => check("auth", false, &github::logged_out()),
+                Ok(Some(_)) => check("auth", false, &github::logged_out()),
+                Ok(None) => check("auth", false, &late("gh auth status")),
                 Err(e) => check("auth", false, &format!("can't run gh: {e}")),
             };
-            [
-                check("gh", version.status.success(), &first_line(&version.stdout)),
-                auth,
-            ]
+            let gh = match version {
+                Some((status, stdout)) => {
+                    let said = first_line(&stdout);
+                    let mut gh = check("gh", status.success(), &said);
+                    // gh says `gh version 2.62.0 (2024-11-14)`.
+                    if let Some(version) = said.strip_prefix("gh version ")
+                        && status.success()
+                    {
+                        let version = version.split_whitespace().next().unwrap_or(version);
+                        gh["brief"] = json!(format!("gh {version}"));
+                    }
+                    gh
+                }
+                None => check("gh", false, &late("gh --version")),
+            };
+            [gh, auth]
         }
     };
     json!({ "checks": checks })
+}
+
+/// Runs gh with `args` to its end, or kills it after [`PROBE_TIMEOUT`]:
+/// its status and stdout, `None` when it didn't answer in time.
+fn probe_gh(args: &[&str]) -> std::io::Result<Option<(ExitStatus, Vec<u8>)>> {
+    let mut child = Command::new("gh")
+        .args(args)
+        .env("GH_PROMPT_DISABLED", "1")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()?;
+    let mut stdout = child.stdout.take();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut out = Vec::new();
+        if let Some(stdout) = &mut stdout {
+            stdout.read_to_end(&mut out).ok();
+        }
+        tx.send(out).ok();
+    });
+    let Ok(stdout) = rx.recv_timeout(PROBE_TIMEOUT) else {
+        child.kill().ok();
+        child.wait().ok();
+        return Ok(None);
+    };
+    Ok(Some((child.wait()?, stdout)))
 }
 
 /// GitHub allows 80 content-creating requests a minute; this stays under

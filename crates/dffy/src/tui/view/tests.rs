@@ -2198,7 +2198,7 @@ fn the_text_box_is_boxed_where_the_thread_sits() {
     insta::assert_snapshot!(rows[at..at + 6].join("\n"), @"
          │  ┃ Simpler.                                        ┃
          │  ┃                                                 ┃
-         │  ┃ you · reply · enter sends · shift+enter new li… ┃
+         │  ┃ you · reply · enter saves · alt+enter new line… ┃
          │  ┃ Sure, and a reply long enough to wrap in its    ┃
          │  ┃ box▏                                            ┃
          │  ┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛
@@ -2212,7 +2212,7 @@ fn the_text_box_is_boxed_where_the_thread_sits() {
         .expect("the line");
     insta::assert_snapshot!(rows[at..at + 4].join("\n"), @"
       4 +│     eprintln!(\"done\");
-         │  ┏ ▾ you · new comment · enter sends · shift+ente… ┓
+         │  ┏ ▾ you · new comment · enter saves · alt+enter … ┓
          │  ┃ New▏                                            ┃
          │  ┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛
     ");

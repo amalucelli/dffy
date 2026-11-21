@@ -190,16 +190,20 @@ impl Lines {
 /// `5m ago` up to `29d ago`, then its date.
 pub(crate) fn age(created: &str, now: u64) -> String {
     let date = || created.get(..10).unwrap_or(created).to_owned();
-    let Some(then) = epoch(created) else {
-        return date();
-    };
-    match now.saturating_sub(then) {
+    epoch(created)
+        .and_then(|then| ago(now.saturating_sub(then)))
+        .unwrap_or_else(date)
+}
+
+/// `seconds` ago as [`age`] says it, `None` from 30 days on.
+pub(crate) fn ago(seconds: u64) -> Option<String> {
+    Some(match seconds {
         s if s < 60 => "just now".to_owned(),
         s if s < 3600 => format!("{}m ago", s / 60),
         s if s < 86_400 => format!("{}h ago", s / 3600),
         s if s < 30 * 86_400 => format!("{}d ago", s / 86_400),
-        _ => date(),
-    }
+        _ => return None,
+    })
 }
 
 pub(crate) fn checkbox(done: bool) -> &'static str {

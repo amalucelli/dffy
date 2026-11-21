@@ -24,7 +24,7 @@ dffy --json --stat | --name-only | --name-status [--syntax] [options] [<rev>...]
 dffy --json [options] <path> <path>
 ```
 
-- **What to compare:** the same as printed output: revisions, `--staged`, `--unstaged`, `--all`, `--merge-base`, paths after `--`, `--focus`, and two files or folders outside git ([usage.md](usage.md#what-to-compare)).
+- **What to compare:** the same as printed output: revisions, `--staged`, `--unstaged`, `--all`, `--merge-base`, `--since-checkpoint`, paths after `--`, `--focus`, and two files or folders outside git ([usage.md](usage.md#what-to-compare)).
 - **Options that change the objects:**
   - `--syntax` turns on the syntax diff. The `moved` and `reformatted` marks, and the classification of a file whose lines only moved or were reformatted, need it.
   - `-w` and `-b` decide which lines differ.
@@ -65,7 +65,7 @@ The header's `version` is `1`.
 |---|---|
 | `version` | The schema version, `1`. |
 | `old`, `new` | The two sides, after revisions are resolved and `-R` is applied. See below. |
-| `untracked` | Whether untracked files are listed: true for plain `dffy` and `--all`. |
+| `untracked` | Whether untracked files are listed: true for plain `dffy`, `--all` and `--since-checkpoint`. With `--since-checkpoint`, `old` is the checkpoint's tree. |
 | `revisions` | The revision arguments as typed, such as `["main..HEAD"]`; empty for none and for two paths compared outside git. |
 | `paths` | The paths the diff is limited to, relative to the repository root; empty for none. |
 | `options.context` | Context lines around each change, or `"full"` for whole files. |

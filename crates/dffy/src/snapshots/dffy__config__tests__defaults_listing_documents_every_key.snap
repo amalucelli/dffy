@@ -65,7 +65,7 @@ expression: text
 <dim># Experimental: the review plugin, the program dffy-review-<name> on PATH. It adds the command it names to open one of the code host's reviews in the viewer, and plain `dffy` asks it for the branch's; empty for none, and no such command. --review <name> sets it for one run. See docs/plugins.md.</>
 <hint>review</><dim> = </>
 
-<dim># Experimental: which coding agent the agent plugin, dffy-agent on PATH, asks about a thread (`a`, or a comment starting @<name>), handed to it unread: claude, codex or pi picks the default, and a command with arguments, split at spaces, runs in their place with the prompt on its stdin. Empty leaves the pick to the plugin, Claude Code first. Fix with agent (`f`) starts the one this names when it's claude, codex, pi or amp, else the first of them on PATH. See docs/plugins.md.</>
+<dim># Experimental: which coding agent the agent plugin, dffy-agent on PATH, asks about a thread (`a`, or a comment starting @<name>), handed to it unread: claude, codex or pi picks the default, and a command with arguments, split at spaces, runs in their place with the prompt on its stdin. Empty leaves the pick to the plugin, Claude Code first. Fix with agent (`f`) starts the one this names of those the plugin can hand a thread to (claude, codex, pi or amp, when on PATH), else the first it lists. See docs/plugins.md.</>
 <hint>agent</><dim> = </>
 
 <dim># Start the viewer in watch mode, refreshing as files, the index or refs change; `w` toggles it. With nothing to show, a watching viewer opens and waits for changes instead of printing that there are none.</>
@@ -104,7 +104,7 @@ expression: text
 <dim># Size the disk cache is trimmed to, least recently used first: bytes, or a number with K, M or G.</>
 <hint>cache-size</><dim> = </>256M
 
-<dim># Keys in the viewer: keybind = <key>=<action>, or <key>=unbind to free a key. A key is a character as typed (n, N, <, ?) or a name (space, enter, tab, shift+tab, esc, backspace, up, down, left, right, home, end, page_up, page_down, insert, delete, f1 to f12), with ctrl+ or alt+ before it. Keys pressed in the file tree look in its own table first, set with tree: before the key (keybind = tree:v=mark_viewed), and so do keys pressed while a comment thread is focused, in the thread's table (thread:), then while the file at the cursor has conflicts to resolve, in the conflict's table (conflict:). The command panel the leader key opens has its own table too, set with leader: (keybind = leader:z=toggle_wrap); the menu lists its entries in this order.</>
+<dim># Keys in the viewer: keybind = <key>=<action>, or <key>=unbind to free a key. A key is a character as typed (n, N, <, ?) or a name (space, enter, tab, shift+tab, esc, backspace, up, down, left, right, home, end, page_up, page_down, insert, delete, f1 to f12), with ctrl+ or alt+ before it. Keys pressed in the file tree look in its own table first, set with tree: before the key (keybind = tree:v=mark_viewed), and so do keys pressed while a comment thread is focused, in the thread's table (thread:), then while the file at the cursor has conflicts to resolve, in the conflict's table (conflict:). The command panel the leader key opens has its own table too, set with leader: (keybind = leader:z=toggle_wrap); within a group, the panel lists its entries in this order.</>
 
 <dim># leader: open the command panel; its next key runs a command</>
 <hint>keybind</><dim> = </>space=leader
@@ -207,6 +207,7 @@ expression: text
 <dim># (no key by default)</>
 
 <dim># copy_prompt: copy the focused thread, else the selected lines, as a prompt for a coding agent: the comments, the lines with those around them and the file's changes near them</>
+<hint>keybind</><dim> = </>thread:y=copy_prompt
 <hint>keybind</><dim> = </>leader:"=copy_prompt
 
 <dim># cancel: end the selection; in the tree, clear the filter</>
@@ -297,6 +298,13 @@ expression: text
 <hint>keybind</><dim> = </>w=toggle_watch
 <hint>keybind</><dim> = </>leader:w=toggle_watch
 
+<dim># take_checkpoint: take a checkpoint of the working tree: its files as plain dffy lists them, staged or not and untracked, kept under a local ref of this worktree, the last 5 of them; starting Fix with agent takes one too</>
+<hint>keybind</><dim> = </>leader:;=take_checkpoint
+
+<dim># since_checkpoint: show only what changed since the latest checkpoint, such as an agent's turn since Fix with agent started it, or the diff shown before again; the status bar says how long ago it was taken</>
+<hint>keybind</><dim> = </>'=since_checkpoint
+<hint>keybind</><dim> = </>leader:'=since_checkpoint
+
 <dim># toggle_mouse: take mouse input, or leave it to the terminal's own selection (many terminals select natively with shift held while dragging)</>
 <hint>keybind</><dim> = </>leader:$=toggle_mouse
 
@@ -352,7 +360,7 @@ expression: text
 <dim># comment_file: comment on the whole file shown, in a text box under its first row; enter sends it</>
 <hint>keybind</><dim> = </>C=comment_file
 
-<dim># comments: the left panel lists every comment thread in place of the files, or the files again; moving through the threads shows each in the diff, enter or tab goes to it; the thread keys act on the selected thread, but f, which filters</>
+<dim># comments: the left panel lists every comment thread in place of the files, or the files again; moving through the threads shows each in the diff, enter or tab goes to it; the thread keys act on the selected thread, and c filters them by state</>
 <hint>keybind</><dim> = </>i=comments
 
 <dim># next_thread: next comment thread, on into the next file with comments; it takes the focus, where r replies, e edits, x resolves, d deletes and o opens it on its host</>
@@ -370,7 +378,7 @@ expression: text
 <dim># move_thread: move the focused thread, or the comments panel's selected one, from the branch it was written on to the current branch</>
 <hint>keybind</><dim> = </>V=move_thread
 
-<dim># ask_agent: ask a coding agent, through the agent plugin dffy-agent, about the focused thread: write your question in a reply box, which enter sends with the thread to the agent that answered last, else the default one; enter on the empty box asks about the thread as it is, and esc saves the question without asking. Elsewhere, write the question on the selected lines, or the line v would start on, in a text box, and enter asks. The answer comes as the agent's reply, with a suggestion when it proposes a change; esc on the thread stops it. A comment you write starting @claude, @codex or @pi asks that agent too (experimental, see agent)</>
+<dim># ask_agent: ask a coding agent, through the agent plugin dffy-agent, about the focused thread: write your question in a reply box, which enter sends with the thread to the agent that answered last, else the default one; enter on the empty box asks about the thread as it is, and esc keeps the question without asking. Elsewhere, write the question on the selected lines, or the line v would start on, in a text box, and enter asks. The answer comes as the agent's reply, with a suggestion when it proposes a change; esc on the thread stops it. A comment you write starting @ and an agent's name, as @name, asks that agent too (experimental, see agent)</>
 <hint>keybind</><dim> = </>a=ask_agent
 <hint>keybind</><dim> = </>thread:a=ask_agent
 <hint>keybind</><dim> = </>leader:a=ask_agent
@@ -390,12 +398,15 @@ expression: text
 <dim># adopt: on a thread: someone else's comments in it not posted, as an agent's, become your drafts, which posting sends under your name</>
 <hint>keybind</><dim> = </>thread:A=adopt
 
-<dim># apply_suggestion: on a thread: put its suggestion, the one last clicked or else its last, in place of the lines it's on in the working tree, refused when they changed since; an unstaged change, which discard undoes</>
+<dim># apply_suggestion: on a thread: put its suggestion, the one last clicked or else its last, in place of the lines it's on in the working tree, refused when they changed since; an unstaged change, which discard undoes. On one applied already, put back the lines it replaced</>
 <hint>keybind</><dim> = </>thread:s=apply_suggestion
 
-<dim># fix_with_agent: on a thread, or the selected lines with a note you write first: start your coding agent (claude, codex, pi or amp) in a new tab, or here until it exits, pointed at the thread to change what it asks and reply in it</>
+<dim># fix_with_agent: on a thread, or the selected lines with a note you write first: start your coding agent in a new tab, or here until it exits, pointed at the thread to change what it asks and reply in it</>
 <hint>keybind</><dim> = </>thread:f=fix_with_agent
 <hint>keybind</><dim> = </>leader:&=fix_with_agent
+
+<dim># send_open_threads: take a checkpoint, then start your coding agent as fix with agent does, pointed at every open thread of yours in view (those you started or replied in) to change what each asks and reply in each; since checkpoint then shows its turn</>
+<hint>keybind</><dim> = </>leader:^=send_open_threads
 
 <dim># open_on_host: on a thread: open it on its code host, in the browser</>
 <hint>keybind</><dim> = </>thread:o=open_on_host
@@ -407,7 +418,7 @@ expression: text
 <hint>keybind</><dim> = </>E=comment_in_editor
 <hint>keybind</><dim> = </>leader:E=comment_in_editor
 
-<dim># commented_files: the tree shows only the files with comments, or every file; f/F and n/N keep to them</>
+<dim># commented_files: the tree shows only the files with comments, or every file; f/F and n/N keep to them. In the comments panel, it steps through all threads, open ones, drafts and resolved ones, and its capital steps back</>
 <hint>keybind</><dim> = </>tree:c=commented_files
 <hint>keybind</><dim> = </>leader:!=commented_files
 
@@ -421,7 +432,7 @@ expression: text
 <hint>keybind</><dim> = </>O=open_review
 <hint>keybind</><dim> = </>leader:O=open_review
 
-<dim># since_last_review: on a review a review plugin opened, show only what changed since the head of your last review posted from dffy, or the whole review again</>
+<dim># since_last_review: on a review a review plugin opened, show only what changed since the head of your last review, as the review plugin records it, or the whole review again</>
 <hint>keybind</><dim> = </>R=since_last_review
 <hint>keybind</><dim> = </>leader:R=since_last_review
 

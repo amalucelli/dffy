@@ -1,0 +1,53 @@
+---
+source: crates/dffy/tests/cli.rs
+expression: stdout(&out)
+---
+2 open review threads of yours, each under its id.
+
+## Thread r1
+
+A review thread on README.md:3 (the new version of the file), as written.
+
+you:
+Say more.
+
+The commented lines, marked >, and the lines around them:
+
+```
+  1  # demo
+  2  
+> 3  A tiny crate.
+```
+
+## Thread c1
+
+A review thread on src/lib.rs:3 (the new version of the file).
+
+ana:
+Overflow?
+
+you:
+Use checked_add.
+
+The commented lines, marked >, and the lines around them:
+
+```
+  1  // Adds.
+  2  pub fn add(a: i64, b: i64) -> i64 {
+> 3      a + b
+  4  }
+```
+
+The file's changes near them:
+
+```diff
+@@ -1,3 +1,4 @@
++// Adds.
+ pub fn add(a: i64, b: i64) -> i64 {
+     a + b
+ }
+```
+
+[1 open thread of yours on other branches left out]
+
+For each thread, change only what its last comment asks, then reply in that thread, by its id, with what you changed.

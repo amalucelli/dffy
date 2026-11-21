@@ -1,13 +1,16 @@
 //! The agent plugin (experimental): `dffy-agent` on PATH, which asks a
 //! coding agent the user already runs about a review thread and hands back
-//! its answer, for dffy to write as the agent's reply. One long-lived
-//! process per viewer, a [`Plugin`], started on the first ask or by `dffy
-//! doctor` and never as dffy starts, speaking JSON-RPC 2.0 over its stdin
-//! and stdout through an [`rpc::Client`]; docs/plugins.md has the messages.
+//! its answer, for dffy to write as the agent's reply, and says how to
+//! start each agent on a thread for Fix with agent. One long-lived process
+//! per viewer, a [`Plugin`], started on the first ask or handoff, or by
+//! `dffy doctor`, and never as dffy starts, speaking JSON-RPC 2.0 over its
+//! stdin and stdout through an [`rpc::Client`]; docs/plugins.md has the
+//! messages. dffy names no agent: what it runs is what the plugin says.
 //!
 //! Its `initialize` answer isn't kept in the disk cache: the agents it
 //! lists are the ones installed now, which a cached answer would hide.
 
+use std::ffi::OsString;
 use std::io;
 #[cfg(test)]
 use std::os::unix::process::CommandExt as _;
@@ -25,38 +28,8 @@ use super::rpc::{self, Pending};
 /// The program, found on PATH as review plugins are.
 pub(crate) const PROGRAM: &str = "dffy-agent";
 
-/// The agent CLIs a thread can be handed to, run as the user runs them,
-/// the first found the default. Amp answers no ask, and takes its first
-/// message only on stdin, which an interactive session has for the user.
-const INTERACTIVE: [&str; 4] = ["claude", "codex", "pi", "amp"];
-
-/// Whether interactive agent `name` starts on a prompt given as its last
-/// argument; the others start bare.
-pub(crate) fn takes_prompt(name: &str) -> bool {
-    name != "amp"
-}
-
-/// The coding agent a thread is handed to, to run interactively with no
-/// flags of dffy's, and its program, as `find` finds it on PATH: the one
-/// the config's `agent` names when it's one of claude, codex, pi and amp,
-/// else the first of those found. The plugin isn't involved, and a command
-/// of the user's in `agent`, which takes a question on stdin rather than a
-/// session to work in, isn't one.
-pub(crate) fn interactive(
-    config: Option<&str>,
-    find: impl Fn(&str) -> Option<PathBuf>,
-) -> Result<(&'static str, PathBuf), String> {
-    let named = |name: &str| INTERACTIVE.into_iter().find(|n| *n == name);
-    if let Some(name) = config.and_then(named) {
-        return find(name)
-            .map(|path| (name, path))
-            .ok_or_else(|| format!("{name} isn't on PATH"));
-    }
-    INTERACTIVE
-        .into_iter()
-        .find_map(|name| Some((name, find(name)?)))
-        .ok_or_else(|| "none of claude, codex, pi and amp is on PATH".to_owned())
-}
+/// The argument a handoff's prompt takes the place of.
+const PROMPT: &str = "{prompt}";
 
 /// The protocol version, sent in `initialize` and named in its answer; a
 /// plugin of another version is refused.
@@ -71,9 +44,10 @@ pub(crate) fn find() -> Option<Program> {
 /// running first, each in a process group of its own.
 const GRACE: Duration = Duration::from_millis(500);
 
-/// How long the plugin's `doctor` may take: it probes each agent's
-/// version and login.
-const DOCTOR_TIMEOUT: Duration = Duration::from_secs(10);
+/// How long the plugin's `doctor` may take: it probes the agents' versions
+/// and logins side by side, each probe for 2 seconds at most, so one that
+/// doesn't answer is said in its own row before this runs out.
+const DOCTOR_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// One of the agents `initialize` lists: those that can run.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -86,10 +60,76 @@ pub(crate) struct Agent {
     pub mark: Option<String>,
 }
 
+/// How a thread is handed to an agent `initialize` lists: run
+/// interactively, as the user runs it, on the thread's prompt.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Handoff {
+    pub name: String,
+    /// Absolute.
+    pub program: PathBuf,
+    /// Its arguments: one that's [`PROMPT`] is where the prompt goes.
+    pub args: Vec<String>,
+    /// The prompt goes on the clipboard for the user to paste, as the
+    /// agent takes its first message from them.
+    pub clipboard: bool,
+}
+
+impl Handoff {
+    fn decode(value: &Value) -> Result<Self, String> {
+        let name = text(value, "name").unwrap_or_default();
+        super::check_name(&name).map_err(|e| format!("a handoff's name: {e}"))?;
+        let program = PathBuf::from(text(value, "program").unwrap_or_default());
+        if !program.is_absolute() {
+            return Err(format!("{name}'s program isn't an absolute path"));
+        }
+        let args = match value.get("args") {
+            None => Vec::new(),
+            Some(args) => (args.as_array())
+                .and_then(|args| args.iter().map(|a| a.as_str().map(str::to_owned)).collect())
+                .ok_or_else(|| format!("{name}'s args aren't text"))?,
+        };
+        let clipboard = match value.get("prompt") {
+            None | Some(Value::Null) => false,
+            Some(Value::String(at)) if at == "clipboard" => true,
+            Some(at) => {
+                let at = at.as_str().unwrap_or("not text");
+                return Err(format!(
+                    "{name}'s prompt is {at}, and dffy knows only clipboard"
+                ));
+            }
+        };
+        if !clipboard && !args.iter().any(|a| a == PROMPT) {
+            return Err(format!(
+                "{name}'s handoff takes no prompt: no {PROMPT} argument, and not on the clipboard"
+            ));
+        }
+        Ok(Self {
+            name,
+            program,
+            args,
+            clipboard,
+        })
+    }
+
+    /// Its program and arguments, `prompt` in place of [`PROMPT`].
+    pub(crate) fn command(&self, prompt: &str) -> Vec<OsString> {
+        std::iter::once(self.program.clone().into_os_string())
+            .chain(
+                self.args
+                    .iter()
+                    .map(|arg| OsString::from(if arg == PROMPT { prompt } else { arg.as_str() })),
+            )
+            .collect()
+    }
+}
+
 /// What `initialize` says.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Init {
     pub agents: Vec<Agent>,
+    /// The agents a thread can be handed to, in the order the first is the
+    /// default; some answer no ask.
+    pub handoffs: Vec<Handoff>,
 }
 
 impl Init {
@@ -128,7 +168,42 @@ impl Init {
                 })
             })
             .collect::<Result<_, String>>()?;
-        Ok(Self { agents })
+        let handoffs = match result.get("handoffs") {
+            None | Some(Value::Null) => Vec::new(),
+            Some(listed) => (listed.as_array())
+                .ok_or("its handoffs aren't a list")?
+                .iter()
+                .map(Handoff::decode)
+                .collect::<Result<_, String>>()?,
+        };
+        Ok(Self { agents, handoffs })
+    }
+
+    /// The agent a thread is handed to: the one `config`, the config's
+    /// `agent`, names, else the first listed. A command of the user's in
+    /// `config`, a value with a space, takes no thread, so the first does.
+    pub(crate) fn handoff(&self, config: Option<&str>) -> Result<&Handoff, String> {
+        let named = config
+            .map(str::trim)
+            .filter(|c| !c.contains(char::is_whitespace));
+        let Some(name) = named else {
+            return self.handoffs.first().ok_or_else(|| {
+                format!("{PROGRAM} lists no agent to hand the thread to; dffy doctor says why")
+            });
+        };
+        self.handoffs.iter().find(|h| h.name == name).ok_or_else(|| {
+            let listed: Vec<&str> = self.handoffs.iter().map(|h| h.name.as_str()).collect();
+            if listed.is_empty() {
+                format!(
+                    "no agent named {name} to hand the thread to; {PROGRAM} lists none, dffy doctor says why"
+                )
+            } else {
+                format!(
+                    "no agent named {name} to hand the thread to; {}",
+                    listed.join(", ")
+                )
+            }
+        })
     }
 
     /// The agent `name` names, or the default one without a name.
@@ -303,10 +378,59 @@ impl Plugin {
         (self.0).on_ready(move |init| ready(init.map(|i| i.agents.clone())));
     }
 
+    /// Initialized, and not since exited.
+    pub(crate) fn ready(&self) -> bool {
+        self.0.lock().ready()
+    }
+
+    /// Hands `ready` the agent a thread goes to, picked with `config`, the
+    /// config's `agent`, as [`Init::handoff`] picks, once the plugin has
+    /// initialized, or why there's none: now, if it has, else from a thread
+    /// of its own, which says so when `initialize` doesn't answer in
+    /// [`rpc::DESCRIBE_TIMEOUT`] and drops an answer after that.
+    pub(crate) fn on_handoff(
+        &self,
+        config: Option<String>,
+        ready: impl FnOnce(Result<Handoff, String>) + Send + 'static,
+    ) {
+        self.when_ready(move |i| i.handoff(config.as_deref()).cloned(), ready);
+    }
+
+    /// Hands `ready` what `read` makes of `initialize`'s answer once the
+    /// plugin has initialized, or why there's none, as
+    /// [`Plugin::on_handoff`] does.
+    fn when_ready<T: Send + 'static>(
+        &self,
+        read: impl FnOnce(&Init) -> Result<T, String> + Send + 'static,
+        ready: impl FnOnce(Result<T, String>) + Send + 'static,
+    ) {
+        let (tx, rx) = mpsc::channel();
+        (self.0).on_ready(move |init| {
+            tx.send(init.and_then(read)).ok();
+        });
+        if let Ok(to) = rx.try_recv() {
+            return ready(to);
+        }
+        std::thread::spawn(move || {
+            let to = match rx.recv_timeout(rpc::DESCRIBE_TIMEOUT) {
+                Ok(to) => to,
+                Err(mpsc::RecvTimeoutError::Timeout) => Err(format!(
+                    "{PROGRAM}'s initialize didn't answer in {}s",
+                    rpc::DESCRIBE_TIMEOUT.as_secs()
+                )),
+                // Closed, as dffy quits.
+                Err(mpsc::RecvTimeoutError::Disconnected) => return,
+            };
+            ready(to);
+        });
+    }
+
     /// Sends `request`, and each thing it says to `deliver` from a thread of
     /// the plugin's; `deliver` mustn't call back into the plugin. An ask
     /// names its agent once the plugin has initialized, which decides the
-    /// default, and ends at once when no listed agent has that name.
+    /// default, and ends at once when no listed agent has that name; it
+    /// waits for that as a handoff does ([`Plugin::on_handoff`]), and ends
+    /// saying so when `initialize` doesn't answer in time.
     pub(crate) fn request(
         &self,
         request: &Request,
@@ -347,7 +471,19 @@ impl Plugin {
             method: request.method(),
             deliver: Box::new(deliver),
         };
-        self.0.request(request.method(), ask, params)
+        let run = self.0.request(request.method(), ask, params);
+        if matches!(request, Request::Ask { .. }) && !self.ready() {
+            let waiting = run.clone();
+            self.when_ready(
+                |_| Ok(()),
+                move |ready| {
+                    if let Err(why) = ready {
+                        waiting.give_up(why);
+                    }
+                },
+            );
+        }
+        run
     }
 
     /// Asks the plugin to shut down, which stops every ask still running,
@@ -410,7 +546,7 @@ pub(crate) fn doctor(program: &Program, config: Option<String>) -> Result<Vec<Ch
             Ok(_) => {}
             Err(_) => {
                 break Err(format!(
-                    "its doctor took over {}s",
+                    "its doctor didn't answer in {}s",
                     DOCTOR_TIMEOUT.as_secs()
                 ));
             }

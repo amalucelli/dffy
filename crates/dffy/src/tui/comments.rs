@@ -29,7 +29,7 @@ use crate::term::{Grid, Key, Mods};
 use crate::theme::{Ink, Role, Theme};
 
 /// The text box's keys, in its heading.
-const BOX_KEYS: &str = " · enter sends · shift+enter new line · ctrl+g editor";
+const BOX_KEYS: &str = " · enter saves · alt+enter new line · ctrl+g editor";
 
 /// The panel's key listing the threads on other branches, or folding them.
 pub(super) const OTHER_BRANCHES: char = 'b';
@@ -78,9 +78,13 @@ fn posting_role(posting: &Posting) -> Role {
 /// When [`age`] next says something else of `created`, from `now`;
 /// `u64::MAX` once it's a date.
 fn age_changes(created: &str, now: u64) -> u64 {
-    let Some(then) = epoch(created) else {
-        return u64::MAX;
-    };
+    epoch(created).map_or(u64::MAX, |then| ago_changes(then, now))
+}
+
+/// When [`crate::review::model::text::ago`] next says something else of
+/// `then`, from `now`, both in seconds since 1970; `u64::MAX` once it says
+/// nothing.
+pub(crate) fn ago_changes(then: u64, now: u64) -> u64 {
     let step = match now.saturating_sub(then) {
         s if s < 3600 => 60,
         s if s < 86_400 => 3600,
@@ -387,13 +391,19 @@ fn row_word(standing: Standing) -> Option<&'static str> {
 }
 
 /// The words after a comment's author: its label, as an agent's mark,
-/// where it lives, what posting it does, whether it's on the host for you
-/// only, and whether its suggestion is applied.
-fn comment_tags(comment: &ThreadComment) -> impl Iterator<Item = (Role, Cow<'_, str>)> {
+/// where it lives, with `share`, the words for the key that makes a
+/// private one a draft (`A shares`), what posting it does, whether it's on
+/// the host for you only, and whether its suggestion is applied.
+fn comment_tags<'a>(
+    comment: &'a ThreadComment,
+    share: Option<&'a str>,
+) -> impl Iterator<Item = (Role, Cow<'a, str>)> {
+    let shares = share.filter(|_| comment.standing == Standing::Unposted);
     (comment.label.as_deref())
         .map(|label| (Role::Dim, Cow::Owned(escape(label.as_bytes()))))
         .into_iter()
         .chain(standing_tag(comment.standing).map(|(role, tag)| (role, Cow::Borrowed(tag))))
+        .chain(shares.map(|words| (Role::Hint, Cow::Borrowed(words))))
         .chain(comment.posting.as_ref().map(|posting| {
             let words = escape(posting.words.as_bytes());
             (posting_role(posting), Cow::Owned(words))
@@ -412,14 +422,18 @@ fn comment_tags(comment: &ThreadComment) -> impl Iterator<Item = (Role, Cow<'_, 
 
 /// The words after a thread's first author: its state, then where it is
 /// when that's not on a line, with the line it was on.
-fn tags<'a>(thread: &'a Thread, first: &'a ThreadComment) -> Vec<(Role, Cow<'a, str>)> {
-    let mut out: Vec<(Role, Cow<'a, str>)> = comment_tags(first).collect();
+fn tags<'a>(
+    thread: &'a Thread,
+    first: &'a ThreadComment,
+    share: Option<&'a str>,
+) -> Vec<(Role, Cow<'a, str>)> {
+    let mut out: Vec<(Role, Cow<'a, str>)> = comment_tags(first, share).collect();
     let mut tag = |role: Role, tag: &'a str| out.push((role, Cow::Borrowed(tag)));
     if !first.applied && thread.comments.iter().any(|c| c.applied) {
         tag(Role::Dim, "applied");
     }
     if thread.local {
-        tag(Role::Hint, "local file");
+        tag(Role::Hint, "branch draft");
     }
     if thread.resolved {
         tag(Role::Dim, "resolved");
@@ -469,14 +483,15 @@ pub(crate) struct CommentRows {
 /// [`bodies`] at `width`.
 /// `focused` draws the border heavy. `writing`, when the text box is in
 /// this thread, takes the place of the comment it edits or follows the
-/// last as a reply. `now` is seconds since 1970. Open, `comment_rows` gets where
-/// each comment is in the box.
+/// last as a reply. `now` is seconds since 1970. `share` follows the word
+/// of a comment kept private, saying the key that makes it a draft. Open,
+/// `comment_rows` gets where each comment is in the box.
 pub(crate) fn thread_rows(
     thread: &Thread,
     bodies: &[Body],
     (collapsed, focused): (bool, bool),
     mut writing: Option<&mut Writing>,
-    (width, now): (usize, u64),
+    (width, now, share): (usize, u64, Option<&str>),
     (c, comment_rows): (&mut Canvas, &mut Vec<CommentRows>),
 ) -> bool {
     comment_rows.clear();
@@ -494,7 +509,7 @@ pub(crate) fn thread_rows(
             1 => "1 reply".to_owned(),
             n => format!("{n} replies"),
         };
-        let tags = tags(thread, first);
+        let tags = tags(thread, first, share);
         let mut spans = vec![
             (Role::Dim.into(), "▸ "),
             (AUTHOR, author.as_str()),
@@ -514,9 +529,9 @@ pub(crate) fn thread_rows(
         let author = escape(who(&comment.author).as_bytes());
         let when = format!(" · {}", escape(age(&comment.created, now).as_bytes()));
         let words = if i == 0 {
-            tags(thread, comment)
+            tags(thread, comment, share)
         } else {
-            comment_tags(comment).collect()
+            comment_tags(comment, share).collect()
         };
         let mut spans = if i == 0 {
             vec![(Role::Dim.into(), "▾ ")]
@@ -735,11 +750,18 @@ impl Panel {
         }
         let page = isize::try_from(self.height).unwrap_or(isize::MAX);
         let plain = !mods.contains(Mods::CTRL) && !mods.contains(Mods::ALT);
+        // The tree's key for files with comments filters the threads here,
+        // and its capital steps back.
+        let filter_back = |c: char| {
+            c.is_ascii_uppercase()
+                && keys.action(true, Key::Char(c.to_ascii_lowercase()), Mods::NONE)
+                    == Some(Act::CommentedFiles)
+        };
         match (key, keys.action(true, key, mods)) {
             (Key::Esc, _) if !list.search().is_empty() => list.clear_search(),
             (Key::Esc | Key::Enter, _) | (_, Some(Act::Open)) => return Outcome::Diff,
-            (Key::Char('f'), _) if plain => list.step_filter(false),
-            (Key::Char('F'), _) if plain => list.step_filter(true),
+            (_, Some(Act::CommentedFiles)) => list.step_filter(false),
+            (Key::Char(c), _) if plain && filter_back(c) => list.step_filter(true),
             (Key::Char(OTHER_BRANCHES), _) if plain => list.toggle_others(),
             (_, Some(Act::FilterTree)) => self.editing = true,
             (_, Some(Act::ScrollDown)) => self.selected = list.step(self.selected, 1),
@@ -925,7 +947,7 @@ fn list_row(c: &mut Canvas, (list, keys): (&Listing, &Keys), row: &Row, width: u
                 (thread.at == At::Lost && !list.files[item.group].absent)
                     .then_some((moved, "moved")),
                 branch.as_deref().map(|b| (ink(Role::Hint), b)),
-                thread.local.then_some((ink(Role::Hint), "local file")),
+                thread.local.then_some((ink(Role::Hint), "branch draft")),
                 row_word(first.standing).map(|word| (ink(Role::Dim), word)),
                 kind.map(|k| (ink(Role::Dim), k)),
                 label.as_deref().map(|l| (ink(Role::Hint), l)),

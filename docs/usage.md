@@ -2,16 +2,19 @@
 
 ```
 dffy [options] [--show-comments] [<rev>...] [-- <path>...]
+dffy [options] --since-checkpoint[=<n>] [-- <path>...]
 dffy [options] [--no-index] <path> <path>
 dffy --json [--show-comments] [options] [<rev>...] [-- <path>...]
 dffy show [<rev>] [-- <path>...]
 dffy config [--default]
 dffy comments [--json | --markdown] [--session] [--open | --resolved] [--path <path>] [--branch <name> | --all-branches]
-dffy comments apply | comments import <file> | comments rm --resolved [--branch <name> | --all-branches]
+dffy comments apply [--as <name>] | comments import <file> | comments rm --resolved [--branch <name> | --all-branches]
 dffy <review-command> [<number>]    # e.g. dffy pr, with a review plugin set
 dffy mcp
-dffy ctl views | open <path>[:<line>[:old]] | focus <id> | selection | state | comment <path>:<line> <text> | schema
-dffy themes | doctor | daemon status|stop | completions <shell>
+dffy ctl views | open <path>[:<line>[:old]] | focus <id> | selection | state | comment <path>:<line> <text> | apply-suggestion <id> | schema
+dffy agents setup|status|remove [--agent <agent>] [--project] | agents show
+dffy checkpoint
+dffy themes | doctor [--json | --verbose] | daemon status|stop | completions <shell>
 ```
 
 Without a subcommand dffy runs `diff`, so `dffy main..HEAD` is `dffy diff main..HEAD`. A revision with the same name as a subcommand needs the explicit form: `dffy diff config`, `dffy diff comments`.
@@ -37,13 +40,15 @@ Otherwise dffy prints.
 |---|---|
 | `diff` | Changes between the working tree, the index and revisions. The default. |
 | `show [<rev>]` | A commit against its first parent, with the commit header. `<rev>` defaults to `HEAD`; a root commit is compared with the empty tree. |
-| `comments` | The review comments, as threads: the current branch's and those on no branch, or `--branch <name>`'s, or `--all-branches`; `--open`, `--resolved` and `--path <path>` narrow them. `--markdown` prints them as Markdown, `--json` prints the whole comments file, and `--session` reads the review session the viewer has open. `comments apply` changes the file with a JSON list of operations on stdin; `comments import <file>` adds another comments file's comments it doesn't have; `comments rm --resolved` removes resolved threads. See [comments.md](comments.md#reading-dffy-comments). |
+| `comments` | The review comments, as threads: the current branch's and those on no branch, or `--branch <name>`'s, or `--all-branches`; `--open`, `--resolved` and `--path <path>` narrow them. `--markdown` prints them as Markdown, `--json` prints the whole comments file, and `--session` reads the review session the viewer has open. `comments apply` changes the file with a JSON list of operations on stdin, `--as <name>` naming the agent its comments are by; `comments import <file>` adds another comments file's comments it doesn't have; `comments rm --resolved` removes resolved threads. See [comments.md](comments.md#reading-dffy-comments). |
 | `<review command> [<id>]` | Experimental, and only with a review plugin set (`review` or `--review`) that describes itself: the plugin's command, named by the plugin, e.g. `dffy pr` for dffy-review-github (a GitLab plugin could name it `mr`). One of the code host's reviews in the viewer: `<base>...<head>` with its review threads, which you answer and post from there. Without an id, the current branch's review, or a list to pick from. It needs a terminal. Without such a plugin, `pr` is a revision like any other. See [viewer.md](viewer.md#code-host-reviews) and [plugins.md](plugins.md#the-review-command). |
 | `config` | The effective settings, each marked with where its value comes from. `--default` prints every key with its documentation and default instead. See [config.md](config.md). |
 | `themes` | The available themes, with a preview. `--dump <name>` prints a built-in theme as a theme file to copy and edit. See [themes.md](themes.md). |
-| `doctor` | Checks git, the repository, the watches it needs, the terminal, the config, the cache and `dffyd`, and times dffy on the repository; `--json` prints it all as one object. See [troubleshooting.md](troubleshooting.md#dffy-doctor). |
+| `checkpoint` | Takes a checkpoint of the working tree and prints its number, for `--since-checkpoint=<n>`. It touches neither the index, `HEAD` nor the files; the last 5 are kept. See [git.md](git.md#checkpoints). |
+| `doctor` | Checks git, the repository, the watches it needs, the terminal, the config, the cache and `dffyd`, the plugins, the agents and their dffy skill, and times dffy on the repository, a row per thing; `--verbose` prints each check on its own line with all it found, and `--json` prints it all as one object. See [troubleshooting.md](troubleshooting.md#dffy-doctor). |
 | `mcp` | A Model Context Protocol server on stdin and stdout, for coding agents: tools that list changed files and return diffs as the objects of `--json`, a page at a time, and tools that drive the viewer the user has open. Register it with `claude mcp add dffy -- dffy mcp`. See [mcp.md](mcp.md). |
-| `ctl` | Drives a running viewer: `ctl open src/lib.rs:42` shows a line, `ctl focus <id>` a comment thread, `ctl comment src/lib.rs:42 <text>` adds a comment, `ctl selection` and `ctl state` print what's selected and shown, `ctl views` lists the viewers. It goes to the viewer in this working tree, or `--view <id>`; `--json` prints the protocol's result. See [control.md](control.md). |
+| `ctl` | Drives a running viewer: `ctl open src/lib.rs:42` shows a line, `ctl focus <id>` a comment thread, `ctl comment src/lib.rs:42 <text>` adds a comment, `ctl apply-suggestion <id>` applies a thread's suggestion, `ctl selection` and `ctl state` print what's selected and shown, `ctl views` lists the viewers. It goes to the viewer in this working tree, or `--view <id>`; `--json` prints the protocol's result. See [control.md](control.md). |
+| `agents` | Teaches coding agents to use dffy: `agents setup` writes a small skill where Claude Code, Codex, Pi and Amp read skills, `agents status` says whether it's there and current, `agents remove` takes it back, and `agents show` prints the guide the skill points to. See [agents.md](agents.md). |
 | `daemon status`, `daemon stop` | Inspect or stop the watch broker. See [watch.md](watch.md#dffyd). |
 | `completions <shell>` | A completion script for `bash`, `zsh`, `fish`, `elvish` or `powershell`. See [install.md](install.md#shell-completions). |
 
@@ -62,10 +67,13 @@ Otherwise dffy prints.
 | `dffy <rev>^!` | The first parent of `<rev>` with `<rev>` |
 | `dffy show <rev>` | Same as `<rev>^!`, plus the commit header |
 | `dffy a.txt b.txt`, `dffy old/ new/` | Two files or folders, with or without a repository; see [Comparing files and folders](#comparing-files-and-folders) |
+| `dffy --since-checkpoint` | The latest checkpoint with the working tree: only what changed since `dffy checkpoint`, or since a Fix with agent started the agent |
+| `dffy --since-checkpoint=<n>` | Checkpoint `<n>`, the number `dffy checkpoint` printed, with the working tree |
 
 Revisions use git's syntax: branch and tag names, short ids, `HEAD^1`, `HEAD~3`, `@{u}` and so on. An empty side of a range means `HEAD`, so `dffy main..` compares `main` with `HEAD`. More than two revisions, or `--staged` with two, is an error.
 
 - **`--merge-base`:** with one revision, the old side becomes the merge base of it and `HEAD`; with two, the merge base of both. It needs at least one revision.
+- **`--since-checkpoint`:** takes no revisions, `--staged`, `--unstaged` or `--merge-base`, and fails with `no checkpoint in this working tree` before one is taken, or `no checkpoint 2 …` once pruning removed it. Lines shown this way can't be staged in the viewer. [git.md](git.md#checkpoints) has what a checkpoint holds.
 - **`-R`:** swaps the two sides.
 - **Unborn `HEAD`:** before the first commit, `HEAD` reads as the empty tree, so `dffy` shows every file as added and `dffy --staged` shows what's staged. Revisions that name `HEAD` (`dffy HEAD`, `dffy show`) fail with `unknown revision 'HEAD'`, as git's do.
 - **Typos:** an unknown revision exits with an error and the closest ref or subcommand name: `hint: did you mean 'main'?`. A revision that's really a path gets `hint: 'README.md' is a path; put paths after --, as in: dffy -- README.md`.

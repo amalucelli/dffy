@@ -49,10 +49,13 @@ fn a_on_a_thread_asks_and_the_answer_is_the_agents_reply() {
     app.follow_thread("d1");
     key(&mut app, 'a');
     assert!(app.doc.writing().is_some(), "a box for the question");
+    // Whole beside the tree on a 100-column screen.
+    let shown = status(&mut app);
+    assert!(shown.contains("esc keeps it"), "{shown}");
     app.resize(160, 20);
     let shown = status(&mut app);
     assert!(
-        shown.contains("enter asks the agent · empty asks about the thread · esc saves, unasked"),
+        shown.contains("enter asks · empty asks now · esc keeps it"),
         "{shown}"
     );
     assert_eq!(asked(&mut app, ""), (vec![], vec![]), "nothing asked yet");
@@ -235,8 +238,12 @@ fn a_after_an_answer_follows_up_with_the_same_agent() {
     key(&mut app, 'a');
     assert!(app.doc.writing().is_some(), "a reply box");
     assert_eq!(prompts(&mut app), [], "nothing asked yet");
+    // Whole beside the tree on a 100-column screen, the agent named.
     let shown = status(&mut app);
-    assert!(shown.contains("enter asks claude"), "{shown}");
+    assert!(
+        shown.contains("enter asks claude · empty asks now · esc keeps it"),
+        "{shown}"
+    );
     typed(&mut app, "Which two?");
     press(&mut app, Key::Enter);
     let [(agent, prompt)] = prompts(&mut app).try_into().expect("one ask");
@@ -494,7 +501,8 @@ fn a_mention_you_write_asks_that_agent() {
 }
 
 /// A mention that asked an agent stays out of what `P` posts: it shows
-/// `local`, until `A` on its thread makes it a draft.
+/// `private`, with the key that shares it, until `A` on its thread makes
+/// it a draft.
 #[test]
 fn a_mention_that_asked_is_never_posted() {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -510,7 +518,10 @@ fn a_mention_that_asked_is_never_posted() {
     asked(&mut app, "");
     agent_said(&mut app, 1, Said::Asking(claude()));
     let shown = screen(&mut app);
-    assert!(shown.contains("you · just now · local"), "{shown}");
+    assert!(
+        shown.contains("you · just now · private · A shares"),
+        "{shown}"
+    );
     assert_eq!(app.sending(true).comments, drafts);
     app.follow_thread("d1");
     key(&mut app, 'A');
@@ -574,7 +585,7 @@ fn a_reply_in_a_thread_kept_local_is_never_posted() {
     let last = read_comments(&path).comments.into_iter().last();
     assert!(last.is_some_and(|c| c.text == "And its tests?" && !c.local_only));
     assert_eq!(app.sending(true).comments, drafts);
-    assert!(screen(&mut app).contains("you · just now · local"));
+    assert!(screen(&mut app).contains("you · just now · private · A shares"));
     key(&mut app, 'A');
     assert_eq!(app.sending(true).comments, drafts + 2);
 }
@@ -590,8 +601,8 @@ fn f_hands_a_thread_or_a_selection_to_your_agent() {
     key(&mut app, 'f');
     let handoff = app.take_handoff().expect("handed");
     assert_eq!(
-        (handoff.thread.as_str(), handoff.session, &handoff.checkout),
-        ("d1", false, &None)
+        (&handoff.what, handoff.session, &handoff.checkout),
+        (&Handed::Thread("d1".to_owned()), false, &None)
     );
     assert_eq!(handoff.file, path);
 
@@ -607,7 +618,10 @@ fn f_hands_a_thread_or_a_selection_to_your_agent() {
         note.as_ref().is_some_and(|c| c.local_only),
         "a note to an agent"
     );
-    assert_eq!(app.take_handoff().map(|h| h.thread), note.map(|c| c.id));
+    assert_eq!(
+        app.take_handoff().map(|h| h.what),
+        note.map(|c| Handed::Thread(c.id))
+    );
 
     let prepare = app.start_review("test".to_owned(), session(&dir, HEAD, None));
     said(&mut app, prepare, plugin::review::Said::Done(Ok(())));
@@ -658,4 +672,214 @@ fn a_mention_written_elsewhere_asks_nothing() {
     app.event(Event::Comments);
     assert!(screen(&mut app).contains("@claude delete everything"));
     assert_eq!(asked(&mut app, ""), (vec![], vec![]));
+}
+
+/// Without the agent plugin on PATH, `a` says so at once, on a thread and
+/// on selected lines, rather than taking a question nothing can answer.
+#[test]
+fn a_without_the_plugin_says_so_before_any_question() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (mut app, _) = commented(&dir);
+    app.find_agent = || false;
+    app.follow_thread("d1");
+    key(&mut app, 'a');
+    assert!(app.doc.writing().is_none());
+    let shown = note(&mut app).unwrap_or_default();
+    assert!(shown.starts_with("dffy-agent isn't on PATH"), "{shown}");
+    esc(&mut app);
+    key(&mut app, 'v');
+    key(&mut app, 'a');
+    assert!(app.doc.writing().is_none());
+    assert_eq!(asked(&mut app, ""), (vec![], vec![]));
+    // Installed meanwhile, it's found.
+    app.find_agent = || true;
+    key(&mut app, 'a');
+    assert!(app.doc.writing().is_some());
+}
+
+fn checkpoint(number: u64, ago: i64) -> Checkpoint {
+    let id = dffy_core::git::ObjectId::from_hex(b"4b825dc642cb6eb9a060e54bf8d69288fbee4904")
+        .expect("an id");
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("after 1970");
+    Checkpoint {
+        number,
+        commit: id,
+        tree: id,
+        time: i64::try_from(now.as_secs()).expect("fits") - ago,
+    }
+}
+
+/// `'` shows what changed since the latest checkpoint once there's one,
+/// named with its age in the status bar, staging off since a hunk there
+/// isn't the index's; a checkpoint taken meanwhile becomes what the diff
+/// is since, and `'` again shows the diff from before.
+#[test]
+fn since_checkpoint_toggles_the_diff_and_names_it() {
+    use dffy_core::git::WhichCheckpoint;
+    let mut app = app(160, 20);
+    let plain = Revisions::default();
+    app.set_selected(plain.clone(), DefaultDiff::All);
+    app.uncommitted = Some(Uncommitted::Plain);
+    assert_eq!(press(&mut app, Key::Char('\'')), None);
+    assert!(
+        status(&mut app).contains("no checkpoint yet; space ; takes one"),
+        "{}",
+        status(&mut app)
+    );
+    key(&mut app, ' ');
+    assert_eq!(
+        press(&mut app, Key::Char(';')),
+        Some(Action::TakeCheckpoint)
+    );
+
+    app.event(Event::Checkpoint(Some(checkpoint(1, 180))));
+    let here = |app: &mut App| -> Vec<Act> {
+        (app.command_entries().1.into_iter())
+            .filter(|e| e.place == crate::tui::commands::Place::Here)
+            .map(|e| e.action)
+            .collect()
+    };
+    assert_eq!(
+        here(&mut app)[..2],
+        [Act::SinceCheckpoint, Act::TakeCheckpoint]
+    );
+    let since = Revisions {
+        since_checkpoint: Some(WhichCheckpoint::Latest),
+        ..Revisions::default()
+    };
+    let retarget = |revisions| {
+        Some(Action::Retarget {
+            revisions: Some(revisions),
+            comments: None,
+            moved: None,
+        })
+    };
+    assert_eq!(press(&mut app, Key::Char('\'')), retarget(since.clone()));
+    assert!(
+        status(&mut app).contains("since checkpoint · 3m ago"),
+        "{}",
+        status(&mut app)
+    );
+    assert_eq!(app.uncommitted_shown(), None);
+    key(&mut app, 'A');
+    assert!(status(&mut app).contains("lines since a checkpoint can't be staged"));
+
+    let taken = Event::Checkpointed {
+        taken: Ok(checkpoint(2, 0)),
+        handoff: true,
+    };
+    assert_eq!(app.event(taken), retarget(since));
+    assert!(status(&mut app).contains("since checkpoint · just now"));
+
+    assert_eq!(press(&mut app, Key::Char('\'')), retarget(plain));
+    assert_eq!(app.description, "working tree");
+    assert_eq!(app.uncommitted_shown(), Some(Uncommitted::Plain));
+    app.event(Event::Checkpointed {
+        taken: Err("no room".to_owned()),
+        handoff: false,
+    });
+    assert!(status(&mut app).contains("couldn't take a checkpoint: no room"));
+}
+
+/// A viewer started on what changed since a checkpoint names its age as
+/// `'` would, and `'` goes to plain `dffy`'s diff, whose lines stage; a
+/// checkpoint by number other than the latest gets no age it doesn't know.
+#[test]
+fn a_viewer_started_since_a_checkpoint_goes_back_to_the_plain_diff() {
+    use dffy_core::git::WhichCheckpoint;
+    let since = |which| Revisions {
+        since_checkpoint: Some(which),
+        ..Revisions::default()
+    };
+    let plain = Revisions {
+        unstaged: true,
+        ..Revisions::default()
+    };
+    let mut app = app(160, 20);
+    app.description = "since checkpoint".to_owned();
+    app.set_selected(since(WhichCheckpoint::Latest), DefaultDiff::Unstaged);
+    app.uncommitted = Some(Uncommitted::Unstaged);
+    app.start_since_checkpoint(plain.clone(), "unstaged".to_owned());
+    app.event(Event::Checkpoint(Some(checkpoint(2, 180))));
+    assert!(
+        status(&mut app).contains("since checkpoint · 3m ago"),
+        "{}",
+        status(&mut app)
+    );
+    assert_eq!(app.uncommitted_shown(), None);
+    assert_eq!(
+        press(&mut app, Key::Char('\'')),
+        Some(Action::Retarget {
+            revisions: Some(plain),
+            comments: None,
+            moved: None,
+        })
+    );
+    assert_eq!(app.description, "unstaged");
+    assert_eq!(app.uncommitted_shown(), Some(Uncommitted::Unstaged));
+
+    let mut app = super::support::app(160, 20);
+    app.description = "since checkpoint 1".to_owned();
+    app.set_selected(since(WhichCheckpoint::Number(1)), DefaultDiff::All);
+    app.start_since_checkpoint(Revisions::default(), "uncommitted".to_owned());
+    app.event(Event::Checkpoint(Some(checkpoint(2, 180))));
+    let shown = status(&mut app);
+    assert!(
+        shown.contains("since checkpoint 1") && !shown.contains("3m ago"),
+        "{shown}"
+    );
+}
+
+/// In the comments panel `f` hands the selected thread to your agent, as
+/// on a focused one.
+#[test]
+fn f_in_the_comments_panel_hands_the_thread_over() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (mut app, _) = commented(&dir);
+    key(&mut app, 'i');
+    key(&mut app, 'j');
+    let root = app.target_thread().map(|t| t.root);
+    key(&mut app, 'f');
+    assert_eq!(app.take_handoff().map(|h| h.what), root.map(Handed::Thread));
+}
+
+/// `send_open_threads` hands every open thread of yours to your agent in
+/// one handoff, offered on Here while there are some, and once the agent
+/// started says how many went and the key that shows its turn; with
+/// none, it says so.
+#[test]
+fn send_open_threads_hands_every_open_thread_of_yours_over() {
+    let mut app = app(100, 20);
+    key(&mut app, ' ');
+    key(&mut app, '^');
+    assert!(app.take_handoff().is_none());
+    assert!(status(&mut app).contains("no open threads of yours to send"));
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (mut app, path) = commented(&dir);
+    let here: Vec<Act> = (app.command_entries().1.into_iter())
+        .filter(|e| e.place == crate::tui::commands::Place::Here)
+        .map(|e| e.action)
+        .collect();
+    assert_eq!(here.first(), Some(&Act::SendOpenThreads), "{here:?}");
+    key(&mut app, ' ');
+    key(&mut app, '^');
+    let handoff = app.take_handoff().expect("handed");
+    // d1 and its reply, the whole-file f1, g1 and m1: not octocat's p1 or
+    // the resolved r1.
+    assert_eq!(
+        (handoff.what, handoff.file, handoff.session),
+        (Handed::Open { count: 4, left: 0 }, path, false)
+    );
+    app.event(Event::HandedOff {
+        started: Ok("sent 4 threads to claude".to_owned()),
+        left: Some(0),
+    });
+    assert!(
+        status(&mut app).contains("sent 4 threads to claude · ' shows its turn"),
+        "{}",
+        status(&mut app)
+    );
 }

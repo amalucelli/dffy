@@ -1,0 +1,26 @@
+---
+source: crates/dffy/src/tui/app/tests/command_panel.rs
+expression: panel(&mut app)
+---
+┌─ commands ──────────────────────────────────────────────────────────── esc close ─┐
+│  Here  View  Files  Review  Git  Copy                                             │
+│                                                                                   │
+│ Comments                                                                          │
+│ E    Continue in editor                                                           │
+│ -    Delete resolved threads…                                                     │
+│ S    Suggest change                                                               │
+│                                                                                   │
+│ Agents                                                                            │
+│ a    Ask agent                                                                    │
+│ &    Fix with agent                                                               │
+│ .    Open terminal here                                                           │
+│                                                                                   │
+│                                                                                   │
+│                                                                                   │
+│                                                                                   │
+│                                                                                   │
+│                                                                                   │
+│                                                                                   │
+│                                                                                   │
+│ key or enter runs · j/k move · h/l step a value                                   │
+│ tab section · / search · esc close                                                │

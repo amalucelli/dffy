@@ -10,7 +10,7 @@ use dffy_core::view::Attributes;
 use unicode_width::UnicodeWidthStr;
 
 use super::{Action, App, escape};
-use crate::keys::Keys;
+use crate::keys::{Action as Act, Keys, Table};
 use crate::plugin::agent::Request as AgentRequest;
 use crate::plugin::review::{Listed, ReviewEvent, ReviewLabel, Said, Session};
 use crate::review::model;
@@ -19,8 +19,8 @@ use crate::review::session::{
 };
 use crate::term::{self, Grid, Input, Key, Mods};
 use crate::theme::{Role, Style, Theme};
-use crate::tui::help;
 use crate::tui::textbox::TextBox;
+use crate::tui::{help, menu};
 
 /// The dialog `P` opens to post the review: a summary, the plugin's
 /// events, and one line when something won't go.
@@ -151,6 +151,9 @@ impl App {
     /// Takes a review's range as what's shown: its words in the title, and
     /// the revisions an empty list is worded by.
     fn show_range(&mut self, range: session::Range) -> Revisions {
+        // The review's range takes the place of the changes since a
+        // checkpoint too.
+        self.since_checkpoint = None;
         self.description = range.description;
         self.doc.page_title = range.title;
         if let Some((selected, _)) = &mut self.selected {
@@ -185,6 +188,25 @@ impl App {
         }
         let effects = self.reviewing.list();
         self.review_effects(effects)
+    }
+
+    /// What the keys do on the review open: post it, pull its updates,
+    /// show what changed since your last review and, on the one plain
+    /// `dffy` found, the whole review. Nothing off a review.
+    pub(super) fn review_offers(&self) -> Vec<menu::Offer> {
+        if !self.reviewing.on_review() {
+            return Vec::new();
+        }
+        let main = |label: &str, action| menu::Offer::new(label, action, Table::Main);
+        let mut offers = vec![
+            main(Act::ReviewPost.title(), Act::ReviewPost),
+            main(Act::ReviewPull.title(), Act::ReviewPull),
+            main(Act::SinceLastReview.title(), Act::SinceLastReview),
+        ];
+        if self.reviewing.found_plain() {
+            offers.push(main(&self.reviewing.whole_title(), Act::WholeReview));
+        }
+        offers
     }
 
     /// Asks `plugin` whether the branch checked out has a review, for
@@ -409,12 +431,12 @@ impl App {
                 dialog.local = !dialog.local;
                 let local = dialog.local;
                 if self.sending(true).local == 0 {
-                    self.message("no local drafts on this diff");
+                    self.message("no branch drafts on this diff");
                 } else {
                     self.message(if local {
-                        "the local drafts go with the review"
+                        "the branch drafts go with the review"
                     } else {
-                        "the local drafts stay local"
+                        "the branch drafts stay on the branch"
                     });
                 }
             }
@@ -638,7 +660,7 @@ impl Dialog {
             lines.push((
                 format!(
                     "l  {mark} with the {} on this diff",
-                    plural(sending.local, "local draft")
+                    plural(sending.local, "branch draft")
                 ),
                 Style::PLAIN,
             ));

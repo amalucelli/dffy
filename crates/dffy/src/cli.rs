@@ -230,7 +230,7 @@ pub(crate) enum Command {
         With --json, print the whole file in its format; with --markdown, the \
         threads with their lines. `dffy comments apply` reads a JSON list of \
         operations on stdin, applies them all or none, and prints the ids they \
-        touched; `dffy comments rm --resolved` removes resolved threads; `dffy \
+        touched, with --as <name> for an agent's comments; `dffy comments rm --resolved` removes resolved threads; `dffy \
         comments prompt <id>` prints a thread as a prompt for a coding agent. See \
         docs/comments.md.")]
     Comments(CommentsArgs),
@@ -238,6 +238,16 @@ pub(crate) enum Command {
     /// reads.
     #[command(skip)]
     Review { id: Option<String> },
+    /// Take a checkpoint of the working tree and print its number
+    #[command(
+        long_about = "Take a checkpoint of the working tree and print its number.\n\n\
+        A checkpoint keeps the files plain dffy lists (staged and unstaged changes, and \
+        untracked files git doesn't ignore) under a local ref of this worktree, \
+        refs/worktree/dffy/checkpoints/<n>, without touching the index, HEAD or the files. \
+        dffy --since-checkpoint then shows only what changed since the latest, and \
+        --since-checkpoint=<n> since that one. The last 5 are kept. See docs/usage.md."
+    )]
+    Checkpoint,
     /// Print the effective configuration
     Config {
         /// Print every key with its documentation and default value instead
@@ -261,11 +271,14 @@ pub(crate) enum Command {
         #[arg(long, value_name = "name")]
         dump: Option<String>,
     },
-    /// Check git, the repository, watch limits, the terminal and the config
+    /// Check git, the repository, watch limits, the terminal, the config, plugins and agents
     Doctor {
         /// Print every check and measurement as one JSON object
         #[arg(long)]
         json: bool,
+        /// Print each check on a line of its own, with all it found
+        #[arg(long, conflicts_with = "json")]
+        verbose: bool,
     },
     /// Inspect or stop the dffyd watch broker
     Daemon {
@@ -283,12 +296,24 @@ pub(crate) enum Command {
         with an agent, as in: claude mcp add dffy -- dffy mcp. See docs/mcp.md."
     )]
     Mcp,
-    /// Drive a running viewer: show a file at a line, focus a thread, read the selection
+    /// Drive a running viewer: show a file at a line, focus a thread, read the selection, apply a suggestion
     #[command(long_about = "Drive a running viewer through dffyd's control API.\n\n\
         Each command goes to the viewer running in this working tree (or -C <path>'s), \
         or to --view <id>. Paths are relative to the current directory. --json prints \
         the protocol's result. See docs/control.md.")]
     Ctl(CtlArgs),
+    /// Teach coding agents to use dffy: install, check or remove its skill, or print the guide
+    #[command(long_about = "Teach coding agents to use dffy.\n\n\
+        setup writes a small skill, dffy/SKILL.md, where agents read skills: \
+        ~/.claude/skills for Claude Code and ~/.agents/skills for Codex, Pi and Amp, \
+        or with --project the same directories at the repository's root. The skill \
+        tells the agent to run dffy agents show, which prints the guide for this \
+        dffy. status says whether each place holds the current skill, and remove \
+        takes back the skills setup wrote. See docs/agents.md.")]
+    Agents {
+        #[command(subcommand)]
+        action: AgentsAction,
+    },
     /// Print a shell completion script
     Completions {
         #[arg(value_enum)]
@@ -363,7 +388,11 @@ pub(crate) struct BranchArgs {
 #[derive(Debug, Clone, Subcommand)]
 pub(crate) enum CommentsAction {
     /// Apply a JSON list of operations from stdin, all or none, and print the ids they touched
-    Apply,
+    Apply {
+        /// The author of the comments it adds that name none, as an agent gives its own name; without it they're yours
+        #[arg(long = "as", value_name = "name", value_parser = author_name)]
+        author: Option<String>,
+    },
     /// Add the comments of another comments file that this one doesn't have, by id or ref
     Import {
         /// The comments file to take them from
@@ -381,8 +410,18 @@ pub(crate) enum CommentsAction {
     /// Print a thread as a prompt for a coding agent: its comments, its lines and the file's changes near them
     Prompt {
         /// The id of any comment in the thread
-        #[arg(value_name = "id")]
-        id: String,
+        #[arg(
+            value_name = "id",
+            required_unless_present = "open",
+            conflicts_with = "open"
+        )]
+        id: Option<String>,
+        /// Every open thread of yours on the current branch in one prompt, each under its id: those you started or replied in
+        #[arg(long)]
+        open: bool,
+        /// With --open, the threads' ids, how many on other branches were left out, and the prompt, as one JSON object
+        #[arg(long, requires = "open")]
+        json: bool,
     },
 }
 
@@ -424,8 +463,81 @@ pub(crate) enum CtlAction {
         #[arg(required = true, value_name = "text")]
         text: Vec<String>,
     },
+    /// Put a thread's suggestion in the working tree, as s on the thread in the viewer would
+    ApplySuggestion {
+        /// A comment with a suggestion, or any comment of its thread for the last one with one
+        #[arg(value_name = "id")]
+        id: String,
+    },
     /// Print the protocol's JSON Schema
     Schema,
+}
+
+/// What a comment's author can be named: what MCP makes of a client's
+/// name, refused rather than replaced, and never `you`, which is how your
+/// own comments show.
+fn author_name(name: &str) -> Result<String, String> {
+    let name = name.trim();
+    if name.is_empty() || name.eq_ignore_ascii_case("you") {
+        return Err("give your own name, not empty or `you`, which means the user".to_owned());
+    }
+    if name.chars().any(char::is_control) {
+        return Err("a name can't hold control characters".to_owned());
+    }
+    if name.chars().count() > 64 {
+        return Err("a name is at most 64 characters".to_owned());
+    }
+    Ok(name.to_owned())
+}
+
+#[derive(Debug, Clone, Subcommand)]
+pub(crate) enum AgentsAction {
+    /// Write the dffy skill where agents read skills
+    Setup {
+        #[command(flatten)]
+        at: SkillArgs,
+        /// Say what it would write, and write nothing
+        #[arg(long)]
+        dry_run: bool,
+        /// Replace a dffy/SKILL.md that dffy didn't write
+        #[arg(long)]
+        force: bool,
+        /// Print the result as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Say whether each place holds the current skill, an outdated one, another's, or none
+    Status {
+        #[command(flatten)]
+        at: SkillArgs,
+        /// Print the result as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Remove the skills setup wrote; another dffy/SKILL.md stays
+    Remove {
+        #[command(flatten)]
+        at: SkillArgs,
+        /// Say what it would remove, and remove nothing
+        #[arg(long)]
+        dry_run: bool,
+        /// Print the result as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Print the guide the skill points agents to: how to work with this dffy
+    Show,
+}
+
+/// Where `dffy agents` looks.
+#[derive(Debug, Clone, Args)]
+pub(crate) struct SkillArgs {
+    /// Only the place this agent reads; repeatable. Without it, every agent's
+    #[arg(long, value_enum, value_name = "agent")]
+    pub agent: Vec<crate::agents::Agent>,
+    /// The repository's own skill directories, at its root, instead of the home directory's
+    #[arg(long)]
+    pub project: bool,
 }
 
 #[derive(Debug, Clone, Subcommand)]
@@ -478,6 +590,19 @@ pub(crate) struct DiffArgs {
     /// Compare from the merge base of the revision(s) and HEAD
     #[arg(long)]
     pub merge_base: bool,
+    /// Compare the latest checkpoint, or checkpoint N, with the working tree: only what changed since `dffy checkpoint` printed N
+    #[arg(
+        long,
+        value_name = "N",
+        num_args = 0..=1,
+        require_equals = true,
+        conflicts_with_all = ["revs", "staged", "unstaged", "all", "merge_base", "no_index", "color_only"]
+    )]
+    #[expect(
+        clippy::option_option,
+        reason = "clap's optional-value form: absent, bare --since-checkpoint, or --since-checkpoint=<n>"
+    )]
+    pub since_checkpoint: Option<Option<u64>>,
     /// Exit with 1 if there are differences, 0 otherwise
     #[arg(long)]
     pub exit_code: bool,
@@ -690,7 +815,9 @@ mod tests {
     #[test]
     fn a_review_command_cant_be_a_builtin_subcommand_or_alias() {
         let builtin = |name| is_subcommand(&Cli::command(), name);
-        for name in ["diff", "show", "config", "doctor", "mcp", "man", "help"] {
+        for name in [
+            "diff", "show", "config", "doctor", "mcp", "agents", "man", "help",
+        ] {
             assert!(builtin(name), "{name}");
         }
         assert!(!builtin("mr"));

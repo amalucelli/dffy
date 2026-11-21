@@ -6,7 +6,7 @@ expression: screen(&mut app)
 │ ▼ src/                   │ @@ -1,7 +1,7 @@                                                       ┃
 │   ▼ …eply/nested/module/ │  1  1  │ line 1                                                       █
 │     M file.rs    +2   -2 │  2  2  │ line 2                                                       ┃
-│   M zz.rs                │        │  ┏ ▾ you · new comment · enter sends · shift+enter new li… ┓ ┃
+│   M zz.rs                │        │  ┏ ▾ you · new comment · enter saves · alt+enter new line… ┓ ┃
 │                          │        │  ┃ Why these?                                              ┃ ┃
 │                          │        │  ┃ Pasted                                                  ┃ ┃
 │                          │        │  ┃ lines▏                                                  ┃ ┃
@@ -21,4 +21,4 @@ expression: screen(&mut app)
 │                          │ 47 47  │ line 47                                                      │
 │                          │ 48 48  │ line 48                                                      │
 │                          │ 49 49  │ line 49                                                      │
-└«─  working tree  ────────┴─ 1/2 · 1/2 hunk  enter sends · shift+enter new line · ctrl+g contin… ─┘
+└«─  working tree  ────────┴─ 1/2 · 1/2 hunk  enter saves · alt+enter new line · esc keeps it ─────┘

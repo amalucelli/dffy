@@ -38,11 +38,14 @@ const CLAUDE_ARGS: [&str; 14] = [
     "dontAsk",
 ];
 
-/// The agent protocol's messages, shared with dffy's own tests.
-fn messages() -> Value {
+/// The agent protocol's messages, shared with dffy's own tests. The
+/// programs in them are under `@BIN@`, the PATH directory they're found
+/// in, which is `bin` here.
+fn messages(bin: &Path) -> Value {
     let path = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../crates/dffy/tests/fixtures/agent-protocol/messages.json");
-    serde_json::from_slice(&fs::read(path).expect("the protocol's messages")).expect("JSON")
+    let text = fs::read_to_string(path).expect("the protocol's messages");
+    serde_json::from_str(&text.replace("@BIN@", bin.to_str().expect("utf-8"))).expect("JSON")
 }
 
 struct Fixture {
@@ -100,6 +103,18 @@ impl Fixture {
 
     fn pi(&self) -> &Self {
         self.install("pi", include_str!("fixtures/stubs/pi.sh"))
+    }
+
+    fn amp(&self) -> &Self {
+        self.install("amp", include_str!("fixtures/stubs/amp.sh"))
+    }
+
+    /// `name`'s stub by its absolute path, as `initialize` names it.
+    fn bin(&self, name: &str) -> String {
+        self.path(&format!("bin/{name}"))
+            .to_str()
+            .expect("utf-8")
+            .to_owned()
     }
 
     fn start(&self) -> Session {
@@ -246,16 +261,24 @@ fn alive(pid: &str) -> bool {
         .success()
 }
 
+/// `initialize` lists the agents found that an ask can go to, and apart
+/// from them how a thread is handed to each agent found that runs
+/// interactively: Claude Code on its prompt as an argument, Amp, which no
+/// ask goes to, with its first message on the clipboard.
 #[test]
-fn initialize_lists_only_the_agents_found() {
+fn initialize_lists_the_agents_and_the_handoffs_found() {
     let f = Fixture::new();
-    f.claude();
+    f.claude().amp();
     let (session, init) = f.session(None);
     session.close();
     assert_eq!(
         init,
         json!({"protocol": 1, "capabilities": {},
-            "agents": [{"name": "claude", "default": true, "mark": null}]})
+        "agents": [{"name": "claude", "default": true, "mark": null}],
+        "handoffs": [
+            {"name": "claude", "program": f.bin("claude"), "args": ["{prompt}"]},
+            {"name": "amp", "program": f.bin("amp"), "args": [], "prompt": "clipboard"},
+        ]})
     );
 }
 
@@ -277,9 +300,9 @@ fn initialize_refuses_another_protocol() {
 /// The protocol's messages, as dffy's tests hold dffy to them.
 #[test]
 fn the_plugin_says_what_the_protocol_fixtures_say() {
-    let m = messages();
     let f = Fixture::new();
-    f.claude().codex();
+    let m = messages(&f.path("bin"));
+    f.claude().codex().amp();
     f.put(
         "stub/claude/answer.jsonl",
         include_str!("fixtures/claude-suggestion.jsonl"),
@@ -524,39 +547,113 @@ fn pi_on_path_is_listed_with_its_mark() {
     assert_eq!(
         doctor.expect("checks")["checks"],
         json!([
-            {"name": "claude", "ok": true, "detail": "not installed"},
-            {"name": "codex", "ok": true, "detail": "not installed"},
+            {"name": "claude", "ok": true, "info": true, "detail": "not installed"},
+            {"name": "codex", "ok": true, "info": true, "detail": "not installed"},
             {"name": "pi", "ok": true, "detail": "0.0.1-dev"},
             {"name": "pi recipe", "ok": true,
                 "detail": "read-only tools: read, grep, find and ls only, MCP off, \
-                           project config ignored, offline; no sandbox"},
+                           project config ignored, offline; no sandbox",
+                "brief": "read-only tools · no sandbox"},
         ])
     );
 }
 
-/// An agent that isn't installed is news, not a failure, while another
+/// An agent that isn't installed is a note, not a failure, while another
 /// one answers; one the config names is a failure.
 #[test]
 fn doctor_fails_an_agent_not_installed_only_when_its_wanted() {
     let f = Fixture::new();
     f.claude();
-    for (agent, ok) in [(None, true), (Some("codex"), false)] {
+    for (agent, codex) in [
+        (
+            None,
+            json!({"name": "codex", "ok": true, "info": true, "detail": "not installed"}),
+        ),
+        (
+            Some("codex"),
+            json!({"name": "codex", "ok": false, "detail": "not installed"}),
+        ),
+    ] {
         let (mut session, _) = f.session(agent);
         let (_, doctor) = session.call("doctor", &json!({}));
         session.close();
         assert_eq!(
             doctor.expect("checks")["checks"],
             json!([
-                {"name": "claude", "ok": true, "detail": "2.1.329 (Claude Code)"},
+                {"name": "claude", "ok": true, "detail": "2.1.329 (Claude Code)", "brief": "2.1.329"},
                 {"name": "claude recipe", "ok": true,
-                    "detail": "read-only: Read, Grep and Glob only, MCP tools denied, user settings only"},
+                    "detail": "read-only: Read, Grep and Glob only, MCP tools denied, user settings only",
+                    "brief": "read-only: Read, Grep, Glob"},
                 {"name": "claude auth", "ok": true, "detail": "logged in"},
-                {"name": "codex", "ok": ok, "detail": "not installed"},
-                {"name": "pi", "ok": true, "detail": "not installed"},
+                codex,
+                {"name": "pi", "ok": true, "info": true, "detail": "not installed"},
             ]),
             "{agent:?}"
         );
     }
+}
+
+/// The config may name an agent only Fix with agent starts, as Amp:
+/// `doctor` passes it, noting no ask goes to it, and fails it while it
+/// isn't installed, as it would an agent with a recipe.
+#[test]
+fn doctor_passes_an_agent_named_for_fix_with_agent_only() {
+    let f = Fixture::new();
+    f.claude();
+    let agent_row = |f: &Fixture| {
+        let (mut session, _) = f.session(Some("amp"));
+        let (_, doctor) = session.call("doctor", &json!({}));
+        session.close();
+        doctor.expect("checks")["checks"][0].clone()
+    };
+    assert_eq!(
+        agent_row(&f),
+        json!({"name": "agent", "ok": false,
+            "detail": "amp is used for Fix with agent only, and isn't installed"})
+    );
+    f.amp();
+    assert_eq!(
+        agent_row(&f),
+        json!({"name": "agent", "ok": true,
+            "detail": "amp is used for Fix with agent only; asks go to claude"})
+    );
+}
+
+/// `doctor` probes the agents side by side, each probe for 2 seconds at
+/// most: two agents that never answer cost one wait, not four, say so in
+/// their rows, and leave the rows of the one that answers, all in order.
+#[test]
+fn doctor_probes_side_by_side_and_says_who_didnt_answer() {
+    let f = Fixture::new();
+    f.claude().codex().pi();
+    f.put("stub/claude/slow", "30");
+    f.put("stub/codex/slow", "30");
+    let (mut session, _) = f.session(None);
+    let start = Instant::now();
+    let (_, doctor) = session.call("doctor", &json!({}));
+    let took = start.elapsed();
+    session.close();
+    assert_eq!(
+        doctor.expect("checks")["checks"],
+        json!([
+            {"name": "claude", "ok": false, "detail": "`claude --version` didn't answer in 2s"},
+            {"name": "claude recipe", "ok": true,
+                "detail": "read-only: Read, Grep and Glob only, MCP tools denied, user settings only",
+                    "brief": "read-only: Read, Grep, Glob"},
+            {"name": "claude auth", "ok": false, "detail": "`claude auth status` didn't answer in 2s"},
+            {"name": "codex", "ok": false, "detail": "`codex --version` didn't answer in 2s"},
+            {"name": "codex recipe", "ok": true,
+                "detail": "read-only sandbox: commands may run, no writes, no network, web search off",
+                "brief": "read-only sandbox"},
+            {"name": "codex auth", "ok": false, "detail": "`codex login status` didn't answer in 2s"},
+            {"name": "pi", "ok": true, "detail": "1.5.2"},
+            {"name": "pi recipe", "ok": true,
+                "detail": "read-only tools: read, grep, find and ls only, MCP off, \
+                           project config ignored, offline; no sandbox",
+                "brief": "read-only tools · no sandbox"},
+        ])
+    );
+    assert!(took < Duration::from_millis(3500), "took {took:?}");
 }
 
 /// The version only informs `doctor`: an agent on PATH is listed and runs
@@ -588,13 +685,31 @@ fn an_agent_on_path_runs_whatever_its_version() {
     assert_eq!(
         doctor.expect("checks")["checks"],
         json!([
-            {"name": "claude", "ok": true, "detail": "not installed"},
+            {"name": "claude", "ok": true, "info": true, "detail": "not installed"},
             {"name": "codex", "ok": true, "detail": "codex-cli dev"},
             {"name": "codex recipe", "ok": true,
-                "detail": "read-only sandbox: commands may run, no writes, no network, web search off"},
+                "detail": "read-only sandbox: commands may run, no writes, no network, web search off",
+                "brief": "read-only sandbox"},
             {"name": "codex auth", "ok": true, "detail": "logged in"},
-            {"name": "pi", "ok": true, "detail": "not installed"},
+            {"name": "pi", "ok": true, "info": true, "detail": "not installed"},
         ])
+    );
+}
+
+/// A CLI whose `--help` doesn't list one of its recipe's flags fails the
+/// recipe's row, saying which: every ask would fail on it.
+#[test]
+fn doctor_fails_a_recipe_its_cli_doesnt_know() {
+    let f = Fixture::new();
+    f.codex();
+    f.put("stub/codex/unknown", "--ephemeral");
+    let (mut session, _) = f.session(None);
+    let (_, doctor) = session.call("doctor", &json!({}));
+    session.close();
+    assert_eq!(
+        doctor.expect("checks")["checks"][2],
+        json!({"name": "codex recipe", "ok": false,
+            "detail": "doesn't know --ephemeral: upgrade codex"})
     );
 }
 

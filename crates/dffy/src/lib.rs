@@ -1,6 +1,7 @@
 //! The `dffy` binary. It's a library only so benchmarks can reach the
 //! renderer; [`main`] is the whole program.
 
+mod agents;
 mod cli;
 mod config;
 mod control;
@@ -532,7 +533,7 @@ fn print_err(ctx: &Ctx, canvas: &Canvas) {
 }
 
 /// `dffy doctor`: fails when a check does.
-fn doctor(ctx: &Ctx, dir: Option<&Path>, json: bool) -> Result<ExitCode, Error> {
+fn doctor(ctx: &Ctx, dir: Option<&Path>, json: bool, verbose: bool) -> Result<ExitCode, Error> {
     let facts = doctor::Facts::gather(ctx, dir);
     let failed = if json {
         let (text, failed) = facts.json();
@@ -540,7 +541,7 @@ fn doctor(ctx: &Ctx, dir: Option<&Path>, json: bool) -> Result<ExitCode, Error> 
         failed
     } else {
         let mut c = Canvas::default();
-        let failed = facts.render(&mut c);
+        let failed = facts.render(&mut c, verbose);
         // Its exit code is always success; the checks decide doctor's.
         let _ = write_stdout(ctx, &c)?;
         failed
@@ -603,6 +604,7 @@ fn branch_scope<'a>(
 
 /// `dffy comments`: the threads listed, the file printed as JSON or
 /// Markdown, or written by `apply` and `rm`.
+#[expect(clippy::too_many_lines, reason = "a dispatch: an arm per action")]
 fn comments(
     dir: Option<&Path>,
     file: Option<&Path>,
@@ -621,35 +623,39 @@ fn comments(
     // the repository nor the branch.
     let branchless = matches!(
         args.action,
-        Some(CommentsAction::Apply | CommentsAction::Import { .. })
+        Some(CommentsAction::Apply { .. } | CommentsAction::Import { .. })
     ) || args.json;
     let repo = if file.is_some() && branchless {
         None
     } else {
         git::Repo::discover(&base_dir(dir)?).ok()
     };
-    let path = match (file, args.session) {
-        (Some(_), true) => {
-            return Err(Error::fatal(
-                "--comments and --session both name the comments file; give one",
-            ));
-        }
-        (_, false) => comments_file(dir, file, repo.as_ref())?,
-        (None, true) => {
-            let pointer = match &repo {
-                Some(repo) => review::read_session(repo).map_err(Error::fatal)?,
-                None => None,
-            };
-            pointer.map(|p| p.comments).ok_or_else(|| Error::Fatal {
+    // The session's file, with its review's head.
+    let (path, review_head) =
+        match (file, args.session) {
+            (Some(_), true) => {
+                return Err(Error::fatal(
+                    "--comments and --session both name the comments file; give one",
+                ));
+            }
+            (_, false) => (comments_file(dir, file, repo.as_ref())?, None),
+            (None, true) => {
+                let pointer = match &repo {
+                    Some(repo) => review::read_session(repo).map_err(Error::fatal)?,
+                    None => None,
+                };
+                pointer.map(|p| (p.comments, Some(p.head))).ok_or_else(|| {
+                    Error::Fatal {
                 message: "no review session: the viewer hasn't opened one in this repository"
                     .to_owned(),
                 hint: Some(
                     "open a review with the review plugin's command, as in dffy pr, then try again"
                         .to_owned(),
                 ),
-            })?
-        }
-    };
+            }
+                })?
+            }
+        };
     let current = repo
         .as_ref()
         .filter(|_| !branchless)
@@ -667,7 +673,7 @@ fn comments(
             writeln!(io::stdout().lock(), "removed {removed} comment{s}")?;
             Ok(ExitCode::SUCCESS)
         }
-        Some(CommentsAction::Apply) => {
+        Some(CommentsAction::Apply { author }) => {
             use std::io::{IsTerminal, Read};
             if io::stdin().is_terminal() {
                 return Err(Error::Fatal {
@@ -687,8 +693,8 @@ fn comments(
                 .as_ref()
                 .filter(|_| file.is_none() && !args.session)
                 .and_then(review::current_branch);
-            let answer =
-                review::apply_given(&path, &input, branch.as_deref()).map_err(Error::fatal)?;
+            let answer = review::apply_given(&path, &input, branch.as_deref(), author.as_deref())
+                .map_err(Error::fatal)?;
             io::stdout().lock().write_all(answer.as_bytes())?;
             Ok(ExitCode::SUCCESS)
         }
@@ -699,9 +705,32 @@ fn comments(
             writeln!(io::stdout().lock(), "imported {came} comment{s}")?;
             Ok(ExitCode::SUCCESS)
         }
-        Some(CommentsAction::Prompt { id }) => {
+        Some(CommentsAction::Prompt { id: None, json, .. }) => {
+            use crate::control::{line, number, object, text};
             let file = review::read(&path).map_err(Error::fatal)?;
-            let prompt = print::thread_prompt(repo.clone(), &file, &id, ctx).ok_or_else(|| {
+            let review = (&file, review_head.as_deref());
+            let branches = scope(&args.branches);
+            let (ids, others, prompt) = print::open_prompt(repo.clone(), review, branches, ctx);
+            let out = if json {
+                line(&object(vec![
+                    (
+                        "threads",
+                        plugin::json::Value::Array(ids.into_iter().map(text).collect()),
+                    ),
+                    ("elsewhere", number(others as u64)),
+                    ("prompt", text(prompt.text)),
+                    ("trimmed", plugin::json::Value::Bool(prompt.trimmed)),
+                ]))
+            } else {
+                prompt.text
+            };
+            io::stdout().lock().write_all(out.as_bytes())?;
+            Ok(ExitCode::SUCCESS)
+        }
+        Some(CommentsAction::Prompt { id: Some(id), .. }) => {
+            let file = review::read(&path).map_err(Error::fatal)?;
+            let review = (&file, review_head.as_deref());
+            let prompt = print::thread_prompt(repo.clone(), review, &id, ctx).ok_or_else(|| {
                 Error::Fatal {
                     message: format!("no comment has the id {id}"),
                     hint: Some("dffy comments lists them with their ids".to_owned()),
@@ -865,7 +894,8 @@ fn run(cli: Cli, ctx: &Ctx) -> Result<ExitCode, Error> {
             out.finish()?;
             Ok(ExitCode::SUCCESS)
         }
-        Some(Command::Doctor { json }) => doctor(ctx, dir, json),
+        Some(Command::Doctor { json, verbose }) => doctor(ctx, dir, json, verbose),
+        Some(Command::Checkpoint) => checkpoint(dir),
         Some(Command::Review { id }) => review_command(dir, id, ctx),
         Some(Command::Daemon { action }) => {
             let mut c = Canvas::default();
@@ -892,6 +922,7 @@ fn run(cli: Cli, ctx: &Ctx) -> Result<ExitCode, Error> {
             Ok(ExitCode::SUCCESS)
         }
         Some(Command::Ctl(args)) => control::client::ctl(dir, &args),
+        Some(Command::Agents { action }) => agents::run(dir, &action),
         Some(Command::Completions { shell }) => {
             let mut buf = Vec::new();
             let mut command = cli::command(ctx.described().map(|d| &d.naming));
@@ -906,6 +937,17 @@ fn run(cli: Cli, ctx: &Ctx) -> Result<ExitCode, Error> {
             Ok(ExitCode::SUCCESS)
         }
     }
+}
+
+/// `dffy checkpoint`: takes one of the working tree at `dir` and prints its
+/// number.
+fn checkpoint(dir: Option<&Path>) -> Result<ExitCode, Error> {
+    let cwd = std::env::current_dir()
+        .map_err(|e| Error::fatal(format!("can't read the current directory: {e}")))?;
+    let repo = git::Repo::discover(&dir.map_or_else(|| cwd.clone(), |dir| cwd.join(dir)))?;
+    let checkpoint = repo.take_checkpoint()?;
+    writeln!(io::stdout().lock(), "{}", checkpoint.number)?;
+    Ok(ExitCode::SUCCESS)
 }
 
 fn write_stdout(ctx: &Ctx, c: &Canvas) -> Result<ExitCode, Error> {
@@ -964,13 +1006,18 @@ fn diff(dir: Option<&Path>, args: &DiffArgs, ctx: &Ctx) -> Result<ExitCode, Erro
         }
         return print_diff(io::stdin().lock(), ctx.output(), ctx);
     }
-    let selected = args.staged || args.merge_base || !args.revs.is_empty();
+    let since_checkpoint = args
+        .since_checkpoint
+        .map(|n| n.map_or(git::WhichCheckpoint::Latest, git::WhichCheckpoint::Number));
+    let selected =
+        args.staged || args.merge_base || !args.revs.is_empty() || since_checkpoint.is_some();
     let revisions = git::Revisions {
         revs: args.revs.clone(),
         staged: args.staged,
         unstaged: args.unstaged
             || (!selected && !args.all && ctx.config.default_diff == DefaultDiff::Unstaged),
         merge_base: args.merge_base,
+        since_checkpoint,
     };
     let target = print::Target::Diff(&revisions);
     let c = &args.common;
@@ -1173,6 +1220,7 @@ fn open_review(
 fn detect_review(args: &DiffArgs, plan: &print::Plan, ctx: &Ctx) -> Option<tui::ReviewStart> {
     let unnamed = args.revs.is_empty()
         && !(args.staged || args.unstaged || args.merge_base || args.common.view.reverse)
+        && args.since_checkpoint.is_none()
         && args.common.paths.is_empty();
     let on_branch = || {
         plan.repo
@@ -1365,8 +1413,12 @@ fn piped(ctx: &Ctx) -> Result<ExitCode, Error> {
 }
 
 /// What a diff compares, as a short phrase.
-fn describe(r: &git::Revisions, reverse: bool) -> String {
+pub(crate) fn describe(r: &git::Revisions, reverse: bool) -> String {
     let mut s = match (r.revs.is_empty(), r.staged) {
+        _ if r.since_checkpoint.is_some() => match r.since_checkpoint {
+            Some(git::WhichCheckpoint::Number(n)) => format!("since checkpoint {n}"),
+            _ => "since checkpoint".to_owned(),
+        },
         (true, false) if r.unstaged => "unstaged".to_owned(),
         (true, false) => "uncommitted".to_owned(),
         (true, true) => "staged".to_owned(),
@@ -1559,6 +1611,7 @@ fn selects_from_repo(args: &DiffArgs) -> bool {
         || args.unstaged
         || args.all
         || args.merge_base
+        || args.since_checkpoint.is_some()
         || args.exit_code
         || args.json
         || c.stat

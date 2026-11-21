@@ -23,7 +23,7 @@ use std::io::{self, BufRead, Write};
 use std::path::{Path, PathBuf};
 
 use dffy_core::diff::Options;
-use dffy_core::git::{FileChange, Repo, Revisions};
+use dffy_core::git::{FileChange, Repo, Revisions, WhichCheckpoint};
 
 use crate::config::{Context, DefaultDiff};
 use crate::encode::{self, Compared, Detail, Files, Window};
@@ -83,6 +83,7 @@ const TOOLS: &str = r#"[
     "type": "object",
     "properties": {
       "range": {"type": ["string", "array"], "items": {"type": "string"}, "description": "Revisions as git diff takes them: \"main..HEAD\", \"main...HEAD\", \"HEAD~3\", \"v1.0 v2.0\" (a string is split at spaces), or an array of them. Omit for uncommitted changes."},
+      "since_checkpoint": {"type": ["string", "integer"], "description": "Instead of range: \"latest\" for what changed since the user's latest dffy checkpoint, or a checkpoint's number. A checkpoint is taken as the user hands their review to an agent, so this is the agent's own turn."},
       "paths": {"type": ["string", "array"], "items": {"type": "string"}, "description": "Only files under these paths, relative to the repository root. No globs."},
       "syntax": {"type": "boolean", "default": false, "description": "Diff by syntax to fill in each file's classification (formatting_only, moved_only) and syntax outcome."},
       "counts": {"type": "boolean", "default": true, "description": "Count added and removed lines. false reads no file content: added and removed are null and binary is false."},
@@ -113,6 +114,7 @@ const TOOLS: &str = r#"[
     "properties": {
       "path": {"type": "string", "description": "The file, relative to the repository root, as changed_files lists it. A renamed file's old path works too."},
       "range": {"type": ["string", "array"], "items": {"type": "string"}, "description": "The same range as for changed_files. Omit for uncommitted changes."},
+      "since_checkpoint": {"type": ["string", "integer"], "description": "As for changed_files, instead of range."},
       "syntax": {"type": "boolean", "default": false, "description": "Diff by syntax: marks moved and reformatted lines."},
       "context": {"type": "integer", "minimum": 0, "maximum": 10000, "default": 3, "description": "Unchanged lines around each change."},
       "max_lines": {"type": "integer", "minimum": 1, "maximum": 20000, "default": 400, "description": "Lines per result, across hunks."},
@@ -773,6 +775,21 @@ impl Args<'_> {
         }
     }
 
+    /// `since_checkpoint`: `"latest"`, or a checkpoint's number.
+    fn checkpoint(&self) -> Result<Option<WhichCheckpoint>, String> {
+        match self.get("since_checkpoint") {
+            None => Ok(None),
+            Some(Value::String(s)) if s == "latest" => Ok(Some(WhichCheckpoint::Latest)),
+            Some(value) => (value.as_usize())
+                .and_then(|n| u64::try_from(n).ok())
+                .filter(|&n| n > 0)
+                .map(|n| Some(WhichCheckpoint::Number(n)))
+                .ok_or_else(|| {
+                    "since_checkpoint must be \"latest\" or a checkpoint's number".to_owned()
+                }),
+        }
+    }
+
     fn cursor(&self) -> Result<Option<Cursor>, String> {
         self.string("cursor")?
             .map(|c| Cursor::decode(c).ok_or_else(|| STALE.to_owned()))
@@ -823,6 +840,8 @@ impl Cursor {
 /// What every tool resolves: the range and the paths.
 struct Range {
     revisions: Vec<String>,
+    /// `since_checkpoint`, in place of `revisions`.
+    since: Option<WhichCheckpoint>,
     plan: Plan,
 }
 
@@ -841,19 +860,35 @@ impl Server<'_> {
         Ok(repo)
     }
 
-    /// Resolves `revisions` and `paths` (relative to the repository root)
-    /// against the repository as it is now.
-    fn range(&mut self, revisions: Vec<String>, paths: &[String]) -> Result<Range, String> {
+    /// Resolves `revisions`, or the checkpoint `since` names, and `paths`
+    /// (relative to the repository root) against the repository as it is
+    /// now.
+    fn range(
+        &mut self,
+        revisions: Vec<String>,
+        since: Option<WhichCheckpoint>,
+        paths: &[String],
+    ) -> Result<Range, String> {
         if revisions.iter().any(|r| r == "-") {
             return Err("range takes revisions; '-' (a diff on stdin) isn't one".to_owned());
+        }
+        if since.is_some() && !revisions.is_empty() {
+            return Err(
+                "since_checkpoint compares a checkpoint with the working tree; give it or range, \
+                 not both"
+                    .to_owned(),
+            );
         }
         let repo = self.repo()?;
         let root = repo
             .workdir()
             .map_or_else(|| self.base.clone(), Path::to_owned);
         let target = Revisions {
-            unstaged: revisions.is_empty() && self.ctx.config.default_diff == DefaultDiff::Unstaged,
+            unstaged: revisions.is_empty()
+                && since.is_none()
+                && self.ctx.config.default_diff == DefaultDiff::Unstaged,
             revs: revisions.clone(),
+            since_checkpoint: since,
             ..Revisions::default()
         };
         let paths: Vec<PathBuf> = paths.iter().map(PathBuf::from).collect();
@@ -866,7 +901,11 @@ impl Server<'_> {
             false,
         )
         .map_err(message)?;
-        Ok(Range { revisions, plan })
+        Ok(Range {
+            revisions,
+            since,
+            plan,
+        })
     }
 
     /// Every change of `range`, oriented and with renames paired.
@@ -905,8 +944,17 @@ impl Server<'_> {
     }
 
     fn changed_files(&mut self, args: &Args) -> Result<Output, String> {
-        args.only(&["range", "paths", "syntax", "counts", "limit", "cursor"])?;
+        args.only(&[
+            "range",
+            "since_checkpoint",
+            "paths",
+            "syntax",
+            "counts",
+            "limit",
+            "cursor",
+        ])?;
         let revisions = args.strings("range", true)?;
+        let since = args.checkpoint()?;
         let paths = args.strings("paths", false)?;
         let syntax = args.bool("syntax", false)?;
         let counts = args.bool("counts", true)?;
@@ -915,7 +963,7 @@ impl Server<'_> {
         if syntax && !counts {
             return Err("syntax: true reads every file; it needs counts left on".to_owned());
         }
-        let range = self.range(revisions, &paths)?;
+        let range = self.range(revisions, since, &paths)?;
         let changes = self.changes(&range)?;
         let mut h = request_hash("changed_files", &range);
         (syntax, counts).hash(&mut h);
@@ -970,6 +1018,7 @@ impl Server<'_> {
         args.only(&[
             "path",
             "range",
+            "since_checkpoint",
             "syntax",
             "context",
             "max_lines",
@@ -981,12 +1030,13 @@ impl Server<'_> {
             "path is required: a file from changed_files, relative to the repository root",
         )?;
         let revisions = args.strings("range", true)?;
+        let since = args.checkpoint()?;
         let syntax = args.bool("syntax", false)?;
         let context = args.number("context", 3, [0, 10_000])?;
         let max_lines = args.number("max_lines", 400, [1, 20_000])?;
         let comments = args.comments()?;
         let cursor = args.cursor()?;
-        let range = self.range(revisions, &[])?;
+        let range = self.range(revisions, since, &[])?;
         let wanted = range.plan.relative(Path::new(path)).map_err(message)?;
         let changes = self.changes(&range)?;
         let change = changes
@@ -1088,7 +1138,7 @@ impl Server<'_> {
         let max_lines = args.number("max_lines_per_file", 100, [1, 20_000])?;
         let comments = args.comments()?;
         let cursor = args.cursor()?;
-        let range = self.range(revisions, &paths)?;
+        let range = self.range(revisions, None, &paths)?;
         let changes = self.changes(&range)?;
         let mut h = request_hash("diff", &range);
         (syntax, context, comments).hash(&mut h);
@@ -1232,8 +1282,8 @@ impl Server<'_> {
         paths.sort_unstable();
         paths.dedup();
         let asked = !revisions.is_empty();
-        let listed =
-            (self.range(revisions, &paths)).and_then(|range| Ok((self.changes(&range)?, range)));
+        let listed = (self.range(revisions, None, &paths))
+            .and_then(|range| Ok((self.changes(&range)?, range)));
         let (changes, range) = match listed {
             Ok(listed) => listed,
             // Unasked, a diff that can't be made, as without a worktree,
@@ -1407,7 +1457,13 @@ impl Server<'_> {
             .ok_or("id is needed: a comment's id, from list_comments")?;
         let session = args.bool("session", false)?;
         let file = review::read(&self.comments_file(session)?)?;
-        let prompt = crate::print::thread_prompt(self.repo().ok(), &file, id, self.ctx)
+        let review_head = if session {
+            review::read_session(&self.repo()?)?.map(|pointer| pointer.head)
+        } else {
+            None
+        };
+        let review = (&file, review_head.as_deref());
+        let prompt = crate::print::thread_prompt(self.repo().ok(), review, id, self.ctx)
             .ok_or_else(|| {
                 let elsewhere = if session {
                     ""
@@ -1490,6 +1546,13 @@ impl Server<'_> {
 
     /// What `range` compares, in words.
     fn compared(&self, range: &Range) -> String {
+        match range.since {
+            Some(WhichCheckpoint::Latest) => {
+                return "the changes since the latest checkpoint".to_owned();
+            }
+            Some(WhichCheckpoint::Number(n)) => return format!("the changes since checkpoint {n}"),
+            None => {}
+        }
         if !range.revisions.is_empty() {
             return range.revisions.join(" ");
         }

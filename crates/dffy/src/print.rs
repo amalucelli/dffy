@@ -6,6 +6,7 @@
 //! from there the rest of the list is held until the rename pass has paired
 //! them, since any later file may pair with it.
 
+use std::collections::{HashMap, HashSet};
 use std::ops::{ControlFlow, Range};
 use std::path::{Component, Path, PathBuf};
 
@@ -133,24 +134,71 @@ impl Plan {
 
 /// The prompt of the thread comment `id` is in, for `dffy comments prompt`
 /// and MCP's `thread_prompt`: placed on its file's diff in what plain
-/// `dffy` shows in `repo`, else its lines as written. `None` when no
-/// comment has that id.
+/// `dffy` shows in `repo`, else its lines as written. `review_head` is the
+/// head of the review session `review` is the file of; the prompt says
+/// when HEAD isn't it. `None` when no comment has that id.
 pub(crate) fn thread_prompt(
     repo: Option<Repo>,
-    review: &review::Review,
+    (review, review_head): (&review::Review, Option<&str>),
     id: &str,
     ctx: &Ctx,
 ) -> Option<prompt::Prompt> {
     let thread = review.thread(id)?;
-    let root = thread[0];
-    // A diff that can't be made, as without a worktree, places nothing.
-    let placed = repo
-        .filter(|_| !root.path.is_empty())
-        .and_then(|repo| place_thread(repo, review, root, ctx).ok().flatten());
-    if let Some((diff, at)) = placed {
-        return Some(prompt::thread(&thread, &at, Some(&diff)));
-    }
-    let at = if root.path.is_empty() {
+    let elsewhere = elsewhere(repo.as_ref(), review_head);
+    let (diffs, placed) = place_threads(repo, review, &[thread[0]], ctx);
+    let (diff, at) = match placed.into_values().next() {
+        Some((i, at)) => (Some(&diffs[i]), at),
+        None => (None, unplaced(thread[0])),
+    };
+    Some(prompt::thread(&thread, &at, diff, elsewhere))
+}
+
+/// The open threads of yours that `branches` takes, for `dffy comments
+/// prompt --open`: their first comments' ids, how many of yours on other
+/// branches are left out, and the prompt holding them, each placed as
+/// [`thread_prompt`] places one.
+pub(crate) fn open_prompt(
+    repo: Option<Repo>,
+    (review, review_head): (&review::Review, Option<&str>),
+    branches: review::Branches,
+    ctx: &Ctx,
+) -> (Vec<String>, usize, prompt::Prompt) {
+    let threads = review.open_threads_of_yours(branches);
+    let others = match branches {
+        review::Branches::All => 0,
+        review::Branches::On(_) => {
+            let all = review.open_threads_of_yours(review::Branches::All);
+            all.len() - threads.len()
+        }
+    };
+    let elsewhere = elsewhere(repo.as_ref(), review_head);
+    let roots: Vec<&review::Comment> = threads.iter().map(|t| t[0]).collect();
+    let (diffs, placed) = place_threads(repo, review, &roots, ctx);
+    let ats: Vec<(At, Option<&FileDiff>)> = (roots.iter())
+        .map(|root| match placed.get(&root.id) {
+            Some((i, at)) => (at.clone(), Some(&diffs[*i])),
+            None => (unplaced(root), None),
+        })
+        .collect();
+    let open: Vec<prompt::Open> = (threads.iter().zip(&ats))
+        .map(|(thread, (at, diff))| (thread.as_slice(), at, *diff))
+        .collect();
+    let ids = roots.iter().map(|r| r.id.clone()).collect();
+    (ids, others, prompt::open_threads(&open, others, elsewhere))
+}
+
+/// Whether HEAD in `repo` isn't `review_head`, the head of the review
+/// session whose threads a prompt is of.
+fn elsewhere(repo: Option<&Repo>, review_head: Option<&str>) -> bool {
+    (repo.and_then(review::head_commit))
+        .zip(review_head)
+        .is_some_and(|(head, review_head)| head != review_head)
+}
+
+/// Where a thread with first comment `root` is shown without a diff of
+/// its file.
+fn unplaced(root: &review::Comment) -> At {
+    if root.path.is_empty() {
         At::Conversation {
             kind: root.kind.clone(),
             label: root.label.clone(),
@@ -159,50 +207,71 @@ pub(crate) fn thread_prompt(
         At::Lost
     } else {
         At::File
-    };
-    Some(prompt::thread(&thread, &at, None))
+    }
 }
 
-/// `root`'s file's diff in what plain `dffy` shows in `repo`, and where
-/// the thread is on it; `None` when that doesn't change the file.
-fn place_thread(
-    repo: Repo,
+/// The threads of `roots`, their first comments, placed on their files'
+/// diffs in what plain `dffy` shows in `repo`: those diffs, and by first
+/// comment's id, the diff each thread is on and where. A thread whose
+/// file that doesn't change has no entry, and neither has any when the
+/// diff can't be made, as without a worktree.
+fn place_threads(
+    repo: Option<Repo>,
     review: &review::Review,
-    root: &review::Comment,
+    roots: &[&review::Comment],
     ctx: &Ctx,
-) -> Result<Option<(FileDiff, At)>, Error> {
-    let Some(workdir) = repo.workdir().map(Path::to_owned) else {
-        return Ok(None);
-    };
-    let revisions = Revisions {
-        unstaged: ctx.config.default_diff == DefaultDiff::Unstaged,
-        ..Revisions::default()
-    };
-    let paths: Vec<PathBuf> = (std::iter::once(&root.path).chain(&root.old_path))
+) -> (Vec<FileDiff>, HashMap<String, (usize, At)>) {
+    let mut diffs = Vec::new();
+    let mut placed = HashMap::new();
+    let paths: Vec<PathBuf> = (roots.iter())
+        .filter(|r| !r.path.is_empty())
+        .flat_map(|r| std::iter::once(&r.path).chain(&r.old_path))
         .map(PathBuf::from)
         .collect();
-    let target = Target::Diff(&revisions);
-    let plan = Plan::resolve(repo, workdir, &target, &paths, Summary::Diff, false)?;
-    let mut changes = Vec::new();
-    plan.for_each_change(ctx, &mut |change| {
-        changes.extend(change);
-        Ok(())
-    })?;
-    let snapshot = Snapshot::new(review, review::Branches::All);
-    let options = Options {
-        context: 3,
-        whitespace: ctx.config.whitespace,
+    let Some(repo) = repo.filter(|_| !paths.is_empty()) else {
+        return (diffs, placed);
     };
-    for change in changes.into_iter().filter(|c| snapshot.has(c, false)) {
-        let diff = plan.repo.file_diff(change.clone(), &options)?;
-        let at = (snapshot.on(&change, &diff, false).into_iter())
-            .find(|hung| hung.thread[0].id == root.id)
-            .map(|hung| hung.at);
-        if let Some(at) = at {
-            return Ok(Some((diff, at)));
+    let Some(workdir) = repo.workdir().map(Path::to_owned) else {
+        return (diffs, placed);
+    };
+    let wanted: HashSet<&str> = roots.iter().map(|r| r.id.as_str()).collect();
+    let place = || -> Result<(), Error> {
+        let revisions = Revisions {
+            unstaged: ctx.config.default_diff == DefaultDiff::Unstaged,
+            ..Revisions::default()
+        };
+        let target = Target::Diff(&revisions);
+        let plan = Plan::resolve(repo, workdir, &target, &paths, Summary::Diff, false)?;
+        let mut changes = Vec::new();
+        plan.for_each_change(ctx, &mut |change| {
+            changes.extend(change);
+            Ok(())
+        })?;
+        let snapshot = Snapshot::new(review, review::Branches::All);
+        let options = Options {
+            context: 3,
+            whitespace: ctx.config.whitespace,
+        };
+        for change in changes.into_iter().filter(|c| snapshot.has(c, false)) {
+            let diff = plan.repo.file_diff(change.clone(), &options)?;
+            let mut on_it = false;
+            for hung in snapshot.on(&change, &diff, false) {
+                let id = &hung.thread[0].id;
+                if wanted.contains(id.as_str()) && !placed.contains_key(id) {
+                    placed.insert(id.clone(), (diffs.len(), hung.at));
+                    on_it = true;
+                }
+            }
+            if on_it {
+                diffs.push(diff);
+            }
         }
+        Ok(())
+    };
+    if place().is_err() {
+        placed.clear();
     }
-    Ok(None)
+    (diffs, placed)
 }
 
 /// What a terminal shows for an empty diff. `--staged` and `--unstaged` see
@@ -255,6 +324,9 @@ pub(crate) fn empty_text(
     others: Option<Others>,
 ) -> String {
     let nothing = "no changes".to_owned();
+    if revisions.since_checkpoint.is_some() {
+        return "no changes since the checkpoint".to_owned();
+    }
     if !revisions.revs.is_empty() || revisions.merge_base {
         return nothing;
     }
@@ -1381,8 +1453,7 @@ pub(crate) fn comments(
             c.line(Role::Plain, &escape(line.as_bytes()));
         }
     };
-    let placed: std::collections::HashMap<&str, &At> =
-        placed.iter().map(|(id, at)| (id.as_str(), at)).collect();
+    let placed: HashMap<&str, &At> = placed.iter().map(|(id, at)| (id.as_str(), at)).collect();
     let mut thread = None;
     for (i, comment) in comments.iter().enumerate() {
         if comment.in_reply_to.is_none() || comment.in_reply_to.as_deref() != thread {
@@ -1773,6 +1844,14 @@ mod tests {
         );
         let all = empty_message(&repo, &Revisions::default(), &[], DefaultDiff::All);
         assert_eq!(all, "no changes", "only --staged and --unstaged count");
+        let since = Revisions {
+            since_checkpoint: Some(dffy_core::git::WhichCheckpoint::Latest),
+            ..Revisions::default()
+        };
+        assert_eq!(
+            empty_text(&since, DefaultDiff::Unstaged, None),
+            "no changes since the checkpoint"
+        );
     }
 
     #[test]

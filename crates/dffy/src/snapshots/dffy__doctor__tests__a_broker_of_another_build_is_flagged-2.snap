@@ -2,7 +2,20 @@
 source: crates/dffy/src/doctor.rs
 expression: "broker.join(\"\\n\")"
 ---
-<warn>!</> dffyd       running (pid 4242), 1 root(s), 3 subscriber(s); it's a build from before brokers reported theirs, this dffy is 0.1.0+0123abcd
-  <hint>hint:</> dffy daemon stop; the next dffy --watch starts this build's broker
-<warn>!</> dffyd       a broker of protocol v2 runs too, from another dffy version
-  <hint>hint:</> it serves that version's views and exits a minute after the last one; dffy daemon stop from that version stops it now
+  <warn>!</> dffyd        running (pid 4242), 1 root(s), 3 subscriber(s); it's a build from before brokers reported theirs, this dffy is 0.1.0+0123abcd
+      <hint>hint:</> dffy daemon stop; the next dffy --watch starts this build's broker
+  <warn>!</> dffyd        a broker of protocol v2 runs too, from another dffy version
+      <hint>hint:</> it serves that version's views and exits a minute after the last one; dffy daemon stop from that version stops it now
+<file-header>terminal</>
+  <ok>✓</> terminal     TERM=xterm-ghostty, COLORTERM=truecolor, TERM_PROGRAM=ghostty, 160 columns
+  <ok>✓</> multiplexer  tmux; dffy's one query (the background color) falls back to dark if it isn't relayed
+  <ok>✓</> copy         tmux passes copies (y, Y) to the terminal: set-clipboard is on
+  <ok>✓</> color        on; the default theme uses the 16 ANSI colors, truecolor themes work too
+  <ok>✓</> config       /home/u/.config/dffy/config
+  <ok>✓</> theme        default
+  <ok>✓</> pager        less
+  <ok>✓</> cache        /home/u/.cache/dffy: 12.0MB in 40 entries, trimmed at 256.0MB
+<file-header>plugins</>
+  <ok>✓</> renderer     .md → markdown: ~/.local/bin/dffy-render-markdown
+  <warn>!</> renderer     .csv → csv: dffy-render-csv isn't on PATH
+      <hint>hint:</> install it, or see docs/plugins.md; files of this type show as lines

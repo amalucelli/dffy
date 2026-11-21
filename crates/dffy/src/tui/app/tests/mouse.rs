@@ -263,7 +263,7 @@ fn the_menu_of_a_panel_row_acts_on_its_thread() {
             "Resolve x",
             "Copy comment",
             "Copy thread",
-            "Copy as prompt",
+            "Copy as prompt y",
         ]
     );
     assert!(choose(&mut app, "Resolve").is_none());
@@ -306,7 +306,7 @@ fn the_menu_of_a_tree_file_runs_the_trees_keys() {
             "Copy path Y",
             "Copy absolute path",
             "Open in editor e",
-            "Open terminal here",
+            "Open terminal here ␣ .",
             "Mark viewed v",
             "Comment on file C",
             "Show only files with comments c",
@@ -357,7 +357,7 @@ fn the_menu_of_a_code_line_runs_its_keys_on_that_line() {
             "Suggest change S",
             "Copy line v y",
             "Open in editor e",
-            "Open terminal here"
+            "Open terminal here ␣ ."
         ]
     );
     let opened = choose(&mut app, "Open terminal here");
@@ -419,11 +419,11 @@ fn the_menu_inside_a_selection_acts_on_the_selection() {
             "Comment on selection c",
             "Suggest change S",
             "Ask agent a",
-            "Fix with agent",
+            "Fix with agent ␣ &",
             "Copy selection y",
-            "Copy as prompt",
+            "Copy as prompt ␣ \"",
             "Open in editor e",
-            "Open terminal here"
+            "Open terminal here ␣ ."
         ]
     );
     let copied = choose(&mut app, "Copy selection");
@@ -513,7 +513,7 @@ fn the_menu_of_a_thread_runs_its_focused_keys() {
             "Fold z",
             "Copy comment",
             "Copy thread",
-            "Copy as prompt",
+            "Copy as prompt y",
         ]
     );
     match choose(&mut app, "Copy as prompt") {
@@ -562,7 +562,7 @@ fn the_menu_of_a_thread_runs_its_focused_keys() {
             "Open on host o",
             "Copy comment",
             "Copy thread",
-            "Copy as prompt"
+            "Copy as prompt y"
         ]
     );
     let opened = choose(&mut app, "Open on host");
@@ -711,7 +711,7 @@ fn the_menu_of_a_thread_copies_a_comment_or_the_thread() {
     right_click(&mut app, "Because.");
     assert_eq!(
         menu_rows(&app)[menu_rows(&app).len() - 3..],
-        ["Copy comment", "Copy thread alt+c", "Copy as prompt"]
+        ["Copy comment", "Copy thread alt+c", "Copy as prompt y"]
     );
     assert_eq!(
         choose(&mut app, "Copy comment"),

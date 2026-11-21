@@ -2,6 +2,8 @@
 
 `dffy mcp` is a [Model Context Protocol](https://modelcontextprotocol.io) server for coding agents such as Claude Code, Cursor and Zed's agent. It lets an agent ask which files a diff changes and read the diffs it needs, a page at a time. The results are the header and file objects of `dffy --json` ([json.md](json.md)), so a long change doesn't land in the agent's context all at once. It also lists the review comments left on the code ([comments.md](comments.md)), gives a thread as a prompt and takes a reply in it, and drives the viewer the user has open: it shows them a line or a thread, reads their selection and applies a thread's suggestion ([Viewer tools](#viewer-tools)).
 
+An agent with a shell is better served by dffy's CLI, which the skill `dffy agents setup` installs teaches it to use ([agents.md](agents.md)). The MCP server is for hosts with no shell, such as Zed's and Cursor's agents without their terminal tool, and for sandboxes that keep `.git` read-only or block Unix sockets, as Codex's `workspace-write` mode may, where `dffy comments apply` and `dffy ctl` fail: the server runs outside the agent's sandbox.
+
 It runs over stdio: the agent starts `dffy mcp` and talks to it on stdin and stdout. It serves the repository of the directory it starts in, or the one `-C <path>` names, and the comments file `--comments <file>` names, or the repository's.
 
 ## Registering it
@@ -36,7 +38,7 @@ A client that starts servers outside the repository needs `-C`: `"args": ["-C", 
 
 ## Recommended agent prompt
 
-The server tells agents to use its tools instead of `git diff`, but agents often reach for git in a shell anyway, especially when a request mentions commits. Put this in the project's `CLAUDE.md`, `AGENTS.md` or equivalent:
+The server tells agents to use its tools instead of `git diff`, but agents often reach for git in a shell anyway, especially when a request mentions commits. For an agent with a shell, the skill ([agents.md](agents.md)) does this. Otherwise, put this in the project's `CLAUDE.md`, `AGENTS.md` or equivalent:
 
 ```
 To see what changed in the current git repository, use dffy tools instead of git diff, git show or git log -p.
@@ -63,6 +65,8 @@ Every diff tool takes `range`:
 - **Default:** without `range`, a tool shows the uncommitted changes, `HEAD` against the working tree with untracked files included, as plain `dffy` does. With `default-diff = unstaged` in the config, it shows the unstaged changes instead.
 - **Revisions:** `range` takes revisions as `git diff` does: `"main..HEAD"`, `"main...HEAD"`, `"HEAD~3"`, or `"v1.0 v2.0"`. Pass them as one string, split at spaces, or as an array.
 
+`changed_files` and `file_diff` also take `since_checkpoint`, in place of `range`: `"latest"` compares the latest [checkpoint](git.md#checkpoints) with the working tree, and a number the checkpoint with that number, as `dffy --since-checkpoint` does: what an agent changed since the user handed it their review. Given with `range`, or with no such checkpoint, it's a tool error that says so.
+
 Paths, in `paths` and `path`, are relative to the repository root, as the file objects give them. `paths` matches whole path components (`src` matches `src/lib.rs`, not `srcs/`) and takes no globs.
 
 ### `changed_files`
@@ -70,6 +74,7 @@ Paths, in `paths` and `path`, are relative to the repository root, as the file o
 | Input | Default | Meaning |
 |---|---|---|
 | `range` | uncommitted changes | What to compare. |
+| `since_checkpoint` | | `"latest"` or a checkpoint's number: what changed since it, in place of `range`. |
 | `paths` | all | Only files under these paths. |
 | `syntax` | `false` | Diff every file of the page by syntax, filling in `syntax` and `classification`. |
 | `counts` | `true` | Count added and removed lines. `false` reads no file content at all. |
@@ -92,6 +97,7 @@ The result:
 |---|---|---|
 | `path` | required | The file. A renamed file's old path finds it too. |
 | `range` | uncommitted changes | What to compare. |
+| `since_checkpoint` | | As for `changed_files`. |
 | `syntax` | `false` | Diff by syntax: `moved` and `reformatted` marks, emphasis on changed tokens only, and the classification. |
 | `context` | 3 | Unchanged lines around each change, 0 to 10000. |
 | `max_lines` | 400 | Lines per result, across hunks, 1 to 20000. |
@@ -153,7 +159,7 @@ The result:
 {"notice":null,"comments":[{"id":"9f3c2a71b04e5d18","path":"src/lib.rs","side":"new",…},…],"placed":{"9f3c2a71b04e5d18":{"side":"new","start":15,"end":17,"lost":false}},"standing":{},"total_comments":14,"next_cursor":null}
 ```
 
-- **`standing`:** with `session`, where each comment on this page lives, by its `id`: `posted` on the host (it has a `ref`), `draft` for yours that posting sends, `local` for one kept here, such as an agent's answer or a question to an agent ([comments.md](comments.md#drafts)). Empty without `session`, as nothing in the local review's file is posted. Kept apart from `comments`, whose objects are as the file holds them.
+- **`standing`:** with `session`, where each comment on this page lives, by its `id`: `posted` on the host (it has a `ref`), `draft` for yours that posting sends, `local` for one kept here, which the viewer shows as `private`, such as an agent's answer or a question to an agent ([comments.md](comments.md#drafts)). Empty without `session`, as nothing in the local review's file is posted. Kept apart from `comments`, whose objects are as the file holds them.
 
 - **`placed`:** where each line thread starting on this page is in `range`'s diff, by its first comment's `id`, as an annotation of `dffy --json --show-comments` gives it ([json.md](json.md#annotations)): the side and 1-based lines its anchor finds now, or `lost: true` with null lines when its lines are gone. A thread whose file the diff doesn't change, a comment on a whole file and a reply have no entry. It's filled only with `range`, or with `placed: true` on the uncommitted changes; otherwise it's empty and nothing is diffed. It costs a diff per file on the page with line threads: only the threads' files are listed and diffed. It's empty outside a repository, and with `placed: true` when the uncommitted changes can't be diffed, as without a worktree; a `range` given that can't be diffed is an error. It's kept apart from `comments`, whose objects are as the file holds them.
 - **`comments`:** each comment as the file holds it ([comments.md](comments.md#the-file-version-1)), unknown fields included, in thread order: a thread's first comment, then its replies in the order they were added. [General comments](comments.md#general-comments), which have no `path`, come first; then threads by path and first line, file comments first. With `path`, general comments are left out. A page may end inside a thread; the next page continues it.
@@ -201,7 +207,7 @@ The result:
 {"id":"e2a05d7c1f9b4836","thread":"9f3c2a71b04e5d18","author":"claude-code"}
 ```
 
-- **Author:** the client's name, as its `initialize` gives it in `clientInfo`, without control characters, up to 64 characters; `dffy mcp` when it gives none, as a client of the 2026-07-28 revision, which has no `initialize`, and when the name is `you`, as your own comments show. Never yours: on a review from a code host the reply shows `local`, and `P` leaves it until `A` on its thread makes it yours ([comments.md](comments.md#drafts)).
+- **Author:** the client's name, as its `initialize` gives it in `clientInfo`, without control characters, up to 64 characters; `dffy mcp` when it gives none, as a client of the 2026-07-28 revision, which has no `initialize`, and when the name is `you`, as your own comments show. Never yours: on a review from a code host the reply shows `private`, and `P` leaves it until `A` on its thread makes it yours ([comments.md](comments.md#drafts)).
 - **Never an ask:** a reply starting `@claude` asks no agent, as nothing but a comment typed in the viewer does.
 - An id no comment has is a tool error that says so; nothing is written.
 
@@ -220,7 +226,7 @@ The text says what happened (`The viewer shows src/lib.rs at line 42.`) or, for 
 
 #### `apply_suggestion`
 
-Puts a suggestion in place of its thread's lines in the working tree, as `s` on the thread does in the viewer ([viewer.md](viewer.md#applying-a-suggestion)): the suggestion of the comment `id` names, or when it has none, of the last comment in its thread with one. The viewer writes it, against the diff it shows, so the result is an unstaged change the user sees at once and can discard. It's a tool error, writing nothing, when the lines changed since the suggestion was written, when the viewer's diff is neither the working tree's nor a review's or doesn't have the file loaded yet (`open_in_viewer` it first), on the old version's lines, or on someone else's review that isn't checked out. It's refused too while the viewer asks an agent: that agent may have this server among its MCP servers, and is to only read.
+Puts a suggestion in place of its thread's lines in the working tree, as `s` on the thread does in the viewer ([viewer.md](viewer.md#applying-a-suggestion)): the suggestion of the comment `id` names, or when it has none, of the last comment in its thread with one. The viewer writes it, against the diff it shows, so the result is an unstaged change the user sees at once and can discard. It's a tool error, writing nothing, when the lines changed since the suggestion was written, when the viewer's diff is neither the working tree's nor a review's or doesn't have the file loaded yet (`open_in_viewer` it first), on the old version's lines, or on someone else's review that isn't checked out. It never takes a suggestion back, as `s` on an applied one does: one applied already is a tool error (`this suggestion is applied already`). It's refused too while the viewer asks an agent: that agent may have this server among its MCP servers, and is to only read.
 
 ## Results
 

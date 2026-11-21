@@ -1,0 +1,30 @@
+---
+source: crates/dffy/src/tui/help.rs
+expression: "shown(&mut help, &keys, 100, 30)"
+---
+
+
+
+       ┌─ keybinds ──────────────────────────────────────────────────────────── esc close ─┐
+       │  Move  Files  View  Git  Copy  Review  General                                    │
+       │                                                                                   │
+       │ Comments                                  on a thread                             │
+       │ c                 comment on lines        y                 copy as prompt        │
+       │ S                 suggest change          a                 ask agent             │
+       │ C                 comment on file         r                 reply to thread       │
+       │ i                 comments panel          e                 edit thread draft     │
+       │ V                 move thread here        d                 delete thread draft   │
+       │ E                 continue in editor      x                 resolve thread        │
+       │                                           A                 make it yours         │
+       │ Agents                                    s                 apply suggestion      │
+       │ a                 ask agent               f                 fix with agent        │
+       │                                           o                 open thread on host   │
+       │ Review                                                                            │
+       │ p                 update the review                                               │
+       │ P                 post the review                                                 │
+       │ O                 open a review…                                                  │
+       │ R                 since last review                                               │
+       │                                                                                   │
+       │ more settings: space · all keys: docs/keys.md                                     │
+       │ tab section · / search · esc close                                                │
+       └───────────────────────────────────────────────────────────────────────────────────┘

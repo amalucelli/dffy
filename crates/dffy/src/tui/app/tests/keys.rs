@@ -219,10 +219,10 @@ fn remapped_keys_act_and_the_help_shows_them() {
     typed(&mut app, "2");
     has(&mut app, "│ f n next file");
     typed(&mut app, "/quit");
-    has(&mut app, "│ ctrl+c ctrl+q quit Other");
+    has(&mut app, "│ ctrl+c ctrl+q quit General");
     app.event(Event::Input(Input::Key(Key::Esc, Mods::NONE)));
     typed(&mut app, "/help");
-    has(&mut app, "│ f1 show this help Other");
+    has(&mut app, "│ f1 show this help General");
     app.event(Event::Input(Input::Key(Key::Enter, Mods::NONE)));
     app.event(Event::Input(Input::Key(Key::F(1), Mods::NONE)));
     assert!(!screen(&mut app).contains("this help"));

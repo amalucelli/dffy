@@ -3,6 +3,7 @@
 - [install.md](install.md): Homebrew, building from source, shell completions, the man page, supported platforms.
 - [usage.md](usage.md): every subcommand and flag, revision and path syntax, stdin, comparing files and folders outside git, exit codes.
 - [json.md](json.md): `--json` output for scripts and agents, the versioned schema of its header, file, hunk and line objects.
+- [agents.md](agents.md): coding agents working with dffy: the skill `dffy agents setup` installs, the guide it points to, what an agent can do with dffy and the rules it follows, and when to use MCP instead.
 - [mcp.md](mcp.md): `dffy mcp`, the Model Context Protocol server for coding agents: registering it, its tools, paging and truncation.
 - [control.md](control.md): driving a running viewer with `dffy ctl` and the control API: its protocol, the commands and the security model.
 - [viewer.md](viewer.md): the full-screen viewer's layout, panels, search, selection and copy, comments, asking an agent, applying a suggestion, fixing with an agent, phones.

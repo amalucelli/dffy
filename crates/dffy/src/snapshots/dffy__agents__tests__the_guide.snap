@@ -1,0 +1,54 @@
+---
+source: crates/dffy/src/agents.rs
+expression: "guide(false, false)"
+---
+# dffy for agents
+
+dffy shows what changed in a git repository and keeps the user's review comments on those changes. Use it instead of git diff, git show or git log -p, and to work on the review threads the user leaves you. Run it inside the repository, or give -C <path>.
+
+## Read the changes
+
+1. `dffy --json --stat` lists the changed files with their line counts: one JSON object a line, a header first and an end object last. Without revisions it's the uncommitted changes, staged, unstaged and untracked.
+2. `dffy --json -- <path>` gives one file's hunks and lines. Read only the files that matter, so a large change never lands in your context at once.
+
+Revisions go before `--`, as in git: `dffy --json --stat main...HEAD` for a branch, `HEAD~3..HEAD` for the last commits, `<commit>^!` for one commit.
+
+## Review threads
+
+The user comments on lines in the dffy viewer. Each comment has an id.
+
+- `dffy comments --open` lists the open threads of the current branch, each comment under its id. `dffy comments --json` prints the whole comments file, every branch and field.
+- `dffy comments prompt <id>` prints one thread as a prompt: its comments, its lines and the file's changes near them. Do what its last comment asks, and only that.
+- When you're done with a thread, reply in it with what you changed:
+
+```sh
+dffy comments apply --as <your name> <<'EOF'
+[{"op":"add","comment":{"in_reply_to":"<id>","text":"Clamped the sum instead of widening the type."}}]
+EOF
+```
+
+Always give `--as` with your own name (claude, codex, pi, amp): a comment without an author is the user's own, which they could post under their name.
+
+- To propose a change instead of making it, add `"suggestion"` to the comment: the lines to put in place of the thread's lines, without a final newline; `""` deletes them. The user applies it with `s` in the viewer.
+- A code host's review the user has open in the viewer keeps its comments apart: give `--session` after `dffy comments`, as in `dffy comments --session --open` and `dffy comments --session apply --as <your name>`.
+
+## The user's viewer
+
+When the user has dffy open in this working tree, you can drive it. Each command fails with "no dffy viewer is running" when none is; carry on without it.
+
+- `dffy ctl selection` prints the lines they selected, after their place.
+- `dffy ctl state` prints the file it shows and the line at the top.
+- `dffy ctl open <path>:<line>` shows them a line; `dffy ctl focus <id>` a thread.
+- `dffy ctl apply-suggestion <id>` puts a thread's suggestion in the working tree, as `s` in the viewer does. Only when the user asks you to.
+
+## Rules
+
+- Never resolve a thread: the user resolves it once they've checked your change.
+- Never post: dffy doesn't, and don't post review comments to a code host for the user with another tool.
+- Never make a comment the user's (a `set` with an empty `author`), and never remove comments.
+
+## Sandboxes
+
+A sandbox that keeps `.git` read-only or blocks Unix sockets, as Codex's workspace-write mode may, makes `dffy comments apply` fail, as the comments file is in the git directory, and `dffy ctl` too. Use dffy's MCP server there when the user set it up (`dffy mcp`: list_comments, thread_prompt, reply_to_thread, apply_suggestion), or tell the user what you'd reply.
+
+`dffy --help` and `dffy <command> --help` list everything else.

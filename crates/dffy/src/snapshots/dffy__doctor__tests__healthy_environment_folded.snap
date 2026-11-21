@@ -1,0 +1,20 @@
+---
+source: crates/dffy/src/doctor.rs
+expression: folded(&facts())
+---
+<file-header>dffy 0.1.0</>
+  <ok>✓</> git          2.43.0
+  <ok>✓</> repository   ~/src/linux · main · 265 staged, 3 unstaged, 4 untracked
+  <ok>✓</> watch        67 needed here · 5,259 of 129,194 in use · dffyd holds them already
+  <dim>·</> speed        repo 3ms · first change 9ms · 270 changes 41ms · untracked 18ms
+  <ok>✓</> dffyd        running (pid 4242)
+<file-header>terminal</>
+  <ok>✓</> terminal     xterm-ghostty · truecolor · ghostty · 160 columns
+  <ok>✓</> multiplexer  tmux
+  <ok>✓</> copy         tmux set-clipboard on
+  <ok>✓</> color        on · 16-color theme, truecolor works
+  <ok>✓</> config       ~/.config/dffy/config · theme default · pager less
+  <ok>✓</> cache        ~/.cache/dffy · 12.0MB of 256.0MB
+<file-header>plugins</>
+  <warn>!</> render       markdown .md · .csv → csv: dffy-render-csv isn't on PATH
+      <hint>hint:</> install it, or see docs/plugins.md; files of this type show as lines

@@ -238,6 +238,7 @@ fn initialize(
     let answer = json!({
         "protocol": PROTOCOL,
         "agents": agents.listed(),
+        "handoffs": agents.handoffs(),
         "capabilities": {},
     });
     Ok((agents, answer))

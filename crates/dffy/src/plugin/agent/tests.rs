@@ -5,10 +5,14 @@ use super::*;
 
 const WAIT: Duration = Duration::from_secs(10);
 
-/// The protocol's messages, which dffy-agent's tests hold the plugin to.
+/// Where the protocol's messages put the programs they name, as `@BIN@`.
+const BIN: &str = "/opt/agents/bin";
+
+/// The protocol's messages, which dffy-agent's tests hold the plugin to,
+/// their programs under [`BIN`].
 fn messages() -> Value {
     let text = include_str!("../../../tests/fixtures/agent-protocol/messages.json");
-    json::parse(text.as_bytes()).expect("JSON")
+    json::parse(text.replace("@BIN@", BIN).as_bytes()).expect("JSON")
 }
 
 fn message(name: &str, part: &str) -> Value {
@@ -293,19 +297,44 @@ fn doctor_reads_the_plugins_checks() {
         Check {
             name: "claude".to_owned(),
             ok: true,
-            detail: "2.1.329 (Claude Code)".to_owned()
+            detail: "2.1.329 (Claude Code)".to_owned(),
+            brief: Some("2.1.329".to_owned()),
+            info: false,
         }
     );
+    assert!(checks[6].ok && checks[6].info, "{:?}", checks[6]);
 }
 
 /// The agents' names are what a mention names, and their marks one
-/// printable line; another protocol is refused.
+/// printable line; a handoff names its program by an absolute path, and
+/// takes its prompt in its arguments or on the clipboard; another protocol
+/// is refused.
 #[test]
 fn an_initialize_answer_is_checked() {
     let parse = |text: &str| json::parse(text.as_bytes()).expect("JSON");
-    let good = r#"{"protocol":1,"agents":[{"name":"claude","default":true,"mark":null}]}"#;
-    assert_eq!(Init::decode(&parse(good)).map(|i| i.agents.len()), Ok(1));
+    let good = r#"{"protocol":1,"agents":[{"name":"claude","default":true,"mark":null}],"handoffs":[{"name":"amp","program":"/bin/amp","args":["{prompt}"]}]}"#;
+    assert_eq!(
+        Init::decode(&parse(good)).map(|i| (i.agents.len(), i.handoffs.len())),
+        Ok((1, 1))
+    );
     for (answer, why) in [
+        (
+            good.replace("\"/bin/amp\"", "\"amp\""),
+            "amp's program isn't an absolute path",
+        ),
+        (
+            good.replace("[\"{prompt}\"]", "[]"),
+            "amp's handoff takes no prompt",
+        ),
+        (
+            good.replace("[\"{prompt}\"]", "[1]"),
+            "amp's args aren't text",
+        ),
+        (
+            good.replace("[\"{prompt}\"]", "[],\"prompt\":\"stdin\""),
+            "amp's prompt is stdin, and dffy knows only clipboard",
+        ),
+        (good.replace("\"amp\"", "\"A m p\""), "a handoff's name"),
         (good.replace("claude", "Claude Code"), "an agent's name"),
         (
             good.replace("null", "\"read\\u001b[2Jonly\""),
@@ -322,38 +351,104 @@ fn an_initialize_answer_is_checked() {
     }
 }
 
-/// A thread goes to the agent the config names when it's one that works
-/// interactively, else the first of claude, codex, pi and amp installed.
+/// The handoffs `initialize` describes, read as the protocol's messages
+/// have them: an agent on its prompt as an argument, or one whose prompt
+/// goes on the clipboard, which no ask goes to. Waiting for them doesn't
+/// take the place of waiting for the agents.
 #[test]
-fn a_thread_goes_to_the_agent_picked_and_installed() {
-    let installed = |names: &'static [&'static str]| {
-        move |name: &str| {
-            names
-                .contains(&name)
-                .then(|| PathBuf::from(format!("/bin/{name}")))
-        }
+fn the_handoffs_read_as_the_protocol_says() {
+    let stub = Stub::new();
+    let plugin = stub.start(None);
+    let (tx, rx) = mpsc::channel();
+    let agents = tx.clone();
+    plugin.on_ready(move |listed| {
+        agents.send(listed.map(|l| l.len().to_string())).ok();
+    });
+    for config in [None, Some("amp")] {
+        let tx = tx.clone();
+        plugin.on_handoff(config.map(str::to_owned), move |handoff| {
+            tx.send(handoff.map(|h| format!("{h:?}"))).ok();
+        });
+    }
+    let said: Vec<_> = (0..3)
+        .map(|_| rx.recv_timeout(WAIT).expect("said"))
+        .collect();
+    plugin.close();
+    assert_eq!(
+        said,
+        [
+            Ok("2".to_owned()),
+            Ok(format!(
+                "{:?}",
+                Handoff {
+                    name: "claude".to_owned(),
+                    program: PathBuf::from(format!("{BIN}/claude")),
+                    args: vec!["{prompt}".to_owned()],
+                    clipboard: false,
+                }
+            )),
+            Ok(format!(
+                "{:?}",
+                Handoff {
+                    name: "amp".to_owned(),
+                    program: PathBuf::from(format!("{BIN}/amp")),
+                    args: Vec::new(),
+                    clipboard: true,
+                }
+            )),
+        ]
+    );
+}
+
+/// A thread goes to the agent the config names, else to the first the
+/// plugin lists; a command of yours in the config takes no thread, so the
+/// first takes it. A name the plugin doesn't list is refused.
+#[test]
+fn a_thread_goes_to_the_agent_picked_from_the_handoffs() {
+    let listing = |names: &[&str]| {
+        let handoffs: Vec<String> = (names.iter())
+            .map(|name| {
+                format!(r#"{{"name":"{name}","program":"/bin/{name}","args":["{{prompt}}"]}}"#)
+            })
+            .collect();
+        let answer = format!(
+            r#"{{"protocol":1,"agents":[],"handoffs":[{}]}}"#,
+            handoffs.join(",")
+        );
+        Init::decode(&json::parse(answer.as_bytes()).expect("JSON")).expect("decodes")
     };
-    let all = installed(&["claude", "codex", "pi", "amp"]);
-    let pick = |config, find: &dyn Fn(&str) -> Option<PathBuf>| {
-        interactive(config, find).map(|(name, path)| (name, path.display().to_string()))
+    let pick = |init: &Init, config| init.handoff(config).map(|h| h.name.clone());
+    let all = listing(&["claude", "codex", "pi", "amp"]);
+    assert_eq!(pick(&all, None), Ok("claude".to_owned()));
+    assert_eq!(pick(&all, Some("amp")), Ok("amp".to_owned()));
+    assert_eq!(pick(&all, Some("my-agent --fast")), Ok("claude".to_owned()));
+    assert_eq!(pick(&listing(&["pi", "amp"]), None), Ok("pi".to_owned()));
+    assert_eq!(
+        pick(&listing(&["codex"]), Some("claude")),
+        Err("no agent named claude to hand the thread to; codex".to_owned())
+    );
+    assert_eq!(
+        pick(&listing(&[]), None),
+        Err("dffy-agent lists no agent to hand the thread to; dffy doctor says why".to_owned())
+    );
+}
+
+/// A handoff's command is its program and arguments, the prompt in place
+/// of `{prompt}`; one whose prompt goes on the clipboard has none of it.
+#[test]
+fn a_handoffs_command_carries_the_prompt_where_it_says() {
+    let handoff = |args: &[&str], clipboard| Handoff {
+        name: "agent".to_owned(),
+        program: PathBuf::from("/bin/agent"),
+        args: args.iter().map(|a| (*a).to_owned()).collect(),
+        clipboard,
     };
-    assert_eq!(pick(None, &all), Ok(("claude", "/bin/claude".to_owned())));
-    assert_eq!(pick(Some("amp"), &all).map(|p| p.0), Ok("amp"));
     assert_eq!(
-        pick(Some("my-agent --fast"), &all).map(|p| p.0),
-        Ok("claude")
+        handoff(&["--fast", "{prompt}"], false).command("Address it"),
+        ["/bin/agent", "--fast", "Address it"].map(OsString::from)
     );
     assert_eq!(
-        pick(None, &installed(&["pi", "amp"])).map(|p| p.0),
-        Ok("pi")
+        handoff(&[], true).command("Address it"),
+        ["/bin/agent"].map(OsString::from)
     );
-    assert_eq!(
-        pick(Some("claude"), &installed(&["codex"])),
-        Err("claude isn't on PATH".to_owned())
-    );
-    assert_eq!(
-        pick(None, &installed(&[])),
-        Err("none of claude, codex, pi and amp is on PATH".to_owned())
-    );
-    assert!(takes_prompt("pi") && !takes_prompt("amp"));
 }

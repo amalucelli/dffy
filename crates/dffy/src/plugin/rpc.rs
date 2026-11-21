@@ -69,8 +69,9 @@ pub(crate) fn detached(program: &Program, root: Option<&Path>) -> MakeCommand {
 /// How long `initialize` may take when only its answer is wanted. Until
 /// that's cached it may run before dffy's first output, as a review
 /// plugin's naming does when the arguments could name its command, so a
-/// hung plugin can't hold every such start.
-const DESCRIBE_TIMEOUT: Duration = Duration::from_secs(2);
+/// hung plugin can't hold every such start. Fix with agent waits as long
+/// for the agent plugin's.
+pub(crate) const DESCRIBE_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// A process that exits this many times in a row, each within
 /// [`STEADY`] of starting, isn't started again.
@@ -224,7 +225,8 @@ pub(crate) struct Inner<I, S, R> {
     crashes: u32,
     /// What the process that initialized last said.
     pub init: Option<I>,
-    on_ready: Option<OnReady<I>>,
+    /// What waits for `initialize`'s answer, in the order it came.
+    on_ready: Vec<OnReady<I>>,
     /// The kind's own.
     pub kind: S,
 }
@@ -274,12 +276,29 @@ impl<I, S, R> std::fmt::Debug for Run<I, S, R> {
     }
 }
 
+impl<I, S, R> Clone for Run<I, S, R> {
+    fn clone(&self) -> Self {
+        Self {
+            client: Weak::clone(&self.client),
+            id: self.id,
+        }
+    }
+}
+
 impl<I: Send + 'static, S: Send + 'static, R: Send + 'static> Run<I, S, R> {
     /// Asks the plugin to stop the request; it still ends as the kind says
     /// it does.
     pub(crate) fn cancel(&self) {
         if let Some(shared) = self.client.upgrade() {
             Client(shared).cancel(self.id);
+        }
+    }
+
+    /// Ends the request with `why`, through the kind, when it still waits
+    /// for the plugin to initialize; once sent, it's left to its answer.
+    pub(crate) fn give_up(&self, why: String) {
+        if let Some(shared) = self.client.upgrade() {
+            Client(shared).unqueue(self.id, why);
         }
     }
 }
@@ -308,7 +327,7 @@ impl<I: Send + 'static, S: Send + 'static, R: Send + 'static> Client<I, S, R> {
                 queued: Vec::new(),
                 crashes: 0,
                 init: None,
-                on_ready: None,
+                on_ready: Vec::new(),
                 kind: state,
             }),
         });
@@ -321,14 +340,15 @@ impl<I: Send + 'static, S: Send + 'static, R: Send + 'static> Client<I, S, R> {
     }
 
     /// Hands what `initialize` said to `ready` once the plugin has
-    /// initialized, or why it can't: now, if it has.
+    /// initialized, or why it can't: now, if it has. Several wait side by
+    /// side, and are handed it in the order they came.
     pub(crate) fn on_ready(&self, ready: impl FnOnce(Result<&I, String>) + Send + 'static) {
         let mut inner = self.0.lock();
         match (&inner.phase, &inner.init) {
             (Phase::Failed(e), _) => ready(Err(e.clone())),
             (Phase::Closed, _) => {}
             (_, Some(init)) => ready(Ok(init)),
-            (_, None) => inner.on_ready = Some(Box::new(ready)),
+            (_, None) => inner.on_ready.push(Box::new(ready)),
         }
     }
 
@@ -395,18 +415,27 @@ impl<I: Send + 'static, S: Send + 'static, R: Send + 'static> Client<I, S, R> {
     }
 
     fn cancel(&self, id: u64) {
+        if self.unqueue(id, "cancelled".to_owned()) {
+            return;
+        }
+        let inner = self.0.lock();
+        if inner.pending.get(&id).is_some_and(|p| !p.ended) {
+            inner.send_cancel(id);
+        }
+    }
+
+    /// Drops request `id` while it waits for `initialize`, ending it with
+    /// `why`; returns whether it was waiting.
+    fn unqueue(&self, id: u64, why: String) -> bool {
         let mut inner = self.0.lock();
-        if inner.pending.get(&id).is_none_or(|p| p.ended) {
-            return;
+        let Some(at) = inner.queued.iter().position(|(q, _)| *q == id) else {
+            return false;
+        };
+        drop(inner.queued.remove(at));
+        if let Some(pending) = inner.pending.remove(&id) {
+            (self.0.kind.failed)(pending, why);
         }
-        if let Some(at) = inner.queued.iter().position(|(q, _)| *q == id) {
-            drop(inner.queued.remove(at));
-            if let Some(pending) = inner.pending.remove(&id) {
-                (self.0.kind.failed)(pending, "cancelled".to_owned());
-            }
-            return;
-        }
-        inner.send_cancel(id);
+        true
     }
 
     /// Asks the plugin to shut down and exit, waits up to the kind's
@@ -663,7 +692,7 @@ fn read<I: Send + 'static, S: Send + 'static, R: Send + 'static>(
             // Before it initialized, it's refused rather than crashed.
             if inner.phase == Phase::Starting {
                 inner.phase = Phase::Failed(why.clone());
-                if let Some(ready) = inner.on_ready.take() {
+                for ready in std::mem::take(&mut inner.on_ready) {
                     ready(Err(why.clone()));
                 }
             }
@@ -738,8 +767,9 @@ fn initialized<I, S, R>(
             for (_, line) in std::mem::take(&mut inner.queued) {
                 inner.send(line);
             }
+            let waiting = std::mem::take(&mut inner.on_ready);
             let init = &*inner.init.insert(init);
-            if let Some(ready) = inner.on_ready.take() {
+            for ready in waiting {
                 ready(Ok(init));
             }
             Ok(())
@@ -747,7 +777,7 @@ fn initialized<I, S, R>(
         Err(e) => {
             inner.phase = Phase::Failed(e.clone());
             inner.fail_all(shared.kind.failed, &e);
-            if let Some(ready) = inner.on_ready.take() {
+            for ready in std::mem::take(&mut inner.on_ready) {
                 ready(Err(e.clone()));
             }
             Err(e)
@@ -786,8 +816,8 @@ fn exited<I: Send + 'static, S: Send + 'static, R: Send + 'static>(
     if inner.crashes > MAX_CRASHES {
         let e = format!("{why}; not started again after {MAX_CRASHES} exits in a row");
         inner.phase = Phase::Failed(e.clone());
-        if let Some(ready) = inner.on_ready.take() {
-            ready(Err(e));
+        for ready in std::mem::take(&mut inner.on_ready) {
+            ready(Err(e.clone()));
         }
         return;
     }

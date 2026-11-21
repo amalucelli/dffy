@@ -163,6 +163,70 @@ pub(super) fn tree_worktree(
     Ok(ControlFlow::Continue(()))
 }
 
+/// [`super::DiffSpec::Checkpoint`]: `tree` against the index overlaid with
+/// the worktree, as [`tree_worktree`] gives it, and the untracked files.
+/// The tree holds files that were untracked when it was taken, which the
+/// index doesn't: the tree-to-index diff reads one as deleted, so where the
+/// file is still on disk, untracked, the two sides are compared instead and
+/// its untracked row goes.
+pub(super) fn checkpoint_worktree(
+    repo: &Repo,
+    tree: ObjectId,
+    index: &gix::index::State,
+    filter: &Filter,
+    emit: &mut dyn FnMut(FileChange) -> ControlFlow<()>,
+) -> Result<ControlFlow<()>> {
+    let scan = Scan::new(repo, index)?;
+    let mut untracked = untracked_files(repo, index, scan.root, filter);
+    untracked.retain(|(_, mode)| *mode != Mode::Gitlink);
+    let mut paired = vec![false; untracked.len()];
+    let mut to_git = Conversion::default();
+    let mut failed = None;
+    let flow = tree_worktree(repo, tree, index, filter, false, &mut |change| {
+        let on_disk = (change.status == Status::Deleted)
+            .then(|| untracked.binary_search_by(|(path, _)| path.cmp(&change.path)))
+            .and_then(std::result::Result::ok);
+        let Some(i) = on_disk else {
+            return emit(change);
+        };
+        paired[i] = true;
+        let new = Side::Worktree {
+            mode: untracked[i].1,
+            id: None,
+        };
+        match scan.overlay(change.path.as_bstr(), change.old, Some(new), &mut to_git) {
+            Ok(Some(change)) => emit(change),
+            Ok(None) => ControlFlow::Continue(()),
+            Err(e) => {
+                failed = Some(e);
+                ControlFlow::Break(())
+            }
+        }
+    })?;
+    if let Some(e) = failed {
+        return Err(e);
+    }
+    if flow.is_break() {
+        return Ok(flow);
+    }
+    for ((path, mode), paired) in untracked.into_iter().zip(paired) {
+        if paired {
+            continue;
+        }
+        let change = FileChange {
+            path,
+            status: Status::Untracked,
+            old: None,
+            new: Some(Side::Worktree { mode, id: None }),
+            staging: None,
+        };
+        if emit(change).is_break() {
+            return Ok(ControlFlow::Break(()));
+        }
+    }
+    Ok(ControlFlow::Continue(()))
+}
+
 /// A tracked path whose worktree file differs from the index.
 struct Modified<'a> {
     path: &'a BStr,

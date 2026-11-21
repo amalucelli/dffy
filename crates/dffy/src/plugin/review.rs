@@ -28,7 +28,8 @@ use super::rpc::{self, Pending};
 pub(crate) const PROTOCOL: usize = 1;
 
 /// How long the plugin's `doctor` may take: its checks may ask the host.
-const DOCTOR_TIMEOUT: Duration = Duration::from_secs(10);
+/// Past it, its checks say it didn't answer, and `dffy doctor` goes on.
+const DOCTOR_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// What a plugin's `initialize` says: the subcommand dffy adds for it, the
 /// words for what it reviews, which dffy's screens use, and the events the
@@ -336,6 +337,11 @@ pub(crate) struct Check {
     pub name: String,
     pub ok: bool,
     pub detail: String,
+    /// The few words `dffy doctor`'s row of the check's group gives it.
+    pub brief: Option<String>,
+    /// A passed check that only notes something, as an agent that isn't
+    /// installed: neither a pass nor a problem.
+    pub info: bool,
 }
 
 /// The plugin's checks of what it needs, for `dffy doctor`: a session of
@@ -354,7 +360,7 @@ pub(crate) fn doctor(program: &Program) -> Result<Vec<Check>, String> {
             Ok(_) => {}
             Err(_) => {
                 break Err(format!(
-                    "its doctor took over {}s",
+                    "its doctor didn't answer in {}s",
                     DOCTOR_TIMEOUT.as_secs()
                 ));
             }
@@ -386,6 +392,9 @@ pub(crate) struct Session {
     pub labels: Vec<ReviewLabel>,
     /// The comments file, absolute.
     pub comments: PathBuf,
+    /// The command that checks the review out, as the plugin says it, for
+    /// dffy to show where something needs HEAD on the review's head.
+    pub checkout: Option<String>,
 }
 
 impl Session {
@@ -814,6 +823,9 @@ fn session(value: &Value, reviews: Option<&Path>) -> Result<Session, String> {
             None | Some(Value::Null) => Vec::new(),
             Some(labels) => review_labels(labels)?,
         },
+        // Only ever shown, never run; a line of text or nothing.
+        checkout: text(value, "checkout")
+            .filter(|c| !c.is_empty() && c.len() <= 200 && !c.contains(char::is_control)),
     };
     Ok(session)
 }
@@ -944,6 +956,8 @@ pub(crate) fn checks(result: &Value) -> Result<Vec<Check>, String> {
                 name: text(check, "name").ok_or("a check without a name")?,
                 ok: check.get("ok") == Some(&Value::Bool(true)),
                 detail: text(check, "detail").unwrap_or_default(),
+                brief: text(check, "brief"),
+                info: check.get("info") == Some(&Value::Bool(true)),
             })
         })
         .collect()

@@ -1,0 +1,15 @@
+---
+source: crates/dffy/src/agents.rs
+expression: stub()
+---
+---
+name: dffy
+description: "Read code changes and the user's review threads with dffy. Use it instead of git diff, git show or git log -p whenever you need to know what changed in a git repository: uncommitted edits, a branch, recent commits or any two revisions. Use it to list, read and reply to the review comments the user left on the code in dffy, to see what they selected in their dffy viewer, and to show them a line or a thread there."
+allowed-tools: Bash(dffy *)
+metadata:
+  dffy-skill: "1"
+---
+
+<!-- Installed by "dffy agents setup". Remove it with "dffy agents remove". -->
+
+Run `dffy agents show` and follow the guide it prints: how to read changes and work on the user's review threads with the dffy installed here. If that command doesn't exist, run `dffy --help`.

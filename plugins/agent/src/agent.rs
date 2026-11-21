@@ -17,10 +17,13 @@ use serde_json::{Value, json};
 
 use crate::server::{FAILED, Failure, LOGGED_OUT, Out, UNAVAILABLE};
 
-/// How long `--version` may take, for `doctor`.
-const VERSION_TIMEOUT: Duration = Duration::from_secs(1);
+/// How long each of `doctor`'s probes may take: `--version`, and asking
+/// whether it's logged in. dffy waits longer for the whole `doctor`, so a
+/// probe that doesn't answer is said in its own row.
+const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 
-/// How long asking an agent's CLI whether it's logged in may take.
+/// How long asking an agent's CLI whether it's logged in may take, after
+/// an ask failed.
 const AUTH_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// A built-in agent: how it's run so it only reads, and how what it prints
@@ -36,6 +39,8 @@ struct Recipe {
     mark: Option<&'static str>,
     /// What the recipe allows, for `doctor`.
     said: &'static str,
+    /// `said` in a few words, for `dffy doctor`'s row of the agent.
+    brief: &'static str,
     login: Login,
     /// What to run to log in, as a failed ask says it.
     log_in: &'static str,
@@ -80,6 +85,7 @@ static RECIPES: [Recipe; 3] = [
         worktree_flag: None,
         mark: None,
         said: "read-only: Read, Grep and Glob only, MCP tools denied, user settings only",
+        brief: "read-only: Read, Grep, Glob",
         login: Login::Status(&["auth", "status"]),
         log_in: "claude auth login",
         event: claude_event,
@@ -102,6 +108,7 @@ static RECIPES: [Recipe; 3] = [
         worktree_flag: Some("-C"),
         mark: Some("read-only sandbox"),
         said: "read-only sandbox: commands may run, no writes, no network, web search off",
+        brief: "read-only sandbox",
         login: Login::Status(&["login", "status"]),
         log_in: "codex login",
         event: codex_event,
@@ -126,9 +133,49 @@ static RECIPES: [Recipe; 3] = [
         mark: Some("read-only tools"),
         said: "read-only tools: read, grep, find and ls only, MCP off, \
                project config ignored, offline; no sandbox",
+        brief: "read-only tools · no sandbox",
         login: Login::Stderr(&["No API key found", "No models available"]),
         log_in: "pi auth login <provider>",
         event: pi_event,
+    },
+];
+
+/// How a review thread is handed to an agent run interactively, in its
+/// normal mode with none of a recipe's flags, for Fix with agent in dffy:
+/// its arguments, an item `{prompt}` being where dffy puts the thread's
+/// prompt, or with `clipboard` none, dffy putting the prompt on the
+/// clipboard for the user to paste.
+struct Handoff {
+    /// Its program on `PATH`, and its `name` in `initialize`.
+    name: &'static str,
+    args: &'static [&'static str],
+    clipboard: bool,
+}
+
+/// The agents a thread can be handed to, in the order dffy picks the first
+/// found. Amp has no recipe, as it has no read-only mode an ask could rely
+/// on, and takes its first message only on stdin, which an interactive
+/// session keeps for the user.
+static HANDOFFS: [Handoff; 4] = [
+    Handoff {
+        name: "claude",
+        args: &["{prompt}"],
+        clipboard: false,
+    },
+    Handoff {
+        name: "codex",
+        args: &["{prompt}"],
+        clipboard: false,
+    },
+    Handoff {
+        name: "pi",
+        args: &["{prompt}"],
+        clipboard: false,
+    },
+    Handoff {
+        name: "amp",
+        args: &[],
+        clipboard: true,
     },
 ];
 
@@ -147,39 +194,65 @@ pub(crate) struct Agent {
 /// The agents found, as `initialize` looked for them.
 pub(crate) struct Agents {
     list: Vec<Agent>,
+    /// The agents a thread can be handed to that are on `PATH`, each with
+    /// its program.
+    handoffs: Vec<(&'static Handoff, PathBuf)>,
     /// The config's `agent` value, as dffy passed it.
     configured: Option<String>,
 }
 
 impl Agents {
-    /// Looks for each recipe's program on `PATH`, and a custom command when
-    /// `configured` is one: a value with a space. Any other value names the
-    /// default agent. Nothing is run.
+    /// Looks for each recipe's and handoff's program on `PATH`, and a
+    /// custom command when `configured` is one: a value with a space. Any
+    /// other value names the default agent. Nothing is run.
     pub(crate) fn probe(configured: Option<&str>) -> Self {
         let configured = configured.map(str::trim).filter(|c| !c.is_empty());
         let custom = configured.filter(|c| c.contains(char::is_whitespace));
         let mut list: Vec<Agent> = custom.map(custom_agent).into_iter().collect();
         list.extend(RECIPES.iter().map(built_in));
+        let handoffs = (HANDOFFS.iter())
+            .filter_map(|handoff| Some((handoff, on_path(handoff.name)?)))
+            .collect();
         Self {
             list,
+            handoffs,
             configured: configured.map(str::to_owned),
         }
+    }
+
+    /// `initialize`'s `handoffs`: how a thread is handed to each agent
+    /// found, by its program's absolute path.
+    pub(crate) fn handoffs(&self) -> Value {
+        (self.handoffs.iter())
+            .map(|(handoff, program)| {
+                let mut said =
+                    json!({"name": handoff.name, "program": program, "args": handoff.args});
+                if handoff.clipboard {
+                    said["prompt"] = json!("clipboard");
+                }
+                said
+            })
+            .collect()
     }
 
     fn ready(&self) -> impl Iterator<Item = &Agent> {
         self.list.iter().filter(|a| a.ready())
     }
 
-    /// `initialize`'s `agents`: those that can run, the default first a
-    /// custom command, then the one the config names, then the first.
-    pub(crate) fn listed(&self) -> Value {
+    /// The agent an ask without a name goes to: a custom command, then the
+    /// one the config names, then the first that can run.
+    fn default(&self) -> Option<&'static str> {
         let named = self.configured.as_deref();
-        let default = self
-            .ready()
+        self.ready()
             .find(|a| a.recipe.is_none())
             .or_else(|| self.ready().find(|a| Some(a.name) == named))
             .or_else(|| self.ready().next())
-            .map(|a| a.name);
+            .map(|a| a.name)
+    }
+
+    /// `initialize`'s `agents`: those that can run, with the default.
+    pub(crate) fn listed(&self) -> Value {
+        let default = self.default();
         self.ready()
             .map(|a| json!({"name": a.name, "default": Some(a.name) == default, "mark": a.mark}))
             .collect()
@@ -198,66 +271,113 @@ impl Agents {
     }
 
     /// For `dffy doctor`: each agent found, looked for again, what its
-    /// `--version` says, how its recipe runs it, and whether it's logged
-    /// in. An agent not installed fails only when the config names it, or
-    /// when no agent can answer.
+    /// `--version` says, how its recipe runs it, failed when its `--help`
+    /// doesn't list one of the recipe's flags, and whether it's logged in. An agent not installed fails only when the config names it, or
+    /// when no agent can answer. A name the config gives an agent without
+    /// a recipe, which only Fix with agent starts, gets a row of its own.
+    /// The agents are probed side by side, each probe for
+    /// [`PROBE_TIMEOUT`] at most, and their rows kept in order.
     pub(crate) fn doctor(&self) -> Value {
         let fresh = Self::probe(self.configured.as_deref());
-        let check =
-            |name: &str, ok: bool, detail: &str| json!({"name": name, "ok": ok, "detail": detail});
         let mut checks = Vec::new();
         if let Some(named) = fresh.configured.as_deref().filter(|c| {
             !c.contains(char::is_whitespace) && !fresh.list.iter().any(|a| a.name == *c)
         }) {
-            let names: Vec<&str> = RECIPES.iter().map(|r| r.name).collect();
-            checks.push(check(
-                "agent",
-                false,
-                &format!(
-                    "{named} names no agent: {}, or a command and its arguments",
-                    names.join(", ")
-                ),
-            ));
+            let row = if !HANDOFFS.iter().any(|h| h.name == named) {
+                let names: Vec<String> = (RECIPES.iter().map(|r| r.name.to_owned()))
+                    .chain(
+                        (HANDOFFS.iter())
+                            .filter(|h| !RECIPES.iter().any(|r| r.name == h.name))
+                            .map(|h| format!("{} (Fix with agent only)", h.name)),
+                    )
+                    .collect();
+                check(
+                    "agent",
+                    false,
+                    &format!(
+                        "{named} names no agent: {}, or a command and its arguments",
+                        names.join(", ")
+                    ),
+                )
+            } else if fresh.handoffs.iter().any(|(h, _)| h.name == named) {
+                let asks =
+                    (fresh.default()).map_or_else(String::new, |d| format!("; asks go to {d}"));
+                check(
+                    "agent",
+                    true,
+                    &format!("{named} is used for Fix with agent only{asks}"),
+                )
+            } else {
+                check(
+                    "agent",
+                    false,
+                    &format!("{named} is used for Fix with agent only, and isn't installed"),
+                )
+            };
+            checks.push(row);
         }
         let any_ready = fresh.ready().next().is_some();
-        for agent in &fresh.list {
-            let program = match &agent.program {
-                Ok(program) => program,
-                Err(why) => {
-                    // Only news while another agent can answer and the
-                    // config doesn't ask for this one.
-                    let wanted = agent.recipe.is_none()
-                        || fresh.configured.as_deref() == Some(agent.name)
-                        || !any_ready;
-                    checks.push(check(agent.name, !wanted, why));
-                    continue;
-                }
-            };
-            let Some(recipe) = agent.recipe else {
-                let command = std::iter::once(program.display().to_string())
-                    .chain(agent.args.iter().cloned())
-                    .collect::<Vec<_>>()
-                    .join(" ");
-                checks.push(check(agent.name, true, &command));
-                continue;
-            };
-            checks.push(match version(program) {
-                Some(said) => check(agent.name, true, &said),
-                None => check(agent.name, false, "--version failed"),
-            });
-            checks.push(check(&format!("{} recipe", agent.name), true, recipe.said));
-            // A CLI that only says so as a run fails has no check here.
-            if let Login::Status(_) = recipe.login {
-                let auth = format!("{} auth", agent.name);
-                checks.push(match agent.logged_in() {
-                    Some(true) => check(&auth, true, "logged in"),
-                    Some(false) => check(&auth, false, &agent.log_in()),
-                    None => check(&auth, false, "its CLI didn't say whether it's logged in"),
-                });
-            }
-        }
+        let configured = fresh.configured.as_deref();
+        let rows: Vec<Vec<Value>> = std::thread::scope(|scope| {
+            let probes: Vec<_> = (fresh.list.iter())
+                .map(|agent| scope.spawn(move || agent.checks(configured, any_ready)))
+                .collect();
+            probes
+                .into_iter()
+                .map(|probe| probe.join().unwrap_or_default())
+                .collect()
+        });
+        checks.extend(rows.into_iter().flatten());
         json!({ "checks": checks })
     }
+}
+
+fn check(name: &str, ok: bool, detail: &str) -> Value {
+    json!({"name": name, "ok": ok, "detail": detail})
+}
+
+/// A check with the few words `dffy doctor` folds into the agent's row,
+/// given only when they differ from `detail`.
+fn check_brief(name: &str, ok: bool, detail: &str, brief: &str) -> Value {
+    let mut check = check(name, ok, detail);
+    if brief != detail {
+        check["brief"] = json!(brief);
+    }
+    check
+}
+
+/// The version in what `--version` printed: its first word with a digit,
+/// as `2.1.329` in `2.1.329 (Claude Code)` or `0.44.0` in
+/// `codex-cli 0.44.0`.
+fn version_number(said: &str) -> &str {
+    said.split_whitespace()
+        .find(|w| w.starts_with(|c: char| c.is_ascii_digit()))
+        .unwrap_or(said)
+}
+
+/// The recipe's flags that `help`, its CLI's `--help`, doesn't list.
+fn unknown_flags(recipe: &Recipe, help: &str) -> Vec<&'static str> {
+    let listed = |flag: &str| {
+        help.match_indices(flag).any(|(at, _)| {
+            let before = help[..at].chars().next_back();
+            let after = help[at + flag.len()..].chars().next();
+            let word = |c: char| c.is_alphanumeric() || c == '-' || c == '_';
+            !before.is_some_and(word) && !after.is_some_and(word)
+        })
+    };
+    (recipe.args.iter().copied())
+        .chain(recipe.worktree_flag)
+        .filter(|arg| arg.starts_with('-') && !listed(arg))
+        .collect()
+}
+
+/// A probe that didn't answer in its time, and was killed.
+#[derive(Debug, PartialEq, Eq)]
+struct Late;
+
+/// What a row says of `command`, a probe that didn't answer.
+fn late(command: &str) -> String {
+    format!("`{command}` didn't answer in {}s", PROBE_TIMEOUT.as_secs())
 }
 
 /// An absolute `PATH` entry's executable `name`: a relative entry would
@@ -284,16 +404,29 @@ fn built_in(recipe: &'static Recipe) -> Agent {
     }
 }
 
-/// The first line `program --version` prints, when it runs.
-fn version(program: &Path) -> Option<String> {
-    run_for(Command::new(program).arg("--version"), VERSION_TIMEOUT)
+/// The first line `program --version` prints, when it runs and succeeds.
+fn version(program: &Path) -> Result<Option<String>, Late> {
+    let ran = run_for(Command::new(program).arg("--version"), PROBE_TIMEOUT)?;
+    Ok(ran
         .filter(|(status, _)| status.success())
         .and_then(|(_, out)| {
             out.lines()
                 .map(str::trim)
                 .find(|l| !l.is_empty())
                 .map(str::to_owned)
-        })
+        }))
+}
+
+/// What the CLI's `--help` prints for the recipe's command: after the
+/// recipe's words before its first flag, as `codex exec`. `None` when it
+/// doesn't run or prints nothing.
+fn help(program: &Path, recipe: &Recipe) -> Result<Option<String>, Late> {
+    let command = recipe.args.iter().take_while(|a| !a.starts_with('-'));
+    let ran = run_for(
+        Command::new(program).args(command).arg("--help"),
+        PROBE_TIMEOUT,
+    )?;
+    Ok(ran.map(|(_, out)| out).filter(|out| !out.trim().is_empty()))
 }
 
 /// The configured command: its first word a name on `PATH` or an absolute
@@ -326,28 +459,31 @@ fn kill_group(group: Pid) {
 }
 
 /// Runs `command` outside the worktree to its end, or kills it with its
-/// group after `limit`: its status and stdout.
-fn run_for(command: &mut Command, limit: Duration) -> Option<(ExitStatus, String)> {
-    let child = command
+/// group after `limit`: its status and stdout, `None` when it can't run.
+fn run_for(command: &mut Command, limit: Duration) -> Result<Option<(ExitStatus, String)>, Late> {
+    let Ok(child) = command
         .current_dir("/")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .process_group(0)
         .spawn()
-        .ok()?;
+    else {
+        return Ok(None);
+    };
     let group = Pid::from_child(&child);
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || tx.send(child.wait_with_output()).ok());
     if let Ok(output) = rx.recv_timeout(limit) {
-        let output = output.ok()?;
-        return Some((
-            output.status,
-            String::from_utf8_lossy(&output.stdout).into_owned(),
-        ));
+        return Ok(output.ok().map(|output| {
+            (
+                output.status,
+                String::from_utf8_lossy(&output.stdout).into_owned(),
+            )
+        }));
     }
     kill_group(group);
-    None
+    Err(Late)
 }
 
 /// What a run's stderr said, read to its end.
@@ -392,19 +528,90 @@ impl Agent {
         format!("{} isn't logged in; run `{how}`", self.name)
     }
 
-    /// Whether its CLI's status command says it's logged in; `None` when it
-    /// didn't say, and for an agent without one.
-    fn logged_in(&self) -> Option<bool> {
-        let program = self.program.as_ref().ok()?;
-        let Login::Status(args) = self.recipe?.login else {
-            return None;
+    /// Whether its CLI's status command says it's logged in, asked for
+    /// `limit` at most; `None` when it didn't say, and for an agent without
+    /// one.
+    fn logged_in(&self, limit: Duration) -> Result<Option<bool>, Late> {
+        let (Ok(program), Some(Login::Status(args))) =
+            (&self.program, self.recipe.map(|r| &r.login))
+        else {
+            return Ok(None);
         };
-        let (status, _) = run_for(Command::new(program).args(args), AUTH_TIMEOUT)?;
-        match status.code() {
+        let ran = run_for(Command::new(program).args(*args), limit)?;
+        Ok(ran.and_then(|(status, _)| match status.code() {
             Some(0) => Some(true),
             Some(1) => Some(false),
             _ => None,
-        }
+        }))
+    }
+
+    /// `doctor`'s rows for it: why it can't run, a custom command as it
+    /// runs, or a recipe's version, recipe and login, the probes side by
+    /// side.
+    fn checks(&self, configured: Option<&str>, any_ready: bool) -> Vec<Value> {
+        let program = match &self.program {
+            Ok(program) => program,
+            Err(why) => {
+                // Only news while another agent can answer and the config
+                // doesn't ask for this one.
+                let wanted = self.recipe.is_none() || configured == Some(self.name) || !any_ready;
+                if wanted {
+                    return vec![check(self.name, false, why)];
+                }
+                let mut note = check(self.name, true, why);
+                note["info"] = json!(true);
+                return vec![note];
+            }
+        };
+        let Some(recipe) = self.recipe else {
+            let command = std::iter::once(program.display().to_string())
+                .chain(self.args.iter().cloned())
+                .collect::<Vec<_>>()
+                .join(" ");
+            return vec![check(self.name, true, &command)];
+        };
+        std::thread::scope(|scope| {
+            // A CLI that only says so as a run fails has no check here.
+            let auth = match recipe.login {
+                Login::Status(args) => Some((args, scope.spawn(|| self.logged_in(PROBE_TIMEOUT)))),
+                Login::Stderr(_) => None,
+            };
+            let help = scope.spawn(|| help(program, recipe));
+            let version = match version(program) {
+                Ok(Some(said)) => check_brief(self.name, true, &said, version_number(&said)),
+                Ok(None) => check(self.name, false, "--version failed"),
+                Err(Late) => check(self.name, false, &late(&format!("{} --version", self.name))),
+            };
+            let name = format!("{} recipe", self.name);
+            // Help that couldn't be read says nothing against the recipe.
+            let unknown = match help.join() {
+                Ok(Ok(Some(help))) => unknown_flags(recipe, &help),
+                _ => Vec::new(),
+            };
+            let recipe = if unknown.is_empty() {
+                check_brief(&name, true, recipe.said, recipe.brief)
+            } else {
+                let detail = format!("doesn't know {}: upgrade {}", unknown.join(", "), self.name);
+                check(&name, false, &detail)
+            };
+            let mut rows = vec![version, recipe];
+            if let Some((args, probe)) = auth {
+                let name = format!("{} auth", self.name);
+                rows.push(match probe.join() {
+                    Ok(Ok(Some(true))) => check(&name, true, "logged in"),
+                    Ok(Ok(Some(false))) => check(&name, false, &self.log_in()),
+                    Ok(Err(Late)) => check(
+                        &name,
+                        false,
+                        &late(&format!("{} {}", self.name, args.join(" "))),
+                    ),
+                    Ok(Ok(None)) | Err(_) => {
+                        check(&name, false, "its CLI didn't say whether it's logged in")
+                    }
+                });
+            }
+            rows
+        })
     }
 
     /// Asks the agent `prompt` in `cwd`, the prompt on its stdin, telling
@@ -457,7 +664,7 @@ impl Agent {
                 }
                 Ok(said)
             }
-            Err(_) if stderr.logged_out || self.logged_in() == Some(false) => {
+            Err(_) if stderr.logged_out || self.logged_in(AUTH_TIMEOUT) == Ok(Some(false)) => {
                 Err(Failure::new(LOGGED_OUT, self.log_in()))
             }
             Err(why) => Err(Failure::new(FAILED, format!("{} failed: {why}", self.name))),

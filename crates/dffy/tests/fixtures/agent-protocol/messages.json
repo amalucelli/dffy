@@ -4,6 +4,10 @@
   "result": {"protocol":1,"agents":[
     {"name":"claude","default":false,"mark":null},
     {"name":"codex","default":true,"mark":"read-only sandbox"}
+  ],"handoffs":[
+    {"name":"claude","program":"@BIN@/claude","args":["{prompt}"]},
+    {"name":"codex","program":"@BIN@/codex","args":["{prompt}"]},
+    {"name":"amp","program":"@BIN@/amp","args":[],"prompt":"clipboard"}
   ],"capabilities":{}}
 },
 "ask": {
@@ -26,13 +30,13 @@
 "doctor": {
   "params": {},
   "result": {"checks":[
-    {"name":"claude","ok":true,"detail":"2.1.329 (Claude Code)"},
-    {"name":"claude recipe","ok":true,"detail":"read-only: Read, Grep and Glob only, MCP tools denied, user settings only"},
+    {"name":"claude","ok":true,"detail":"2.1.329 (Claude Code)","brief":"2.1.329"},
+    {"name":"claude recipe","ok":true,"detail":"read-only: Read, Grep and Glob only, MCP tools denied, user settings only","brief":"read-only: Read, Grep, Glob"},
     {"name":"claude auth","ok":true,"detail":"logged in"},
-    {"name":"codex","ok":true,"detail":"codex-cli 0.59.0"},
-    {"name":"codex recipe","ok":true,"detail":"read-only sandbox: commands may run, no writes, no network, web search off"},
+    {"name":"codex","ok":true,"detail":"codex-cli 0.59.0","brief":"0.59.0"},
+    {"name":"codex recipe","ok":true,"detail":"read-only sandbox: commands may run, no writes, no network, web search off","brief":"read-only sandbox"},
     {"name":"codex auth","ok":true,"detail":"logged in"},
-    {"name":"pi","ok":true,"detail":"not installed"}
+    {"name":"pi","ok":true,"info":true,"detail":"not installed"}
   ]}
 }
 }

@@ -86,6 +86,8 @@ pub(super) fn app_with(
         size,
         Indicators::Classic,
     );
+    // The agent plugin, whose program tests stand in for.
+    app.find_agent = || true;
     app.event(Event::Enumerated(diff("src/zz.rs").change));
     app.event(Event::EnumerationDone(None));
     app.event(Event::Diffed(Done::Diff {
@@ -311,6 +313,7 @@ pub(super) fn session(dir: &tempfile::TempDir, head: &str, last: Option<&str>) -
         state: None,
         labels: Vec::new(),
         comments: dir.path().join("comments.json"),
+        checkout: Some("gh pr checkout 7".to_owned()),
     }
 }
 

@@ -307,7 +307,7 @@ pub(crate) const KEYS: &[Key] = &[
     },
     Key {
         name: "agent",
-        doc: "Experimental: which coding agent the agent plugin, dffy-agent on PATH, asks about a thread (`a`, or a comment starting @<name>), handed to it unread: claude, codex or pi picks the default, and a command with arguments, split at spaces, runs in their place with the prompt on its stdin. Empty leaves the pick to the plugin, Claude Code first. Fix with agent (`f`) starts the one this names when it's claude, codex, pi or amp, else the first of them on PATH. See docs/plugins.md.",
+        doc: "Experimental: which coding agent the agent plugin, dffy-agent on PATH, asks about a thread (`a`, or a comment starting @<name>), handed to it unread: claude, codex or pi picks the default, and a command with arguments, split at spaces, runs in their place with the prompt on its stdin. Empty leaves the pick to the plugin, Claude Code first. Fix with agent (`f`) starts the one this names of those the plugin can hand a thread to (claude, codex, pi or amp, when on PATH), else the first it lists. See docs/plugins.md.",
         default: "",
     },
     Key {

@@ -106,6 +106,15 @@ The viewer stages, unstages and discards hunks and picked lines of these diffs i
 
 Conflicts are resolved from the viewer too ([Merge conflicts](#merge-conflicts)).
 
+## Checkpoints
+
+A checkpoint is the working tree as plain `dffy` lists it, kept so a later diff shows only what changed since: an agent's turn, say ([viewer.md](viewer.md#checkpoints)). `dffy checkpoint` takes one and prints its number; Fix with agent and `space` then `;` in the viewer take one too.
+
+- **What it holds:** every file plain `dffy` would compare: tracked files as they are in the working tree, staged or not, through the same filters as a diff ([Line endings and filters](#line-endings-and-filters)), untracked files git doesn't ignore, and nothing of files deleted. Untracked nested repositories are left out, and so is a working-tree file too large to diff (64 MiB or more): a tracked one keeps `HEAD`'s version in the checkpoint and an untracked one isn't in it, so a large file isn't copied into the repository's objects on every checkpoint, and it lists as changed since one for as long as it differs from `HEAD`.
+- **Where it's kept:** a commit, its tree those files, its parent `HEAD` when it was taken, under `refs/worktree/dffy/checkpoints/<n>`, numbered from 1 in each worktree. git keeps `refs/worktree/` apart for each worktree, and no default refspec fetches or pushes it. Each new checkpoint removes all but the last 5. `git diff refs/worktree/dffy/checkpoints/3^ refs/worktree/dffy/checkpoints/3` shows what was uncommitted then.
+- **What it doesn't touch:** the index, `HEAD` and the working tree. It writes objects and its ref, as dffy itself, so it needs no git identity.
+- **Since a checkpoint:** `dffy --since-checkpoint` compares the latest with the working tree, `--since-checkpoint=3` checkpoint 3 ([usage.md](usage.md#what-to-compare)). A file untracked then and now is compared with its checkpointed content; one untracked only now shows as untracked.
+
 `--staged` (`git diff --cached`) and `--unstaged` (`git diff`) show one side each. `default-diff = unstaged` in the [config](config.md) makes plain `dffy` behave like plain `git diff`, and `dffy --all` brings back everything for one run. In printed output, untracked files get an `untracked file:` header.
 
 ## Merge conflicts
@@ -145,6 +154,6 @@ A tracked file under a directory that has been replaced by a symbolic link is sh
 
 ## What dffy doesn't read
 
-dffy reads the repository with its own code, not by running git. Staging from the viewer is the exception: `git apply` writes it.
+dffy reads the repository with its own code, not by running git. Staging from the viewer is the exception: `git apply` writes it. A [checkpoint](#checkpoints) is written with dffy's own code too.
 
 - **Paths after `--`** are prefixes, not git pathspecs with globs.

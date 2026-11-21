@@ -3,32 +3,32 @@ source: crates/dffy/src/tui/app/tests/command_panel.rs
 expression: screen(&mut phone)
 ---
 ┌─ commands ───────────────────────── esc close ─┐
-│ Files                                         ┃│
-│     Find file…                            o   ┃│
-│     Filter tree…                          | / ┃│
-│ [ ] Files with comments                   ! c ┃│
-│ [ ] File tree                             t T ┃│
-│     Next file                             f   ┃│
-│     Previous file                         F   ┃│
-│                                               ┃│
-│ View                                          ┃│
-│     Layout ‹ auto (unified here) ›        s   ┃│
-│ [ ] Wrap long lines                       W   ┃│
-│ [ ] Syntax diff                           d   ┃│
-│ [ ] Rendered view                         r   ┃│
-│     More context                          x   ┃│
-│ [ ] Whole file                            X   ││
-│     Indicators ‹ classic ›                K   ││
-│     Modified lines ‹ changed ›            %   ││
-│ [x] Syntax highlighting                   *   ││
-│ [ ] Ignore whitespace                     I   ││
-│ [x] Line numbers                          #   ││
-│ [x] Hunk headers                          @   ││
-│     Status bar ‹ bottom ›                 B   ││
-│     Theme ‹ default ›                     ~   ││
-│                                               ││
-│ Copy                                          ││
-│     Copy selection                        y   ││
-│     Copy file path                        Y   ││
-│ key or enter runs · j/k move · / search · esc  │
+│  Here  View  Files  Review  Git  Copy          │
+│ s    Layout ‹ auto (unified here) ›            │
+│ W    [ ] Wrap long lines                       │
+│ d    [ ] Syntax diff                           │
+│ r    [ ] Rendered view                         │
+│ x    More context                              │
+│ X    [ ] Whole file                            │
+│ K    Indicators ‹ classic ›                    │
+│ %    Modified lines ‹ changed ›                │
+│ *    [x] Syntax highlighting                   │
+│ I    [ ] Ignore whitespace                     │
+│ #    [x] Line numbers                          │
+│ @    [x] Hunk headers                          │
+│ B    Status bar ‹ bottom ›                     │
+│ ~    Theme ‹ default ›                         │
+│                                                │
+│                                                │
+│                                                │
+│                                                │
+│                                                │
+│                                                │
+│                                                │
+│                                                │
+│                                                │
+│                                                │
+│                                                │
+│ key or enter runs · j/k move                   │
+│ tab section · / search · esc close             │
 └────────────────────────────────────────────────┘

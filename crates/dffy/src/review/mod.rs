@@ -142,6 +142,10 @@ pub(crate) struct Comment {
     /// When its suggestion was applied to the working tree, RFC 3339. Kept
     /// here only: never sent to a host.
     pub applied: Option<String>,
+    /// The lines applying its suggestion replaced, a line break between
+    /// each, which taking it back puts in place again. Kept here only, and
+    /// cleared with `applied`.
+    pub replaced: Option<String>,
     /// Fields dffy doesn't know, in file order, written back as read: on a
     /// comment from a host, the integration's own.
     pub extra: Fields,
@@ -188,7 +192,9 @@ pub(crate) struct Change {
     pub start: Option<LineNumbers>,
     pub end: Option<LineNumbers>,
     pub start_side: Option<Option<Side>>,
+    /// Removing it removes `replaced` too, unless that's given.
     pub applied: Option<Option<String>>,
+    pub replaced: Option<Option<String>>,
 }
 
 /// One of `dffy comments apply`'s operations.
@@ -395,6 +401,11 @@ pub(crate) fn current_branch(repo: &Repo) -> Option<String> {
             })
         }
     }
+}
+
+/// HEAD's commit, a full id; `None` on an unborn branch.
+pub(crate) fn head_commit(repo: &Repo) -> Option<String> {
+    repo.resolve_show("HEAD").ok().map(|(id, _)| id.to_string())
 }
 
 /// The review session the viewer has open, as the session pointer names
@@ -687,13 +698,24 @@ pub(crate) fn apply_json(
 /// what a comment says are refused while the review is being posted, as
 /// the post read its drafts before; they hold the post lock while they
 /// write, so a post doesn't start in between. A file never posted has no
-/// post lock to take.
+/// post lock to take. `author`, `--as`'s, writes each `add` that names no
+/// author, which would otherwise be yours.
 pub(crate) fn apply_given(
     path: &Path,
     input: &[u8],
     branch: Option<&str>,
+    author: Option<&str>,
 ) -> Result<String, String> {
-    let ops = parse_ops(input, branch)?;
+    let mut ops = parse_ops(input, branch)?;
+    if let Some(author) = author {
+        for op in &mut ops {
+            if let Op::Add { comment, .. } = op
+                && comment.author.is_empty()
+            {
+                author.clone_into(&mut comment.author);
+            }
+        }
+    }
     let rewrites = ops.iter().any(|op| {
         matches!(op, Op::Set { change, .. } if change.text.is_some() || change.suggestion.is_some())
     });
@@ -1022,6 +1044,7 @@ impl Review {
     }
 
     /// [`Op::Set`]: returns the id of the comment changed.
+    #[expect(clippy::too_many_lines, reason = "a step per field a set changes")]
     fn set(
         &mut self,
         target: &Target,
@@ -1087,9 +1110,14 @@ impl Review {
         if let Some(suggestion) = change.suggestion {
             comment.suggestion = suggestion;
             comment.applied = None;
+            comment.replaced = None;
         }
         if let Some(applied) = change.applied {
+            comment.replaced = comment.replaced.take().filter(|_| applied.is_some());
             comment.applied = applied;
+        }
+        if let Some(replaced) = change.replaced {
+            comment.replaced = replaced;
         }
         comment.start = change.start.or(comment.start);
         comment.end = change.end.or(comment.end);
@@ -1249,6 +1277,26 @@ impl Review {
             .collect()
     }
 
+    /// The open threads of `branches` that are yours, in [`threads`] order,
+    /// each its first comment then its replies: those you started, or
+    /// replied in.
+    pub(crate) fn open_threads_of_yours(&self, branches: Branches) -> Vec<Vec<&Comment>> {
+        let select = Select {
+            resolved: Some(false),
+            branches,
+            ..Select::default()
+        };
+        let mut out: Vec<Vec<&Comment>> = Vec::new();
+        for c in threads(self.selected(&select)) {
+            match out.last_mut() {
+                Some(thread) if c.in_reply_to.as_ref() == Some(&thread[0].id) => thread.push(c),
+                _ => out.push(vec![c]),
+            }
+        }
+        out.retain(|thread| thread.iter().any(|c| c.author.is_empty()));
+        out
+    }
+
     /// The thread comment `id` is in: its first comment, then its replies
     /// in file order. `None` when no comment has that id.
     pub(crate) fn thread(&self, id: &str) -> Option<Vec<&Comment>> {
@@ -1384,6 +1432,7 @@ impl Comment {
                 "post_error" => c.post_error = string(&key, value)?,
                 "moved_from" => c.moved_from = string(&key, value)?,
                 "applied" => c.applied = string(&key, value)?,
+                "replaced" => c.replaced = string(&key, value)?,
                 "host_resolved" => {
                     c.host_resolved = match value {
                         Value::Null => None,
@@ -1483,6 +1532,7 @@ impl Comment {
         put(&mut f, "host_resolved", self.host_resolved.map(Value::Bool));
         put(&mut f, "moved_from", self.moved_from.as_deref().map(text));
         put(&mut f, "applied", self.applied.as_deref().map(text));
+        put(&mut f, "replaced", self.replaced.as_deref().map(text));
         f.extend(self.extra.iter().cloned());
         f
     }
@@ -1712,10 +1762,12 @@ fn change(value: Option<Value>) -> Result<Change, String> {
             "end" => change.end = Some(line_numbers(&key, &value)?.ok_or("`end` can't be null")?),
             "start_side" => change.start_side = Some(side(&key, value)?),
             "applied" => change.applied = Some(string(&key, value)?),
+            "replaced" => change.replaced = Some(string(&key, value)?),
             _ => {
                 return Err(format!(
                     "`{key}` can't be set; set changes text, resolved, ref, anchor, author, \
-                     suggestion, branch, pending, post_error, start, end, start_side and applied"
+                     suggestion, branch, pending, post_error, start, end, start_side, applied \
+                     and replaced"
                 ));
             }
         }

@@ -223,7 +223,8 @@ impl Line<'_> {
 }
 
 /// Tab `tab`'s lines, in a left and a right column when `two`: the titled
-/// groups on the right when the tab has some, else half each. The diff's
+/// groups on the right when the tab has some, else half each, split
+/// between groups where it has several. The diff's
 /// keys go under their groups' titles when the tab has more than one.
 fn columns(rows: &[Row], tab: usize, two: bool) -> (Vec<Line<'_>>, Vec<Line<'_>>) {
     let kept = |section: Section| {
@@ -272,8 +273,15 @@ fn columns(rows: &[Row], tab: usize, two: bool) -> (Vec<Line<'_>>, Vec<Line<'_>>
     }
     main.append(&mut titled);
     if two {
-        let right = main.split_off(main.len().div_ceil(2));
-        return (main, right);
+        // At the blank between groups nearest half way, which shows in
+        // neither column, else half way.
+        let half = main.len().div_ceil(2);
+        let blank = (0..main.len())
+            .filter(|&i| matches!(main[i], Line::Blank))
+            .min_by_key(|&i| i.abs_diff(half));
+        let right = main.split_off(blank.unwrap_or(half));
+        let skip = usize::from(blank.is_some());
+        return (main, right.into_iter().skip(skip).collect());
     }
     (main, Vec::new())
 }
@@ -787,6 +795,19 @@ mod tests {
             "{text}"
         );
         assert!(line(&text, "Stage, discard & resolve") < line(&text, "stage lines"));
+    }
+
+    /// The View tab titles its groups, Layout and Diff, and two columns
+    /// split between them rather than inside one.
+    #[test]
+    fn the_view_tab_splits_its_columns_between_groups() {
+        let keys = Keys::default();
+        let mut help = Help::default();
+        press(&mut help, &keys, "3");
+        let text = shown(&mut help, &keys, 100, 20);
+        insta::assert_snapshot!(text);
+        let first = text.lines().find(|l| l.contains("Layout"));
+        assert!(first.is_some_and(|l| l.contains("Diff")), "{text}");
     }
 
     /// When the tabs don't all fit, the strip starts late enough to show

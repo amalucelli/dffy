@@ -5,13 +5,13 @@ expression: screen(&mut short)
  modified · src/some/deeply/nested/module/file.rs · +2 -2                                                                   @@ -1,7 +1,7 @@
 ┌ Files · 2 +2 -2 ─────────┌─ commands ──────────────────────────────────────────────────────────── esc close ─┐                           █
 │ ▼ src/                   │  Here  View  Files  Review  Git  Copy                                             │                           ┃
-│   ▼ some/deeply/nested/mo│ s    Layout ‹ auto (split here) ›         %    Modified lines ‹ changed ›         │                           ┃
-│     M file.rs            │ W    [ ] Wrap long lines                  *    [x] Syntax highlighting            │                           ┃
-│   M zz.rs                │ d    [ ] Syntax diff                      I    [ ] Ignore whitespace              │                           ┃
-│                          │ r    [ ] Rendered view                    #    [x] Line numbers                   │                           ┃
-│                          │ x    More context                         @    [x] Hunk headers                   │                           ┃
-│                          │ X    [ ] Whole file                       B    Status bar ‹ bottom ›              │                           ┃
-│                          │ K    Indicators ‹ classic ›               ~    Theme ‹ default ›                  │                           ┃
+│   ▼ some/deeply/nested/mo│ Layout                                    Display                                ┃│                           ┃
+│     M file.rs            │ s    Layout ‹ auto (split here) ›         *    [x] Syntax highlighting           ┃│                           ┃
+│   M zz.rs                │ W    [ ] Wrap long lines                  K    Indicators ‹ classic ›            ┃│                           ┃
+│                          │ X    [ ] Whole file                       %    Modified lines ‹ changed ›        ┃│                           ┃
+│                          │ x    More context                         #    [x] Line numbers                  ││                           ┃
+│                          │ B    Status bar ‹ bottom ›                @    [x] Hunk headers                  ││                           ┃
+│                          │                                           ~    Theme ‹ default ›                 ││                           ┃
 │                          │ key or enter runs · j/k move · h/l step a value                                   │                           █
 │                          │ tab section · / search · esc close                                                │
 └──────────────────────────└───────────────────────────────────────────────────────────────────────────────────┘

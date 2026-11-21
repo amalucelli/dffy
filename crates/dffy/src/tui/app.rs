@@ -579,6 +579,9 @@ pub(crate) struct App {
     titled: Option<String>,
     /// The working tree's directory name, for the window title.
     repository: Option<String>,
+    /// The working tree, where a commented file the diff doesn't list is
+    /// opened from; `None` for a piped diff and paths compared outside git.
+    worktree: Option<PathBuf>,
     /// What the repository's diff selects, to word an empty list.
     selected: Option<(Revisions, DefaultDiff)>,
     /// The working tree's latest checkpoint, as last read or taken.
@@ -780,6 +783,7 @@ impl App {
             reported: None,
             titled: None,
             repository: None,
+            worktree: None,
             selected: None,
             checkpoint: None,
             since_checkpoint: None,
@@ -853,6 +857,10 @@ impl App {
 
     pub(crate) fn set_repository(&mut self, name: Option<String>) {
         self.repository = name;
+    }
+
+    pub(crate) fn set_worktree(&mut self, root: Option<PathBuf>) {
+        self.worktree = root;
     }
 
     /// The files come from a piped diff: they keep its order.
@@ -3189,9 +3197,12 @@ impl App {
                 change: files[file].change().clone(),
                 piped: match &files[file].source() {
                     Source::Piped(piped) => Some(Arc::clone(piped)),
-                    Source::Repo | Source::Commit(_) | Source::Page { .. } => None,
+                    Source::Repo | Source::Commit(_) | Source::Page { .. } | Source::Unchanged => {
+                        None
+                    }
                 },
                 choices: files[file].choices().cloned(),
+                unchanged: files[file].is_unchanged(),
                 paint: highlight && !self.visible.contains(&file),
             })
         };

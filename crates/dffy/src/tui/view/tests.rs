@@ -3,6 +3,7 @@ use std::fmt::Write as _;
 use dffy_core::diff::{Options, Text, Whitespace, emphasize, hunks};
 use dffy_core::document::State;
 use dffy_core::git::{FileChange, FileDiff, Mode, Side, Status};
+use proptest::prelude::*;
 
 use super::*;
 use crate::config::Indicators;
@@ -2817,4 +2818,90 @@ fn without_scopes_the_title_keeps_the_heading() {
             .is_some_and(|s| s.get().is_some())
     );
     assert_eq!(scope(&mut doc), None);
+}
+
+/// A canvas row's glyphs: each on either side, showing any bytes, in
+/// columns of their own as a canvas lays them out (past the pane's end
+/// too), listed in no particular order.
+fn row_glyphs() -> impl Strategy<Value = Vec<Mapped>> {
+    let glyph = (0..2usize, 0..3usize, 0..3usize, 0..24usize, 1..4usize);
+    prop::collection::vec(glyph, 0..24)
+        .prop_map(|glyphs| {
+            let mut col = 0;
+            (glyphs.into_iter())
+                .map(|(side, gap, width, start, len)| {
+                    col += gap;
+                    let g = Mapped {
+                        row: 0,
+                        side,
+                        col,
+                        width,
+                        bytes: start..start + len,
+                    };
+                    col += width;
+                    g
+                })
+                .collect::<Vec<_>>()
+        })
+        .prop_shuffle()
+}
+
+/// One side's matches on a line, as a search finds them: ascending and not
+/// overlapping.
+fn line_matches() -> impl Strategy<Value = Vec<(u32, u32)>> {
+    prop::collection::vec((0..4u32, 0..5u32), 0..6).prop_map(|cuts| {
+        let mut at = 0;
+        cuts.into_iter()
+            .map(|(gap, len)| {
+                let start = at + gap;
+                at = start + len;
+                (start, at)
+            })
+            .collect()
+    })
+}
+
+proptest! {
+    /// One pass over a row's glyphs leaves the same cells in the same
+    /// styles as restyling the row once per match, old side's matches then
+    /// new side's, so where both sides' matches cover a glyph of an unsplit
+    /// row the new side's wins.
+    #[test]
+    fn a_rows_matches_restyle_in_one_pass_as_one_per_match(
+        glyphs in row_glyphs(),
+        old in line_matches(),
+        new in line_matches(),
+        current in prop::option::of(0..12usize),
+        split: bool,
+        x in 0..4usize,
+        end in 0..40usize,
+        y in 0..3usize,
+    ) {
+        let theme = Theme::default_theme();
+        let (lit, now) = (theme.style(Role::SearchMatch), theme.style(Role::SearchCurrent));
+        prop_assert_ne!(lit, now);
+        let style = |i| if current == Some(i) { now } else { lit };
+        let found: Vec<(usize, (u32, u32))> = (old.iter().map(|&m| (0, m)))
+            .chain(new.iter().map(|&m| (1, m)))
+            .collect();
+        let mut want = Grid::new(32, 2);
+        for (i, &(side, (start, end_byte))) in found.iter().enumerate() {
+            let side = split.then_some(side);
+            for g in &glyphs {
+                if (start as usize..end_byte as usize).contains(&g.bytes.start)
+                    && side.is_none_or(|s| g.side == s)
+                {
+                    let left = (x + g.col).min(end);
+                    want.restyle(left, y, (left + g.width).min(end), style(i));
+                }
+            }
+        }
+        let spans: Vec<(u32, u32, Style)> = (found.iter().enumerate())
+            .map(|(i, &(_, (start, end_byte)))| (start, end_byte, style(i)))
+            .collect();
+        let (on_old, on_new) = spans.split_at(old.len());
+        let mut got = Grid::new(32, 2);
+        restyle_matches(&mut got, &glyphs, [on_old, on_new], split, (x, end, y));
+        prop_assert_eq!(got, want);
+    }
 }

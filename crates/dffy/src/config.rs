@@ -262,12 +262,12 @@ pub(crate) const KEYS: &[Key] = &[
     },
     Key {
         name: "ignore-all-space",
-        doc: "Ignore all whitespace when comparing lines (-w). The command panel's `W` toggles it in the viewer.",
+        doc: "Ignore all whitespace when comparing lines (-w). The command panel's Ignore whitespace entry toggles it in the viewer.",
         default: "false",
     },
     Key {
         name: "ignore-space-change",
-        doc: "Ignore changes in the amount of whitespace (-b). The command panel's `W` toggles between ignoring all whitespace and none.",
+        doc: "Ignore changes in the amount of whitespace (-b). The command panel's Ignore whitespace entry switches between ignoring all whitespace and none.",
         default: "false",
     },
     Key {
@@ -327,7 +327,7 @@ pub(crate) const KEYS: &[Key] = &[
     },
     Key {
         name: "status-bar",
-        doc: "Where the viewer shows what's compared, the position, the modes and the key hints: bottom (in the frame's bottom border) or top (in its top border, after the file's name). The command panel's `b` switches it.",
+        doc: "Where the viewer shows what's compared, the position, the modes and the key hints: bottom (in the frame's bottom border) or top (in its top border, after the file's name). The command panel's Status bar entry switches it.",
         default: "bottom",
     },
     Key {
@@ -357,7 +357,7 @@ pub(crate) const KEYS: &[Key] = &[
     },
     Key {
         name: "mouse",
-        doc: "Take mouse input in the viewer: clicks, the wheel, and dragging over code to select and copy it. `M` in the command panel turns it off for the terminal's own selection (many terminals, Ghostty included, also select natively with shift held while dragging).",
+        doc: "Take mouse input in the viewer: clicks, the wheel, and dragging over code to select and copy it. The command panel's Mouse selection entry turns it off for the terminal's own selection (many terminals, Ghostty included, also select natively with shift held while dragging).",
         default: "true",
     },
     Key {

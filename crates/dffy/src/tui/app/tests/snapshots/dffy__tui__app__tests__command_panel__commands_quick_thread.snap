@@ -1,44 +1,27 @@
 ---
 source: crates/dffy/src/tui/app/tests/command_panel.rs
-expression: screen(&mut app)
+expression: popup
 ---
-┌ Files · 12 +4 -4 ───────────────────┬─ modified · src/some/deeply/nested/module/file.rs · +2 -2 ─────────────────────── @@ -1,7 +1,7 @@ ─┐
-│ ▼ src/                              │ @@ -1,7 +1,7 @@                                                                                    ┃
-│   ▼ some/deeply/nested/module/      │     │  ╭ ▾ you · 3h ago · draft · on the file ───────────────────────────────────────────────────╮ ┃
-│     M file.rs           5   +2   -2 │     │  │ On the whole file                                                                       │ █
-│   M zz.rs                           │     │  ╰─────────────────────────────────────────────────────────────────────────────────────────╯ ┃
-│   M zz0.rs                          │  1  │ line 1                                     │ 1  │ line 1                                     ┃
-│   M zz1.rs                          │  2  │ line 2                                     │ 2◆ │ line 2                                     ┃
-│   M zz2.rs                          │                                                  │    │  ┏ ▾ you · 2h ago · draft ━━━━━━━━━━━━━━━┓ ┃
-│   M zz3.rs                          │                                                  │    │  ┃ Why two?                              ┃ ┃
-│   M zz4.rs                          │                                                  │    │  ┃                                       ┃ ┃
-│   M zz5.rs                          │                                                  │    │  ┃ you · 1h ago · draft                  ┃ ┃
-│   M zz6.rs                          │                                                  │    │  ┃ Because.                              ┃ ┃
-│   M zz7.rs                          │                                                  │    │  ┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛ ┃
-│   M zz8.rs                          │  3  │ line 3                                     │ 3  │ line 3                                     ┃
-│   M zz9.rs              1   +2   -2 │  4○-│ line 4                                     │ 4 +│ line four                                  ┃
-│                                     │     │  │ ▸ you · 2h ago · resolved · Old four  │ │                                                 ┃
-│                                     │  5  │ line 5                                     │ 5  │ line 5                                     ┃
-│                                     │  6  │ line 6                                     │ 6  │ line 6                                     ┃
-│                                     │  7  │ line 7                                     │ 7  │ line 7                                     ┃
-│                                     │ ⋯ 39 unchanged lines  @@ -47,7 +47,7 @@ line 46                                                    ┃
-│                                     │ 47  │ line 47                                    │47  │ line 47                                    ┃
-│                                     │ 48  │ line 48                                    │48  │ line 48                                    ┃
-│                                     │ 49  │ line 49                                    │49  │ line 49                                    ┃
-│                                     │ 50 -│ line 50                                    │50●+│ line fifty                                 ┃
-│                                     │                                                  │    │  │ ▸┌─ on this thread ────────────────────┐┃
-│                                     │ 51  │ line 51                                    │51  │ line│                                     │┃
-│                                     │ 52  │ line 52                                    │52  │ line│  a    Ask agent                     │┃
-│                                     │ 53  │ line 53                                    │53  │ line│  & f  Fix with agent                │┃
-│                                     │ ⋯ 7 unchanged lines                                         │  " y  Copy as prompt                │┃
-│                                     │                                                             │    x  Resolve                       │┃
-│                                     │                                                             │    r  Reply                         │┃
-│                                     │                                                             │  ^    Send open threads to agent    │┃
-│                                     │                                                             │  ─────────────────────────────────  │█
-│                                     │                                                             │  s    Layout ‹ auto (split here) ›  │┃
-│                                     │                                                             │  W    [ ] Wrap long lines           │┃
-│                                     │                                                             │  w    [ ] Watch for changes         │┃
-│                                     │                                                             │                                     ││
-│                                     │                                                             │  space more · ? keys · esc close    ││
-│                                     │                                                             └─────────────────────────────────────┘│
-└──  review 7  1/12 · 1/2 hunk ───────┴─ r reply · a ask · x resolve · f fix · e edit · d delete  review 7 · 6 threads · 5 drafts ─────────┘
+┌─ commands ────────────────────────┐
+│                                   │
+│  On this thread                   │
+│  a  Ask agent                     │
+│  f  Fix with agent                │
+│  y  Copy as prompt                │
+│  x  Resolve                       │
+│  r  Reply                         │
+│  ^  Send open threads to agent    │
+│                                   │
+│  View                             │
+│  s  Layout ‹ auto (split here) ›  │
+│  W  [ ] Wrap long lines           │
+│  d  [ ] Syntax diff               │
+│  X  [ ] Whole file                │
+│                                   │
+│  Go                               │
+│  o  Find file…                    │
+│  i  Comments panel                │
+│  w  [ ] Watch for changes         │
+│  .  Open terminal here            │
+│                                   │
+│  space more · ? keys · esc close  │

@@ -378,6 +378,9 @@ pub(crate) struct Comments {
     highlight: bool,
     /// Where each commented path is in the list, when it is.
     pub(super) located: HashMap<BString, usize>,
+    /// Commented paths not in the list that the viewer found missing from
+    /// the working tree.
+    pub(super) gone: HashSet<BString>,
     /// What stat said of `path` and `local` just before the last read.
     stats: Vec<Option<Stat>>,
     /// The stamps of the bytes of `path` and `local` the last read parsed.
@@ -443,6 +446,7 @@ impl Comments {
             placed: HashMap::new(),
             highlight: false,
             located: HashMap::new(),
+            gone: HashSet::new(),
             stats: Vec::new(),
             stamps: Vec::new(),
             generation: 0,
@@ -641,6 +645,19 @@ impl Comments {
 
     pub(crate) fn file_of(&self, path: &[u8]) -> Option<usize> {
         self.located.get(path).copied()
+    }
+
+    /// Notes whether `path`, a commented file not in the list, was found
+    /// missing from the working tree, for the panel to say.
+    pub(crate) fn set_gone(&mut self, path: &[u8], gone: bool) {
+        let changed = if gone {
+            self.gone.insert(path.into())
+        } else {
+            self.gone.remove(path)
+        };
+        if changed {
+            self.generation += 1;
+        }
     }
 
     /// The files in the list with comments, in list order; not those whose

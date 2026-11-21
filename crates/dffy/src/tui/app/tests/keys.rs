@@ -87,7 +87,7 @@ fn ctrl_j_is_enter_outside_the_text_box() {
     assert_eq!(app.tree.filter(), "zz");
     esc(&mut app);
     esc(&mut app);
-    key(&mut app, ' ');
+    typed(&mut app, "  ");
     assert!(app.commands.is_some());
     ctrl_j(&mut app);
     assert!(app.commands.is_none(), "the command panel ran its first");

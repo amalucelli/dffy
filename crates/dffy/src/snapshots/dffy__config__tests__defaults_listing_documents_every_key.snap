@@ -38,10 +38,10 @@ expression: text
 <dim># Lines of context around each change (-U), or full for the whole file with changes inline. In the viewer, `X` switches every file between the two and is remembered; `x` reveals hidden lines in one file, for that run.</>
 <hint>context</><dim> = </>3
 
-<dim># Ignore all whitespace when comparing lines (-w). The command panel's `W` toggles it in the viewer.</>
+<dim># Ignore all whitespace when comparing lines (-w). The command panel's Ignore whitespace entry toggles it in the viewer.</>
 <hint>ignore-all-space</><dim> = </>false
 
-<dim># Ignore changes in the amount of whitespace (-b). The command panel's `W` toggles between ignoring all whitespace and none.</>
+<dim># Ignore changes in the amount of whitespace (-b). The command panel's Ignore whitespace entry switches between ignoring all whitespace and none.</>
 <hint>ignore-space-change</><dim> = </>false
 
 <dim># What dffy without revisions shows: all (everything not committed: HEAD against the working tree, with staged, unstaged and untracked files, each file marked by its staging) or unstaged (the working tree against the index, as plain git diff, which hides staged and untracked files; the same as --unstaged). --staged and revisions are unaffected.</>
@@ -77,7 +77,7 @@ expression: text
 <dim># The tree's width in columns, or auto for 28% of the terminal (24 to 60 columns). `+` and `-` in the tree change it.</>
 <hint>tree-width</><dim> = </>auto
 
-<dim># Where the viewer shows what's compared, the position, the modes and the key hints: bottom (in the frame's bottom border) or top (in its top border, after the file's name). The command panel's `b` switches it.</>
+<dim># Where the viewer shows what's compared, the position, the modes and the key hints: bottom (in the frame's bottom border) or top (in its top border, after the file's name). The command panel's Status bar entry switches it.</>
 <hint>status-bar</><dim> = </>bottom
 
 <dim># Show line numbers, in the viewer and in printed diffs. Without them the change marks stay.</>
@@ -95,7 +95,7 @@ expression: text
 <dim># Show the one-time tip about the command panel on the first run of the viewer.</>
 <hint>tips</><dim> = </>true
 
-<dim># Take mouse input in the viewer: clicks, the wheel, and dragging over code to select and copy it. `M` in the command panel turns it off for the terminal's own selection (many terminals, Ghostty included, also select natively with shift held while dragging).</>
+<dim># Take mouse input in the viewer: clicks, the wheel, and dragging over code to select and copy it. The command panel's Mouse selection entry turns it off for the terminal's own selection (many terminals, Ghostty included, also select natively with shift held while dragging).</>
 <hint>mouse</><dim> = </>true
 
 <dim># Keep results that are slow to compute (renames, highlighting of large files) in $XDG_CACHE_HOME/dffy.</>
@@ -362,6 +362,7 @@ expression: text
 
 <dim># comments: the left panel lists every comment thread in place of the files, or the files again; moving through the threads shows each in the diff, enter or tab goes to it; the thread keys act on the selected thread, and c filters them by state</>
 <hint>keybind</><dim> = </>i=comments
+<hint>keybind</><dim> = </>leader:i=comments
 
 <dim># next_thread: next comment thread, on into the next file with comments; it takes the focus, where r replies, e edits, x resolves, d deletes and o opens it on its host</>
 <hint>keybind</><dim> = </>m=next_thread

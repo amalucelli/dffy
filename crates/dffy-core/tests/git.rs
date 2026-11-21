@@ -14,7 +14,7 @@ use std::process::Command;
 use dffy_core::diff::Options;
 use dffy_core::git::{
     ChangeSet, DiffSpec, Error, FileChange, Mode, ObjectId, Repo, Revisions, Side, Status,
-    WhichCheckpoint,
+    WhichCheckpoint, worktree_file,
 };
 use dffy_core::view::Staging;
 
@@ -1092,6 +1092,45 @@ fn file_diff_loads_both_sides() {
     };
     let fd = repo.file_diff(change, &Options::default()).expect("diff");
     assert!(fd.binary && fd.hunks.is_empty());
+}
+
+/// A working-tree file compared with itself is read once and has no
+/// hunks. It's found only along a path git could track there.
+#[test]
+fn an_unchanged_file_is_read_once_on_a_path_git_could_track() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let dir = init();
+    let d = dir.path();
+    write(d, "src/a.rs", "fn a() {}\n");
+    write(d, "run.sh", "#!/bin/sh\n");
+    std::fs::set_permissions(d.join("run.sh"), std::fs::Permissions::from_mode(0o755))
+        .expect("chmod");
+    std::os::unix::fs::symlink(d.join("src"), d.join("link")).expect("symlink");
+    let repo = Repo::discover(d).expect("repo");
+    let root = repo.workdir().expect("a working tree");
+    assert_eq!(worktree_file(root, b"src/a.rs"), Some(Mode::File));
+    assert_eq!(worktree_file(root, b"run.sh"), Some(Mode::Executable));
+    for refused in [
+        "",
+        "src",
+        "gone.rs",
+        "/etc/hosts",
+        "../a.rs",
+        "src/../src/a.rs",
+        "./src/a.rs",
+        "src//a.rs",
+        ".git/config",
+        ".GIT/config",
+        "link/a.rs",
+    ] {
+        assert_eq!(worktree_file(root, refused.as_bytes()), None, "{refused}");
+    }
+
+    let change = FileChange::unchanged("src/a.rs".into(), Mode::File);
+    let fd = repo.file_diff(change, &Options::default()).expect("diff");
+    assert_eq!(fd.hunks.len(), 0);
+    assert_eq!(fd.new.bytes(), b"fn a() {}\n");
+    assert_eq!(fd.old, fd.new);
 }
 
 #[test]

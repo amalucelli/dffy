@@ -317,6 +317,89 @@ fn a_saved_place_follows_a_reveal_after_the_list_moved() {
     assert_eq!(doc.pos, at(1, 3, 15 + 6));
 }
 
+/// A file the diff doesn't list shows whole after the files, every line
+/// unchanged and highlighted, whatever the view shows of the others. It
+/// needs no counts and no syntax diff, is added once, isn't a commit's,
+/// and stays last when the files are sorted.
+#[test]
+fn an_unchanged_file_shows_every_line_after_the_files() {
+    let mut doc = Document::<()>::default();
+    let commit = Arc::new(patch::Commit::new("abc".to_owned(), Vec::new()));
+    let label = FileChange {
+        path: "abc".into(),
+        status: Status::Modified,
+        old: None,
+        new: None,
+        staging: None,
+    };
+    doc.push(label, Source::Commit(commit));
+    doc.push(long_diff("z.c").change, Source::Repo);
+    doc.push(long_diff("b.c").change, Source::Repo);
+    let change = FileChange::unchanged("a.c".into(), Mode::File);
+    assert_eq!(doc.show_unchanged(change.clone()), 3);
+    assert_eq!(doc.show_unchanged(change.clone()), 3, "added once");
+    assert_eq!(
+        doc.show_unchanged(long_diff("b.c").change),
+        2,
+        "a listed file is its own entry"
+    );
+    assert_eq!(doc.commit_files(0), 1..3);
+    assert_eq!(doc.commit_of(3), None);
+    assert!(doc.sort_by_path());
+    let paths: Vec<_> = doc
+        .files()
+        .iter()
+        .map(|e| e.change().path.clone())
+        .collect();
+    assert_eq!(paths, ["abc", "b.c", "z.c", "a.c"]);
+
+    let entry = &doc.files()[3];
+    assert!(entry.wants_diff() && !entry.wants_counts());
+    assert!(doc.is_full(entry) && !doc.full);
+    let text = long_diff("a.c").old;
+    let fd = FileDiff {
+        change,
+        old: text.clone(),
+        new: text,
+        hunks: Vec::new(),
+        binary: false,
+        too_large: false,
+        note: None,
+    };
+    let loaded = File::prepare(&GRAMMARS, None).unchanged(fd, true);
+    let _ = doc.load(3, Ok(Box::new(loaded)));
+    let part = doc.first_part(3);
+    assert_eq!(doc.rows(3, part, unified), 80);
+    assert!(matches!(
+        doc.row(at(3, part, 79), unified),
+        Some(Content::Gap { new: 79, .. })
+    ));
+    let missing = |doc: &Document<()>| {
+        doc.missing(at(3, part, 0), at(3, part, 9))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(missing(&doc), [Missing::GapSyntax(0)]);
+
+    let prepare = File::prepare(&GRAMMARS, None);
+    let file = doc.file(3).expect("loaded");
+    let (diff, slot) = (
+        Arc::clone(file.diff()),
+        file.syntax().cloned().expect("highlighted"),
+    );
+    let spans = prepare.gap_syntax(&diff, &slot, file.gap_lines(0));
+    assert!(spans.is_some());
+    doc.set_gap_syntax(3, &diff, 0, spans);
+    assert_eq!(missing(&doc), [Missing::Scopes]);
+    prepare.scopes(&diff, &slot);
+    assert_eq!(missing(&doc), Vec::<Missing>::new());
+    doc.structural = true;
+    assert_eq!(
+        missing(&doc),
+        Vec::<Missing>::new(),
+        "no syntax diff: nothing changed"
+    );
+}
+
 /// `n` lands on each change of the file shown, then shows the next file;
 /// one not diffed yet waits, and opens landing on its first change once
 /// its diff is loaded. Each file keeps the place it was left at.

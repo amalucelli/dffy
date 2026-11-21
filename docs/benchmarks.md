@@ -1,9 +1,11 @@
 # Benchmarks and comparison
 
+How dffy's speed is measured: the gate that checks a change against an earlier commit, and the published comparison with other diff tools. It's for contributors running the gate and for readers checking the numbers.
+
 ## What's measured
 
-- **dffy next to other tools.** `delta`, `diff-so-fancy`, `difftastic`, `hunk`, `lumen`, git and GNU diff on the Linux kernel: how long each takes, how much memory it uses, and what each one does. The tables under [Setup](#setup) are the output of `cargo xtask compare` ([`crates/xtask`](../crates/xtask/src/compare.rs)), with tool and temporary paths shortened.
-- **dffy against an earlier commit of itself.** `cargo xtask perf` ([`crates/xtask`](../crates/xtask/src/perf.rs)) builds the checkout and a baseline commit, runs both on the same machine, and fails when the checkout does more work, allocates more, is slower or uses more memory. It runs eight groups:
+- **dffy next to other tools.** `delta`, `diff-so-fancy`, `difftastic`, `hunk`, `lumen`, git and GNU diff on the Linux kernel: how long each takes, how much memory it uses, and what it does. The tables under [Setup](#setup) are the output of `cargo xtask compare` ([`crates/xtask`](../crates/xtask/src/compare.rs)), with tool and temporary paths shortened.
+- **dffy against an earlier commit of itself.** `cargo xtask perf` ([`crates/xtask`](../crates/xtask/src/perf.rs)) builds the checkout and a baseline commit and runs both on the same machine. It fails when the checkout does more work, allocates more, is slower or uses more memory. It runs eight groups:
 
   | Group | Runs |
   |---|---|
@@ -18,7 +20,7 @@
 
   dffy's own budgets are in [architecture.md](architecture.md#performance).
 
-Both need `DFFY_BENCH_REPO` naming a clone of the Linux kernel with tags `v6.0` and `v6.1`. A shallow clone is enough (about 600MB of history):
+Both need `DFFY_BENCH_REPO` set to a clone of the Linux kernel with tags `v6.0` and `v6.1`. A shallow clone is enough (about 600MB of history):
 
 ```sh
 git clone --depth 1 --branch v6.1 https://github.com/torvalds/linux <dir>
@@ -37,11 +39,11 @@ task perf:full                  # every group, measuring layout bands when they'
 task bench:compare       # dffy against the other tools
 ```
 
-Every run prints its tables and saves them, with `results.json` and every program's raw output, in `target/perf/runs/<time>/`. The tasks never change a tracked file.
+Every run prints its tables and saves them in `target/perf/runs/<time>/`, with `results.json` and every program's raw output. The tasks never change a tracked file.
 
 ### Checking a change for regressions
 
-The candidate is always the checkout, uncommitted changes included; the results mark it as such. The baseline is the commit given with `--rev`, `HEAD~1` unless given. Comparing two branches is checking out one and naming the other:
+The candidate is always the checkout, uncommitted changes included, and the results mark it as such. The baseline is the commit given with `--rev`, `HEAD~1` by default. To compare two branches, check out one and name the other:
 
 ```sh
 git checkout my-branch
@@ -54,22 +56,36 @@ task perf -- --rev main
 | `task perf` | timing, peak memory, instructions and allocations | 10 | for changes to hot paths, or when `perf:quick` fails |
 | `task perf:full` | the same, with fresh layout bands | 10 | before a release |
 
-`perf:quick` measures every group. `task perf` and `task perf:full` do too, unless `--only` narrows them to a comma-separated list of groups from the table above, as in `task perf -- --only frame,print`.
+`perf:quick` measures every group. So do `task perf` and `task perf:full`, unless `--only` narrows them to a comma-separated list of groups from the table above, as in `task perf -- --only frame,print`.
 
-**Baselines.** Every run builds its baseline fresh: a temporary git worktree of the commit under `target/perf/worktree/`, built from that commit's sources into `target/perf/build/`, and its executables copied to `target/perf/baseline/`. When the run ends, whether it passed, failed or was interrupted with Ctrl-C, it removes its builds, keeping only `target/perf/runs/` and `target/perf/layout.tsv`, and prints what it removed and about how much space that freed.
+**Baselines.** Every run builds its baseline fresh. It makes a temporary git worktree of the commit under `target/perf/worktree/`, builds it into `target/perf/build/`, and copies the executables to `target/perf/baseline/`. When the run ends, whether it passed, failed or was interrupted with Ctrl-C, it removes its builds and keeps only `target/perf/runs/` and `target/perf/layout.tsv`. It prints what it removed and about how much space that freed.
 
-**Layout bands.** Timings are held to the layout bands in `target/perf/layout.tsv`: per metric, how far its median moved between builds of one commit with different code layouts. One file serves every baseline, and its first line names the commit and date it was measured on. `perf:full` measures it again when it's missing or more than 30 days old, and says so: the baseline's commit built four times with shuffled code layouts and each compared with the first, about three times as long as the comparison. When the file is current but has no band for a group being measured, such as a group added since, `perf:full` measures that group's bands alone, adds them and leaves the file's age as it was. Without the file the bands are 0. `perf` and `perf:quick` never calibrate.
+**Layout bands.** Timings are held to the layout bands in `target/perf/layout.tsv`. A metric's band is how far its median moved between builds of one commit with different code layouts. One file serves every baseline, and its first line names the commit and date it was measured on.
 
-**The rules.** Every round runs both builds, alternating which goes first, and a metric's value is its median over the rounds.
+- `perf:full` measures the file again when it's missing or more than 30 days old, and says so. It builds the baseline's commit four times with shuffled code layouts and compares each with the first, which takes about three times as long as the comparison.
+- When the file is current but has no band for a group being measured, such as a newly added group, `perf:full` measures that group's bands alone and adds them. The file's age stays as it was.
+- Without the file, the bands are 0. `perf` and `perf:quick` never calibrate.
 
-- A timing or peak-memory metric fails when the candidate was slower in enough rounds that a one-sided sign test gives p < 0.05 (9 of 10 at 10 rounds, 5 of 5 at 5) and its median is above the baseline's by more than 1% or the metric's layout band, whichever is larger, or when its instruction count fails. The 1% is criterion's default noise threshold.
-- On Linux, the user-space instructions retired, threads and child processes included, are counted for `count_pass`, each `first_paint` run and one more run of dffy per print and pager case, and, after the rounds, per iteration for every divan benchmark whose timing failed. A count fails when the candidate's median is more than 0.5% above the baseline's. On macOS, or without a hardware counter, these rows have no values and pass.
+**The rules.** Every round runs both builds, alternating which goes first. A metric's value is its median over the rounds.
+
+- A timing or peak-memory metric fails in two cases. One is when its instruction count fails. The other is when both of these hold:
+  - the candidate was slower in enough rounds that a one-sided sign test gives p < 0.05 (9 of 10 at 10 rounds, 5 of 5 at 5);
+  - its median is above the baseline's by more than 1% or the metric's layout band, whichever is larger. The 1% is criterion's default noise threshold.
+- On Linux, the gate counts user-space instructions retired, threads and child processes included. It counts them for `count_pass`, each `first_paint` run and one more run of dffy per print and pager case. After the rounds, it also counts per iteration for every divan benchmark whose timing failed. A count fails when the candidate's median is more than 0.5% above the baseline's. On macOS, or without a hardware counter, these rows have no values and pass.
 - Allocation counts and bytes per iteration, from divan's allocation profiler, fail on any increase of the median.
-- `count_pass` finding files whose count differs from their diff fails. A metric the baseline has and the candidate lacks fails; one only the candidate has is listed.
+- `count_pass` fails when it finds files whose count differs from their diff.
+- A metric the baseline has and the candidate lacks fails. One only the candidate has is listed.
 
-**The quick tier** keeps only the deterministic metrics, so 3 rounds are enough. Each round runs each divan benchmark alone twice, with the same number of samples, and divides the difference in instructions by the iterations the second run adds: the power of two nearest to 200ms of the benchmark's time per iteration, at most 8 more per sample. With equal sample counts, divan's per-sample work cancels in the difference, and a sample holds at most 10 iterations' inputs and outputs. Print and pager run on a fixed subset of the range: 421 changed files under ten directories, with C sources and headers, Makefiles and Kconfig, Rust, docs, YAML, JSON, renames and the largest file, in rows named `print/subset` and `pager/subset`. There are no timings, peak memory, `pty` or `comments` group. The summary ends with the largest spread of an instruction count over one side's rounds.
+**The quick tier** keeps only the deterministic metrics, so 3 rounds are enough.
 
-Every command runs in the kernel clone with only `PATH` from the environment, an empty home and XDG directories, git with no global or system config, and `TERM=xterm-256color`. Peak memory needs `/usr/bin/time` (GNU time on Linux). Layout bands hold only for the machine that measured them. Advanced: `cargo xtask bench-baseline`, `bench-ab`, `bench-noise` and `bench-layouts` run the steps above on a directory of executables, and `bench-noise` writes a `noise.tsv` beside them that lets an allocation metric pass within its band; `cargo xtask` prints their usage.
+- Each round runs each divan benchmark alone twice, with the same number of samples. It divides the difference in instructions by the iterations the second run adds: the power of two nearest to 200ms of the benchmark's time per iteration, at most 8 more per sample. With equal sample counts, divan's per-sample work cancels out in the difference. A sample holds at most 10 iterations' inputs and outputs.
+- Print and pager run on a fixed subset of the range, in rows named `print/subset` and `pager/subset`. The subset is 421 changed files under ten directories: C sources and headers, Makefiles and Kconfig, Rust, docs, YAML, JSON, renames and the largest file.
+- It has no timings, no peak memory, and no `pty` or `comments` group.
+- The summary ends with the largest spread of an instruction count over one side's rounds.
+
+Every command runs in the kernel clone with only `PATH` from the environment, an empty home and XDG directories, git with no global or system config, and `TERM=xterm-256color`. Peak memory needs `/usr/bin/time` (GNU time on Linux). Layout bands hold only for the machine that measured them.
+
+`cargo xtask bench-baseline`, `bench-ab`, `bench-noise` and `bench-layouts` run the steps above on a directory of executables. `bench-noise` writes a `noise.tsv` beside them, which lets an allocation metric pass within its band. `cargo xtask` prints their usage.
 
 ### The comments group
 
@@ -77,8 +93,8 @@ The `comments` group ([`crates/xtask`](../crates/xtask/src/comments.rs)) times t
 
 **The comments files.** At the start of a run, the checkout's own `dffy comments apply` writes them into the run's temporary directory, and both builds open the same files. They're made from the range's diff and the files' text at `v6.1`, so they're the same on every run:
 
-- The review: 300 threads. One is on `.clang-format`'s changed line, so the first screen shows one; 250 are over `mm/vmscan.c`'s added lines and 49 over `net/core/filter.c`'s.
-- The large review: 2,000 threads. The first is on `.clang-format` again; the others are over the added lines of 15 C files the range edits, each with 695 to 3,221 added lines, about one thread per ten. `drivers/clk/clk_test.c` comes first, with 160; `mm/vmscan.c` has the most, 400.
+- The review: 300 threads. One is on `.clang-format`'s changed line, so the first screen shows a thread. 250 are over `mm/vmscan.c`'s added lines and 49 over `net/core/filter.c`'s.
+- The large review: 2,000 threads. The first is on `.clang-format` again. The others are over the added lines of 15 C files the range edits, each with 695 to 3,221 added lines, about one thread per ten. `drivers/clk/clk_test.c` comes first, with 160. `mm/vmscan.c` has the most, 400.
 - Every third thread covers up to three lines, every fifth is resolved, and every tenth is unplaced, because its anchor's lines aren't in the file.
 - Thread `i` has `i % 4` replies: 450 in the review, 3,000 in the large one.
 - The texts range from one line to a paragraph that wraps, or a list with a code block.
@@ -94,12 +110,19 @@ The `comments` group ([`crates/xtask`](../crates/xtask/src/comments.rs)) times t
 | `comments/page down` | Then 16 presses of page down in `mm/vmscan.c`: the median time from a press to the end of the frame it draws. |
 | `comments/large first frame`, `large first thread`, `large next thread`, `large page down` | The same with the large review, where `m` goes from `.clang-format` to `drivers/clk/clk_test.c` and the paging runs there. Its first screen is the same, so `settled` isn't measured again. |
 
-- **Between presses.** The harness waits for 150ms of silence before the next press, so a late repaint isn't taken for the next key's frame.
-- **Failures.** A run fails if a key draws no frame within 10 seconds, or if no thread's text is on screen after an `m`. It also fails if the last `m` doesn't land on the thread it should in the second file. `m` walks the placed threads first and the unplaced ones after them, so the 16th press lands on thread 16.
+The harness waits for 150ms of silence before each press, so a late repaint isn't taken for the next key's frame.
 
-These are timings only, held to the timing rule and to their layout bands, so `perf:quick` leaves the group out. The next `perf:full` adds their bands to `layout.tsv`.
+A run fails if a key draws no frame within 10 seconds, or if no thread's text is on screen after an `m`. It also fails if the last `m` doesn't land on the right thread in the second file. `m` walks the placed threads first and the unplaced ones after, so the 16th press lands on thread 16.
 
-**Baselines without comments.** A baseline from before `--comments`, such as any commit before the review-comments work, can't open the file, so the group would compare nothing: the run fails, saying so, rather than pass a gate it didn't check. Name a baseline that has comments to gate the comments path, leave the group out with `--only`, or pass `--allow-missing-baseline` (to `perf` or `bench-ab`) to run it on the checkout alone, its rows listed as "only in B". A checkout that can't open the file always fails.
+These metrics are timings only, held to the timing rule and their layout bands, so `perf:quick` leaves the group out. The next `perf:full` adds their bands to `layout.tsv`.
+
+**Baselines without comments.** A baseline from before `--comments` can't open the file, so the group would compare nothing. That covers any commit before the review-comments work. The run fails and says so, rather than pass a gate it didn't check. You have three ways out:
+
+- name a baseline that has comments, to gate the comments path;
+- leave the group out with `--only`;
+- pass `--allow-missing-baseline` (to `perf` or `bench-ab`) to run the group on the checkout alone, its rows listed as "only in B".
+
+A checkout that can't open the file always fails.
 
 ```sh
 task perf:full -- --rev <commit-with-comments> --only comments   # first time: also measures the group's layout bands
@@ -107,33 +130,53 @@ task perf -- --rev <commit-with-comments> --only comments
 task perf -- --rev main --allow-missing-baseline                  # main from before comments: the group on B alone
 ```
 
-The group needs the kernel clone. Its files and line numbers are the range's, and it fails when `DFFY_BENCH_REPO` has fewer added lines in them than threads.
+The group needs the kernel clone. Its files and line numbers are the range's. It fails when `DFFY_BENCH_REPO` has fewer added lines in them than threads.
 
 ### Comparing with other tools
 
-`task bench:compare` builds dffy from the checkout and runs `cargo xtask compare` with it. It needs git, GNU diff and hyperfine. Each other tool is found on `PATH` or through its variable (`DELTA`, `DIFFT`, `DIFF_SO_FANCY`, `HUNK`, `LUMEN`, `HYPERFINE`; `DFFY` overrides the build), and a tool it can't find is skipped. `RUNS`, `SLOW_RUNS` and `MEM_RUNS` set the number of runs, and `SCENARIOS` picks sections from `range,renames,file,syntax,tui`, where `tui` is every viewer table. The working-tree viewer table needs uncommitted changes in the clone and is skipped without them. On Linux every measurement waits until the one-minute load average is under 1, so the run stalls on a machine that never gets that quiet. A full run takes about an hour, half of it `difftastic` on the whole range.
+`task bench:compare` builds dffy from the checkout and runs `cargo xtask compare` with it. It needs git, GNU diff and hyperfine.
+
+- Each other tool is found on `PATH` or through its variable: `DELTA`, `DIFFT`, `DIFF_SO_FANCY`, `HUNK`, `LUMEN`, `HYPERFINE`. `DFFY` overrides the build. A tool it can't find is skipped.
+- `RUNS`, `SLOW_RUNS` and `MEM_RUNS` set the number of runs.
+- `SCENARIOS` picks sections from `range,renames,file,syntax,tui`, where `tui` is every viewer table.
+- The working-tree viewer table needs uncommitted changes in the clone, and is skipped without them.
+- On Linux, every measurement waits until the one-minute load average is under 1. The run stalls on a machine that never gets that quiet.
+
+A full run takes about an hour, half of it `difftastic` on the whole range.
 
 ## Reading the tables
 
-**Comparison tables:**
-- **Total:** wall time from start to exit, with output to `/dev/null`, from [hyperfine](https://github.com/sharkdp/hyperfine): the median, the standard deviation and the range.
-- **First byte:** time from spawning the command to the first byte on its stdout (a pipe), from the harness in [`crates/xtask`](../crates/xtask/src/harness.rs). It's what decides when a pager shows its first screen.
-- **Own memory** and **Mapped files:** the harness reads `/proc/<pid>/status` every 2ms for every process the command starts and keeps each program's peak, in separate runs from the timed ones. "Own memory" is `RssAnon`: the heap and stacks the program allocated. "Mapped files" is `RssFile`: pages of files the program has mapped, its own executable and, for git and dffy, the repository's pack files. Those pages are the OS file cache, shared with every other process that reads the same packs, so they aren't the program's to free. A daemon that leaves the command's process group, like `hunk`'s session daemon, isn't counted. On macOS, own memory is the whole command's peak RSS from `/usr/bin/time -l`, and the other memory columns are empty.
-- **git beside it:** git's own and mapped memory when it runs beside the tool, in a pipeline or as a viewer's helper.
-- **First frame** and **Settled:** each viewer runs in a 200×60 pseudo-terminal. The harness timestamps every chunk of output as it's read and feeds it to the [vt100](https://crates.io/crates/vt100) terminal emulator: "first frame" is the timestamp of the chunk after which the scenario's first changed line is on the screen, however the viewer draws it. "Settled" is the last chunk before a full second without output; a viewer that keeps redrawing gets 5 more seconds after its first frame and reads "still drawing". A viewer that doesn't show the line within 60 seconds is stopped and reads ">60s"; one that shows a notice in its place reads "n/a" with the notice. The harness answers the queries a terminal would (device attributes, cursor position, colors, mode reports, window size). The "harness floor" row is `echo` of the same text: the cost of starting a process from the harness. After the run, `q` is sent; memory is sampled from start to exit.
+The comparison tables have these columns:
 
-**`perf` tables:**
-- **A** and **B:** the baseline's and the checkout's median over the rounds. Times are wall time, `B` bytes, `n` a count; instruction counts are in scientific notation.
+- **Total:** wall time from start to exit, with output to `/dev/null`, from [hyperfine](https://github.com/sharkdp/hyperfine). It shows the median, the standard deviation and the range.
+- **First byte:** time from spawning the command to the first byte on its stdout (a pipe), from the harness in [`crates/xtask`](../crates/xtask/src/harness.rs). It decides when a pager shows its first screen.
+- **Own memory** and **Mapped files:** in runs separate from the timed ones, the harness reads `/proc/<pid>/status` every 2ms for every process the command starts, and keeps each program's peak.
+  - "Own memory" is `RssAnon`, the heap and stacks the program allocated.
+  - "Mapped files" is `RssFile`, the pages of files the program has mapped. That's its own executable and, for git and dffy, the repository's pack files. Those pages are the OS file cache, shared with every other process reading the same packs, so they aren't the program's to free.
+  - A daemon that leaves the command's process group, like `hunk`'s session daemon, isn't counted.
+  - On macOS, own memory is the whole command's peak RSS from `/usr/bin/time -l`, and the other memory columns are empty.
+- **git beside it:** git's own and mapped memory when it runs beside the tool, in a pipeline or as a viewer's helper.
+- **First frame** and **Settled:** each viewer runs in a 200×60 pseudo-terminal. The harness timestamps every chunk of output as it's read and feeds it to the [vt100](https://crates.io/crates/vt100) terminal emulator.
+  - "First frame" is the timestamp of the chunk after which the scenario's first changed line is on screen, however the viewer draws it.
+  - "Settled" is the last chunk before a full second without output. A viewer that keeps redrawing gets 5 more seconds after its first frame, then reads "still drawing".
+  - A viewer that doesn't show the line within 60 seconds is stopped and reads ">60s". One that shows a notice in its place reads "n/a" with the notice.
+  - The harness answers the queries a terminal would: device attributes, cursor position, colors, mode reports, window size.
+  - The "harness floor" row is `echo` of the same text, the cost of starting a process from the harness.
+  - After the run, `q` is sent. Memory is sampled from start to exit.
+
+The `perf` tables have these columns:
+
+- **A** and **B:** the baseline's and the checkout's median over the rounds. Times are wall time, `B` is bytes and `n` a count. Instruction counts are in scientific notation.
 - **Delta:** B's median relative to A's.
 - **Slower rounds:** the rounds B was slower in, out of those both sides have.
 - **Band:** in a `bench-noise` run only, the largest difference between the two sides of one round.
-- **Result:** the rule's verdict, with the threshold when a layout band raised it above 1%, and `instructions flat` when a timing's count stayed within 0.5%. A run of the baseline against itself shows a failing metric as a false alarm.
+- **Result:** the rule's verdict. It adds the threshold when a layout band raised it above 1%, and `instructions flat` when a timing's count stayed within 0.5%. In a run of the baseline against itself, a failing metric is a false alarm.
 
-`cargo xtask report <run-dir>` prints a run's tables from its `results.json`: a comparison's as they appear below, an A/B run's as Before, After, Change and Result.
+`cargo xtask report <run-dir>` prints a run's tables from its `results.json`. A comparison's come out as they appear below, and an A/B run's as Before, After, Change and Result.
 
 ## Updating the published numbers
 
-The tables below are pasted from a run; no task writes them.
+The tables below are pasted from a run. No task writes them.
 
 1. On a machine with nothing else running, run `task bench:compare`.
 2. Run `cargo xtask report target/perf/runs/<time>` with the directory it printed.
@@ -144,10 +187,10 @@ dffy's budget table in [architecture.md](architecture.md#performance) is updated
 ## Setup
 
 - **Date:** every table is from one run of `cargo xtask compare`, started on 2026-11-17 at 01:56 UTC, on a release build (`cargo build --release`).
-- **Machine:** a VM with 4 vCPUs of an AMD EPYC 9554P, 15.6GiB of RAM, Ubuntu 24.04.5 LTS, Linux 6.12.115, with nothing else running. The load average was 0.11 when the run started, and each measurement started once the one-minute load average was under 1.
+- **Machine:** a VM with 4 vCPUs of an AMD EPYC 9554P, 15.6GiB of RAM, Ubuntu 24.04.5 LTS, Linux 6.12.115, with nothing else running. The load average was 0.11 when the run started. Each measurement started once the one-minute load average was under 1.
 - **Versions:** dffy 0.2.0 (commit `126c8cf`, built with rustc 1.100.0), `delta` 0.20.1, `difftastic` 0.72.0, `diff-so-fancy` 1.4.14 on Perl 5.38.2, `hunk` 0.25.0, `lumen` 2.32.0, git 2.43.0, GNU diffutils 3.10, hyperfine 2.0.0.
 - **Runs:** 10 per measurement after a warmup run, 3 without warmup for commands over about ten seconds, and one for `difftastic` on the whole range. Memory comes from 3 more runs of each command (one for `difftastic` on the range); the viewer tables sample memory during their timed runs.
-- **Memory:** "own memory" is what the program allocated itself. "Mapped files" is the part of the repository's pack files (and the program's executable) it has mapped: OS file cache, shared with git and every other reader of the same packs. `git diff` maps the same packs.
+- **Memory:** "own memory" is what the program allocated itself. "Mapped files" is the part of the repository's pack files, and of the program's executable, that it has mapped. That's OS file cache, shared with git and every other reader of the same packs. `git diff` maps the same packs.
 
 ## The whole v6.0..v6.1 range, printed
 
@@ -164,10 +207,11 @@ The pagers read what git writes for a terminal. Totals are measured with output 
 | `diff-so-fancy` | `git diff --no-ext-diff --color=always v6.0 v6.1 \| diff-so-fancy` | 211.0ms (209.0–221.7) | 14.81s ± 0.09s (14.75s–14.93s) | 33.4MB | 5.4MB | 125.8MB / 276.4MB |
 | `difftastic`, as git's external diff | `DFT_COLOR=always GIT_EXTERNAL_DIFF=difft git diff v6.0 v6.1` | 245.4ms, one run | 935.15s, one run | 917.1MB | 11.5MB | 117.7MB / 276.5MB |
 
-- A pager's first byte follows git's, which comes after git's rename detection: with `--no-renames`, git's first byte comes at 33ms (median of 10).
-- dffy as a pager doesn't highlight code; dffy on the repository highlights every file it prints, which is most of its 16.1s.
-- git and dffy on the repository each map about 280MB of the repository's 576MB of packs, the same pages of the same files. Of its own memory, dffy holds at most 4MB of file contents and output ahead of what it has written. A file larger than that is diffed on a thread of its own, one at a time, while the others go on, and its output streams once its turn comes. Highlighting adds the syntax trees of the files being highlighted.
-- `difftastic` starts one process per file; its memory is the peak of the largest one.
+- A pager's first byte follows git's, which comes after git's rename detection. With `--no-renames`, git's first byte comes at 33ms (median of 10).
+- dffy as a pager doesn't highlight code. dffy on the repository highlights every file it prints, which is most of its 16.1s.
+- git and dffy on the repository each map about 280MB of the repository's 576MB of packs, the same pages of the same files.
+- Of its own memory, dffy holds at most 4MB of file contents and output ahead of what it has written. A larger file is diffed on a thread of its own, one at a time, while the others go on. Its output streams once its turn comes. Highlighting adds the syntax trees of the files being highlighted.
+- `difftastic` starts one process per file. Its memory is the peak of the largest one.
 
 ## The range's file list, with rename detection
 
@@ -192,9 +236,9 @@ Both lists are identical: 12,914 entries, 254 of them renames, with the same sim
 | dffy --syntax | `dffy --syntax --paging=never --color=always old/kernel/sched/fair.c new/kernel/sched/fair.c` | 66.9ms (58.5–77.3) | 76.4ms ± 8.8ms (58.7ms–85.5ms) | 34.4MB | 9.4MB | — |
 | `difftastic` | `DFT_COLOR=always difft old/kernel/sched/fair.c new/kernel/sched/fair.c` | 258.3ms (239.5–281.4) | 264.4ms ± 11.9ms (248.3ms–290.9ms) | 45.0MB | 7.2MB | 17.1MB / 14.2MB |
 
-`delta` runs `git diff --no-index` itself to compare two files, and `difftastic` runs git as well; their git is in the last column.
+`delta` runs `git diff --no-index` itself to compare two files, and `difftastic` runs git as well. Their git is in the last column.
 
-dffy parses both sides of the file for highlighting before it prints the first line, so its first byte comes after `delta`'s and `diff-so-fancy`'s; its total is level with `diff-so-fancy`'s, and its median is under `delta`'s. In the viewer, the plain diff paints first and highlighting follows.
+dffy parses both sides of the file for highlighting before it prints the first line, so its first byte comes after `delta`'s and `diff-so-fancy`'s. Its total is level with `diff-so-fancy`'s, and its median is under `delta`'s. In the viewer, the plain diff paints first and highlighting follows.
 
 ## Syntax-aware diffs of five large files
 
@@ -213,11 +257,11 @@ dffy parses both sides of the file for highlighting before it prints the first l
 | drivers/net/wireless/realtek/rtw89/rtw8852c_table.c (517KB → 1076KB) | dffy --syntax | 327.1ms ± 15.9ms (308.7ms–360.5ms) | 108.8MB | 8.5MB | syntax diff, nothing fell back |
 | drivers/net/wireless/realtek/rtw89/rtw8852c_table.c (517KB → 1076KB) | `difftastic` | 233.4ms ± 10.5ms (221.2ms–254.9ms) | 141.5MB | 7.2MB | Text (1.1 MiB exceeded DFT_BYTE_LIMIT) |
 
-`difftastic`'s times here are for its text fallback, not a structural diff; its header names the limit each file went over. dffy's syntax diff matches parse-error subtrees as opaque pieces, so the same files get a syntax diff.
+`difftastic`'s times here are for its text fallback, not a structural diff. Its header names the limit each file went over. dffy's syntax diff matches parse-error subtrees as opaque pieces, so the same files get a syntax diff.
 
 ## Interactive viewers
 
-Every viewer runs in a 200×60 pseudo-terminal. First frame: the scenario's first changed line is on screen. Settled: the last byte before a second with no output. Medians with min–max, over 10 runs, or 3 for `lumen` and `hunk` on the whole range and for `hunk` as a pager.
+Every viewer runs in a 200×60 pseudo-terminal. First frame is when the scenario's first changed line is on screen. Settled is the last byte before a second with no output. Values are medians with min–max over 10 runs, or 3 for `lumen` and `hunk` on the whole range and for `hunk` as a pager.
 
 ### The v6.0..v6.1 range
 
@@ -230,7 +274,7 @@ The first changed line is in the first file, `.clang-format`.
 | `lumen` | `lumen diff v6.0..v6.1` | 5246.7ms (5192.6–5300.6) | 12474.4ms (12458.1–12545.4) | 12474.6ms (12458.4–12545.7) | 676.2MB | 314.1MB | — |
 | `hunk` | `hunk diff v6.0 v6.1` | 10261.6ms (10171.8–10269.2) | 18111.1ms (17731.8–18298.9) | 18111.3ms (17731.9–18300.1) | 4.39GB | 95.7MB | 0.5MB / 5.4MB |
 
-dffy keeps updating the screen after its first frame while it finishes the file list, pairs renames and counts every file's lines for the tree; that work ends at "settled". Its own pty benchmark, which stops at the end of the first complete frame, is in [architecture.md](architecture.md#performance).
+After its first frame, dffy keeps updating the screen while it finishes the file list, pairs renames and counts every file's lines for the tree. That work ends at "settled". Its own pty benchmark, which stops at the end of the first complete frame, is in [architecture.md](architecture.md#performance).
 
 ### The working tree
 
@@ -282,7 +326,7 @@ The viewer reads the range's patch from `git diff --no-ext-diff v6.0 v6.1` on st
 | `hunk` pager | `git diff --no-ext-diff v6.0 v6.1 \| hunk pager` | 7504.7ms (7446.7–7633.5) | 15178.9ms (15175.8–15583.1) | 15179.0ms (15175.9–15583.2) | 4.19GB | 95.8MB | 125.8MB / 276.4MB |
 | `lumen` | | n/a | n/a (not a pager: reads revisions, not a patch) | n/a | | | |
 
-Both first frames wait for git's first byte, which comes after git's rename detection. dffy reads the patch only as far as the screen and its look-ahead need, so git waits on the pipe with 21.5MB of its own. Beside `hunk`, git runs to the end of the patch, with the same 126MB as on its own.
+Both first frames wait for git's first byte, which comes after git's rename detection. dffy reads the patch only as far as the screen and its look-ahead need, so git waits on the pipe holding 21.5MB of its own. Beside `hunk`, git runs to the end of the patch, with the same 126MB as on its own.
 
 ## Method
 
@@ -290,16 +334,17 @@ Both first frames wait for git's first byte, which comes after git's rename dete
 
 **Isolation.** Every command runs with only `PATH` from the environment, `TERM=xterm-256color`, `COLORTERM=truecolor`, `LANG=C.UTF-8`, an empty `HOME`, empty XDG config, state, cache and data directories, and git with no global or system config (`GIT_CONFIG_GLOBAL` pointing at an empty file, `GIT_CONFIG_NOSYSTEM=1`). That keeps a `diff.external`, a `delta` theme, `diff.renames = copies` or dffy's remembered viewer settings out of the numbers. Each tool runs with its defaults.
 
-**Caches.** The page cache is warm: every repository object and file is read before timing (hyperfine's warmup run, or earlier rows). dffy keeps a disk cache of rename and syntax-diff results; it's emptied before every run, so no run reuses work from another. `hunk` starts a session daemon on first use, which stays up across its runs and is stopped after them.
+**Caches.** The page cache is warm. Every repository object and file is read before timing, by hyperfine's warmup run or by earlier rows. dffy's disk cache of rename and syntax-diff results is emptied before every run, so no run reuses another's work. `hunk` starts a session daemon on first use, which stays up across its runs and is stopped after them.
 
-**The tools don't all do the same work:**
+**Work done.** The tools don't all do the same work.
+
 - `delta` highlights syntax by default, and so does dffy when it reads the repository. dffy as a pager doesn't highlight, because a piped diff has only the lines git wrote. Both are shown with highlighting on and off where the tool allows it.
-- `difftastic` isn't a pager: it reads two files, not a patch. For the range it runs as git's external diff, once per file, which is how its manual sets it up with git.
+- `difftastic` isn't a pager. It reads two files, not a patch. For the range it runs as git's external diff, once per file, which is how its manual sets it up with git.
 - `hunk` and `lumen` are interactive only, so they appear only in the viewer tables.
 
 **Commands.** The pager rows read `git diff --no-ext-diff --color=always v6.0 v6.1`, which is what git hands its pager in a terminal. dffy's rows on the repository read the objects with dffy's own git code. The "Command" column has the exact command line for every row.
 
-**Tools.** `difftastic`, `hyperfine` and `lumen` were installed with `cargo binstall`, `delta` from its GitHub release, and `hunk` and `diff-so-fancy` from npm. `hunk`'s npm package is a Node launcher around a compiled binary; `HUNK` points at that binary, so Node's startup isn't counted against it. The kernel clone is shallow, checked out at a later commit with a one-line comment appended to five files. The working-tree table diffs those five; no other table reads the working tree.
+**Tools.** `difftastic`, `hyperfine` and `lumen` were installed with `cargo binstall`, `delta` from its GitHub release, and `hunk` and `diff-so-fancy` from npm. `hunk`'s npm package is a Node launcher around a compiled binary. `HUNK` points at that binary, so Node's startup isn't counted against it. The kernel clone is shallow, checked out at a later commit with a one-line comment appended to five files. The working-tree table diffs those five, and no other table reads the working tree.
 
 ## Feature comparison sources
 
@@ -346,5 +391,5 @@ Checked on 2026-11-15 against the versions benchmarked: `hunk` 0.25.0, `lumen` 2
 
 **dffy**: [viewer.md](viewer.md), [git.md](git.md), [watch.md](watch.md), [usage.md](usage.md#comparing-files-and-folders), [themes.md](themes.md), [plugins.md](plugins.md) and [config.md](config.md) (`view = auto` splits from `split-min-width`, 140 columns), each describing the current code. Highlighting is off in pager mode ([git.md](git.md#piped-input)).
 - Line comments: [comments.md](comments.md) and [viewer.md](viewer.md#comments).
-- Agent annotations: [viewer.md](viewer.md#asking-an-agent) and the agent section of [plugins.md](plugins.md#agent-plugins). `a` asks Claude Code, Codex or Pi about a thread through the dffy-agent plugin, and the answer shows inline as the agent's reply, with its suggestion; agents reply through MCP's `reply_to_thread` or `dffy comments apply`.
-- Pull request review: [viewer.md](viewer.md#code-host-reviews) and the dffy-review-github section of [plugins.md](plugins.md). It's partial because it needs the experimental plugin and the GitHub CLI, and doesn't support forks or GitHub Enterprise yet.
+- Agent annotations: [viewer.md](viewer.md#asking-an-agent) and the agent section of [plugins.md](plugins.md#agent-plugins). `a` asks Claude Code, Codex or Pi about a thread through the dffy-agent plugin. The answer shows inline as the agent's reply, with its suggestion. Agents reply through MCP's `reply_to_thread` or `dffy comments apply`.
+- Pull request review: [viewer.md](viewer.md#code-host-reviews) and the dffy-review-github section of [plugins.md](plugins.md). It's partial because it needs the experimental plugin and the GitHub CLI.

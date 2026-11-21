@@ -71,7 +71,7 @@ keybind = leader:z=toggle_wrap
 | `tree_narrower` | `-` in the tree |  | Narrow the tree |
 | `commented_files` | `c` in the tree | `!` | The tree shows only the files with comments, or every file; f/F and n/N keep to them. In the comments panel, it steps through all threads, open ones, drafts and resolved ones, and its capital steps back |
 
-### View
+### Layout
 
 | Action | Keys | Command panel | Description |
 |---|---|---|---|
@@ -79,18 +79,28 @@ keybind = leader:z=toggle_wrap
 | `toggle_full` | `X` | `X` | Whole files or changes only, for every file |
 | `cycle_layout` | `s` | `s` | Layout: split, unified, then auto (split on wide screens); while selecting, the side copied |
 | `toggle_wrap` | `W` | `W` | Wrap or truncate long lines |
+| `toggle_status_bar` |  | `B` | The status bar in the frame's bottom border or its top one |
+| `toggle_thread` | `z` |  | Fold or unfold the focused comment thread, or the first on screen |
+| `toggle_threads` | `Z` |  | Fold every comment thread to one row, or unfold them all |
+
+### Diff
+
+| Action | Keys | Command panel | Description |
+|---|---|---|---|
 | `toggle_syntax` | `d` | `d` | Diff by lines or by syntax |
 | `toggle_rendered` | `r` | `r` | Files with a renderer plugin rendered, or as lines (experimental, see render) |
+| `toggle_whitespace` |  | `I` | Ignore whitespace (-w) or not, diffing again |
+
+### Display
+
+| Action | Keys | Command panel | Description |
+|---|---|---|---|
 | `cycle_indicators` |  | `K` | How changed lines are marked: background, bars, classic signs or none |
 | `cycle_modified_lines` |  | `%` | A line and its edit in the modified color with red and green tokens, or red and green lines |
 | `toggle_highlight` |  | `*` | Syntax highlighting on or off |
-| `toggle_whitespace` |  | `I` | Ignore whitespace (-w) or not, diffing again |
 | `toggle_line_numbers` |  | `#` | Show or hide line numbers |
 | `toggle_hunk_headers` |  | `@` | Show or hide the @@ numbers of hunks |
-| `toggle_status_bar` |  | `B` | The status bar in the frame's bottom border or its top one |
 | `cycle_theme` |  | `~` | The next theme, built-in or yours |
-| `toggle_thread` | `z` |  | Fold or unfold the focused comment thread, or the first on screen |
-| `toggle_threads` | `Z` |  | Fold every comment thread to one row, or unfold them all |
 
 ### Selection & copy
 
@@ -137,7 +147,7 @@ keybind = leader:z=toggle_wrap
 | `comment` | `c` |  | Comment on the selected lines, or the line v would start on, in a text box under them; enter sends it |
 | `suggest_change` | `S` | `S` | Suggest a change to the selected lines, or the line v would start on: a comment's text box holding them, to edit into what they should be; enter sends it |
 | `comment_file` | `C` |  | Comment on the whole file shown, in a text box under its first row; enter sends it |
-| `comments` | `i` |  | The left panel lists every comment thread in place of the files, or the files again; moving through the threads shows each in the diff, enter or tab goes to it; the thread keys act on the selected thread, and c filters them by state |
+| `comments` | `i` | `i` | The left panel lists every comment thread in place of the files, or the files again; moving through the threads shows each in the diff, enter or tab goes to it; the thread keys act on the selected thread, and c filters them by state |
 | `move_thread` | `V` |  | Move the focused thread, or the comments panel's selected one, from the branch it was written on to the current branch |
 | `reply` | `r` on a thread |  | On a thread: reply in a text box under it; enter sends it |
 | `edit_draft` | `e` on a thread |  | On a thread: edit your last draft in it, in a text box; enter sends it |
@@ -224,23 +234,23 @@ While the file at the cursor has conflicts to resolve, these keys come after a t
 
 ## Command panel
 
-`space` opens the panel. These keys run its entries from any tab; within a group, the panel lists them in this order. On a setting with values (`Layout ‹ auto ›`), `h`/`l` and `left`/`right` step back and forward; on other rows they do nothing, so a `leader:h` or `leader:l` binding never runs, and `tab` and `shift+tab` switch tabs. `enter` on Theme opens the theme list.
+`space` opens the panel as a quick popup of what applies to what you're on; `space` or `tab` again shows the whole panel. These keys run its entries from the popup and from any tab; within a group, the panel lists them in this order. On a setting with values (`Layout ‹ auto ›`), `h`/`l` and `left`/`right` step back and forward; on other rows they do nothing, so a `leader:h` or `leader:l` binding never runs, and `tab` and `shift+tab` switch tabs. `enter` on Theme opens the theme list.
 
 | Key | Entry | Action |
 |---|---|---|
 | `s` | Layout | `cycle_layout` |
 | `W` | Wrap long lines | `toggle_wrap` |
+| `X` | Whole file | `toggle_full` |
+| `x` | More context | `expand` |
+| `B` | Status bar | `toggle_status_bar` |
 | `d` | Syntax diff | `toggle_syntax` |
 | `r` | Rendered view | `toggle_rendered` |
-| `x` | More context | `expand` |
-| `X` | Whole file | `toggle_full` |
+| `I` | Ignore whitespace | `toggle_whitespace` |
+| `*` | Syntax highlighting | `toggle_highlight` |
 | `K` | Indicators | `cycle_indicators` |
 | `%` | Modified lines | `cycle_modified_lines` |
-| `*` | Syntax highlighting | `toggle_highlight` |
-| `I` | Ignore whitespace | `toggle_whitespace` |
 | `#` | Line numbers | `toggle_line_numbers` |
 | `@` | Hunk headers | `toggle_hunk_headers` |
-| `B` | Status bar | `toggle_status_bar` |
 | `o` | Find file… | `open_picker` |
 | `\|` | Filter tree… | `filter_tree` |
 | `!` | Files with comments | `commented_files` |
@@ -259,6 +269,7 @@ While the file at the cursor has conflicts to resolve, these keys come after a t
 | `;` | Take checkpoint | `take_checkpoint` |
 | `'` | Since checkpoint | `since_checkpoint` |
 | `~` | Theme | `cycle_theme` |
+| `i` | Comments panel | `comments` |
 | `E` | Continue in editor | `comment_in_editor` |
 | `a` | Ask agent | `ask_agent` |
 | `&` | Fix with agent | `fix_with_agent` |

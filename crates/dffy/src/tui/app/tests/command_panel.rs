@@ -77,45 +77,95 @@ fn on_thread(dir: &tempfile::TempDir, size: (usize, usize)) -> App {
 }
 
 /// `space` opens the quick popup: on a focused thread, its actions under
-/// "on this thread", then the layout, wrapping and watching after a rule,
-/// and a footer pointing to the rest. A row's key runs it.
+/// "On this thread", then View and Go, and a footer pointing to the rest.
+/// Each row shows one key, the one from outside the panel when there's
+/// one: `f` fixes with an agent, not `& f`; both run it.
 #[test]
 fn space_opens_a_quick_popup_with_the_threads_actions() {
     let dir = tempfile::tempdir().expect("tempdir");
     let mut app = on_thread(&dir, (140, 40));
     key(&mut app, ' ');
     assert!(quick(&app));
-    let popup = boxed(&mut app, "on this thread");
-    for row in ["Reply", "Resolve", "Wrap long lines", "space more · ? keys · esc close"] {
-        assert!(popup.contains(row), "{row}:\n{popup}");
-    }
-    assert!(!popup.contains(" Here  View"), "{popup}");
-    insta::assert_snapshot!("commands_quick_thread", screen(&mut app));
+    let popup = boxed(&mut app, "commands");
+    let line = |wanted: &str| {
+        (popup.lines())
+            .position(|l| l.contains(wanted))
+            .unwrap_or_else(|| panic!("{wanted}:\n{popup}"))
+    };
+    assert!(line("On this thread") < line("Reply"));
+    assert!(line("Reply") < line("View"));
+    assert!(line("View") < line("Syntax diff"));
+    assert!(line("Syntax diff") < line("Go"));
+    assert!(line("Go") < line("Comments panel"));
+    assert!(popup.contains("│  f  Fix with agent"), "{popup}");
+    assert!(
+        !popup.contains('&') && !popup.contains(" Here  View"),
+        "{popup}"
+    );
+    insta::assert_snapshot!("commands_quick_thread", popup);
     let phone_dir = tempfile::tempdir().expect("tempdir");
-    let mut phone = on_thread(&phone_dir, (50, 30));
+    let mut phone = on_thread(&phone_dir, (50, 40));
     key(&mut phone, ' ');
-    insta::assert_snapshot!("commands_quick_thread_narrow", screen(&mut phone));
+    let popup = boxed(&mut phone, "commands");
+    insta::assert_snapshot!("commands_quick_thread_narrow", popup);
+    let fix = app
+        .commands
+        .as_mut()
+        .map(|c| c.key(Key::Char('&'), Mods::NONE));
+    let fix_runs = crate::tui::commands::Outcome::Run {
+        action: Act::FixWithAgent,
+        back: false,
+    };
+    assert_eq!(fix, Some(fix_runs), "the panel's key runs it too");
     key(&mut app, 'r');
     assert!(app.commands.is_none());
     assert!(matches!(app.composing, Some(Compose::Reply(ref root)) if root == "d1"));
 }
 
-/// With nothing in particular to act on, the quick popup has Here's
-/// default rows. `space` or `tab` expands it into the full panel on Here,
-/// `/` into the full panel's search, and `esc` closes it.
+/// A screen too short for the whole quick popup drops its View group
+/// before Go, and the cursor and keys follow the rows shown.
+#[test]
+fn a_short_screen_drops_the_quick_popups_view_group() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut app = on_thread(&dir, (140, 24));
+    key(&mut app, ' ');
+    let popup = boxed(&mut app, "commands");
+    insta::assert_snapshot!("commands_quick_short", popup);
+    assert!(
+        !popup.contains("Syntax diff") && popup.contains("Go"),
+        "{popup}"
+    );
+    let rows = app.commands.as_ref().map_or(0, Commands::len);
+    key(&mut app, 'k');
+    let last = app.commands.as_ref().and_then(|c| c.entry(c.cursor()));
+    assert_eq!(
+        (app.commands.as_ref().map(Commands::cursor), last),
+        (Some(rows - 1), Some(Act::OpenTerminal))
+    );
+}
+
+/// With nothing in particular to act on, the quick popup has View and Go,
+/// which own the settings and places Here lists then. `space` or `tab`
+/// expands it into the full panel on Here, `/` into the full panel's
+/// search; `?` lists the keys instead, and `esc` closes it.
 #[test]
 fn space_again_expands_the_quick_popup_into_the_panel() {
     let mut phone = app(50, 30);
     let mut app = app(140, 40);
     key(&mut app, ' ');
     assert!(quick(&app));
+    let popup = boxed(&mut app, "commands");
+    assert!(!popup.contains("Here"), "nothing of Here's left:\n{popup}");
     insta::assert_snapshot!("commands_quick", screen(&mut app));
     key(&mut phone, ' ');
     insta::assert_snapshot!("commands_quick_narrow", screen(&mut phone));
     key(&mut app, ' ');
     assert_eq!((quick(&app), tab(&app)), (false, "Here"));
     let here = panel(&mut app);
-    assert!(here.contains(" Here  View  Files  Review  Git  Copy "), "{here}");
+    assert!(
+        here.contains(" Here  View  Files  Review  Git  Copy "),
+        "{here}"
+    );
     esc(&mut app);
     assert!(app.commands.is_none());
     key(&mut app, ' ');
@@ -125,24 +175,31 @@ fn space_again_expands_the_quick_popup_into_the_panel() {
     key(&mut app, ' ');
     esc(&mut app);
     assert!(app.commands.is_none(), "esc closes the popup");
+    typed(&mut app, " ?");
+    assert!(app.help.is_some() && app.commands.is_none());
+    esc(&mut app);
     key(&mut app, ' ');
     typed(&mut app, "/wrp");
     assert!(!quick(&app));
     let shown = screen(&mut app);
-    assert!(shown.contains("/wrp") && shown.contains("Wrap long lines"), "{shown}");
+    assert!(
+        shown.contains("/wrp") && shown.contains("Wrap long lines"),
+        "{shown}"
+    );
 }
 
-/// Here's keys come before the popup's common rows, which leave out one
-/// whose key a Here row takes: in a conflict once a choice is made, `w`
-/// writes the file rather than toggling watching.
+/// Here's keys come before the popup's other groups, which leave out a
+/// row whose key a Here row takes: in a conflict once a choice is made,
+/// `w` writes the file rather than toggling watching.
 #[test]
-fn heres_keys_win_over_the_quick_popups_common_rows() {
+fn heres_keys_win_over_the_quick_popups_other_groups() {
     let mut app = conflicted_app();
     key(&mut app, ' ');
     key(&mut app, 'j');
     press(&mut app, Key::Enter);
     key(&mut app, ' ');
-    let popup = boxed(&mut app, "in this conflict");
+    let popup = boxed(&mut app, "commands");
+    assert!(popup.contains("In this conflict"), "{popup}");
     assert!(popup.contains("Write resolved file…"), "{popup}");
     assert!(!popup.contains("Watch for changes"), "{popup}");
     let done = press(&mut app, Key::Char('w'));
@@ -153,7 +210,7 @@ fn heres_keys_win_over_the_quick_popups_common_rows() {
     assert_eq!(app.watch, Watch::Off);
 }
 
-/// `space` opens the command panel on Here: with nothing in particular
+/// `space` twice shows the full panel on Here: with nothing in particular
 /// to act on, a few settings and actions, and all keys after a blank.
 /// The tabs head it, the open one highlighted; `tab` and `shift+tab` go
 /// round them. A tab's rows have their state, their key and, dimmed,
@@ -183,6 +240,10 @@ fn the_command_panel_opens_on_here_and_tab_switches_tabs() {
     }
     press(&mut app, Key::Tab);
     assert_eq!(tab(&app), "View");
+    let view = panel(&mut app);
+    for title in ["│ Layout ", "│ Diff ", " Display "] {
+        assert!(view.contains(title), "{title}:\n{view}");
+    }
     insta::assert_snapshot!("commands_wide", panel_markup(&mut app));
     press(&mut app, Key::BackTab);
     press(&mut app, Key::BackTab);
@@ -682,4 +743,48 @@ fn toggling_highlighting_diffs_again() {
             whitespace: Whitespace::IgnoreAll
         })
     );
+}
+
+/// Expanding the quick popup leaves nothing of it on the terminal: the
+/// frames sent, played in an emulator, show the full panel over the diff
+/// alone, after the popup stood through several frames.
+#[test]
+fn expanding_the_quick_popup_leaves_none_of_it_on_screen() {
+    let (width, height) = (160, 40);
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut app = on_thread(&dir, (width, height));
+    let size =
+        |n: usize| std::num::NonZero::new(u16::try_from(n).expect("fits")).expect("non-zero");
+    let mut vt = vt100::Parser::new(size(height), size(width), 0);
+    app.invalidate();
+    let mut frame = |app: &mut App| {
+        app.dirty = true;
+        vt.process(app.draw().unwrap_or_default());
+        if place(app) {
+            vt.process(app.draw().unwrap_or_default());
+        }
+        vt.screen().contents()
+    };
+    frame(&mut app);
+    key(&mut app, ' ');
+    let popup = frame(&mut app);
+    assert!(popup.contains("space more"), "{popup}");
+    key(&mut app, 'j');
+    frame(&mut app);
+    key(&mut app, 'W');
+    frame(&mut app);
+    key(&mut app, ' ');
+    assert!(!quick(&app));
+    for _ in 0..2 {
+        let shown = frame(&mut app);
+        for gone in ["space more", "On this thread", "Watch for changes"] {
+            assert!(!shown.contains(gone), "{gone}:\n{shown}");
+        }
+        let lines = |text: &str| -> Vec<String> {
+            (text.trim_end().lines())
+                .map(|l| l.trim_end().to_owned())
+                .collect()
+        };
+        assert_eq!(lines(&shown), lines(&app.screen.text()));
+    }
 }

@@ -25,17 +25,17 @@ expression: screen(&mut app)
 │                                     │                                                                                                    ┃
 │                                     │                                                                                                    ┃
 │                                     │                                                                                                    ┃
-│                                     │                                                                                                    ┃
-│                                     │                                                                                                    ┃
-│                                     │                                                                                                    ┃
-│                                     │                                                                                                    ┃
-│                                     │                                                                                                    ┃
-│                                     │                                                                                                    ┃
 │                                     │                                                               ┌─ commands ────────────────────────┐┃
 │                                     │                                                               │                                   │┃
-│                                     │                                                               │  o  Find file…                    │┃
-│                                     │                                                               │  s  Layout ‹ auto (split here) ›  │█
+│                                     │                                                               │  View                             │┃
+│                                     │                                                               │  s  Layout ‹ auto (split here) ›  │┃
 │                                     │                                                               │  W  [ ] Wrap long lines           │┃
+│                                     │                                                               │  d  [ ] Syntax diff               │┃
+│                                     │                                                               │  X  [ ] Whole file                │┃
+│                                     │                                                               │                                   │┃
+│                                     │                                                               │  Go                               │┃
+│                                     │                                                               │  o  Find file…                    │█
+│                                     │                                                               │  i  Comments panel                │┃
 │                                     │                                                               │  w  [ ] Watch for changes         │┃
 │                                     │                                                               │  .  Open terminal here            │┃
 │                                     │                                                               │                                   ││

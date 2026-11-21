@@ -2,28 +2,32 @@
 //! and actions, one per row with its state and its key, in tabs.
 //!
 //! It opens as a quick popup, sized to its rows at the bottom right so the
-//! diff stays in sight: Here's rows, then the layout, wrapping and
-//! watching after a rule, those Here doesn't list already and whose key
-//! no Here row takes. Its keys are the full panel's on Here. `space` or
-//! `tab` expands it into the full panel, on Here; `/` into the full
-//! panel's search; a setting's key that the popup doesn't list runs it and
-//! expands onto its tab, as it shows its tab in the full panel.
+//! diff stays in sight, in three titled groups: Here's rows under what
+//! they act on (`On this thread`), then [`QUICK`]'s View and Go rows. Those
+//! two own their rows, so Here's group leaves out what they list, and they
+//! leave out a row whose key a Here row takes. A screen too short for all
+//! three drops View. Every row shows one key, the one that does the same
+//! outside the panel when there's one, else the panel's; both run it.
+//! `space` or `tab` expands it into the full panel, on Here; `/` into the
+//! full panel's search; a setting's key that the popup doesn't list runs
+//! it and expands onto its tab, as it shows its tab in the full panel.
 //!
 //! The full panel opens on Here, the few actions that apply to what
-//! you're on; the other tabs
-//! hold the leader's table by kind, a tab of several groups titling each,
-//! and leave out what can't apply. `tab` and `shift+tab` switch tabs. A
-//! row's key runs it straight away from any tab, hidden or not. The other
-//! tabs' keys are the leader's table's, each with the key that does the
-//! same outside the panel, dimmed, when that's another. On Here, the key
-//! a row shows from outside runs it too, ahead of the leader's entry on
-//! the same letter, so it isn't dimmed there: on a thread `r` replies,
-//! where the View tab's `r` is the rendered view. `j`/`k` move a cursor
-//! and `enter` runs the row under it. Toggles keep the panel open and
-//! flash their new state; actions that go somewhere (the picker, the next
-//! file) close it. Settings with a few values show `‹ value ›`:
-//! `h`/`l`, the arrows or a tap on either mark step back or forward; on
-//! other rows `h`/`l` do nothing, so no entry can have them as its key.
+//! you're on; the other tabs hold the leader's table by kind, a tab of
+//! several groups titling each, and leave out what can't apply. `tab` and
+//! `shift+tab` switch tabs. A row's key runs it straight away from any
+//! tab, hidden or not. The other tabs' keys are the leader's table's, each
+//! with the key that does the same outside the panel, dimmed, when that's
+//! another. Here's rows show one key as the popup's do, and the key from
+//! outside runs it ahead of the leader's entry on the same letter: on a
+//! thread `r` replies, where the View tab's `r` is the rendered view, and
+//! `f` fixes with an agent, where the Files tab's is the next file.
+//! `j`/`k` move a cursor and `enter` runs the row under it. Toggles keep
+//! the panel open and flash their new state; actions that go somewhere
+//! (the picker, the next file) close it. Settings with a few values show
+//! `‹ value ›`: `h`/`l`, the arrows or a tap on either mark step back or
+//! forward; on other rows `h`/`l` do nothing, so no entry can have them as
+//! its key.
 //! The theme row opens a list of every theme instead, which tries each one
 //! on the screen behind it as the cursor moves. `/` searches every tab by
 //! label or key. It takes the `?` overlay's box, tabs and footer, a row
@@ -66,8 +70,29 @@ const TABS: [Place; 6] = [
 const COLUMN_GAP: usize = 4;
 /// Between a row's keys and its label.
 const GAP: usize = 2;
-/// The quick popup's rows after Here's, as far as Here leaves them.
-const COMMON: [Action; 3] = [Action::CycleLayout, Action::ToggleWrap, Action::ToggleWatch];
+/// The quick popup's groups after Here's, by title, each row as far as
+/// it applies and no Here row has its key.
+const QUICK: [(&str, &[Action]); 2] = [
+    (
+        "View",
+        &[
+            Action::CycleLayout,
+            Action::ToggleWrap,
+            Action::ToggleSyntax,
+            Action::ToggleFull,
+        ],
+    ),
+    (
+        "Go",
+        &[
+            Action::OpenPicker,
+            Action::Comments,
+            Action::ToggleWatch,
+            Action::SinceCheckpoint,
+            Action::OpenTerminal,
+        ],
+    ),
+];
 /// The quick popup's footer, the longest that fits.
 const QUICK_FOOTERS: [&str; 3] = [
     "space more · ? keys · esc close",
@@ -117,6 +142,24 @@ pub(super) struct Entry {
     pub place: Place,
 }
 
+impl Entry {
+    /// The one key a Here or quick popup row shows: the one from outside
+    /// the panel when there's one, else the panel's.
+    fn plain_key(&self) -> &str {
+        self.direct.as_deref().unwrap_or(&self.key)
+    }
+
+    /// Whether `self` and `other` share a key, panel's or plain.
+    fn shares_key(&self, other: &Self) -> bool {
+        fn keys(e: &Entry) -> impl Iterator<Item = &str> {
+            std::iter::once(e.key.as_str())
+                .chain(e.direct.as_deref())
+                .filter(|k| !k.is_empty())
+        }
+        keys(self).any(|k| keys(other).any(|o| o == k))
+    }
+}
+
 /// What a key or a tap in the panel asks for.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum Outcome {
@@ -146,7 +189,11 @@ pub(super) struct Commands {
     entries: Vec<Entry>,
     /// The quick popup shows, not the full panel.
     quick: bool,
-    /// The quick popup's title: what Here acts on (`on this thread`).
+    /// The quick popup's last draw found the screen too short for its
+    /// View group, which it leaves out until the next draw says otherwise.
+    short: bool,
+    /// The title of the quick popup's Here group: what Here acts on
+    /// (`On this thread`).
     title: String,
     /// Of [`TABS`].
     tab: usize,
@@ -177,12 +224,12 @@ enum Line {
     Title(&'static str),
     Entry(usize),
     Blank,
-    /// Between the quick popup's Here rows and its common ones.
-    Rule,
+    /// The quick popup's Here group's title, [`Commands::title`].
+    Here,
 }
 
 impl Commands {
-    /// The quick popup, titled `title`.
+    /// The quick popup, its Here group titled `title`.
     pub(super) fn new(title: String, entries: Vec<Entry>) -> Self {
         Self {
             entries,
@@ -252,28 +299,50 @@ impl Commands {
         kept
     }
 
-    /// The quick popup's entries: Here's but the leader's own (all keys,
-    /// which its footer points to), then [`COMMON`]'s from their tabs,
-    /// each unless Here lists it or a Here row has its key, so every key
-    /// shown runs what it shows.
+    /// The quick popup's entries: [`Commands::quick_groups`]' in order.
     fn in_quick(&self) -> Vec<(&Entry, Vec<usize>)> {
-        let here: Vec<&Entry> = (self.entries.iter())
-            .filter(|e| e.place == Place::Here && e.action.group() != Group::General)
-            .collect();
-        let taken = |e: &Entry| {
-            here.iter().any(|h| {
-                h.action == e.action || h.key == e.key || h.direct.as_ref() == Some(&e.key)
-            })
-        };
-        let common = COMMON.iter().filter_map(|&action| {
-            (self.entries.iter())
-                .find(|e| e.action == action && matches!(e.place, Place::Tab(_)))
-                .filter(|e| !taken(e))
-        });
-        (here.iter().copied())
-            .chain(common)
+        (self.quick_groups().into_iter())
+            .flat_map(|(_, group)| group)
             .map(|e| (e, Vec::new()))
             .collect()
+    }
+
+    /// The quick popup's groups, `None` for Here's title: Here's entries
+    /// but the leader's own (all keys, which the footer points to) and
+    /// those [`QUICK`]'s groups list, then each of those with its entries
+    /// that apply, from their tabs, unless a Here row has a key of theirs,
+    /// so every key shown runs what it shows. View is left out on a short
+    /// screen.
+    fn quick_groups(&self) -> Vec<(Option<&'static str>, Vec<&Entry>)> {
+        let quick: Vec<(&'static str, Vec<&Entry>)> = QUICK
+            .iter()
+            .map(|&(title, actions)| {
+                let entries = (actions.iter()).filter_map(|&action| {
+                    (self.entries.iter())
+                        .find(|e| e.action == action && matches!(e.place, Place::Tab(_)))
+                });
+                (title, entries.collect())
+            })
+            .collect();
+        let listed = |e: &Entry| {
+            quick
+                .iter()
+                .flat_map(|(_, g)| g)
+                .any(|q| q.action == e.action)
+        };
+        let here: Vec<&Entry> = (self.entries.iter())
+            .filter(|e| e.place == Place::Here && e.action.group() != Group::General && !listed(e))
+            .collect();
+        let quick: Vec<_> = (quick.into_iter())
+            .filter(|&(title, _)| !(self.short && title == QUICK[0].0))
+            .map(|(title, group)| {
+                let kept = group
+                    .into_iter()
+                    .filter(|e| !here.iter().any(|h| h.shares_key(e)));
+                (Some(title), kept.collect())
+            })
+            .collect();
+        std::iter::once((None, here)).chain(quick).collect()
     }
 
     /// The rows of tab `tab`, or without one, a search's matches alone. A
@@ -330,22 +399,29 @@ impl Commands {
     fn shown_lines(&self, kept: &[(&Entry, Vec<usize>)]) -> Vec<Line> {
         if self.quick {
             let mut out = Vec::new();
-            for (i, (e, _)) in kept.iter().enumerate() {
-                if i > 0 && e.place != Place::Here && kept[i - 1].0.place == Place::Here {
-                    out.push(Line::Rule);
+            let mut i = 0;
+            for (title, group) in self.quick_groups() {
+                if group.is_empty() {
+                    continue;
                 }
-                out.push(Line::Entry(i));
+                if !out.is_empty() {
+                    out.push(Line::Blank);
+                }
+                out.push(title.map_or(Line::Here, Line::Title));
+                out.extend((i..i + group.len()).map(Line::Entry));
+                i += group.len();
             }
             return out;
         }
         Self::lines(kept, self.filter.is_empty().then_some(self.tab))
     }
 
-    /// Whether `e`, shown, runs on its key from outside the panel: Here's
-    /// rows, in the quick popup or on Here while no search hides it.
+    /// Whether `e`, shown, shows only [`Entry::plain_key`], which runs it
+    /// too: the quick popup's rows, and Here's on Here while no search
+    /// hides it.
     fn direct_runs(&self, e: &Entry) -> bool {
-        e.place == Place::Here
-            && (self.quick || (TABS[self.tab] == Place::Here && self.filter.is_empty()))
+        self.quick
+            || (e.place == Place::Here && TABS[self.tab] == Place::Here && self.filter.is_empty())
     }
 
     /// Shows tab `tab` of the full panel, wrapping round, with the search
@@ -453,19 +529,10 @@ impl Commands {
             self.cursor = 0;
             return Outcome::Stay;
         }
-        if self.quick {
-            match key {
-                Key::Char(' ') | Key::Tab | Key::BackTab => {
-                    self.switch(0);
-                    return Outcome::Stay;
-                }
-                Key::Char('/') => {
-                    self.switch(0);
-                    self.editing = true;
-                    return Outcome::Stay;
-                }
-                _ => {}
-            }
+        if self.quick && matches!(key, Key::Char(' ' | '/') | Key::Tab | Key::BackTab) {
+            self.switch(0);
+            self.editing = matches!(key, Key::Char('/'));
+            return Outcome::Stay;
         }
         let page = self.page.max(1);
         let len = kept.len();
@@ -723,7 +790,7 @@ impl Commands {
                             arrows.push((y, l, r));
                         }
                     }
-                    Line::Blank | Line::Rule => {}
+                    Line::Blank | Line::Here => {}
                 }
             }
         }
@@ -747,43 +814,44 @@ impl Commands {
         self.columns = columns;
     }
 
-    /// Draws the quick popup: its title on the top border, its rows one
-    /// each between [`PAD`] blank columns and a blank row either side, a
-    /// rule between Here's rows and the common ones, and its footer. Sized
-    /// to its rows, at the bottom right above the screen's last row, which
-    /// holds the status bar or the frame's edge; a narrow screen gets it
-    /// full width. Taller than the screen, it scrolls with the cursor.
+    /// Draws the quick popup: its rows one each, under their groups'
+    /// titles with a blank row between groups, between [`PAD`] blank
+    /// columns and a blank row either side, and its footer. Sized to its
+    /// rows, at the bottom right above the screen's last row, which holds
+    /// the status bar or the frame's edge; a narrow screen gets it full
+    /// width. Too tall for the screen, it leaves out its View group, then
+    /// scrolls with the cursor.
     fn draw_quick(&mut self, grid: &mut Grid, theme: &Theme) {
         let (gw, gh) = (grid.width(), grid.height());
+        self.short = false;
+        // Borders, blank rows above and below the list, and the footer.
+        self.short = self.shown_lines(&[]).len() + 5 > gh - 1;
         let kept = self.kept();
         let lines = self.shown_lines(&kept);
         let cursor = self.cursor.min(kept.len().saturating_sub(1));
         let widest = |f: &dyn Fn(&Entry) -> usize| kept.iter().map(|(e, _)| f(e)).max();
-        let panel = widest(&|e| e.key.width()).unwrap_or(0);
-        let both = widest(&|e| e.key.width() + e.direct.as_ref().map_or(0, |d| d.width() + 1));
+        let key = widest(&|e| e.plain_key().width()).unwrap_or(0);
         // A toggle's `[x] `, and a value's ` ‹ value ›`.
         let label = widest(&|e| {
             let state = if e.on.is_some() { 4 } else { 0 };
             state + e.label.width() + e.value.as_ref().map_or(0, |v| v.width() + 5)
         });
-        let both = both.unwrap_or(0);
-        let title = format!(" {} ", self.title);
-        let inner = (both + GAP + label.unwrap_or(0))
+        let inner = (key + GAP + label.unwrap_or(0))
             .max(QUICK_FOOTERS[0].width())
-            .max(title.width());
+            .max(TITLE.width())
+            .max(self.title.width());
         let (x0, width) = if gw < help::FULL_SCREEN_BELOW {
             (0, gw)
         } else {
             let width = (inner + 2 * PAD + 2).min(gw - 1);
             (gw - 1 - width, width)
         };
-        // Borders, blank rows above and below the list, and the footer.
         let height = (lines.len() + 5).min(gh - 1);
         let y0 = gh - 1 - height;
         let end = x0 + width;
         let (x, right) = (x0 + 1 + PAD, end - 1 - PAD);
         help::border(grid, (x0, y0, width, height), theme);
-        grid.put_str(x0 + 2, y0, end - 1, &title, theme.style(Role::FileHeader));
+        grid.put_str(x0 + 2, y0, end - 1, TITLE, theme.style(Role::FileHeader));
 
         let (top, rows) = (y0 + 2, height.saturating_sub(5));
         let at = (lines.iter())
@@ -800,6 +868,8 @@ impl Commands {
             .filter(|(_, at)| at.elapsed() < FLASH)
             .map(|(a, _)| a);
         let dim = theme.style(Role::Dim);
+        let mut bold = theme.style(Role::Plain);
+        bold.attributes |= Attributes::BOLD;
         let mut arrows = Vec::new();
         for (i, line) in lines.iter().skip(scroll).take(rows).enumerate() {
             let y = top + i;
@@ -811,18 +881,19 @@ impl Commands {
                         flashing: flashing == Some(e.action),
                         direct_runs: self.direct_runs(e),
                     };
-                    let widths = ((panel, both), None);
+                    let widths = ((key, key), None);
                     if let Some((l, r)) = row.draw(grid, theme, (x, y, right), (e, matched), widths)
                     {
                         arrows.push((y, l, r));
                     }
                 }
-                Line::Rule => {
-                    for column in x..right {
-                        grid.put_str(column, y, right, "─", dim);
-                    }
+                Line::Title(text) => {
+                    grid.put_str(x, y, right, text, bold);
                 }
-                Line::Title(_) | Line::Blank => {}
+                Line::Here => {
+                    grid.put_str(x, y, right, &self.title, bold);
+                }
+                Line::Blank => {}
             }
         }
         help::scrollbar(grid, (end - 2, top, rows), (lines.len(), scroll), dim);
@@ -846,18 +917,20 @@ struct Row {
     selected: bool,
     /// Just toggled: its state stands out.
     flashing: bool,
-    /// Its key from outside the panel runs it here, so it shows as a key.
+    /// Its key from outside the panel runs it here: it shows that one
+    /// alone, [`Entry::plain_key`].
     direct_runs: bool,
 }
 
 impl Row {
     /// `key direct  [x] Label ‹ value ›  ...  place` between `x` and
     /// `right`, as the `?` overlay writes a row: the keys first, the panel
-    /// key `panel` wide and the direct key after it, dimmed unless it runs
-    /// the row here, then `both` columns on the label, its `matched`
-    /// characters marked, a toggle's state before it and a value after;
-    /// `place`, a search's tab name, dimmed at the right where it fits.
-    /// Returns the columns of the value's `‹` and `›`, when it has one.
+    /// key `panel` wide and the direct key after it, dimmed, or the plain
+    /// key alone where it runs the row; then `both` columns on the label,
+    /// its `matched` characters marked, a toggle's state before it and a
+    /// value after; `place`, a search's tab name, dimmed at the right where
+    /// it fits. Returns the columns of the value's `‹` and `›`, when it has
+    /// one.
     fn draw(
         &self,
         grid: &mut Grid,
@@ -877,14 +950,14 @@ impl Row {
             grid.fill(x - 1, y, right + 1, mark(Style::PLAIN));
         }
         let dim = mark(theme.style(Role::Dim));
-        grid.put_str(x, y, right, &e.key, mark(theme.style(Role::Hint)));
-        if let Some(direct) = &e.direct {
-            let style = if self.direct_runs {
-                mark(theme.style(Role::Hint))
-            } else {
-                dim
-            };
-            grid.put_str(x + panel + 1, y, right, direct, style);
+        let hint = mark(theme.style(Role::Hint));
+        if self.direct_runs {
+            grid.put_str(x, y, right, e.plain_key(), hint);
+        } else {
+            grid.put_str(x, y, right, &e.key, hint);
+            if let Some(direct) = &e.direct {
+                grid.put_str(x + panel + 1, y, right, direct, dim);
+            }
         }
         let style = if self.flashing {
             theme.style(Role::Hint)
@@ -1156,7 +1229,7 @@ impl ThemeList {
                         (mark(Style::PLAIN), mark(theme.style(Role::Hint))),
                     );
                 }
-                Line::Blank | Line::Rule => {}
+                Line::Blank | Line::Here => {}
             }
         }
         help::scrollbar(

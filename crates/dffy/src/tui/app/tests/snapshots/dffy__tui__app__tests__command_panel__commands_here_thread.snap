@@ -6,10 +6,10 @@ expression: panel(&mut app)
 │  Here  View  Files  Review  Git  Copy                                             │
 │                                                                                   │
 │ a    Ask agent                                                                    │
-│ & f  Fix with agent                                                               │
-│ " y  Copy as prompt                                                               │
-│   x  Resolve                                                                      │
-│   r  Reply                                                                        │
+│ f    Fix with agent                                                               │
+│ y    Copy as prompt                                                               │
+│ x    Resolve                                                                      │
+│ r    Reply                                                                        │
 │ ^    Send open threads to agent                                                   │
 │                                                                                   │
 │ ?    All keys                                                                     │

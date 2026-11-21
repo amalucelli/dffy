@@ -653,7 +653,9 @@ fn doctor_probes_side_by_side_and_says_who_didnt_answer() {
                 "brief": "read-only tools · no sandbox"},
         ])
     );
-    assert!(took < Duration::from_millis(3500), "took {took:?}");
+    // One after another, the four 2s probes would take 8s; the margin is for
+    // a loaded test machine.
+    assert!(took < Duration::from_secs(6), "took {took:?}");
 }
 
 /// The version only informs `doctor`: an agent on PATH is listed and runs

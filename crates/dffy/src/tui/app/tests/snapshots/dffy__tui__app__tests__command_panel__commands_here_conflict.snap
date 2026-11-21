@@ -5,9 +5,9 @@ expression: panel(&mut app)
 ┌─ commands ──────────────────────────────────────────────────────────── esc close ─┐
 │  Here  View  Files  Review  Git  Copy                                             │
 │                                                                                   │
-│   o  Keep current (ours)                                                          │
-│   t  Take incoming (theirs)                                                       │
-│   b  Keep both                                                                    │
+│ o    Keep current (ours)                                                          │
+│ t    Take incoming (theirs)                                                       │
+│ b    Keep both                                                                    │
 │                                                                                   │
 │ ?    All keys                                                                     │
 │                                                                                   │

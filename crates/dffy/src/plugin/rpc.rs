@@ -73,8 +73,8 @@ pub(crate) fn detached(program: &Program, root: Option<&Path>) -> MakeCommand {
 /// for the agent plugin's.
 pub(crate) const DESCRIBE_TIMEOUT: Duration = Duration::from_secs(2);
 
-/// A process that exits this many times in a row, each within
-/// [`STEADY`] of starting, isn't started again.
+/// A process that exits within [`STEADY`] of starting is started again
+/// at most this many times in a row; the next such exit is the last.
 const MAX_CRASHES: u32 = 5;
 
 /// A process that ran this long before exiting starts the count of
@@ -814,7 +814,10 @@ fn exited<I: Send + 'static, S: Send + 'static, R: Send + 'static>(
         inner.crashes + 1
     };
     if inner.crashes > MAX_CRASHES {
-        let e = format!("{why}; not started again after {MAX_CRASHES} exits in a row");
+        let e = format!(
+            "{why}; not started again after {} exits in a row",
+            inner.crashes
+        );
         inner.phase = Phase::Failed(e.clone());
         for ready in std::mem::take(&mut inner.on_ready) {
             ready(Err(e.clone()));

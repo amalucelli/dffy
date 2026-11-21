@@ -1521,7 +1521,7 @@ impl App {
                 continue;
             }
             let left = self.new_threads.len();
-            self.follow_thread(&root);
+            self.open_thread(&root);
             if left > 0 && self.message.is_none() {
                 self.message(format!("{left} more new"));
             }
@@ -1530,7 +1530,13 @@ impl App {
         // The shown file's blocks are given as they're measured; the core
         // steps into the others by these.
         self.doc.document.set_held_blocks(&comments.files());
-        let file = match self.doc.step_thread(forward) {
+        let stepped = match self.doc.step_thread(forward) {
+            Stepped::Nowhere if forward => {
+                self.next_unlisted().map_or(Stepped::Nowhere, Stepped::File)
+            }
+            stepped => stepped,
+        };
+        let file = match stepped {
             Stepped::Thread(_) => return,
             Stepped::File(file) => file,
             Stepped::Nowhere => {
@@ -1614,13 +1620,19 @@ impl App {
             if !self.can_comment() {
                 return;
             }
+            self.note_gone();
             let Some(comments) = &self.comments else {
                 return;
             };
             let root = self.doc.focused().map(|t| t.root.as_str());
             let file = self.doc.document.files().get(self.doc.document.pos.file);
             let path = file.map_or(&[][..], |e| &e.change().path[..]);
-            self.panel = Some(Panel::new(comments, self.enumerating, (root, path)));
+            let opens = self.worktree.is_some() && !self.piped;
+            self.panel = Some(Panel::new(
+                comments,
+                (self.enumerating, opens),
+                (root, path),
+            ));
         }
         self.focus_tree();
     }
@@ -1650,6 +1662,13 @@ impl App {
             comments::Outcome::Stay => {}
             comments::Outcome::Moved(root) => self.follow_thread(&root),
             comments::Outcome::Diff => self.leave_panel(),
+            comments::Outcome::Open => {
+                let root = panel.selected().map(str::to_owned);
+                let unlisted = root.filter(|root| self.unlisted_path(root).is_some());
+                if unlisted.is_none_or(|root| self.open_thread(&root)) {
+                    self.leave_panel();
+                }
+            }
             comments::Outcome::Pass => {
                 return match self.thread_key(key, mods, deleting) {
                     Ok(done) => ControlFlow::Break(done),
@@ -1703,6 +1722,92 @@ impl App {
             self.thread_pending = Some((file, Seek::Root(root.to_owned())));
             self.wait_note(file);
         }
+    }
+
+    /// [`App::follow_thread`], adding the thread's file first when the diff
+    /// doesn't list it (see [`App::unchanged_entry`]). When that can't be,
+    /// says why and returns false.
+    pub(super) fn open_thread(&mut self, root: &str) -> bool {
+        if let Some(path) = self.unlisted_path(root)
+            && let Err(why) = self.unchanged_entry(&path)
+        {
+            self.follow_thread(root);
+            self.message(why);
+            return false;
+        }
+        self.follow_thread(root);
+        true
+    }
+
+    /// The path of the thread with root `root` when it's on a file the
+    /// diff doesn't list; not for a general comment or one on another
+    /// branch, which have no file to open.
+    pub(super) fn unlisted_path(&self, root: &str) -> Option<String> {
+        let comments = self.comments.as_ref().filter(|c| !c.elsewhere(root))?;
+        let path = comments.home_of(root).filter(|p| !p.is_empty())?;
+        comments
+            .file_of(path.as_bytes())
+            .is_none()
+            .then(|| path.to_owned())
+    }
+
+    /// The entry of `path`, a commented file: the diff's own, else one
+    /// added for it after the others, as the working tree has it, whole and
+    /// with no changes (see [`Source::Unchanged`]); built once it shows.
+    /// Says why there's none to add: the list is still growing, there's no
+    /// working tree, or the file isn't in it, which the panel then says.
+    fn unchanged_entry(&mut self, path: &str) -> Result<usize, String> {
+        let comments = self.comments.as_mut().ok_or("no comments file here")?;
+        if let Some(file) = comments.file_of(path.as_bytes()) {
+            return Ok(file);
+        }
+        if self.enumerating {
+            return Err("still listing files; its file isn't here yet".to_owned());
+        }
+        let shown = escape(path.as_bytes());
+        let root = (self.worktree.as_deref())
+            .filter(|_| !self.piped)
+            .ok_or_else(|| format!("{shown} isn't in this diff"))?;
+        let Some(mode) = dffy_core::git::worktree_file(root, path.as_bytes()) else {
+            comments.set_gone(path.as_bytes(), true);
+            return Err(format!("{shown} isn't on disk"));
+        };
+        comments.set_gone(path.as_bytes(), false);
+        let change = dffy_core::git::FileChange::unchanged(path.into(), mode);
+        let file = self.doc.document.show_unchanged(change);
+        self.rebuild_tree();
+        if let Some(picker) = &mut self.picker {
+            picker.rebuild(self.doc.document.files());
+        }
+        self.dirty = true;
+        Ok(file)
+    }
+
+    /// Notes which commented files the diff doesn't list are missing from
+    /// the working tree, for the panel to say before one is opened.
+    fn note_gone(&mut self) {
+        let (Some(comments), Some(root)) = (&mut self.comments, &self.worktree) else {
+            return;
+        };
+        let paths: Vec<String> = (comments.unlisted().into_iter())
+            .map(str::to_owned)
+            .collect();
+        for path in paths {
+            let gone = dffy_core::git::worktree_file(root, path.as_bytes()).is_none();
+            comments.set_gone(path.as_bytes(), gone);
+        }
+    }
+
+    /// The entry `m` goes on to past the last file: the first file with
+    /// threads the diff doesn't list that's on disk, added (see
+    /// [`App::unchanged_entry`]).
+    fn next_unlisted(&mut self) -> Option<usize> {
+        let paths: Vec<String> = (self.comments.as_ref()?.unlisted().into_iter())
+            .map(str::to_owned)
+            .collect();
+        paths
+            .iter()
+            .find_map(|path| self.unchanged_entry(path).ok())
     }
 
     /// Says what a thread going to `file` waits for, unless it's only its

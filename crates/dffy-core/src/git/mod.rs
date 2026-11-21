@@ -311,6 +311,20 @@ impl FileChange {
         }
     }
 
+    /// The working-tree file at `path`, of `mode` (see [`worktree_file`]),
+    /// compared with itself: a file shown for what's on it rather than for
+    /// what changed. [`Repo::file_diff`] reads it once and finds no hunks.
+    #[must_use]
+    pub fn unchanged(path: BString, mode: Mode) -> Self {
+        let side = Some(Side::Worktree { mode, id: None });
+        Self::new(path, side, side)
+    }
+
+    /// Both sides are one side, read from one place: nothing can differ.
+    fn is_unchanged(&self) -> bool {
+        self.old.is_some() && self.old == self.new && self.old_path() == self.path
+    }
+
     /// The same change seen backwards (`git diff -R`): sides swapped, so
     /// additions become deletions and renames go the other way. Untracked
     /// files read as deletions; unmerged paths stay unmerged.
@@ -815,7 +829,9 @@ impl Repo {
             Contents::TooLarge(..) => out.too_large = true,
             Contents::Binary(..) => out.binary = true,
             Contents::Text(old, new) => {
-                out.hunks = diff::hunks_without_emphasis(&old, &new, options);
+                if !out.change.is_unchanged() {
+                    out.hunks = diff::hunks_without_emphasis(&old, &new, options);
+                }
                 out.old = old;
                 out.new = new;
             }
@@ -887,6 +903,16 @@ impl Repo {
             side.as_ref()
                 .map_or(Ok((Vec::new(), None)), |s| self.load_noted(path, s))
         };
+        // Read twice, a file written between the reads would show changes.
+        if change.is_unchanged() {
+            let (bytes, note) = load(change.path.as_bstr(), &change.new)?;
+            let size = bytes.len() as u64;
+            if is_binary(&bytes) {
+                return Ok((Contents::Binary(size, size), note));
+            }
+            let text = Text::new(bytes);
+            return Ok((Contents::Text(text.clone(), text), note));
+        }
         let ((old, old_note), (new, new_note)) = (
             load(change.old_path(), &change.old)?,
             load(change.path.as_bstr(), &change.new)?,
@@ -963,6 +989,31 @@ enum Contents {
     TooLarge(u64, u64),
     Binary(u64, u64),
     Text(Text, Text),
+}
+
+/// The mode of the file at the repository-relative `path` in the working
+/// tree at `root`. `None` when there's no file there as git would track
+/// one: it's missing or a directory, a directory leading to it is a
+/// symbolic link, or `path` is absolute, has an empty, `.` or `..`
+/// component, or is inside `.git`. A path from outside git, such as a
+/// comment's, is safe to read and write once this finds it.
+#[must_use]
+pub fn worktree_file(root: &Path, path: &[u8]) -> Option<Mode> {
+    let tracked = |c: &[u8]| !matches!(c, b"" | b"." | b"..") && !c.eq_ignore_ascii_case(b".git");
+    if !path.split(|&b| b == b'/').all(tracked) || !worktree::Leading::default().real(root, path) {
+        return None;
+    }
+    let meta = std::fs::symlink_metadata(root.join(std::ffi::OsStr::from_bytes(path))).ok()?;
+    let kind = meta.file_type();
+    if kind.is_symlink() {
+        Some(Mode::Symlink)
+    } else if !kind.is_file() {
+        None
+    } else if std::os::unix::fs::PermissionsExt::mode(&meta.permissions()) & 0o100 != 0 {
+        Some(Mode::Executable)
+    } else {
+        Some(Mode::File)
+    }
 }
 
 /// Git's binary heuristic: a NUL byte near the start.

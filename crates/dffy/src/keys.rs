@@ -305,17 +305,17 @@ const DEFAULTS: &[(Table, &str, Action)] = &[
     // that, so searching is the diff's `/`.
     (L, "s", Action::CycleLayout),
     (L, "W", Action::ToggleWrap),
+    (L, "X", Action::ToggleFull),
+    (L, "x", Action::Expand),
+    (L, "B", Action::ToggleStatusBar),
     (L, "d", Action::ToggleSyntax),
     (L, "r", Action::ToggleRendered),
-    (L, "x", Action::Expand),
-    (L, "X", Action::ToggleFull),
+    (L, "I", Action::ToggleWhitespace),
+    (L, "*", Action::ToggleHighlight),
     (L, "K", Action::CycleIndicators),
     (L, "%", Action::CycleModifiedLines),
-    (L, "*", Action::ToggleHighlight),
-    (L, "I", Action::ToggleWhitespace),
     (L, "#", Action::ToggleLineNumbers),
     (L, "@", Action::ToggleHunkHeaders),
-    (L, "B", Action::ToggleStatusBar),
     (L, "o", Action::OpenPicker),
     (L, "|", Action::FilterTree),
     (L, "!", Action::CommentedFiles),
@@ -334,6 +334,7 @@ const DEFAULTS: &[(Table, &str, Action)] = &[
     (L, ";", Action::TakeCheckpoint),
     (L, "'", Action::SinceCheckpoint),
     (L, "~", Action::CycleTheme),
+    (L, "i", Action::Comments),
     (L, "E", Action::CommentInEditor),
     (L, "a", Action::AskAgent),
     (L, "&", Action::FixWithAgent),
@@ -353,7 +354,9 @@ const DEFAULTS: &[(Table, &str, Action)] = &[
 pub(crate) enum Group {
     Navigation,
     Files,
-    View,
+    Layout,
+    Diff,
+    Display,
     Copy,
     Changes,
     Modes,
@@ -364,10 +367,12 @@ pub(crate) enum Group {
 }
 
 impl Group {
-    pub(crate) const ALL: [Self; 10] = [
+    pub(crate) const ALL: [Self; 12] = [
         Self::Navigation,
         Self::Files,
-        Self::View,
+        Self::Layout,
+        Self::Diff,
+        Self::Display,
         Self::Copy,
         Self::Changes,
         Self::Modes,
@@ -381,7 +386,9 @@ impl Group {
         match self {
             Self::Navigation => "Navigation",
             Self::Files => "Files/tree",
-            Self::View => "View",
+            Self::Layout => "Layout",
+            Self::Diff => "Diff",
+            Self::Display => "Display",
             Self::Copy => "Selection & copy",
             Self::Changes => "Stage, discard & resolve",
             Self::Modes => "Watch & checkpoints",
@@ -398,7 +405,7 @@ impl Group {
         match self {
             Self::Navigation => Tab::Move,
             Self::Files => Tab::Files,
-            Self::View => Tab::View,
+            Self::Layout | Self::Diff | Self::Display => Tab::View,
             Self::Changes | Self::Modes => Tab::Git,
             Self::Copy => Tab::Copy,
             Self::Comments | Self::Agents | Self::Review => Tab::Review,
@@ -470,18 +477,16 @@ impl Action {
             | Self::ToggleFull
             | Self::CycleLayout
             | Self::ToggleWrap
-            | Self::ToggleSyntax
-            | Self::ToggleRendered
-            | Self::CycleIndicators
+            | Self::ToggleStatusBar
+            | Self::ToggleThread
+            | Self::ToggleThreads => Group::Layout,
+            Self::ToggleSyntax | Self::ToggleRendered | Self::ToggleWhitespace => Group::Diff,
+            Self::CycleIndicators
             | Self::CycleModifiedLines
             | Self::ToggleHighlight
-            | Self::ToggleWhitespace
             | Self::ToggleLineNumbers
             | Self::ToggleHunkHeaders
-            | Self::ToggleStatusBar
-            | Self::CycleTheme
-            | Self::ToggleThread
-            | Self::ToggleThreads => Group::View,
+            | Self::CycleTheme => Group::Display,
             Self::Select
             | Self::Copy
             | Self::CopyPath
@@ -579,6 +584,7 @@ impl Action {
             Self::OpenTerminal => "Open terminal here",
             Self::SuggestChange => "Suggest change",
             Self::CommentedFiles => "Files with comments",
+            Self::Comments => "Comments panel",
             Self::OpenReview => "Open review…",
             Self::SinceLastReview => "Since last review",
             Self::WholeReview => "Show whole review",

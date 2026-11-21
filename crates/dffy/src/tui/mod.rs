@@ -417,6 +417,7 @@ pub(crate) fn run(
             .and_then(Path::file_name)
             .map(|name| name.to_string_lossy().into_owned()),
     );
+    app.set_worktree(repo.workdir().map(Path::to_owned));
     if let Some(commit) = commit {
         app.event(Event::Piped(piped::Item::Commit(commit)));
     }

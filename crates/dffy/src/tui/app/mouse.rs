@@ -412,7 +412,7 @@ impl App {
             };
             if let Some(panel) = &mut self.panel {
                 if let Some(root) = panel.click(line) {
-                    self.follow_thread(&root);
+                    self.open_thread(&root);
                 }
                 return;
             }

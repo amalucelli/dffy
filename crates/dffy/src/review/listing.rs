@@ -82,12 +82,22 @@ pub(crate) struct Listing {
 
 pub(crate) struct Group {
     pub path: String,
-    /// Not in the list of files.
-    pub absent: bool,
+    /// Not in the list of files, and why.
+    pub absent: Option<Absent>,
     /// The general comments, listed first: not a file's.
     pub conversation: bool,
     /// The threads on other branches, listed last while asked for.
     pub branches: bool,
+}
+
+/// A group not in the list of files.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Absent {
+    /// Its threads are another branch's, or its file isn't listed.
+    Unlisted,
+    /// Its file was found missing from the working tree when opened (see
+    /// [`Comments::set_gone`]).
+    Gone,
 }
 
 pub(crate) struct Item {
@@ -156,6 +166,27 @@ impl Comments {
         (out, waiting.len())
     }
 
+    /// Why commented `path` isn't in the list of files, when it isn't.
+    fn absent(&self, path: &[u8]) -> Option<Absent> {
+        match (self.located.contains_key(path), self.gone.contains(path)) {
+            (true, _) => None,
+            (false, false) => Some(Absent::Unlisted),
+            (false, true) => Some(Absent::Gone),
+        }
+    }
+
+    /// The paths of the threads listed whose file isn't in the list, in
+    /// the panel's order: by path.
+    pub(crate) fn unlisted(&self) -> Vec<&str> {
+        let mut paths: Vec<&str> = (self.listed(false).0.into_iter())
+            .map(|root| self.home(root))
+            .filter(|path| !self.located.contains_key(path.as_bytes()))
+            .collect();
+        paths.sort_unstable();
+        paths.dedup();
+        paths
+    }
+
     /// [`Comments::listed`] by file: files in the list's order, then those
     /// not in it by path; a file's threads most pressing first, then by
     /// line. Placed threads are shared with the diff; threads on a file
@@ -181,7 +212,7 @@ impl Comments {
             }));
             files.push(Group {
                 path: String::new(),
-                absent: false,
+                absent: None,
                 conversation: true,
                 branches: false,
             });
@@ -189,7 +220,7 @@ impl Comments {
         let general = items.len();
         for path in paths {
             let roots = &by_path[path];
-            let absent = !self.located.contains_key(path.as_bytes());
+            let absent = self.absent(path.as_bytes());
             let threads: Arc<[Thread]> = match self.placed.get(path.as_bytes()) {
                 Some(placed) => Arc::clone(&placed.threads),
                 None => roots
@@ -248,7 +279,7 @@ impl Comments {
             }));
             files.push(Group {
                 path: String::new(),
-                absent: true,
+                absent: Some(Absent::Unlisted),
                 conversation: false,
                 branches: true,
             });

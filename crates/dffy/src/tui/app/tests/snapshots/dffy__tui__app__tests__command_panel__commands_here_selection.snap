@@ -5,7 +5,7 @@ expression: panel(&mut app)
 ┌─ commands ──────────────────────────────────────────────────────────── esc close ─┐
 │  Here  View  Files  Review  Git  Copy                                             │
 │                                                                                   │
-│   c  Comment on selection                                                         │
+│ c    Comment on selection                                                         │
 │ S    Suggest change                                                               │
 │ a    Ask agent                                                                    │
 │ &    Fix with agent                                                               │

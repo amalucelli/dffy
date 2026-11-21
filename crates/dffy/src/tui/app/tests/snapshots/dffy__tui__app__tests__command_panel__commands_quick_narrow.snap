@@ -15,17 +15,17 @@ expression: screen(&mut phone)
 ⋯ 39 unchanged lines  @@ -47,7 +47,7 @@ line 46  ┃
 47 47  │ line 47                                 ┃
 48 48  │ line 48                                 ┃
-49 49  │ line 49                                 ┃
-50    -│ line 50                                 ┃
-   50 +│ line fifty                              ┃
-51 51  │ line 51                                 ┃
-52 52  │ line 52                                 ┃
-53 53  │ line 53                                 ┃
 ┌─ commands ─────────────────────────────────────┐
 │                                                │
-│  o  Find file…                                 │
+│  View                                          │
 │  s  Layout ‹ auto (unified here) ›             │
 │  W  [ ] Wrap long lines                        │
+│  d  [ ] Syntax diff                            │
+│  X  [ ] Whole file                             │
+│                                                │
+│  Go                                            │
+│  o  Find file…                                 │
+│  i  Comments panel                             │
 │  w  [ ] Watch for changes                      │
 │  .  Open terminal here                         │
 │                                                │

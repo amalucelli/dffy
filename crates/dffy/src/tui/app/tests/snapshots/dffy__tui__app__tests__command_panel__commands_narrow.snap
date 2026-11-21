@@ -4,25 +4,25 @@ expression: screen(&mut phone)
 ---
 ┌─ commands ───────────────────────── esc close ─┐
 │  Here  View  Files  Review  Git  Copy          │
+│ Layout                                         │
 │ s    Layout ‹ auto (unified here) ›            │
 │ W    [ ] Wrap long lines                       │
+│ X    [ ] Whole file                            │
+│ x    More context                              │
+│ B    Status bar ‹ bottom ›                     │
+│                                                │
+│ Diff                                           │
 │ d    [ ] Syntax diff                           │
 │ r    [ ] Rendered view                         │
-│ x    More context                              │
-│ X    [ ] Whole file                            │
+│ I    [ ] Ignore whitespace                     │
+│                                                │
+│ Display                                        │
+│ *    [x] Syntax highlighting                   │
 │ K    Indicators ‹ classic ›                    │
 │ %    Modified lines ‹ changed ›                │
-│ *    [x] Syntax highlighting                   │
-│ I    [ ] Ignore whitespace                     │
 │ #    [x] Line numbers                          │
 │ @    [x] Hunk headers                          │
-│ B    Status bar ‹ bottom ›                     │
 │ ~    Theme ‹ default ›                         │
-│                                                │
-│                                                │
-│                                                │
-│                                                │
-│                                                │
 │                                                │
 │                                                │
 │                                                │

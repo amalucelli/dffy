@@ -65,19 +65,42 @@ enum Kind {
     /// The review's conversation, the document's page: the first row,
     /// outside the root's children, which keep git's order.
     Page(usize),
+    /// The files shown whole for their comments, which the diff doesn't
+    /// list: the root's last child, holding their tree, as they come
+    /// after the diff's files.
+    Unchanged {
+        children: Vec<usize>,
+        open: bool,
+    },
+}
+
+/// The [`Kind::Unchanged`] row's words, and its name among collapsed paths.
+pub(super) const UNCHANGED: &str = "comments only · no changes";
+
+/// The status letter of `entry`'s row; a file with no changes has a dot.
+pub(super) fn letter(entry: &Entry) -> (&'static str, Role) {
+    if entry.is_unchanged() {
+        ("·", Role::Dim)
+    } else {
+        stat::status_letter(entry.status())
+    }
 }
 
 impl Node {
     fn children(&self) -> &[usize] {
         match &self.kind {
-            Kind::Dir { children, .. } | Kind::Commit { children, .. } => children,
+            Kind::Dir { children, .. }
+            | Kind::Commit { children, .. }
+            | Kind::Unchanged { children, .. } => children,
             Kind::File(_) | Kind::Page(_) => &[],
         }
     }
 
     fn children_mut(&mut self) -> Option<&mut Vec<usize>> {
         match &mut self.kind {
-            Kind::Dir { children, .. } | Kind::Commit { children, .. } => Some(children),
+            Kind::Dir { children, .. }
+            | Kind::Commit { children, .. }
+            | Kind::Unchanged { children, .. } => Some(children),
             Kind::File(_) | Kind::Page(_) => None,
         }
     }
@@ -387,10 +410,32 @@ impl Tree {
             } else if e.is_commit() {
                 self.insert_commit(i, &e.change().path);
             } else {
+                if e.is_unchanged() && !matches!(self.nodes[self.base].kind, Kind::Unchanged { .. })
+                {
+                    self.insert_unchanged();
+                }
                 self.insert(i, &e.change().path);
             }
         }
         self.stale = true;
+    }
+
+    /// Adds the [`Kind::Unchanged`] group after the last top-level row;
+    /// files inserted from now on go under it.
+    fn insert_unchanged(&mut self) {
+        let id = self.nodes.len();
+        self.nodes.push(Node {
+            name: UNCHANGED.as_bytes().into(),
+            parent: ROOT,
+            kind: Kind::Unchanged {
+                children: Vec::new(),
+                open: !self.collapsed.contains(UNCHANGED.as_bytes()),
+            },
+        });
+        if let Some(children) = self.nodes[ROOT].children_mut() {
+            children.push(id);
+        }
+        self.base = id;
     }
 
     /// Flattens the visible rows if the tree changed since.
@@ -460,10 +505,16 @@ impl Tree {
         keep
     }
 
-    /// A file node's path, from below its commit when it's under one.
+    /// A file node's path, from below its commit or group when it's under
+    /// one.
     fn file_path(&self, mut node: usize) -> BString {
         let mut parts = Vec::new();
-        while node != ROOT && !matches!(self.nodes[node].kind, Kind::Commit { .. }) {
+        while node != ROOT
+            && !matches!(
+                self.nodes[node].kind,
+                Kind::Commit { .. } | Kind::Unchanged { .. }
+            )
+        {
             parts.push(&self.nodes[node].name[..]);
             node = self.nodes[node].parent;
         }
@@ -550,6 +601,19 @@ impl Tree {
                         self.hide(child, row);
                     }
                 }
+                Kind::Unchanged { open, .. } => {
+                    let row = self.rows.len();
+                    self.rows.push(Row {
+                        node: child,
+                        top: child,
+                        depth,
+                    });
+                    if open || keep.is_some() {
+                        self.flatten(child, depth + 1, keep);
+                    } else {
+                        self.hide(child, row);
+                    }
+                }
                 Kind::Dir { .. } => {
                     let mut bottom = child;
                     while let [only] = *self.nodes[bottom].children()
@@ -582,7 +646,9 @@ impl Tree {
         while let Some(node) = stack.pop() {
             match &self.nodes[node].kind {
                 Kind::File(file) => self.file_rows[*file] = Some(row),
-                Kind::Dir { children, .. } | Kind::Commit { children, .. } => {
+                Kind::Dir { children, .. }
+                | Kind::Commit { children, .. }
+                | Kind::Unchanged { children, .. } => {
                     stack.extend(children);
                 }
                 Kind::Page(_) => {}
@@ -628,7 +694,9 @@ impl Tree {
             .iter()
             .filter_map(|r| match self.nodes[r.node].kind {
                 Kind::File(file) => Some(file),
-                Kind::Dir { .. } | Kind::Commit { .. } | Kind::Page(_) => None,
+                Kind::Dir { .. } | Kind::Commit { .. } | Kind::Page(_) | Kind::Unchanged { .. } => {
+                    None
+                }
             })
     }
 
@@ -656,7 +724,7 @@ impl Tree {
         let row = self.rows.get(self.selected)?;
         Some(match self.nodes[row.node].kind {
             Kind::File(file) | Kind::Page(file) => Item::File(file),
-            Kind::Dir { open, .. } => Item::Dir { open },
+            Kind::Dir { open, .. } | Kind::Unchanged { open, .. } => Item::Dir { open },
             Kind::Commit { entry, open, .. } => Item::Commit { file: entry, open },
         })
     }
@@ -682,8 +750,9 @@ impl Tree {
             return;
         };
         let path = self.path(row.node);
-        if let Kind::Dir { open: o, .. } | Kind::Commit { open: o, .. } =
-            &mut self.nodes[row.node].kind
+        if let Kind::Dir { open: o, .. }
+        | Kind::Commit { open: o, .. }
+        | Kind::Unchanged { open: o, .. } = &mut self.nodes[row.node].kind
         {
             *o = open;
             if open {
@@ -888,7 +957,7 @@ impl Tree {
                     grid.put_str(at, line, end, &count, style(Role::Hint, false));
                 }
             }
-            Kind::Dir { open, .. } => {
+            Kind::Dir { open, .. } | Kind::Unchanged { open, .. } => {
                 let x = grid.put_str(
                     x,
                     line,
@@ -896,16 +965,15 @@ impl Tree {
                     if open { "▼ " } else { "▶ " },
                     style(Role::Dim, false),
                 );
-                let mut label = escape(&self.path_between(row.top, row.node));
-                label.push('/');
                 let room = end.saturating_sub(x + 1);
-                grid.put_str(
-                    x,
-                    line,
-                    end,
-                    &fit_left(&label, room),
-                    named(Role::Plain, false),
-                );
+                let (label, role) = if self.nodes[row.node].is_dir() {
+                    let mut label = escape(&self.path_between(row.top, row.node));
+                    label.push('/');
+                    (fit_left(&label, room), Role::Plain)
+                } else {
+                    (fit_right(UNCHANGED, room), Role::Dim)
+                };
+                grid.put_str(x, line, end, &label, named(role, false));
             }
             Kind::Commit { open, .. } => {
                 let x = grid.put_str(
@@ -930,7 +998,7 @@ impl Tree {
             Kind::File(file) => {
                 let entry = &files[file];
                 let dim = entry.viewed();
-                let (letter, role) = stat::status_letter(entry.status());
+                let (letter, role) = letter(entry);
                 let x = grid.put_str(x, line, end, letter, style(role, dim)) + 1;
                 let name = escape(&self.nodes[row.node].name);
                 let (mut stats_x, counts) = place_counts(entry.counts(), (x, end), totals);

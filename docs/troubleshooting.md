@@ -1,8 +1,13 @@
 # Troubleshooting
 
-## `dffy doctor`
+Start with `dffy doctor`. It checks everything dffy depends on and prints a hint for each problem it finds.
 
-`dffy doctor` checks git, the repository, file watching, the terminal and multiplexer, copying, color, the config, the theme, the pager, the cache, `dffyd`, the plugins, the agents and dffy's skill for them, and times dffy on the repository. Run it inside a repository, or point it at one with `-C <path>`.
+```sh
+dffy doctor              # in a repository
+dffy doctor -C ~/src/linux
+```
+
+## `dffy doctor`
 
 ```
 dffy 0.3.0
@@ -27,7 +32,7 @@ agents           dffy-agent ~/.local/bin/dffy-agent
   ✓ skill        current in ~/.claude/skills, ~/.agents/skills
 ```
 
-Each row is a thing dffy uses, with what was found about it in a few words: a plugin's or an agent's checks share its row. `dffy doctor --verbose` prints each check on a line of its own, with all it found (`! agent codex recipe  doesn't know --ephemeral: upgrade codex`).
+Each row is one thing dffy uses, with what doctor found. A plugin's or an agent's checks share its row. `--verbose` prints each check on its own line with everything it found (`! agent codex recipe  doesn't know --ephemeral: upgrade codex`).
 
 | Mark | Meaning |
 |---|---|
@@ -36,86 +41,46 @@ Each row is a thing dffy uses, with what was found about it in a few words: a pl
 | `✗` | Failure |
 | `·` | Information |
 
-Problems come with a `hint:` line. dffy exits with 1 when a check fails, and 0 otherwise, warnings included.
-
-`dffy doctor --json` prints the same checks as one JSON object, without color, for bug reports and scripts:
-
-- **`checks`:** a list, each with `name`, `status` (`ok`, `warn`, `fail` or `info`), `detail`, `notes` and `hints`.
-- The data behind them, under `git`, `repository`, `watch`, `speed`, `terminal`, `config`, `cache`, `dffyd`, `renderers`, `skills`, `review` and `agent`.
-- Every key is always present, `null` when it doesn't apply.
-- Durations are milliseconds as numbers (`"all_changes_ms": 127.4`).
-
-| Check | What it looks at | Warns or fails when |
-|---|---|---|
-| `git` | `git --version` | git isn't on `PATH` (fails). dffy's own diffs work without git; using it as git's pager doesn't. |
-| `repository` | The working tree dffy would read here, its branch (`main`, `main (no commits yet)` or `detached at 80f116f`), and the uncommitted files plain `dffy` lists, counted as `git status` does ([Repository counts](#repository-counts)) | Not in one (information only). |
-| `watch` | Linux: the inotify watches this repository takes (one per directory git doesn't ignore, plus `.git` and its refs), against `fs.inotify.max_user_watches` and the watches your processes hold. macOS: notes FSEvents needs no per-directory watches | The repository needs more watches than are free (watches `dffyd` already holds for it count as free), or the limit can't be read. See [watch.md](watch.md#linux-the-inotify-limit). |
-| `speed` | How long dffy takes here, along the viewer's own code paths: opening the repository, the first change listed, all of them, the untracked-file walk alone, and the diff of the largest changed text file | Never. See [Speed check limits](#speed-check-limits). |
-| `terminal` | `TERM`, `COLORTERM`, `TERM_PROGRAM`, the width | `TERM=dumb`. |
-| `multiplexer` | tmux, zellij, screen or herdr, from their environment variables | Never; it notes the background-color query (see [Colors](#colors)). |
-| `copy` | tmux's `set-clipboard`, inside tmux only | It isn't `on`, or can't be read. See [Copying](#copying-clipboard-and-osc-52). |
-| `color` | Whether stdout gets color, and truecolor support | Never. |
-| `config` | The config file and any problems in it | A line was skipped; each one is listed. |
-| `theme` | The theme in use | Never; a theme that fails to load falls back to `default` with a warning on every run. |
-| `pager` | The pager printed output goes through | Never. |
-| `cache` | The disk cache's location, size and budget | It can't be read. |
-| `dffyd` | The watch broker, its build, and repositories it polls; brokers of other dffy versions | The broker doesn't answer (a stale socket), or comes from another build of dffy than the one running doctor. See [An old broker](#an-old-broker). |
-| `render`, `review` | The renderer and review plugins set, and the review plugin's own checks ([plugins.md](plugins.md)) | A plugin isn't on `PATH`, or one of its checks fails. |
-| `agents`, an agent's name | The agent plugin, then each agent it knows: its version, its recipe, and whether it's logged in ([plugins.md](plugins.md#the-agents-and-their-recipes)) | The agent's CLI doesn't know a flag of its recipe (upgrade it), it isn't logged in, or the config names one that isn't installed. |
-| `skill` | dffy's skill in each place agents read skills, in the home directory and the repository ([agents.md](agents.md)) | It's outdated: `dffy agents setup` updates it. A missing one is information only. |
-
-### Repository counts
-
-As in `git status`, a file staged and then changed again counts as staged and unstaged. A file removed with `git rm --cached` counts once, as a staged deletion.
-
-### Speed check limits
-
-- On a huge repository it stops counting at 50,000 changes, and says so.
-- It skips the untracked walk or the largest diff once about a quarter of a second has gone by, and says so.
-- The untracked walk lists every directory before reporting, so the 50,000 cap doesn't shorten it.
-
-### An old broker
-
-A broker outlives rebuilds and reinstalls, so an old one keeps running old code. `dffy daemon stop` stops it, and the next `dffy --watch` starts the new one.
+Problems come with a `hint:` line. dffy exits with 1 when a check fails, and 0 otherwise, warnings included. [Doctor checks](#doctor-checks) lists every row.
 
 ## Copying: clipboard and OSC 52
 
-`y`, `Y` and mouse selections copy with an OSC 52 escape sequence that the terminal handles, so copying works over SSH and needs no local clipboard tool. The terminal, and anything between dffy and it, has to pass the sequence on. dffy can't tell whether it did.
+`y`, `Y` and mouse selections copy with an OSC 52 escape sequence. The terminal handles it, so copying works over SSH and needs no local clipboard tool. The terminal, and anything between dffy and it, has to pass the sequence on, and dffy can't tell whether it did.
 
-- **tmux:** drops OSC 52 unless `set-clipboard` is `on`. `dffy doctor` checks it. Set it for the running server and in `~/.tmux.conf`:
-  ```sh
-  tmux set -g set-clipboard on
-  ```
-- **herdr and other multiplexers:** dffy doesn't check them. Copy something with `y` and paste it to find out.
-- **Terminals:** some ask before letting a program write the clipboard, some turn it off by default and some don't support it. Look for a clipboard or OSC 52 setting in the terminal's configuration.
-- **Size:** terminals cap the sequence at different lengths, so dffy refuses copies over 75KB with a note instead of cutting them short.
+tmux drops OSC 52 unless `set-clipboard` is `on`, and `dffy doctor` checks it. Set it for the running server and in `~/.tmux.conf`:
 
-Copies hold the code only. `copy-decorations = true` (or `G` in the command panel) adds line numbers and `+`/`-` signs.
+```sh
+tmux set -g set-clipboard on
+```
+
+dffy doesn't check herdr or other multiplexers. Copy something with `y` and paste it to find out. Some terminals ask before letting a program write the clipboard, some turn it off by default and some don't support it. Look for a clipboard or OSC 52 setting.
+
+Terminals cap the sequence at different lengths, so dffy refuses copies over 75KB with a note instead of cutting them short.
+
+Copies hold only the code. `copy-decorations = true`, or its toggle in the command panel, adds line numbers and `+`/`-` signs.
 
 ## Mouse or native selection
 
-dffy takes mouse input for clicks, the wheel, and drags that select and copy code. While it does, the terminal's own selection doesn't work. To get it back:
+dffy takes mouse input for clicks, the wheel, and dragging to select and copy code. While it does, the terminal's own selection doesn't work. To get it back:
 
-- Hold `shift` while dragging. Many terminals select natively then, whatever the program asks for.
-- Press `space` then `$` to hand the mouse to the terminal, and the same again to take it back. `mouse = false` in the config starts with it off.
+- Hold `shift` while dragging. Many terminals select natively then.
+- Turn the mouse off from the command panel (`space`, the `toggle_mouse` action in [keys.md](keys.md)), and the same again to turn it back on. `mouse = false` in the config starts with it off.
 
 ## Colors
 
-- **No color at all:** `NO_COLOR` is set, `--color never` or `color = never` is in effect, or stdout isn't a terminal. `--color always` forces it. Without color dffy marks changes with `+`/`-` signs so the output stays a readable diff.
-- **Bars instead of tinted lines:** `indicators = auto` tints changed lines only when `COLORTERM` is `truecolor` or `24bit`, and draws a colored bar otherwise.
-  - Terminals that support 24-bit color but don't set `COLORTERM` get bars, and so do sessions over SSH or under a multiplexer that drop it.
-  - Fix: set `COLORTERM=truecolor` in the environment, or `indicators = background` in the config.
-- **Tints too dark on a light background:** the viewer asks the terminal for its background color (OSC 11) and waits up to 200ms for the answer.
-  - Multiplexers often don't pass the question on, and dffy then assumes a dark background.
-  - Fix: set `background = light` (or `dark`) to skip the question.
-  - Printed output always uses the dark tints unless `background = light` is set.
-- **Themes:** see [themes.md](themes.md).
+| Symptom | Cause | Fix |
+|---|---|---|
+| No color at all | `NO_COLOR` is set, `--color never` or `color = never` is in effect, or stdout isn't a terminal | `--color always`. Without color dffy marks changes with `+`/`-` signs, so the output stays a readable diff. |
+| Bars instead of tinted lines | `indicators = auto` tints only when `COLORTERM` is `truecolor` or `24bit`. Some terminals with 24-bit color don't set it, and some SSH sessions and multiplexers drop it. | Set `COLORTERM=truecolor` in the environment, or `indicators = background` in the config. |
+| Tints too dark on a light background | The viewer asks the terminal for its background color (OSC 11) and waits up to 200ms. Multiplexers often don't pass the question on, and dffy then assumes dark. Printed output never asks and uses dark tints. | Set `background = light`, which also skips the question and applies to printed output. |
+
+[themes.md](themes.md) covers the colors themselves.
 
 ## Watch mode stops refreshing
 
-On Linux the usual cause is the inotify limit. `dffy doctor` shows it; [watch.md](watch.md#linux-the-inotify-limit) explains how to raise it. When the limit runs out, dffy polls once a second instead and says so in the status bar.
+On Linux the usual cause is the inotify limit. `dffy doctor` shows it, and [watch.md](watch.md#linux-the-inotify-limit) shows how to raise it. When the limit runs out, dffy polls once a second and says so in the status bar.
 
-`dffy daemon stop` stops a broken `dffyd`. Viewers keep watching on their own, and the next viewer to watch starts a new broker. A broker that doesn't answer at all leaves a stale socket in `$XDG_RUNTIME_DIR/dffy` that can be removed.
+`dffy daemon stop` stops a broken `dffyd`. Viewers keep watching on their own, and the next one to watch starts a new broker. A broker that doesn't answer at all leaves a stale socket in `$XDG_RUNTIME_DIR/dffy`, which you can delete.
 
 ## Git shows `difftastic`'s output, or no diff
 
@@ -127,6 +92,46 @@ With `diff.external` set, git hands dffy the external tool's output, which dffy 
 
 ## A garbled terminal after a crash
 
-dffy restores the terminal when it exits, panics or is interrupted.
+dffy restores the terminal when it exits, panics or is interrupted. If it was killed outright (`kill -9`, or the terminal's process dying), the terminal can stay in the viewer's mode: no echo, the mouse printing escape codes, the alternate screen. Type `reset` and press enter, even if you can't see what you type.
 
-If it was killed outright (`kill -9`, the terminal's process dying), the terminal can stay in the viewer's mode: no echo, the mouse reporting escape codes, the alternate screen. Type `reset` and press enter, even if you can't see what you type.
+## Doctor checks
+
+| Check | What it looks at | Warns or fails when |
+|---|---|---|
+| `git` | `git --version` | git isn't on `PATH` (fails). dffy's own diffs work without git. Using it as git's pager doesn't. |
+| `repository` | The working tree dffy would read here, its branch (`main`, `main (no commits yet)` or `detached at 80f116f`), and the uncommitted files plain `dffy` lists, counted as `git status` does ([Repository counts](#repository-counts)) | Not in one (information only). |
+| `watch` | Linux: the inotify watches this repository takes (one per directory git doesn't ignore, plus `.git` and its refs), against `fs.inotify.max_user_watches` and the watches your processes hold. macOS: a note that FSEvents needs no per-directory watches | The repository needs more watches than are free (watches `dffyd` already holds for it count as free), or the limit can't be read. See [watch.md](watch.md#linux-the-inotify-limit). |
+| `speed` | How long dffy takes here: opening the repository, the first change listed, all of them, the untracked-file walk alone, and the diff of the largest changed text file | Never. See [Speed check limits](#speed-check-limits). |
+| `terminal` | `TERM`, `COLORTERM`, `TERM_PROGRAM`, the width | `TERM=dumb`. |
+| `multiplexer` | tmux, zellij, screen or herdr, from their environment variables | Never. It notes the background-color query (see [Colors](#colors)). |
+| `copy` | tmux's `set-clipboard`, inside tmux only | It isn't `on`, or can't be read. See [Copying](#copying-clipboard-and-osc-52). |
+| `color` | Whether stdout gets color, and truecolor support | Never. |
+| `config` | The config file and any problems in it | A line was skipped. Each one is listed. |
+| `theme` | The theme in use | Never. A theme that fails to load falls back to `default` with a warning on every run. |
+| `pager` | The pager printed output goes through | Never. |
+| `cache` | The disk cache's location, size and budget | It can't be read. |
+| `dffyd` | The watch broker, its build, the repositories it polls, and brokers of other dffy versions | The broker doesn't answer (a stale socket), or comes from another build of dffy than the one running doctor. See [An old broker](#an-old-broker). |
+| `render`, `review` | The renderer and review plugins set, and the review plugin's own checks ([plugins.md](plugins.md)) | A plugin isn't on `PATH`, or one of its checks fails. |
+| `agents`, an agent's name | The agent plugin, then each agent it knows: its version, its recipe, and whether it's logged in ([plugins.md](plugins.md#the-agents-and-their-recipes)) | The agent's CLI doesn't know a flag its recipe uses (upgrade it), it isn't logged in, or the config names one that isn't installed. |
+| `skill` | dffy's skill in each place agents read skills, in the home directory and the repository ([agents.md](agents.md)) | It's outdated. `dffy agents setup` updates it. A missing one is information only. |
+
+`dffy doctor --json` prints the same checks as one JSON object, without color, for bug reports and scripts:
+
+- `checks` is a list. Each entry has `name`, `status` (`ok`, `warn`, `fail` or `info`), `detail`, `notes` and `hints`.
+- The data behind the checks is under `git`, `repository`, `watch`, `speed`, `terminal`, `config`, `cache`, `dffyd`, `renderers`, `skills`, `review` and `agent`.
+- Every key is always present, `null` when it doesn't apply.
+- Durations are milliseconds as numbers (`"all_changes_ms": 127.4`).
+
+### Repository counts
+
+As in `git status`, a file staged and then changed again counts as staged and unstaged. A file removed with `git rm --cached` counts once, as a staged deletion.
+
+### Speed check limits
+
+- On a huge repository it stops counting at 50,000 changes, and says so.
+- It skips the untracked walk or the largest diff once about a quarter of a second has passed, and says so.
+- The untracked walk lists every directory before reporting, so the 50,000 cap doesn't shorten it.
+
+### An old broker
+
+An old broker keeps running old code after a rebuild or reinstall. `dffy daemon stop` stops it, and the next `dffy --watch` starts the new one ([watch.md](watch.md#dffyd)).

@@ -188,6 +188,9 @@ pub(crate) enum Job {
         piped: Option<Arc<PipedFile>>,
         /// The choices made on a conflicted file, to preview.
         choices: Option<Arc<Choices>>,
+        /// A file the diff doesn't list, shown whole (see
+        /// [`Source::Unchanged`](dffy_core::document::Source::Unchanged)).
+        unchanged: bool,
         /// The code of the annotations lost is parsed with the placement
         /// (see [`model::land`]); else a [`Job::Place`] does it after.
         paint: bool,
@@ -738,13 +741,15 @@ fn in_worktree_conflict(change: &FileChange) -> bool {
 }
 
 /// A file's diff: a piped file's read back, or diffed from `repo`; for a
-/// conflicted file, with its conflicts, or the preview of `choices`.
+/// conflicted file, with its conflicts, or the preview of `choices`; for an
+/// `unchanged` one, its every line.
 fn diff(
     repo: Option<&Repo>,
     settings: &Settings,
     change: FileChange,
     piped: Option<Arc<PipedFile>>,
     choices: Option<Arc<Choices>>,
+    unchanged: bool,
 ) -> Result<Box<File>, String> {
     let options = &settings.options;
     match (piped, repo) {
@@ -756,7 +761,9 @@ fn diff(
             .map(|fd| {
                 let prepare = settings.prepare();
                 let (whitespace, highlight) = (options.whitespace, settings.highlight);
-                Box::new(if in_worktree_conflict(&fd.change) {
+                Box::new(if unchanged {
+                    prepare.unchanged(fd, highlight)
+                } else if in_worktree_conflict(&fd.change) {
                     let conflicts = repo.conflicts(&fd);
                     prepare.conflicted(fd, conflicts, choices, whitespace, highlight)
                 } else {
@@ -861,7 +868,7 @@ fn work(shared: &Shared, repo: Option<&Repo>, tx: &Sender<Event>, counter: bool)
 }
 
 #[expect(clippy::too_many_lines, reason = "an arm per kind of job")]
-fn run(job: Job, repo: Option<&Repo>, settings: &Settings) -> Done {
+pub(super) fn run(job: Job, repo: Option<&Repo>, settings: &Settings) -> Done {
     match job {
         Job::Diff {
             file,
@@ -869,11 +876,12 @@ fn run(job: Job, repo: Option<&Repo>, settings: &Settings) -> Done {
             change,
             piped,
             choices,
+            unchanged,
             ..
         } => Done::Diff {
             file,
             version,
-            result: diff(repo, settings, change, piped, choices),
+            result: diff(repo, settings, change, piped, choices, unchanged),
             placed: None,
         },
         Job::Place(job) => job.run(),
@@ -908,7 +916,7 @@ fn run(job: Job, repo: Option<&Repo>, settings: &Settings) -> Done {
             let blocks = view::thread_blocks(&threads, |i, _| u32::try_from(i).ok().map(BlockId));
             let stop = || live.load(Ordering::Relaxed) != id;
             let found = match change {
-                Some(change) => diff(repo, settings, change, piped, None)
+                Some(change) => diff(repo, settings, change, piped, None, false)
                     .ok()
                     .and_then(|l| document::find(l.diff(), None, &blocks, &needle, stop)),
                 None => document::find_blocks(&blocks, &needle, stop),

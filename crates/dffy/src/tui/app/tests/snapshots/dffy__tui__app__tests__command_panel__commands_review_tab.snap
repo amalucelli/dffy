@@ -6,6 +6,7 @@ expression: panel(&mut app)
 │  Here  View  Files  Review  Git  Copy                                             │
 │                                                                                   │
 │ Comments                                                                          │
+│ i    Comments panel                                                               │
 │ E    Continue in editor                                                           │
 │ -    Delete resolved threads…                                                     │
 │ S    Suggest change                                                               │
@@ -14,7 +15,6 @@ expression: panel(&mut app)
 │ a    Ask agent                                                                    │
 │ &    Fix with agent                                                               │
 │ .    Open terminal here                                                           │
-│                                                                                   │
 │                                                                                   │
 │                                                                                   │
 │                                                                                   │

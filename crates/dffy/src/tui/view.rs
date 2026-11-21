@@ -743,6 +743,9 @@ pub(crate) struct Doc {
     scratch: Canvas,
     /// For rows rendered again to find which byte a cell shows.
     mapped: Canvas,
+    /// The search's matches on the row being painted, old side's first, as
+    /// [`restyle_matches`] takes them; kept so painting doesn't allocate.
+    search_spans: Vec<(u32, u32, Style)>,
     /// The last column of the drawing area is kept for the overview of the
     /// file at the top.
     pub overview: bool,
@@ -785,6 +788,7 @@ impl Doc {
             height,
             scratch: Canvas::default(),
             mapped: Canvas::mapped(),
+            search_spans: Vec::new(),
             overview: false,
             separators: Vec::new(),
             target: None,
@@ -818,7 +822,12 @@ impl Doc {
             return layout.for_file(entry.status(), rendered.source_len());
         }
         let lines = loaded.map_or(0, |l| l.diff().old.len().max(l.diff().new.len()));
-        self.layout.for_file(entry.status(), lines)
+        let layout = self.layout.for_file(entry.status(), lines);
+        Layout {
+            // Both sides are the same lines: one column says it.
+            one_sided: layout.one_sided || entry.is_unchanged(),
+            ..layout
+        }
     }
 
     /// Keeps the position inside the document after rows changed under it
@@ -1136,7 +1145,7 @@ impl Doc {
                     &line[..],
                 )
             }
-            Source::Repo | Source::Page { .. } => return None,
+            Source::Repo | Source::Page { .. } | Source::Unchanged => return None,
         };
         Some((role, display_text(text).into()))
     }
@@ -2302,6 +2311,7 @@ impl Doc {
             return;
         };
         let mut mapped = std::mem::take(&mut self.mapped);
+        let mut spans = std::mem::take(&mut self.search_spans);
         let mut previous = None;
         let blocks = !marks.matches.blocks.is_empty()
             && marks.blocks_version == self.document.blocks_version(marks.file);
@@ -2328,12 +2338,25 @@ impl Doc {
                 }
                 continue;
             }
-            let here: Vec<usize> = [Side::Old, Side::New]
-                .into_iter()
-                .filter_map(|side| Some((side, lines[side.index()]?)))
-                .flat_map(|(side, line)| marks.matches.on(side, line))
-                .collect();
-            if here.is_empty() {
+            let (matches, current) = (&marks.matches, marks.current);
+            let on = move |side: Side| {
+                (lines[side.index()].into_iter())
+                    .flat_map(move |line| matches.on(side, line))
+                    .map(move |i| {
+                        let found = matches.list[i];
+                        let role = if current == Some(matches.of_line(i)) {
+                            Role::SearchCurrent
+                        } else {
+                            Role::SearchMatch
+                        };
+                        (found.start, found.end, theme.style(role))
+                    })
+            };
+            spans.clear();
+            spans.extend(on(Side::Old));
+            let on_old = spans.len();
+            spans.extend(on(Side::New));
+            if spans.is_empty() {
                 continue;
             }
             if previous != Some(logical) {
@@ -2347,25 +2370,11 @@ impl Doc {
             let first = map.glyphs.partition_point(|g| g.row < pos.offset);
             let glyphs = &map.glyphs[first..];
             let glyphs = &glyphs[..glyphs.partition_point(|g| g.row == pos.offset)];
-            for i in here {
-                let found = marks.matches.list[i];
-                let role = if marks.current == Some(marks.matches.of_line(i)) {
-                    Role::SearchCurrent
-                } else {
-                    Role::SearchMatch
-                };
-                let bytes = found.start as usize..found.end as usize;
-                let side = split.then(|| found.side.index());
-                restyle_match(
-                    grid,
-                    glyphs,
-                    (side, bytes),
-                    (x, end, top + y),
-                    theme.style(role),
-                );
-            }
+            let (on_old, on_new) = spans.split_at(on_old);
+            restyle_matches(grid, glyphs, [on_old, on_new], split, (x, end, top + y));
         }
         self.mapped = mapped;
+        self.search_spans = spans;
         self.document.search = Some(marks);
     }
 
@@ -3123,24 +3132,41 @@ impl Doc {
     }
 }
 
-/// Restyles the cells of `glyphs`, a canvas row's, showing `bytes` of
-/// `side`, or of either side with `None`, in screen row `y` of a pane from
-/// `x` to `end`.
+/// Restyles the cells of `glyphs`, a canvas row's, that show a byte in
+/// one of `matches`, each side's on that side's line as start, end and
+/// style, in screen row `y` of a pane from `x` to `end`. Each side's
+/// matches must be ascending and not overlapping, as a search finds them.
+/// In a split row a glyph shows only its own side's matches; otherwise
+/// either side's, the new side's where both cover it.
 // Out of line: inlined into the frame's drawing, this loop over every glyph
-// of the row, once per match on it, competes with the caller for registers
-// and runs longer per glyph.
+// of the row competes with the caller for registers and runs longer per
+// glyph.
 #[inline(never)]
-fn restyle_match(
+fn restyle_matches(
     grid: &mut Grid,
     glyphs: &[Mapped],
-    (side, bytes): (Option<usize>, Range<usize>),
+    matches: [&[(u32, u32, Style)]; 2],
+    split: bool,
     (x, end, y): (usize, usize, usize),
-    style: Style,
 ) {
-    let len = bytes.len();
+    debug_assert!(
+        (matches.iter()).all(|m| m.windows(2).all(|w| w[0].1 <= w[1].0)),
+        "a side's matches on a line overlap or are out of order"
+    );
+    // The match whose bytes hold `byte`: the last starting at or before it.
+    let covering = |matches: &[(u32, u32, Style)], byte: usize| {
+        let after = matches.partition_point(|m| m.0 as usize <= byte);
+        let &(_, end, style) = matches.get(after.checked_sub(1)?)?;
+        (byte < end as usize).then_some(style)
+    };
     for g in glyphs {
-        // `bytes.contains`, in one comparison.
-        if g.bytes.start.wrapping_sub(bytes.start) < len && side.is_none_or(|s| g.side == s) {
+        let byte = g.bytes.start;
+        let style = if split {
+            matches.get(g.side).and_then(|m| covering(m, byte))
+        } else {
+            covering(matches[1], byte).or_else(|| covering(matches[0], byte))
+        };
+        if let Some(style) = style {
             let left = (x + g.col).min(end);
             grid.restyle(left, y, (left + g.width).min(end), style);
         }

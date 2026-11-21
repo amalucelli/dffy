@@ -510,7 +510,9 @@ impl App {
                 change: (!files[file].is_page()).then(|| files[file].change().clone()),
                 piped: match &files[file].source() {
                     Source::Piped(piped) => Some(Arc::clone(piped)),
-                    Source::Repo | Source::Commit(_) | Source::Page { .. } => None,
+                    Source::Repo | Source::Commit(_) | Source::Page { .. } | Source::Unchanged => {
+                        None
+                    }
                 },
                 // Its comments as placed, once they are.
                 threads: (self.comments.as_ref())

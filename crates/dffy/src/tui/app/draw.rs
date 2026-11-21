@@ -476,7 +476,7 @@ fn heading(app: &App) -> Option<Heading> {
     let doc = &app.doc;
     let entry = doc.document.files().get(doc.document.pos.file)?;
     let commit = entry.is_commit();
-    let counts = entry.counts().filter(|_| !commit);
+    let counts = entry.counts().filter(|_| !commit && !entry.is_unchanged());
     let staging = entry
         .change()
         .staging
@@ -529,7 +529,11 @@ fn heading(app: &App) -> Option<Heading> {
             tail: Vec::new(),
         }));
     }
-    let mut head = vec![(entry.status().word().to_owned(), Role::Plain)];
+    let mut head = vec![if entry.is_unchanged() {
+        (crate::tui::tree::UNCHANGED.to_owned(), Role::Dim)
+    } else {
+        (entry.status().word().to_owned(), Role::Plain)
+    }];
     if let Some(staging) = staging {
         head.push((format!(" · {staging}"), Role::Plain));
     }

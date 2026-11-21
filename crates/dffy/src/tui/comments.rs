@@ -19,7 +19,7 @@ use super::tree;
 use super::view::paint;
 use crate::keys::{Action as Act, Keys};
 use crate::render::{Canvas, escape, plain};
-use crate::review::listing::{List, Listing, Row};
+use crate::review::listing::{Absent, List, Listing, Row};
 use crate::review::model::text::{age, epoch};
 use crate::review::model::{
     self, At, Comments, Look, Posting, Snippet, Standing, Thread, ThreadComment,
@@ -613,6 +613,9 @@ pub(super) enum Outcome {
     Moved(String),
     /// The keys go to the diff.
     Diff,
+    /// The keys go to the diff, on the selected thread's file, which is
+    /// opened when the diff doesn't list it.
+    Open,
     /// Not the panel's: the key does what it does in the tree.
     Pass,
 }
@@ -629,6 +632,8 @@ const REPLIES_COLUMNS: usize = 19;
 /// screen.
 pub(super) struct Panel {
     list: List,
+    /// A file the diff doesn't list opens from the working tree.
+    opens: bool,
     /// Keys go to the search.
     pub editing: bool,
     /// The selected thread's row, when there's one.
@@ -642,14 +647,20 @@ pub(super) struct Panel {
 }
 
 impl Panel {
-    /// `listing` while the list of files is still growing. The selection
-    /// starts on the thread with root `near.0`, else on the first of file
-    /// `near.1`'s, else on the first.
-    pub(super) fn new(comments: &Comments, listing: bool, near: (Option<&str>, &[u8])) -> Self {
+    /// `listing` while the list of files is still growing; with `opens`, a
+    /// file the diff doesn't list opens from the working tree. The
+    /// selection starts on the thread with root `near.0`, else on the first
+    /// of file `near.1`'s, else on the first.
+    pub(super) fn new(
+        comments: &Comments,
+        (listing, opens): (bool, bool),
+        near: (Option<&str>, &[u8]),
+    ) -> Self {
         let list = List::new(comments, listing);
         let selected = list.near(near).unwrap_or_else(|| list.keep(None, 0));
         Self {
             list,
+            opens,
             editing: false,
             selected,
             missed: None,
@@ -759,7 +770,8 @@ impl Panel {
         };
         match (key, keys.action(true, key, mods)) {
             (Key::Esc, _) if !list.search().is_empty() => list.clear_search(),
-            (Key::Esc | Key::Enter, _) | (_, Some(Act::Open)) => return Outcome::Diff,
+            (Key::Esc, _) => return Outcome::Diff,
+            (Key::Enter, _) | (_, Some(Act::Open)) => return Outcome::Open,
             (_, Some(Act::CommentedFiles)) => list.step_filter(false),
             (Key::Char(c), _) if plain && filter_back(c) => list.step_filter(true),
             (Key::Char(OTHER_BRANCHES), _) if plain => list.toggle_others(),
@@ -852,7 +864,7 @@ impl Panel {
         let (x, right) = (2, width - 2);
         let mut c = Canvas::default();
         for row in rows.iter().skip(self.scroll).take(self.height) {
-            list_row(&mut c, (list, keys), row, right - x);
+            list_row(&mut c, (list, keys, self.opens), row, right - x);
         }
         for (i, cells) in c.rows().enumerate() {
             let y = top + 1 + i;
@@ -876,10 +888,11 @@ fn group_title(conversation: bool, keys: &Keys) -> (&'static str, String) {
 }
 
 /// Writes `row` of the panel's list, `width` columns wide. A file header's
-/// folders are cut from the left to leave its name whole. A thread's
-/// replies are marked (`↩2`) so they don't read as the header's count of
-/// threads.
-fn list_row(c: &mut Canvas, (list, keys): (&Listing, &Keys), row: &Row, width: usize) {
+/// folders are cut from the left to leave its name whole; one the diff
+/// doesn't list says whether `enter` opens it (with `opens`, unless it's
+/// gone from the working tree). A thread's replies are marked (`↩2`) so
+/// they don't read as the header's count of threads.
+fn list_row(c: &mut Canvas, (list, keys, opens): (&Listing, &Keys, bool), row: &Row, width: usize) {
     match row {
         Row::Note(words) => {
             let text = model::say(words, |hint| super::app::hint_words(keys, hint));
@@ -896,10 +909,11 @@ fn list_row(c: &mut Canvas, (list, keys): (&Listing, &Keys), row: &Row, width: u
             let group = &list.files[*group];
             let path = escape(group.path.as_bytes());
             let (dir, name) = path.split_at(path.rfind('/').map_or(0, |i| i + 1));
-            let absent = if group.absent {
-                " · not in this diff"
-            } else {
-                ""
+            let absent = match (group.absent, opens) {
+                (None, _) => "",
+                (Some(_), false) => " · not in this diff",
+                (Some(Absent::Unlisted), true) => " · enter opens the file",
+                (Some(Absent::Gone), true) => " · file not on disk",
             };
             let count = threads.to_string();
             let room = width.saturating_sub(count.width() + 2);
@@ -944,7 +958,7 @@ fn list_row(c: &mut Canvas, (list, keys): (&Listing, &Keys), row: &Row, width: u
             let label = label.map(|l| escape(l.as_bytes()));
             let branch = thread.branch.as_deref().map(|b| escape(b.as_bytes()));
             let words = [
-                (thread.at == At::Lost && !list.files[item.group].absent)
+                (thread.at == At::Lost && list.files[item.group].absent.is_none())
                     .then_some((moved, "moved")),
                 branch.as_deref().map(|b| (ink(Role::Hint), b)),
                 thread.local.then_some((ink(Role::Hint), "branch draft")),

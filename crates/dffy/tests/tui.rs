@@ -3702,7 +3702,7 @@ fn a_layout_remembered_in_the_viewer_leaves_printed_output_alone() {
     assert!(term.wait_exit().success());
 }
 
-/// Whole files (`X`), ignored whitespace (the panel's `W`) and watching
+/// Whole files (`X`), ignored whitespace (the panel's `I`) and watching
 /// (`w`) set in one run are on in the next. Flags beat them for their run
 /// without being saved.
 #[test]

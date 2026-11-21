@@ -2189,3 +2189,179 @@ fn s_takes_an_applied_suggestion_back_and_applies_one_discarded() {
     let stale = &read_comments(&path).comments[0];
     assert_eq!(stale.applied, None, "no longer marked applied");
 }
+
+/// Runs `git` in `dir`, with no config of the user's.
+fn git_in(dir: &Path, args: &[&str]) {
+    let out = std::process::Command::new("git")
+        .current_dir(dir)
+        .args(args)
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_AUTHOR_NAME", "A")
+        .env("GIT_AUTHOR_EMAIL", "a@example.com")
+        .env("GIT_COMMITTER_NAME", "A")
+        .env("GIT_COMMITTER_EMAIL", "a@example.com")
+        .output()
+        .expect("git runs");
+    assert!(out.status.success(), "git {args:?}");
+}
+
+/// A viewer of the working tree in `d`, which changed `changed.txt` and
+/// not `kept.rs`, with the comments in `comments`: a thread with a
+/// suggestion on `kept.rs`'s line 2, and one on `gone.rs`, which isn't
+/// there. Its uncommitted changes list `changed.txt` alone.
+fn beyond_the_diff(d: &Path, comments: &Path) -> (App, Repo, ChangeSet) {
+    git_in(d, &["init", "-q", "-b", "main"]);
+    std::fs::write(d.join("changed.txt"), "a\n").expect("write");
+    std::fs::write(d.join("kept.rs"), "line 1\nline 2\nline 3\nline 4\n").expect("write");
+    git_in(d, &["add", "-A"]);
+    git_in(d, &["commit", "-q", "-m", "x"]);
+    std::fs::write(d.join("changed.txt"), "b\n").expect("write");
+    let at = |n: usize| {
+        format!(r#""side":"new","start":{{"old":null,"new":{n}}},"end":{{"old":null,"new":{n}}}"#)
+    };
+    std::fs::write(
+        comments,
+        format!(
+            r#"{{"version":1,"comments":[
+{{"id":"k1","path":"kept.rs",{},"text":"Two?","suggestion":"line TWO","author":"","created":"2026-11-17T10:00:00Z","anchor":{{"before":["line 1"],"lines":["line 2"],"after":["line 3"]}}}},
+{{"id":"g1","path":"gone.rs",{},"text":"Gone","author":"","created":"2026-11-17T10:00:00Z","anchor":{{"before":[],"lines":["gone"],"after":[]}}}}
+]}}"#,
+            at(2),
+            at(1)
+        ),
+    )
+    .expect("write");
+    let repo = Repo::discover(d).expect("repo");
+    let spec = repo.resolve(&[], false, false).expect("spec");
+    let mut set = ChangeSet::new(repo.clone(), spec, Revisions::default(), &[], false);
+    let mut app = App::new(
+        &Config::default(),
+        Theme::default_theme(),
+        "working tree".to_owned(),
+        None,
+        (140, 16),
+        Indicators::Classic,
+    );
+    set.enumerate(|change| {
+        app.event(Event::Enumerated(change));
+        ControlFlow::Continue(())
+    })
+    .expect("enumerate");
+    app.event(Event::EnumerationDone(None));
+    app.set_worktree(Some(d.to_owned()));
+    app.set_comments(comments.to_owned());
+    diff_shown(&mut app, &repo);
+    screen(&mut app);
+    (app, repo, set)
+}
+
+/// Draws, then runs the diffs the viewer asks for in the pool's worker.
+fn diff_shown(app: &mut App, repo: &Repo) {
+    app.draw();
+    let settings = crate::tui::worker::Settings {
+        options: Options::default(),
+        highlight: false,
+        grammars: crate::grammars(),
+        cache: None,
+    };
+    let jobs: Vec<Job> = (app.jobs().into_iter())
+        .filter(|job| matches!(job, Job::Diff { .. }))
+        .collect();
+    for job in jobs {
+        let done = crate::tui::worker::run(job, Some(repo), &settings);
+        app.event(Event::Diffed(done));
+    }
+}
+
+/// `enter` on a thread whose file the diff doesn't list opens that file
+/// after the others, whole and marked as having no changes, with the
+/// thread focused on its line; the panel says up front which such file
+/// isn't on disk. The file stays through a refresh of other files, and
+/// its suggestion applies there. Once the file changes, the list has it,
+/// and it's a file like any other.
+#[test]
+fn enter_opens_a_threads_file_the_diff_doesnt_list() {
+    let (repo_dir, dir) = (
+        tempfile::tempdir().expect("tempdir"),
+        tempfile::tempdir().expect("tempdir"),
+    );
+    let d = repo_dir.path();
+    let (mut app, repo, mut set) = beyond_the_diff(d, &dir.path().join("comments.json"));
+    key(&mut app, 'i');
+    let shown = screen(&mut app);
+    assert!(shown.contains("kept.rs · enter opens the file"), "{shown}");
+    assert!(shown.contains("gone.rs · file not on disk"), "{shown}");
+    app.panel.as_mut().expect("the comments show").select("k1");
+    press(&mut app, Key::Enter);
+    let files = app.doc.document.files();
+    assert_eq!(files.len(), 2);
+    assert!(files[1].is_unchanged());
+    assert_eq!(app.doc.document.pos.file, 1);
+    diff_shown(&mut app, &repo);
+    screen(&mut app);
+    assert_eq!(focused(&app), Some("k1"));
+    key(&mut app, 'i');
+    app.message = None;
+    insta::assert_snapshot!("unchanged_file", screen(&mut app));
+
+    std::fs::write(d.join("changed.txt"), "c\n").expect("write");
+    let update = set
+        .refresh(&["changed.txt".into()])
+        .expect("refresh")
+        .expect("an update");
+    app.event(Event::Refreshed(update));
+    let files = app.doc.document.files();
+    assert!(
+        files[1].is_unchanged() && !files[1].wants_diff(),
+        "kept as it was"
+    );
+    assert_eq!(app.doc.document.pos.file, 1);
+    screen(&mut app);
+    assert_eq!(focused(&app), Some("k1"));
+
+    let Some(Action::ApplySuggestion(suggestion)) = press(&mut app, Key::Char('s')) else {
+        panic!("applies: {}", status(&mut app));
+    };
+    crate::tui::apply(&repo, &suggestion).expect("applied");
+    assert_eq!(
+        std::fs::read_to_string(d.join("kept.rs")).expect("read"),
+        "line 1\nline TWO\nline 3\nline 4\n"
+    );
+    let update = set.rescan().expect("rescan").expect("an update");
+    app.event(Event::Refreshed(update));
+    let files = app.doc.document.files();
+    let paths: Vec<_> = files.iter().map(|e| e.change().path.clone()).collect();
+    assert_eq!(paths, ["changed.txt", "kept.rs"]);
+    assert!(!files[1].is_unchanged(), "the list's own entry");
+}
+
+/// `m` past the last thread goes on to the next file with threads that
+/// the diff doesn't list, past one that isn't on disk, which `enter` in
+/// the panel opens nothing for.
+#[test]
+fn m_goes_on_to_a_threads_file_the_diff_doesnt_list() {
+    let (repo_dir, dir) = (
+        tempfile::tempdir().expect("tempdir"),
+        tempfile::tempdir().expect("tempdir"),
+    );
+    let (mut app, repo, _) = beyond_the_diff(repo_dir.path(), &dir.path().join("comments.json"));
+    key(&mut app, 'm');
+    let files = app.doc.document.files();
+    assert_eq!(files.len(), 2);
+    assert_eq!(files[1].change().path, "kept.rs");
+    assert_eq!(app.doc.document.pos.file, 1);
+    diff_shown(&mut app, &repo);
+    screen(&mut app);
+    assert_eq!(focused(&app), Some("k1"));
+
+    key(&mut app, 'i');
+    let shown = screen(&mut app);
+    assert!(shown.contains("gone.rs · file not on disk"), "{shown}");
+    app.panel.as_mut().expect("the comments show").select("g1");
+    press(&mut app, Key::Enter);
+    let shown = status(&mut app);
+    assert!(shown.contains("gone.rs isn't on disk"), "{shown}");
+    assert_eq!(app.doc.document.files().len(), 2);
+    assert_eq!(app.pane, Pane::Tree, "the keys stay in the panel");
+}

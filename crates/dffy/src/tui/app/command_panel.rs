@@ -141,7 +141,7 @@ impl App {
         }
     }
 
-    /// The quick popup's title and the command panel's rows as things
+    /// The quick popup's Here title and the command panel's rows as things
     /// stand: Here's, then the leader's table, each with its state, its key
     /// in the panel and the key that does the same outside it.
     pub(super) fn command_entries(&mut self) -> (String, Vec<commands::Entry>) {
@@ -220,15 +220,16 @@ impl App {
     /// few of its keys; in a conflict on screen, its choices; on a review,
     /// its actions; else a few settings and actions. Sending your open
     /// threads to your agent joins a thread's, a review's and the rest
-    /// while you have some. With them, what they act on, the quick popup's
-    /// title: `on this thread`, or `commands` with nothing in particular.
+    /// while you have some. With them, what they act on, the title of the
+    /// quick popup's Here group: `On this thread`, or `Here` with nothing
+    /// in particular.
     fn here(&mut self) -> (String, Vec<Offer>) {
         if self.pane == Pane::Diff
             && let Some((file, ..)) = self.doc.selected_lines()
         {
             let mut offers = self.line_offers(file, true);
             offers.extend(self.edit_offers(file, true));
-            return ("on these lines".to_owned(), offers);
+            return ("On these lines".to_owned(), offers);
         }
         let send = (self.applies(Act::SendOpenThreads)).then(|| {
             Offer::new(
@@ -243,17 +244,17 @@ impl App {
                 .filter_map(|&a| offers.iter().find(|o| o.action == a).cloned())
                 .chain(send)
                 .collect();
-            return ("on this thread".to_owned(), offers);
+            return ("On this thread".to_owned(), offers);
         }
         // The conflict a choice would act on: the line last tapped's first.
         let tapped = self.tapped_shown().map(|(pos, _)| pos);
         let conflict = self.conflict_offers(tapped);
         if !conflict.is_empty() {
-            return ("in this conflict".to_owned(), conflict);
+            return ("In this conflict".to_owned(), conflict);
         }
         let review = self.review_offers();
         if !review.is_empty() {
-            let title = format!("on this {}", self.reviewing.noun(false));
+            let title = format!("On this {}", self.reviewing.noun(false));
             return (title, review.into_iter().chain(send).collect());
         }
         // The agent loop first: your open threads to hand over, then once
@@ -265,7 +266,7 @@ impl App {
             .filter(|&a| self.applies(a))
             .map(|a| Offer::new(a.title(), a, Table::Main))
             .collect();
-        ("commands".to_owned(), offers)
+        ("Here".to_owned(), offers)
     }
     /// A panel row's checkbox, if it's a toggle, its text, and a
     /// multi-value setting's value (`auto (split here)`).

@@ -13,20 +13,20 @@ expression: panel_markup(&mut app)
 <dim>│</>                          <dim>┌─</> commands <dim>────────────────────────────────────────────────────────────</> <dim>esc</> <dim>close</> <dim>─┐</>                           <dim>┃</>
 <dim>│</>                          <dim>│</>  Here  View  Files  Review  Git  Copy                                             <dim>│</>                           <dim>┃</>
 <dim>│</>                          <dim>│</>                                                                                   <dim>│</>                           <dim>┃</>
-<dim>│</>                          <dim>│</> s    Layout ‹ auto (split here) ›                                                 <dim>│</>                           <dim>┃</>
-<dim>│</>                          <dim>│</> W    [ ] Wrap long lines                                                          <dim>│</>                           <dim>┃</>
+<dim>│</>                          <dim>│</> Layout                                    Display                                 <dim>│</>                           <dim>┃</>
+<dim>│</>                          <dim>│</> s    Layout ‹ auto (split here) ›         *    [x] Syntax highlighting            <dim>│</>                           <dim>┃</>
+<dim>│</>                          <dim>│</> W    [ ] Wrap long lines                  K    Indicators <dim>‹</> classic <dim>›</>             <dim>│</>                           <dim>┃</>
+<dim>│</>                          <dim>│</> X    [ ] Whole file                       %    Modified lines <dim>‹</> changed <dim>›</>         <dim>│</>                           <dim>┃</>
+<dim>│</>                          <dim>│</> x    More context                         #    [x] Line numbers                   <dim>│</>                           <dim>┃</>
+<dim>│</>                          <dim>│</> B    Status bar <dim>‹</> bottom <dim>›</>                @    [x] Hunk headers                   <dim>│</>                           <dim>┃</>
+<dim>│</>                          <dim>│</>                                           ~    Theme <dim>‹</> default <dim>›</>                  <dim>│</>                           <dim>┃</>
+<dim>│</>                          <dim>│</> Diff                                                                              <dim>│</>                           <dim>┃</>
 <dim>│</>                          <dim>│</> d    [ ] Syntax diff                                                              <dim>│</>                           <dim>┃</>
 <dim>│</>                          <dim>│</> r    [ ] Rendered view                                                            <dim>│</>                           <dim>┃</>
-<dim>│</>                          <dim>│</> x    More context                                                                 <dim>│</>                           <dim>┃</>
-<dim>│</>                          <dim>│</> X    [ ] Whole file                                                               <dim>│</>                           <dim>┃</>
-<dim>│</>                          <dim>│</> K    Indicators <dim>‹</> classic <dim>›</>                                                       <dim>│</>                           <dim>┃</>
-<dim>│</>                          <dim>│</> %    Modified lines <dim>‹</> changed <dim>›</>                                                   <dim>│</>                           <dim>┃</>
-<dim>│</>                          <dim>│</> *    [x] Syntax highlighting                                                      <dim>│</>                           <dim>┃</>
 <dim>│</>                          <dim>│</> I    [ ] Ignore whitespace                                                        <dim>│</>                           <dim>┃</>
-<dim>│</>                          <dim>│</> #    [x] Line numbers                                                             <dim>│</>                           <dim>┃</>
-<dim>│</>                          <dim>│</> @    [x] Hunk headers                                                             <dim>│</>                           <dim>┃</>
-<dim>│</>                          <dim>│</> B    Status bar <dim>‹</> bottom <dim>›</>                                                        <dim>│</>                           <dim>┃</>
-<dim>│</>                          <dim>│</> ~    Theme <dim>‹</> default <dim>›</>                                                            <dim>│</>                           <dim>┃</>
+<dim>│</>                          <dim>│</>                                                                                   <dim>│</>                           <dim>┃</>
+<dim>│</>                          <dim>│</>                                                                                   <dim>│</>                           <dim>┃</>
+<dim>│</>                          <dim>│</>                                                                                   <dim>│</>                           <dim>┃</>
 <dim>│</>                          <dim>│</>                                                                                   <dim>│</>                           <dim>┃</>
 <dim>│</>                          <dim>│</>                                                                                   <dim>│</>                           <dim>┃</>
 <dim>│</>                          <dim>│</>                                                                                   <dim>│</>                           <dim>┃</>

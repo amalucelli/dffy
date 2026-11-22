@@ -15,8 +15,6 @@ Run `dffy` in a git repository and it opens your changes full screen: a file tre
 
 <p align="center"><img src="assets/view.png" alt="dffy showing a split diff with the file tree on the left"></p>
 
-<p align="center"><img src="assets/ai.png" alt="Claude Code answering a review thread inline in dffy"></p>
-
 ## Install
 
 ```sh
@@ -92,6 +90,8 @@ dffy agents setup    # a skill for Claude Code, Codex, Pi and Amp
 ```
 
 The skill tells the agent to run `dffy agents show`, which prints how to use the installed dffy. It also tells the agent to reply in your threads under its own name and never resolve or post them. Agents without a shell use [`dffy mcp`](docs/mcp.md) instead. [agents.md](docs/agents.md) has the details.
+
+<p align="center"><img src="assets/ai.png" alt="Claude Code answering a review thread inline in dffy"></p>
 
 ## Why `dffy`
 

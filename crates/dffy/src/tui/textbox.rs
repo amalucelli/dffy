@@ -36,9 +36,16 @@ impl TextBox {
 
     /// Edits for `key`. Moves and deletes by word and to the line's start
     /// take readline's keys, which macOS terminals send for option and
-    /// command. Other keys with ctrl or alt do nothing.
+    /// command. Enter starts a line, and so do shift+enter, alt+enter and
+    /// ctrl+j, for an owner that takes enter alone to send the text: only
+    /// terminals with the kitty keyboard protocol tell shift+enter from
+    /// enter, and every terminal sends the other two. Other keys with ctrl
+    /// or alt do nothing.
     pub(crate) fn key(&mut self, key: Key, mods: Mods) {
         match (key, mods) {
+            (Key::Enter, Mods::SHIFT | Mods::ALT) | (Key::Char('j'), Mods::CTRL) => {
+                self.insert("\n");
+            }
             (Key::Backspace, Mods::ALT) | (Key::Char('w'), Mods::CTRL) => {
                 self.cut(word_start(&self.text, self.cursor)..self.cursor);
             }
@@ -320,6 +327,21 @@ mod tests {
         b.key(Key::Char('x'), Mods::CTRL);
         b.key(Key::Char('x'), Mods::ALT);
         assert_eq!(b.text(), "one two threex", "ctrl and alt keys don't type");
+    }
+
+    /// Shift+enter, alt+enter and ctrl+j start a line as enter does, for
+    /// an owner that takes enter to send.
+    #[test]
+    fn new_line_keys() {
+        let mut b = typed("a");
+        for (key, mods) in [
+            (Key::Enter, Mods::SHIFT),
+            (Key::Enter, Mods::ALT),
+            (Key::Char('j'), Mods::CTRL),
+        ] {
+            b.key(key, mods);
+        }
+        assert_eq!(b.text(), "a\n\n\n");
     }
 
     fn at(text: &str, cursor: usize) -> TextBox {

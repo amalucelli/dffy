@@ -611,7 +611,33 @@ fn gaps(diff: &FileDiff) -> Vec<Gap> {
 impl File {
     /// Pairs every hunk of `diff` and builds its views. `highlight` has the
     /// grammars to highlight with; `None` leaves the file plain.
-    fn new(mut diff: FileDiff, whitespace: Whitespace, highlight: Option<&Registry>) -> Self {
+    fn new(diff: FileDiff, whitespace: Whitespace, highlight: Option<&Registry>) -> Self {
+        let gaps = gaps(&diff);
+        Self::with_gaps(diff, gaps, whitespace, highlight)
+    }
+
+    /// `diff`, a file compared with itself (see [`FileChange::unchanged`]),
+    /// as one gap of every line. An empty, binary or too large one has none.
+    fn unchanged(diff: FileDiff, highlight: Option<&Registry>) -> Self {
+        let len = diff.new.len();
+        let gaps = if len == 0 {
+            Vec::new()
+        } else {
+            vec![Gap {
+                old: 0,
+                new: 0,
+                len,
+            }]
+        };
+        Self::with_gaps(diff, gaps, Whitespace::Exact, highlight)
+    }
+
+    fn with_gaps(
+        mut diff: FileDiff,
+        gaps: Vec<Gap>,
+        whitespace: Whitespace,
+        highlight: Option<&Registry>,
+    ) -> Self {
         // Whether a line is modified decides its color from the first frame
         // on, and the overview marks every hunk, shown or not.
         for hunk in &mut diff.hunks {
@@ -642,15 +668,13 @@ impl File {
         let syntax_bytes: usize = sides
             .iter()
             .filter(|(path, bytes)| {
-                highlight.is_some_and(|grammars| {
-                    !diff.hunks.is_empty() && highlighted(grammars, path, bytes)
-                })
+                highlight
+                    .is_some_and(|grammars| !gaps.is_empty() && highlighted(grammars, path, bytes))
             })
             // Measured on kernel/sched/fair.c: a first parse grew the process
             // by about 19 bytes per byte of source, an upper bound.
             .map(|(_, bytes)| bytes.len() * 20)
             .sum();
-        let gaps = gaps(&diff);
         let whole = hunks.len() == 1
             && gaps.iter().all(|g| g.len == 0)
             && (diff.old.is_empty() || diff.new.is_empty());

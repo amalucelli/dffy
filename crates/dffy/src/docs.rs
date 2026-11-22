@@ -24,7 +24,7 @@ pub(crate) fn keys() -> String {
     let _ = writeln!(out, "{BEGIN}\n");
     out.push_str(KEYS_INTRO);
     for group in Group::ALL {
-        let _ = writeln!(out, "\n### {}\n", capitalize(group.name()));
+        let _ = writeln!(out, "\n### {}\n", group.title());
         out.push_str("| Action | Keys | Command panel | Description |\n|---|---|---|---|\n");
         for &action in Action::ALL.iter().filter(|a| a.group() == group) {
             let shown: Vec<String> = [
@@ -76,11 +76,13 @@ pub(crate) fn keys() -> String {
         |action| spans(keys.conflict_chords(action)),
     );
     out.push_str(
-        "\n## Command panel\n\n`space` opens the panel. These keys run its entries, \
-         in the order the panel lists them. On a setting with values (`Layout ‹ auto ›`), \
-         `h`/`l` and `left`/`right` step back and forward; on other rows they do nothing, \
-         so a `leader:h` or `leader:l` binding never runs. `enter` on Theme opens the theme \
-         list.\n\n\
+        "\n## Command panel\n\n`space` opens the panel as a quick popup of what applies to \
+         what you're on; `space` or `tab` again shows the whole panel. These keys run its \
+         entries from the popup and from any tab; within a group, the panel lists them in this \
+         order. On a setting with values \
+         (`Layout ‹ auto ›`), `h`/`l` and `left`/`right` step back and forward; on other rows \
+         they do nothing, so a `leader:h` or `leader:l` binding never runs, and `tab` and \
+         `shift+tab` switch tabs. `enter` on Theme opens the theme list.\n\n\
          | Key | Entry | Action |\n|---|---|---|\n",
     );
     for &(chord, action) in keys.leader_entries() {
@@ -230,6 +232,7 @@ fn values(key: &str) -> String {
         "theme" => "a theme name".to_owned(),
         "render" => "`extension:name` pairs, space-separated".to_owned(),
         "review" => "a plugin name, or empty".to_owned(),
+        "agent" => "`claude`, `codex`, `pi`, a command, or empty".to_owned(),
         "split-min-width" => "columns".to_owned(),
         "tab-width" => "columns, at least 1".to_owned(),
         "context" => "lines, or `full`".to_owned(),

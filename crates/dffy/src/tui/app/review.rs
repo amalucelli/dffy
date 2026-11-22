@@ -10,7 +10,8 @@ use dffy_core::view::Attributes;
 use unicode_width::UnicodeWidthStr;
 
 use super::{Action, App, escape};
-use crate::keys::Keys;
+use crate::keys::{Action as Act, Keys, Table};
+use crate::plugin::agent::Request as AgentRequest;
 use crate::plugin::review::{Listed, ReviewEvent, ReviewLabel, Said, Session};
 use crate::review::model;
 use crate::review::session::{
@@ -18,8 +19,8 @@ use crate::review::session::{
 };
 use crate::term::{self, Grid, Input, Key, Mods};
 use crate::theme::{Role, Style, Theme};
-use crate::tui::help;
 use crate::tui::textbox::TextBox;
+use crate::tui::{help, menu};
 
 /// The dialog `P` opens to post the review: a summary, the plugin's
 /// events, and one line when something won't go.
@@ -107,6 +108,8 @@ impl App {
                     });
                 }
                 Effect::Ask { id, request } => action = Some(Action::Review { id, request }),
+                Effect::Agent { id, request } => self.agent_asks.push((id, request)),
+                Effect::StopAgents(ids) => self.agent_stops.extend(ids),
                 Effect::Show {
                     range,
                     comments,
@@ -148,6 +151,9 @@ impl App {
     /// Takes a review's range as what's shown: its words in the title, and
     /// the revisions an empty list is worded by.
     fn show_range(&mut self, range: session::Range) -> Revisions {
+        // The review's range takes the place of the changes since a
+        // checkpoint too.
+        self.since_checkpoint = None;
         self.description = range.description;
         self.doc.page_title = range.title;
         if let Some((selected, _)) = &mut self.selected {
@@ -182,6 +188,25 @@ impl App {
         }
         let effects = self.reviewing.list();
         self.review_effects(effects)
+    }
+
+    /// What the keys do on the review open: post it, pull its updates,
+    /// show what changed since your last review and, on the one plain
+    /// `dffy` found, the whole review. Nothing off a review.
+    pub(super) fn review_offers(&self) -> Vec<menu::Offer> {
+        if !self.reviewing.on_review() {
+            return Vec::new();
+        }
+        let main = |label: &str, action| menu::Offer::new(label, action, Table::Main);
+        let mut offers = vec![
+            main(Act::ReviewPost.title(), Act::ReviewPost),
+            main(Act::ReviewPull.title(), Act::ReviewPull),
+            main(Act::SinceLastReview.title(), Act::SinceLastReview),
+        ];
+        if self.reviewing.found_plain() {
+            offers.push(main(&self.reviewing.whole_title(), Act::WholeReview));
+        }
+        offers
     }
 
     /// Asks `plugin` whether the branch checked out has a review, for
@@ -304,14 +329,30 @@ impl App {
     }
 
     /// The review's part of the program status: a plugin run is work going
-    /// on.
+    /// on, and so is an ask.
     pub(super) fn review_status(&self) -> Option<term::Status> {
-        let work = self.reviewing.work()?;
+        let Some(work) = self.reviewing.work() else {
+            return Some(term::Status {
+                state: term::State::Working,
+                message: Some(self.asking.work()?),
+                progress: None,
+            });
+        };
         Some(term::Status {
             state: term::State::Working,
             message: Some(format!("{} · {}", work.doing, work.label)),
             progress: work.progress,
         })
+    }
+
+    /// What the agent plugin is to be asked, and which asks it's to stop,
+    /// since the last call: for the loop, which runs the plugin. An ask
+    /// stopped before it went isn't asked.
+    pub(crate) fn take_agent_work(&mut self) -> (Vec<(u64, AgentRequest)>, Vec<u64>) {
+        let stops = std::mem::take(&mut self.agent_stops);
+        let mut asks = std::mem::take(&mut self.agent_asks);
+        asks.retain(|(id, _)| !stops.contains(id));
+        (asks, stops)
     }
 
     /// What's left to say once the viewer is gone: drafts in a review
@@ -390,12 +431,12 @@ impl App {
                 dialog.local = !dialog.local;
                 let local = dialog.local;
                 if self.sending(true).local == 0 {
-                    self.message("no local drafts on this diff");
+                    self.message("no branch drafts on this diff");
                 } else {
                     self.message(if local {
-                        "the local drafts go with the review"
+                        "the branch drafts go with the review"
                     } else {
-                        "the local drafts stay local"
+                        "the branch drafts stay on the branch"
                     });
                 }
             }
@@ -619,7 +660,7 @@ impl Dialog {
             lines.push((
                 format!(
                     "l  {mark} with the {} on this diff",
-                    plural(sending.local, "local draft")
+                    plural(sending.local, "branch draft")
                 ),
                 Style::PLAIN,
             ));

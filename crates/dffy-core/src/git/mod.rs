@@ -5,6 +5,7 @@
 //! stream in path order and stop early.
 
 mod changes;
+mod checkpoint;
 mod conflict;
 mod paths;
 mod rename;
@@ -12,6 +13,7 @@ mod spec;
 mod stage;
 mod stats;
 mod status;
+mod suggestion;
 mod tree;
 mod worktree;
 
@@ -24,12 +26,15 @@ use std::sync::Arc;
 use gix::bstr::{BStr, BString, ByteSlice};
 
 pub use changes::{ChangeSet, Update};
+pub use checkpoint::{Checkpoint, KEPT_CHECKPOINTS, WhichCheckpoint};
 pub use gix::ObjectId;
 pub use paths::{Compare, Endpoint};
 pub use spec::{DiffSpec, Revisions};
 pub use stage::{Applied, Edit, Picked};
 pub use stats::StatStore;
 pub(crate) use status::excludes_file;
+pub use suggestion::NewSide;
+pub(crate) use suggestion::check_suggestion;
 
 use crate::diff::{self, Hunk, Options, Text};
 use crate::view::Staging;
@@ -76,6 +81,13 @@ pub enum Error {
         /// Why, in a few words.
         reason: &'static str,
     },
+    /// No checkpoint of the working tree to compare with: none taken, or
+    /// not the one numbered, which pruning may have removed.
+    #[error("{}", match .0 {
+        Some(n) => format!("no checkpoint {n} in this working tree"),
+        None => "no checkpoint in this working tree".to_owned(),
+    })]
+    NoCheckpoint(Option<u64>),
     /// `a...b` or `--merge-base` on commits with no common ancestor.
     #[error("no merge base between {0} and {1}")]
     NoMergeBase(ObjectId, ObjectId),
@@ -100,8 +112,8 @@ pub enum Error {
         #[source]
         source: std::io::Error,
     },
-    /// A stage, unstage or discard that doesn't apply to the file or the
-    /// lines given; the message says why.
+    /// A stage, unstage, discard or suggestion that doesn't apply to the
+    /// file or the lines given; the message says why.
     #[error("{0}")]
     Refused(String),
     /// `git apply` couldn't run, or refused the patch, as when the file
@@ -236,8 +248,8 @@ pub enum Status {
     /// The file changed between regular file, symlink and submodule.
     TypeChange,
     /// Not in the index and not ignored. Only reported for
-    /// [`DiffSpec::Uncommitted`] and for [`DiffSpec::IndexToWorktree`] with
-    /// `untracked` set.
+    /// [`DiffSpec::Uncommitted`], [`DiffSpec::Checkpoint`] and
+    /// [`DiffSpec::IndexToWorktree`] with `untracked` set.
     Untracked,
     /// Has conflict stages in the index, from a merge, rebase or
     /// cherry-pick that stopped. Reported once in every diff of the index
@@ -297,6 +309,20 @@ impl FileChange {
             status: Status::Unmerged,
             ..Self::new(path, old, new)
         }
+    }
+
+    /// The working-tree file at `path`, of `mode` (see [`worktree_file`]),
+    /// compared with itself: a file shown for what's on it rather than for
+    /// what changed. [`Repo::file_diff`] reads it once and finds no hunks.
+    #[must_use]
+    pub fn unchanged(path: BString, mode: Mode) -> Self {
+        let side = Some(Side::Worktree { mode, id: None });
+        Self::new(path, side, side)
+    }
+
+    /// Both sides are one side, read from one place: nothing can differ.
+    fn is_unchanged(&self) -> bool {
+        self.old.is_some() && self.old == self.new && self.old_path() == self.path
     }
 
     /// The same change seen backwards (`git diff -R`): sides swapped, so
@@ -613,6 +639,9 @@ impl Repo {
             DiffSpec::Uncommitted { head } => {
                 status::tree_worktree(self, head, index, filter, true, emit)?
             }
+            DiffSpec::Checkpoint { tree } => {
+                status::checkpoint_worktree(self, tree, index, filter, emit)?
+            }
             DiffSpec::TreeToTree { .. } | DiffSpec::Paths => ControlFlow::Continue(()),
         };
         Ok(())
@@ -800,7 +829,9 @@ impl Repo {
             Contents::TooLarge(..) => out.too_large = true,
             Contents::Binary(..) => out.binary = true,
             Contents::Text(old, new) => {
-                out.hunks = diff::hunks_without_emphasis(&old, &new, options);
+                if !out.change.is_unchanged() {
+                    out.hunks = diff::hunks_without_emphasis(&old, &new, options);
+                }
                 out.old = old;
                 out.new = new;
             }
@@ -872,6 +903,16 @@ impl Repo {
             side.as_ref()
                 .map_or(Ok((Vec::new(), None)), |s| self.load_noted(path, s))
         };
+        // Read twice, a file written between the reads would show changes.
+        if change.is_unchanged() {
+            let (bytes, note) = load(change.path.as_bstr(), &change.new)?;
+            let size = bytes.len() as u64;
+            if is_binary(&bytes) {
+                return Ok((Contents::Binary(size, size), note));
+            }
+            let text = Text::new(bytes);
+            return Ok((Contents::Text(text.clone(), text), note));
+        }
         let ((old, old_note), (new, new_note)) = (
             load(change.old_path(), &change.old)?,
             load(change.path.as_bstr(), &change.new)?,
@@ -948,6 +989,31 @@ enum Contents {
     TooLarge(u64, u64),
     Binary(u64, u64),
     Text(Text, Text),
+}
+
+/// The mode of the file at the repository-relative `path` in the working
+/// tree at `root`. `None` when there's no file there as git would track
+/// one: it's missing or a directory, a directory leading to it is a
+/// symbolic link, or `path` is absolute, has an empty, `.` or `..`
+/// component, or is inside `.git`. A path from outside git, such as a
+/// comment's, is safe to read and write once this finds it.
+#[must_use]
+pub fn worktree_file(root: &Path, path: &[u8]) -> Option<Mode> {
+    let tracked = |c: &[u8]| !matches!(c, b"" | b"." | b"..") && !c.eq_ignore_ascii_case(b".git");
+    if !path.split(|&b| b == b'/').all(tracked) || !worktree::Leading::default().real(root, path) {
+        return None;
+    }
+    let meta = std::fs::symlink_metadata(root.join(std::ffi::OsStr::from_bytes(path))).ok()?;
+    let kind = meta.file_type();
+    if kind.is_symlink() {
+        Some(Mode::Symlink)
+    } else if !kind.is_file() {
+        None
+    } else if std::os::unix::fs::PermissionsExt::mode(&meta.permissions()) & 0o100 != 0 {
+        Some(Mode::Executable)
+    } else {
+        Some(Mode::File)
+    }
 }
 
 /// Git's binary heuristic: a NUL byte near the start.

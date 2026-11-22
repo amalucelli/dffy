@@ -10,9 +10,10 @@ use dffy_core::conflict::{Choice, Region};
 use dffy_core::document::Pos;
 use dffy_core::git::Status;
 
-use super::{Action, App, escape, menu};
-use crate::keys::Action as Act;
+use super::{Action, App, Confirmed, escape};
+use crate::keys::{Action as Act, Table};
 use crate::review::session::plural;
+use crate::tui::menu::Offer;
 
 /// How a choice reads once made.
 fn made(choice: Choice) -> &'static str {
@@ -61,9 +62,37 @@ impl App {
             .is_some_and(|c| c.refused().is_some() || !c.regions().is_empty())
     }
 
+    /// Arriving in a file with conflicts to resolve says, once, which of
+    /// how many is on screen and the keys that choose: `conflict 1/5 · o
+    /// ours · t theirs · b both · w writes`. Leaving it, coming back says
+    /// it again.
+    pub(super) fn arrive_conflicts(&mut self) {
+        let file = self.doc.document.pos.file;
+        if self.conflicts_said.is_some_and(|said| said != file) {
+            self.conflicts_said = None;
+        }
+        if self.conflicts_said.is_some() || !self.has_conflicts() {
+            return;
+        }
+        let Ok(count) = self.conflict_regions(file).map(|r| r.len()) else {
+            return;
+        };
+        self.conflicts_said = Some(file);
+        let at = self.doc.conflicts_at(None).first().map_or(0, |r| *r);
+        let note = format!(
+            "conflict {}/{count} · {} ours · {} theirs · {} both · {} writes",
+            at + 1,
+            self.conflict_key(Act::KeepCurrent),
+            self.conflict_key(Act::TakeIncoming),
+            self.conflict_key(Act::KeepBoth),
+            self.conflict_key(Act::WriteResolution),
+        );
+        self.message(note);
+    }
+
     /// The first key the conflict's table binds `action` to, else the
     /// diff's, else its name.
-    fn conflict_key(&self, action: Act) -> String {
+    pub(super) fn conflict_key(&self, action: Act) -> String {
         (self.keys.conflict_chords(action).next())
             .or_else(|| self.keys.chords(false, action).next())
             .map_or_else(|| action.name().to_owned(), crate::keys::Chord::name)
@@ -162,13 +191,7 @@ impl App {
                 return;
             }
         };
-        let region = match tapped {
-            Some(pos) => self.doc.conflicts_at(Some(pos)).first().copied(),
-            None => self
-                .current_conflict()
-                .or_else(|| self.doc.conflicts_at(None).first().copied()),
-        };
-        let Some(region) = region else {
+        let Some(region) = self.aimed_conflict(tapped) else {
             let note = if tapped.is_some() {
                 "no conflict on this line".to_owned()
             } else {
@@ -240,7 +263,7 @@ impl App {
             return Some(action);
         }
         self.message = None;
-        self.confirm = Some((prompt, action, "nothing written"));
+        self.confirm = Some((prompt, Confirmed::Run(action), "nothing written"));
         None
     }
 
@@ -274,7 +297,7 @@ impl App {
         self.message = None;
         self.confirm = Some((
             format!("wrote {shown}; git add it to mark it resolved? y/n"),
-            Action::GitAdd(path),
+            Confirmed::Run(Action::GitAdd(path)),
             "not added; git add marks it resolved",
         ));
     }
@@ -296,20 +319,33 @@ impl App {
         }
     }
 
-    /// The right-click menu's choices for the conflict at `pos`, the one
-    /// made reading as taking it back, then the write once there's a
-    /// choice.
-    pub(super) fn conflict_entries(&mut self, pos: Pos) -> Vec<menu::Entry> {
-        let Ok(regions) = self.conflict_regions(pos.file) else {
+    /// The conflict a choice acts on: the one at `tapped`, else the one
+    /// last gone to while it's on screen, else the first on screen.
+    fn aimed_conflict(&mut self, tapped: Option<Pos>) -> Option<usize> {
+        match tapped {
+            Some(pos) => self.doc.conflicts_at(Some(pos)).first().copied(),
+            None => self
+                .current_conflict()
+                .or_else(|| self.doc.conflicts_at(None).first().copied()),
+        }
+    }
+
+    /// The choices for the conflict at `tapped`, else the one the keys act
+    /// on, the one made reading as taking it back, then the write once
+    /// there's a choice.
+    pub(super) fn conflict_offers(&mut self, tapped: Option<Pos>) -> Vec<Offer> {
+        let file = tapped.map_or(self.doc.document.pos.file, |p| p.file);
+        let Ok(regions) = self.conflict_regions(file) else {
             return Vec::new();
         };
-        let Some(&region) = self.doc.conflicts_at(Some(pos)).first() else {
+        let Some(region) = self.aimed_conflict(tapped) else {
             return Vec::new();
         };
-        let choices = self.doc.document.files()[pos.file].choices();
+        let choices = self.doc.document.files()[file].choices();
         let picked = choices.and_then(|c| c.picks.get(region).copied().flatten());
         let chosen = choices.is_some();
-        let mut entries = Vec::new();
+        let offer = |label: &str, action| Offer::new(label, action, Table::Conflict);
+        let mut offers = Vec::new();
         for (choice, label, action) in [
             (Choice::Ours, "Keep current (ours)", Act::KeepCurrent),
             (Choice::Theirs, "Take incoming (theirs)", Act::TakeIncoming),
@@ -324,19 +360,11 @@ impl App {
             } else {
                 label.to_owned()
             };
-            entries.push(self.conflict_entry(&label, action));
+            offers.push(offer(&label, action));
         }
         if chosen {
-            entries.push(self.conflict_entry("Write resolved file…", Act::WriteResolution));
+            offers.push(offer("Write resolved file…", Act::WriteResolution));
         }
-        entries
-    }
-
-    /// A menu entry running `action` as the conflict's key does.
-    fn conflict_entry(&self, label: &str, action: Act) -> menu::Entry {
-        menu::Entry {
-            key: self.conflict_key(action),
-            ..self.menu_entry(false, label, action)
-        }
+        offers
     }
 }

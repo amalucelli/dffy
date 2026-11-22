@@ -6,5 +6,9 @@
 {"id":"d1","path":"src/new.rs","old_path":"src/old.rs","side":"old","start_side":"old","start":{"old":3,"new":null},"end":{"old":4,"new":null},"text":"Why?","suggestion":"x.checked_add(y)","author":"","created":"2026-11-17T11:00:00Z","resolved":true,"anchor":{"before":[],"lines":["x + y","y"],"after":["z"]},"distance":2,"post_error":"refused before"},
 {"id":"d2","path":"src/lib.rs","text":"Agreed","author":"","created":"2026-11-17T11:01:00Z","in_reply_to":"r1","resolved":false},
 {"id":"d3","path":"src/new.rs","old_path":"src/old.rs","text":"And this","author":"","created":"2026-11-17T11:02:00Z","in_reply_to":"d1","resolved":false},
-{"id":"a1","path":"src/lib.rs","text":"An agent's, never sent","author":"claude","created":"2026-11-17T11:03:00Z","resolved":false}
+{"id":"a1","path":"src/lib.rs","text":"An agent's, never sent","author":"claude","created":"2026-11-17T11:03:00Z","resolved":false},
+{"id":"a2","path":"src/new.rs","old_path":"src/old.rs","text":"An agent's answer in your thread, never sent","suggestion":"x.checked_add(y)?","author":"codex","label":"read-only sandbox","created":"2026-11-17T11:04:00Z","in_reply_to":"d1","resolved":false},
+{"id":"m1","path":"src/new.rs","old_path":"src/old.rs","text":"@claude is this right?","author":"","created":"2026-11-17T11:05:00Z","in_reply_to":"d1","resolved":false,"local_only":true},
+{"id":"m2","path":"src/lib.rs","text":"@claude why this file?","author":"","created":"2026-11-17T11:06:00Z","resolved":false,"local_only":true},
+{"id":"d4","path":"src/lib.rs","text":"And its tests?","author":"","created":"2026-11-17T11:07:00Z","in_reply_to":"m2","resolved":false}
 ]}

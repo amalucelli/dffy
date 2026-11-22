@@ -176,7 +176,8 @@ impl Language {
     }
 
     /// [`Language::prepare`] for the scope query, which only
-    /// [`super::FileSyntax`] uses: up to about 20ms (C++'s).
+    /// [`super::FileSyntax`] and [`super::scopes`] use: up to about 20ms
+    /// (C++'s).
     pub fn prepare_scopes(&self) {
         self.scope_query();
     }

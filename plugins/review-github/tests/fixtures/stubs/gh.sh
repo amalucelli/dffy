@@ -5,11 +5,15 @@
 # it said to write, which orders the plugin's output against its requests
 # without sleeps. GraphQL requests go to `requests` and `events`, REST ones
 # to `rest`, and every `gh api` names its host first, which goes to
-# `hostnames`.
+# `hostnames`. A $STUB/gh/slow file makes `--version` and `auth` hang for
+# the seconds it holds, as the process it becomes.
 printed() {
   n=$(grep -cv '"comments/apply"' "$STUB/out")
   echo $((n > 0 ? n - 1 : 0))
 }
+case "$1" in
+  --version|auth) [ -f "$STUB/gh/slow" ] && exec sleep "$(cat "$STUB/gh/slow")" ;;
+esac
 case "$1" in
   --version) echo 'gh version 2.0.0 (stub)'; exit 0 ;;
   auth)

@@ -1,0 +1,2 @@
+{"type":"system","subtype":"init","cwd":"/work","session_id":"s1","tools":[],"mcp_servers":[],"model":"claude-opus","permissionMode":"dontAsk"}
+{"type":"result","subtype":"success","is_error":true,"result":"API Error: 529 Overloaded","session_id":"s1"}

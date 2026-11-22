@@ -2,7 +2,7 @@
 source: crates/dffy/tests/mcp.rs
 expression: "snapshot(&[all.raw_structured(), all.text().to_owned()])"
 ---
-{"notice":null,"comments":[{"id":"m1","path":"lib.rs","text":"Open on main.","author":"","created":"t1","resolved":false,"branch":"main"},{"id":"t1","path":"lib.rs","text":"On topic.","author":"","created":"t4","resolved":false,"branch":"topic"}],"placed":{},"total_comments":2,"next_cursor":null}
+{"notice":null,"comments":[{"id":"m1","path":"lib.rs","text":"Open on main.","author":"","created":"t1","resolved":false,"branch":"main"},{"id":"t1","path":"lib.rs","text":"On topic.","author":"","created":"t4","resolved":false,"branch":"topic"}],"placed":{},"standing":{},"total_comments":2,"next_cursor":null}
 --
 2 comments
 

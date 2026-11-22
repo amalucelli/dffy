@@ -55,6 +55,14 @@ impl Prepare<'_> {
         File::new(diff, whitespace, highlight.then_some(self.grammars))
     }
 
+    /// [`Prepare::file`] for a [`super::Source::Unchanged`] entry's diff, a
+    /// file compared with itself: every line is in one gap, which the
+    /// entry always shows.
+    #[must_use]
+    pub fn unchanged(&self, diff: FileDiff, highlight: bool) -> File {
+        File::unchanged(diff, highlight.then_some(self.grammars))
+    }
+
     /// Both sides of `diff` prepared for highlighting, on two threads when
     /// both are large (see [`FileSyntax::new`]). With `store`, large sides'
     /// spans go to the cache.

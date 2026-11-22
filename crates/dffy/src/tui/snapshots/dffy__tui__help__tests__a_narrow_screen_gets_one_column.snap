@@ -3,7 +3,7 @@ source: crates/dffy/src/tui/help.rs
 expression: text
 ---
 ┌─ keybinds ───────────────────────── esc close ─┐
-│  Move  Files  View  Copy  Other                │
+│  Move  Files  View  Git  Copy  Review  Genera  │
 │ j down            scroll down                 ┃│
 │ k up              scroll up                   ┃│
 │ page_down ctrl+f  page down                   ┃│

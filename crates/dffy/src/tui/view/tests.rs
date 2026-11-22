@@ -3,12 +3,14 @@ use std::fmt::Write as _;
 use dffy_core::diff::{Options, Text, Whitespace, emphasize, hunks};
 use dffy_core::document::State;
 use dffy_core::git::{FileChange, FileDiff, Mode, Side, Status};
+use proptest::prelude::*;
 
 use super::*;
 use crate::config::Indicators;
 use crate::print;
 use crate::review::{self, model};
 use crate::theme::Role;
+use crate::tui::comments::Enter;
 use crate::tui::textbox::TextBox;
 
 const OLD: &str = "fn main() {\n    let total = count + 1;\n    println!(\"{total}\");\n}\n\
@@ -857,6 +859,73 @@ fn comment_marks_go_after_the_line_numbers_of_their_side() {
     ");
 }
 
+/// A thread on several lines marks them with a rail in its look's color,
+/// unbroken by removed lines between them; one on a single line keeps its
+/// glyph. Without color the rail starts on the glyph.
+#[test]
+fn a_threads_lines_are_marked_with_a_rail() {
+    let thread = |lines: Range<usize>, look| Thread {
+        root: format!("{lines:?}"),
+        at: At::Line {
+            side: document::Side::New,
+            lines,
+        },
+        look,
+        resolved: false,
+        outdated: false,
+        url: None,
+        comments: vec![thread_comment("x", "", "11:00", "Hm", true)],
+        lines: Vec::new(),
+        snippet: None,
+        local: false,
+        branch: None,
+    };
+    let (name, mono) = crate::theme::BUILTIN[1];
+    let mono = Theme::parse(name, mono, &mut Vec::new());
+    let mut shown = Vec::new();
+    for (split, theme, height) in [
+        (false, &Theme::default_theme(), 10),
+        (true, &Theme::default_theme(), 10),
+        (false, &mono, 5),
+    ] {
+        let mut doc = doc(layout(split, false), height);
+        doc.set_threads(
+            0,
+            Arc::new([thread(0..3, Look::Open), thread(3..4, Look::Draft)]),
+        );
+        doc.toggle_folds();
+        let (_, rows) = grid_rows(&mut doc, theme);
+        shown.extend(rows);
+    }
+    insta::assert_snapshot!(shown.join("\n"), @r#"
+    @@ -1,5 +1,6 @@
+    1 1┌ │ fn main() {
+    2  │-│     let total = count + 1;
+      2│+│     let total = items.len() + 1;
+    3 3└ │     println!("{total}");
+         │  │ ▸ you · just now · draft · Hm                   │
+      4◆+│     eprintln!("done");
+         │  │ ▸ you · just now · draft · Hm                   │
+    4 5  │ }
+    5   -│ // a comment long enough to wrap in a narrow split c…
+    @@ -1,5 +1,6 @@
+    1  │ fn main() {             │1┌ │ fn main() {
+    2 -│     let total = count +…│2│+│     let total = items.le…
+    3  │     println!("{total}");│3└ │     println!("{total}");
+                                 │   │  │ ▸ you · just now ·… │
+       │                         │4◆+│     eprintln!("done");
+                                 │   │  │ ▸ you · just now ·… │
+    4  │ }                       │5  │ }
+    5 -│ // a comment long enoug…│6 +│ // a comment long enough…
+       │\ No newline at end of file
+    @@ -1,5 +1,6 @@
+    1 1● │ fn main() {
+    2  │-│     let total = count + 1;
+      2│+│     let total = items.len() + 1;
+    3 3└ │     println!("{total}");
+    "#);
+}
+
 #[test]
 fn background_tints_give_moved_code_its_own_hue() {
     let old = "int a(void) { return 1; }\nint b(void) { return 2; }\n";
@@ -1203,6 +1272,7 @@ fn thread_comment(id: &str, author: &str, at: &str, text: &str, draft: bool) -> 
         text: text.to_owned(),
         summary: model::text::summary(text),
         suggestion: None,
+        label: None,
         standing: if draft {
             model::Standing::Draft
         } else {
@@ -1210,6 +1280,7 @@ fn thread_comment(id: &str, author: &str, at: &str, text: &str, draft: bool) -> 
         },
         pending: false,
         posting: None,
+        applied: false,
     }
 }
 
@@ -2181,11 +2252,13 @@ fn the_text_box_is_boxed_where_the_thread_sits() {
             lines: 3..4,
         },
         text: TextBox::new("New"),
+        enter: Enter::Saves,
     };
     let mut doc = commented(layout(false, false), 40);
     doc.write(Writing {
         at: Writes::Reply("n".to_owned()),
         text: TextBox::new("Sure, and a reply long enough to wrap in its box"),
+        enter: Enter::Saves,
     });
     doc.refit();
     let rows = tall_rows(&mut doc);
@@ -2196,7 +2269,7 @@ fn the_text_box_is_boxed_where_the_thread_sits() {
     insta::assert_snapshot!(rows[at..at + 6].join("\n"), @"
          │  ┃ Simpler.                                        ┃
          │  ┃                                                 ┃
-         │  ┃ you · reply · esc saves · ctrl+g editor         ┃
+         │  ┃ you · reply · enter saves · alt+enter new line… ┃
          │  ┃ Sure, and a reply long enough to wrap in its    ┃
          │  ┃ box▏                                            ┃
          │  ┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛
@@ -2209,8 +2282,8 @@ fn the_text_box_is_boxed_where_the_thread_sits() {
         .position(|r| r.contains("eprintln!"))
         .expect("the line");
     insta::assert_snapshot!(rows[at..at + 4].join("\n"), @"
-      4 +│     eprintln!(\"done\");
-         │  ┏ ▾ you · new comment · esc saves, empty discard… ┓
+      4[+│     eprintln!(\"done\");
+         │  ┏ ▾ you · new comment · line 4 · enter saves ━━━━━┓
          │  ┃ New▏                                            ┃
          │  ┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛
     ");
@@ -2219,6 +2292,86 @@ fn the_text_box_is_boxed_where_the_thread_sits() {
     doc.reveal_block(Block::New, true);
     let shown = screen(&mut doc);
     assert!(shown.contains("New▏"), "{shown}");
+}
+
+/// While the box for a new thread is open, its lines stay marked: a rail
+/// in the mark column of their side, unbroken by removed lines between
+/// them, over their gutter tinted. Their code keeps its colors, on a light
+/// theme too.
+#[test]
+fn a_new_threads_lines_stay_marked_while_its_box_is_open() {
+    let drawn = |split: bool, lines: Option<Range<usize>>, theme: &Theme| {
+        let mut doc = doc(layout(split, false), 9);
+        if let Some(lines) = lines {
+            doc.write(Writing {
+                at: Writes::New {
+                    side: document::Side::New,
+                    lines,
+                },
+                text: TextBox::new(""),
+                enter: Enter::Saves,
+            });
+            doc.refit();
+        }
+        let mut grid = Grid::new(60, 9);
+        doc.draw(&mut grid, None, (0, 60, 0), theme, 1);
+        grid
+    };
+    let theme = Theme::default_theme();
+    let mut shown = Vec::new();
+    for (split, lines) in [(false, 1..3), (true, 1..3), (false, 3..4), (false, 0..3)] {
+        let rows = backgrounds(&drawn(split, Some(lines), &theme), 0..9);
+        shown.extend(rows.lines().map(|l| l.trim_end().to_owned()));
+    }
+    let light = Theme::parse("l", "inherit = github-light", &mut Vec::new());
+    for theme in [&theme, &light] {
+        let (open, closed) = (drawn(false, Some(1..3), theme), drawn(false, None, theme));
+        for y in [3, 4] {
+            let styles = |g: &Grid, columns: Range<usize>| -> Vec<Style> {
+                columns.map(|x| g.row(y)[x].style()).collect()
+            };
+            assert_eq!(styles(&open, 7..60), styles(&closed, 7..60), "row {y}");
+            assert_ne!(styles(&open, 0..1), styles(&closed, 0..1), "row {y}");
+        }
+    }
+    insta::assert_snapshot!(shown.join("\n"), @r#"
+    @@ -1,5 +1,6 @@
+    1 1  │ fn main() {
+    2   -│     let total = count + 1;
+    [ansi8   2┌+│ ]    let total = items.len() + 1;
+    [ansi8 3 3└ │ ]    println!("{total}");
+         │  ┏ ▾ you · new comment · lines 2–3 · enter saves ━━┓
+         │  ┃ ▏                                               ┃
+         │  ┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛
+      4 +│     eprintln!("done");
+    @@ -1,5 +1,6 @@
+    1  │ fn main() {             │1  │ fn main() {
+    2 -│     let total = count +…│[ansi8 2┌+│ ]    let total = items.le…
+    3  │     println!("{total}");│[ansi8 3└ │ ]    println!("{total}");
+                                 │   │  ┏ ▾ you · new comment ┓
+                                 │   │  ┃ ▏                   ┃
+                                 │   │  ┗━━━━━━━━━━━━━━━━━━━━━┛
+       │                         │4 +│     eprintln!("done");
+    4  │ }                       │5  │ }
+    @@ -1,5 +1,6 @@
+    1 1  │ fn main() {
+    2   -│     let total = count + 1;
+      2 +│     let total = items.len() + 1;
+    3 3  │     println!("{total}");
+    [ansi8   4[+│ ]    eprintln!("done");
+         │  ┏ ▾ you · new comment · line 4 · enter saves ━━━━━┓
+         │  ┃ ▏                                               ┃
+         │  ┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛
+    @@ -1,5 +1,6 @@
+    [ansi8 1 1┌ │ ]fn main() {
+    [ansi8 2  │-│ ]    let total = count + 1;
+    [ansi8   2│+│ ]    let total = items.len() + 1;
+    [ansi8 3 3└ │ ]    println!("{total}");
+         │  ┏ ▾ you · new comment · lines 1–3 · enter saves ━━┓
+         │  ┃ ▏                                               ┃
+         │  ┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛
+      4 +│     eprintln!("done");
+    "#);
 }
 
 /// Their rows change without a scroll, so a frame after one copies them
@@ -2815,4 +2968,96 @@ fn without_scopes_the_title_keeps_the_heading() {
             .is_some_and(|s| s.get().is_some())
     );
     assert_eq!(scope(&mut doc), None);
+}
+
+/// A canvas row's glyphs: each on either side, showing any bytes, in
+/// columns of their own as a canvas lays them out (past the pane's end
+/// too), listed in no particular order.
+fn row_glyphs() -> impl Strategy<Value = Vec<Mapped>> {
+    let glyph = (0..2usize, 0..3usize, 0..3usize, 0..24usize, 1..4usize);
+    prop::collection::vec(glyph, 0..24)
+        .prop_map(|glyphs| {
+            let mut col = 0;
+            (glyphs.into_iter())
+                .map(|(side, gap, width, start, len)| {
+                    col += gap;
+                    let g = Mapped {
+                        row: 0,
+                        side,
+                        col,
+                        width,
+                        bytes: start..start + len,
+                    };
+                    col += width;
+                    g
+                })
+                .collect::<Vec<_>>()
+        })
+        .prop_shuffle()
+}
+
+/// One side's matches on a line, as a search finds them: ascending and not
+/// overlapping. Up to [`FEW_MATCHES`] a side, so a row's two sides together
+/// fall on either side of it.
+fn line_matches() -> impl Strategy<Value = Vec<(u32, u32)>> {
+    prop::collection::vec((0..4u32, 0..5u32), 0..=FEW_MATCHES).prop_map(|cuts| {
+        let mut at = 0;
+        cuts.into_iter()
+            .map(|(gap, len)| {
+                let start = at + gap;
+                at = start + len;
+                (start, at)
+            })
+            .collect()
+    })
+}
+
+proptest! {
+    // Few rows at or under the threshold have glyphs both sides' matches
+    // cover in different styles.
+    #![proptest_config(ProptestConfig::with_cases(2048))]
+
+    /// Restyling a row with up to [`FEW_MATCHES`] matches, a pass per
+    /// match, or with more, one pass, leaves the same cells in the same
+    /// styles as restyling the row once per match, old side's matches then
+    /// new side's, so where both sides' matches cover a glyph of an unsplit
+    /// row the new side's wins.
+    #[test]
+    fn a_rows_matches_restyle_as_one_per_match_however_many(
+        glyphs in row_glyphs(),
+        old in line_matches(),
+        new in line_matches(),
+        current in prop::option::weighted(0.9, 0..2 * FEW_MATCHES),
+        split: bool,
+        x in 0..4usize,
+        end in 0..40usize,
+        y in 0..3usize,
+    ) {
+        let theme = Theme::default_theme();
+        let (lit, now) = (theme.style(Role::SearchMatch), theme.style(Role::SearchCurrent));
+        prop_assert_ne!(lit, now);
+        let style = |i| if current == Some(i) { now } else { lit };
+        let found: Vec<(usize, (u32, u32))> = (old.iter().map(|&m| (0, m)))
+            .chain(new.iter().map(|&m| (1, m)))
+            .collect();
+        let mut want = Grid::new(32, 2);
+        for (i, &(side, (start, end_byte))) in found.iter().enumerate() {
+            let side = split.then_some(side);
+            for g in &glyphs {
+                if (start as usize..end_byte as usize).contains(&g.bytes.start)
+                    && side.is_none_or(|s| g.side == s)
+                {
+                    let left = (x + g.col).min(end);
+                    want.restyle(left, y, (left + g.width).min(end), style(i));
+                }
+            }
+        }
+        let spans: Vec<(u32, u32, Style)> = (found.iter().enumerate())
+            .map(|(i, &(_, (start, end_byte)))| (start, end_byte, style(i)))
+            .collect();
+        let (on_old, on_new) = spans.split_at(old.len());
+        let mut got = Grid::new(32, 2);
+        restyle_matches(&mut got, &glyphs, [on_old, on_new], split, (x, end, y));
+        prop_assert_eq!(got, want);
+    }
 }

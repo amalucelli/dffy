@@ -404,6 +404,9 @@ pub(crate) struct Boxes {
     cache: RefCell<HashMap<usize, Boxed>>,
     /// Fenced code in comments is highlighted.
     highlight: bool,
+    /// What a private comment's heading says after its word: the key that
+    /// makes it a draft, as `A shares`.
+    share: Option<String>,
     fold: Fold,
     /// The text box, while it's open; keys go to it.
     writing: Option<Writing>,
@@ -421,6 +424,7 @@ impl Boxes {
             starts: Vec::new(),
             cache: RefCell::default(),
             highlight: true,
+            share: None,
             fold: Fold::default(),
             writing: None,
             new_at: None,
@@ -592,7 +596,7 @@ impl Boxes {
                     bodies,
                     (collapsed, focused),
                     writing,
-                    (boxed, now),
+                    (boxed, now, self.share.as_deref()),
                     (c, &mut comment_rows),
                 );
                 if !collapsed && !writes {
@@ -602,7 +606,7 @@ impl Boxes {
             }
             Block::New => {
                 if let Some(writing) = writing {
-                    comments::new_rows(&mut writing.text, boxed, c);
+                    comments::new_rows(writing, boxed, c);
                 }
                 None
             }
@@ -739,6 +743,9 @@ pub(crate) struct Doc {
     scratch: Canvas,
     /// For rows rendered again to find which byte a cell shows.
     mapped: Canvas,
+    /// The search's matches on the row being painted, old side's first, as
+    /// [`restyle_matches`] takes them; kept so painting doesn't allocate.
+    search_spans: Vec<(u32, u32, Style)>,
     /// The last column of the drawing area is kept for the overview of the
     /// file at the top.
     pub overview: bool,
@@ -781,6 +788,7 @@ impl Doc {
             height,
             scratch: Canvas::default(),
             mapped: Canvas::mapped(),
+            search_spans: Vec::new(),
             overview: false,
             separators: Vec::new(),
             target: None,
@@ -814,7 +822,12 @@ impl Doc {
             return layout.for_file(entry.status(), rendered.source_len());
         }
         let lines = loaded.map_or(0, |l| l.diff().old.len().max(l.diff().new.len()));
-        self.layout.for_file(entry.status(), lines)
+        let layout = self.layout.for_file(entry.status(), lines);
+        Layout {
+            // Both sides are the same lines: one column says it.
+            one_sided: layout.one_sided || entry.is_unchanged(),
+            ..layout
+        }
     }
 
     /// Keeps the position inside the document after rows changed under it
@@ -1132,7 +1145,7 @@ impl Doc {
                     &line[..],
                 )
             }
-            Source::Repo | Source::Page { .. } => return None,
+            Source::Repo | Source::Page { .. } | Source::Unchanged => return None,
         };
         Some((role, display_text(text).into()))
     }
@@ -1575,6 +1588,12 @@ impl Doc {
         let pos = self.document.pos;
         self.document.pos.offset = pos.offset.min(self.height(pos, &layout) - 1);
         self.clamp_in(&layout);
+    }
+
+    /// What follows a private comment's word in its heading, as `A shares`;
+    /// set before any box is drawn.
+    pub(crate) fn set_share(&mut self, words: Option<String>) {
+        self.boxes.share = words;
     }
 
     /// Highlights fenced code in comments, or stops; their boxes are drawn
@@ -2034,6 +2053,9 @@ impl Doc {
     /// Returns the files drawn, and when rows were copied, the pane's rows
     /// of the grid and how many rows the view scrolled down by (up when
     /// negative).
+    // Out of line: inlined into the app's frame, the frame after a search
+    // step (`n`, `N`) decodes and schedules worse and is slower.
+    #[inline(never)]
     pub(crate) fn draw(
         &mut self,
         grid: &mut Grid,
@@ -2058,7 +2080,7 @@ impl Doc {
         let reused = previous
             .filter(|_| painted == self.painted)
             .and_then(|previous| self.reuse(grid, previous, area, &layout));
-        let (scrolled, rows, mut pos) = if let Some((by, rows, from)) = reused {
+        let (scrolled, rows, pos) = if let Some((by, rows, from)) = reused {
             (Some(by), rows, from)
         } else {
             self.separators.clear();
@@ -2068,34 +2090,8 @@ impl Doc {
             (None, 0..self.height, self.document.pos)
         };
         let kept = self.separators.len();
-        let mut y = rows.start;
-        let mut last = pos;
         self.box_drawn = None;
-        while y < rows.end {
-            c.clear();
-            let drawn = self.render(pos, &layout, &mut c);
-            if drawn.separator && pos.offset == 0 {
-                self.separators.push((y, pos));
-            }
-            for (i, row) in c.rows().enumerate().skip(pos.offset) {
-                if y == rows.end {
-                    break;
-                }
-                let after = paint(grid, x, top + y, end, row, theme, Attributes::NONE);
-                if let Some(fill) = c.fill(i) {
-                    grid.fill(after, top + y, end, theme.ink_style(fill));
-                }
-                if let Some(card) = &drawn.card {
-                    card.tint(grid, (x, end, top + y), theme);
-                }
-                self.drawn[y] = Some(Pos { offset: i, ..pos });
-                y += 1;
-            }
-            last = pos;
-            if !self.next_row(&mut pos, &layout) {
-                break;
-            }
-        }
+        let (y, last) = self.draw_rows(grid, &mut c, area, rows.clone(), pos, &layout, theme);
         self.box_drawn = None;
         // Rows drawn above the copied ones: their separators come first.
         if rows.start == 0 {
@@ -2110,6 +2106,9 @@ impl Doc {
             .map_or(last, |p| Pos { offset: 0, ..p });
         self.draw_selection(grid, area, &layout);
         self.draw_comment_selection(grid, area);
+        if self.boxes.writing.is_some() {
+            self.draw_anchored(grid, area, theme, &layout, rows.clone());
+        }
         self.draw_search(grid, area, theme, &layout, rows);
         self.draw_markers(grid, area, theme, &layout);
         self.document.touch(file, frame);
@@ -2135,6 +2134,54 @@ impl Doc {
             file..file + 1,
             scrolled.map(|by| (top..top + self.height, by)),
         )
+    }
+
+    /// Lays out and paints screen rows `rows` from `pos` down, as far as
+    /// the file goes, noting each row in `drawn` and each separator at its
+    /// top. Returns the row after the last painted and the position of the
+    /// last laid out.
+    // Out of line, so the code layout of every scroll's row loop doesn't
+    // shift as `draw` grows.
+    #[inline(never)]
+    #[expect(clippy::too_many_arguments, reason = "draw's state, passed through")]
+    fn draw_rows(
+        &mut self,
+        grid: &mut Grid,
+        c: &mut Canvas,
+        (x, end, top): (usize, usize, usize),
+        rows: Range<usize>,
+        mut pos: Pos,
+        layout: &Layout,
+        theme: &Theme,
+    ) -> (usize, Pos) {
+        let mut y = rows.start;
+        let mut last = pos;
+        while y < rows.end {
+            c.clear();
+            let drawn = self.render(pos, layout, c);
+            if drawn.separator && pos.offset == 0 {
+                self.separators.push((y, pos));
+            }
+            for (i, row) in c.rows().enumerate().skip(pos.offset) {
+                if y == rows.end {
+                    break;
+                }
+                let after = paint(grid, x, top + y, end, row, theme, Attributes::NONE);
+                if let Some(fill) = c.fill(i) {
+                    grid.fill(after, top + y, end, theme.ink_style(fill));
+                }
+                if let Some(card) = &drawn.card {
+                    card.tint(grid, (x, end, top + y), theme);
+                }
+                self.drawn[y] = Some(Pos { offset: i, ..pos });
+                y += 1;
+            }
+            last = pos;
+            if !self.next_row(&mut pos, layout) {
+                break;
+            }
+        }
+        (y, last)
     }
 
     /// Draws the first separator on screen again, highlighted as what `x`
@@ -2255,6 +2302,9 @@ impl Doc {
     /// Paints the search's matches on screen rows `rows`, the current one
     /// in its own color. Only those rows are looked up, however many
     /// matches the file has. `layout` is the drawn file's.
+    // Out of line, so the code layout of the per-row match loop doesn't
+    // shift as `draw` grows.
+    #[inline(never)]
     fn draw_search(
         &mut self,
         grid: &mut Grid,
@@ -2267,6 +2317,7 @@ impl Doc {
             return;
         };
         let mut mapped = std::mem::take(&mut self.mapped);
+        let mut spans = std::mem::take(&mut self.search_spans);
         let mut previous = None;
         let blocks = !marks.matches.blocks.is_empty()
             && marks.blocks_version == self.document.blocks_version(marks.file);
@@ -2293,12 +2344,25 @@ impl Doc {
                 }
                 continue;
             }
-            let here: Vec<usize> = [Side::Old, Side::New]
-                .into_iter()
-                .filter_map(|side| Some((side, lines[side.index()]?)))
-                .flat_map(|(side, line)| marks.matches.on(side, line))
-                .collect();
-            if here.is_empty() {
+            let (matches, current) = (&marks.matches, marks.current);
+            let on = move |side: Side| {
+                (lines[side.index()].into_iter())
+                    .flat_map(move |line| matches.on(side, line))
+                    .map(move |i| {
+                        let found = matches.list[i];
+                        let role = if current == Some(matches.of_line(i)) {
+                            Role::SearchCurrent
+                        } else {
+                            Role::SearchMatch
+                        };
+                        (found.start, found.end, theme.style(role))
+                    })
+            };
+            spans.clear();
+            spans.extend(on(Side::Old));
+            let on_old = spans.len();
+            spans.extend(on(Side::New));
+            if spans.is_empty() {
                 continue;
             }
             if previous != Some(logical) {
@@ -2312,25 +2376,11 @@ impl Doc {
             let first = map.glyphs.partition_point(|g| g.row < pos.offset);
             let glyphs = &map.glyphs[first..];
             let glyphs = &glyphs[..glyphs.partition_point(|g| g.row == pos.offset)];
-            for i in here {
-                let found = marks.matches.list[i];
-                let role = if marks.current == Some(marks.matches.of_line(i)) {
-                    Role::SearchCurrent
-                } else {
-                    Role::SearchMatch
-                };
-                let bytes = found.start as usize..found.end as usize;
-                let side = split.then(|| found.side.index());
-                restyle_match(
-                    grid,
-                    glyphs,
-                    (side, bytes),
-                    (x, end, top + y),
-                    theme.style(role),
-                );
-            }
+            let (on_old, on_new) = spans.split_at(on_old);
+            restyle_matches(grid, glyphs, [on_old, on_new], split, (x, end, top + y));
         }
         self.mapped = mapped;
+        self.search_spans = spans;
         self.document.search = Some(marks);
     }
 
@@ -2383,10 +2433,15 @@ impl Doc {
         }
     }
 
-    /// Marks the rows of lines with comment threads in the gutter, in the
-    /// cell after the line numbers, its background kept. A unified row with
-    /// threads on both sides takes the most pressing look. `layout` is the
-    /// drawn file's.
+    /// Marks the lines of comment threads in the gutter, in the cell after
+    /// the line numbers, on their side of a split, in the color of the most
+    /// pressing thread on them, the background kept. A line alone takes its
+    /// look's glyph; lines together a rail, `┌` down through `│` to `└`,
+    /// unbroken by rows between them showing only the other side's lines.
+    /// Overlapping threads, and a unified row's two sides, share one rail.
+    /// When the theme doesn't tell the looks apart by color (`mono`, with
+    /// color off), the rail starts on the glyph instead, as its shape is
+    /// all that says the look. `layout` is the drawn file's.
     fn draw_markers(
         &mut self,
         grid: &mut Grid,
@@ -2399,62 +2454,272 @@ impl Doc {
             return;
         }
         let threads = Arc::clone(&self.boxes.threads);
+        let on_side = [Side::Old, Side::New].map(|side| {
+            (threads.iter()).any(|t| matches!(&t.at, At::Line { side: s, .. } if *s == side))
+        });
+        let color = |look| theme.style(comments::look_role(look)).fg;
+        let shapes = color(Look::Draft) == color(Look::Open)
+            || color(Look::Open) == color(Look::Resolved)
+            || color(Look::Draft) == color(Look::Resolved);
         let mut mapped = std::mem::take(&mut self.mapped);
         let mut previous = None;
+        // For the logical row being drawn: per side, its rail, and whether
+        // the row is split. `None` when nothing marks it.
+        let mut marks: Option<([Option<Rail>; 2], bool)> = None;
+        // Per side, for a run of rows with a line only on the other side,
+        // the lines of the side's line after them.
+        let mut after_run: [Option<Range<usize>>; 2] = [None, None];
         for y in 0..self.drawn.len() {
             let Some(pos) = self.drawn[y] else { continue };
             let logical = Pos { offset: 0, ..pos };
-            if pos.file != file || previous == Some(logical) {
+            if pos.file != file {
                 continue;
             }
-            previous = Some(logical);
-            let lines = self
-                .document
-                .row_lines(logical, arrange(layout, &self.boxes));
-            let looks = [Side::Old, Side::New].map(|side| {
-                let line = lines[side.index()]?;
-                let source = self.source_lines(file, side, line, line);
-                threads
-                    .iter()
-                    .filter(|t| matches!(&t.at, At::Line { side: s, lines } if *s == side && overlap(lines, &source)))
-                    .map(|t| t.look)
-                    .max()
-            });
-            if looks == [None, None] {
-                continue;
+            if previous != Some(logical) {
+                previous = Some(logical);
+                let shown = self
+                    .document
+                    .row_lines(logical, arrange(layout, &self.boxes));
+                let found = [Side::Old, Side::New].map(|side| {
+                    let i = side.index();
+                    if !on_side[i] {
+                        return None;
+                    }
+                    self.rail(&threads, (logical, side), shown, layout, &mut after_run[i])
+                });
+                marks = (found != [None, None]).then(|| {
+                    mapped.clear();
+                    self.render_code(logical, layout, &mut mapped);
+                    (found, self.split_row(logical, layout))
+                });
             }
-            mapped.clear();
-            self.render_code(logical, layout, &mut mapped);
-            let split = self.split_row(logical, layout);
+            let Some((found, split)) = marks else {
+                continue;
+            };
             let Some(map) = mapped.map() else { continue };
-            let mut put = |side: Option<usize>, look: Look| {
-                let Some(area) = map
-                    .areas
-                    .iter()
-                    .find(|a| a.row == pos.offset && side.is_none_or(|s| s == a.side))
+            let height = mapped.len();
+            let mut put = |side: Option<usize>, rail: Rail| {
+                let Some(area) =
+                    (map.areas.iter()).find(|a| a.row == 0 && side.is_none_or(|s| s == a.side))
                 else {
                     return;
                 };
+                let first = rail.starts && pos.offset == 0;
+                let mark = match (first, rail.ends && pos.offset + 1 >= height) {
+                    // A line alone keeps its glyph on its first row only.
+                    _ if rail.starts && rail.ends => match pos.offset {
+                        0 => comments::glyph(rail.look),
+                        _ => return,
+                    },
+                    (true, _) if shapes => comments::glyph(rail.look),
+                    (true, _) => "┌",
+                    (_, true) => "└",
+                    _ => "│",
+                };
                 let column = x + area.col.saturating_sub(layout.mark_width());
-                let mut style = theme.style(comments::look_role(look));
+                let mut style = theme.style(comments::look_role(rail.look));
                 style.bg = grid
                     .row(top + y)
                     .get(column)
                     .and_then(|cell| cell.style().bg)
                     .or(style.bg);
-                grid.put_str(column, top + y, end, comments::glyph(look), style);
+                grid.put_str(column, top + y, end, mark, style);
             };
             if split {
                 for side in [Side::Old, Side::New] {
-                    if let Some(look) = looks[side.index()] {
-                        put(Some(side.index()), look);
+                    if let Some(rail) = found[side.index()] {
+                        put(Some(side.index()), rail);
                     }
                 }
-            } else if let Some(look) = looks.into_iter().flatten().max() {
-                put(None, look);
+            } else if let Some(rail) = found.into_iter().flatten().reduce(|a, b| Rail {
+                look: a.look.max(b.look),
+                starts: a.starts && b.starts,
+                ends: a.ends && b.ends,
+            }) {
+                put(None, rail);
             }
         }
         self.mapped = mapped;
+    }
+
+    /// The rail of `threads` on `side` of the logical row at `pos`, whose
+    /// lines are `shown`: on its line, or between two of its lines when the
+    /// row shows only the other side's. `after_run` keeps, for a run of such
+    /// rows, the lines of `side`'s line after them, empty when there's none.
+    fn rail(
+        &mut self,
+        threads: &[Thread],
+        (pos, side): (Pos, Side),
+        shown: [Option<usize>; 2],
+        layout: &Layout,
+        after_run: &mut Option<Range<usize>>,
+    ) -> Option<Rail> {
+        let file = pos.file;
+        let lines_of = |t: &Thread| match &t.at {
+            At::Line { side: s, lines } if *s == side => Some(lines.clone()),
+            _ => None,
+        };
+        let Some(line) = shown[side.index()] else {
+            if shown[side.other().index()].is_none() {
+                *after_run = None;
+                return None;
+            }
+            let after = after_run
+                .get_or_insert_with(|| {
+                    (self.line_after_run(pos, side, layout))
+                        .map_or(0..0, |line| self.source_lines(file, side, line, line))
+                })
+                .clone();
+            let between = threads.iter().filter(|t| {
+                lines_of(t).is_some_and(|l| l.start < after.start && after.start < l.end)
+            });
+            return between.map(|t| t.look).max().map(|look| Rail {
+                look,
+                starts: false,
+                ends: false,
+            });
+        };
+        *after_run = None;
+        let source = self.source_lines(file, side, line, line);
+        let mut rail: Option<Rail> = None;
+        for t in threads {
+            let Some(lines) = lines_of(t).filter(|l| overlap(l, &source)) else {
+                continue;
+            };
+            let r = rail.get_or_insert(Rail {
+                look: t.look,
+                starts: true,
+                ends: true,
+            });
+            r.look = r.look.max(t.look);
+            r.starts &= lines.start >= source.start;
+            r.ends &= lines.end <= source.end;
+        }
+        rail
+    }
+
+    /// While the text box writes a new thread on lines, marks them: a rail
+    /// in the mark column, in the box's border color, `┌` on their first
+    /// screen row, `│` between and `└` on the last (`[` alone when they
+    /// take one row), over their gutter tinted as a selection without the
+    /// keys. Rows between them showing only the other side's lines are
+    /// marked too. The code keeps its colors. Only screen rows `rows`, those drawn this frame: rows
+    /// copied from the last have the marks already. `layout` is the drawn
+    /// file's.
+    // Cold and out of line, as it runs only while the box is open: its call
+    // in `Doc::draw` otherwise slows scrolling on the reference machine.
+    #[cold]
+    #[inline(never)]
+    fn draw_anchored(
+        &mut self,
+        grid: &mut Grid,
+        (x, end, top): (usize, usize, usize),
+        theme: &Theme,
+        layout: &Layout,
+        rows: Range<usize>,
+    ) {
+        let Some(Writing {
+            at: Writes::New { side, lines },
+            ..
+        }) = &self.boxes.writing
+        else {
+            return;
+        };
+        let (side, lines, file) = (*side, lines.clone(), self.boxes.file);
+        let mut mapped = std::mem::take(&mut self.mapped);
+        let mut previous = None;
+        // For the logical row being drawn, when its line is one of them:
+        // its gutter's columns, its screen rows, and whether it holds
+        // their first and their last line.
+        let mut marked: Option<(Range<usize>, usize, bool, bool)> = None;
+        // For a run of rows with a line only on the other side, the line
+        // of `side` after them: they're between its lines when it and the
+        // one before them both are.
+        let mut after_run: Option<Option<Range<usize>>> = None;
+        for y in rows {
+            let Some(pos) = self.drawn[y] else { continue };
+            let logical = Pos { offset: 0, ..pos };
+            if pos.file != file {
+                continue;
+            }
+            if previous != Some(logical) {
+                previous = Some(logical);
+                let shown = self
+                    .document
+                    .row_lines(logical, arrange(layout, &self.boxes));
+                let ends = match shown[side.index()] {
+                    Some(line) => {
+                        after_run = None;
+                        let source = self.source_lines(file, side, line, line);
+                        overlap(&lines, &source)
+                            .then_some((source.start <= lines.start, source.end >= lines.end))
+                    }
+                    None if shown[side.other().index()].is_some() => after_run
+                        .get_or_insert_with(|| {
+                            let line = self.line_after_run(logical, side, layout)?;
+                            Some(self.source_lines(file, side, line, line))
+                        })
+                        .as_ref()
+                        .filter(|after| lines.start < after.start && after.start < lines.end)
+                        .map(|_| (false, false)),
+                    None => {
+                        after_run = None;
+                        None
+                    }
+                };
+                marked = ends.and_then(|(first, last)| {
+                    let split = self.split_row(logical, layout);
+                    mapped.clear();
+                    self.render_code(logical, layout, &mut mapped);
+                    let area = (mapped.map())?
+                        .areas
+                        .iter()
+                        .find(|a| a.row == 0 && (!split || a.side == side.index()))?;
+                    let start = match (split, side) {
+                        (true, Side::New) => x + (end - x).saturating_sub(1) / 2 + 1,
+                        _ => x,
+                    };
+                    Some((start..x + area.col, mapped.len(), first, last))
+                });
+            }
+            let Some((gutter, height, first, last)) = &marked else {
+                continue;
+            };
+            grid.map_styles(gutter.start, top + y, gutter.end, |s| {
+                theme.selected(s, false)
+            });
+            let rail = match (
+                *first && pos.offset == 0,
+                *last && pos.offset + 1 >= *height,
+            ) {
+                (true, true) => "[",
+                (true, false) => "┌",
+                (false, true) => "└",
+                (false, false) => "│",
+            };
+            let column = gutter.end.saturating_sub(layout.mark_width());
+            // The new thread's box border: a draft's.
+            let mut style = theme.style(Role::Warn);
+            style.bg = (grid.row(top + y).get(column))
+                .and_then(|cell| cell.style().bg)
+                .or(style.bg);
+            grid.put_str(column, top + y, end, rail, style);
+        }
+        self.mapped = mapped;
+    }
+
+    /// The line of `side` on the first logical row after `pos` with one,
+    /// when every row between shows a line of the other side only.
+    fn line_after_run(&mut self, mut pos: Pos, side: Side, layout: &Layout) -> Option<usize> {
+        while self.next_row(&mut pos, layout) {
+            let shown = self.document.row_lines(pos, arrange(layout, &self.boxes));
+            match (shown[side.index()], shown[side.other().index()]) {
+                (Some(line), _) => return Some(line),
+                (None, Some(_)) => {}
+                (None, None) => return None,
+            }
+        }
+        None
     }
 
     /// The lines of `file`'s line diff that lines `lo..=hi` of `side` show:
@@ -3088,12 +3353,69 @@ impl Doc {
     }
 }
 
+/// Restyles the cells of `glyphs`, a canvas row's, that show a byte in
+/// one of `matches`, each side's on that side's line as start, end and
+/// style, in screen row `y` of a pane from `x` to `end`. Each side's
+/// matches must be ascending and not overlapping, as a search finds them.
+/// In a split row a glyph shows only its own side's matches; otherwise
+/// either side's, the new side's where both cover it.
+// Out of line: inlined into the frame's drawing, this loop over every glyph
+// of the row competes with the caller for registers and runs longer per
+// glyph.
+#[inline(never)]
+fn restyle_matches(
+    grid: &mut Grid,
+    glyphs: &[Mapped],
+    matches: [&[(u32, u32, Style)]; 2],
+    split: bool,
+    (x, end, y): (usize, usize, usize),
+) {
+    debug_assert!(
+        (matches.iter()).all(|m| m.windows(2).all(|w| w[0].1 <= w[1].0)),
+        "a side's matches on a line overlap or are out of order"
+    );
+    if matches[0].len() + matches[1].len() <= FEW_MATCHES {
+        // Old side's first, so the new side's win where both cover a glyph.
+        for (side, matches) in matches.into_iter().enumerate() {
+            for &(start, end_byte, style) in matches {
+                let bytes = start as usize..end_byte as usize;
+                let side = split.then_some(side);
+                restyle_match(grid, glyphs, (side, bytes), (x, end, y), style);
+            }
+        }
+        return;
+    }
+    // The match whose bytes hold `byte`: the last starting at or before it.
+    let covering = |matches: &[(u32, u32, Style)], byte: usize| {
+        let after = matches.partition_point(|m| m.0 as usize <= byte);
+        let &(_, end, style) = matches.get(after.checked_sub(1)?)?;
+        (byte < end as usize).then_some(style)
+    };
+    for g in glyphs {
+        let byte = g.bytes.start;
+        let style = if split {
+            matches.get(g.side).and_then(|m| covering(m, byte))
+        } else {
+            covering(matches[1], byte).or_else(|| covering(matches[0], byte))
+        };
+        if let Some(style) = style {
+            let left = (x + g.col).min(end);
+            grid.restyle(left, y, (left + g.width).min(end), style);
+        }
+    }
+}
+
+/// The most matches on a row that [`restyle_matches`] restyles one at a
+/// time.
+// Up to this, a pass per match beats one pass branching on a binary search per glyph.
+const FEW_MATCHES: usize = 4;
+
 /// Restyles the cells of `glyphs`, a canvas row's, showing `bytes` of
 /// `side`, or of either side with `None`, in screen row `y` of a pane from
 /// `x` to `end`.
-// Out of line: inlined into the frame's drawing, this loop over every glyph
-// of the row, once per match on it, competes with the caller for registers
-// and runs longer per glyph.
+// Out of line: inlined, this loop over every glyph of the row, once per
+// match on it, competes with the caller for registers and runs longer per
+// glyph.
 #[inline(never)]
 fn restyle_match(
     grid: &mut Grid,
@@ -3136,6 +3458,15 @@ fn rule_row(
         c.push(Role::Dim, "│");
     }
     c.end_line();
+}
+
+/// How comment threads mark a row's side: the most pressing look on it, and
+/// whether their rail starts and ends there.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Rail {
+    look: Look,
+    starts: bool,
+    ends: bool,
 }
 
 fn overlap(a: &Range<usize>, b: &Range<usize>) -> bool {

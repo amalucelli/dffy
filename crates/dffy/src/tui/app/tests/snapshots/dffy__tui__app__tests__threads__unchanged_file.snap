@@ -1,0 +1,21 @@
+---
+source: crates/dffy/src/tui/app/tests/threads.rs
+assertion_line: 2306
+expression: screen(&mut app)
+---
+┌ Files · 2 +1 -1 ────────────────────┬─ comments only · no changes · kept.rs ─────────────────────────────────────────────────────────────┐
+│ M changed.txt                 +1 -1 │ 1  │ line 1                                                                                        ┃
+│ ▼ comments only · no changes        │ 2● │ line 2                                                                                        ┃
+│   · kept.rs                 1       │    │  ┏ ▾ you · 2h ago ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓ ┃
+│                                     │    │  ┃ Two?                                                                                     ┃ ┃
+│                                     │    │  ┃ suggested change:                                                                        ┃ ┃
+│                                     │    │  ┃ - line 2                                                                                 ┃ ┃
+│                                     │    │  ┃ + line TWO                                                                               ┃ ┃
+│                                     │    │  ┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛ ┃
+│                                     │ 3  │ line 3                                                                                        ┃
+│                                     │ 4  │ line 4                                                                                        ┃
+│                                     │                                                                                                    ┃
+│                                     │                                                                                                    ┃
+│                                     │                                                                                                    ┃
+│                                     │                                                                                                    ┃
+└«─  working tree  2/2 ───────────────┴─ r reply · a ask · s apply · x resolve · f fix · e edit · d delete  2 threads ──── space commands ─┘

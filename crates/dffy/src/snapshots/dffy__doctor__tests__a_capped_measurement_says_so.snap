@@ -2,6 +2,6 @@
 source: crates/dffy/src/doctor.rs
 expression: "check(&text(&facts).0, \"speed\").join(\"\\n\")"
 ---
-<dim>·</> speed       repo 3ms · first change 9ms · all 50,000+ changes 41ms · untracked not timed · largest diff not timed
-  <warn>stopped counting at 50,000 changes; the viewer lists them all</>
-  <warn>the rest wasn't timed, to keep doctor quick on a large repository</>
+  <dim>·</> speed        repo 3ms · first change 9ms · all 50,000+ changes 41ms · untracked not timed · largest diff not timed
+      <warn>stopped counting at 50,000 changes; the viewer lists them all</>
+      <warn>the rest wasn't timed, to keep doctor quick on a large repository</>

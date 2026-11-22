@@ -12,7 +12,10 @@ use std::path::Path;
 use std::process::Command;
 
 use dffy_core::diff::Options;
-use dffy_core::git::{DiffSpec, Error, FileChange, Mode, ObjectId, Repo, Revisions, Side, Status};
+use dffy_core::git::{
+    ChangeSet, DiffSpec, Error, FileChange, Mode, ObjectId, Repo, Revisions, Side, Status,
+    WhichCheckpoint, worktree_file,
+};
 use dffy_core::view::Staging;
 
 fn git(dir: &Path, args: &[&str]) -> String {
@@ -1091,6 +1094,45 @@ fn file_diff_loads_both_sides() {
     assert!(fd.binary && fd.hunks.is_empty());
 }
 
+/// A working-tree file compared with itself is read once and has no
+/// hunks. It's found only along a path git could track there.
+#[test]
+fn an_unchanged_file_is_read_once_on_a_path_git_could_track() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let dir = init();
+    let d = dir.path();
+    write(d, "src/a.rs", "fn a() {}\n");
+    write(d, "run.sh", "#!/bin/sh\n");
+    std::fs::set_permissions(d.join("run.sh"), std::fs::Permissions::from_mode(0o755))
+        .expect("chmod");
+    std::os::unix::fs::symlink(d.join("src"), d.join("link")).expect("symlink");
+    let repo = Repo::discover(d).expect("repo");
+    let root = repo.workdir().expect("a working tree");
+    assert_eq!(worktree_file(root, b"src/a.rs"), Some(Mode::File));
+    assert_eq!(worktree_file(root, b"run.sh"), Some(Mode::Executable));
+    for refused in [
+        "",
+        "src",
+        "gone.rs",
+        "/etc/hosts",
+        "../a.rs",
+        "src/../src/a.rs",
+        "./src/a.rs",
+        "src//a.rs",
+        ".git/config",
+        ".GIT/config",
+        "link/a.rs",
+    ] {
+        assert_eq!(worktree_file(root, refused.as_bytes()), None, "{refused}");
+    }
+
+    let change = FileChange::unchanged("src/a.rs".into(), Mode::File);
+    let fd = repo.file_diff(change, &Options::default()).expect("diff");
+    assert_eq!(fd.hunks.len(), 0);
+    assert_eq!(fd.new.bytes(), b"fn a() {}\n");
+    assert_eq!(fd.old, fd.new);
+}
+
 #[test]
 fn git_dir_is_the_worktrees_own() {
     let dir = init();
@@ -1113,4 +1155,224 @@ fn git_dir_is_the_worktrees_own() {
         Repo::discover(dir.path()).expect("repo").git_dir(),
         Repo::discover(&linked).expect("repo").git_dir()
     );
+}
+
+fn since_checkpoint(repo: &Repo) -> Vec<(String, String)> {
+    let revisions = Revisions {
+        since_checkpoint: Some(WhichCheckpoint::Latest),
+        ..Revisions::default()
+    };
+    let spec = repo.resolve_revisions(&revisions).expect("resolves");
+    assert!(matches!(spec, DiffSpec::Checkpoint { .. }), "{spec:?}");
+    ours(&collect(repo, &spec, &[]))
+}
+
+/// What a checkpoint must leave as it found: the index's bytes, `HEAD`,
+/// and what `git status` says of the working tree.
+fn untouched(dir: &Path) -> (Vec<u8>, String, String) {
+    (
+        std::fs::read(dir.join(".git/index")).expect("index"),
+        git(dir, &["rev-parse", "HEAD"]),
+        git(
+            dir,
+            &["status", "--porcelain=v1", "-z", "-uall", "--ignored"],
+        ),
+    )
+}
+
+/// A checkpoint holds the files plain `dffy` lists, staged or not and
+/// untracked, and none git ignores; right after one, nothing has changed
+/// since it, and taking it wrote nothing but objects and its ref.
+#[test]
+fn a_checkpoint_holds_the_working_tree_as_plain_dffy_lists_it() {
+    let dir = messy_repo();
+    let d = dir.path();
+    let repo = Repo::discover(d).expect("repo");
+    let before = untouched(d);
+    let checkpoint = repo.take_checkpoint().expect("checkpoint");
+    assert_eq!(untouched(d), before);
+    assert_eq!(checkpoint.number, 1);
+
+    let tree = checkpoint.tree.to_string();
+    let files = git(d, &["ls-tree", "-r", "--name-only", &tree]);
+    let files: BTreeSet<&str> = files.lines().collect();
+    for kept in [
+        "modified.txt",
+        "staged.txt",
+        "sub/added.c",
+        "sub/gone.c",
+        "sub/untracked.c",
+        "new-untracked.txt",
+        "newdir/b/c.txt",
+        "intent.txt",
+        "to-link.txt",
+    ] {
+        assert!(files.contains(kept), "{kept} in {files:?}");
+    }
+    for left in ["deleted.txt", "debug.log", "build/out.o", "excluded.tmp"] {
+        assert!(!files.contains(left), "{left} in {files:?}");
+    }
+    let blob = |path: &str| git(d, &["show", &format!("{tree}:{path}")]);
+    assert_eq!(blob("modified.txt"), "new content\n");
+    assert_eq!(blob("staged-reverted.txt"), "v1\n");
+    let modes = git(d, &["ls-tree", &tree, "exec.sh", "to-link.txt"]);
+    assert!(
+        modes.contains("100755 blob") && modes.contains("120000 blob"),
+        "{modes}"
+    );
+
+    assert_eq!(since_checkpoint(&repo), []);
+}
+
+/// Since a checkpoint: only what changed after it, a file untracked then
+/// and edited since read as modified.
+#[test]
+fn since_a_checkpoint_lists_only_later_edits() {
+    let dir = messy_repo();
+    let d = dir.path();
+    let repo = Repo::discover(d).expect("repo");
+    repo.take_checkpoint().expect("checkpoint");
+    write(d, "new-untracked.txt", "edited\n");
+    write(d, "staged.txt", "v3\n");
+    git(d, &["add", "staged.txt"]);
+    std::fs::remove_file(d.join("keep.txt")).expect("rm");
+    write(d, "later.txt", "new\n");
+    write(d, "later.log", "ignored\n");
+    let pair = |s: &str, p: &str| (s.to_owned(), p.to_owned());
+    assert_eq!(
+        since_checkpoint(&repo),
+        [
+            pair("D", "keep.txt"),
+            pair("M", "new-untracked.txt"),
+            pair("M", "staged.txt"),
+            pair("??", "later.txt"),
+        ]
+    );
+}
+
+/// Watch mode's refresh of one path since a checkpoint pairs a file
+/// untracked then the same way a full listing does: edited, it's
+/// modified; written back as it was, it's gone.
+#[test]
+fn since_a_checkpoint_a_refresh_pairs_untracked_files_too() {
+    let dir = messy_repo();
+    let d = dir.path();
+    let repo = Repo::discover(d).expect("repo");
+    repo.take_checkpoint().expect("checkpoint");
+    let revisions = Revisions {
+        since_checkpoint: Some(WhichCheckpoint::Latest),
+        ..Revisions::default()
+    };
+    let spec = repo.resolve_revisions(&revisions).expect("resolves");
+    let mut set = ChangeSet::new(repo, spec, revisions, &[], false);
+    set.enumerate(|_| ControlFlow::Continue(()))
+        .expect("enumerates");
+    assert_eq!(set.files(), []);
+    let refresh = |set: &mut ChangeSet| {
+        let update = set
+            .refresh(&["new-untracked.txt".into()])
+            .expect("refreshes");
+        ours(&update.map(|u| u.files).unwrap_or_default())
+    };
+    write(d, "new-untracked.txt", "edited\n");
+    assert_eq!(
+        refresh(&mut set),
+        [("M".to_owned(), "new-untracked.txt".to_owned())]
+    );
+    write(d, "new-untracked.txt", "hi\n");
+    assert_eq!(refresh(&mut set), []);
+}
+
+/// A working-tree file too large to diff isn't copied into a checkpoint:
+/// a tracked one keeps HEAD's version there, an untracked one is left out,
+/// and both list as changed since it.
+#[test]
+fn a_checkpoint_leaves_out_files_too_large_to_diff() {
+    let dir = init();
+    let d = dir.path();
+    write(d, "big.bin", "small at first\n");
+    write(d, "a.txt", "a\n");
+    git(d, &["add", "-A"]);
+    git(d, &["commit", "-q", "-m", "init"]);
+    let grow = |path: &str| {
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(d.join(path))
+            .expect("open");
+        // Sparse: as large as it gets, without writing it.
+        file.set_len(dffy_core::git::MAX_DIFF_BYTES).expect("grow");
+    };
+    grow("big.bin");
+    grow("new-big.bin");
+    write(d, "a.txt", "b\n");
+    let repo = Repo::discover(d).expect("repo");
+    let tree = repo.take_checkpoint().expect("checkpoint").tree.to_string();
+    let files = git(d, &["ls-tree", "-r", "--name-only", &tree]);
+    assert_eq!(files.lines().collect::<Vec<_>>(), ["a.txt", "big.bin"]);
+    assert_eq!(
+        git(d, &["show", &format!("{tree}:big.bin")]),
+        "small at first\n"
+    );
+    assert_eq!(git(d, &["show", &format!("{tree}:a.txt")]), "b\n");
+    let pair = |s: &str, p: &str| (s.to_owned(), p.to_owned());
+    assert_eq!(
+        since_checkpoint(&repo),
+        [pair("M", "big.bin"), pair("??", "new-big.bin")]
+    );
+}
+
+/// Each worktree keeps its own checkpoints, numbered on from its last,
+/// the last five kept; asking for one that's gone, or before any, fails.
+#[test]
+fn checkpoints_keep_the_last_five_per_worktree() {
+    let dir = init();
+    let d = dir.path();
+    write(d, "a.txt", "a\n");
+    git(d, &["add", "-A"]);
+    git(d, &["commit", "-q", "-m", "init"]);
+    let repo = Repo::discover(d).expect("repo");
+    let since = |which| Revisions {
+        since_checkpoint: Some(which),
+        ..Revisions::default()
+    };
+    assert!(matches!(
+        repo.resolve_revisions(&since(WhichCheckpoint::Latest)),
+        Err(Error::NoCheckpoint(None))
+    ));
+    for n in 1..=7 {
+        write(d, "a.txt", &format!("{n}\n"));
+        assert_eq!(repo.take_checkpoint().expect("checkpoint").number, n);
+    }
+    let numbers: Vec<u64> = (repo.checkpoints().expect("listed").iter())
+        .map(|c| c.number)
+        .collect();
+    assert_eq!(numbers, [3, 4, 5, 6, 7]);
+    assert!(matches!(
+        repo.resolve_revisions(&since(WhichCheckpoint::Number(2))),
+        Err(Error::NoCheckpoint(Some(2)))
+    ));
+    write(d, "a.txt", "8\n");
+    assert_eq!(
+        since_checkpoint(&repo),
+        [("M".to_owned(), "a.txt".to_owned())]
+    );
+    let with_rev = Revisions {
+        revs: vec!["HEAD".to_owned()],
+        ..since(WhichCheckpoint::Latest)
+    };
+    assert!(matches!(
+        repo.resolve_revisions(&with_rev),
+        Err(Error::UnsupportedRevision { .. })
+    ));
+
+    let linked = d.join("linked");
+    git(
+        d,
+        &["worktree", "add", "-q", linked.to_str().expect("utf-8")],
+    );
+    let other = Repo::discover(&linked).expect("repo");
+    assert_eq!(other.checkpoints().expect("listed"), []);
+    assert_eq!(other.take_checkpoint().expect("checkpoint").number, 1);
+    assert_eq!(repo.checkpoints().expect("listed").len(), 5);
 }

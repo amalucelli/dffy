@@ -65,7 +65,9 @@ pub(crate) fn header(
     let index = || r#"{"kind":"index"}"#.to_owned();
     let worktree = || r#"{"kind":"worktree"}"#.to_owned();
     let (mut old, mut new, untracked) = match plan.spec {
-        DiffSpec::Uncommitted { head } => (tree(head), worktree(), true),
+        DiffSpec::Uncommitted { head } | DiffSpec::Checkpoint { tree: head } => {
+            (tree(head), worktree(), true)
+        }
         DiffSpec::IndexToWorktree { untracked } => (index(), worktree(), untracked),
         DiffSpec::TreeToIndex { tree: id } => (tree(id), index(), false),
         DiffSpec::TreeToWorktree { tree: id } => (tree(id), worktree(), false),

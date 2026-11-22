@@ -21,6 +21,7 @@ fn session(file: &Path, head: &str) -> Session {
         state: None,
         labels: Vec::new(),
         comments: file.to_owned(),
+        checkout: None,
     }
 }
 

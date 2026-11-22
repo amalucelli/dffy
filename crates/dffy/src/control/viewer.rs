@@ -61,6 +61,11 @@ pub(crate) enum Command {
     Focus {
         id: String,
     },
+    /// The suggestion of the comment `id`, or of a thread's last comment
+    /// with one when `id` names a comment without one.
+    ApplySuggestion {
+        id: String,
+    },
     Comment {
         path: String,
         line: usize,
@@ -159,6 +164,24 @@ pub(crate) fn focused(thread: String, path: String, focused: bool) -> Value {
     ])
 }
 
+/// What `comments/applySuggestion` answers: the suggestion's comment, its
+/// thread, and the lines of `path` it replaced, 0-based, as they were.
+pub(crate) fn applied(
+    (thread, comment): (String, String),
+    path: String,
+    replaced: std::ops::Range<usize>,
+    lines: usize,
+) -> Value {
+    object(vec![
+        ("thread", text(thread)),
+        ("comment", text(comment)),
+        ("path", text(path)),
+        ("start", number(replaced.start as u64 + 1)),
+        ("end", number(replaced.end as u64)),
+        ("lines", number(lines as u64)),
+    ])
+}
+
 /// A 0-based line, 1-based on the wire.
 fn one_based(line: Option<usize>) -> Value {
     line.map_or(Value::Null, |l| number(l as u64 + 1))
@@ -198,6 +221,7 @@ impl Command {
                 side: side()?,
             },
             "view/focusThread" => Self::Focus { id: string("id")? },
+            "comments/applySuggestion" => Self::ApplySuggestion { id: string("id")? },
             "comments/add" => Self::Comment {
                 path: string("path")?,
                 line: line()?.ok_or_else(|| Fault::invalid("line is needed"))?,
@@ -232,6 +256,18 @@ impl Reply {
     /// waiting: it's not to be done.
     pub(crate) fn cancelled(&self) -> bool {
         self.cancelled.load(Ordering::Relaxed)
+    }
+
+    /// A reply whose answer comes out of the receiver, as its line.
+    #[cfg(test)]
+    pub(crate) fn channel() -> (Self, mpsc::Receiver<String>) {
+        let (tx, rx) = mpsc::channel();
+        let reply = Self {
+            id: Value::Number(1.0),
+            tx,
+            cancelled: Arc::default(),
+        };
+        (reply, rx)
     }
 }
 

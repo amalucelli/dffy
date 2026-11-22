@@ -1,0 +1,23 @@
+---
+source: crates/dffy/src/tui/help.rs
+expression: text
+---
+
+       ┌─ keybinds ──────────────────────────────────────────────────────────── esc close ─┐
+       │  Move  Files  View  Git  Copy  Review  General                                    │
+       │ Layout                                    Diff                                    │
+       │ x                 more context            d                 toggle syntax diff    │
+       │ X                 toggle whole file       r                 toggle rendered view  │
+       │ s                 cycle layout                                                    │
+       │ W                 toggle wrap                                                     │
+       │ z                 fold thread                                                     │
+       │ Z                 fold all threads                                                │
+       │                                                                                   │
+       │                                                                                   │
+       │                                                                                   │
+       │                                                                                   │
+       │                                                                                   │
+       │                                                                                   │
+       │ more settings: space · all keys: docs/keys.md                                     │
+       │ tab section · / search · esc close                                                │
+       └───────────────────────────────────────────────────────────────────────────────────┘

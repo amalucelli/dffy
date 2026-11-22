@@ -27,6 +27,7 @@ use dffy_core::annotation::{Annotated, Annotation, AnnotationSet, Placement};
 use dffy_core::bstr::BString;
 use dffy_core::document::{self, File, Side};
 use dffy_core::git::{FileDiff, Status};
+use dffy_core::highlight::Scopes;
 use dffy_core::view::{Spans, Syntax};
 
 use self::reload::{Stamp, Stat};
@@ -106,10 +107,49 @@ pub(crate) enum Standing {
     /// Yours, in a review session, not posted yet: what `P` posts.
     Draft,
     /// Someone else's, an agent's, in a review session, without a `ref`:
-    /// `P` leaves it, since it would post under your name.
+    /// `P` leaves it, since it would post under your name. Or yours, kept
+    /// local, as a mention that asked an agent.
     Unposted,
     /// Outside a review session.
     Kept,
+}
+
+impl Standing {
+    /// Where it lives, in a review session: `posted` on the host, `draft`
+    /// until `P` posts it, `local` when it stays here. `None` outside one,
+    /// where nothing is posted.
+    pub(crate) fn name(self) -> Option<&'static str> {
+        match self {
+            Self::Posted => Some("posted"),
+            Self::Draft => Some("draft"),
+            Self::Unposted => Some("local"),
+            Self::Kept => None,
+        }
+    }
+
+    /// The word a comment's heading says of where it lives, when that's
+    /// news: a posted comment is the usual case, so only the others say.
+    /// One kept here is `private`, as nobody else sees it until it's made
+    /// a draft.
+    pub(crate) fn word(self) -> Option<&'static str> {
+        match self {
+            Self::Draft => Some("draft"),
+            Self::Unposted => Some("private"),
+            Self::Posted | Self::Kept => None,
+        }
+    }
+}
+
+/// Where `c` stands, `root` its thread's first comment when it's a reply,
+/// in a review session's file or not: a reply is a draft only as
+/// [`crate::review::Review::drafts`] has it.
+pub(crate) fn standing(c: &Comment, root: Option<&Comment>, session: bool) -> Standing {
+    match (&c.reference, session) {
+        (Some(_), _) => Standing::Posted,
+        (None, false) => Standing::Kept,
+        (None, true) if c.draft() && root.is_none_or(Comment::takes_replies) => Standing::Draft,
+        (None, true) => Standing::Unposted,
+    }
 }
 
 /// Where a thread shows on its file's diff.
@@ -142,12 +182,18 @@ pub(crate) struct ThreadComment {
     /// [`summary`] of the text.
     pub summary: String,
     pub suggestion: Option<String>,
+    /// Words after its author, as given: how an agent's reply was made,
+    /// `read-only sandbox`. A general comment's are its thread's, in
+    /// [`At::Conversation`].
+    pub label: Option<String>,
     pub standing: Standing,
     /// On the host, but only for you: in a review not submitted yet.
     pub pending: bool,
     /// For a draft, what posting it does, when that's news: refused
     /// before, waiting for its lines, or going on the whole file.
     pub posting: Option<Posting>,
+    /// Its suggestion is in the working tree already.
+    pub applied: bool,
 }
 
 /// What posting a draft does, in the words its heading says.
@@ -192,12 +238,25 @@ pub(crate) struct Thread {
 }
 
 impl Thread {
-    /// Whether it holds someone else's comment not posted, as an agent's,
-    /// that `a` makes yours.
+    /// Whether it holds a comment that posting leaves, as an agent's, that
+    /// `A` makes yours.
     pub(crate) fn unposted(&self) -> bool {
         self.comments
             .iter()
             .any(|n| n.standing == Standing::Unposted)
+    }
+
+    /// Its last comment with a suggestion, the one applying picks by
+    /// default.
+    pub(crate) fn suggestion(&self) -> Option<&ThreadComment> {
+        (self.comments.iter().rev()).find(|n| n.suggestion.is_some())
+    }
+
+    /// Whether applying takes back its last suggestion, applied already,
+    /// its lines where the thread is; lost, as after a discard, it applies
+    /// again.
+    pub(crate) fn reverts(&self) -> bool {
+        self.at != At::Lost && self.suggestion().is_some_and(|n| n.applied)
     }
 }
 
@@ -271,7 +330,8 @@ pub(super) struct Placed {
 
 /// The comments file shown and, on a review session's, the drafts of the
 /// local review's file (your comments without a ref, and their threads).
-/// A local draft shows only where it places on this diff, marked `local`;
+/// A local draft shows only where it places on this diff, marked `branch
+/// draft`;
 /// edits, replies and deletes in its thread go to the local file, and
 /// posting moves it to the session's first (see [`Comments::move_local`]).
 ///
@@ -319,6 +379,9 @@ pub(crate) struct Comments {
     highlight: bool,
     /// Where each commented path is in the list, when it is.
     pub(super) located: HashMap<BString, usize>,
+    /// Commented paths not in the list that the viewer found missing from
+    /// the working tree.
+    pub(super) gone: HashSet<BString>,
     /// What stat said of `path` and `local` just before the last read.
     stats: Vec<Option<Stat>>,
     /// The stamps of the bytes of `path` and `local` the last read parsed.
@@ -384,6 +447,7 @@ impl Comments {
             placed: HashMap::new(),
             highlight: false,
             located: HashMap::new(),
+            gone: HashSet::new(),
             stats: Vec::new(),
             stamps: Vec::new(),
             generation: 0,
@@ -444,13 +508,11 @@ impl Comments {
         self.highlight
     }
 
+    /// Where `c` stands, a reply a draft only as [`crate::review::Review::drafts`]
+    /// has it.
     fn standing(&self, c: &Comment) -> Standing {
-        match (&c.reference, self.session, c.author.is_empty()) {
-            (Some(_), ..) => Standing::Posted,
-            (None, false, _) => Standing::Kept,
-            (None, true, true) => Standing::Draft,
-            (None, true, false) => Standing::Unposted,
-        }
+        let root = c.in_reply_to.as_deref().and_then(|r| self.find(r));
+        standing(c, root, self.session)
     }
 
     /// New threads go to the local review's file rather than the
@@ -469,6 +531,38 @@ impl Comments {
     /// [`Comments::homes`]); empty for a general comment's.
     pub(crate) fn home_of(&self, root: &str) -> Option<&str> {
         self.find(root).map(|c| self.home(c))
+    }
+
+    /// The file the thread with root `root` is in, and whether that's a
+    /// review session's.
+    pub(crate) fn file_with(&self, root: &str) -> (&Path, bool) {
+        match &self.local {
+            Some(local) if self.from_local.contains(root) || self.others_local.contains(root) => {
+                (local, false)
+            }
+            _ => (&self.path, self.session),
+        }
+    }
+
+    /// The comments file, and whether it's a review session's.
+    pub(crate) fn file(&self) -> (&Path, bool) {
+        (&self.path, self.session)
+    }
+
+    /// The local review's file, when it's read beside [`Comments::file`].
+    pub(crate) fn local_file(&self) -> Option<&Path> {
+        self.local.as_deref()
+    }
+
+    /// How many open threads of yours are in view, by the file each is in:
+    /// [`Comments::file`], then [`Comments::local_file`]. `dffy comments
+    /// prompt --open` gives one file's.
+    pub(crate) fn open_threads_of_yours(&self) -> (usize, usize) {
+        let threads = self.review.open_threads_of_yours(review::Branches::All);
+        let local = (threads.iter())
+            .filter(|thread| self.from_local.contains(&thread[0].id))
+            .count();
+        (threads.len() - local, local)
     }
 
     /// Whether `root` starts a thread on another branch.
@@ -552,6 +646,19 @@ impl Comments {
 
     pub(crate) fn file_of(&self, path: &[u8]) -> Option<usize> {
         self.located.get(path).copied()
+    }
+
+    /// Notes whether `path`, a commented file not in the list, was found
+    /// missing from the working tree, for the panel to say.
+    pub(crate) fn set_gone(&mut self, path: &[u8], gone: bool) {
+        let changed = if gone {
+            self.gone.insert(path.into())
+        } else {
+            self.gone.remove(path)
+        };
+        if changed {
+            self.generation += 1;
+        }
     }
 
     /// The files in the list with comments, in list order; not those whose
@@ -776,9 +883,11 @@ impl Comments {
                     text: c.text.clone(),
                     summary: summary(&c.text),
                     suggestion: c.suggestion.clone(),
+                    label: c.label.clone().filter(|_| !c.path.is_empty()),
                     standing: self.standing(c),
                     pending: c.pending,
                     posting: self.posting(c),
+                    applied: c.applied.is_some(),
                 })
                 .collect(),
             lines: root
@@ -949,6 +1058,39 @@ impl Comments {
         self.index.get(id).map(|&i| &self.review.comments[i])
     }
 
+    /// What clearing the resolved threads shown removes: a thread with
+    /// nothing on the host goes whole; from one on the host, only its
+    /// comments not posted, as the host would bring the rest back on the
+    /// next update. General comments, threads on other branches and local
+    /// drafts out of view stay.
+    pub(crate) fn clear_resolved(&self) -> Cleared {
+        let mut cleared = Cleared::default();
+        let roots = (self.review.comments.iter())
+            .filter(|c| c.in_reply_to.is_none() && !c.path.is_empty() && c.resolved)
+            .filter(|c| !self.hides(c));
+        for root in roots {
+            let thread = self.thread(&root.id);
+            let gone = if thread.iter().all(|c| c.reference.is_none()) {
+                cleared.threads += 1;
+                vec![root]
+            } else {
+                cleared.kept += 1;
+                // Replies only: a root the host deleted under posted
+                // replies, without its ref, takes them with it.
+                let unposted: Vec<&Comment> = (thread.into_iter())
+                    .filter(|c| c.reference.is_none() && c.in_reply_to.is_some())
+                    .collect();
+                cleared.comments += unposted.len();
+                unposted
+            };
+            for c in gone {
+                let batch = usize::from(self.from_local.contains(&c.id));
+                cleared.ops[batch].push(review::Op::Rm(review::Target::Id(c.id.clone())));
+            }
+        }
+        cleared
+    }
+
     pub(crate) fn thread_root(&self, id: &str) -> Option<String> {
         self.find(id)
             .map(|c| c.in_reply_to.clone().unwrap_or_else(|| id.to_owned()))
@@ -964,6 +1106,20 @@ impl Comments {
             .chain(self.replies_of(first))
             .collect()
     }
+}
+
+/// What [`Comments::clear_resolved`] removes.
+#[derive(Debug, Default)]
+pub(crate) struct Cleared {
+    /// Threads that go whole.
+    pub threads: usize,
+    /// Comments not posted that go from threads on the host.
+    pub comments: usize,
+    /// Resolved threads on the host, which stay.
+    pub kept: usize,
+    /// The removals, by the file they're in: the comments file's, then the
+    /// local review's, each to apply as one write.
+    pub ops: [Vec<review::Op>; 2],
 }
 
 /// The source the comments' annotations name, in the core and in
@@ -991,6 +1147,15 @@ fn annotation(c: &Comment) -> Option<Annotation> {
 /// comments are anchored in.
 pub(crate) fn line_diff(file: &File) -> &Arc<FileDiff> {
     file.rendered().map_or_else(|| file.diff(), |r| r.source())
+}
+
+/// The definitions of each side of [`line_diff`] found already, for the
+/// scope line. A rendered view's are of what it draws, not of its source.
+pub(crate) fn line_scopes(file: &File) -> [Option<&Scopes>; 2] {
+    (file.rendered().is_none())
+        .then(|| file.syntax()?.get()?.scopes())
+        .flatten()
+        .unwrap_or_default()
 }
 
 #[cfg(test)]

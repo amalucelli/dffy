@@ -1,7 +1,10 @@
-//! Keys and mouse reports from raw terminal bytes. Only the encodings every
-//! terminal and multiplexer passes through: UTF-8, C0 controls, CSI and SS3
-//! keys with xterm modifiers, and SGR mouse reports. Nothing here waits for
-//! a terminal to answer a query, and no extended keyboard protocol is used.
+//! Keys and mouse reports from raw terminal bytes: UTF-8, C0 controls, CSI
+//! and SS3 keys with xterm modifiers, and SGR mouse reports, which every
+//! terminal and multiplexer passes through. The kitty keyboard protocol's
+//! disambiguate flag, which dffy asks for so shift+enter is a key of its
+//! own, adds its `CSI u` keys, read as their legacy forms; a terminal
+//! without it sends the legacy ones. Nothing here waits for a terminal to
+//! answer a query.
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Key {
@@ -30,6 +33,7 @@ pub(crate) struct Mods(u8);
 
 impl Mods {
     pub(crate) const NONE: Self = Self(0);
+    pub(crate) const SHIFT: Self = Self(1);
     pub(crate) const ALT: Self = Self(2);
     pub(crate) const CTRL: Self = Self(4);
 
@@ -246,7 +250,7 @@ fn parse(b: &[u8]) -> Parsed {
 
 fn control(b: u8) -> Option<(Key, Mods)> {
     Some(match b {
-        b'\r' | b'\n' => (Key::Enter, Mods::NONE),
+        b'\r' => (Key::Enter, Mods::NONE),
         b'\t' => (Key::Tab, Mods::NONE),
         0x08 | 0x7f => (Key::Backspace, Mods::NONE),
         0x00 => (Key::Char(' '), Mods::CTRL),
@@ -370,14 +374,20 @@ fn csi(b: &[u8]) -> Parsed {
     let Some(&last) = b.get(end) else {
         return Parsed::Incomplete;
     };
+    // A parameter's subfields after `:` (the kitty protocol's alternate
+    // keys and event types) aren't asked for, and are ignored.
     let mut params = [None; 4];
     for (slot, p) in params.iter_mut().zip(b[2..end].split(|&c| c == b';')) {
+        let p = p.split(|&c| c == b':').next().unwrap_or_default();
         *slot = std::str::from_utf8(p)
             .ok()
-            .and_then(|s| s.parse::<u16>().ok());
+            .and_then(|s| s.parse::<u32>().ok());
+    }
+    if last == b'u' {
+        return kitty(end + 1, params[0], params[1]);
     }
     let mods = params[1].map_or(Mods::NONE, |m| {
-        Mods(u8::try_from(m.saturating_sub(1)).unwrap_or(0) & 7)
+        Mods(u8::try_from(m.saturating_sub(1) & 7).unwrap_or(0))
     });
     let k = match last {
         b'A' => Key::Up,
@@ -404,6 +414,53 @@ fn csi(b: &[u8]) -> Parsed {
         _ => return Parsed::Done(end + 1, None),
     };
     key(end + 1, k, mods)
+}
+
+/// `CSI code ; modifiers u`, `n` bytes long: a key as the kitty keyboard
+/// protocol's disambiguate flag sends it, read as the legacy encoding
+/// would have it, so bindings match either way: shift goes into the key
+/// (an uppercase letter, backtab) or is dropped, but on enter, where it's
+/// the one way to tell shift+enter apart; ctrl with `[`, `i`, `m` and `h`
+/// is esc, tab, enter and backspace, as their control bytes are, and
+/// ctrl+backspace is backspace, which legacy sends the same. Caps and
+/// num lock are dropped; a key with super, hyper or meta is none dffy
+/// binds.
+fn kitty(n: usize, code: Option<u32>, modifiers: Option<u32>) -> Parsed {
+    // The keypad's enter, among the protocol's private-use key codes.
+    const KEYPAD_ENTER: u32 = 57414;
+    let bits = modifiers.map_or(0, |m| m.saturating_sub(1)) & !(64 | 128);
+    let (Some(code), Ok(bits)) = (code, u8::try_from(bits)) else {
+        return Parsed::Done(n, None);
+    };
+    if bits > 7 {
+        return Parsed::Done(n, None);
+    }
+    let mods = Mods(bits);
+    let shift = mods.contains(Mods::SHIFT);
+    let unshifted = Mods(bits & !Mods::SHIFT.0);
+    let (k, mods) = match (code, mods) {
+        (13 | KEYPAD_ENTER, _) => (Key::Enter, mods),
+        (9, _) if shift => (Key::BackTab, unshifted),
+        (9, _) => (Key::Tab, mods),
+        (127, _) if mods != Mods::CTRL => (Key::Backspace, unshifted),
+        (27, _) => (Key::Esc, unshifted),
+        (109, Mods::CTRL) => (Key::Enter, Mods::NONE),
+        (105, Mods::CTRL) => (Key::Tab, Mods::NONE),
+        (104 | 127, Mods::CTRL) => (Key::Backspace, Mods::NONE),
+        (91, Mods::CTRL) => (Key::Esc, Mods::NONE),
+        // The protocol's other private-use codes: the keypad's keys, media
+        // keys, modifiers on their own.
+        (0xe000..=0xf8ff, _) => return Parsed::Done(n, None),
+        _ => match char::from_u32(code) {
+            // Legacy ctrl+shift+letter is the control byte of ctrl+letter.
+            Some(c) if shift && !mods.contains(Mods::CTRL) && c.is_ascii_lowercase() => {
+                (Key::Char(c.to_ascii_uppercase()), unshifted)
+            }
+            Some(c) if !c.is_control() => (Key::Char(c), unshifted),
+            _ => return Parsed::Done(n, None),
+        },
+    };
+    key(n, k, mods)
 }
 
 /// `ESC [ < button ; x ; y M` (press) or `m` (release), 1-based cells.
@@ -578,6 +635,69 @@ mod tests {
                 (Key::Char('w'), Mods::CTRL),
                 (Key::Char('a'), Mods::CTRL),
             ]
+        );
+    }
+
+    /// Without the kitty keyboard protocol, enter is CR, and ctrl+j the
+    /// line feed raw mode leaves as it is.
+    #[test]
+    fn legacy_enter_and_ctrl_j() {
+        assert_eq!(
+            keys(&[b"\r\n\x1b\r"]),
+            [
+                (Key::Enter, N),
+                (Key::Char('j'), Mods::CTRL),
+                (Key::Enter, Mods::ALT)
+            ]
+        );
+    }
+
+    /// The forms the kitty keyboard protocol's disambiguate flag sends
+    /// read as their legacy keys would, shift kept only where it means
+    /// something of its own (enter); lock modifiers are dropped.
+    #[test]
+    fn kitty_disambiguated_keys_read_as_their_legacy_forms() {
+        assert_eq!(
+            keys(&[
+                b"\x1b[13;2u\x1b[13u\x1b[13;3u\x1b[57414u\x1b[13;130u\x1b[27u\x1b[106;5u\x1b[99;5u",
+                b"\x1b[98;3u\x1b[106;4u\x1b[127;3u\x1b[9;2u\x1b[32;5u\x1b[97:65;5u\x1b[1;5A",
+            ]),
+            [
+                (Key::Enter, Mods::SHIFT),
+                (Key::Enter, N),
+                (Key::Enter, Mods::ALT),
+                (Key::Enter, N),
+                (Key::Enter, Mods::SHIFT),
+                (Key::Esc, N),
+                (Key::Char('j'), Mods::CTRL),
+                (Key::Char('c'), Mods::CTRL),
+                (Key::Char('b'), Mods::ALT),
+                (Key::Char('J'), Mods::ALT),
+                (Key::Backspace, Mods::ALT),
+                (Key::BackTab, N),
+                (Key::Char(' '), Mods::CTRL),
+                (Key::Char('a'), Mods::CTRL),
+                (Key::Up, Mods::CTRL),
+            ]
+        );
+        // Ctrl with shift and a letter, and ctrl with the keys whose
+        // control bytes are esc, tab, enter and backspace, as legacy.
+        assert_eq!(
+            keys(&[b"\x1b[99;6u\x1b[91;5u\x1b[105;5u\x1b[109;5u\x1b[104;5u\x1b[127;5u"]),
+            [
+                (Key::Char('c'), Mods::CTRL),
+                (Key::Esc, N),
+                (Key::Tab, N),
+                (Key::Enter, N),
+                (Key::Backspace, N),
+                (Key::Backspace, N),
+            ]
+        );
+        // Super or hyper with a key: nothing dffy binds, rather than the
+        // key alone; a reply to a flags query isn't a key either.
+        assert_eq!(
+            keys(&[b"\x1b[13;9u\x1b[?1u\x1b[99;17ux"]),
+            [(Key::Char('x'), N)]
         );
     }
 

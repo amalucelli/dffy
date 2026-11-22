@@ -3,9 +3,10 @@
 //! they're driven with, as the loop and the workers would send them.
 //! Each module takes them, and every name the viewer has, from here.
 
-pub(super) use std::ops::ControlFlow;
+pub(super) use std::ops::{ControlFlow, Range};
 pub(super) use std::path::Path;
 
+pub(super) use dffy_core::annotation::{self, Anchor};
 pub(super) use dffy_core::diff::{Options, Text, Whitespace, hunks};
 pub(super) use dffy_core::document::{self, Counts};
 pub(super) use dffy_core::git::{ChangeSet, FileDiff, Mode, Repo, Side};
@@ -85,6 +86,8 @@ pub(super) fn app_with(
         size,
         Indicators::Classic,
     );
+    // The agent plugin, whose program tests stand in for.
+    app.find_agent = || true;
     app.event(Event::Enumerated(diff("src/zz.rs").change));
     app.event(Event::EnumerationDone(None));
     app.event(Event::Diffed(Done::Diff {
@@ -310,6 +313,7 @@ pub(super) fn session(dir: &tempfile::TempDir, head: &str, last: Option<&str>) -
         state: None,
         labels: Vec::new(),
         comments: dir.path().join("comments.json"),
+        checkout: Some("gh pr checkout 7".to_owned()),
     }
 }
 

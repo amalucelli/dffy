@@ -347,6 +347,7 @@ pub(crate) fn run(
         "the checkout"
     };
     let _ = writeln!(summary, "- Rounds: {rounds}; A: {}; B: {b}", base.display());
+    summary += "- Builds: every function and loop aligned to 64 bytes on both sides\n";
     if quick {
         summary += "- Quick: instruction and allocation counts only; print and pager on a subset of the range\n";
     }
@@ -437,42 +438,62 @@ pub(crate) fn snapshot(dest: &Path, layout: Option<usize>, worktree: Option<&Pat
     Ok(())
 }
 
-/// cargo, building with `layout`, a seed from 1, into its own target
-/// directory with the code laid out by the seed: on `x86_64` Linux, where
-/// rustc links with lld, lld shuffles the input sections, one per function;
-/// elsewhere the seed goes into every symbol's hash. A `worktree` build,
-/// with a layout or not, goes to `target/perf/build`, which `perf` removes
-/// after every run, so the checkout's `target/release` keeps the checkout's
-/// executables.
+/// Every function and loop of a measurement build starts on a 64-byte
+/// boundary, so a timing compares the code rather than where the linker
+/// happened to place it.
+const ALIGNMENT: [&str; 2] = [
+    "-Cllvm-args=-align-all-functions=6",
+    "-Cllvm-args=-align-loops=64",
+];
+
+/// cargo, building a set: with [`ALIGNMENT`] after any rustflags of the
+/// environment's, and with `layout`, a seed from 1, the code laid out by the
+/// seed: on `x86_64` Linux, where rustc links with lld, lld shuffles the
+/// input sections, one per function; elsewhere the seed goes into every
+/// symbol's hash. Never into `target/release`, so an ordinary release
+/// build keeps its flags and its cache: a `worktree` build, with a layout or
+/// not, goes to `target/perf/build`, which `perf` removes after every run, a
+/// layout build of the checkout to `target/layouts`, and the checkout to
+/// `target/aligned`.
 fn cargo(layout: Option<usize>, worktree: bool) -> Command {
     let mut cmd = Command::new(std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into()));
-    if worktree {
-        cmd.env("CARGO_TARGET_DIR", format!("{ROOT}/target/perf/build"));
-    }
-    let Some(seed) = layout else {
-        return cmd;
+    let target = match (worktree, layout) {
+        (true, _) => "perf/build",
+        (false, Some(_)) => "layouts",
+        (false, None) => "aligned",
     };
-    // lld takes seed 0 as a random seed.
-    let flag = if cfg!(all(target_os = "linux", target_arch = "x86_64")) {
-        format!("-Clink-arg=-Wl,--shuffle-sections=*={seed}")
-    } else {
-        format!("-Cmetadata=layout{seed}")
-    };
-    if !worktree {
-        cmd.env("CARGO_TARGET_DIR", format!("{ROOT}/target/layouts"));
+    cmd.env("CARGO_TARGET_DIR", format!("{ROOT}/target/{target}"));
+    let mut flags = ALIGNMENT.map(str::to_owned).to_vec();
+    if let Some(seed) = layout {
+        // lld takes seed 0 as a random seed.
+        flags.push(if cfg!(all(target_os = "linux", target_arch = "x86_64")) {
+            format!("-Clink-arg=-Wl,--shuffle-sections=*={seed}")
+        } else {
+            format!("-Cmetadata=layout{seed}")
+        });
     }
     // Cargo takes rustflags from the first of these that's set, else from
-    // the config files, where the flag joins `build.rustflags` and loses to
+    // the config files, where the flags join `build.rustflags` and lose to
     // a `target.<triple>.rustflags`.
     let var = [("CARGO_ENCODED_RUSTFLAGS", '\x1f'), ("RUSTFLAGS", ' ')]
         .into_iter()
         .find_map(|(var, sep)| Some((var, sep, std::env::var(var).ok()?)));
     match var {
-        Some((var, _, flags)) if flags.is_empty() => cmd.env(var, flag),
-        Some((var, sep, flags)) => cmd.env(var, format!("{flags}{sep}{flag}")),
-        None => cmd.arg(format!("--config=build.rustflags=[{flag:?}]")),
+        Some((var, sep, set)) => cmd.env(var, rustflags(&set, sep, &flags)),
+        None => cmd.arg(format!("--config=build.rustflags={flags:?}")),
     };
     cmd
+}
+
+/// `flags` after `set`, a rustflags variable's value, joined by `sep`, the
+/// variable's separator.
+fn rustflags(set: &str, sep: char, flags: &[String]) -> String {
+    let flags = flags.join(&sep.to_string());
+    if set.is_empty() {
+        flags
+    } else {
+        format!("{set}{sep}{flags}")
+    }
 }
 
 /// The set's executables of the given kinds that `cmd args` built. The
@@ -1559,6 +1580,23 @@ mod tests {
         assert_eq!(sides(need, [false, true], true), Ok([false, true]));
         assert!(sides(need, [true, false], true).is_err());
         assert!(needs("frame").is_none());
+    }
+
+    /// A set's flags come after the rustflags the environment set, in that
+    /// variable's own separator.
+    #[test]
+    fn a_sets_rustflags_follow_the_environments() {
+        let flags = ALIGNMENT.map(str::to_owned);
+        let [functions, loops] = ALIGNMENT;
+        assert_eq!(rustflags("", ' ', &flags), format!("{functions} {loops}"));
+        assert_eq!(
+            rustflags("-Ctarget-cpu=native", ' ', &flags),
+            format!("-Ctarget-cpu=native {functions} {loops}")
+        );
+        assert_eq!(
+            rustflags("-Ca\x1f-Cb", '\x1f', &flags),
+            format!("-Ca\x1f-Cb\x1f{functions}\x1f{loops}")
+        );
     }
 
     #[test]

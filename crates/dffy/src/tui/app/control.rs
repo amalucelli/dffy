@@ -9,7 +9,7 @@ use dffy_core::bstr::BString;
 use dffy_core::document::{Pos, Side, State};
 use dffy_core::git::Status;
 
-use super::{App, Pane, Seek};
+use super::{Action, App, Pane, Seek};
 use crate::control::viewer::{self, Command, Inbound, Push, Reply};
 use crate::control::{Fault, object};
 use crate::encode;
@@ -63,9 +63,9 @@ fn lossy(path: &[u8]) -> String {
 }
 
 impl App {
-    pub(super) fn control(&mut self, inbound: Inbound) {
+    pub(super) fn control(&mut self, inbound: Inbound) -> Option<Action> {
         match inbound {
-            Inbound::Command(command, reply) => self.control_command(command, reply),
+            Inbound::Command(command, reply) => return self.control_command(command, reply),
             Inbound::Wanted {
                 selection,
                 view,
@@ -92,6 +92,7 @@ impl App {
             // What waits for it goes as the event settles.
             Inbound::Cancelled => {}
         }
+        None
     }
 
     /// After each event: requests whose diff came are answered, unless a
@@ -156,10 +157,10 @@ impl App {
         }
     }
 
-    fn control_command(&mut self, command: Command, reply: Reply) {
+    fn control_command(&mut self, command: Command, reply: Reply) -> Option<Action> {
         // Its asker left while it waited behind the editor.
         if reply.cancelled() {
-            return;
+            return None;
         }
         // Moving the view under the text box, or the editor, would take
         // the comment being written somewhere it isn't about.
@@ -168,7 +169,7 @@ impl App {
                 "failed",
                 "a comment is being written in the viewer; ask again once it's saved",
             )));
-            return;
+            return None;
         }
         match command {
             Command::State => reply.send(Ok(self.control_state().encode())),
@@ -188,12 +189,46 @@ impl App {
                         "failed",
                         "this viewer has no comments file: start it with --comments <file>",
                     )));
-                    return;
+                    return None;
                 }
                 self.control_open(path, Some(line), side, Some((text, author)), reply);
             }
             Command::Focus { id } => reply.send(self.control_focus(&id)),
+            Command::ApplySuggestion { id } => return self.control_apply(&id, reply),
         }
+        None
+    }
+
+    /// Applies the suggestion of comment `id`, or of its thread's last
+    /// comment with one, as `s` on its thread would. Refused while an ask
+    /// runs: an agent asked to only read may reach this through dffy's own
+    /// MCP server, which its harness can load, and applying writes files.
+    fn control_apply(&mut self, id: &str, reply: Reply) -> Option<Action> {
+        if self.asking.busy() {
+            let key = (self.thread_key_name(crate::keys::Action::ApplySuggestion))
+                .unwrap_or_else(|| "apply_suggestion".to_owned());
+            reply.send(Err(Fault::new(
+                "failed",
+                format!("an agent ask is running; apply with {key} in the viewer"),
+            )));
+            return None;
+        }
+        let Some(comments) = &self.comments else {
+            reply.send(Err(Fault::new(
+                "failed",
+                "this viewer has no comments file",
+            )));
+            return None;
+        };
+        let Some(root) = comments.thread_root(id) else {
+            let missing = format!("no comment {id} in the comments this view shows");
+            reply.send(Err(Fault::new("not_found", missing)));
+            return None;
+        };
+        let path = comments.home_of(&root).unwrap_or_default();
+        let at = (comments.threads(path.as_bytes()))
+            .and_then(|threads| Some(threads.iter().find(|t| t.root == root)?.at.clone()));
+        self.apply_suggestion((&root, at.as_ref()), Some(id), Some(reply))
     }
 
     /// The entry of the file at `path`, by its path or, renamed, its old

@@ -36,7 +36,7 @@ use crate::plugin::json::{self, Value};
 pub(crate) const VERSION: usize = 1;
 
 /// Every request dffyd answers, itself or through a view.
-pub(crate) const METHODS: [&str; 8] = [
+pub(crate) const METHODS: [&str; 9] = [
     "views/list",
     "views/register",
     "subscribe",
@@ -45,6 +45,7 @@ pub(crate) const METHODS: [&str; 8] = [
     "view/open",
     "view/focusThread",
     "comments/add",
+    "comments/applySuggestion",
 ];
 
 /// The notifications a client can subscribe to.
@@ -195,6 +196,7 @@ pub(crate) const SCHEMA: &str = r##"{
     "view/open": {"description": "Shows a file of the diff, at a line when given. Answered once it shows.", "properties": {"params": {"type": "object", "properties": {"view": {"type": "integer"}, "path": {"type": "string", "description": "Relative to the working tree's root."}, "line": {"type": "integer", "minimum": 1}, "side": {"$ref": "#/$defs/side", "default": "new"}}, "required": ["view", "path"]}, "result": {"type": "object", "properties": {"view": {"type": "integer"}, "path": {"type": "string"}, "line": {"type": ["integer", "null"]}, "side": {"$ref": "#/$defs/side"}}, "required": ["view", "path", "line", "side"]}}},
     "view/focusThread": {"description": "Shows and focuses a comment thread, named by any of its comments' ids.", "properties": {"params": {"type": "object", "properties": {"view": {"type": "integer"}, "id": {"type": "string"}}, "required": ["view", "id"]}, "result": {"type": "object", "properties": {"view": {"type": "integer"}, "thread": {"type": "string"}, "path": {"type": "string"}, "focused": {"type": "boolean", "description": "false while its file's diff or the thread's place is on its way: it's focused once there."}}, "required": ["view", "thread", "path", "focused"]}}},
     "comments/add": {"description": "Adds a comment on a line, as the viewer's c would, to the comments file the view shows; the view shows it.", "properties": {"params": {"type": "object", "properties": {"view": {"type": "integer"}, "path": {"type": "string"}, "line": {"type": "integer", "minimum": 1}, "side": {"$ref": "#/$defs/side", "default": "new"}, "text": {"type": "string", "minLength": 1}}, "required": ["view", "path", "line", "text"]}, "result": {"type": "object", "properties": {"view": {"type": "integer"}, "id": {"type": "string"}, "path": {"type": "string"}, "line": {"type": "integer"}, "side": {"$ref": "#/$defs/side"}}, "required": ["view", "id", "path", "line", "side"]}}},
+    "comments/applySuggestion": {"description": "Puts a suggestion in place of its thread's lines in the working tree, as the viewer's s would: the suggestion of comment id, or of the last comment with one in the thread it names. Answered once it's written, or with why it was refused.", "properties": {"params": {"type": "object", "properties": {"view": {"type": "integer"}, "id": {"type": "string"}}, "required": ["view", "id"]}, "result": {"type": "object", "properties": {"view": {"type": "integer"}, "thread": {"type": "string"}, "comment": {"type": "string", "description": "The comment whose suggestion went in."}, "path": {"type": "string"}, "start": {"type": "integer", "description": "The first line replaced, as the file was."}, "end": {"type": "integer", "description": "The last line replaced, as the file was."}, "lines": {"type": "integer", "description": "How many lines went in their place; 0 deleted them."}}, "required": ["view", "thread", "comment", "path", "start", "end", "lines"]}}},
     "selection/changed": {"description": "Pushed to subscribers, debounced.", "properties": {"params": {"type": "object", "properties": {"view": {"type": "integer"}, "selection": {"$ref": "#/$defs/selection"}}, "required": ["view", "selection"]}}},
     "view/changed": {"description": "Pushed to subscribers, debounced: the state when the file or the top row moved.", "properties": {"params": {"$ref": "#/$defs/state"}}},
     "view/closed": {"description": "Pushed to subscribers when their view's viewer leaves.", "properties": {"params": {"type": "object", "properties": {"view": {"type": "integer"}}, "required": ["view"]}}},

@@ -1,0 +1,60 @@
+---
+source: crates/dffy/src/review/prompt/tests.rs
+expression: prompt.text
+---
+A review thread on src/lib.rs:5-6 (the new version of the file).
+Language: rust
+
+ana:
+Why edit these?
+
+you:
+Use `line 5` as it was.
+
+Suggested change, in place of the commented lines:
+
+````suggestion
+line 5
+line 6 ```
+````
+
+The commented lines, marked >, and the lines around them:
+
+```
+   1  line 1
+   2  line 2
+   3  line 3
+   4  line 4
+>  5  line 5 edited
+>  6  line 6
+   7  line 7
+   8  line 8
+   9  line 9
+  10  line 10
+  11  line 11
+```
+
+The file's changes near them:
+
+```diff
+@@ -2,7 +2,7 @@
+ line 2
+ line 3
+ line 4
+-line 5
++line 5 edited
+ line 6
+ line 7
+ line 8
+@@ -22,7 +22,7 @@
+ line 22
+ line 23
+ line 24
+-line 25
++line 25 edited
+ line 26
+ line 27
+ line 28
+```
+
+Answer the thread's last comment. To propose a change to the commented lines, end with the lines that replace them in a fenced block opened with ```suggestion.

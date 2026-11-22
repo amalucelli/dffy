@@ -10,7 +10,7 @@ const INIT: &str = r#"{"jsonrpc":"2.0","id":@ID@,"result":{"protocol":1,"command
 const BASE: &str = "a1b2c3d000000000000000000000000000000000";
 const HEAD: &str = "e4f5a6b000000000000000000000000000000000";
 
-const SESSION: &str = r#"{"id":"7","title":"Spell out five","url":"https://github.com/acme/widgets/pull/7","base":"a1b2c3d000000000000000000000000000000000","head":"e4f5a6b000000000000000000000000000000000","last_reviewed_head":null}"#;
+const SESSION: &str = r#"{"id":"7","title":"Spell out five","url":"https://github.com/acme/widgets/pull/7","base":"a1b2c3d000000000000000000000000000000000","head":"e4f5a6b000000000000000000000000000000000","last_reviewed_head":null,"checkout":"gh pr checkout 7"}"#;
 
 /// The session [`SESSION`] names, its comments file in `reviews`.
 fn seven(reviews: &Path) -> Session {
@@ -25,6 +25,7 @@ fn seven(reviews: &Path) -> Session {
         state: None,
         labels: Vec::new(),
         comments: reviews.join("7.json"),
+        checkout: Some("gh pr checkout 7".to_owned()),
     }
 }
 
@@ -352,6 +353,7 @@ fn requests_carry_what_the_protocol_says_and_never_the_file() {
         .iter()
         .filter_map(|d| d.get("id")?.as_str())
         .collect();
+    // d4 replies in a thread kept local, which the host can't put it in.
     assert_eq!(ids, ["d1", "d2", "d3"]);
     let post = Request::Post {
         id: id(),
@@ -394,7 +396,7 @@ fn results_read_by_method() {
 {"id":"a","path":"a.rs","text":"Mine","author":"","created":"2026-11-17T10:00:00Z"},
 {"id":"b","path":"a.rs","text":"Mine too","author":"","created":"2026-11-17T10:00:00Z"},
 {"id":"c","path":"a.rs","text":"Posted","author":"","created":"2026-11-17T10:00:00Z","ref":"x:1"},
-{"id":"d","path":"a.rs","text":"An agent's","author":"claude","created":"2026-11-17T10:00:00Z"}]}"#,
+{"id":"d","path":"a.rs","text":"An agent's","author":"claude","created":"2026-11-17T10:00:00Z"},{"id":"e","path":"a.rs","text":"@claude why?","author":"","created":"2026-11-17T10:00:00Z","local_only":true},{"id":"f","path":"a.rs","text":"In its thread","author":"","created":"2026-11-17T10:00:00Z","in_reply_to":"e"}]}"#,
     )
     .expect("write");
     let sent = Sent {

@@ -330,6 +330,7 @@ fn listed() -> Result<(Value, String), Error> {
 }
 
 /// A `dffy ctl` command for `view`: its result and its words.
+#[expect(clippy::too_many_lines, reason = "a dispatch: an arm per command")]
 fn drive(
     client: &mut Client,
     view: &View,
@@ -429,7 +430,35 @@ fn drive(
             );
             (result, words)
         }
+        CtlAction::ApplySuggestion { id: comment } => applied(
+            id,
+            ask(
+                "comments/applySuggestion",
+                vec![("id", text(comment.clone()))],
+            )?,
+        ),
     })
+}
+
+/// `comments/applySuggestion`'s `result` in view `id`, and what it did in
+/// words.
+fn applied(id: u64, result: Value) -> (Value, String) {
+    let field = |key: &str| result.get(key).and_then(Value::as_str).unwrap_or_default();
+    let number = |key: &str| result.get(key).and_then(Value::as_usize).unwrap_or(0);
+    let (path, start, end) = (escape(field("path")), number("start"), number("end"));
+    let at = if start == end {
+        format!("{path}:{start}")
+    } else {
+        format!("{path}:{start}-{end}")
+    };
+    let comment = escape(field("comment"));
+    let words = match number("lines") {
+        0 => format!("view {id} removed {at}, as comment {comment} suggested"),
+        _ => {
+            format!("view {id} applied comment {comment}'s suggestion to {at}: an unstaged change")
+        }
+    };
+    (result, words)
 }
 
 #[cfg(test)]

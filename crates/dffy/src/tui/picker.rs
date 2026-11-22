@@ -11,7 +11,7 @@ use unicode_width::UnicodeWidthStr;
 
 use super::view::Entry;
 use crate::fuzzy::score;
-use crate::render::{Canvas, escape, stat, thousands};
+use crate::render::{Canvas, escape, thousands};
 use crate::theme::Role;
 
 /// What the picker lists for an entry: its path, or `None` for a commit.
@@ -260,7 +260,7 @@ impl Picker {
         c: &mut Canvas,
     ) {
         let entry = &files[file];
-        let (letter, role) = stat::status_letter(entry.status());
+        let (letter, role) = super::tree::letter(entry);
         c.push(Role::Plain, " ");
         c.push(role, letter);
         c.push(Role::Plain, " ");

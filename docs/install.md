@@ -1,40 +1,29 @@
 # Install
 
-## Homebrew
+dffy is a single binary for Linux and macOS. Install it with Homebrew or the install script:
 
 ```sh
 brew install --cask amalucelli/tap/dffy
-```
-
-The cask is published with each release.
-
-## Install script
-
-```sh
+# or
 curl -fsSL https://raw.githubusercontent.com/amalucelli/dffy/main/install.sh | sh
 ```
 
-The script:
+## Install script
 
-- downloads the release archive for your OS and architecture;
-- checks it against the release's `checksums.txt`;
-- puts `dffy` in `~/.local/bin`.
+The script downloads the release archive for your OS and architecture, checks it against the release's `checksums.txt`, and puts `dffy` in `~/.local/bin`. It needs `curl` or `wget`, and `sha256sum` or `shasum`. It never asks for root.
 
-It needs `curl` or `wget`, and `sha256sum` or `shasum`. It never asks for root. `--plugin <name>` also installs a renderer plugin ([Plugins](#plugins)).
-
-Environment variables:
-
-| Variable | Default | Sets |
+| Option or variable | Default | Sets |
 |---|---|---|
-| `DFFY_VERSION` | the latest release | a release tag such as `v0.1.0` |
-| `DFFY_INSTALL_DIR` | `~/.local/bin` | where the binaries go |
-| `DFFY_PLUGINS` | none | plugins to install, as with `--plugin`, separated by spaces or commas |
+| `--plugin <name>` | none | A plugin to install next to dffy: `markdown`, `mermaid`, `review-github` or `agent`. Repeatable. See [Plugins](#plugins). |
+| `DFFY_VERSION` | the latest release | A release tag such as `v0.1.0` |
+| `DFFY_INSTALL_DIR` | `~/.local/bin` | Where the binaries go |
+| `DFFY_PLUGINS` | none | Plugins to install, as with `--plugin`, separated by spaces or commas |
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/amalucelli/dffy/main/install.sh | DFFY_VERSION=v0.1.0 sh
 ```
 
-The Linux binaries link glibc, so the script stops on musl systems such as Alpine; build from source there.
+The Linux binaries link glibc, so the script stops on musl systems such as Alpine. Build from source there.
 
 ## mise
 
@@ -52,28 +41,22 @@ dffy builds with stable Rust 1.90 or newer.
 cargo install --locked --git https://github.com/amalucelli/dffy dffy
 ```
 
-From a clone, `task install` runs `cargo install --path crates/dffy --root ~/.local`.
-
-| Method | Binary lands in |
-|---|---|
-| `cargo install --git` | `~/.cargo/bin` |
-| `task install` | `~/.local/bin` |
-
-That directory must be on your `PATH`.
+That puts `dffy` in `~/.cargo/bin`. From a clone, `task install` runs `cargo install --path crates/dffy --root ~/.local`, which puts it in `~/.local/bin`. Either directory must be on your `PATH`.
 
 ## Plugins
 
-The experimental plugins are separate binaries: the renderers `dffy-render-markdown` and `dffy-render-mermaid`, and the review plugin `dffy-review-github`. Each dffy release ships them under the same version, outside dffy's archive and cask. Install them with one of these (drop the ones you don't want):
+The experimental plugins are separate binaries: the renderers `dffy-render-markdown` and `dffy-render-mermaid`, the review plugin `dffy-review-github`, and the agent plugin `dffy-agent`. Each dffy release ships them at the same version, outside dffy's archive and cask. Install the ones you want:
 
 ```sh
-brew install --cask amalucelli/tap/dffy-render-markdown amalucelli/tap/dffy-render-mermaid amalucelli/tap/dffy-review-github
-curl -fsSL https://raw.githubusercontent.com/amalucelli/dffy/main/install.sh | sh -s -- --plugin markdown --plugin mermaid --plugin review-github
-cargo install --locked --git https://github.com/amalucelli/dffy dffy-render-markdown dffy-render-mermaid dffy-review-github
+brew install --cask amalucelli/tap/dffy-render-markdown amalucelli/tap/dffy-render-mermaid amalucelli/tap/dffy-review-github amalucelli/tap/dffy-agent
+curl -fsSL https://raw.githubusercontent.com/amalucelli/dffy/main/install.sh | sh -s -- --plugin markdown --plugin mermaid --plugin review-github --plugin agent
+cargo install --locked --git https://github.com/amalucelli/dffy dffy-render-markdown dffy-render-mermaid dffy-review-github dffy-agent
 ```
 
-- The script installs dffy and the plugins side by side, all checked against the release's `checksums.txt`. `DFFY_PLUGINS=markdown,mermaid,review-github` does the same as the flags.
-- dffy finds the plugins on your `PATH`.
-- `dffy-review-github` also needs the GitHub CLI, [`gh`](https://cli.github.com) (`brew install gh`, or your system's package), logged in with `gh auth login`. `dffy doctor` checks both once `review = github` is set.
+- The script installs the plugins next to dffy and checks them against the release's `checksums.txt`.
+- dffy finds plugins on your `PATH`.
+- `dffy-review-github` needs the GitHub CLI, [`gh`](https://cli.github.com), logged in with `gh auth login`. `dffy doctor` checks both once `review = github` is set.
+- `dffy-agent` needs Claude Code (`claude`), Codex (`codex`) or Pi (`pi`), logged in.
 
 [plugins.md](plugins.md) covers turning them on.
 
@@ -87,18 +70,18 @@ cargo install --locked --git https://github.com/amalucelli/dffy dffy-render-mark
 | zsh | `dffy completions zsh > ~/.zfunc/_dffy`, with `fpath=(~/.zfunc $fpath)` before `compinit` in `~/.zshrc` |
 | bash | `dffy completions bash > ~/.local/share/bash-completion/completions/dffy` (needs the bash-completion package) |
 
-Regenerate the script after upgrading to pick up new or changed flags, and after setting a review plugin: the script includes the plugin's command (`dffy pr`) only when one is set. The man page leaves it out.
+Regenerate the script after upgrading, and after setting a review plugin. The script includes the plugin's command, such as `dffy pr`, only when one is set.
 
 ## Man page
 
-The man page is generated from the same definitions as `--help`. `dffy man` (hidden from `--help`) prints it in roff, and `task man` writes it to `target/dffy.1`:
+`task man` writes the man page to `target/dffy.1`. It's generated from the same definitions as `--help`, and leaves out review plugin commands.
 
 ```sh
 task man
 man target/dffy.1
 ```
 
-To install it, copy it into a directory on your `MANPATH`, such as `~/.local/share/man/man1/`.
+To install it, copy it into a directory on your `MANPATH`, such as `~/.local/share/man/man1/`. `dffy man`, hidden from `--help`, prints the same page in roff.
 
 ## Platforms
 
@@ -107,8 +90,8 @@ To install it, copy it into a directory on your `MANPATH`, such as `~/.local/sha
 | Linux | x86_64, aarch64 | inotify |
 | macOS | x86_64, aarch64 (Apple silicon) | FSEvents |
 
-These are the release targets. Windows isn't supported. [watch.md](watch.md) covers file watching on each OS.
+Windows isn't supported. [watch.md](watch.md) covers file watching on each OS.
 
-dffy reads repositories with its own code and doesn't need git to show diffs. `dffy doctor` checks for git, and the pager setup in [git.md](git.md) needs it.
+dffy reads repositories with its own code and doesn't need git to show diffs. Using it as git's pager needs git, and so do staging and resolving conflicts in the viewer ([git.md](git.md#when-dffy-runs-git)).
 
 Next: [usage.md](usage.md).

@@ -256,11 +256,14 @@ fn the_menu_of_a_panel_row_acts_on_its_thread() {
         menu_rows(&app),
         [
             "Reply r",
+            "Ask agent a",
+            "Fix with agent f",
             "Edit draft e",
             "Delete draft d",
             "Resolve x",
             "Copy comment",
             "Copy thread",
+            "Copy as prompt y",
         ]
     );
     assert!(choose(&mut app, "Resolve").is_none());
@@ -303,6 +306,7 @@ fn the_menu_of_a_tree_file_runs_the_trees_keys() {
             "Copy path Y",
             "Copy absolute path",
             "Open in editor e",
+            "Open terminal here ␣ .",
             "Mark viewed v",
             "Comment on file C",
             "Show only files with comments c",
@@ -313,6 +317,10 @@ fn the_menu_of_a_tree_file_runs_the_trees_keys() {
     assert_eq!(
         choose_again(&mut app, "zz3.rs", "Copy absolute path"),
         Some(Action::CopyFullPath("src/zz3.rs".into()))
+    );
+    assert_eq!(
+        choose_again(&mut app, "zz3.rs", "Open terminal here"),
+        Some(Action::OpenTerminal)
     );
     assert!(choose_again(&mut app, "zz3.rs", "Mark viewed").is_none());
     assert!(app.doc.document.files()[file].viewed());
@@ -348,9 +356,15 @@ fn the_menu_of_a_code_line_runs_its_keys_on_that_line() {
             "Comment on line c",
             "Suggest change S",
             "Copy line v y",
-            "Open in editor e"
+            "Open in editor e",
+            "Open terminal here ␣ ."
         ]
     );
+    let opened = choose(&mut app, "Open terminal here");
+    key(&mut app, ' ');
+    assert_eq!(opened, press(&mut app, Key::Char('.')));
+    assert_eq!(opened, Some(Action::OpenTerminal));
+    right_click(&mut app, "line 3");
     let copied = choose(&mut app, "Copy line");
     assert!(app.doc.selection.is_none());
     let tap = |app: &mut App, text: &str| {
@@ -404,12 +418,40 @@ fn the_menu_inside_a_selection_acts_on_the_selection() {
         [
             "Comment on selection c",
             "Suggest change S",
+            "Ask agent a",
+            "Fix with agent ␣ &",
             "Copy selection y",
-            "Open in editor e"
+            "Copy as prompt ␣ \"",
+            "Open in editor e",
+            "Open terminal here ␣ ."
         ]
     );
     let copied = choose(&mut app, "Copy selection");
     assert!(matches!(&copied, Some(Action::Copy { text, .. }) if text == b"line 1\nline 2"));
+    assert!(app.doc.selection.is_none(), "as y ends it");
+    key(&mut app, 'v');
+    key(&mut app, 'j');
+    let selection = app.doc.selection.clone();
+    right_click(&mut app, "line 2");
+    assert_eq!(
+        choose(&mut app, "Open terminal here"),
+        Some(Action::OpenTerminal)
+    );
+    assert_eq!(app.doc.selection, selection, "kept for its prompt");
+    right_click(&mut app, "line 2");
+    let prompt = match choose(&mut app, "Copy as prompt") {
+        Some(Action::Copy { text, note }) => {
+            assert_eq!(note, "copied 2 lines as a prompt");
+            String::from_utf8(text).expect("utf-8")
+        }
+        other => panic!("{other:?}"),
+    };
+    assert!(
+        prompt.starts_with(&format!(
+            "Lines selected in a diff: {FILE}:2-3 (the new version of the file).\n"
+        )),
+        "{prompt}"
+    );
     assert!(app.doc.selection.is_none(), "as y ends it");
     // From the line right-clicked, as after a tap.
     key(&mut app, 'v');
@@ -463,14 +505,29 @@ fn the_menu_of_a_thread_runs_its_focused_keys() {
         menu_rows(&app),
         [
             "Reply r",
+            "Ask agent a",
+            "Fix with agent f",
             "Edit draft e",
             "Delete draft d",
             "Resolve x",
             "Fold z",
             "Copy comment",
             "Copy thread",
+            "Copy as prompt y",
         ]
     );
+    match choose(&mut app, "Copy as prompt") {
+        Some(Action::Copy { text, note }) => {
+            assert_eq!(note, "copied a thread as a prompt");
+            let text = String::from_utf8(text).expect("utf-8");
+            assert!(
+                text.contains("Why two?") && text.contains("Because."),
+                "{text}"
+            );
+        }
+        other => panic!("{other:?}"),
+    }
+    right_click(&mut app, "Why two?");
     choose(&mut app, "Edit draft");
     assert_eq!(
         app.doc.writing().map(|w| w.text.text().to_owned()),
@@ -498,11 +555,14 @@ fn the_menu_of_a_thread_runs_its_focused_keys() {
         menu_rows(&app),
         [
             "Reply r",
+            "Ask agent a",
+            "Fix with agent f",
             "Resolve x",
             "Unfold z",
             "Open on host o",
             "Copy comment",
-            "Copy thread"
+            "Copy thread",
+            "Copy as prompt y"
         ]
     );
     let opened = choose(&mut app, "Open on host");
@@ -514,6 +574,21 @@ fn the_menu_of_a_thread_runs_its_focused_keys() {
             .comments
             .iter()
             .any(|c| c.id == "p1" && c.resolved)
+    );
+}
+
+/// The command panel's `"` copies the focused thread as a prompt, as the
+/// menu's entry does.
+#[test]
+fn the_command_panel_copies_the_focused_thread_as_a_prompt() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut app = marked(&dir, &Config::default());
+    right_click(&mut app, "Because.");
+    let menu = choose(&mut app, "Copy as prompt");
+    key(&mut app, ' ');
+    assert_eq!(press(&mut app, Key::Char('"')), menu);
+    assert!(
+        matches!(&menu, Some(Action::Copy { note, .. }) if note == "copied a thread as a prompt")
     );
 }
 
@@ -635,8 +710,8 @@ fn the_menu_of_a_thread_copies_a_comment_or_the_thread() {
     let mut app = marked(&dir, &config);
     right_click(&mut app, "Because.");
     assert_eq!(
-        menu_rows(&app)[menu_rows(&app).len() - 2..],
-        ["Copy comment", "Copy thread alt+c"]
+        menu_rows(&app)[menu_rows(&app).len() - 3..],
+        ["Copy comment", "Copy thread alt+c", "Copy as prompt y"]
     );
     assert_eq!(
         choose(&mut app, "Copy comment"),

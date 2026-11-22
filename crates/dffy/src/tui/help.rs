@@ -1,10 +1,13 @@
 //! The `?` overlay: the key bindings in effect, the config's included, in
-//! five tabs shown one at a time. Each action gets one row: its first key,
-//! at most one other (dimmed), and a few words. Actions without a key are
-//! left out, since the command panel reaches them; docs/keys.md has every
-//! key and the full descriptions. `/` searches all tabs at once. A wide
-//! screen gets a tab's rows in two columns; a narrow one (a phone) gets
-//! the whole screen and one column, scrolled with `j`/`k`.
+//! seven tabs shown one at a time, a tab of several groups titling each.
+//! Each action gets a row in each table it's bound in (the diff's, and the
+//! tree's, a thread's and a conflict's under titles of their own): its
+//! first key there, at most one other (dimmed), and a few words. Actions
+//! without a key are left out, since the command panel reaches them;
+//! docs/keys.md has every key and the full descriptions. `/` searches all
+//! tabs at once. A wide screen gets a tab's rows in two columns; a narrow
+//! one (a phone) gets the whole screen and one column, scrolled with
+//! `j`/`k`.
 
 use std::ops::Range;
 
@@ -12,7 +15,7 @@ use dffy_core::view::Attributes;
 use unicode_width::UnicodeWidthStr;
 
 use super::fuzzy;
-use crate::keys::{Action, Chord, Group, Keys};
+use crate::keys::{Action, Chord, Keys, Tab};
 use crate::term::{Grid, Key, Mods};
 use crate::theme::{Role, Style, Theme};
 
@@ -20,10 +23,16 @@ use crate::theme::{Role, Style, Theme};
 pub(super) const FULL_SCREEN_BELOW: usize = 70;
 const TITLE: &str = " keybinds ";
 const CLOSE: &str = " esc close ";
-const HINTS: &str = "tab section · / search · esc close";
-const TABS: [&str; 5] = ["Move", "Files", "View", "Copy", "Other"];
-const FILES: usize = 1;
-const TREE_TITLE: &str = "in the tree";
+pub(super) const HINTS: &str = "tab section · / search · esc close";
+const TABS: [Tab; 7] = [
+    Tab::Move,
+    Tab::Files,
+    Tab::View,
+    Tab::Git,
+    Tab::Copy,
+    Tab::Review,
+    Tab::General,
+];
 /// Between a row's keys and its label.
 const GAP: usize = 2;
 const COLUMN_GAP: usize = 4;
@@ -45,22 +54,40 @@ pub(super) struct Help {
     titles: (usize, Vec<Range<usize>>),
 }
 
-fn tab(group: Group) -> usize {
-    match group {
-        Group::Navigation => 0,
-        Group::Files => FILES,
-        Group::View => 2,
-        Group::Copy => 3,
-        Group::Changes | Group::Modes | Group::Other => 4,
+fn tab(tab: Tab) -> usize {
+    TABS.iter().position(|&t| t == tab).unwrap_or(0)
+}
+
+/// The table a row's keys are from: the diff's, or one that comes first
+/// somewhere, listed under its own title.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum Section {
+    Main,
+    Tree,
+    Thread,
+    Conflict,
+}
+
+impl Section {
+    const TITLED: [Self; 3] = [Self::Tree, Self::Thread, Self::Conflict];
+
+    fn title(self) -> &'static str {
+        match self {
+            Self::Main => "",
+            Self::Tree => "in the tree",
+            Self::Thread => "on a thread",
+            Self::Conflict => "in a conflict",
+        }
     }
 }
 
 /// An action's row: in its group's tab, or for keys from the tree's own
-/// table, in the Files tab's tree group.
+/// table, in the Files tab's tree group; a thread's keys in a group of
+/// their own in the Review tab, and a conflict's in the Git tab.
 struct Row {
     action: Action,
     tab: usize,
-    tree: bool,
+    section: Section,
     key: String,
     alias: Option<String>,
 }
@@ -86,30 +113,44 @@ fn rank(chord: Chord) -> u8 {
     }
 }
 
-/// Every action with a key, tab by tab, each tab's tree group last.
+/// Every action with a key, tab by tab, each tab's titled groups last.
 fn rows(keys: &Keys) -> Vec<Row> {
+    let sections = [
+        Section::Main,
+        Section::Tree,
+        Section::Thread,
+        Section::Conflict,
+    ];
     let mut rows: Vec<Row> = Action::ALL
         .iter()
         .flat_map(|&action| {
-            [false, true].into_iter().filter_map(move |tree| {
-                // A thread's keys and a conflict's show with the diff's:
-                // both are in it.
-                let thread = (keys.thread_chords(action))
-                    .chain(keys.conflict_chords(action))
-                    .filter(move |_| !tree);
-                let mut chords = keys.chords(tree, action).chain(thread);
+            sections.into_iter().filter_map(move |section| {
+                let mut chords: Box<dyn Iterator<Item = Chord>> = match section {
+                    Section::Main => Box::new(keys.chords(false, action)),
+                    Section::Tree => Box::new(keys.chords(true, action)),
+                    Section::Thread => Box::new(keys.thread_chords(action)),
+                    Section::Conflict => Box::new(keys.conflict_chords(action)),
+                };
                 let first = chords.next()?;
                 Some(Row {
                     action,
-                    tab: if tree { FILES } else { tab(action.group()) },
-                    tree,
+                    tab: tab(match section {
+                        Section::Main => action.group().tab(),
+                        Section::Tree => Tab::Files,
+                        Section::Thread => Tab::Review,
+                        Section::Conflict => Tab::Git,
+                    }),
+                    section,
                     key: first.name(),
                     alias: chords.min_by_key(|&c| rank(c)).map(Chord::name),
                 })
             })
         })
         .collect();
-    rows.sort_by_key(|r| (r.tab, r.tree));
+    rows.sort_by_key(|r| {
+        let group = (r.section == Section::Main).then(|| r.action.group());
+        (r.tab, r.section, group)
+    });
     rows
 }
 
@@ -166,7 +207,7 @@ impl Line<'_> {
                     (Style::PLAIN, hit),
                 );
                 if let Some(px) = place_x {
-                    let place = TABS[row.tab];
+                    let place = TABS[row.tab].title();
                     let at = (x + px).min(end.saturating_sub(place.width()));
                     if at > label_end {
                         grid.put_str(at, y, end, place, dim);
@@ -181,29 +222,66 @@ impl Line<'_> {
     }
 }
 
-/// Tab `tab`'s lines, in a left and a right column when `two`: the tree
-/// group on the right when the tab has one, else half each.
+/// Tab `tab`'s lines, in a left and a right column when `two`: the titled
+/// groups on the right when the tab has some, else half each, split
+/// between groups where it has several. The diff's
+/// keys go under their groups' titles when the tab has more than one.
 fn columns(rows: &[Row], tab: usize, two: bool) -> (Vec<Line<'_>>, Vec<Line<'_>>) {
-    let kept = |tree: bool| {
+    let kept = |section: Section| {
         rows.iter()
-            .filter(move |r| r.tab == tab && r.tree == tree)
+            .filter(move |r| r.tab == tab && r.section == section)
             .map(|r| Line::Entry(r, Vec::new(), Vec::new()))
     };
-    let mut main: Vec<Line<'_>> = kept(false).collect();
-    let mut tree: Vec<Line<'_>> = kept(true).collect();
-    if !tree.is_empty() {
-        tree.insert(0, Line::Title(TREE_TITLE));
+    let main_rows: Vec<&Row> = (rows.iter())
+        .filter(|r| r.tab == tab && r.section == Section::Main)
+        .collect();
+    let titled_groups = main_rows
+        .windows(2)
+        .any(|w| w[0].action.group() != w[1].action.group());
+    let mut main: Vec<Line<'_>> = Vec::new();
+    for (i, row) in main_rows.iter().enumerate() {
+        let group = row.action.group();
+        if titled_groups
+            && main_rows[..i]
+                .last()
+                .is_none_or(|r| r.action.group() != group)
+        {
+            if i > 0 {
+                main.push(Line::Blank);
+            }
+            main.push(Line::Title(group.title()));
+        }
+        main.push(Line::Entry(row, Vec::new(), Vec::new()));
     }
-    if two && !main.is_empty() && !tree.is_empty() {
-        return (main, tree);
+    let mut titled: Vec<Line<'_>> = Vec::new();
+    for section in Section::TITLED {
+        let mut lines = kept(section).peekable();
+        if lines.peek().is_none() {
+            continue;
+        }
+        if !titled.is_empty() {
+            titled.push(Line::Blank);
+        }
+        titled.push(Line::Title(section.title()));
+        titled.extend(lines);
     }
-    if !main.is_empty() && !tree.is_empty() {
+    if two && !main.is_empty() && !titled.is_empty() {
+        return (main, titled);
+    }
+    if !main.is_empty() && !titled.is_empty() {
         main.push(Line::Blank);
     }
-    main.append(&mut tree);
+    main.append(&mut titled);
     if two {
-        let right = main.split_off(main.len().div_ceil(2));
-        return (main, right);
+        // At the blank between groups nearest half way, which shows in
+        // neither column, else half way.
+        let half = main.len().div_ceil(2);
+        let blank = (0..main.len())
+            .filter(|&i| matches!(main[i], Line::Blank))
+            .min_by_key(|&i| i.abs_diff(half));
+        let right = main.split_off(blank.unwrap_or(half));
+        let skip = usize::from(blank.is_some());
+        return (main, right.into_iter().skip(skip).collect());
     }
     (main, Vec::new())
 }
@@ -256,8 +334,8 @@ impl Help {
                 self.switch(self.tab + TABS.len() - 1);
                 return true;
             }
-            Key::Char(c @ '1'..='5') if plain => {
-                self.switch("12345".find(c).unwrap_or(0));
+            Key::Char(c @ '1'..='7') if plain => {
+                self.switch("1234567".find(c).unwrap_or(0));
                 return true;
             }
             _ => {}
@@ -339,102 +417,46 @@ impl Help {
         scored.into_iter().map(|(_, line)| line).collect()
     }
 
-    /// The tab titles along row `y`, the open one highlighted unless a
-    /// search spans them all.
-    fn put_titles(
-        &mut self,
-        grid: &mut Grid,
-        theme: &Theme,
-        (x, y, end): (usize, usize, usize),
-        searching: bool,
-    ) {
-        let mut at = x;
-        let mut titles = Vec::with_capacity(TABS.len());
-        for (i, name) in TABS.iter().enumerate() {
-            let style = if i == self.tab && !searching {
-                let mut s = theme.selected(Style::PLAIN, true);
-                s.attributes |= Attributes::BOLD;
-                s
-            } else {
-                Style::PLAIN
-            };
-            let start = at;
-            at = grid.put_str(at, y, end, &format!(" {name} "), style);
-            titles.push(start..at);
-        }
-        self.titles = (y, titles);
-    }
-
     pub(super) fn draw(&mut self, grid: &mut Grid, theme: &Theme, keys: &Keys) {
         let (gw, gh) = (grid.width(), grid.height());
         if gw < 12 || gh < 6 {
             return;
         }
         let rows = rows(keys);
-        let widest = |f: &dyn Fn(&Row) -> usize| rows.iter().map(f).max().unwrap_or(0);
-        let label_w = widest(&|r| r.action.short().width());
-        let pair = widest(&|r| r.keys().width()) + GAP + label_w;
-        let leader = keys.chords(false, Action::Leader).next().map(Chord::name);
-        let more = match &leader {
-            Some(l) => [
-                format!("more settings: {l} · all keys: docs/keys.md"),
-                format!("settings: {l} · docs/keys.md"),
-            ],
-            None => [
-                "all keys: docs/keys.md".to_owned(),
-                "docs/keys.md".to_owned(),
-            ],
-        };
-        let full = gw < FULL_SCREEN_BELOW;
-        let two_width = 2 * pair + COLUMN_GAP + CHROME;
-        let two = !full && gw - 4 >= two_width;
-        let width = if full {
-            gw
-        } else if two {
-            two_width
-        } else {
-            (pair + GAP + TABS.iter().map(|t| t.width()).max().unwrap_or(0) + CHROME)
-                .max(more[0].width() + CHROME)
-                .min(gw - 4)
-        };
+        let Layout {
+            area,
+            label_w,
+            pair,
+            more,
+        } = layout(&rows, keys, (gw, gh));
+        let Area {
+            x0,
+            y0,
+            width,
+            height,
+            two,
+            ..
+        } = area;
         // On a tight screen the labels keep their room and a row's keys
         // drop the alias instead.
+        let widest = |f: &dyn Fn(&Row) -> usize| rows.iter().map(f).max().unwrap_or(0);
         let key_w = widest(&|r| r.keys().width())
             .min(width.saturating_sub(CHROME + GAP + label_w))
             .max(widest(&|r| r.key.width()));
-        // Sized for the longest tab, so switching doesn't resize the box.
-        let content = (0..TABS.len())
-            .map(|t| {
-                let (left, right) = columns(&rows, t, two);
-                left.len().max(right.len())
-            })
-            .max()
-            .unwrap_or(0);
-        // Borders, the tabs and two footer rows; then a blank row above and
-        // below the list when the screen has room for them.
-        let fixed = 5;
-        let gap = usize::from(!full && content + fixed + 2 <= gh - 2);
-        let chrome_rows = fixed + 2 * gap;
-        let height = if full {
-            gh
-        } else {
-            (content + chrome_rows).min(gh - 2)
-        };
-        let (x0, y0) = ((gw - width) / 2, (gh - height) / 2);
         let end = x0 + width;
         let (x, right) = (x0 + 2, end - 3);
         let dim = theme.style(Role::Dim);
         frame(grid, (x0, y0, width, height), TITLE, theme);
 
         let searching = self.editing || !self.filter.is_empty();
-        self.put_titles(grid, theme, (x, y0 + 1, right), searching);
+        let titles = (&TABS.map(Tab::title)[..], (self.tab, !searching));
+        self.titles = (y0 + 1, tab_strip(grid, theme, (x, y0 + 1, right), titles));
         let (left, right_column) = if self.filter.is_empty() {
             columns(&rows, self.tab, two)
         } else {
             (self.hits(&rows), Vec::new())
         };
-        let top = y0 + 2 + gap;
-        let list_rows = height.saturating_sub(chrome_rows);
+        let (top, list_rows) = (area.top(), area.list_rows());
         self.page = list_rows;
         let len = left.len().max(right_column.len());
         self.scroll = self.scroll.min(len.saturating_sub(list_rows));
@@ -461,15 +483,161 @@ impl Help {
 
         let room = right - x;
         let more = more.iter().find(|m| m.width() <= room).unwrap_or(&more[1]);
-        grid.put_str(x, y0 + height - 3, right, more, dim);
         let hints = if searching {
-            let cursor = if self.editing { "▏" } else { "" };
-            format!("/{}{cursor} · esc clear", self.filter)
+            search_hint(&self.filter, self.editing)
         } else {
             HINTS.to_owned()
         };
-        grid.put_str(x, y0 + height - 2, right, &hints, dim);
+        footer(grid, &area, [more, &hints], theme);
     }
+}
+
+/// The footer of a search while it's typed (`editing`) or kept.
+pub(super) fn search_hint(filter: &str, editing: bool) -> String {
+    let cursor = if editing { "▏" } else { "" };
+    format!("/{filter}{cursor} · esc clear")
+}
+
+/// The box's two footer rows, dimmed.
+pub(super) fn footer(grid: &mut Grid, area: &Area, lines: [&str; 2], theme: &Theme) {
+    let (x, right) = (area.x0 + 2, area.x0 + area.width - 3);
+    let bottom = area.y0 + area.height;
+    for (y, line) in [bottom - 3, bottom - 2].into_iter().zip(lines) {
+        grid.put_str(x, y, right, line, theme.style(Role::Dim));
+    }
+}
+
+/// Where the overlay's box goes on the screen, which the command panel
+/// shares so the two look one: its corner, size, a blank row above and
+/// below the list when there's room, and whether it holds two columns.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct Area {
+    pub x0: usize,
+    pub y0: usize,
+    pub width: usize,
+    pub height: usize,
+    pub gap: usize,
+    pub two: bool,
+}
+
+impl Area {
+    /// The rows the list has between the tabs and the two footer rows.
+    pub(super) fn list_rows(&self) -> usize {
+        self.height.saturating_sub(FIXED_ROWS + 2 * self.gap)
+    }
+
+    /// The first row of the list.
+    pub(super) fn top(&self) -> usize {
+        self.y0 + 2 + self.gap
+    }
+}
+
+/// [`Help::draw`]'s box and the widths it was sized by: the widest label,
+/// a column's keys and label, and the footer's pointer to the rest.
+struct Layout {
+    area: Area,
+    label_w: usize,
+    pair: usize,
+    more: [String; 2],
+}
+
+/// Borders, the tabs and two footer rows.
+const FIXED_ROWS: usize = 5;
+
+/// The box on a `gw` × `gh` screen of at least 12 × 6, sized by the
+/// overlay's rows for the keys in effect.
+pub(super) fn area(keys: &Keys, size: (usize, usize)) -> Area {
+    layout(&rows(keys), keys, size).area
+}
+
+fn layout(rows: &[Row], keys: &Keys, (gw, gh): (usize, usize)) -> Layout {
+    let widest = |f: &dyn Fn(&Row) -> usize| rows.iter().map(f).max().unwrap_or(0);
+    let label_w = widest(&|r| r.action.short().width());
+    let pair = widest(&|r| r.keys().width()) + GAP + label_w;
+    let leader = keys.chords(false, Action::Leader).next().map(Chord::name);
+    let more = match &leader {
+        Some(l) => [
+            format!("more settings: {l} · all keys: docs/keys.md"),
+            format!("settings: {l} · docs/keys.md"),
+        ],
+        None => [
+            "all keys: docs/keys.md".to_owned(),
+            "docs/keys.md".to_owned(),
+        ],
+    };
+    let full = gw < FULL_SCREEN_BELOW;
+    let two_width = 2 * pair + COLUMN_GAP + CHROME;
+    let two = !full && gw - 4 >= two_width;
+    let width = if full {
+        gw
+    } else if two {
+        two_width
+    } else {
+        (pair + GAP + TABS.iter().map(|t| t.title().width()).max().unwrap_or(0) + CHROME)
+            .max(more[0].width() + CHROME)
+            .min(gw - 4)
+    };
+    // Sized for the longest tab, so switching doesn't resize the box.
+    let content = (0..TABS.len())
+        .map(|t| {
+            let (left, right) = columns(rows, t, two);
+            left.len().max(right.len())
+        })
+        .max()
+        .unwrap_or(0);
+    // A blank row above and below the list when the screen has room.
+    let gap = usize::from(!full && content + FIXED_ROWS + 2 <= gh - 2);
+    let height = if full {
+        gh
+    } else {
+        (content + FIXED_ROWS + 2 * gap).min(gh - 2)
+    };
+    Layout {
+        area: Area {
+            x0: (gw - width) / 2,
+            y0: (gh - height) / 2,
+            width,
+            height,
+            gap,
+            two,
+        },
+        label_w,
+        pair,
+        more,
+    }
+}
+
+/// Tab titles along row `y` from `x`, left of `end`, tab `shown`
+/// highlighted when `open`, as it isn't while a search spans every tab.
+/// When they don't all fit, those before it are left out as far as it
+/// takes for it to show. Returns each title's columns, empty for one left
+/// out, for taps.
+pub(super) fn tab_strip(
+    grid: &mut Grid,
+    theme: &Theme,
+    (x, y, end): (usize, usize, usize),
+    (titles, (shown, open)): (&[&str], (usize, bool)),
+) -> Vec<Range<usize>> {
+    let width = |t: &[&str]| t.iter().map(|t| t.width() + 2).sum::<usize>();
+    let room = end.saturating_sub(x);
+    let first = (0..=shown)
+        .find(|&s| width(&titles[s..=shown]) <= room)
+        .unwrap_or(shown);
+    let mut at = x;
+    let mut ranges = vec![x..x; first];
+    for (i, name) in titles.iter().enumerate().skip(first) {
+        let style = if open && i == shown {
+            let mut s = theme.selected(Style::PLAIN, true);
+            s.attributes |= Attributes::BOLD;
+            s
+        } else {
+            Style::PLAIN
+        };
+        let start = at;
+        at = grid.put_str(at, y, end, &format!(" {name} "), style);
+        ranges.push(start..at);
+    }
+    ranges
 }
 
 /// A box over the screen at `x0`, `y0`, `width` by `height`: cleared, a
@@ -579,10 +747,11 @@ mod tests {
             let mut grid = Grid::new(200, 60);
             help.draw(&mut grid, &theme, &keys);
             let text: String = (0..60).map(|y| grid.row_text(y) + "\n").collect();
-            assert!(!text.contains('┃'), "{} scrolls:\n{text}", TABS[tab]);
+            let name = TABS[tab].title();
+            assert!(!text.contains('┃'), "{name} scrolls:\n{text}");
             let (y, titles) = &help.titles;
             let active = grid.row(*y)[titles[tab].start + 1].style();
-            assert_ne!(active, Style::PLAIN, "{}", TABS[tab]);
+            assert_ne!(active, Style::PLAIN, "{name}");
             let other = grid.row(*y)[titles[(tab + 1) % TABS.len()].start + 1].style();
             assert_eq!(other, Style::PLAIN);
         }
@@ -596,6 +765,63 @@ mod tests {
         let mut help = Help::default();
         press(&mut help, &keys, "2");
         insta::assert_snapshot!(shown(&mut help, &keys, 100, 20));
+    }
+
+    /// The Review tab titles its groups, Comments, Agents and Review, and
+    /// lists a thread's keys under a title of their own; the Git tab lists
+    /// a conflict's: `a` asks on a thread, takes the base in a conflict.
+    #[test]
+    fn the_review_tab_has_a_thread_group_and_git_a_conflict_group() {
+        let keys = Keys::default();
+        let mut help = Help::default();
+        press(&mut help, &keys, "6");
+        let text = shown(&mut help, &keys, 200, 60);
+        insta::assert_snapshot!(shown(&mut help, &keys, 100, 30));
+        let line = |text: &str, wanted: &str| {
+            text.lines()
+                .position(|l| l.contains(wanted))
+                .unwrap_or_else(|| panic!("{wanted}:\n{text}"))
+        };
+        let thread = line(&text, "on a thread");
+        assert!(thread < line(&text, "apply suggestion"), "{text}");
+        assert!(
+            line(&text, "Agents") < line(&text, "post the review"),
+            "{text}"
+        );
+        press(&mut help, &keys, "4");
+        let text = shown(&mut help, &keys, 200, 60);
+        assert!(
+            line(&text, "in a conflict") < line(&text, "take base"),
+            "{text}"
+        );
+        assert!(line(&text, "Stage, discard & resolve") < line(&text, "stage lines"));
+    }
+
+    /// The View tab titles its groups, Layout and Diff, and two columns
+    /// split between them rather than inside one.
+    #[test]
+    fn the_view_tab_splits_its_columns_between_groups() {
+        let keys = Keys::default();
+        let mut help = Help::default();
+        press(&mut help, &keys, "3");
+        let text = shown(&mut help, &keys, 100, 20);
+        insta::assert_snapshot!(text);
+        let first = text.lines().find(|l| l.contains("Layout"));
+        assert!(first.is_some_and(|l| l.contains("Diff")), "{text}");
+    }
+
+    /// When the tabs don't all fit, the strip starts late enough to show
+    /// the one open.
+    #[test]
+    fn the_open_tab_always_shows() {
+        let keys = Keys::default();
+        let mut help = Help::default();
+        press(&mut help, &keys, "7");
+        let text = shown(&mut help, &keys, 40, 15);
+        assert!(
+            text.lines().nth(1).is_some_and(|l| l.contains(" General ")),
+            "{text}"
+        );
     }
 
     /// Moving a thread to this branch is a key of its own, listed as any
@@ -673,7 +899,7 @@ mod tests {
         ");
     }
 
-    /// `tab`, the arrows, `h`/`l` and `1`–`5` switch tabs, round past
+    /// `tab`, the arrows, `h`/`l` and `1`–`7` switch tabs, round past
     /// either end; a tap on a title opens its tab; other keys close.
     #[test]
     fn keys_and_taps_switch_tabs() {
@@ -689,7 +915,7 @@ mod tests {
         key(&mut help, Key::Char('h'));
         key(&mut help, Key::BackTab);
         key(&mut help, Key::BackTab);
-        assert_eq!(help.tab, 4);
+        assert_eq!(help.tab, 6);
         key(&mut help, Key::Char('3'));
         assert_eq!(help.tab, 2);
         shown(&mut help, &keys, 100, 20);

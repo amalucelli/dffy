@@ -16,13 +16,14 @@
 //! listed or diffed, so a cursor from another request, or from before the
 //! diff changed, is refused instead of continuing at the wrong place.
 
+use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::io::{self, BufRead, Write};
 use std::path::{Path, PathBuf};
 
 use dffy_core::diff::Options;
-use dffy_core::git::{FileChange, Repo, Revisions};
+use dffy_core::git::{FileChange, Repo, Revisions, WhichCheckpoint};
 
 use crate::config::{Context, DefaultDiff};
 use crate::encode::{self, Compared, Detail, Files, Window};
@@ -63,10 +64,13 @@ const INSTRUCTIONS: &str = "dffy shows the changes in the git repository it was 
     (range: HEAD~3..HEAD) or any two revisions. Start with changed_files to see which files changed and by how much, then call file_diff \
     for the files that matter. With syntax: true, files whose changes are only formatting or \
     only moved code are classified, so you can skip them. list_comments returns the review \
-    comments left on the code, with their threads. Results are paged: pass next_cursor \
+    comments left on the code, with their threads, thread_prompt one thread as a prompt to \
+    answer, with its lines and the changes near them, and reply_to_thread answers in a thread. \
+    Results are paged: pass next_cursor \
     back as cursor, with the same arguments, to continue. When the user has the dffy viewer \
-    open here, open_in_viewer shows them a file at a line, focus_thread a comment thread, and \
-    viewer_selection reads the lines they selected.";
+    open here, open_in_viewer shows them a file at a line, focus_thread a comment thread, \
+    viewer_selection reads the lines they selected, and apply_suggestion applies a thread's \
+    suggested change to the working tree.";
 
 /// The tools, as `tools/list` returns them. Written readable here and
 /// compacted when listed, since a message is one line.
@@ -79,6 +83,7 @@ const TOOLS: &str = r#"[
     "type": "object",
     "properties": {
       "range": {"type": ["string", "array"], "items": {"type": "string"}, "description": "Revisions as git diff takes them: \"main..HEAD\", \"main...HEAD\", \"HEAD~3\", \"v1.0 v2.0\" (a string is split at spaces), or an array of them. Omit for uncommitted changes."},
+      "since_checkpoint": {"type": ["string", "integer"], "description": "Instead of range: \"latest\" for what changed since the user's latest dffy checkpoint, or a checkpoint's number. A checkpoint is taken as the user hands their review to an agent, so this is the agent's own turn."},
       "paths": {"type": ["string", "array"], "items": {"type": "string"}, "description": "Only files under these paths, relative to the repository root. No globs."},
       "syntax": {"type": "boolean", "default": false, "description": "Diff by syntax to fill in each file's classification (formatting_only, moved_only) and syntax outcome."},
       "counts": {"type": "boolean", "default": true, "description": "Count added and removed lines. false reads no file content: added and removed are null and binary is false."},
@@ -109,6 +114,7 @@ const TOOLS: &str = r#"[
     "properties": {
       "path": {"type": "string", "description": "The file, relative to the repository root, as changed_files lists it. A renamed file's old path works too."},
       "range": {"type": ["string", "array"], "items": {"type": "string"}, "description": "The same range as for changed_files. Omit for uncommitted changes."},
+      "since_checkpoint": {"type": ["string", "integer"], "description": "As for changed_files, instead of range."},
       "syntax": {"type": "boolean", "default": false, "description": "Diff by syntax: marks moved and reformatted lines."},
       "context": {"type": "integer", "minimum": 0, "maximum": 10000, "default": 3, "description": "Unchanged lines around each change."},
       "max_lines": {"type": "integer", "minimum": 1, "maximum": 20000, "default": 400, "description": "Lines per result, across hunks."},
@@ -190,12 +196,91 @@ const TOOLS: &str = r#"[
       "notice": {"type": ["string", "null"], "description": "A note from the integration that keeps the comments, such as that they're stale."},
       "comments": {"type": "array", "items": {"type": "object"}, "description": "Comments as the comments file holds them (docs/comments.md)."},
       "placed": {"type": "object", "additionalProperties": {"type": "object", "properties": {"side": {"type": "string"}, "start": {"type": ["integer", "null"]}, "end": {"type": ["integer", "null"]}, "lost": {"type": "boolean"}}}, "description": "Where the line threads starting on this page are in range's diff, by first comment id; empty without range or placed."},
+      "standing": {"type": "object", "additionalProperties": {"type": "string", "enum": ["posted", "draft", "local"]}, "description": "With session, where each comment on this page lives, by id: posted on the host, a draft of yours that posting sends, or local, kept here; empty without session."},
       "total_comments": {"type": "integer"},
       "next_cursor": {"type": ["string", "null"]}
     },
-    "required": ["notice", "comments", "placed", "total_comments", "next_cursor"]
+    "required": ["notice", "comments", "placed", "standing", "total_comments", "next_cursor"]
   },
   "annotations": {"readOnlyHint": true, "idempotentHint": true, "openWorldHint": false}
+},
+{
+  "name": "thread_prompt",
+  "title": "A thread as a prompt",
+  "description": "One review comment thread as a prompt to answer: where it is (path, lines and side), its comments with their authors, any suggested change, the commented lines with the lines around them, and the file's changes near them. Takes the id of any comment in the thread, from list_comments. The thread is placed on the uncommitted changes, as plain dffy shows them; when they don't change its file, its lines come as written. At most 32 KiB, cut farthest from the thread first, every cut marked in the text. Read-only.",
+  "inputSchema": {
+    "type": "object",
+    "properties": {
+      "id": {"type": "string", "description": "A comment's id, the thread's first or a reply."},
+      "session": {"type": "boolean", "default": false, "description": "The thread is in the review session the user has open in the viewer, as list_comments with session: true lists them."}
+    },
+    "required": ["id"],
+    "additionalProperties": false
+  },
+  "outputSchema": {
+    "type": "object",
+    "properties": {
+      "thread": {"type": "string", "description": "The id of the thread's first comment."},
+      "path": {"type": ["string", "null"], "description": "Its file; null for a comment on the review as a whole."},
+      "prompt": {"type": "string"},
+      "trimmed": {"type": "boolean", "description": "Something was cut to fit 32 KiB; the prompt marks where."}
+    },
+    "required": ["thread", "path", "prompt", "trimmed"]
+  },
+  "annotations": {"readOnlyHint": true, "idempotentHint": true, "openWorldHint": false}
+},
+{
+  "name": "reply_to_thread",
+  "title": "Reply in a thread",
+  "description": "Add a reply to a review comment thread, by the id of any of its comments (list_comments lists them), under your client's name. Use it to say what you changed for a thread you were asked to address. A suggestion is the replacement for the thread's lines, without a final newline. The reply is never posted to a code host as the user's: they make it theirs first. It never asks another agent, whatever it says.",
+  "inputSchema": {
+    "type": "object",
+    "properties": {
+      "id": {"type": "string", "description": "A comment's id, the thread's first or a reply."},
+      "text": {"type": "string", "description": "The reply, as Markdown."},
+      "suggestion": {"type": "string", "description": "Lines to put in place of the thread's lines; empty removes them."},
+      "session": {"type": "boolean", "default": false, "description": "The thread is in the review session the user has open in the viewer, as list_comments with session: true lists them."}
+    },
+    "required": ["id", "text"],
+    "additionalProperties": false
+  },
+  "outputSchema": {
+    "type": "object",
+    "properties": {
+      "id": {"type": "string", "description": "The reply's id."},
+      "thread": {"type": "string", "description": "The id of the thread's first comment."},
+      "author": {"type": "string"}
+    },
+    "required": ["id", "thread", "author"]
+  },
+  "annotations": {"readOnlyHint": false, "destructiveHint": false, "idempotentHint": false, "openWorldHint": false}
+},
+{
+  "name": "apply_suggestion",
+  "title": "Apply a suggestion in the viewer",
+  "description": "Put a thread's suggested change in place of its lines in the working tree, through the dffy viewer the user has open in this repository, as its s key does: the suggestion of the comment id names, or of the thread's last comment with one. It's refused, writing nothing, when the lines changed since the suggestion was written, when the viewer doesn't show the working tree, or on someone else's review that isn't checked out. The result is an unstaged change. Fails, saying so, when no viewer runs here.",
+  "inputSchema": {
+    "type": "object",
+    "properties": {
+      "id": {"type": "string", "description": "A comment's id: one with a suggestion, or any of its thread's."}
+    },
+    "required": ["id"],
+    "additionalProperties": false
+  },
+  "outputSchema": {
+    "type": "object",
+    "properties": {
+      "view": {"type": "integer"},
+      "thread": {"type": "string"},
+      "comment": {"type": "string", "description": "The comment whose suggestion went in."},
+      "path": {"type": "string"},
+      "start": {"type": "integer", "description": "The first line replaced, 1-based, as the file was."},
+      "end": {"type": "integer", "description": "The last line replaced, as the file was."},
+      "lines": {"type": "integer", "description": "How many lines went in their place; 0 removed them."}
+    },
+    "required": ["view", "thread", "comment", "path", "start", "end", "lines"]
+  },
+  "annotations": {"readOnlyHint": false, "destructiveHint": true, "idempotentHint": false, "openWorldHint": false}
 },
 {
   "name": "open_in_viewer",
@@ -277,6 +362,7 @@ pub(crate) fn serve(dir: Option<&Path>, comments: Option<&Path>, ctx: &Ctx) -> R
         base,
         ctx,
         legacy: false,
+        client: None,
     };
     let mut stdin = io::stdin().lock();
     let mut stdout = io::stdout().lock();
@@ -309,6 +395,9 @@ struct Server<'a> {
     /// An `initialize` came: requests without the per-request metadata are
     /// served as the legacy revision it chose.
     legacy: bool,
+    /// The client's name, as `initialize`'s `clientInfo` gives it: who the
+    /// replies it writes are by.
+    client: Option<String>,
 }
 
 /// A JSON-RPC error.
@@ -375,6 +464,13 @@ impl Server<'_> {
     /// The result of request `method`, as the members of its object.
     fn request(&mut self, method: &str, params: Option<&Value>) -> Result<String, Fault> {
         if method == "initialize" {
+            let info = params.and_then(|p| p.get("clientInfo"));
+            // Shown as the author; `you` is how the user's own comments
+            // show.
+            self.client = (info.and_then(|i| i.get("name")).and_then(Value::as_str))
+                .map(|n| n.chars().filter(|c| !c.is_control()).collect::<String>())
+                .map(|n| n.trim().chars().take(64).collect::<String>())
+                .filter(|n| !n.is_empty() && !n.eq_ignore_ascii_case("you"));
             return Ok(self.initialize(params));
         }
         let era = era(params, self.legacy || method == "ping")?;
@@ -472,6 +568,9 @@ impl Server<'_> {
             "file_diff" => self.file_diff(&args),
             "diff" => self.diff(&args),
             "list_comments" => self.list_comments(&args),
+            "thread_prompt" => self.thread_prompt(&args),
+            "reply_to_thread" => self.reply_to_thread(&args),
+            "apply_suggestion" => self.apply_suggestion(&args),
             "open_in_viewer" => self.open_in_viewer(&args),
             "focus_thread" => self.focus_thread(&args),
             "viewer_selection" => self.viewer_selection(&args),
@@ -676,6 +775,21 @@ impl Args<'_> {
         }
     }
 
+    /// `since_checkpoint`: `"latest"`, or a checkpoint's number.
+    fn checkpoint(&self) -> Result<Option<WhichCheckpoint>, String> {
+        match self.get("since_checkpoint") {
+            None => Ok(None),
+            Some(Value::String(s)) if s == "latest" => Ok(Some(WhichCheckpoint::Latest)),
+            Some(value) => (value.as_usize())
+                .and_then(|n| u64::try_from(n).ok())
+                .filter(|&n| n > 0)
+                .map(|n| Some(WhichCheckpoint::Number(n)))
+                .ok_or_else(|| {
+                    "since_checkpoint must be \"latest\" or a checkpoint's number".to_owned()
+                }),
+        }
+    }
+
     fn cursor(&self) -> Result<Option<Cursor>, String> {
         self.string("cursor")?
             .map(|c| Cursor::decode(c).ok_or_else(|| STALE.to_owned()))
@@ -726,6 +840,8 @@ impl Cursor {
 /// What every tool resolves: the range and the paths.
 struct Range {
     revisions: Vec<String>,
+    /// `since_checkpoint`, in place of `revisions`.
+    since: Option<WhichCheckpoint>,
     plan: Plan,
 }
 
@@ -744,19 +860,35 @@ impl Server<'_> {
         Ok(repo)
     }
 
-    /// Resolves `revisions` and `paths` (relative to the repository root)
-    /// against the repository as it is now.
-    fn range(&mut self, revisions: Vec<String>, paths: &[String]) -> Result<Range, String> {
+    /// Resolves `revisions`, or the checkpoint `since` names, and `paths`
+    /// (relative to the repository root) against the repository as it is
+    /// now.
+    fn range(
+        &mut self,
+        revisions: Vec<String>,
+        since: Option<WhichCheckpoint>,
+        paths: &[String],
+    ) -> Result<Range, String> {
         if revisions.iter().any(|r| r == "-") {
             return Err("range takes revisions; '-' (a diff on stdin) isn't one".to_owned());
+        }
+        if since.is_some() && !revisions.is_empty() {
+            return Err(
+                "since_checkpoint compares a checkpoint with the working tree; give it or range, \
+                 not both"
+                    .to_owned(),
+            );
         }
         let repo = self.repo()?;
         let root = repo
             .workdir()
             .map_or_else(|| self.base.clone(), Path::to_owned);
         let target = Revisions {
-            unstaged: revisions.is_empty() && self.ctx.config.default_diff == DefaultDiff::Unstaged,
+            unstaged: revisions.is_empty()
+                && since.is_none()
+                && self.ctx.config.default_diff == DefaultDiff::Unstaged,
             revs: revisions.clone(),
+            since_checkpoint: since,
             ..Revisions::default()
         };
         let paths: Vec<PathBuf> = paths.iter().map(PathBuf::from).collect();
@@ -769,7 +901,11 @@ impl Server<'_> {
             false,
         )
         .map_err(message)?;
-        Ok(Range { revisions, plan })
+        Ok(Range {
+            revisions,
+            since,
+            plan,
+        })
     }
 
     /// Every change of `range`, oriented and with renames paired.
@@ -808,8 +944,17 @@ impl Server<'_> {
     }
 
     fn changed_files(&mut self, args: &Args) -> Result<Output, String> {
-        args.only(&["range", "paths", "syntax", "counts", "limit", "cursor"])?;
+        args.only(&[
+            "range",
+            "since_checkpoint",
+            "paths",
+            "syntax",
+            "counts",
+            "limit",
+            "cursor",
+        ])?;
         let revisions = args.strings("range", true)?;
+        let since = args.checkpoint()?;
         let paths = args.strings("paths", false)?;
         let syntax = args.bool("syntax", false)?;
         let counts = args.bool("counts", true)?;
@@ -818,7 +963,7 @@ impl Server<'_> {
         if syntax && !counts {
             return Err("syntax: true reads every file; it needs counts left on".to_owned());
         }
-        let range = self.range(revisions, &paths)?;
+        let range = self.range(revisions, since, &paths)?;
         let changes = self.changes(&range)?;
         let mut h = request_hash("changed_files", &range);
         (syntax, counts).hash(&mut h);
@@ -873,6 +1018,7 @@ impl Server<'_> {
         args.only(&[
             "path",
             "range",
+            "since_checkpoint",
             "syntax",
             "context",
             "max_lines",
@@ -884,12 +1030,13 @@ impl Server<'_> {
             "path is required: a file from changed_files, relative to the repository root",
         )?;
         let revisions = args.strings("range", true)?;
+        let since = args.checkpoint()?;
         let syntax = args.bool("syntax", false)?;
         let context = args.number("context", 3, [0, 10_000])?;
         let max_lines = args.number("max_lines", 400, [1, 20_000])?;
         let comments = args.comments()?;
         let cursor = args.cursor()?;
-        let range = self.range(revisions, &[])?;
+        let range = self.range(revisions, since, &[])?;
         let wanted = range.plan.relative(Path::new(path)).map_err(message)?;
         let changes = self.changes(&range)?;
         let change = changes
@@ -991,7 +1138,7 @@ impl Server<'_> {
         let max_lines = args.number("max_lines_per_file", 100, [1, 20_000])?;
         let comments = args.comments()?;
         let cursor = args.cursor()?;
-        let range = self.range(revisions, &paths)?;
+        let range = self.range(revisions, None, &paths)?;
         let changes = self.changes(&range)?;
         let mut h = request_hash("diff", &range);
         (syntax, context, comments).hash(&mut h);
@@ -1135,8 +1282,8 @@ impl Server<'_> {
         paths.sort_unstable();
         paths.dedup();
         let asked = !revisions.is_empty();
-        let listed =
-            (self.range(revisions, &paths)).and_then(|range| Ok((self.changes(&range)?, range)));
+        let listed = (self.range(revisions, None, &paths))
+            .and_then(|range| Ok((self.changes(&range)?, range)));
         let (changes, range) = match listed {
             Ok(listed) => listed,
             // Unasked, a diff that can't be made, as without a worktree,
@@ -1162,7 +1309,7 @@ impl Server<'_> {
                 .collect::<Vec<_>>())
         })
         .map_err(message)?;
-        let placed: std::collections::HashMap<String, At> = placed.into_iter().flatten().collect();
+        let placed: HashMap<String, At> = placed.into_iter().flatten().collect();
         Ok((roots.iter())
             .filter_map(|c| Some((c.id.clone(), placed.get(&c.id)?.clone())))
             .collect())
@@ -1255,6 +1402,22 @@ impl Server<'_> {
         }
         structured.push_str(r#"],"placed":"#);
         placed_object(&placed, page, &mut structured);
+        structured.push_str(r#","standing":{"#);
+        if session {
+            let by_id: HashMap<&str, &review::Comment> =
+                (file.comments.iter()).map(|c| (c.id.as_str(), c)).collect();
+            for (i, comment) in page.iter().enumerate() {
+                let root = (comment.in_reply_to.as_deref()).and_then(|r| by_id.get(r).copied());
+                let standing = review::model::standing(comment, root, true);
+                if i > 0 {
+                    structured.push(',');
+                }
+                string(&mut structured, &comment.id);
+                structured.push(':');
+                string(&mut structured, standing.name().unwrap_or_default());
+            }
+        }
+        structured.push('}');
         let _ = write!(
             structured,
             r#","total_comments":{},"next_cursor":"#,
@@ -1287,8 +1450,109 @@ impl Server<'_> {
         Ok(Output { structured, text })
     }
 
+    fn thread_prompt(&mut self, args: &Args) -> Result<Output, String> {
+        args.only(&["id", "session"])?;
+        let id = args
+            .string("id")?
+            .ok_or("id is needed: a comment's id, from list_comments")?;
+        let session = args.bool("session", false)?;
+        let file = review::read(&self.comments_file(session)?)?;
+        let review_head = if session {
+            review::read_session(&self.repo()?)?.map(|pointer| pointer.head)
+        } else {
+            None
+        };
+        let review = (&file, review_head.as_deref());
+        let prompt = crate::print::thread_prompt(self.repo().ok(), review, id, self.ctx)
+            .ok_or_else(|| {
+                let elsewhere = if session {
+                    ""
+                } else {
+                    "; a review session's are listed with session: true"
+                };
+                format!("No comment has the id {id}: list_comments lists them{elsewhere}.")
+            })?;
+        let root = file.thread(id).and_then(|t| t.first().copied());
+        let mut structured = String::from(r#"{"thread":"#);
+        string(&mut structured, root.map_or(id, |c| c.id.as_str()));
+        structured.push_str(r#","path":"#);
+        optional_string(
+            &mut structured,
+            root.map(|c| c.path.as_str()).filter(|p| !p.is_empty()),
+        );
+        structured.push_str(r#","prompt":"#);
+        string(&mut structured, &prompt.text);
+        let _ = write!(structured, r#","trimmed":{}}}"#, prompt.trimmed);
+        Ok(Output {
+            structured,
+            text: prompt.text,
+        })
+    }
+
+    /// Writes a reply by the client, through the comments file's one write,
+    /// as the control API's `comments/add` does: someone else's, so never a
+    /// draft, and never an ask, which only a comment typed in the viewer is.
+    fn reply_to_thread(&mut self, args: &Args) -> Result<Output, String> {
+        args.only(&["id", "text", "suggestion", "session"])?;
+        let id = (args.string("id")?)
+            .ok_or("id is needed: a comment's id, from list_comments")?
+            .to_owned();
+        let text = (args.string("text")?)
+            .map(str::trim)
+            .filter(|t| !t.is_empty())
+            .ok_or("text is needed")?
+            .to_owned();
+        let suggestion = args.string("suggestion")?.map(str::to_owned);
+        let session = args.bool("session", false)?;
+        let file = self.comments_file(session)?;
+        let author = self
+            .client
+            .clone()
+            .unwrap_or_else(|| control::client::MCP.to_owned());
+        let reply = review::Comment {
+            text,
+            suggestion,
+            author: author.clone(),
+            ..review::Comment::default()
+        };
+        let op = review::Op::Add {
+            comment: Box::new(reply),
+            reply_to: Some(review::Target::Id(id.clone())),
+        };
+        let written = review::apply(&file, vec![op]).map_err(|e| {
+            let elsewhere = if session {
+                ""
+            } else {
+                "; a review session's are listed with session: true"
+            };
+            format!("{e}{elsewhere}")
+        })?;
+        let reply = written.into_iter().next().flatten().unwrap_or_default();
+        let thread = (review::read(&file)?.thread(&id))
+            .and_then(|t| t.first().map(|c| c.id.clone()))
+            .unwrap_or_else(|| id.clone());
+        let mut structured = String::from(r#"{"id":"#);
+        string(&mut structured, &reply);
+        structured.push_str(r#","thread":"#);
+        string(&mut structured, &thread);
+        structured.push_str(r#","author":"#);
+        string(&mut structured, &author);
+        structured.push('}');
+        Ok(Output {
+            structured,
+            text: format!("Replied in thread {thread} as {author}: comment {reply}."),
+        })
+    }
+
     /// What `range` compares, in words.
     fn compared(&self, range: &Range) -> String {
+        match range.since {
+            Some(WhichCheckpoint::Latest) => {
+                return "the changes since the latest checkpoint".to_owned();
+            }
+            Some(WhichCheckpoint::Number(n)) => return format!("the changes since checkpoint {n}"),
+            None => {}
+        }
         if !range.revisions.is_empty() {
             return range.revisions.join(" ");
         }
@@ -1360,6 +1624,31 @@ impl Server<'_> {
             format!(
                 "The viewer shows {path}, and focuses the thread of comment {id} once it's placed there."
             )
+        };
+        Ok(Output {
+            structured: compact(&result),
+            text,
+        })
+    }
+
+    fn apply_suggestion(&mut self, args: &Args) -> Result<Output, String> {
+        args.only(&["id"])?;
+        let id = args.string("id")?.ok_or("id is needed")?.to_owned();
+        let result = self.viewer("comments/applySuggestion", vec![("id", control::text(id))])?;
+        let field = |key: &str| result.get(key).and_then(Value::as_str).unwrap_or_default();
+        let number = |key: &str| result.get(key).and_then(Value::as_usize).unwrap_or(0);
+        let (path, start, end) = (field("path"), number("start"), number("end"));
+        let at = if start == end {
+            format!("{path}:{start}")
+        } else {
+            format!("{path}:{start}-{end}")
+        };
+        let text = match number("lines") {
+            0 => format!("Removed {at}, as comment {} suggested.", field("comment")),
+            _ => format!(
+                "Applied comment {}'s suggestion to {at}: an unstaged change.",
+                field("comment")
+            ),
         };
         Ok(Output {
             structured: compact(&result),
@@ -1743,6 +2032,9 @@ mod tests {
                 "file_diff",
                 "diff",
                 "list_comments",
+                "thread_prompt",
+                "reply_to_thread",
+                "apply_suggestion",
                 "open_in_viewer",
                 "focus_thread",
                 "viewer_selection"

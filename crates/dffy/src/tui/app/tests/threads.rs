@@ -1,9 +1,9 @@
 use super::support::*;
 
 /// `c` on a selection opens a text box right under it, where every key
-/// types, `enter` and a paste included; `esc` saves the text on the
+/// types, shift+enter and a paste included; `enter` saves the text on the
 /// selected lines with their anchor and distance, and the new thread
-/// shows there, focused, with its mark in the gutter.
+/// shows there with its mark in the gutter.
 #[test]
 fn c_writes_a_comment_in_a_box_under_the_selection() {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -17,11 +17,11 @@ fn c_writes_a_comment_in_a_box_under_the_selection() {
     assert!(app.doc.selection.is_none());
     typed(&mut app, "Why these? q");
     press(&mut app, Key::Backspace);
-    press(&mut app, Key::Enter);
+    app.event(Event::Input(Input::Key(Key::Enter, Mods::SHIFT)));
     app.event(Event::Input(Input::Paste("Pasted\r\nlines".to_owned())));
     insta::assert_snapshot!("comment_box", screen(&mut app));
     assert!(!path.exists(), "nothing saved while writing");
-    press(&mut app, Key::Esc);
+    press(&mut app, Key::Enter);
     assert!(app.doc.writing().is_none());
     let saved = read_comments(&path);
     let [comment] = saved.comments.as_slice() else {
@@ -49,8 +49,10 @@ fn c_writes_a_comment_in_a_box_under_the_selection() {
     assert_eq!(anchor.after, ["line 3", "line four"]);
     assert_eq!(comment.distance, Some(2));
     let shown = screen(&mut app);
-    // Outside a review session nothing is posted, so nothing's a draft.
-    let rows: Vec<&str> = shown.lines().filter(|l| l.contains('●')).collect();
+    let rows: Vec<&str> = shown
+        .lines()
+        .filter(|l| l.contains("1┌ ") || l.contains("2└ "))
+        .collect();
     assert_eq!(rows.len(), 2, "{shown}");
     assert!(rows[0].contains("line 1") && rows[1].contains("line 2"));
     let below = shown
@@ -58,11 +60,10 @@ fn c_writes_a_comment_in_a_box_under_the_selection() {
         .skip_while(|l| !l.contains("line 2"))
         .nth(1)
         .unwrap_or_default();
-    assert!(below.contains("▾ you · just now ━"), "{shown}");
-    assert_eq!(
-        app.doc.focused().map(|t| t.root.as_str()),
-        Some(comment.id.as_str())
-    );
+    // Outside a review session nothing is posted, so it isn't a draft.
+    // Saved with `enter`, the keys stay the diff's.
+    assert!(below.contains("▾ you · just now ─"), "{shown}");
+    assert_eq!(app.doc.focused(), None);
 
     // An empty box saves nothing.
     press(&mut app, Key::Esc);
@@ -81,6 +82,42 @@ fn c_writes_a_comment_in_a_box_under_the_selection() {
     press(&mut app, Key::Esc);
     assert!(screen(&mut app).contains("draft deleted"));
     assert_eq!(read_comments(&path).comments.len(), 0);
+}
+
+/// The rail on a new thread's lines stays while its box is open, through
+/// a scroll, and goes with the box, left or saved.
+#[test]
+fn a_new_threads_rail_goes_with_its_box() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut app = app(100, 20);
+    app.set_comments(dir.path().join("comments.json"));
+    screen(&mut app);
+    // What the mark column of each unchanged line shows.
+    let marks = |app: &mut App| -> String {
+        (screen(app).lines())
+            .filter_map(|l| l.split_once(" │ line ")?.0.chars().last())
+            .filter(|&c| c != ' ')
+            .collect()
+    };
+    // Lines 1 to 7, the last of them still on screen after a scroll.
+    typed(&mut app, "vjjjjjjc");
+    assert_eq!(marks(&mut app), "┌││││└");
+    for (delta, shown) in [(1, "│││└"), (-1, "┌││││└")] {
+        app.event(Event::Input(Input::Scroll {
+            delta,
+            x: 60,
+            y: 10,
+        }));
+        assert_eq!(marks(&mut app), shown, "after a scroll by {delta}");
+    }
+    press(&mut app, Key::Esc);
+    assert_eq!(marks(&mut app), "", "left empty");
+    key(&mut app, 'v');
+    key(&mut app, 'c');
+    assert_eq!(marks(&mut app), "[");
+    typed(&mut app, "Why?");
+    press(&mut app, Key::Enter);
+    assert_eq!(marks(&mut app), "●", "saved");
 }
 
 /// A `d` armed for one draft doesn't outlast the mouse: after a click
@@ -185,6 +222,152 @@ fn an_untouched_suggestion_saves_nothing() {
     key(&mut app, 'S');
     press(&mut app, Key::Esc);
     assert!(!path.exists() || read_comments(&path).comments.is_empty());
+}
+
+/// Once applied, a suggestion's thread moves to the lines it put there and
+/// stays open, its comment marked applied with what it replaced: drawn
+/// so, and `s` takes it back rather than applying it again.
+#[test]
+fn an_applied_suggestion_moves_its_thread_and_applies_once() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("comments.json");
+    let mut app = app(100, 30);
+    app.set_comments(path.clone());
+    screen(&mut app);
+    key(&mut app, 'S');
+    typed(&mut app, "Shorter");
+    press(&mut app, Key::Esc);
+    screen(&mut app);
+    let Some(Action::ApplySuggestion(suggestion)) = press(&mut app, Key::Char('s')) else {
+        panic!("not applied: {}", status(&mut app));
+    };
+    let mut moved = Anchor::new(&suggestion.diff.new, 0..1);
+    moved.before = vec!["above".to_owned()];
+    app.event(Event::Applied(Ok(annotation::Applied {
+        replaced: 0..1,
+        lines: 0..1,
+        anchor: Some(moved.clone()),
+    })));
+    let marked = &read_comments(&path).comments[0];
+    assert!(marked.applied.is_some(), "{marked:?}");
+    assert_eq!(marked.replaced.as_deref(), Some("line 1"));
+    assert_eq!(
+        (marked.anchor.as_ref(), marked.resolved),
+        (Some(&moved), false),
+        "on the new lines, still open"
+    );
+    let shown = screen(&mut app);
+    assert!(shown.contains("you · just now · applied ━"), "{shown}");
+    assert!(shown.contains("suggested change, applied:"), "{shown}");
+    assert!(!shown.contains("s apply"), "{shown}");
+    let back = press(&mut app, Key::Char('s'));
+    assert!(
+        matches!(&back, Some(Action::ApplySuggestion(s)) if s.lines == ["line 1"]),
+        "{back:?}"
+    );
+}
+
+/// `s` on a thread applies its last suggestion to the lines it's on, as
+/// the loop writes them; an empty one deletes them, and a thread without
+/// one says so. Another `s` while one is applied waits.
+#[test]
+fn s_on_a_thread_applies_its_suggestion() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("comments.json");
+    let mut app = app(100, 30);
+    app.set_comments(path.clone());
+    screen(&mut app);
+    key(&mut app, 'c');
+    typed(&mut app, "No suggestion");
+    press(&mut app, Key::Esc);
+    screen(&mut app);
+    assert_eq!(press(&mut app, Key::Char('s')), None);
+    assert!(status(&mut app).contains("this thread has no suggestion to apply"));
+    esc(&mut app);
+    key(&mut app, 'S');
+    typed(&mut app, "Shorter");
+    press(&mut app, Key::Esc);
+    screen(&mut app);
+    let root = read_comments(&path).comments[1].id.clone();
+    let applied = |app: &mut App| match press(app, Key::Char('s')) {
+        Some(Action::ApplySuggestion(suggestion)) => suggestion,
+        other => panic!("{other:?}: {}", status(app)),
+    };
+    let suggestion = applied(&mut app);
+    assert_eq!(
+        (
+            suggestion.at,
+            &suggestion.anchor.lines[..],
+            &suggestion.lines[..],
+            &suggestion.checkout,
+            &suggestion.comment,
+            &suggestion.diff.change.path
+        ),
+        (
+            0,
+            &["line 1".to_owned()][..],
+            &["line 1".to_owned()][..],
+            &None,
+            &root,
+            &FILE.into()
+        )
+    );
+    assert_eq!(press(&mut app, Key::Char('s')), None);
+    assert!(status(&mut app).contains("still applying"));
+    let said = |app: &App| app.message.as_ref().map(|(m, _)| m.clone());
+    let done = |replaced: Range<usize>, lines: Range<usize>, anchor: Option<Anchor>| {
+        Event::Applied(Ok(annotation::Applied {
+            replaced,
+            lines,
+            anchor,
+        }))
+    };
+    app.event(done(0..1, 0..1, None));
+    assert_eq!(
+        said(&app),
+        Some(format!("applied the suggestion to {FILE}:1 · x resolves"))
+    );
+
+    let empty = Op::Add {
+        comment: Box::new(review::Comment {
+            text: "Drop it".to_owned(),
+            suggestion: Some(String::new()),
+            author: "octocat".to_owned(),
+            ..review::Comment::default()
+        }),
+        reply_to: Some(Target::Id(root.clone())),
+    };
+    review::apply(&path, vec![empty]).expect("applies");
+    app.event(Event::Comments);
+    screen(&mut app);
+    assert_eq!(applied(&mut app).lines, Vec::<String>::new());
+    app.event(done(0..1, 0..0, None));
+    assert_eq!(
+        said(&app),
+        Some(format!("deleted {FILE}:1, as suggested · x resolves"))
+    );
+
+    // Written elsewhere, as through MCP: its line breaks are read as lines,
+    // a last one ending the last line rather than adding an empty one.
+    for (suggestion, lines) in [
+        ("line 1\r\nline 1b\r\n", &["line 1", "line 1b"][..]),
+        ("\n", &[""][..]),
+    ] {
+        let written = Op::Add {
+            comment: Box::new(review::Comment {
+                text: "This way".to_owned(),
+                suggestion: Some(suggestion.to_owned()),
+                author: "an-mcp-client".to_owned(),
+                ..review::Comment::default()
+            }),
+            reply_to: Some(Target::Id(root.clone())),
+        };
+        review::apply(&path, vec![written]).expect("applies");
+        app.event(Event::Comments);
+        screen(&mut app);
+        assert_eq!(applied(&mut app).lines, lines, "{suggestion:?}");
+        app.event(done(0..1, 0..lines.len(), None));
+    }
 }
 
 /// Threads show under the lines they're on, each comment with its
@@ -370,7 +553,7 @@ fn the_comments_panel_lists_the_conversation_first() {
     assert!(lines[order[3] + 1].contains(FILE.rsplit('/').next().expect("a name")));
     key(&mut app, 'g');
     assert_eq!(at(&app), (0, "d1".to_owned()));
-    key(&mut app, 'f');
+    key(&mut app, 'c');
     let open = left(&mut app);
     assert!(
         !open.contains("Conversation"),
@@ -564,7 +747,11 @@ fn moving_through_the_comments_shows_each_thread_in_the_diff() {
             at_(11, "")
         ]
     );
-    assert!(status(&mut app).contains("r reply · e edit · d delete · x resolve"));
+    screen(&mut app);
+    assert_eq!(
+        note(&mut app).as_deref(),
+        Some("r reply · a ask · x resolve · f fix · e edit · d delete")
+    );
     assert_eq!(app.pane, Pane::Tree);
     key(&mut app, 'k');
     assert_eq!(at(&app), at_(11, "m1"));
@@ -670,8 +857,8 @@ fn thread_keys_follow_the_thread_table() {
     }
     screen(&mut app);
     assert_eq!(
-        note(&app).as_deref(),
-        Some("r reply · e edit · d delete · R resolve")
+        note(&mut app).as_deref(),
+        Some("r reply · a ask · R resolve · f fix · e edit · d delete")
     );
     key(&mut app, 'x');
     assert!(!resolved());
@@ -704,13 +891,13 @@ fn the_comments_panel_acts_on_a_thread_not_in_the_diff() {
     );
     screen(&mut app);
     assert_eq!(
-        note(&app).as_deref(),
-        Some("r reply · e edit · d delete · x resolve")
+        note(&mut app).as_deref(),
+        Some("r reply · a ask · x resolve · f fix · e edit · d delete")
     );
     app.resize(200, 30);
     let shown = status(&mut app);
     assert!(
-        shown.contains("r reply") && shown.contains("f filter"),
+        shown.contains("r reply") && shown.contains("c filter"),
         "{shown}"
     );
     key(&mut app, 'x');
@@ -718,7 +905,7 @@ fn the_comments_panel_acts_on_a_thread_not_in_the_diff() {
     assert_eq!((app.pane, selected(&app)), (Pane::Tree, "g1".to_owned()));
     app.message = None;
     screen(&mut app);
-    assert!(note(&app).is_some_and(|n| n.ends_with("x reopen")));
+    assert!(note(&mut app).is_some_and(|n| n.contains("x reopen")));
     key(&mut app, 'x');
     assert!(find("g1").is_some_and(|c| !c.resolved));
 
@@ -759,7 +946,10 @@ fn the_comments_panel_acts_on_a_thread_not_in_the_diff() {
     app.message = None;
     key(&mut app, '/');
     assert_eq!(selected(&app), "m1");
-    assert!(!note(&app).is_some_and(|n| n.contains("r reply")), "typing");
+    assert!(
+        !note(&mut app).is_some_and(|n| n.contains("r reply")),
+        "typing"
+    );
     typed(&mut app, "rexdo");
     assert!(app.panel.as_ref().is_some_and(|p| p.editing));
     assert!(left(&mut app).contains("no thread matches /rexdo"));
@@ -810,7 +1000,7 @@ fn the_comments_panel_writes_in_the_diff_on_a_thread_shown_there() {
     assert!(matches!(writes(&app), Some(Writes::Edit { root, .. }) if root == "f1"));
 }
 
-/// `f` steps through All, Open, Drafts and Resolved, `F` back; the title
+/// `c` steps through All, Open, Drafts and Resolved, `C` back; the title
 /// counts what's kept of every thread and names the filter. `/` keeps
 /// the threads whose path, author or text has what's typed, with the
 /// filter; `esc` clears it, then hands the keys to the diff. A filter
@@ -837,23 +1027,23 @@ fn the_comments_panel_filters_by_state_and_text() {
         .filter(|t| shown.contains(t))
         .collect::<Vec<_>>()
     };
-    key(&mut app, 'f');
+    key(&mut app, 'c');
     assert_eq!(
         texts(&mut app),
         ["On the whole", "Why two?", "Fifty?", "Moved away", "Gone"]
     );
     assert!(title(&mut app).starts_with("┌ Comments · 5/6 · open ─"));
-    key(&mut app, 'f');
+    key(&mut app, 'c');
     assert_eq!(
         texts(&mut app),
         ["On the whole", "Why two?", "Moved away", "Gone"]
     );
-    key(&mut app, 'f');
+    key(&mut app, 'c');
     assert_eq!(texts(&mut app), ["Old four"]);
     assert_eq!(selected(&app), "r1");
     assert_eq!(at(&app).1, "r1", "the diff follows the selection");
-    key(&mut app, 'F');
-    key(&mut app, 'F');
+    key(&mut app, 'C');
+    key(&mut app, 'C');
     typed(&mut app, "/octo");
     assert_eq!(texts(&mut app), ["Fifty?"], "the author");
     assert!(screen(&mut app).contains("└« /octo▏ ─"));
@@ -869,14 +1059,14 @@ fn the_comments_panel_filters_by_state_and_text() {
     );
     press(&mut app, Key::Enter);
     assert!(title(&mut app).starts_with("┌ Comments · 1/6 · open · /zz9 ─"));
-    key(&mut app, 'f');
-    key(&mut app, 'f');
+    key(&mut app, 'c');
+    key(&mut app, 'c');
     assert!(
         left(&mut app).contains("no thread matches"),
         "the filter keeps the search"
     );
-    key(&mut app, 'F');
-    key(&mut app, 'F');
+    key(&mut app, 'C');
+    key(&mut app, 'C');
     press(&mut app, Key::Esc);
     assert_eq!(app.pane, Pane::Tree, "esc clears the search first");
     typed(&mut app, "/because");
@@ -884,7 +1074,7 @@ fn the_comments_panel_filters_by_state_and_text() {
     press(&mut app, Key::Enter);
     press(&mut app, Key::Esc);
     for _ in 0..4 {
-        key(&mut app, 'f');
+        key(&mut app, 'c');
     }
     assert_eq!(texts(&mut app).len(), 5, "round to Open");
     press(&mut app, Key::Esc);
@@ -908,11 +1098,11 @@ fn a_resolved_thread_with_a_draft_in_it_lists_as_a_draft() {
     }
     assert_eq!(seen, ["f1", "d1", "r1", "p1"]);
     let listed = |app: &mut App| left(app).contains("Old four");
-    key(&mut app, 'f');
+    key(&mut app, 'c');
     assert!(!listed(&mut app), "not open");
-    key(&mut app, 'f');
+    key(&mut app, 'c');
     assert!(listed(&mut app), "a draft");
-    key(&mut app, 'f');
+    key(&mut app, 'c');
     assert!(listed(&mut app), "resolved");
 }
 
@@ -1156,16 +1346,16 @@ fn a_focused_thread_takes_its_keys_only_while_focused() {
     assert_eq!(app.doc.focused().map(|t| t.root.as_str()), Some("d1"));
     app.message = None;
     let shown = screen(&mut app);
+    // The most used first, so a narrow status bar keeps them.
     assert!(
-        shown.contains("r reply · e edit · d delete · x resolve"),
+        shown.contains("r reply · a ask · x resolve · f fix · e edit · d …"),
         "{shown}"
     );
-    let hint = note(&app).unwrap_or_default();
-    assert!(hint.ends_with("z fold · esc"), "{hint}");
-    key(&mut app, 'z');
-    let hint = note(&app).unwrap_or_default();
-    assert!(hint.ends_with("z unfold · esc"), "{hint}");
-    key(&mut app, 'z');
+    let hint = note(&mut app).unwrap_or_default();
+    assert_eq!(
+        hint, "r reply · a ask · x resolve · f fix · e edit · d delete",
+        "no fold or esc"
+    );
     key(&mut app, 'x');
     assert!(find("d1").is_some_and(|c| c.resolved));
     key(&mut app, 'x');
@@ -1438,8 +1628,8 @@ fn a_review_runs_progress_reads_the_comments_file_again() {
 
 /// Only a review session's file has drafts: your comments not posted
 /// in it. In a local review nothing is posted, so nothing is a draft,
-/// and an agent's comment in a session is left for you, marked, rather
-/// than posted under your name.
+/// and an agent's reply in a session, with how the agent ran, is left for
+/// you, marked, rather than posted under your name.
 #[test]
 fn drafts_are_yours_in_a_review_session() {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -1451,6 +1641,7 @@ fn drafts_are_yours_in_a_review_session() {
                 path: FILE.to_owned(),
                 text: "From the agent".to_owned(),
                 author: "claude".to_owned(),
+                label: Some("read-only sandbox".to_owned()),
                 ..review::Comment::default()
             }),
             reply_to: Some(Target::Id("d1".to_owned())),
@@ -1460,14 +1651,17 @@ fn drafts_are_yours_in_a_review_session() {
     app.event(Event::Comments);
     let shown = screen(&mut app);
     assert!(!shown.contains("draft") && !shown.contains('◆'), "{shown}");
-    assert!(!shown.contains("not posted"), "{shown}");
+    assert!(!shown.contains("· private"), "no origin words: {shown}");
     assert_eq!(app.comments.as_ref().map(Comments::counts), Some((6, 0)));
 
     let prepare = app.start_review("test".to_owned(), session(&dir, HEAD, None));
     said(&mut app, prepare, Said::Done(Ok(())));
     let shown = screen(&mut app);
     assert!(shown.contains("▾ you · 2h ago · draft"), "{shown}");
-    assert!(shown.contains("claude · just now · not posted"), "{shown}");
+    assert!(
+        shown.contains("claude · just now · read-only sandbox · private · A sh"),
+        "{shown}"
+    );
     assert_eq!(app.comments.as_ref().map(Comments::counts), Some((6, 5)));
     assert_eq!(
         app.sending(true).comments,
@@ -1475,16 +1669,106 @@ fn drafts_are_yours_in_a_review_session() {
         "the agent's reply isn't sent"
     );
 
-    // `a` on its thread makes it yours: a draft, sent with the rest.
+    // `A` on its thread makes it yours: a draft, sent with the rest.
     app.reviewing.job = None;
     app.follow_thread("d1");
-    key(&mut app, 'a');
+    key(&mut app, 'A');
     assert!(status(&mut app).contains("now yours: 1 draft"));
     assert_eq!(app.sending(true).comments, 6);
     let authors: Vec<String> = (read_comments(&path).comments.into_iter())
         .map(|c| c.author)
         .collect();
     assert!(!authors.contains(&"claude".to_owned()), "{authors:?}");
+}
+
+/// A review session's file: a resolved thread of yours with an agent's
+/// reply, an open one of yours, and a resolved thread on the host holding
+/// your draft reply and the host's.
+fn resolved_mix() -> String {
+    let c = |id: &str, author: &str, rest: &str| {
+        format!(
+            r#"{{"id":"{id}","path":"{FILE}","text":"{id}","author":"{author}","created":"2026-11-17T10:00:00Z"{rest}}}"#
+        )
+    };
+    let comments = [
+        c("l1", "", r#","resolved":true"#),
+        c("l2", "claude", r#","resolved":false,"in_reply_to":"l1""#),
+        c("o1", "", r#","resolved":false"#),
+        c("h1", "octocat", r#","resolved":true,"ref":"github:1""#),
+        c("h2", "", r#","resolved":false,"in_reply_to":"h1""#),
+        c(
+            "h3",
+            "ana",
+            r#","resolved":false,"in_reply_to":"h1","ref":"github:2""#,
+        ),
+        // Yours, deleted on the host, under a reply still there.
+        c(
+            "g1",
+            "",
+            r#","resolved":true,"post_error":"deleted on the host""#,
+        ),
+        c(
+            "g2",
+            "ana",
+            r#","resolved":false,"in_reply_to":"g1","ref":"github:3""#,
+        ),
+    ];
+    format!(r#"{{"version":1,"comments":[{}]}}"#, comments.join(","))
+}
+
+/// `clear_resolved` asks first, naming what goes, and any key but `y`
+/// keeps it all. `y` deletes the resolved threads with nothing on the
+/// host, and from one on the host only what isn't posted, saying the
+/// host's threads stay; open threads stay.
+#[test]
+fn clearing_resolved_threads_deletes_only_what_lives_here() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut app = reviewed(&dir, &resolved_mix(), (120, 30));
+    let path = dir.path().join("comments.json");
+    let ids = || -> Vec<String> {
+        (read_comments(&path).comments.into_iter())
+            .map(|c| c.id)
+            .collect()
+    };
+    let clear = |app: &mut App| {
+        press(app, Key::Char(' '));
+        key(app, '-');
+        status(app)
+    };
+    let asked = "delete 1 resolved thread and 1 private comment in host threads? y/n";
+    assert!(clear(&mut app).contains(asked));
+    key(&mut app, 'n');
+    assert!(status(&mut app).contains("kept"));
+    assert_eq!(ids(), ["l1", "l2", "o1", "h1", "h2", "h3", "g1", "g2"]);
+
+    assert!(clear(&mut app).contains(asked));
+    key(&mut app, 'y');
+    assert_eq!(ids(), ["o1", "h1", "h3", "g1", "g2"]);
+    assert_eq!(
+        note(&mut app).as_deref(),
+        Some(
+            "deleted 1 resolved thread and 1 private comment in host threads · host threads \
+             stay; resolve hides them"
+        )
+    );
+    assert!(clear(&mut app).contains("no resolved threads to delete · host threads stay"));
+}
+
+/// `d` twice on a resolved thread with nothing on the host deletes it
+/// whole, not only its last comment.
+#[test]
+fn d_deletes_a_resolved_local_thread_whole() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut app = reviewed(&dir, &resolved_mix(), (120, 30));
+    app.follow_thread("l1");
+    key(&mut app, 'd');
+    assert!(status(&mut app).contains("deletes this thread, replies too"));
+    key(&mut app, 'd');
+    let left: Vec<String> = (read_comments(&dir.path().join("comments.json")).comments)
+        .into_iter()
+        .map(|c| c.id)
+        .collect();
+    assert_eq!(left, ["o1", "h1", "h2", "h3", "g1", "g2"]);
 }
 
 /// The local review's file holds every branch's threads: the viewer
@@ -1752,4 +2036,371 @@ fn a_reply_whose_thread_goes_keeps_its_text() {
         saved.in_reply_to.is_none() && saved.end.is_none(),
         "{saved:?}"
     );
+}
+
+/// `enter` saves a new comment and leaves the keys to the diff, saying
+/// that `m` goes to it, as `m` right after does: `s` there cycles the
+/// layout rather than applying, and `f` goes to the next file. `esc`
+/// keeps it focused, saying how to delete it; a reply keeps the focus.
+#[test]
+fn enter_saves_a_new_comment_and_leaves_the_keys_to_the_diff() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("comments.json");
+    let mut app = app(100, 30);
+    app.set_comments(path.clone());
+    screen(&mut app);
+    key(&mut app, 'S');
+    typed(&mut app, "Shorter");
+    press(&mut app, Key::Enter);
+    assert_eq!(read_comments(&path).comments.len(), 1);
+    let shown = status(&mut app);
+    assert!(shown.contains("comment saved · m goes to it"), "{shown}");
+    assert_eq!(focused(&app), None);
+    let layout = app.view;
+    assert_eq!(press(&mut app, Key::Char('s')), None, "nothing applied");
+    assert_ne!(app.view, layout, "s cycles the layout");
+    key(&mut app, 'f');
+    assert_eq!(app.doc.document.pos.file, 1, "f goes to the next file");
+
+    key(&mut app, 'F');
+    key(&mut app, 'c');
+    typed(&mut app, "Second");
+    press(&mut app, Key::Enter);
+    screen(&mut app);
+    key(&mut app, 'm');
+    let second = read_comments(&path).comments[1].id.clone();
+    assert_eq!(focused(&app), Some(second.as_str()), "m goes to it");
+
+    esc(&mut app);
+    key(&mut app, 'j');
+    key(&mut app, 'c');
+    typed(&mut app, "Kept");
+    press(&mut app, Key::Esc);
+    let kept = read_comments(&path).comments[2].id.clone();
+    let shown = status(&mut app);
+    assert!(shown.contains("draft kept · d d deletes"), "{shown}");
+    screen(&mut app);
+    assert_eq!(focused(&app), Some(kept.as_str()), "esc keeps it focused");
+    key(&mut app, 'r');
+    typed(&mut app, "And a reply");
+    press(&mut app, Key::Enter);
+    screen(&mut app);
+    assert_eq!(
+        focused(&app),
+        Some(kept.as_str()),
+        "a reply keeps the focus"
+    );
+}
+
+/// `A` on a thread with nothing someone else wrote unposted says so,
+/// rather than staging the lines under it.
+#[test]
+fn a_on_a_thread_with_nothing_to_adopt_says_so() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (mut app, _) = commented(&dir);
+    app.follow_thread("d1");
+    assert_eq!(press(&mut app, Key::Char('A')), None);
+    let shown = status(&mut app);
+    assert!(shown.contains("nothing here to make yours"), "{shown}");
+}
+
+/// `y` on a focused thread copies it as a prompt; text selected in one of
+/// its comments is still `y`'s to copy.
+#[test]
+fn y_on_a_thread_copies_it_as_a_prompt() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (mut app, _) = commented(&dir);
+    app.follow_thread("d1");
+    let copied = press(&mut app, Key::Char('y'));
+    assert!(
+        matches!(&copied, Some(Action::Copy { note, .. }) if note == "copied a thread as a prompt"),
+        "{copied:?}"
+    );
+}
+
+/// The file `diff` makes for `path`, its new side's first line `first`.
+fn with_first_line(path: &str, first: &str) -> FileDiff {
+    let mut fd = diff(path);
+    let new =
+        String::from_utf8_lossy(fd.new.bytes()).replacen("line 1\n", &format!("{first}\n"), 1);
+    fd.new = Text::new(new.into_bytes());
+    fd.hunks = hunks(&fd.old, &fd.new, &Options::default());
+    fd
+}
+
+/// `s` on an applied suggestion takes it back: the lines it replaced go in
+/// place of the suggested ones. Applied, then discarded another way, it
+/// applies again from the lines it replaced.
+#[test]
+fn s_takes_an_applied_suggestion_back_and_applies_one_discarded() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("comments.json");
+    let mut app = app(100, 30);
+    app.set_comments(path.clone());
+    screen(&mut app);
+    let original = diff(FILE);
+    let changed = with_first_line(FILE, "line one");
+    let first = review::LineNumbers {
+        old: None,
+        new: Some(0),
+    };
+    let suggested = Op::Add {
+        comment: Box::new(review::Comment {
+            path: FILE.to_owned(),
+            start: Some(first),
+            end: Some(first),
+            anchor: Some(Anchor::new(&original.new, 0..1)),
+            text: "Spell it out".to_owned(),
+            suggestion: Some("line one".to_owned()),
+            ..review::Comment::default()
+        }),
+        reply_to: None,
+    };
+    review::apply(&path, vec![suggested]).expect("applies");
+    app.event(Event::Comments);
+    screen(&mut app);
+    let root = read_comments(&path).comments[0].id.clone();
+    let s = |app: &mut App| {
+        app.follow_thread(&root);
+        match press(app, Key::Char('s')) {
+            Some(Action::ApplySuggestion(suggestion)) => {
+                (suggestion.anchor.lines, suggestion.lines)
+            }
+            other => panic!("{other:?}: {}", status(app)),
+        }
+    };
+    let lines = |l: &[&str]| l.iter().map(|&l| l.to_owned()).collect::<Vec<_>>();
+    // The list read again after a write, as the loop has it read.
+    let reload = |app: &mut App, fd: FileDiff| {
+        app.doc.document.restale();
+        let again = diffed(app, 0, fd);
+        app.event(Event::Diffed(again));
+        screen(app);
+    };
+    // Applies, as the loop writes it, and the list read again shows it.
+    let apply = |app: &mut App| {
+        assert_eq!(s(app), (lines(&["line 1"]), lines(&["line one"])));
+        app.event(Event::Applied(Ok(annotation::Applied {
+            replaced: 0..1,
+            lines: 0..1,
+            anchor: Some(Anchor::new(&changed.new, 0..1)),
+        })));
+        reload(app, with_first_line(FILE, "line one"));
+    };
+    apply(&mut app);
+    let marked = &read_comments(&path).comments[0];
+    assert_eq!(marked.replaced.as_deref(), Some("line 1"), "{marked:?}");
+    app.follow_thread(&root);
+    app.message = None;
+    app.dirty = true;
+    let shown = status(&mut app);
+    assert!(shown.contains("s revert"), "{shown}");
+
+    assert_eq!(s(&mut app), (lines(&["line one"]), lines(&["line 1"])));
+    app.event(Event::Applied(Ok(annotation::Applied {
+        replaced: 0..1,
+        lines: 0..1,
+        anchor: Some(Anchor::new(&original.new, 0..1)),
+    })));
+    let shown = status(&mut app);
+    assert!(shown.contains("took the suggestion back"), "{shown}");
+    let back = &read_comments(&path).comments[0];
+    assert_eq!(
+        (back.applied.as_ref(), back.replaced.as_ref()),
+        (None, None)
+    );
+    assert_eq!(
+        back.anchor.as_ref().map(|a| &a.lines[..]),
+        Some(&lines(&["line 1"])[..])
+    );
+    reload(&mut app, diff(FILE));
+
+    apply(&mut app);
+    // Discarded with `D`: the file has the lines it replaced again, so it
+    // says it applies.
+    reload(&mut app, diff(FILE));
+    app.follow_thread(&root);
+    app.message = None;
+    app.dirty = true;
+    let shown = status(&mut app);
+    assert!(shown.contains("s apply"), "{shown}");
+    assert_eq!(s(&mut app), (lines(&["line 1"]), lines(&["line one"])));
+    let stale = &read_comments(&path).comments[0];
+    assert_eq!(stale.applied, None, "no longer marked applied");
+}
+
+/// Runs `git` in `dir`, with no config of the user's.
+fn git_in(dir: &Path, args: &[&str]) {
+    let out = std::process::Command::new("git")
+        .current_dir(dir)
+        .args(args)
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_AUTHOR_NAME", "A")
+        .env("GIT_AUTHOR_EMAIL", "a@example.com")
+        .env("GIT_COMMITTER_NAME", "A")
+        .env("GIT_COMMITTER_EMAIL", "a@example.com")
+        .output()
+        .expect("git runs");
+    assert!(out.status.success(), "git {args:?}");
+}
+
+/// A viewer of the working tree in `d`, which changed `changed.txt` and
+/// not `kept.rs`, with the comments in `comments`: a thread with a
+/// suggestion on `kept.rs`'s line 2, and one on `gone.rs`, which isn't
+/// there. Its uncommitted changes list `changed.txt` alone.
+fn beyond_the_diff(d: &Path, comments: &Path) -> (App, Repo, ChangeSet) {
+    git_in(d, &["init", "-q", "-b", "main"]);
+    std::fs::write(d.join("changed.txt"), "a\n").expect("write");
+    std::fs::write(d.join("kept.rs"), "line 1\nline 2\nline 3\nline 4\n").expect("write");
+    git_in(d, &["add", "-A"]);
+    git_in(d, &["commit", "-q", "-m", "x"]);
+    std::fs::write(d.join("changed.txt"), "b\n").expect("write");
+    let at = |n: usize| {
+        format!(r#""side":"new","start":{{"old":null,"new":{n}}},"end":{{"old":null,"new":{n}}}"#)
+    };
+    std::fs::write(
+        comments,
+        format!(
+            r#"{{"version":1,"comments":[
+{{"id":"k1","path":"kept.rs",{},"text":"Two?","suggestion":"line TWO","author":"","created":"2026-11-17T10:00:00Z","anchor":{{"before":["line 1"],"lines":["line 2"],"after":["line 3"]}}}},
+{{"id":"g1","path":"gone.rs",{},"text":"Gone","author":"","created":"2026-11-17T10:00:00Z","anchor":{{"before":[],"lines":["gone"],"after":[]}}}}
+]}}"#,
+            at(2),
+            at(1)
+        ),
+    )
+    .expect("write");
+    let repo = Repo::discover(d).expect("repo");
+    let spec = repo.resolve(&[], false, false).expect("spec");
+    let mut set = ChangeSet::new(repo.clone(), spec, Revisions::default(), &[], false);
+    let mut app = App::new(
+        &Config::default(),
+        Theme::default_theme(),
+        "working tree".to_owned(),
+        None,
+        (140, 16),
+        Indicators::Classic,
+    );
+    set.enumerate(|change| {
+        app.event(Event::Enumerated(change));
+        ControlFlow::Continue(())
+    })
+    .expect("enumerate");
+    app.event(Event::EnumerationDone(None));
+    app.set_worktree(Some(d.to_owned()));
+    app.set_comments(comments.to_owned());
+    diff_shown(&mut app, &repo);
+    screen(&mut app);
+    (app, repo, set)
+}
+
+/// Draws, then runs the diffs the viewer asks for in the pool's worker.
+fn diff_shown(app: &mut App, repo: &Repo) {
+    app.draw();
+    let settings = crate::tui::worker::Settings {
+        options: Options::default(),
+        highlight: false,
+        grammars: crate::grammars(),
+        cache: None,
+    };
+    let jobs: Vec<Job> = (app.jobs().into_iter())
+        .filter(|job| matches!(job, Job::Diff { .. }))
+        .collect();
+    for job in jobs {
+        let done = crate::tui::worker::run(job, Some(repo), &settings);
+        app.event(Event::Diffed(done));
+    }
+}
+
+/// `enter` on a thread whose file the diff doesn't list opens that file
+/// after the others, whole and marked as having no changes, with the
+/// thread focused on its line; the panel says up front which such file
+/// isn't on disk. The file stays through a refresh of other files, and
+/// its suggestion applies there. Once the file changes, the list has it,
+/// and it's a file like any other.
+#[test]
+fn enter_opens_a_threads_file_the_diff_doesnt_list() {
+    let (repo_dir, dir) = (
+        tempfile::tempdir().expect("tempdir"),
+        tempfile::tempdir().expect("tempdir"),
+    );
+    let d = repo_dir.path();
+    let (mut app, repo, mut set) = beyond_the_diff(d, &dir.path().join("comments.json"));
+    key(&mut app, 'i');
+    let shown = screen(&mut app);
+    assert!(shown.contains("kept.rs · enter opens the file"), "{shown}");
+    assert!(shown.contains("gone.rs · file not on disk"), "{shown}");
+    app.panel.as_mut().expect("the comments show").select("k1");
+    press(&mut app, Key::Enter);
+    let files = app.doc.document.files();
+    assert_eq!(files.len(), 2);
+    assert!(files[1].is_unchanged());
+    assert_eq!(app.doc.document.pos.file, 1);
+    diff_shown(&mut app, &repo);
+    screen(&mut app);
+    assert_eq!(focused(&app), Some("k1"));
+    key(&mut app, 'i');
+    app.message = None;
+    insta::assert_snapshot!("unchanged_file", screen(&mut app));
+
+    std::fs::write(d.join("changed.txt"), "c\n").expect("write");
+    let update = set
+        .refresh(&["changed.txt".into()])
+        .expect("refresh")
+        .expect("an update");
+    app.event(Event::Refreshed(update));
+    let files = app.doc.document.files();
+    assert!(
+        files[1].is_unchanged() && !files[1].wants_diff(),
+        "kept as it was"
+    );
+    assert_eq!(app.doc.document.pos.file, 1);
+    screen(&mut app);
+    assert_eq!(focused(&app), Some("k1"));
+
+    let Some(Action::ApplySuggestion(suggestion)) = press(&mut app, Key::Char('s')) else {
+        panic!("applies: {}", status(&mut app));
+    };
+    crate::tui::apply(&repo, &suggestion).expect("applied");
+    assert_eq!(
+        std::fs::read_to_string(d.join("kept.rs")).expect("read"),
+        "line 1\nline TWO\nline 3\nline 4\n"
+    );
+    let update = set.rescan().expect("rescan").expect("an update");
+    app.event(Event::Refreshed(update));
+    let files = app.doc.document.files();
+    let paths: Vec<_> = files.iter().map(|e| e.change().path.clone()).collect();
+    assert_eq!(paths, ["changed.txt", "kept.rs"]);
+    assert!(!files[1].is_unchanged(), "the list's own entry");
+}
+
+/// `m` past the last thread goes on to the next file with threads that
+/// the diff doesn't list, past one that isn't on disk, which `enter` in
+/// the panel opens nothing for.
+#[test]
+fn m_goes_on_to_a_threads_file_the_diff_doesnt_list() {
+    let (repo_dir, dir) = (
+        tempfile::tempdir().expect("tempdir"),
+        tempfile::tempdir().expect("tempdir"),
+    );
+    let (mut app, repo, _) = beyond_the_diff(repo_dir.path(), &dir.path().join("comments.json"));
+    key(&mut app, 'm');
+    let files = app.doc.document.files();
+    assert_eq!(files.len(), 2);
+    assert_eq!(files[1].change().path, "kept.rs");
+    assert_eq!(app.doc.document.pos.file, 1);
+    diff_shown(&mut app, &repo);
+    screen(&mut app);
+    assert_eq!(focused(&app), Some("k1"));
+
+    key(&mut app, 'i');
+    let shown = screen(&mut app);
+    assert!(shown.contains("gone.rs · file not on disk"), "{shown}");
+    app.panel.as_mut().expect("the comments show").select("g1");
+    press(&mut app, Key::Enter);
+    let shown = status(&mut app);
+    assert!(shown.contains("gone.rs isn't on disk"), "{shown}");
+    assert_eq!(app.doc.document.files().len(), 2);
+    assert_eq!(app.pane, Pane::Tree, "the keys stay in the panel");
 }

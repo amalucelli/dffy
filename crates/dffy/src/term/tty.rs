@@ -24,13 +24,17 @@ use super::input::{ESC_TIMEOUT_MS, Input, Parser};
 /// (motion only while a button is held) in the SGR mouse encoding, and
 /// bracketed paste, so pasted text never runs as keys. The window title is
 /// saved on the terminal's stack, for dffy's to replace until [`LEAVE`].
+/// Last, the kitty keyboard protocol's disambiguate flag is pushed, so the
+/// text box can tell shift+enter from enter; terminals without it ignore
+/// it. Each screen keeps its own stack of flags, so it goes on the
+/// alternate screen's, and comes off it before that's left.
 pub(super) const ENTER: &[u8] =
-    b"\x1b[?1049h\x1b[?25l\x1b[?7l\x1b[?1000h\x1b[?1002h\x1b[?1006h\x1b[?2004h\x1b[22;2t";
+    b"\x1b[?1049h\x1b[?25l\x1b[?7l\x1b[?1000h\x1b[?1002h\x1b[?1006h\x1b[?2004h\x1b[22;2t\x1b[>1u";
 /// Ends with the saved window title back and dffy's program status
 /// (OSC 7501) cleared: a `done` or `error` record would outlive dffy,
 /// though the viewer already showed it. The clear takes every record on
 /// the terminal; dffy's report replaced the root one when it started anyway.
-pub(super) const LEAVE: &[u8] = b"\x1b[0m\x1b[?2004l\x1b[?1006l\x1b[?1002l\x1b[?1000l\x1b[?7h\x1b[?25h\x1b[?1049l\x1b[23;2t\x1b]7501;state=clear\x1b\\";
+pub(super) const LEAVE: &[u8] = b"\x1b[<u\x1b[0m\x1b[?2004l\x1b[?1006l\x1b[?1002l\x1b[?1000l\x1b[?7h\x1b[?25h\x1b[?1049l\x1b[23;2t\x1b]7501;state=clear\x1b\\";
 /// Mouse reports off, so the terminal's own selection works, and back on.
 pub(crate) const MOUSE_OFF: &[u8] = b"\x1b[?1006l\x1b[?1002l\x1b[?1000l";
 pub(crate) const MOUSE_ON: &[u8] = b"\x1b[?1000h\x1b[?1002h\x1b[?1006h";

@@ -3,7 +3,8 @@
 //! version of the file. An annotation records its lines as they were; when
 //! the file changed since, its anchor text finds them again, or tells they
 //! are gone. What an annotation says and how it's drawn is the host's: here
-//! it's an id and the lines it's on.
+//! it's an id and the lines it's on. A suggestion made on anchored lines is
+//! applied to the working tree through the same placement.
 //!
 //! Placement reads only the two sides of a file's diff, so a host runs it
 //! off its main thread with the diff it loads. [`AnnotationSet`] stamps
@@ -22,7 +23,7 @@ use gix::bstr::BString;
 
 use crate::diff::Text;
 use crate::document::Side;
-use crate::git::FileDiff;
+use crate::git::{self, FileDiff, NewSide, Repo};
 
 /// Lines of context an anchor keeps on each side of the anchored lines.
 const CONTEXT: usize = 2;
@@ -68,12 +69,17 @@ impl Anchor {
     /// they're gone, found more than once, or there are none to find.
     #[must_use]
     pub fn place(&self, text: &Text, at: usize) -> Option<Range<usize>> {
+        self.find(text, at).ok()
+    }
+
+    /// [`Anchor::place`], with why nothing was found.
+    fn find(&self, text: &Text, at: usize) -> Result<Range<usize>, Missing> {
         let len = self.lines.len();
         if len == 0 {
-            return None;
+            return Err(Missing::Gone);
         }
         if matches_at(text, at, &self.lines) {
-            return Some(at..at + len);
+            return Ok(at..at + len);
         }
         let mut found = None;
         for first in at.saturating_sub(NEARBY)..=at.saturating_add(NEARBY).min(text.len()) {
@@ -85,13 +91,114 @@ impl Anchor {
                 && matches_at(text, first + len, &self.after)
             {
                 if found.is_some() {
-                    return None;
+                    return Err(Missing::Repeated);
                 }
                 found = Some(first..first + len);
             }
         }
-        found
+        found.ok_or(Missing::Gone)
     }
+}
+
+/// Why an anchor's lines weren't placed.
+enum Missing {
+    Gone,
+    /// Found more than once away from where they were recorded.
+    Repeated,
+}
+
+/// Why no suggestion can apply to `shown`'s file, from what the diff
+/// already says: no I/O, for a frontend to ask before it offers one.
+///
+/// # Errors
+///
+/// [`git::Error::Refused`] for a diff whose new side isn't the working
+/// tree, a file deleted there, symbolic links and submodules, binary files,
+/// files too large to diff and files shown as read from disk because their
+/// filter failed. A file plain `dffy` shows staged, whose new side is the
+/// index, counts as the working tree: they match. So does a blob of a
+/// commit's tree with [`NewSide::Head`].
+pub fn check_suggestion(shown: &FileDiff, new_side: NewSide) -> git::Result<()> {
+    git::check_suggestion(shown, new_side)
+}
+
+/// What [`apply_suggestion`] wrote, in 0-based lines of the file as git
+/// reads it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Applied {
+    /// Where the anchored lines were, before the write.
+    pub replaced: Range<usize>,
+    /// Where the replacement is, after it: empty where lines were deleted.
+    pub lines: Range<usize>,
+    /// `lines` anchored in the file as written, to hold on to them; `None`
+    /// when they're empty.
+    pub anchor: Option<Anchor>,
+}
+
+/// Puts `replacement`'s lines in place of the lines `anchor` holds, in the
+/// working-tree file that `shown` is a diff of, and returns where they
+/// were and where the new ones are.
+///
+/// `new_side` says whether `shown`'s new side may be a commit's tree: with
+/// [`NewSide::Head`], the caller checked it's HEAD's version of the file
+/// ([`Repo::head_blob`]), so the working tree was made from it. The lines are found in the file on disk
+/// either way, and refused when they no longer match.
+///
+/// `at` is the first anchored line as recorded on `shown`'s new side. The
+/// file is read now and the lines placed on it as [`Anchor::place`] does:
+/// at `at` when they still match, else where they and their context appear
+/// once nearby. `replacement` holds lines without their endings; none
+/// removes the anchored lines.
+///
+/// Only the working tree is written, never the index or a commit, so the
+/// result is an unstaged change. The new lines take the line ending of
+/// those they replace, a missing newline at the end of the file stays
+/// missing, and the rest of the file is kept byte for byte. The file is
+/// replaced through a rename in its directory and keeps its permissions,
+/// but it's a new file: another hard link to the old one keeps the old
+/// text, and its extended attributes, ACLs and owner aren't carried over.
+/// The file isn't locked: an edit saved between the read and the rename
+/// is lost.
+///
+/// # Errors
+///
+/// [`git::Error::Refused`], writing nothing: as [`check_suggestion`] says;
+/// when the file is gone, binary, or converted by git other than in its
+/// line endings (a clean or process filter such as LFS, `ident`, an
+/// encoding); when the anchored lines changed since, or moved and are
+/// found more than once. [`git::Error::Io`] when the file can't be read or
+/// replaced.
+pub fn apply_suggestion(
+    repo: &Repo,
+    shown: &FileDiff,
+    new_side: NewSide,
+    at: usize,
+    anchor: &Anchor,
+    replacement: &[&str],
+) -> git::Result<Applied> {
+    let find = |text: &Text| {
+        anchor.find(text, at).map_err(|missing| {
+            git::Error::Refused(
+                match missing {
+                    Missing::Gone => {
+                        "can't apply the suggestion: its lines changed since it was written"
+                    }
+                    Missing::Repeated => {
+                        "can't apply the suggestion: its lines moved and are in the file \
+                         more than once"
+                    }
+                }
+                .to_owned(),
+            )
+        })
+    };
+    let (replaced, after) = repo.replace_lines(shown, new_side, find, replacement)?;
+    let lines = replaced.start..replaced.start + replacement.len();
+    Ok(Applied {
+        anchor: (!lines.is_empty()).then(|| Anchor::new(&after, lines.clone())),
+        replaced,
+        lines,
+    })
 }
 
 fn matches_at(text: &Text, at: usize, lines: &[String]) -> bool {

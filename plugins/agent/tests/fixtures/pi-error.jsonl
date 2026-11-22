@@ -1,0 +1,8 @@
+{"type":"session","version":3,"id":"01a1fa21-3264-713b-a9e2-bbc29df88f30","timestamp":"2026-11-20T18:04:02.021Z","cwd":"/work"}
+{"type":"agent_start"}
+{"type":"turn_start"}
+{"type":"message_end","message":{"role":"assistant","content":[],"stopReason":"error","errorMessage":"529 overloaded","timestamp":1795000000001}}
+{"type":"turn_end","message":{"role":"assistant","content":[],"stopReason":"error"},"toolResults":[]}
+{"type":"agent_end","messages":[],"willRetry":false}
+{"type":"auto_retry_end","success":false,"attempt":3,"finalError":"529 overloaded"}
+{"type":"agent_settled","aborted":false}

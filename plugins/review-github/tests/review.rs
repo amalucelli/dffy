@@ -181,12 +181,18 @@ mod carry {
         )
     }
 
-    /// `dryRun`'s and `post`'s `drafts`.
+    /// `dryRun`'s and `post`'s `drafts`: a reply only in a thread not kept
+    /// local.
     pub(crate) fn drafts(file: &Value) -> Vec<Value> {
         let all = comments(file);
-        let drafts = all
-            .iter()
-            .filter(|c| c["ref"].is_null() && c["author"].as_str().unwrap_or_default().is_empty());
+        let drafts = all.iter().filter(|c| {
+            let root =
+                (c["in_reply_to"].as_str()).and_then(|id| all.iter().find(|r| r["id"] == id));
+            c["ref"].is_null()
+                && c["author"].as_str().unwrap_or_default().is_empty()
+                && c["local_only"] != true
+                && root.is_none_or(|r| r["local_only"] != true)
+        });
         drafts
             .map(|c| {
                 let mut draft = Map::new();
@@ -1266,8 +1272,9 @@ fn doctor_checks_gh_and_its_login() {
     assert_eq!(
         run.lines,
         [json!({"checks": [
-            {"name": "gh", "ok": true, "detail": "gh version 2.0.0 (stub)"},
-            {"name": "auth", "ok": true, "detail": "Logged in to github.com account octocat (keyring)"},
+            {"name": "gh", "ok": true, "detail": "gh version 2.0.0 (stub)", "brief": "gh 2.0.0"},
+            {"name": "auth", "ok": true, "detail": "Logged in to github.com account octocat (keyring)",
+                "brief": "logged in as octocat"},
         ]})]
     );
     assert_eq!(
@@ -1292,6 +1299,27 @@ fn doctor_checks_gh_and_its_login() {
     );
 }
 
+/// `doctor`'s gh calls run side by side, each for 2 seconds at most: a gh
+/// that never answers is killed and said in each row, inside the 3
+/// seconds dffy waits for the whole answer.
+#[test]
+fn doctor_says_which_gh_call_didnt_answer() {
+    let f = Fixture::new();
+    fs::write(f.path("stub/gh/slow"), "30").expect("write");
+    let start = Instant::now();
+    let run = f.run(&["doctor"]);
+    let took = start.elapsed();
+    run.ok();
+    assert_eq!(
+        run.lines,
+        [json!({"checks": [
+            {"name": "gh", "ok": false, "detail": "`gh --version` didn't answer in 2s"},
+            {"name": "auth", "ok": false, "detail": "`gh auth status` didn't answer in 2s"},
+        ]})]
+    );
+    assert!(took < Duration::from_millis(3500), "took {took:?}");
+}
+
 #[test]
 fn prepare_prints_the_session_once_the_head_is_local_then_imports_the_rest() {
     let f = Fixture::new();
@@ -1302,7 +1330,7 @@ fn prepare_prints_the_session_once_the_head_is_local_then_imports_the_rest() {
         [
             json!({"session": {"id": "7", "title": "Spell out five", "url": URL,
                 "base": f.base, "head": f.head, "last_reviewed_head": null,
-                "state": "open"}}),
+                "state": "open", "checkout": "gh pr checkout 7"}}),
             json!({"progress": "1/4"}),
             json!({"progress": "4/4"}),
         ]
@@ -1546,7 +1574,7 @@ fn pull_moves_the_session_to_the_new_head_and_leaves_the_last_reviewed_one() {
         [
             json!({"session": {"id": "7", "title": "Spell out five", "url": URL,
                 "base": f.base, "head": f.head2, "last_reviewed_head": null,
-                "state": "open"}}),
+                "state": "open", "checkout": "gh pr checkout 7"}}),
             json!({"progress": "0/0"}),
         ]
     );
@@ -2006,6 +2034,37 @@ fn a_dry_run_plans_each_draft_without_asking_github() {
         ]
     );
     assert_eq!((f.requests().len(), f.rest().len(), f.comments()), before);
+}
+
+/// A reply under a comment kept local, as a mention that asked an agent,
+/// has no thread on GitHub, and won't until it's yours: dffy doesn't send
+/// it, so neither a dry run nor `post` plans it, and GitHub gets nothing
+/// for it.
+#[test]
+fn a_reply_to_a_comment_kept_local_is_never_sent() {
+    let f = Fixture::new();
+    f.prepare();
+    let root = f.apply(&json!([
+        {"op": "add", "comment": {"path": "src/lib.rs", "text": "@claude why?", "local_only": true}},
+    ]));
+    let reply = f.apply(&json!([
+        {"op": "add", "comment": {"in_reply_to": root["ids"][0], "text": "And its tests?"}},
+    ]));
+    let reply = reply["ids"][0].as_str().expect("an id").to_owned();
+    let run = f.run(&["post", PR, "--dry-run"]);
+    run.ok();
+    assert_eq!(run.lines, Vec::<Value>::new());
+
+    f.reply("PostState", None, "post_state.json");
+    let before = f.operations().len();
+    let run = f.post("pending", "");
+    run.ok();
+    assert_eq!(
+        run.lines,
+        [json!({"posted": 0, "failed": 0, "pending": 0, "url": URL})]
+    );
+    assert_eq!(f.operations()[before..], ["PostState"]);
+    assert!(f.draft(&reply).get("ref").is_none());
 }
 
 /// `--drafts` plans another comments file's drafts after the PR's own, as
@@ -2630,7 +2689,8 @@ fn detect_finds_the_pr_of_the_branch_from_its_session_else_by_one_query() {
     assert_eq!(
         run.lines[0]["review"],
         json!({"id": "7", "title": "Spell out five", "url": URL,
-            "base": f.base, "head": f.head, "last_reviewed_head": null, "state": "open"})
+            "base": f.base, "head": f.head, "last_reviewed_head": null, "state": "open",
+            "checkout": "gh pr checkout 7"})
     );
     assert_eq!(f.operations(), ["Detect"]);
 

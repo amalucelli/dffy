@@ -2,12 +2,9 @@
 //! (stages 1 to 3) and the regions its markers bound in the working tree;
 //! and writing the file a set of choices resolves it to.
 
-use std::io::Write as _;
-use std::os::unix::ffi::OsStrExt;
-
 use gix::bstr::{BStr, ByteSlice};
 
-use super::{BINARY_SNIFF_BYTES, Error, FileDiff, Mode, Repo, Result, Side, Status};
+use super::{BINARY_SNIFF_BYTES, Error, FileDiff, Mode, Repo, Result, Side, Status, worktree};
 use crate::conflict::{self, Choices, Conflicts, Sides};
 use crate::diff::Text;
 
@@ -112,31 +109,7 @@ impl Repo {
         }
         let resolved = conflict::resolve(&text, &choices.regions, &choices.picks);
         let permissions = std::fs::metadata(&full).map_err(io)?.permissions();
-        let dir = full.parent().unwrap_or(&full);
-        let mut name = b".".to_vec();
-        name.extend_from_slice(
-            full.file_name()
-                .map_or(b"file".as_slice(), OsStrExt::as_bytes),
-        );
-        name.extend_from_slice(format!(".dffy-{}", std::process::id()).as_bytes());
-        let temp = dir.join(std::ffi::OsStr::from_bytes(&name));
-        let written = (|| {
-            // One a crash left goes; `create_new` won't follow a link put
-            // in its place.
-            drop(std::fs::remove_file(&temp));
-            let mut file = std::fs::File::options()
-                .write(true)
-                .create_new(true)
-                .open(&temp)?;
-            file.write_all(resolved.text.bytes())?;
-            file.set_permissions(permissions)?;
-            file.sync_all()?;
-            std::fs::rename(&temp, &full)
-        })();
-        if let Err(source) = written {
-            drop(std::fs::remove_file(&temp));
-            return Err(io(source));
-        }
+        worktree::replace(&full, resolved.text.bytes(), permissions).map_err(io)?;
         Ok(choices.picks.iter().filter(|p| p.is_none()).count())
     }
 

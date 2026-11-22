@@ -74,6 +74,7 @@ fn review_labels_use_the_plugins_words() {
     );
     let entry = app
         .command_entries()
+        .1
         .into_iter()
         .find(|e| e.action == Act::OpenReview)
         .expect("the panel's entry");
@@ -137,7 +138,7 @@ fn an_undescribed_plugin_reviews_reviews() {
     app.reviewing.plugin = Some("test".to_owned());
     press(&mut app, Key::Char('p'));
     assert!(status(&mut app).contains("not on a review"));
-    let entry = (app.command_entries().into_iter())
+    let entry = (app.command_entries().1.into_iter())
         .find(|e| e.action == Act::OpenReview)
         .expect("the panel's entry");
     assert_eq!(entry.label, "Open review…");
@@ -686,16 +687,16 @@ fn a_local_draft_placed_later_is_planned_again() {
 }
 
 /// On a PR, the local review's drafts that place on its diff show with
-/// a `local` chip and count as drafts; one that doesn't place stays out
-/// of view and of the `i` list, and a posted one isn't brought. Edits
-/// and replies in a local thread go to the local file, a new comment to
-/// the PR's.
+/// a `branch draft` chip and count as drafts; one that doesn't place
+/// stays out of view and of the `i` list, and a posted one isn't brought.
+/// Edits and replies in a local thread go to the local file, a new comment
+/// to the PR's.
 #[test]
 fn local_drafts_show_on_a_pr_and_are_written_where_they_live() {
     let dir = tempfile::tempdir().expect("tempdir");
     let (mut app, pr, local) = pr_with_local(&dir);
     let shown = screen(&mut app);
-    assert!(shown.contains("draft · local"), "{shown}");
+    assert!(shown.contains("draft · branch draft"), "{shown}");
     assert!(shown.contains("Local reply"), "{shown}");
     assert!(!shown.contains("Not on this diff") && !shown.contains("Posted from here"));
     assert_eq!(
@@ -769,14 +770,14 @@ fn posting_moves_the_local_drafts_into_the_prs_file_first() {
     said(&mut app, check, Said::Done(Ok(())));
     let shown = screen(&mut app);
     assert!(
-        shown.contains("1 comment") && shown.contains("l  [ ] with the 2 local drafts"),
+        shown.contains("1 comment") && shown.contains("l  [ ] with the 2 branch drafts"),
         "written before the session: {shown}"
     );
     key(&mut app, 'l');
     let shown = screen(&mut app);
     assert!(
         shown.contains("3 comments · 1 as a file comment")
-            && shown.contains("l  [x] with the 2 local drafts"),
+            && shown.contains("l  [x] with the 2 branch drafts"),
         "{shown}"
     );
 
@@ -920,10 +921,10 @@ fn refused_drafts_say_why_and_the_post_says_how_it_went() {
             path,
             vec![Op::Set {
                 target: Target::Id("d1".to_owned()),
-                change: Change {
+                change: Box::new(Change {
                     post_error: Some(Some(why.to_owned())),
                     ..Change::default()
-                },
+                }),
             }],
         )
         .expect("applies");
@@ -1440,7 +1441,27 @@ fn on_a_detected_review_new_comments_go_to_the_local_file() {
             .iter()
             .any(|c| c.text == "Fix this")
     );
-    assert!(screen(&mut app).contains("draft · local"));
+    assert!(screen(&mut app).contains("draft · branch draft"));
+
+    // Your open threads go to your agent from the file new ones go to,
+    // the review's draft counted as left.
+    key(&mut app, ' ');
+    key(&mut app, '^');
+    let handoff = app.take_handoff().expect("handed");
+    assert_eq!(
+        (handoff.what, handoff.file, handoff.session),
+        (Handed::Open { count: 1, left: 1 }, local, false)
+    );
+    app.event(Event::HandedOff {
+        started: Ok("sent 1 thread to claude".to_owned()),
+        left: Some(1),
+    });
+    app.resize(200, 30);
+    assert!(
+        status(&mut app).contains("1 more of yours in the other comments file not sent"),
+        "{}",
+        status(&mut app)
+    );
 }
 
 /// A review the host closed or merged says so in the status bar, and
@@ -1530,4 +1551,26 @@ fn a_plugins_words_are_escaped_where_they_are_drawn() {
     assert!(shown.contains("no ^[[2J access"), "{shown}");
     let report = app.status_report().expect("a report");
     assert!(!report.windows(3).any(|w| w == b"\x1b[2"), "{report:?}");
+}
+
+/// While HEAD isn't the review's head, a thread's prompt says the files
+/// on disk aren't the review's, for an agent that would read them.
+#[test]
+fn a_prompt_off_the_reviews_head_says_the_files_differ() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (mut app, _) = commented(&dir);
+    app.start_review("test".to_owned(), session(&dir, HEAD, None));
+    app.reviewing.job = None;
+    let copy = |app: &mut App| {
+        app.follow_thread("d1");
+        match press(app, Key::Char('y')) {
+            Some(Action::Copy { text, .. }) => String::from_utf8(text).expect("utf-8"),
+            other => panic!("{other:?}"),
+        }
+    };
+    let note = "The files on disk aren't this review's version";
+    app.set_head(Some(HEAD.to_owned()));
+    assert!(!copy(&mut app).contains(note));
+    app.event(Event::Head(Some(BASE.to_owned())));
+    assert!(copy(&mut app).contains(note));
 }

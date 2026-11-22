@@ -3,12 +3,15 @@
 //! contract). This module owns the format and the operations that write the
 //! file under a lock; a comment's anchor is the core's
 //! [`dffy_core::annotation::Anchor`], which places it. Its submodules are the review layer frontends share: the threads made
-//! from the file ([`model`]), the comments panel's list ([`listing`]) and
-//! a review session with a plugin ([`session`]). Nothing here knows about
-//! the viewer.
+//! from the file ([`model`]), the comments panel's list ([`listing`]), a
+//! thread or a selection as a prompt for a coding agent ([`prompt`]), a
+//! review session with a plugin ([`session`]) and asking an agent about a
+//! thread ([`ask`]). Nothing here knows about the viewer.
 
+pub(crate) mod ask;
 pub(crate) mod listing;
 pub(crate) mod model;
+pub(crate) mod prompt;
 pub(crate) mod session;
 
 use std::collections::{HashMap, HashSet};
@@ -72,6 +75,10 @@ impl LineNumbers {
 /// `anchor`; file comments and replies have none of them. A general
 /// comment, on the review rather than a file, has no path either.
 #[derive(Debug, Clone, PartialEq, Default)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "the file's flags, each its own field"
+)]
 pub(crate) struct Comment {
     pub id: String,
     /// Empty for a general comment.
@@ -117,6 +124,12 @@ pub(crate) struct Comment {
     pub pending: bool,
     /// Set by an integration: why the host refused to take the comment.
     pub post_error: Option<String>,
+    /// Yours, but never posted until you make it yours again (`set` with an
+    /// empty author): one that asked a local agent with `@<name>`, which
+    /// on the host would mention someone, or set off the host's own bot;
+    /// a question or follow-up to an agent, out of context there; and a
+    /// note for Fix with agent.
+    pub local_only: bool,
     /// Set by an integration on a thread's first comment: whether the host
     /// last said the thread is resolved. A `resolved` that differs is a
     /// resolve or reopen not sent yet; `None` for a thread the host doesn't
@@ -126,6 +139,13 @@ pub(crate) struct Comment {
     /// id is another's here: a move or import cut short and run again
     /// finds it by this instead of copying it twice.
     pub moved_from: Option<String>,
+    /// When its suggestion was applied to the working tree, RFC 3339. Kept
+    /// here only: never sent to a host.
+    pub applied: Option<String>,
+    /// The lines applying its suggestion replaced, a line break between
+    /// each, which taking it back puts in place again. Kept here only, and
+    /// cleared with `applied`.
+    pub replaced: Option<String>,
     /// Fields dffy doesn't know, in file order, written back as read: on a
     /// comment from a host, the integration's own.
     pub extra: Fields,
@@ -168,6 +188,13 @@ pub(crate) struct Change {
     pub branch: Option<Option<String>>,
     pub pending: Option<bool>,
     pub post_error: Option<Option<String>>,
+    /// A line comment's lines, `start` and `end` given together.
+    pub start: Option<LineNumbers>,
+    pub end: Option<LineNumbers>,
+    pub start_side: Option<Option<Side>>,
+    /// Removing it removes `replaced` too, unless that's given.
+    pub applied: Option<Option<String>>,
+    pub replaced: Option<Option<String>>,
 }
 
 /// One of `dffy comments apply`'s operations.
@@ -182,7 +209,7 @@ pub(crate) enum Op {
     },
     Set {
         target: Target,
-        change: Change,
+        change: Box<Change>,
     },
     /// The comment's fields as given, a `ref` among them. They're merged
     /// into the comment with that ref field by field, so imports work on
@@ -374,6 +401,11 @@ pub(crate) fn current_branch(repo: &Repo) -> Option<String> {
             })
         }
     }
+}
+
+/// HEAD's commit, a full id; `None` on an unborn branch.
+pub(crate) fn head_commit(repo: &Repo) -> Option<String> {
+    repo.resolve_show("HEAD").ok().map(|(id, _)| id.to_string())
 }
 
 /// The review session the viewer has open, as the session pointer names
@@ -666,13 +698,24 @@ pub(crate) fn apply_json(
 /// what a comment says are refused while the review is being posted, as
 /// the post read its drafts before; they hold the post lock while they
 /// write, so a post doesn't start in between. A file never posted has no
-/// post lock to take.
+/// post lock to take. `author`, `--as`'s, writes each `add` that names no
+/// author, which would otherwise be yours.
 pub(crate) fn apply_given(
     path: &Path,
     input: &[u8],
     branch: Option<&str>,
+    author: Option<&str>,
 ) -> Result<String, String> {
-    let ops = parse_ops(input, branch)?;
+    let mut ops = parse_ops(input, branch)?;
+    if let Some(author) = author {
+        for op in &mut ops {
+            if let Op::Add { comment, .. } = op
+                && comment.author.is_empty()
+            {
+                author.clone_into(&mut comment.author);
+            }
+        }
+    }
     let rewrites = ops.iter().any(|op| {
         matches!(op, Op::Set { change, .. } if change.text.is_some() || change.suggestion.is_some())
     });
@@ -761,6 +804,19 @@ fn fresh_id(taken: impl Fn(&str) -> bool) -> String {
 }
 
 impl Review {
+    /// The drafts a review session's post sends, in file order: each
+    /// [`Comment::draft`], a reply only in a thread that
+    /// [`Comment::takes_replies`].
+    pub(crate) fn drafts(&self) -> impl Iterator<Item = &Comment> {
+        let closed: HashSet<&str> = (self.comments.iter())
+            .filter(|c| c.in_reply_to.is_none() && !c.takes_replies())
+            .map(|c| c.id.as_str())
+            .collect();
+        (self.comments.iter()).filter(move |c| {
+            c.draft() && (c.in_reply_to.as_deref()).is_none_or(|root| !closed.contains(root))
+        })
+    }
+
     /// Parses a file. Blank bytes are no comments; any `version` but 1 is
     /// refused, so a newer file is never rewritten in this one's format.
     pub(crate) fn parse(bytes: &[u8]) -> Result<Self, String> {
@@ -873,7 +929,7 @@ impl Review {
             Op::Add { comment, reply_to } => self
                 .insert(*comment, reply_to.as_ref(), now, places)
                 .map(Some),
-            Op::Set { target, change } => self.set(&target, change, places).map(Some),
+            Op::Set { target, change } => self.set(&target, *change, places).map(Some),
             Op::Upsert { fields, reply_to } => {
                 if fields.iter().any(|(k, _)| k == "id") {
                     return Err("dffy assigns the id".to_owned());
@@ -988,6 +1044,7 @@ impl Review {
     }
 
     /// [`Op::Set`]: returns the id of the comment changed.
+    #[expect(clippy::too_many_lines, reason = "a step per field a set changes")]
     fn set(
         &mut self,
         target: &Target,
@@ -1006,6 +1063,13 @@ impl Review {
         let named = &self.comments[i];
         if change.reference == Some(None) && named.path.is_empty() && named.in_reply_to.is_none() {
             return Err("a general comment keeps its ref".to_owned());
+        }
+        let moves = change.start.is_some() || change.end.is_some() || change.start_side.is_some();
+        if moves && named.end.is_none() {
+            return Err("only a line comment has lines to move".to_owned());
+        }
+        if change.start.is_some() != change.end.is_some() {
+            return Err("`start` and `end` are set together".to_owned());
         }
         if let Some(branch) = change.branch {
             let named = &self.comments[i];
@@ -1045,9 +1109,24 @@ impl Review {
         }
         if let Some(suggestion) = change.suggestion {
             comment.suggestion = suggestion;
+            comment.applied = None;
+            comment.replaced = None;
+        }
+        if let Some(applied) = change.applied {
+            comment.replaced = comment.replaced.take().filter(|_| applied.is_some());
+            comment.applied = applied;
+        }
+        if let Some(replaced) = change.replaced {
+            comment.replaced = replaced;
+        }
+        comment.start = change.start.or(comment.start);
+        comment.end = change.end.or(comment.end);
+        if let Some(start_side) = change.start_side {
+            comment.start_side = start_side;
         }
         if let Some(author) = change.author {
             comment.author = author;
+            comment.local_only = false;
         }
         if let Some(resolved) = change.resolved {
             comment.resolved = resolved;
@@ -1197,6 +1276,38 @@ impl Review {
             })
             .collect()
     }
+
+    /// The open threads of `branches` that are yours, in [`threads`] order,
+    /// each its first comment then its replies: those you started, or
+    /// replied in.
+    pub(crate) fn open_threads_of_yours(&self, branches: Branches) -> Vec<Vec<&Comment>> {
+        let select = Select {
+            resolved: Some(false),
+            branches,
+            ..Select::default()
+        };
+        let mut out: Vec<Vec<&Comment>> = Vec::new();
+        for c in threads(self.selected(&select)) {
+            match out.last_mut() {
+                Some(thread) if c.in_reply_to.as_ref() == Some(&thread[0].id) => thread.push(c),
+                _ => out.push(vec![c]),
+            }
+        }
+        out.retain(|thread| thread.iter().any(|c| c.author.is_empty()));
+        out
+    }
+
+    /// The thread comment `id` is in: its first comment, then its replies
+    /// in file order. `None` when no comment has that id.
+    pub(crate) fn thread(&self, id: &str) -> Option<Vec<&Comment>> {
+        let named = self.comments.iter().find(|c| c.id == id)?;
+        let root = (named.in_reply_to.as_deref())
+            .and_then(|root| self.comments.iter().find(|c| c.id == root))
+            .unwrap_or(named);
+        let replies = (self.comments.iter())
+            .filter(|c| c.in_reply_to.as_ref() == Some(&root.id) && c.path == root.path);
+        Some(std::iter::once(root).chain(replies).collect())
+    }
 }
 
 /// Which threads a listing or a removal takes, each judged by its first
@@ -1253,6 +1364,20 @@ impl Comment {
         self.branch.is_none() || self.branch.as_deref() == branch
     }
 
+    /// Yours, without a ref and not kept local: what a review session's
+    /// post sends, a reply only in a thread that [`Comment::takes_replies`].
+    pub(crate) fn draft(&self) -> bool {
+        self.reference.is_none() && self.author.is_empty() && !self.local_only
+    }
+
+    /// A thread's first comment that a post may put a draft reply under:
+    /// any but one kept local, which isn't on the host and won't be until
+    /// you make it yours. Under another not on the host, the review
+    /// plugin's plan says why the reply can't go.
+    pub(crate) fn takes_replies(&self) -> bool {
+        !self.local_only
+    }
+
     /// A posted thread's first comment resolved or reopened here since the
     /// host last said otherwise: what a review plugin's `post` sends.
     pub(crate) fn resolve_unsent(&self) -> bool {
@@ -1306,6 +1431,8 @@ impl Comment {
                 "branch" => c.branch = string(&key, value)?,
                 "post_error" => c.post_error = string(&key, value)?,
                 "moved_from" => c.moved_from = string(&key, value)?,
+                "applied" => c.applied = string(&key, value)?,
+                "replaced" => c.replaced = string(&key, value)?,
                 "host_resolved" => {
                     c.host_resolved = match value {
                         Value::Null => None,
@@ -1313,16 +1440,16 @@ impl Comment {
                         _ => return Err("`host_resolved` must be true or false".to_owned()),
                     };
                 }
-                "outdated" | "pending" => {
+                "outdated" | "pending" | "local_only" => {
                     let flag = match value {
                         Value::Null => false,
                         Value::Bool(b) => b,
                         _ => return Err(format!("`{key}` must be true or false")),
                     };
-                    if key == "outdated" {
-                        c.outdated = flag;
-                    } else {
-                        c.pending = flag;
+                    match key.as_str() {
+                        "outdated" => c.outdated = flag,
+                        "pending" => c.pending = flag,
+                        _ => c.local_only = flag,
                     }
                 }
                 "distance" => {
@@ -1397,8 +1524,15 @@ impl Comment {
         put(&mut f, "branch", self.branch.as_deref().map(text));
         put(&mut f, "pending", self.pending.then_some(Value::Bool(true)));
         put(&mut f, "post_error", self.post_error.as_deref().map(text));
+        put(
+            &mut f,
+            "local_only",
+            self.local_only.then_some(Value::Bool(true)),
+        );
         put(&mut f, "host_resolved", self.host_resolved.map(Value::Bool));
         put(&mut f, "moved_from", self.moved_from.as_deref().map(text));
+        put(&mut f, "applied", self.applied.as_deref().map(text));
+        put(&mut f, "replaced", self.replaced.as_deref().map(text));
         f.extend(self.extra.iter().cloned());
         f
     }
@@ -1536,7 +1670,7 @@ fn parse_op(item: Value, branch: Option<&str>) -> Result<Op, String> {
         }
         Some("set") => Ok(Op::Set {
             target: target(take(&mut fields, "id"), take(&mut fields, "ref"))?,
-            change: change(take(&mut fields, "fields"))?,
+            change: Box::new(change(take(&mut fields, "fields"))?),
         }),
         Some("upsert") => {
             let (fields, reply_to) = comment_fields(take(&mut fields, "comment"))?;
@@ -1622,10 +1756,18 @@ fn change(value: Option<Value>) -> Result<Change, String> {
             "branch" => change.branch = Some(string(&key, value)?),
             "pending" => change.pending = flag(&key, value)?,
             "post_error" => change.post_error = Some(string(&key, value)?),
+            "start" => {
+                change.start = Some(line_numbers(&key, &value)?.ok_or("`start` can't be null")?);
+            }
+            "end" => change.end = Some(line_numbers(&key, &value)?.ok_or("`end` can't be null")?),
+            "start_side" => change.start_side = Some(side(&key, value)?),
+            "applied" => change.applied = Some(string(&key, value)?),
+            "replaced" => change.replaced = Some(string(&key, value)?),
             _ => {
                 return Err(format!(
                     "`{key}` can't be set; set changes text, resolved, ref, anchor, author, \
-                     suggestion, branch, pending and post_error"
+                     suggestion, branch, pending, post_error, start, end, start_side, applied \
+                     and replaced"
                 ));
             }
         }
@@ -1787,7 +1929,7 @@ fn fence(text: &str, min: usize) -> String {
 }
 
 /// `t` in RFC 3339, UTC, to the second.
-fn timestamp(t: SystemTime) -> String {
+pub(crate) fn timestamp(t: SystemTime) -> String {
     let secs = t.duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs());
     let (days, rem) = (secs / 86_400, secs % 86_400);
     // Howard Hinnant's civil_from_days, for days on or after 1970.

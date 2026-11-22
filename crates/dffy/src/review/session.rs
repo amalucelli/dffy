@@ -20,6 +20,7 @@ use dffy_core::git::Revisions;
 
 use super::model::reload::{Check, Written};
 use super::model::{self, Comments, Hint, Part, Posting};
+use crate::plugin::agent;
 use crate::plugin::review::{
     self, Listed, Naming, Plan, Push, Reason, Request, ReviewEvent, ReviewLabel, Said, Session,
     State,
@@ -47,6 +48,10 @@ pub(crate) enum Effect {
     Finished(String),
     /// Ask the plugin `request`; what it says comes back under `id`.
     Ask { id: u64, request: Request },
+    /// Ask the agent plugin `request`; what it says comes back under `id`.
+    Agent { id: u64, request: agent::Request },
+    /// Tell the agent plugin to stop these asks.
+    StopAgents(Vec<u64>),
     /// Show `range` when given, and `comments` when it's another file.
     /// `moved` is the review's head before and after, to count commits.
     Show {
@@ -1175,6 +1180,18 @@ impl Reviewing {
         (self.mode.as_ref()).is_none_or(|m| m.plain.is_some() && !m.whole && !m.since_last)
     }
 
+    /// Whether a review is open: what pulling, posting and "Since last
+    /// review" act on, and refuse without.
+    pub(crate) fn on_review(&self) -> bool {
+        self.mode.is_some()
+    }
+
+    /// Whether the review open is the one plain `dffy` found, which "Show
+    /// whole review" switches; it refuses on any other.
+    pub(crate) fn found_plain(&self) -> bool {
+        self.mode.as_ref().is_some_and(|m| m.plain.is_some())
+    }
+
     pub(crate) fn since_review(&self) -> bool {
         self.mode.as_ref().is_some_and(|p| p.since_last)
     }
@@ -1669,7 +1686,7 @@ impl Reviewing {
             Some(Err(e)) => {
                 let noun = self.noun(false);
                 return Err(vec![Effect::Say(format!(
-                    "nothing posted: local drafts not moved to the {noun}: {e}"
+                    "nothing posted: branch drafts not moved to the {noun}: {e}"
                 ))]);
             }
             None => {}

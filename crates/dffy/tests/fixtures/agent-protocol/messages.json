@@ -1,0 +1,42 @@
+{
+"initialize": {
+  "params": {"protocol":1,"client":{"name":"dffy","version":"0.3.0"},"agent":"codex"},
+  "result": {"protocol":1,"agents":[
+    {"name":"claude","default":false,"mark":null},
+    {"name":"codex","default":true,"mark":"read-only sandbox"}
+  ],"handoffs":[
+    {"name":"claude","program":"@BIN@/claude","args":["{prompt}"]},
+    {"name":"codex","program":"@BIN@/codex","args":["{prompt}"]},
+    {"name":"amp","program":"@BIN@/amp","args":[],"prompt":"clipboard"}
+  ],"capabilities":{}}
+},
+"ask": {
+  "params": {"agent":"claude","prompt":"src/lib.rs:12-14 (the new version of the file)\n\nyou:\n  Can this overflow?\n","cwd":"/"},
+  "progress": ["starting…","thinking…","writing…"],
+  "result": {"text":"Yes: `x + y` overflows past `u32::MAX`.","suggestion":"let total = x\n    .checked_add(y)?;"}
+},
+"notLoggedIn": {
+  "params": {"agent":"claude","prompt":"Can this overflow?\n","cwd":"/"},
+  "error": {"code":2,"message":"claude isn't logged in; run `claude auth login`"}
+},
+"unknownAgent": {
+  "params": {"agent":"gemini","prompt":"Can this overflow?\n","cwd":"/"},
+  "error": {"code":-32602,"message":"no agent named gemini; claude, codex"}
+},
+"cancelled": {
+  "params": {"agent":"claude","prompt":"Can this overflow?\n","cwd":"/"},
+  "error": {"code":-32800,"message":"cancelled"}
+},
+"doctor": {
+  "params": {},
+  "result": {"checks":[
+    {"name":"claude","ok":true,"detail":"2.1.329 (Claude Code)","brief":"2.1.329"},
+    {"name":"claude recipe","ok":true,"detail":"read-only: Read, Grep and Glob only, MCP tools denied, user settings only","brief":"read-only: Read, Grep, Glob"},
+    {"name":"claude auth","ok":true,"detail":"logged in"},
+    {"name":"codex","ok":true,"detail":"codex-cli 0.59.0","brief":"0.59.0"},
+    {"name":"codex recipe","ok":true,"detail":"read-only sandbox: commands may run, no writes, no network, web search off","brief":"read-only sandbox"},
+    {"name":"codex auth","ok":true,"detail":"logged in"},
+    {"name":"pi","ok":true,"info":true,"detail":"not installed"}
+  ]}
+}
+}

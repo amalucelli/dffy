@@ -27,12 +27,13 @@ const HELLO_TIMEOUT: Duration = Duration::from_secs(60);
 const ACCEPT_BACKOFF: Range<Duration> = Duration::from_millis(10)..Duration::from_secs(1);
 
 /// The requests dffyd hands to the view they name.
-const FORWARDED: [&str; 5] = [
+const FORWARDED: [&str; 6] = [
     "view/state",
     "view/selection",
     "view/open",
     "view/focusThread",
     "comments/add",
+    "comments/applySuggestion",
 ];
 
 type Views = Box<dyn Fn(usize) + Send + Sync>;

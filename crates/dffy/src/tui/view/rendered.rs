@@ -1338,9 +1338,11 @@ mod tests {
             text: "On the file".to_owned(),
             summary: "On the file".to_owned(),
             suggestion: None,
+            label: None,
             standing: crate::review::model::Standing::Kept,
             pending: false,
             posting: None,
+            applied: false,
         };
         let thread = crate::review::model::Thread {
             root: "f".to_owned(),

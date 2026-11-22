@@ -8,15 +8,19 @@ use std::sync::Arc;
 use dffy_core::git::{Applied, Edit, FileChange, FileDiff, Picked, Status};
 use dffy_core::view::Staging;
 
-use super::{Action, App, Event, STILL_EDITING, Uncommitted, escape, menu, session};
-use crate::keys::Action as Act;
+use super::{Action, App, Confirmed, Event, STILL_EDITING, Uncommitted, escape, session};
+use crate::keys::{Action as Act, Table};
+use crate::tui::menu::Offer;
 
 impl App {
     /// The uncommitted changes shown, if that's what the diff is now: not
     /// a review's range a review plugin switched to.
-    fn uncommitted_shown(&self) -> Option<Uncommitted> {
-        self.uncommitted
-            .filter(|_| !self.piped && self.reviewing.shows_plain())
+    pub(super) fn uncommitted_shown(&self) -> Option<Uncommitted> {
+        // Since a checkpoint, a hunk isn't the index's or HEAD's: staging or
+        // discarding it would change other lines.
+        self.uncommitted.filter(|_| {
+            !self.piped && self.reviewing.shows_plain() && self.since_checkpoint.is_none()
+        })
     }
 
     /// Where `change`'s lines are, as `which` shows them.
@@ -35,6 +39,15 @@ impl App {
     /// ([`Self::discard_planned`]).
     pub(super) fn edit_lines(&mut self, edit: Edit) -> Option<Action> {
         let Some(which) = self.uncommitted_shown() else {
+            if self.since_checkpoint.is_some() {
+                let back = self
+                    .key_for(false, Act::SinceCheckpoint)
+                    .unwrap_or_default();
+                self.message(format!(
+                    "lines since a checkpoint can't be staged; {back} shows the whole diff again"
+                ));
+                return None;
+            }
             self.message(
                 "staging works on uncommitted changes: plain dffy, --staged or --unstaged",
             );
@@ -135,13 +148,13 @@ impl App {
             edit: Edit::Discard,
         };
         self.message = None;
-        self.confirm = Some((prompt, action, "kept"));
+        self.confirm = Some((prompt, Confirmed::Run(action), "kept"));
         self.dirty = true;
     }
 
-    /// The right-click menu's entries staging, unstaging and discarding
-    /// on `file`: those its staging leaves anything to do for.
-    pub(super) fn edit_entries(&self, file: usize, selected: bool) -> Vec<menu::Entry> {
+    /// Staging, unstaging and discarding on `file`: those its staging
+    /// leaves anything to do for.
+    pub(super) fn edit_offers(&self, file: usize, selected: bool) -> Vec<Offer> {
         let (Some(which), Some(entry)) = (
             self.uncommitted_shown(),
             self.doc.document.files().get(file),
@@ -154,16 +167,17 @@ impl App {
         }
         let staging = Self::staging_of(which, entry.change());
         let what = if selected { "selected lines" } else { "hunk" };
-        let mut entries = Vec::new();
+        let offer = |label: String, action| Offer::new(&label, action, Table::Main);
+        let mut offers = Vec::new();
         if staging != Staging::Staged {
-            entries.push(self.menu_entry(false, &format!("Stage {what}"), Act::Stage));
+            offers.push(offer(format!("Stage {what}"), Act::Stage));
         }
         if staging != Staging::Unstaged {
-            entries.push(self.menu_entry(false, &format!("Unstage {what}"), Act::Unstage));
+            offers.push(offer(format!("Unstage {what}"), Act::Unstage));
         }
         if staging != Staging::Staged {
-            entries.push(self.menu_entry(false, &format!("Discard {what}…"), Act::Discard));
+            offers.push(offer(format!("Discard {what}…"), Act::Discard));
         }
-        entries
+        offers
     }
 }

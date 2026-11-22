@@ -158,7 +158,7 @@ const LINE_COMMENT: &str = r#"{"op":"add","comment":{"path":"src/lib.rs","side":
 
 const EVERY_FIELD: &str = r#"{"version":1,"notice":"as of 10:42","summary":"Two nits.","tool":{"pr":7},"comments":[
 {"id":"a1","path":"new.rs","old_path":"old.rs","side":"new","start_side":"old","start":{"old":3,"new":null},"end":{"old":null,"new":5},"text":"Use \"checked_add\".\nIt\twraps.","suggestion":"x.checked_add(y)","author":"octocat","created":"2026-11-17T10:42:00Z","resolved":true,"ref":"github:PRRC_1","anchor":{"before":["fn f() {"],"lines":["    x + y","é \r"],"after":[]},"distance":2,"url":"https://github.com/o/r/pull/7#discussion_r1","outdated":true,"branch":"feature/x","pending":true,"post_error":"line 5 isn't in the diff","host_resolved":false,"github_thread":"PRRT_1","github_draft":[1,{"a":null}]},
-{"id":"a2","path":"new.rs","text":"Agreed.","author":"","created":"2026-11-17T11:00:00Z","in_reply_to":"a1","resolved":false,"moved_from":"l9"}
+{"id":"a2","path":"new.rs","text":"Agreed.","author":"","created":"2026-11-17T11:00:00Z","in_reply_to":"a1","resolved":false,"moved_from":"l9","applied":"2026-11-18T09:00:00Z"}
 ]}
 "#;
 
@@ -232,7 +232,11 @@ fn the_file_roundtrips_through_the_reader_and_writer_with_unknown_fields() {
     assert_eq!(read_back.summary.as_deref(), Some("Two nits."));
     assert_eq!(read_back.extra[0].0, "tool");
     assert_eq!(read_back.comments[1].moved_from.as_deref(), Some("l9"));
-    assert!(read_back.comments[1].extra.is_empty(), "a field dffy knows");
+    assert_eq!(
+        read_back.comments[1].applied.as_deref(),
+        Some("2026-11-18T09:00:00Z")
+    );
+    assert!(read_back.comments[1].extra.is_empty(), "fields dffy knows");
 
     // A write through `apply` keeps everything it didn't change.
     apply(&path, vec![Op::Notice(Some("refreshed".to_owned()))]).expect("applies");
@@ -416,6 +420,53 @@ fn set_changes_fields_by_id_or_ref() {
         r#"{"op":"set","fields":{"resolved":true}}"#,
         r#"{"op":"set","ref":"x","id":"y","fields":{"resolved":true}}"#,
         r#"{"op":"set","ref":"x","fields":{"path":"other.rs"}}"#,
+    ] {
+        assert!(ops(&mut c, &format!("[{bad}]")).is_err(), "{bad}");
+    }
+}
+
+/// After a suggestion is applied: its thread moves to the lines it put
+/// there, a range from the old side becoming one on the new, and its
+/// comment is marked applied, posted or not; a new suggestion clears the
+/// mark. Lines move only on a line comment, and only together.
+#[test]
+fn set_moves_a_threads_lines_and_marks_a_suggestion_applied() {
+    let mut c = Review::default();
+    let id = added(&mut c, &format!("[{LINE_COMMENT}]"));
+    let reply = added(
+        &mut c,
+        &format!(r#"[{{"op":"add","comment":{{"text":"r","in_reply_to":"{id}"}}}}]"#),
+    );
+    ops(
+        &mut c,
+        &format!(
+            r#"[{{"op":"set","id":"{id}","fields":{{"ref":"github:1"}}}},
+                {{"op":"set","id":"{id}","fields":{{"start":{{"old":null,"new":7}},"end":{{"old":null,"new":8}},"start_side":null,"anchor":{{"lines":["x","y"]}}}}}},
+                {{"op":"set","id":"{id}","fields":{{"applied":"2026-11-18T09:00:00Z"}}}}]"#
+        ),
+    )
+    .expect("applies to a posted comment too");
+    let root = &c.comments[0];
+    assert_eq!(
+        (root.range(), root.start_side, root.applied.as_deref()),
+        (Some((Side::New, 6..8)), None, Some("2026-11-18T09:00:00Z"))
+    );
+    ops(
+        &mut c,
+        &format!(r#"[{{"op":"set","id":"{reply}","fields":{{"applied":"t"}}}}]"#),
+    )
+    .expect("marks a reply");
+    ops(
+        &mut c,
+        &format!(r#"[{{"op":"set","id":"{reply}","fields":{{"suggestion":"z"}}}}]"#),
+    )
+    .expect("suggests again");
+    assert_eq!(c.comments[1].applied, None, "a new suggestion to apply");
+    for bad in [
+        format!(
+            r#"{{"op":"set","id":"{reply}","fields":{{"start":{{"new":1}},"end":{{"new":1}}}}}}"#
+        ),
+        format!(r#"{{"op":"set","id":"{id}","fields":{{"start":{{"new":1}}}}}}"#),
     ] {
         assert!(ops(&mut c, &format!("[{bad}]")).is_err(), "{bad}");
     }
@@ -1307,10 +1358,10 @@ fn moved_threads_leave_their_file_only_once_the_other_has_them() {
         &from,
         vec![Op::Set {
             target: Target::Id(moving.clone()),
-            change: Change {
+            change: Box::new(Change {
                 branch: Some(Some("topic".to_owned())),
                 ..Change::default()
-            },
+            }),
         }],
     )
     .expect("puts it on a branch");

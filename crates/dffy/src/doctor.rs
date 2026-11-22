@@ -17,6 +17,7 @@ use dffy_core::git::{self, ChangeSet, FileChange, Head, Repo, Revisions, Status}
 use dffy_core::view::Staging;
 
 use crate::Ctx;
+use crate::agents::{Place, State};
 use crate::daemon::protocol::{self, VERSION};
 use crate::render::{Canvas, escape, escape_lines, thousands};
 use crate::theme::Role;
@@ -75,6 +76,28 @@ pub(crate) struct Facts {
     /// renderer's executable is, if it's on PATH.
     pub renderers: Vec<(String, String, Option<PathBuf>)>,
     pub review: Option<ReviewFacts>,
+    /// `None` when not gathered.
+    pub agent: Option<AgentFacts>,
+    /// dffy's skill in each place agents read skills from: the home
+    /// directory's, then the repository's that hold one.
+    pub skills: Vec<SkillFacts>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SkillFacts {
+    pub place: Place,
+    pub state: Result<State, String>,
+}
+
+/// The agent plugin, `dffy-agent`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct AgentFacts {
+    /// Where its executable is, if it's on PATH; the checks are `None`
+    /// when it isn't.
+    pub path: Option<PathBuf>,
+    /// Its own checks of the agents, from its `doctor`, or why they
+    /// couldn't be read.
+    pub checks: Option<Result<Vec<crate::plugin::review::Check>, String>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -131,7 +154,8 @@ pub(crate) struct CacheUsage {
 
 impl Facts {
     pub(crate) fn gather(ctx: &Ctx, dir: Option<&Path>) -> Self {
-        let env = |name| std::env::var(name).ok().filter(|v| !v.is_empty());
+        let plugins = plugins(ctx);
+        let env = |name: &str| std::env::var(name).ok().filter(|v| !v.is_empty());
         let git = match Command::new("git").arg("--version").output() {
             Ok(out) if out.status.success() => {
                 Ok(String::from_utf8_lossy(&out.stdout).trim().to_owned())
@@ -169,21 +193,17 @@ impl Facts {
             Ok((read("max_user_watches")?, read("max_user_instances")?))
         });
         let dffyd = crate::daemon::report().map_err(|e| e.to_string());
-        let multiplexer = if env("TMUX").is_some() {
-            Some("tmux")
-        } else if env("ZELLIJ").is_some() {
-            Some("zellij")
-        } else if env("STY").is_some() {
-            Some("screen")
-        } else if env("TERM_PROGRAM").is_some_and(|p| p == "herdr") {
-            // herdr sets no variable of its own; it names itself in TERM_PROGRAM.
-            Some("herdr")
-        } else {
-            None
-        };
+        let (review, agent) = plugins();
+        let home = std::env::var_os("HOME")
+            .filter(|h| !h.is_empty())
+            .map(PathBuf::from);
         Self {
             build: crate::BUILD,
-            home: std::env::var_os("HOME").map(PathBuf::from),
+            skills: skills(
+                home.as_deref(),
+                repo.as_ref().ok().map(|r| r.path.as_path()),
+            ),
+            home,
             git,
             repo,
             speed,
@@ -195,7 +215,7 @@ impl Facts {
             term: env("TERM"),
             colorterm: env("COLORTERM"),
             term_program: env("TERM_PROGRAM"),
-            multiplexer,
+            multiplexer: multiplexer(env),
             tmux_clipboard: crate::term::tmux_clipboard(),
             width: ctx.term.width,
             stdout_tty: ctx.term.stdout_tty,
@@ -227,30 +247,69 @@ impl Facts {
                 })
             }),
             renderers: renderers(&ctx.config.render),
-            review: ctx.config.review.as_ref().map(|name| review(name, ctx)),
+            review,
+            agent: Some(agent),
         }
     }
 
-    /// Writes the report as text. Returns whether any check failed.
-    pub(crate) fn render(&self, c: &mut Canvas) -> bool {
-        let checks = self.checks();
-        for check in &checks {
-            let (symbol, role) = match check.mark {
-                Mark::Ok => ("✓", Role::Ok),
-                Mark::Warn => ("!", Role::Warn),
-                Mark::Fail => ("✗", Role::Error),
-                Mark::Info => ("·", Role::Dim),
-            };
-            c.push(role, symbol);
-            c.push_fmt(Role::Plain, format_args!(" {:<11} ", check.label));
-            // Details quote paths, config values and environment variables.
-            c.line(Role::Plain, &escape_lines(&check.detail));
-            for note in &check.notes {
+    /// Writes the report as text, in sections, each group of checks on one
+    /// row, or with `verbose` each check on its own with its whole detail.
+    /// Returns whether any check failed.
+    pub(crate) fn render(&self, c: &mut Canvas, verbose: bool) -> bool {
+        let mut checks = self.checks();
+        checks.sort_by_key(|check| check.section);
+        let rows = if verbose {
+            checks.iter().map(Row::of).collect()
+        } else {
+            Row::folded(&checks)
+        };
+        let width = rows
+            .iter()
+            .map(|r| r.label.chars().count())
+            .max()
+            .unwrap_or(0)
+            + 2;
+        let version = if verbose {
+            self.build
+        } else {
+            self.build.split('+').next().unwrap_or(self.build)
+        };
+        c.line(Role::FileHeader, &format!("dffy {version}"));
+        let mut section = Section::Dffy;
+        for row in &rows {
+            // The agent plugin's row heads its section, which it runs.
+            let heading = !verbose && row.section == Section::Agents && row.label == "agents";
+            if row.section != section {
+                section = row.section;
+                c.push(Role::FileHeader, section.title());
+                if !heading {
+                    c.end_line();
+                }
+            }
+            if heading {
+                // Details quote paths, config values and environment
+                // variables.
+                let pad = width + 4 - section.title().chars().count();
+                c.spaces(Role::Plain, pad);
+                c.line(Role::Plain, &escape_lines(&row.detail));
+            } else {
+                let (symbol, role) = match row.mark {
+                    Mark::Ok => ("✓", Role::Ok),
+                    Mark::Warn => ("!", Role::Warn),
+                    Mark::Fail => ("✗", Role::Error),
+                    Mark::Info => ("·", Role::Dim),
+                };
                 c.push(Role::Plain, "  ");
+                c.push(role, symbol);
+                c.push_fmt(Role::Plain, format_args!(" {:<width$}", row.label));
+                c.line(Role::Plain, &escape_lines(&row.detail));
+            }
+            for note in &row.notes {
+                c.push(Role::Plain, "      ");
                 c.line(Role::Warn, &escape_lines(note));
             }
-            for hint in &check.hints {
-                c.push(Role::Plain, "  ");
+            for hint in &row.hints {
+                c.push(Role::Plain, "      ");
                 c.push(Role::Hint, "hint:");
                 c.line(Role::Plain, &format!(" {}", escape_lines(hint)));
             }
@@ -341,10 +400,12 @@ impl Facts {
                         .collect(),
                 ),
             ),
+            ("skills", skills_json(&self.skills)),
             (
                 "review",
                 self.review.as_ref().map_or(Json::Null, review_json),
             ),
+            ("agent", self.agent.as_ref().map_or(Json::Null, agent_json)),
         ]);
         let mut out = String::new();
         object.write(&mut out);
@@ -480,14 +541,38 @@ impl Facts {
         ])
     }
 
+    /// Every check, in the order `--json` lists them.
     fn checks(&self) -> Vec<Check> {
         let mut checks = Vec::new();
-        self.repository(&mut checks);
-        self.watch(&mut checks);
-        self.speed(&mut checks);
-        self.terminal(&mut checks);
-        self.settings(&mut checks);
-        self.broker(&mut checks);
+        let mut add = |section, add: &dyn Fn(&mut Vec<Check>)| {
+            let from = checks.len();
+            add(&mut checks);
+            for check in &mut checks[from..] {
+                check.section = section;
+            }
+        };
+        add(Section::Dffy, &|c| {
+            self.repository(c);
+            self.watch(c);
+            self.speed(c);
+        });
+        add(Section::Terminal, &|c| {
+            self.terminal(c);
+            self.settings(c);
+        });
+        add(Section::Plugins, &|c| {
+            self.renderer_checks(c);
+            if let Some(review) = &self.review {
+                self.review_checks(review, c);
+            }
+        });
+        add(Section::Agents, &|c| {
+            if let Some(agent) = &self.agent {
+                self.agent_checks(agent, c);
+            }
+            self.skill_checks(c);
+        });
+        add(Section::Dffy, &|c| self.broker(c));
         checks
     }
 
@@ -511,7 +596,10 @@ impl Facts {
 
     fn repository(&self, checks: &mut Vec<Check>) {
         match &self.git {
-            Ok(version) => checks.push(Check::new(Mark::Ok, "git", version)),
+            Ok(version) => checks.push(
+                Check::new(Mark::Ok, "git", version)
+                    .brief(version.trim_start_matches("git version ")),
+            ),
             Err(e) => checks.push(
                 Check::new(Mark::Fail, "git", format!("not found: {e}"))
                     .hint("install git; dffy reads repositories itself but checks against git"),
@@ -562,11 +650,10 @@ impl Facts {
         let label = "watch";
         let (limit, used) = match &self.inotify {
             None => {
-                checks.push(Check::new(
-                    Mark::Info,
-                    label,
-                    "FSEvents needs no per-directory watches",
-                ));
+                checks.push(
+                    Check::new(Mark::Info, label, "FSEvents needs no per-directory watches")
+                        .brief("FSEvents"),
+                );
                 return;
             }
             Some(Err(e)) => {
@@ -625,22 +712,26 @@ impl Facts {
             parts.push(format!("first change {}", millis(first)));
         }
         let changes = if s.changes == 1 { "change" } else { "changes" };
-        parts.push(format!(
-            "all {}{} {changes} {}",
+        let all = format!(
+            "{}{} {changes} {}",
             thousands(s.changes),
             if s.capped { "+" } else { "" },
             millis(s.all)
-        ));
-        parts.push(match s.untracked {
+        );
+        let untracked = match s.untracked {
             Some(walk) => format!("untracked {}", millis(walk)),
             None => "untracked not timed".to_owned(),
-        });
+        };
+        let brief = [&parts[..], &[all.clone(), untracked.clone()]]
+            .concat()
+            .join(" · ");
+        parts.extend([format!("all {all}"), untracked]);
         if let Some((path, took)) = &s.largest {
             parts.push(format!("largest diff {} ({path})", millis(*took)));
         } else if s.largest_skipped {
             parts.push("largest diff not timed".to_owned());
         }
-        let mut check = Check::new(Mark::Info, "speed", parts.join(" · "));
+        let mut check = Check::new(Mark::Info, "speed", parts.join(" · ")).brief(brief);
         if s.capped {
             check = check.note(format!(
                 "stopped counting at {} changes; the viewer lists them all",
@@ -656,11 +747,10 @@ impl Facts {
     fn broker(&self, checks: &mut Vec<Check>) {
         let label = "dffyd";
         match &self.dffyd {
-            Ok(None) => checks.push(Check::new(
-                Mark::Info,
-                label,
-                "not running; the first viewer starts it",
-            )),
+            Ok(None) => checks.push(
+                Check::new(Mark::Info, label, "not running; the first viewer starts it")
+                    .brief("not running"),
+            ),
             Ok(Some(report)) => {
                 let subscribers: u32 = report.roots.iter().map(|root| root.subscribers).sum();
                 let running = format!(
@@ -670,6 +760,7 @@ impl Facts {
                 );
                 let mut check = if self.current(report) {
                     Check::new(Mark::Ok, label, running)
+                        .brief(format!("running (pid {})", report.pid))
                 } else {
                     let build = match &report.build {
                         Some(build) => format!("build {build}"),
@@ -680,6 +771,10 @@ impl Facts {
                         label,
                         format!("{running}; it's {build}, this dffy is {}", self.build),
                     )
+                    .brief(format!(
+                        "running (pid {}), another dffy's build",
+                        report.pid
+                    ))
                     .hint("dffy daemon stop; the next dffy --watch starts this build's broker")
                 };
                 for root in report.roots.iter().filter(|root| root.polling.is_some()) {
@@ -731,7 +826,20 @@ impl Facts {
         } else {
             Mark::Ok
         };
-        checks.push(Check::new(mark, "terminal", terminal.join(", ")));
+        let brief: Vec<String> = [
+            Some(self.term.clone().unwrap_or_else(|| "TERM unset".to_owned())),
+            self.colorterm.clone(),
+            self.term_program.clone(),
+            Some(match (self.stdout_tty, self.width) {
+                (true, Some(w)) => format!("{w} columns"),
+                (true, None) => "width unknown".to_owned(),
+                (false, _) => "not a terminal".to_owned(),
+            }),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
+        checks.push(Check::new(mark, "terminal", terminal.join(", ")).brief(brief.join(" · ")));
         checks.push(match self.multiplexer {
             Some(name) => Check::new(
                 Mark::Ok,
@@ -739,8 +847,9 @@ impl Facts {
                 format!(
                     "{name}; dffy's one query (the background color) falls back to dark if it isn't relayed"
                 ),
-            ),
-            None => Check::new(Mark::Info, "multiplexer", "none detected"),
+            )
+            .brief(name),
+            None => Check::new(Mark::Info, "multiplexer", "none detected").brief("none"),
         });
         if self.multiplexer == Some("tmux") {
             let label = "copy";
@@ -749,7 +858,8 @@ impl Facts {
                     Mark::Ok,
                     label,
                     "tmux passes copies (y, Y) to the terminal: set-clipboard is on",
-                ),
+                )
+                .brief("tmux set-clipboard on"),
                 value => {
                     let detail = match value {
                         Some(value) => {
@@ -767,19 +877,26 @@ impl Facts {
             });
         }
         let truecolor = matches!(self.colorterm.as_deref(), Some("truecolor" | "24bit"));
-        checks.push(Check::new(
-            Mark::Ok,
-            "color",
-            format!(
-                "{}; the default theme uses the 16 ANSI colors{}",
-                if self.color { "on" } else { "off" },
-                if truecolor {
-                    ", truecolor themes work too"
-                } else {
-                    ""
-                }
-            ),
-        ));
+        let on = if self.color { "on" } else { "off" };
+        checks.push(
+            Check::new(
+                Mark::Ok,
+                "color",
+                format!(
+                    "{on}; the default theme uses the 16 ANSI colors{}",
+                    if truecolor {
+                        ", truecolor themes work too"
+                    } else {
+                        ""
+                    }
+                ),
+            )
+            .brief(if truecolor {
+                format!("{on} · 16-color theme, truecolor works")
+            } else {
+                format!("{on} · 16-color theme")
+            }),
+        );
     }
 
     fn settings(&self, checks: &mut Vec<Check>) {
@@ -787,28 +904,48 @@ impl Facts {
             || "no config directory".to_owned(),
             |p| p.display().to_string(),
         );
+        let short = self
+            .config_path
+            .as_ref()
+            .map_or_else(|| "no config directory".to_owned(), |p| self.short(p));
         if !self.config_found {
-            checks.push(Check::new(
-                Mark::Info,
-                "config",
-                format!("{path} (not present; using defaults)"),
-            ));
+            checks.push(
+                Check::new(
+                    Mark::Info,
+                    "config",
+                    format!("{path} (not present; using defaults)"),
+                )
+                .brief(format!("{short} (not present)")),
+            );
         } else if self.config_warnings.is_empty() {
-            checks.push(Check::new(Mark::Ok, "config", path));
+            checks.push(Check::new(Mark::Ok, "config", path).brief(short));
         } else {
             let count = self.config_warnings.len();
-            let mut check = Check::new(Mark::Warn, "config", format!("{path}: {count} problem(s)"));
+            let mut check = Check::new(Mark::Warn, "config", format!("{path}: {count} problem(s)"))
+                .brief(format!("{short}: {count} problem(s)"));
             check.notes.clone_from(&self.config_warnings);
             checks.push(check);
         }
-        checks.push(Check::new(Mark::Ok, "theme", &self.theme));
-        checks.push(Check::new(
-            Mark::Ok,
-            "pager",
-            self.pager
-                .as_deref()
-                .unwrap_or("none; output goes straight to the terminal"),
-        ));
+        checks.push(
+            Check::new(Mark::Ok, "theme", &self.theme)
+                .group("config")
+                .brief(format!("theme {}", self.theme)),
+        );
+        checks.push(
+            Check::new(
+                Mark::Ok,
+                "pager",
+                self.pager
+                    .as_deref()
+                    .unwrap_or("none; output goes straight to the terminal"),
+            )
+            .group("config")
+            .brief(
+                self.pager
+                    .as_ref()
+                    .map_or_else(|| "no pager".to_owned(), |p| format!("pager {p}")),
+            ),
+        );
         checks.push(match &self.cache {
             None => Check::new(Mark::Info, "cache", "off"),
             Some(Ok(usage)) => Check::new(
@@ -821,17 +958,56 @@ impl Facts {
                     usage.entries,
                     megabytes(usage.budget)
                 ),
-            ),
+            )
+            .brief(format!(
+                "{} · {} of {}",
+                self.short(&usage.dir),
+                megabytes(usage.bytes),
+                megabytes(usage.budget)
+            )),
             Some(Err(e)) => Check::new(Mark::Warn, "cache", format!("can't read: {e}"))
                 .hint("fix its permissions or set cache = false; dffy works without it"),
         });
-        for (ext, name, found) in &self.renderers {
-            checks.push(match found {
-                Some(path) => Check::new(
-                    Mark::Ok,
-                    "renderer",
-                    format!(".{ext} → {name}: {}", self.short(path)),
-                ),
+    }
+
+    /// A line per renderer the config sets, folded into one `render` row
+    /// that lists each renderer found once, with its extensions.
+    fn renderer_checks(&self, checks: &mut Vec<Check>) {
+        let mut found: Vec<(&str, Vec<&str>)> = Vec::new();
+        for (ext, name, at) in &self.renderers {
+            if at.is_some() {
+                match found.iter_mut().find(|(n, _)| n == name) {
+                    Some((_, exts)) => exts.push(ext),
+                    None => found.push((name, vec![ext])),
+                }
+            }
+        }
+        let mut brief = Some(
+            found
+                .iter()
+                .map(|(name, exts)| {
+                    let exts: Vec<String> = exts.iter().map(|e| format!(".{e}")).collect();
+                    format!("{name} {}", exts.join(" "))
+                })
+                .collect::<Vec<_>>()
+                .join(" · "),
+        );
+        for (ext, name, at) in &self.renderers {
+            let check = match at {
+                Some(path) => {
+                    let check = Check::new(
+                        Mark::Ok,
+                        "renderer",
+                        format!(".{ext} → {name}: {}", self.short(path)),
+                    );
+                    match brief.take() {
+                        Some(all) => check.brief(all),
+                        None => Check {
+                            brief: Brief::Folded,
+                            ..check
+                        },
+                    }
+                }
                 None => Check::new(
                     Mark::Warn,
                     "renderer",
@@ -841,11 +1017,109 @@ impl Facts {
                     ),
                 )
                 .hint("install it, or see docs/plugins.md; files of this type show as lines"),
+            };
+            checks.push(check.group("render"));
+        }
+    }
+
+    /// The agent plugin's line, the agents section's heading, then a line
+    /// per check of its own, those of an agent folded into its row: a
+    /// check's group is its name's first word.
+    fn agent_checks(&self, agent: &AgentFacts, checks: &mut Vec<Check>) {
+        let program = crate::plugin::agent::PROGRAM;
+        let Some(path) = &agent.path else {
+            checks.push(
+                Check::new(Mark::Info, "agent", format!("{program} isn't on PATH"))
+                    .group("agents")
+                    .hint("asking an agent about a thread needs it; see docs/plugins.md"),
+            );
+            return;
+        };
+        let at = format!("{program}: {}", self.short(path));
+        let brief = format!("{program} {}", self.short(path));
+        checks.push(
+            match &agent.checks {
+                Some(Err(why)) => {
+                    Check::new(Mark::Warn, "agent", at).note(format!("its checks: {why}"))
+                }
+                _ => Check::new(Mark::Ok, "agent", at),
+            }
+            .group("agents")
+            .brief(brief),
+        );
+        for own in agent.checks.iter().flatten().flatten() {
+            // Labels aren't escaped when drawn, and these come from the
+            // plugin.
+            let name = escape(own.name.as_bytes());
+            let group = name.split(' ').next().unwrap_or_default().to_owned();
+            checks.push(own_check(own, format!("agent {name}"), group));
+        }
+    }
+
+    /// A line per skill location: dffy's skill there is current,
+    /// outdated, someone else's or missing. The repository's own show
+    /// only when there's one.
+    fn skill_checks(&self, checks: &mut Vec<Check>) {
+        // Each state with the places in it; a place that can't be read is
+        // its error alone.
+        let mut parts: Vec<(String, Vec<String>)> = Vec::new();
+        for skill in &self.skills {
+            let file = self.short(&skill.place.file);
+            let dir = skill
+                .place
+                .file
+                .parent()
+                .and_then(Path::parent)
+                .map_or_else(|| file.clone(), |d| self.short(d));
+            let readers = skill.place.readers();
+            let check = match &skill.state {
+                Ok(state) => {
+                    let detail = format!("{file} ({readers}): {}", state.name());
+                    let check = match state {
+                        State::Current => Check::new(Mark::Ok, "skill", detail),
+                        State::Outdated => Check::new(Mark::Warn, "skill", detail)
+                            .hint("run dffy agents setup to update it"),
+                        State::Foreign => Check::new(Mark::Info, "skill", detail)
+                            .note("a dffy skill dffy didn't write"),
+                        State::Missing => Check::new(Mark::Info, "skill", detail),
+                    };
+                    match parts.iter_mut().find(|(s, _)| s == state.name()) {
+                        Some((_, dirs)) => dirs.push(dir),
+                        None => parts.push((state.name().to_owned(), vec![dir])),
+                    }
+                    check
+                }
+                Err(e) => {
+                    parts.push((e.clone(), Vec::new()));
+                    Check::new(Mark::Warn, "skill", e.clone())
+                }
+            };
+            checks.push(Check {
+                brief: Brief::Folded,
+                ..check
             });
         }
-        if let Some(review) = &self.review {
-            self.review_checks(review, checks);
+        let Some(first) = checks.iter_mut().find(|c| c.label == "skill") else {
+            return;
+        };
+        if parts
+            .iter()
+            .any(|(state, _)| state == State::Missing.name())
+        {
+            first
+                .hints
+                .push("dffy agents setup teaches agents to use dffy".to_owned());
         }
+        first.brief = Brief::Text(
+            parts
+                .iter()
+                .map(|(state, dirs)| match &dirs[..] {
+                    [] => state.clone(),
+                    dirs => format!("{state} in {}", dirs.join(", ")),
+                })
+                .collect::<Vec<_>>()
+                .join(" · "),
+        );
     }
 
     /// The review plugin's line, then a line per check of its own.
@@ -862,63 +1136,203 @@ impl Facts {
         let mut check = match &review.command {
             Some(Ok(command)) => {
                 Check::new(Mark::Ok, "review", format!("{at}, adds dffy {command}"))
+                    .brief(&review.name)
             }
             Some(Err(why)) => Check::new(Mark::Warn, "review", format!("{at}, adds no command"))
                 .note(why.clone())
                 .hint("see docs/plugins.md; a plugin names its command with describe"),
-            None => Check::new(Mark::Ok, "review", at),
+            None => Check::new(Mark::Ok, "review", at).brief(&review.name),
         };
         if let Some(Err(why)) = &review.checks {
             check = check.note(format!("its checks: {why}"));
         }
         checks.push(check);
         for own in review.checks.iter().flatten().flatten() {
-            let mark = if own.ok { Mark::Ok } else { Mark::Warn };
-            // Details are escaped when drawn, labels aren't, and this label
-            // comes from the plugin.
-            checks.push(Check::new(
-                mark,
-                format!("review {}", escape(own.name.as_bytes())),
-                own.detail.clone(),
-            ));
+            // Labels aren't escaped when drawn, and these come from the
+            // plugin.
+            let label = format!("review {}", escape(own.name.as_bytes()));
+            checks.push(own_check(own, label, "review"));
         }
     }
 }
 
+/// One of a plugin's own checks, folded into `group`'s row by its brief
+/// when it passed; a failed one warns, with its whole detail, and one that
+/// only notes something is a note.
+fn own_check(
+    own: &crate::plugin::review::Check,
+    label: String,
+    group: impl Into<Cow<'static, str>>,
+) -> Check {
+    let mark = match (own.ok, own.info) {
+        (false, _) => Mark::Warn,
+        (true, true) => Mark::Info,
+        (true, false) => Mark::Ok,
+    };
+    let check = Check::new(mark, label, own.detail.clone()).group(group);
+    match &own.brief {
+        Some(brief) if own.ok => check.brief(brief.clone()),
+        _ => check,
+    }
+}
+
+/// Starts asking the review plugin the config names, if any, and the agent
+/// plugin, side by side on threads of their own: their checks wait on
+/// programs of theirs, a few seconds at most, so they run beside dffy's
+/// own and doctor takes the slowest. What's returned waits for them.
+fn plugins(ctx: &Ctx) -> impl FnOnce() -> (Option<ReviewFacts>, AgentFacts) + use<> {
+    fn joined<T>(thread: std::thread::JoinHandle<T>) -> T {
+        (thread.join()).unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+    }
+    let (review, cache, agent) = (
+        ctx.config.review.clone(),
+        ctx.cache.clone(),
+        ctx.config.agent.clone(),
+    );
+    let agent = std::thread::spawn(move || self::agent(agent));
+    let review = review.map(|name| std::thread::spawn(move || self::review(&name, cache.as_ref())));
+    move || (review.map(joined), joined(agent))
+}
+
 /// The review plugin `name`: the command it describes and its own checks,
-/// both asked now. What it describes replaces the cached answer, so a
-/// failure kept from before is asked again.
-fn review(name: &str, ctx: &Ctx) -> ReviewFacts {
+/// both asked now, side by side. What it describes replaces the cached
+/// answer, so a failure kept from before is asked again.
+fn review(name: &str, cache: Option<&dffy_core::cache::Cache>) -> ReviewFacts {
     let found = crate::plugin::find(crate::plugin::REVIEW_PREFIX, name);
-    let command = found
-        .as_ref()
-        .map(|_| crate::describe_review(name, ctx.cache.as_ref(), true).map(|d| d.naming.command));
+    let (command, checks) = std::thread::scope(|scope| {
+        let checks =
+            (found.as_ref()).map(|program| scope.spawn(|| crate::plugin::review::doctor(program)));
+        let command = (found.as_ref())
+            .map(|_| crate::describe_review(name, cache, true).map(|d| d.naming.command));
+        let checks = checks
+            .map(|checks| (checks.join()).unwrap_or_else(|panic| std::panic::resume_unwind(panic)));
+        (command, checks)
+    });
     ReviewFacts {
         name: name.to_owned(),
         command,
-        checks: found.as_ref().map(crate::plugin::review::doctor),
+        checks,
         path: found.map(|p| p.path),
     }
+}
+
+/// The agent plugin, found on PATH, and its own checks, asked now: a
+/// process started for them alone, which probes the agents again.
+/// `config` is the config's `agent`.
+fn agent(config: Option<String>) -> AgentFacts {
+    let found = crate::plugin::agent::find();
+    AgentFacts {
+        checks: (found.as_ref()).map(|program| crate::plugin::agent::doctor(program, config)),
+        path: found.map(|p| p.path),
+    }
+}
+
+/// The multiplexer dffy runs in, from the variables `env` reads.
+fn multiplexer(env: impl Fn(&str) -> Option<String>) -> Option<&'static str> {
+    if env("TMUX").is_some() {
+        Some("tmux")
+    } else if env("ZELLIJ").is_some() {
+        Some("zellij")
+    } else if env("STY").is_some() {
+        Some("screen")
+    } else if env("TERM_PROGRAM").is_some_and(|p| p == "herdr") {
+        // herdr names itself in TERM_PROGRAM, and sets HERDR_ENV and
+        // other HERDR_ variables too.
+        Some("herdr")
+    } else {
+        None
+    }
+}
+
+/// dffy's skill under `home`, and under the repository's root `worktree`
+/// where it's there at all.
+fn skills(home: Option<&Path>, worktree: Option<&Path>) -> Vec<SkillFacts> {
+    let judged = |base: &Path| {
+        crate::agents::places(base, &[])
+            .into_iter()
+            .map(|place| SkillFacts {
+                state: crate::agents::state(&place.file),
+                place,
+            })
+            .collect::<Vec<_>>()
+    };
+    let mut skills = home.map(judged).unwrap_or_default();
+    if let Some(worktree) = worktree.filter(|w| Some(*w) != home) {
+        skills.extend(
+            judged(worktree)
+                .into_iter()
+                .filter(|s| s.state != Ok(State::Missing)),
+        );
+    }
+    skills
+}
+
+fn skills_json(skills: &[SkillFacts]) -> Json {
+    Json::Array(
+        skills
+            .iter()
+            .map(|skill| {
+                Json::Object(vec![
+                    ("path", Json::path(&skill.place.file)),
+                    (
+                        "agents",
+                        Json::Array(
+                            (skill.place.agents.iter())
+                                .map(|a| Json::str(a.id()))
+                                .collect(),
+                        ),
+                    ),
+                    (
+                        "status",
+                        skill
+                            .state
+                            .as_ref()
+                            .map_or(Json::Null, |s| Json::str(s.name())),
+                    ),
+                    ("error", Json::error(skill.state.as_ref())),
+                ])
+            })
+            .collect(),
+    )
+}
+
+fn agent_json(agent: &AgentFacts) -> Json {
+    let checks = agent.checks.as_ref();
+    Json::Object(vec![
+        ("path", agent.path.as_ref().map_or(Json::Null, Json::path)),
+        (
+            "checks",
+            checks
+                .and_then(|r| r.as_ref().ok())
+                .map_or(Json::Null, |c| checks_json(c)),
+        ),
+        (
+            "checks_error",
+            checks.map_or(Json::Null, |r| Json::error(r.as_ref())),
+        ),
+    ])
+}
+
+fn checks_json(checks: &[crate::plugin::review::Check]) -> Json {
+    Json::Array(
+        checks
+            .iter()
+            .map(|c| {
+                Json::Object(vec![
+                    ("name", Json::str(&c.name)),
+                    ("ok", Json::Bool(c.ok)),
+                    ("detail", Json::str(&c.detail)),
+                ])
+            })
+            .collect(),
+    )
 }
 
 fn review_json(review: &ReviewFacts) -> Json {
     let (command, checks) = (review.command.as_ref(), review.checks.as_ref());
     let listed = checks
         .and_then(|r| r.as_ref().ok())
-        .map_or(Json::Null, |checks| {
-            Json::Array(
-                checks
-                    .iter()
-                    .map(|c| {
-                        Json::Object(vec![
-                            ("name", Json::str(&c.name)),
-                            ("ok", Json::Bool(c.ok)),
-                            ("detail", Json::str(&c.detail)),
-                        ])
-                    })
-                    .collect(),
-            )
-        });
+        .map_or(Json::Null, |checks| checks_json(checks));
     Json::Object(vec![
         ("name", Json::str(&review.name)),
         ("path", review.path.as_ref().map_or(Json::Null, Json::path)),
@@ -1132,6 +1546,23 @@ enum Mark {
 }
 
 impl Mark {
+    /// The one of the two a folded row shows: a failure over a warning
+    /// over a note over a pass, so a row isn't marked passed when part of
+    /// it is only noted, as a config file that isn't there.
+    fn worst(self, other: Self) -> Self {
+        let rank = |mark| match mark {
+            Self::Ok => 0,
+            Self::Info => 1,
+            Self::Warn => 2,
+            Self::Fail => 3,
+        };
+        if rank(other) > rank(self) {
+            other
+        } else {
+            self
+        }
+    }
+
     fn name(self) -> &'static str {
         match self {
             Self::Ok => "ok",
@@ -1142,7 +1573,40 @@ impl Mark {
     }
 }
 
-/// One line of the report, with the lines under it.
+/// Where a check shows in the text report, in this order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum Section {
+    /// Under the `dffy <version>` heading.
+    Dffy,
+    Terminal,
+    Plugins,
+    Agents,
+}
+
+impl Section {
+    fn title(self) -> &'static str {
+        match self {
+            Self::Dffy => "dffy",
+            Self::Terminal => "terminal",
+            Self::Plugins => "plugins",
+            Self::Agents => "agents",
+        }
+    }
+}
+
+/// What a check says in its row of the folded report.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Brief {
+    /// Its detail.
+    Detail,
+    Text(String),
+    /// Nothing: another check of its row says it for both.
+    Folded,
+}
+
+/// One line of the report, with the lines under it. `--json` and
+/// `--verbose` give each check its own line; the text report folds the
+/// checks of a `group` into one row, their briefs joined.
 struct Check {
     mark: Mark,
     /// dffy's own, or `review <name>` for one of the review plugin's.
@@ -1151,16 +1615,24 @@ struct Check {
     /// Indented lines in the warning color.
     notes: Vec<String>,
     hints: Vec<String>,
+    section: Section,
+    /// The folded row's label; `agents` is the agents section's heading.
+    group: Cow<'static, str>,
+    brief: Brief,
 }
 
 impl Check {
     fn new(mark: Mark, label: impl Into<Cow<'static, str>>, detail: impl Into<String>) -> Self {
+        let label = label.into();
         Self {
             mark,
-            label: label.into(),
+            group: label.clone(),
+            label,
             detail: detail.into(),
             notes: Vec::new(),
             hints: Vec::new(),
+            section: Section::Dffy,
+            brief: Brief::Detail,
         }
     }
 
@@ -1172,6 +1644,78 @@ impl Check {
     fn hint(mut self, text: impl Into<String>) -> Self {
         self.hints.push(text.into());
         self
+    }
+
+    fn brief(mut self, text: impl Into<String>) -> Self {
+        self.brief = Brief::Text(text.into());
+        self
+    }
+
+    fn group(mut self, group: impl Into<Cow<'static, str>>) -> Self {
+        self.group = group.into();
+        self
+    }
+}
+
+/// A line of the text report: a check, or the checks of a group folded.
+struct Row<'a> {
+    mark: Mark,
+    label: &'a str,
+    detail: Cow<'a, str>,
+    notes: Vec<&'a str>,
+    hints: Vec<&'a str>,
+    section: Section,
+}
+
+impl<'a> Row<'a> {
+    fn of(check: &'a Check) -> Self {
+        Self {
+            mark: check.mark,
+            label: &check.label,
+            detail: Cow::Borrowed(&check.detail),
+            notes: check.notes.iter().map(String::as_str).collect(),
+            hints: check.hints.iter().map(String::as_str).collect(),
+            section: check.section,
+        }
+    }
+
+    /// `checks`' groups, each one row in the order it first comes: the
+    /// worst mark, the briefs joined, every note and hint.
+    fn folded(checks: &'a [Check]) -> Vec<Self> {
+        let mut rows: Vec<Self> = Vec::new();
+        for check in checks {
+            let brief = match &check.brief {
+                Brief::Detail => Some(check.detail.as_str()),
+                Brief::Text(text) => Some(text.as_str()),
+                Brief::Folded => None,
+            };
+            let at = rows
+                .iter()
+                .position(|r| r.label == check.group && r.section == check.section);
+            let Some(at) = at else {
+                rows.push(Self {
+                    mark: check.mark,
+                    label: &check.group,
+                    detail: Cow::Borrowed(brief.unwrap_or_default()),
+                    notes: check.notes.iter().map(String::as_str).collect(),
+                    hints: check.hints.iter().map(String::as_str).collect(),
+                    section: check.section,
+                });
+                continue;
+            };
+            let row = &mut rows[at];
+            row.mark = row.mark.worst(check.mark);
+            if let Some(brief) = brief.filter(|b| !b.is_empty()) {
+                let detail = row.detail.to_mut();
+                if !detail.is_empty() {
+                    detail.push_str(" · ");
+                }
+                detail.push_str(brief);
+            }
+            row.notes.extend(check.notes.iter().map(String::as_str));
+            row.hints.extend(check.hints.iter().map(String::as_str));
+        }
+        rows
     }
 }
 
@@ -1340,24 +1884,46 @@ mod tests {
                 ("csv".to_owned(), "csv".to_owned(), None),
             ],
             review: None,
+            agent: None,
+            skills: Vec::new(),
         }
     }
 
     fn text(facts: &Facts) -> (String, bool) {
         let mut c = Canvas::default();
-        let failed = facts.render(&mut c);
+        let failed = facts.render(&mut c, true);
         (c.markup(), failed)
+    }
+
+    fn folded(facts: &Facts) -> String {
+        let mut c = Canvas::default();
+        facts.render(&mut c, false);
+        c.markup()
+    }
+
+    /// The lines of the section of `text` headed `title`.
+    fn section<'a>(text: &'a str, title: &str) -> Vec<&'a str> {
+        let mut lines = text
+            .lines()
+            .skip_while(|l| !l.contains(&format!(">{title}</>")));
+        let heading = lines.next().into_iter();
+        heading
+            .chain(lines.take_while(|l| l.starts_with(' ')))
+            .collect()
     }
 
     /// The lines of `text` from the one labelled `label`, with what's
     /// indented under it.
     fn check<'a>(text: &'a str, label: &str) -> Vec<&'a str> {
-        let mut lines = text
-            .lines()
-            .skip_while(|l| !l.contains(&format!(" {label:<12}")));
+        let labelled = |l: &str| {
+            l.split_once("</> ")
+                .and_then(|(_, rest)| rest.strip_prefix(label))
+                .is_some_and(|rest| rest.starts_with("  "))
+        };
+        let mut lines = text.lines().skip_while(|l| !labelled(l));
         let first = lines.next().into_iter();
         first
-            .chain(lines.take_while(|l| l.starts_with("  ")))
+            .chain(lines.take_while(|l| l.starts_with("      ")))
             .collect()
     }
 
@@ -1366,6 +1932,70 @@ mod tests {
         let (text, failed) = text(&facts());
         assert!(!failed);
         insta::assert_snapshot!(text);
+        insta::assert_snapshot!("healthy_environment_folded", folded(&facts()));
+    }
+
+    /// A line per place in `--verbose` and `--json`; one row in the text,
+    /// the places of each state together, with a hint while one is missing
+    /// and how to update one that's outdated.
+    #[test]
+    fn the_skill_row_says_each_place_by_its_state() {
+        let skills = |states: [Result<State, String>; 2]| {
+            let places = crate::agents::places(Path::new("/home/u"), &[]);
+            let facts = Facts {
+                skills: places
+                    .into_iter()
+                    .zip(states)
+                    .map(|(place, state)| SkillFacts { place, state })
+                    .collect(),
+                ..facts()
+            };
+            let json = facts.json().0;
+            let at = json.find("\"skills\":").expect("the skills key");
+            let end = json.find(",\"review\":").expect("the review key");
+            [
+                section(&folded(&facts), "agents").join("\n"),
+                check(&text(&facts).0, "skill").join("\n"),
+                json[at..end].to_owned(),
+            ]
+            .join("\n")
+        };
+        insta::assert_snapshot!(
+            [
+                skills([Ok(State::Current), Ok(State::Current)]),
+                skills([Ok(State::Outdated), Ok(State::Missing)]),
+                skills([Ok(State::Foreign), Err("can't read it: denied".to_owned())]),
+                skills([Err("can't read it: denied".to_owned()), Ok(State::Current)]),
+            ]
+            .join("\n\n"),
+            @r#"
+            <file-header>agents</>
+              <ok>✓</> skill        current in ~/.claude/skills, ~/.agents/skills
+              <ok>✓</> skill        ~/.claude/skills/dffy/SKILL.md (Claude Code): current
+            "skills":[{"path":"/home/u/.claude/skills/dffy/SKILL.md","agents":["claude"],"status":"current","error":null},{"path":"/home/u/.agents/skills/dffy/SKILL.md","agents":["codex","pi","amp"],"status":"current","error":null}]
+
+            <file-header>agents</>
+              <warn>!</> skill        outdated in ~/.claude/skills · missing in ~/.agents/skills
+                  <hint>hint:</> run dffy agents setup to update it
+                  <hint>hint:</> dffy agents setup teaches agents to use dffy
+              <warn>!</> skill        ~/.claude/skills/dffy/SKILL.md (Claude Code): outdated
+                  <hint>hint:</> run dffy agents setup to update it
+                  <hint>hint:</> dffy agents setup teaches agents to use dffy
+            "skills":[{"path":"/home/u/.claude/skills/dffy/SKILL.md","agents":["claude"],"status":"outdated","error":null},{"path":"/home/u/.agents/skills/dffy/SKILL.md","agents":["codex","pi","amp"],"status":"missing","error":null}]
+
+            <file-header>agents</>
+              <warn>!</> skill        foreign in ~/.claude/skills · can't read it: denied
+                  <warn>a dffy skill dffy didn't write</>
+              <dim>·</> skill        ~/.claude/skills/dffy/SKILL.md (Claude Code): foreign
+                  <warn>a dffy skill dffy didn't write</>
+            "skills":[{"path":"/home/u/.claude/skills/dffy/SKILL.md","agents":["claude"],"status":"foreign","error":null},{"path":"/home/u/.agents/skills/dffy/SKILL.md","agents":["codex","pi","amp"],"status":null,"error":"can't read it: denied"}]
+
+            <file-header>agents</>
+              <warn>!</> skill        can't read it: denied · current in ~/.agents/skills
+              <warn>!</> skill        can't read it: denied
+            "skills":[{"path":"/home/u/.claude/skills/dffy/SKILL.md","agents":["claude"],"status":null,"error":"can't read it: denied"},{"path":"/home/u/.agents/skills/dffy/SKILL.md","agents":["codex","pi","amp"],"status":"current","error":null}]
+            "#
+        );
     }
 
     #[test]
@@ -1404,8 +2034,8 @@ mod tests {
         };
         let (text, failed) = text(&facts);
         assert!(!failed);
-        insta::assert_snapshot!(check(&text, "repository").join("\n"), @"<dim>·</> repository  not in a git repository (-C <path>)");
-        insta::assert_snapshot!(check(&text, "watch").join("\n"), @"<ok>✓</> watch       5,259 of 129,194 in use");
+        insta::assert_snapshot!(check(&text, "repository").join("\n"), @"  <dim>·</> repository   not in a git repository (-C <path>)");
+        insta::assert_snapshot!(check(&text, "watch").join("\n"), @"  <ok>✓</> watch        5,259 of 129,194 in use");
         assert!(check(&text, "speed").is_empty(), "nothing to measure");
     }
 
@@ -1433,11 +2063,11 @@ mod tests {
                 line(Some(Head::Branch("main".to_owned())), 50_000, true),
             ]
             .join("\n"),
-            @r"
-        <ok>✓</> repository  ~/src/linux · main (no commits yet) · 265 staged
-        <ok>✓</> repository  ~/src/linux · detached at 80f116f · nothing uncommitted
-        <ok>✓</> repository  ~/src/linux · main · 50,000 staged (counting stopped at 50,000 changes)
-        "
+            @r#"
+            <ok>✓</> repository   ~/src/linux · main (no commits yet) · 265 staged
+            <ok>✓</> repository   ~/src/linux · detached at 80f116f · nothing uncommitted
+            <ok>✓</> repository   ~/src/linux · main · 50,000 staged (counting stopped at 50,000 changes)
+            "#
         );
     }
 
@@ -1474,13 +2104,13 @@ mod tests {
         };
         insta::assert_snapshot!(
             [detail(125_000, 0), detail(125_000, 6_345), detail(1_000, 0)].join("\n"),
-            @r"
-        <warn>!</> watch       6,345 needed here · 125,000 of 129,194 in use
-          <warn>only 4,194 free: watch mode would poll this repository once a second</>
-          <hint>hint:</> raise the limit: sudo sysctl fs.inotify.max_user_watches=524288
-        <ok>✓</> watch       6,345 needed here · 125,000 of 129,194 in use · dffyd holds them already
-        <ok>✓</> watch       6,345 needed here · 1,000 of 129,194 in use
-        "
+            @r#"
+            <warn>!</> watch        6,345 needed here · 125,000 of 129,194 in use
+                <warn>only 4,194 free: watch mode would poll this repository once a second</>
+                <hint>hint:</> raise the limit: sudo sysctl fs.inotify.max_user_watches=524288
+            <ok>✓</> watch        6,345 needed here · 125,000 of 129,194 in use · dffyd holds them already
+            <ok>✓</> watch        6,345 needed here · 1,000 of 129,194 in use
+            "#
         );
     }
 
@@ -1493,7 +2123,7 @@ mod tests {
             watches_needed: None,
             ..facts()
         };
-        insta::assert_snapshot!(check(&text(&facts).0, "watch").join("\n"), @"<dim>·</> watch       FSEvents needs no per-directory watches");
+        insta::assert_snapshot!(check(&text(&facts).0, "watch").join("\n"), @"  <dim>·</> watch        FSEvents needs no per-directory watches");
     }
 
     #[test]
@@ -1524,25 +2154,28 @@ mod tests {
             };
             let json = facts.json().0;
             let at = json.find("\"review\":").expect("the review key");
-            let shown = text(&facts).0;
-            let at_text = shown.find(" review ").expect("the review line");
-            let line_start = shown[..at_text].rfind('\n').map_or(0, |i| i + 1);
-            let lines: Vec<&str> = shown[line_start..]
-                .lines()
-                .take_while(|l| !l.contains(" dffyd "))
-                .collect();
-            [lines.join("\n"), json[at..].trim_end().to_owned()].join("\n")
+            let end = json.find(",\"agent\":").expect("the agent key");
+            let shown = folded(&facts);
+            [
+                section(&shown, "plugins").join("\n"),
+                json[at..end].to_owned(),
+            ]
+            .join("\n")
         };
         let own = [
             Own {
                 name: "gh".to_owned(),
                 ok: true,
                 detail: "gh version 2.62.0".to_owned(),
+                brief: Some("gh 2.62.0".to_owned()),
+                info: false,
             },
             Own {
                 name: "auth".to_owned(),
                 ok: false,
                 detail: "gh isn't logged in to github.com; run `gh auth login`".to_owned(),
+                brief: None,
+                info: false,
             },
         ];
         insta::assert_snapshot!(
@@ -1553,24 +2186,121 @@ mod tests {
             ]
             .join("\n\n"),
             @r#"
-        <ok>✓</> review      dffy-review-github: ~/bin/dffy-review-github, adds dffy pr
-        <ok>✓</> review gh   gh version 2.62.0
-        <warn>!</> review auth gh isn't logged in to github.com; run `gh auth login`
-        "review":{"name":"github","path":"/home/u/bin/dffy-review-github","command":"pr","command_error":null,"checks":[{"name":"gh","ok":true,"detail":"gh version 2.62.0"},{"name":"auth","ok":false,"detail":"gh isn't logged in to github.com; run `gh auth login`"}],"checks_error":null}}
+            <file-header>plugins</>
+              <warn>!</> render       markdown .md · .csv → csv: dffy-render-csv isn't on PATH
+                  <hint>hint:</> install it, or see docs/plugins.md; files of this type show as lines
+              <warn>!</> review       github · gh 2.62.0 · gh isn't logged in to github.com; run `gh auth login`
+            "review":{"name":"github","path":"/home/u/bin/dffy-review-github","command":"pr","command_error":null,"checks":[{"name":"gh","ok":true,"detail":"gh version 2.62.0"},{"name":"auth","ok":false,"detail":"gh isn't logged in to github.com; run `gh auth login`"}],"checks_error":null}
 
-        <warn>!</> review      dffy-review-github: ~/bin/dffy-review-github, adds no command
-          <warn>its command 'diff' is one of dffy's own</>
-          <warn>its checks: it doesn't know doctor; it may be older than this dffy</>
-          <hint>hint:</> see docs/plugins.md; a plugin names its command with describe
-        "review":{"name":"github","path":"/home/u/bin/dffy-review-github","command":null,"command_error":"its command 'diff' is one of dffy's own","checks":null,"checks_error":"it doesn't know doctor; it may be older than this dffy"}}
+            <file-header>plugins</>
+              <warn>!</> render       markdown .md · .csv → csv: dffy-render-csv isn't on PATH
+                  <hint>hint:</> install it, or see docs/plugins.md; files of this type show as lines
+              <warn>!</> review       dffy-review-github: ~/bin/dffy-review-github, adds no command
+                  <warn>its command 'diff' is one of dffy's own</>
+                  <warn>its checks: it doesn't know doctor; it may be older than this dffy</>
+                  <hint>hint:</> see docs/plugins.md; a plugin names its command with describe
+            "review":{"name":"github","path":"/home/u/bin/dffy-review-github","command":null,"command_error":"its command 'diff' is one of dffy's own","checks":null,"checks_error":"it doesn't know doctor; it may be older than this dffy"}
 
-        <warn>!</> review      dffy-review-github isn't on PATH
-          <hint>hint:</> install it, or see docs/plugins.md; until then the review keys say so
-        "review":{"name":"github","path":null,"command":null,"command_error":null,"checks":null,"checks_error":null}}
-        "#
+            <file-header>plugins</>
+              <warn>!</> render       markdown .md · .csv → csv: dffy-render-csv isn't on PATH
+                  <hint>hint:</> install it, or see docs/plugins.md; files of this type show as lines
+              <warn>!</> review       dffy-review-github isn't on PATH
+                  <hint>hint:</> install it, or see docs/plugins.md; until then the review keys say so
+            "review":{"name":"github","path":null,"command":null,"command_error":null,"checks":null,"checks_error":null}
+            "#
         );
         assert_eq!(check(&text(&facts()).0, "review"), Vec::<&str>::new());
         assert!(facts().json().0.contains("\"review\":null"));
+    }
+
+    /// The agent plugin, found or not, then its own checks of the agents;
+    /// a check that failed warns.
+    #[test]
+    fn the_agent_plugin_is_listed_with_its_checks() {
+        use crate::plugin::review::Check as Own;
+        let agent = |path: Option<&str>, checks: Option<Result<Vec<Own>, String>>| {
+            let facts = Facts {
+                agent: Some(AgentFacts {
+                    path: path.map(PathBuf::from),
+                    checks,
+                }),
+                ..facts()
+            };
+            let json = facts.json().0;
+            let at = json.find("\"agent\":").expect("the agent key");
+            let shown = folded(&facts);
+            [
+                section(&shown, "agents").join("\n"),
+                json[at..].trim_end().to_owned(),
+            ]
+            .join("\n")
+        };
+        let own = vec![
+            Own {
+                name: "claude".to_owned(),
+                ok: true,
+                detail: "2.1.329 (Claude Code)".to_owned(),
+                brief: Some("2.1.329".to_owned()),
+                info: false,
+            },
+            Own {
+                name: "claude auth".to_owned(),
+                ok: false,
+                detail: "not logged in; run `claude auth login`".to_owned(),
+                brief: None,
+                info: false,
+            },
+        ];
+        insta::assert_snapshot!(
+            [
+                agent(Some("/home/u/bin/dffy-agent"), Some(Ok(own))),
+                agent(Some("/home/u/bin/dffy-agent"), Some(Err("its doctor didn't answer in 3s".to_owned()))),
+                agent(None, None),
+            ]
+            .join("\n\n"),
+            @r#"
+            <file-header>agents</>           dffy-agent ~/bin/dffy-agent
+              <warn>!</> claude       2.1.329 · not logged in; run `claude auth login`
+            "agent":{"path":"/home/u/bin/dffy-agent","checks":[{"name":"claude","ok":true,"detail":"2.1.329 (Claude Code)"},{"name":"claude auth","ok":false,"detail":"not logged in; run `claude auth login`"}],"checks_error":null}}
+
+            <file-header>agents</>           dffy-agent ~/bin/dffy-agent
+                  <warn>its checks: its doctor didn't answer in 3s</>
+            "agent":{"path":"/home/u/bin/dffy-agent","checks":null,"checks_error":"its doctor didn't answer in 3s"}}
+
+            <file-header>agents</>           dffy-agent isn't on PATH
+                  <hint>hint:</> asking an agent about a thread needs it; see docs/plugins.md
+            "agent":{"path":null,"checks":null,"checks_error":null}}
+            "#
+        );
+    }
+
+    /// A row that only notes something, a missing config file or an agent
+    /// that isn't installed, shows `·`, though what's folded with it passed.
+    #[test]
+    fn a_note_outranks_a_pass_in_a_folded_row() {
+        use crate::plugin::review::Check as Own;
+        let facts = Facts {
+            config_found: false,
+            agent: Some(AgentFacts {
+                path: Some(PathBuf::from("/home/u/bin/dffy-agent")),
+                checks: Some(Ok(vec![Own {
+                    name: "codex".to_owned(),
+                    ok: true,
+                    detail: "not installed".to_owned(),
+                    brief: None,
+                    info: true,
+                }])),
+            }),
+            ..facts()
+        };
+        let shown = folded(&facts);
+        insta::assert_snapshot!(
+            [check(&shown, "config"), check(&shown, "codex")].concat().join("\n"),
+            @r"
+          <dim>·</> config       ~/.config/dffy/config (not present) · theme default · pager less
+          <dim>·</> codex        not installed
+        "
+        );
     }
 
     /// The JSON's keys, with every value as text shows it; a path with a

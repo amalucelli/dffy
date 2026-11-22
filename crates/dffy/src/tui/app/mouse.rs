@@ -6,10 +6,10 @@ use std::time::Instant;
 use dffy_core::document::{Pos, Side};
 
 use super::{Action, App, MULTI_CLICK, Pane, Press, WHEEL_ROWS};
-use crate::keys::Action as Act;
+use crate::keys::{Action as Act, Table};
 use crate::review::model;
 use crate::term::Input;
-use crate::tui::menu::{self, Menu, Run};
+use crate::tui::menu::{self, Menu, Offer, Run};
 use crate::tui::picker::Picker;
 use crate::tui::tree::Item;
 use crate::tui::view::{Block, Doc, Hit};
@@ -118,7 +118,7 @@ impl App {
                 return Vec::new();
             };
             let shown = self.doc.focused().is_some_and(|t| t.root == root);
-            return self.thread_entries(&thread, shown);
+            return self.menu_entries(self.thread_offers(&thread, shown));
         }
         let Some(item) = self.tree.click(line) else {
             return Vec::new();
@@ -139,6 +139,9 @@ impl App {
         }
         if editable {
             entries.push(self.menu_entry(true, "Open in editor", Act::Edit));
+        }
+        if self.applies(Act::OpenTerminal) {
+            entries.push(self.menu_entry(true, "Open terminal here", Act::OpenTerminal));
         }
         let mark = if entry.viewed() {
             "Mark unviewed"
@@ -173,7 +176,7 @@ impl App {
                 self.doc.selection = None;
                 self.doc.set_focus(Some(thread.root.clone()));
                 self.tapped_comment = self.doc.comment_at(y - 1);
-                return self.thread_entries(&thread, true);
+                return self.menu_entries(self.thread_offers(&thread, true));
             }
             Some((Block::New, _)) => return Vec::new(),
             None => self.doc.set_focus(None),
@@ -196,20 +199,8 @@ impl App {
         self.tapped = Some((pos, side));
         let entry = &self.doc.document.files()[pos.file];
         let editable = !entry.is_commit() && !self.piped && entry.change().new.is_some();
-        let commentable = self.comments.is_some() && !entry.is_commit();
-        let mut entries = Vec::new();
-        if commentable {
-            let label = if selected {
-                "Comment on selection"
-            } else {
-                "Comment on line"
-            };
-            entries.push(self.menu_entry(false, label, Act::Comment));
-            entries.push(self.menu_entry(false, "Suggest change", Act::SuggestChange));
-        }
-        if selected {
-            entries.push(self.menu_entry(false, "Copy selection", Act::Copy));
-        } else {
+        let mut entries = self.menu_entries(self.line_offers(pos.file, selected));
+        if !selected {
             let key = match (
                 self.key_for(false, Act::Select),
                 self.key_for(false, Act::Copy),
@@ -223,25 +214,55 @@ impl App {
                 run: Run::CopyLine,
             });
         }
-        entries.extend(self.edit_entries(pos.file, selected));
-        entries.extend(self.conflict_entries(pos));
+        let mut offers = self.edit_offers(pos.file, selected);
+        offers.extend(self.conflict_offers(Some(pos)));
+        entries.extend(self.menu_entries(offers));
         if editable {
             entries.push(self.menu_entry(false, "Open in editor", Act::Edit));
+        }
+        if self.applies(Act::OpenTerminal) {
+            entries.push(self.menu_entry(false, "Open terminal here", Act::OpenTerminal));
         }
         entries
     }
 
+    /// What the keys do to the lines selected in `file`, or to the line
+    /// aimed at: comment and suggest where comments can go, ask and fix on
+    /// a selection there, and copy a selection.
+    pub(super) fn line_offers(&self, file: usize, selected: bool) -> Vec<Offer> {
+        let main = |label: &str, action| Offer::new(label, action, Table::Main);
+        let commentable = self.comments.is_some()
+            && (self.doc.document.files().get(file)).is_some_and(|e| !e.is_commit());
+        let mut offers = Vec::new();
+        if commentable {
+            let label = if selected {
+                "Comment on selection"
+            } else {
+                "Comment on line"
+            };
+            offers.push(main(label, Act::Comment));
+            offers.push(main("Suggest change", Act::SuggestChange));
+            if selected {
+                offers.push(main(&self.ask_label(), Act::AskAgent));
+                offers.push(main("Fix with agent", Act::FixWithAgent));
+            }
+        }
+        if selected {
+            offers.push(main("Copy selection", Act::Copy));
+            offers.push(main("Copy as prompt", Act::CopyPrompt));
+        }
+        offers
+    }
+
     /// The thread keys, as far as they'd act on `thread`, then its copies;
     /// folding only when the diff shows it (`folds`).
-    fn thread_entries(&self, thread: &model::Thread, folds: bool) -> Vec<menu::Entry> {
-        let key = |label: &str, action: Act| menu::Entry {
-            label: label.to_owned(),
-            key: self.thread_key_name(action).unwrap_or_default(),
-            run: Run::Thread(action),
-        };
+    pub(super) fn thread_offers(&self, thread: &model::Thread, folds: bool) -> Vec<Offer> {
+        let key = |label: &str, action| Offer::new(label, action, Table::Thread);
+        let main = |label: &str, action| Offer::new(label, action, Table::Main);
         let copies = [
-            self.menu_entry(false, "Copy comment", Act::CopyComment),
-            self.menu_entry(false, "Copy thread", Act::CopyThread),
+            main("Copy comment", Act::CopyComment),
+            main("Copy thread", Act::CopyThread),
+            key("Copy as prompt", Act::CopyPrompt),
         ];
         // The conversation is read-only, and never folds.
         if matches!(thread.at, model::At::Conversation { .. }) {
@@ -251,18 +272,27 @@ impl App {
                 .chain(copies)
                 .collect();
         }
-        let mut entries = vec![key("Reply", Act::Reply)];
+        let mut offers = vec![
+            key("Reply", Act::Reply),
+            key(&self.ask_label(), Act::AskAgent),
+        ];
+        if thread.reverts() {
+            offers.push(key("Revert suggestion", Act::ApplySuggestion));
+        } else if thread.suggestion().is_some() {
+            offers.push(key("Apply suggestion", Act::ApplySuggestion));
+        }
+        offers.push(key("Fix with agent", Act::FixWithAgent));
         if thread.comments.iter().any(|n| !n.posted()) {
-            entries.push(key("Edit draft", Act::EditDraft));
-            entries.push(key("Delete draft", Act::DeleteDraft));
+            offers.push(key("Edit draft", Act::EditDraft));
+            offers.push(key("Delete draft", Act::DeleteDraft));
         }
         if thread.unposted() {
-            entries.push(key("Make it yours", Act::Adopt));
+            offers.push(key("Make it yours", Act::Adopt));
         }
         if thread.branch.is_some() {
-            entries.push(self.menu_entry(false, "Move to this branch", Act::MoveThread));
+            offers.push(main("Move to this branch", Act::MoveThread));
         }
-        entries.push(key(
+        offers.push(key(
             if thread.resolved { "Reopen" } else { "Resolve" },
             Act::Resolve,
         ));
@@ -272,21 +302,60 @@ impl App {
             } else {
                 "Fold"
             };
-            entries.push(self.menu_entry(false, fold, Act::ToggleThread));
+            offers.push(main(fold, Act::ToggleThread));
         }
         if thread.url.as_deref().is_some_and(model::text::is_web) {
-            entries.push(key("Open on host", Act::OpenOnHost));
+            offers.push(key("Open on host", Act::OpenOnHost));
         }
-        entries.extend(copies);
-        entries
+        offers.extend(copies);
+        offers
+    }
+
+    /// The ask's entry: `Ask claude` once the agent plugin said which
+    /// agent answers, which it says only once asked.
+    fn ask_label(&self) -> String {
+        format!("Ask {}", self.asking.default_agent().unwrap_or("agent"))
+    }
+
+    /// `offers` as the menu's entries, each with the key that does it
+    /// where it's aimed, running as that key does.
+    fn menu_entries(&self, offers: Vec<Offer>) -> Vec<menu::Entry> {
+        (offers.into_iter())
+            .map(|o| match o.table {
+                Table::Thread => menu::Entry {
+                    key: self.thread_key_name(o.action).unwrap_or_default(),
+                    label: o.label,
+                    run: Run::Thread(o.action),
+                },
+                Table::Conflict => menu::Entry {
+                    key: self.conflict_key(o.action),
+                    ..self.menu_entry(false, &o.label, o.action)
+                },
+                table => self.menu_entry(table == Table::Tree, &o.label, o.action),
+            })
+            .collect()
     }
 
     /// An entry running `action` as its key does, in the tree (`tree`) or
-    /// the diff.
+    /// the diff; with no key there, as the command panel's does, shown as
+    /// its two keys: `␣ "`.
     pub(super) fn menu_entry(&self, tree: bool, label: &str, action: Act) -> menu::Entry {
+        let leader = || {
+            let (chord, _) = (self.keys.leader_entries().iter()).find(|(_, a)| *a == action)?;
+            let leader = self.key_name(Act::Leader)?;
+            let leader = if leader == "space" {
+                "␣".to_owned()
+            } else {
+                leader
+            };
+            Some(format!("{leader} {}", chord.name()))
+        };
         menu::Entry {
             label: label.to_owned(),
-            key: self.key_for(tree, action).unwrap_or_default(),
+            key: self
+                .key_for(tree, action)
+                .or_else(leader)
+                .unwrap_or_default(),
             run: Run::Action(action),
         }
     }
@@ -343,7 +412,7 @@ impl App {
             };
             if let Some(panel) = &mut self.panel {
                 if let Some(root) = panel.click(line) {
-                    self.follow_thread(&root);
+                    self.open_thread(&root);
                 }
                 return;
             }

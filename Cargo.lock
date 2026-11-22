@@ -443,6 +443,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "dffy-agent"
+version = "0.3.0"
+dependencies = [
+ "rustix",
+ "serde_json",
+ "tempfile",
+]
+
+[[package]]
 name = "dffy-core"
 version = "0.3.0"
 dependencies = [

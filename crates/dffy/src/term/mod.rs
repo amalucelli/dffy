@@ -1,6 +1,7 @@
 //! dffy's own terminal layer, so the frame path and multiplexer behavior
 //! are dffy's: a diffed cell grid, raw termios, and an input parser that
-//! needs nothing beyond what every terminal and multiplexer passes through.
+//! needs nothing beyond what every terminal and multiplexer passes through,
+//! and reads the kitty keyboard protocol's keys where a terminal has it.
 
 mod grid;
 mod input;

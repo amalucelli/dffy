@@ -1,3 +1,4 @@
+mod agents;
 mod command_panel;
 mod draw;
 mod jobs;

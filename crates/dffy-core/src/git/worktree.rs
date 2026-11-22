@@ -1,4 +1,5 @@
-//! Working-tree files as git reads them. Content goes through git's to-git
+//! Working-tree files as git reads them, and replacing one whole when dffy
+//! edits it. Content goes through git's to-git
 //! conversion (end of line, `ident`, `working-tree-encoding`, clean and
 //! process filters) before it's hashed or shown, so a checkout that git
 //! calls clean isn't listed as modified. A tracked path is read only when
@@ -7,8 +8,8 @@
 
 use std::ffi::OsStr;
 use std::fs;
-use std::io::Read as _;
-use std::os::unix::ffi::OsStrExt as _;
+use std::io::{self, Read as _, Write as _};
+use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 
 use gix::bstr::BStr;
@@ -151,6 +152,37 @@ impl ToGit {
         }
         Ok(true)
     }
+}
+
+/// Puts `bytes` in place of the working-tree file `full`, with
+/// `permissions`: through a file beside it renamed over it, so no reader
+/// sees it half written.
+pub(super) fn replace(full: &Path, bytes: &[u8], permissions: fs::Permissions) -> io::Result<()> {
+    let dir = full.parent().unwrap_or(full);
+    let mut name = b".".to_vec();
+    name.extend_from_slice(
+        full.file_name()
+            .map_or(b"file".as_slice(), OsStrExt::as_bytes),
+    );
+    name.extend_from_slice(format!(".dffy-{}", std::process::id()).as_bytes());
+    let temp = dir.join(OsStr::from_bytes(&name));
+    let written = (|| {
+        // One a crash left goes; `create_new` won't follow a link put in
+        // its place.
+        drop(fs::remove_file(&temp));
+        let mut file = fs::File::options()
+            .write(true)
+            .create_new(true)
+            .open(&temp)?;
+        file.write_all(bytes)?;
+        file.set_permissions(permissions)?;
+        file.sync_all()?;
+        fs::rename(&temp, full)
+    })();
+    if written.is_err() {
+        drop(fs::remove_file(&temp));
+    }
+    written
 }
 
 /// The last directory found to be a real directory, so that paths in index

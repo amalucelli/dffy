@@ -1,0 +1,26 @@
+---
+source: crates/dffy/src/tui/app/tests/command_panel.rs
+expression: panel(&mut app)
+---
+┌─ commands ──────────────────────────────────────────────────────────── esc close ─┐
+│  Here  View  Files  Review  Git  Copy                                             │
+│                                                                                   │
+│ c    Comment on selection                                                         │
+│ S    Suggest change                                                               │
+│ a    Ask agent                                                                    │
+│ &    Fix with agent                                                               │
+│ y    Copy selection                                                               │
+│ "    Copy as prompt                                                               │
+│ A    Stage selected lines                                                         │
+│ D    Discard selected lines…                                                      │
+│                                                                                   │
+│ ?    All keys                                                                     │
+│                                                                                   │
+│                                                                                   │
+│                                                                                   │
+│                                                                                   │
+│                                                                                   │
+│                                                                                   │
+│                                                                                   │
+│ key or enter runs · j/k move · h/l step a value                                   │
+│ tab section · / search · esc close                                                │

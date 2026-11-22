@@ -19,7 +19,7 @@ use super::tree;
 use super::view::paint;
 use crate::keys::{Action as Act, Keys};
 use crate::render::{Canvas, escape, plain};
-use crate::review::listing::{List, Listing, Row};
+use crate::review::listing::{Absent, List, Listing, Row};
 use crate::review::model::text::{age, epoch};
 use crate::review::model::{
     self, At, Comments, Look, Posting, Snippet, Standing, Thread, ThreadComment,
@@ -27,6 +27,9 @@ use crate::review::model::{
 use crate::review::who;
 use crate::term::{Grid, Key, Mods};
 use crate::theme::{Ink, Role, Theme};
+
+/// The text box's keys, in its heading.
+const BOX_KEYS: &str = " · enter saves · alt+enter new line · ctrl+g editor";
 
 /// The panel's key listing the threads on other branches, or folding them.
 pub(super) const OTHER_BRANCHES: char = 'b';
@@ -36,6 +39,19 @@ pub(super) const OTHER_BRANCHES: char = 'b';
 pub(crate) struct Writing {
     pub at: Writes,
     pub text: TextBox,
+    /// What `enter` does with a new thread, for its box's heading.
+    pub enter: Enter,
+}
+
+/// What `enter` does with a new thread's text box.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Enter {
+    Saves,
+    /// Saves it and asks this agent about it; `None` before the agent
+    /// plugin named its default one.
+    Asks(Option<String>),
+    /// Saves it and hands its thread to your coding agent.
+    Fixes,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -75,9 +91,13 @@ fn posting_role(posting: &Posting) -> Role {
 /// When [`age`] next says something else of `created`, from `now`;
 /// `u64::MAX` once it's a date.
 fn age_changes(created: &str, now: u64) -> u64 {
-    let Some(then) = epoch(created) else {
-        return u64::MAX;
-    };
+    epoch(created).map_or(u64::MAX, |then| ago_changes(then, now))
+}
+
+/// When [`crate::review::model::text::ago`] next says something else of
+/// `then`, from `now`, both in seconds since 1970; `u64::MAX` once it says
+/// nothing.
+pub(crate) fn ago_changes(then: u64, now: u64) -> u64 {
     let step = match now.saturating_sub(then) {
         s if s < 3600 => 60,
         s if s < 86_400 => 3600,
@@ -331,6 +351,25 @@ impl Frame<'_> {
         self.body::<Role>(&[]);
     }
 
+    /// A suggested change: the commented `lines` it replaces, then its own.
+    /// Once applied, the thread's lines are its own, so only those show,
+    /// dimmed.
+    fn suggestion(&mut self, lines: &[String], suggestion: &str, applied: bool) {
+        if applied {
+            self.body(&[(Role::Dim, "suggested change, applied:")]);
+            for line in suggestion.lines() {
+                self.body(&[(Role::Dim, "  "), (Role::Dim, &plain(line))]);
+            }
+            return;
+        }
+        self.body(&[(Role::Dim, "suggested change:")]);
+        let old = lines.iter().map(|l| (Role::Removed, "- ", l.as_str()));
+        let new = suggestion.lines().map(|l| (Role::Added, "+ ", l));
+        for (role, sign, text) in old.chain(new) {
+            self.body(&[(role, sign), (role, &plain(text))]);
+        }
+    }
+
     /// The text box's wrapped rows, its cursor a bar in the text.
     fn text_box(&mut self, text: &mut TextBox) {
         // A column for the cursor.
@@ -348,23 +387,36 @@ impl Frame<'_> {
     }
 }
 
-/// What a comment's heading says of where it stands, when that's news: a
-/// comment shows posted by its link, and outside a review session nothing
-/// is posted.
+/// The model's word for where a comment lives, in the role it's drawn in.
 fn standing_tag(standing: Standing) -> Option<(Role, &'static str)> {
-    match standing {
-        Standing::Draft => Some((Role::Warn, "draft")),
-        Standing::Unposted => Some((Role::Dim, "not posted")),
-        Standing::Posted | Standing::Kept => None,
-    }
+    let role = if standing == Standing::Draft {
+        Role::Warn
+    } else {
+        Role::Dim
+    };
+    standing.word().map(|word| (role, word))
 }
 
-/// The words after a comment's author: where it stands, what posting it
-/// does, and whether it's on the host for you only.
-fn comment_tags(comment: &ThreadComment) -> impl Iterator<Item = (Role, Cow<'_, str>)> {
-    standing_tag(comment.standing)
-        .map(|(role, tag)| (role, Cow::Borrowed(tag)))
+/// The model's word for where a thread's first comment lives, on its row
+/// in the comments panel, where the gutter's mark says a draft.
+fn row_word(standing: Standing) -> Option<&'static str> {
+    standing.word().filter(|_| standing != Standing::Draft)
+}
+
+/// The words after a comment's author: its label, as an agent's mark,
+/// where it lives, with `share`, the words for the key that makes a
+/// private one a draft (`A shares`), what posting it does, whether it's on
+/// the host for you only, and whether its suggestion is applied.
+fn comment_tags<'a>(
+    comment: &'a ThreadComment,
+    share: Option<&'a str>,
+) -> impl Iterator<Item = (Role, Cow<'a, str>)> {
+    let shares = share.filter(|_| comment.standing == Standing::Unposted);
+    (comment.label.as_deref())
+        .map(|label| (Role::Dim, Cow::Owned(escape(label.as_bytes()))))
         .into_iter()
+        .chain(standing_tag(comment.standing).map(|(role, tag)| (role, Cow::Borrowed(tag))))
+        .chain(shares.map(|words| (Role::Hint, Cow::Borrowed(words))))
         .chain(comment.posting.as_ref().map(|posting| {
             let words = escape(posting.words.as_bytes());
             (posting_role(posting), Cow::Owned(words))
@@ -374,15 +426,27 @@ fn comment_tags(comment: &ThreadComment) -> impl Iterator<Item = (Role, Cow<'_, 
                 .pending
                 .then_some((Role::Hint, Cow::Borrowed("pending"))),
         )
+        .chain(
+            comment
+                .applied
+                .then_some((Role::Dim, Cow::Borrowed("applied"))),
+        )
 }
 
 /// The words after a thread's first author: its state, then where it is
 /// when that's not on a line, with the line it was on.
-fn tags<'a>(thread: &'a Thread, first: &'a ThreadComment) -> Vec<(Role, Cow<'a, str>)> {
-    let mut out: Vec<(Role, Cow<'a, str>)> = comment_tags(first).collect();
+fn tags<'a>(
+    thread: &'a Thread,
+    first: &'a ThreadComment,
+    share: Option<&'a str>,
+) -> Vec<(Role, Cow<'a, str>)> {
+    let mut out: Vec<(Role, Cow<'a, str>)> = comment_tags(first, share).collect();
     let mut tag = |role: Role, tag: &'a str| out.push((role, Cow::Borrowed(tag)));
+    if !first.applied && thread.comments.iter().any(|c| c.applied) {
+        tag(Role::Dim, "applied");
+    }
     if thread.local {
-        tag(Role::Hint, "local");
+        tag(Role::Hint, "branch draft");
     }
     if thread.resolved {
         tag(Role::Dim, "resolved");
@@ -432,14 +496,15 @@ pub(crate) struct CommentRows {
 /// [`bodies`] at `width`.
 /// `focused` draws the border heavy. `writing`, when the text box is in
 /// this thread, takes the place of the comment it edits or follows the
-/// last as a reply. `now` is seconds since 1970. Open, `comment_rows` gets where
-/// each comment is in the box.
+/// last as a reply. `now` is seconds since 1970. `share` follows the word
+/// of a comment kept private, saying the key that makes it a draft. Open,
+/// `comment_rows` gets where each comment is in the box.
 pub(crate) fn thread_rows(
     thread: &Thread,
     bodies: &[Body],
     (collapsed, focused): (bool, bool),
     mut writing: Option<&mut Writing>,
-    (width, now): (usize, u64),
+    (width, now, share): (usize, u64, Option<&str>),
     (c, comment_rows): (&mut Canvas, &mut Vec<CommentRows>),
 ) -> bool {
     comment_rows.clear();
@@ -457,7 +522,7 @@ pub(crate) fn thread_rows(
             1 => "1 reply".to_owned(),
             n => format!("{n} replies"),
         };
-        let tags = tags(thread, first);
+        let tags = tags(thread, first, share);
         let mut spans = vec![
             (Role::Dim.into(), "▸ "),
             (AUTHOR, author.as_str()),
@@ -477,9 +542,9 @@ pub(crate) fn thread_rows(
         let author = escape(who(&comment.author).as_bytes());
         let when = format!(" · {}", escape(age(&comment.created, now).as_bytes()));
         let words = if i == 0 {
-            tags(thread, comment)
+            tags(thread, comment, share)
         } else {
-            comment_tags(comment).collect()
+            comment_tags(comment, share).collect()
         };
         let mut spans = if i == 0 {
             vec![(Role::Dim.into(), "▾ ")]
@@ -494,7 +559,7 @@ pub(crate) fn thread_rows(
             .as_deref_mut()
             .filter(|w| matches!(&w.at, Writes::Edit { id, .. } if *id == comment.id));
         if editing.is_some() {
-            spans.push((Role::Dim.into(), " · esc saves · ctrl+g editor"));
+            spans.push((Role::Dim.into(), BOX_KEYS));
         }
         // A reply's heading is under a blank row.
         let heading = frame.c.len() - top + usize::from(i > 0);
@@ -523,22 +588,12 @@ pub(crate) fn thread_rows(
             text: from..frame.c.len() - top,
         });
         if let Some(suggestion) = &comment.suggestion {
-            frame.body(&[(Role::Dim, "suggested change:")]);
-            let old = thread
-                .lines
-                .iter()
-                .map(|l| (Role::Removed, "- ", l.as_str()));
-            let new = suggestion.lines().map(|l| (Role::Added, "+ ", l));
-            for (role, sign, text) in old.chain(new) {
-                frame.body(&[(role, sign), (role, &plain(text))]);
-            }
+            frame.suggestion(&thread.lines, suggestion, comment.applied);
         }
     }
     if let Some(writing) = writing.filter(|w| matches!(w.at, Writes::Reply(_))) {
-        frame.heading(&[
-            (AUTHOR, "you"),
-            (Role::Dim.into(), " · reply · esc saves · ctrl+g editor"),
-        ]);
+        let dim = Role::Dim.into();
+        frame.heading(&[(AUTHOR, "you"), (dim, " · reply"), (dim, BOX_KEYS)]);
         frame.text_box(&mut writing.text);
     }
     frame.bottom();
@@ -546,22 +601,63 @@ pub(crate) fn thread_rows(
 }
 
 /// Writes the text box for a new thread, `width` columns wide: a draft's
-/// box with the focus, its heading in the top border.
-pub(crate) fn new_rows(text: &mut TextBox, width: usize, c: &mut Canvas) {
+/// box with the focus. Its heading in the top border says what it writes,
+/// the lines it's on and what `enter` does, then the other keys; too
+/// narrow for all of it, the keys go from the last, then the lines, then
+/// the agent a question is for, then what it writes.
+pub(crate) fn new_rows(writing: &mut Writing, width: usize, c: &mut Canvas) {
+    let what = match &writing.enter {
+        Enter::Saves => Cow::Borrowed(" · new comment"),
+        Enter::Asks(agent) => {
+            let agent = agent.as_deref().map_or(Cow::Borrowed("the agent"), |a| {
+                Cow::Owned(escape(a.as_bytes()))
+            });
+            Cow::Owned(format!(" · question for {agent}"))
+        }
+        Enter::Fixes => Cow::Borrowed(" · fix with agent"),
+    };
+    let lines = match &writing.at {
+        Writes::New { lines, .. } if lines.len() > 1 => {
+            format!(" · lines {}–{}", lines.start + 1, lines.end)
+        }
+        Writes::New { lines, .. } => format!(" · line {}", lines.start + 1),
+        Writes::File => " · whole file".to_owned(),
+        Writes::Reply(_) | Writes::Edit { .. } => String::new(),
+    };
+    let enter = match &writing.enter {
+        Enter::Saves => " · enter saves",
+        Enter::Asks(_) => " · enter asks",
+        Enter::Fixes => " · enter sends it",
+    };
+    let dim: Ink = Role::Dim.into();
+    let mut spans = vec![
+        (dim, "▾ "),
+        (AUTHOR, "you"),
+        (dim, &*what),
+        (dim, &*lines),
+        (dim, enter),
+        (dim, " · alt+enter new line"),
+        (dim, " · ctrl+g editor"),
+    ];
+    let mut question = matches!(writing.enter, Enter::Asks(_)).then_some(" · question");
+    // The top border's room for a heading: inside its corners, a space
+    // either side.
+    while spans.len() > 2 && spans_width(&spans) > width.saturating_sub(4) {
+        match (spans.len(), question) {
+            (3, Some(short)) => {
+                spans[2].1 = short;
+                question = None;
+            }
+            _ => drop(spans.pop()),
+        }
+    }
     let mut frame = Frame {
         c,
         border: Border::new(true, true),
         width,
     };
-    frame.top(&[
-        (Role::Dim.into(), "▾ "),
-        (AUTHOR, "you"),
-        (
-            Role::Dim.into(),
-            " · new comment · esc saves, empty discards · ctrl+g editor",
-        ),
-    ]);
-    frame.text_box(text);
+    frame.top(&spans);
+    frame.text_box(&mut writing.text);
     frame.bottom();
 }
 
@@ -573,6 +669,9 @@ pub(super) enum Outcome {
     Moved(String),
     /// The keys go to the diff.
     Diff,
+    /// The keys go to the diff, on the selected thread's file, which is
+    /// opened when the diff doesn't list it.
+    Open,
     /// Not the panel's: the key does what it does in the tree.
     Pass,
 }
@@ -589,6 +688,8 @@ const REPLIES_COLUMNS: usize = 19;
 /// screen.
 pub(super) struct Panel {
     list: List,
+    /// A file the diff doesn't list opens from the working tree.
+    opens: bool,
     /// Keys go to the search.
     pub editing: bool,
     /// The selected thread's row, when there's one.
@@ -602,14 +703,20 @@ pub(super) struct Panel {
 }
 
 impl Panel {
-    /// `listing` while the list of files is still growing. The selection
-    /// starts on the thread with root `near.0`, else on the first of file
-    /// `near.1`'s, else on the first.
-    pub(super) fn new(comments: &Comments, listing: bool, near: (Option<&str>, &[u8])) -> Self {
+    /// `listing` while the list of files is still growing; with `opens`, a
+    /// file the diff doesn't list opens from the working tree. The
+    /// selection starts on the thread with root `near.0`, else on the first
+    /// of file `near.1`'s, else on the first.
+    pub(super) fn new(
+        comments: &Comments,
+        (listing, opens): (bool, bool),
+        near: (Option<&str>, &[u8]),
+    ) -> Self {
         let list = List::new(comments, listing);
         let selected = list.near(near).unwrap_or_else(|| list.keep(None, 0));
         Self {
             list,
+            opens,
             editing: false,
             selected,
             missed: None,
@@ -710,11 +817,19 @@ impl Panel {
         }
         let page = isize::try_from(self.height).unwrap_or(isize::MAX);
         let plain = !mods.contains(Mods::CTRL) && !mods.contains(Mods::ALT);
+        // The tree's key for files with comments filters the threads here,
+        // and its capital steps back.
+        let filter_back = |c: char| {
+            c.is_ascii_uppercase()
+                && keys.action(true, Key::Char(c.to_ascii_lowercase()), Mods::NONE)
+                    == Some(Act::CommentedFiles)
+        };
         match (key, keys.action(true, key, mods)) {
             (Key::Esc, _) if !list.search().is_empty() => list.clear_search(),
-            (Key::Esc | Key::Enter, _) | (_, Some(Act::Open)) => return Outcome::Diff,
-            (Key::Char('f'), _) if plain => list.step_filter(false),
-            (Key::Char('F'), _) if plain => list.step_filter(true),
+            (Key::Esc, _) => return Outcome::Diff,
+            (Key::Enter, _) | (_, Some(Act::Open)) => return Outcome::Open,
+            (_, Some(Act::CommentedFiles)) => list.step_filter(false),
+            (Key::Char(c), _) if plain && filter_back(c) => list.step_filter(true),
             (Key::Char(OTHER_BRANCHES), _) if plain => list.toggle_others(),
             (_, Some(Act::FilterTree)) => self.editing = true,
             (_, Some(Act::ScrollDown)) => self.selected = list.step(self.selected, 1),
@@ -805,7 +920,7 @@ impl Panel {
         let (x, right) = (2, width - 2);
         let mut c = Canvas::default();
         for row in rows.iter().skip(self.scroll).take(self.height) {
-            list_row(&mut c, (list, keys), row, right - x);
+            list_row(&mut c, (list, keys, self.opens), row, right - x);
         }
         for (i, cells) in c.rows().enumerate() {
             let y = top + 1 + i;
@@ -829,10 +944,11 @@ fn group_title(conversation: bool, keys: &Keys) -> (&'static str, String) {
 }
 
 /// Writes `row` of the panel's list, `width` columns wide. A file header's
-/// folders are cut from the left to leave its name whole. A thread's
-/// replies are marked (`↩2`) so they don't read as the header's count of
-/// threads.
-fn list_row(c: &mut Canvas, (list, keys): (&Listing, &Keys), row: &Row, width: usize) {
+/// folders are cut from the left to leave its name whole; one the diff
+/// doesn't list says whether `enter` opens it (with `opens`, unless it's
+/// gone from the working tree). A thread's replies are marked (`↩2`) so
+/// they don't read as the header's count of threads.
+fn list_row(c: &mut Canvas, (list, keys, opens): (&Listing, &Keys, bool), row: &Row, width: usize) {
     match row {
         Row::Note(words) => {
             let text = model::say(words, |hint| super::app::hint_words(keys, hint));
@@ -849,10 +965,11 @@ fn list_row(c: &mut Canvas, (list, keys): (&Listing, &Keys), row: &Row, width: u
             let group = &list.files[*group];
             let path = escape(group.path.as_bytes());
             let (dir, name) = path.split_at(path.rfind('/').map_or(0, |i| i + 1));
-            let absent = if group.absent {
-                " · not in this diff"
-            } else {
-                ""
+            let absent = match (group.absent, opens) {
+                (None, _) => "",
+                (Some(_), false) => " · not in this diff",
+                (Some(Absent::Unlisted), true) => " · enter opens the file",
+                (Some(Absent::Gone), true) => " · file not on disk",
             };
             let count = threads.to_string();
             let room = width.saturating_sub(count.width() + 2);
@@ -897,11 +1014,11 @@ fn list_row(c: &mut Canvas, (list, keys): (&Listing, &Keys), row: &Row, width: u
             let label = label.map(|l| escape(l.as_bytes()));
             let branch = thread.branch.as_deref().map(|b| escape(b.as_bytes()));
             let words = [
-                (thread.at == At::Lost && !list.files[item.group].absent)
+                (thread.at == At::Lost && list.files[item.group].absent.is_none())
                     .then_some((moved, "moved")),
                 branch.as_deref().map(|b| (ink(Role::Hint), b)),
-                thread.local.then_some((ink(Role::Hint), "local")),
-                (first.standing == Standing::Unposted).then_some((ink(Role::Dim), "not posted")),
+                thread.local.then_some((ink(Role::Hint), "branch draft")),
+                row_word(first.standing).map(|word| (ink(Role::Dim), word)),
                 kind.map(|k| (ink(Role::Dim), k)),
                 label.as_deref().map(|l| (ink(Role::Hint), l)),
             ];
@@ -972,5 +1089,60 @@ mod tests {
         assert_eq!(age("2026-11-14T12:00:00Z", now), "3d ago");
         assert_eq!(age("2026-09-01T12:00:00Z", now), "2026-09-01");
         assert_eq!(age("yesterday", now), "yesterday");
+    }
+
+    /// A new thread's box heading says what it writes, its lines and what
+    /// `enter` does; narrower, the keys go first, then the lines, then the
+    /// agent asked, then what it writes.
+    #[test]
+    fn a_new_threads_heading_says_its_lines_and_what_enter_does() {
+        let top = |at: Writes, enter: Enter, width: usize| {
+            let mut writing = Writing {
+                at,
+                text: TextBox::new(""),
+                enter,
+            };
+            let mut c = Canvas::default();
+            new_rows(&mut writing, width, &mut c);
+            (c.rows().next())
+                .map(|row| row.map(|(_, text)| text).collect::<String>())
+                .unwrap_or_default()
+        };
+        let lines = |lines| Writes::New {
+            side: Side::New,
+            lines,
+        };
+        let claude = || Enter::Asks(Some("claude".to_owned()));
+        // Parts go whole: only a box too narrow for `▾ you` cuts.
+        for width in 9..120 {
+            for enter in [claude(), Enter::Asks(None), Enter::Saves, Enter::Fixes] {
+                let heading = top(lines(318..331), enter, width);
+                assert!(!heading.contains('…'), "{width}: {heading}");
+            }
+        }
+        let shown = [
+            top(lines(318..331), claude(), 100),
+            top(lines(318..331), Enter::Asks(None), 100),
+            top(lines(318..331), Enter::Saves, 100),
+            top(lines(41..42), Enter::Saves, 100),
+            top(Writes::File, Enter::Saves, 100),
+            top(lines(41..42), Enter::Fixes, 100),
+            top(lines(318..331), claude(), 80),
+            top(lines(318..331), claude(), 50),
+            top(lines(318..331), claude(), 30),
+            top(lines(318..331), Enter::Fixes, 24),
+        ];
+        insta::assert_snapshot!(shown.join("\n"), @"
+        ┏ ▾ you · question for claude · lines 319–331 · enter asks · alt+enter new line · ctrl+g editor ━━━┓
+        ┏ ▾ you · question for the agent · lines 319–331 · enter asks · alt+enter new line · ctrl+g editor ┓
+        ┏ ▾ you · new comment · lines 319–331 · enter saves · alt+enter new line · ctrl+g editor ━━━━━━━━━━┓
+        ┏ ▾ you · new comment · line 42 · enter saves · alt+enter new line · ctrl+g editor ━━━━━━━━━━━━━━━━┓
+        ┏ ▾ you · new comment · whole file · enter saves · alt+enter new line · ctrl+g editor ━━━━━━━━━━━━━┓
+        ┏ ▾ you · fix with agent · line 42 · enter sends it · alt+enter new line · ctrl+g editor ━━━━━━━━━━┓
+        ┏ ▾ you · question for claude · lines 319–331 · enter asks ━━━━━━━━━━━━━━━━━━━━┓
+        ┏ ▾ you · question for claude · lines 319–331 ━━━┓
+        ┏ ▾ you · question ━━━━━━━━━━┓
+        ┏ ▾ you ━━━━━━━━━━━━━━━┓
+        ");
     }
 }

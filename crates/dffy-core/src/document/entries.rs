@@ -76,6 +76,12 @@ pub enum Source<P> {
         /// At least 1.
         rows: usize,
     },
+    /// A file the diff doesn't list, shown whole for what's on it, such as
+    /// comments: its change is [`FileChange::unchanged`], which the host
+    /// diffs from the repository and prepares with
+    /// [`super::Prepare::unchanged`], so every line is unchanged. These come
+    /// after the diff's files (see [`Document::show_unchanged`]).
+    Unchanged,
 }
 
 /// An entry's diff.
@@ -168,7 +174,7 @@ impl<P> Entry<P> {
         let counts = match &source {
             Source::Repo => None,
             Source::Piped(file) => Some(file.counts),
-            Source::Commit(_) | Source::Page { .. } => Some(Counts::default()),
+            Source::Commit(_) | Source::Page { .. } | Source::Unchanged => Some(Counts::default()),
         };
         let mut entry = Self {
             change,
@@ -296,8 +302,15 @@ impl<P> Entry<P> {
         match &self.source {
             Source::Commit(_) | Source::Page { .. } => true,
             Source::Piped(file) => file.combined.is_some(),
-            Source::Repo => false,
+            Source::Repo | Source::Unchanged => false,
         }
+    }
+
+    /// A file the diff doesn't list, shown whole (see [`Source::Unchanged`]).
+    #[inline]
+    #[must_use]
+    pub fn is_unchanged(&self) -> bool {
+        matches!(self.source, Source::Unchanged)
     }
 
     /// The status to show: a piped file's is its patch header's.
@@ -305,7 +318,7 @@ impl<P> Entry<P> {
     pub fn status(&self) -> FileStatus {
         match &self.source {
             Source::Piped(file) => file.status,
-            Source::Repo | Source::Commit(_) | Source::Page { .. } => {
+            Source::Repo | Source::Commit(_) | Source::Page { .. } | Source::Unchanged => {
                 file_status(&self.change.status)
             }
         }
@@ -554,12 +567,41 @@ impl<P> Document<P> {
         self.rendered
     }
 
-    /// Adds an entry at the end, not diffed yet.
+    /// Adds an entry at the end, not diffed yet. A host lists the diff's
+    /// files before it adds any [`Source::Unchanged`] entry, which come last.
     pub fn push(&mut self, change: FileChange, source: Source<P>) {
         if matches!(source, Source::Commit(_)) {
             self.commits.push(self.files.len());
         }
         self.files.push(Entry::new(change, source));
+    }
+
+    /// The entry of `change`'s path, adding `change`, a file the diff
+    /// doesn't list (see [`FileChange::unchanged`]), as a
+    /// [`Source::Unchanged`] entry after the others when there's none. It
+    /// stays through [`Document::replace`], until a refreshed list has its
+    /// path: then it's that file's entry.
+    pub fn show_unchanged(&mut self, change: FileChange) -> usize {
+        if let Some(file) = self
+            .files
+            .iter()
+            .position(|e| !e.is_commit() && e.change.path == change.path)
+        {
+            return file;
+        }
+        self.files.push(Entry::new(change, Source::Unchanged));
+        self.files.len() - 1
+    }
+
+    /// Where the [`Source::Unchanged`] entries after the diff's start.
+    fn listed_end(&self) -> usize {
+        self.files.len()
+            - self
+                .files
+                .iter()
+                .rev()
+                .take_while(|e| e.is_unchanged())
+                .count()
     }
 
     /// Marks entry `file` viewed, or not.
@@ -573,6 +615,9 @@ impl<P> Document<P> {
     /// [`Document::commits`].
     #[must_use]
     pub fn commit_of(&self, file: usize) -> Option<usize> {
+        if file >= self.listed_end() {
+            return None;
+        }
         self.commits.partition_point(|&c| c <= file).checked_sub(1)
     }
 
@@ -580,7 +625,12 @@ impl<P> Document<P> {
     #[must_use]
     pub fn commit_files(&self, commit: usize) -> Range<usize> {
         let next = self.commits.partition_point(|&c| c <= commit);
-        commit + 1..self.commits.get(next).copied().unwrap_or(self.files.len())
+        commit + 1
+            ..self
+                .commits
+                .get(next)
+                .copied()
+                .unwrap_or_else(|| self.listed_end())
     }
 
     /// Puts a page of `rows` rows (see [`Source::Page`]) first in the list,
@@ -635,12 +685,14 @@ impl<P> Document<P> {
         self.files.iter().take_while(|e| e.is_commit()).count()
     }
 
-    /// Puts the files in path order, keeping the position on the same file.
+    /// Puts the files in path order, keeping the position on the same file;
+    /// [`Source::Unchanged`] entries stay last, as they were added.
     /// Returns whether any file moved; positions held in other files are
     /// dropped then ([`Document::forget_positions`]).
     pub fn sort_by_path(&mut self) -> bool {
         let head = self.head();
-        let files = &mut self.files[head..];
+        let end = self.listed_end().max(head);
+        let files = &mut self.files[head..end];
         if files.is_sorted_by(|a, b| a.change.path <= b.change.path) {
             return false;
         }
@@ -666,7 +718,10 @@ impl<P> Document<P> {
 
     /// Takes the refreshed file list, in path order. Files still listed
     /// keep their diffs, counts, viewed marks and revealed lines; diffs and
-    /// counts are marked for redoing when they may have changed. The
+    /// counts are marked for redoing when they may have changed.
+    /// [`Source::Unchanged`] entries stay after them, their diffs marked for
+    /// redoing when the refresh may have touched them, but for one the list
+    /// now has, which becomes its entry. The
     /// position stays on the same file, or moves to the one in its place
     /// when it's gone. Returns that file when it has a diff it never showed:
     /// the host opens it ([`Settle::Open`]). Positions held in files are
@@ -697,6 +752,10 @@ impl<P> Document<P> {
         // The rename pass turns an addition into a rename and drops the
         // deletion it pairs with; a position on either stays on the pair.
         let renamed_from = |c: &FileChange, path: &BString| matches!(&c.status, Status::Renamed { from, .. } if from == path);
+        let unchanged: Vec<BString> = (self.files.iter())
+            .filter(|e| e.is_unchanged())
+            .map(|e| e.change.path.clone())
+            .collect();
         let mut old: HashMap<BString, Entry<P>> = std::mem::take(&mut self.files)
             .into_iter()
             .map(|e| (e.change.path.clone(), e))
@@ -706,6 +765,9 @@ impl<P> Document<P> {
             .iter()
             .map(|change| match old.remove(&change.path) {
                 Some(mut entry) => {
+                    if entry.is_unchanged() {
+                        entry.source = Source::Repo;
+                    }
                     if entry.change != *change || update.is_dirty(change) {
                         entry.stale = true;
                         entry.recount = true;
@@ -718,6 +780,15 @@ impl<P> Document<P> {
             })
             .collect();
         self.files.sort_by(|a, b| a.change.path.cmp(&b.change.path));
+        for path in unchanged {
+            if let Some(mut entry) = old.remove(&path) {
+                if update.is_dirty(&entry.change) {
+                    entry.stale = !matches!(entry.state, State::Pending);
+                    entry.version = next_version();
+                }
+                self.files.push(entry);
+            }
+        }
         for gone in old.into_values() {
             self.loaded_bytes -= gone.render_bytes();
             if let State::Loaded(file) = gone.state {
@@ -1122,11 +1193,16 @@ impl<P> Document<P> {
         self.file(file).map(File::diff)
     }
 
-    /// Whether `entry` shows its full text. A piped file never does.
+    /// Whether `entry` shows its full text. A piped file never does, and a
+    /// [`Source::Unchanged`] one always does.
     #[inline]
     #[must_use]
     pub fn is_full(&self, entry: &Entry<P>) -> bool {
-        !matches!(entry.source, Source::Piped(_)) && self.full
+        match entry.source {
+            Source::Piped(_) => false,
+            Source::Unchanged => true,
+            Source::Repo | Source::Commit(_) | Source::Page { .. } => self.full,
+        }
     }
 
     /// Whether the file shown is a piped one, which has only its hunks.
@@ -1145,7 +1221,7 @@ impl<P> Document<P> {
         };
         let shape = Shape {
             structural: self.structural,
-            full: self.full,
+            full: self.full || matches!(entry.source, Source::Unchanged),
             reveal: &entry.reveal,
             arrange: &(),
             blocks: entry.blocks.as_deref(),
@@ -1169,7 +1245,7 @@ impl<P> Document<P> {
         };
         let shape = Shape {
             structural: self.structural,
-            full: self.full,
+            full: self.full || matches!(entry.source, Source::Unchanged),
             reveal: &entry.reveal,
             arrange,
             blocks: entry.blocks.as_deref(),
@@ -1248,7 +1324,7 @@ impl<P> Document<P> {
             }),
             Source::Piped(piped) => Some(piped.combined.as_ref().map_or(0, Vec::len).max(1)),
             Source::Page { rows } => Some((*rows).max(1)),
-            Source::Repo => None,
+            Source::Repo | Source::Unchanged => None,
         }
     }
 
@@ -1289,7 +1365,7 @@ impl<P> Document<P> {
         };
         let shape = Shape {
             structural,
-            full,
+            full: full || matches!(entry.source, Source::Unchanged),
             reveal: &entry.reveal,
             arrange: &arrange,
             blocks: entry.blocks.as_deref(),
@@ -1915,7 +1991,7 @@ impl<P> Document<P> {
         };
         let shape = Shape {
             structural: self.structural,
-            full: self.full,
+            full: self.full || matches!(entry.source, Source::Unchanged),
             reveal: &entry.reveal,
             arrange: &arrange,
             blocks: entry.blocks.as_deref(),

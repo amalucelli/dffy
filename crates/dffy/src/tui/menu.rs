@@ -9,7 +9,7 @@ use dffy_core::view::Attributes;
 use unicode_width::UnicodeWidthStr;
 
 use super::help;
-use crate::keys::Action as Act;
+use crate::keys::{Action as Act, Table};
 use crate::term::{Grid, Key, Mods};
 use crate::theme::{Role, Style, Theme};
 
@@ -23,6 +23,26 @@ pub(super) enum Run {
     Thread(Act),
     /// `x`, on this separator rather than the first on screen.
     Reveal(Pos),
+}
+
+/// Something a key does to what it's aimed at, which this menu and the
+/// command panel's Here tab list: its words, the action, and the table
+/// whose key does it there (a thread's runs on the thread aimed at).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct Offer {
+    pub label: String,
+    pub action: Act,
+    pub table: Table,
+}
+
+impl Offer {
+    pub(super) fn new(label: &str, action: Act, table: Table) -> Self {
+        Self {
+            label: label.to_owned(),
+            action,
+            table,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

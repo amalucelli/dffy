@@ -85,11 +85,11 @@ impl Compose {
             Self::Edit { id, .. } => (
                 Op::Set {
                     target: review::Target::Id(id),
-                    change: review::Change {
+                    change: Box::new(review::Change {
                         text: Some(text.to_owned()),
                         suggestion: Some(suggestion),
                         ..review::Change::default()
-                    },
+                    }),
                 },
                 "comment saved",
             ),

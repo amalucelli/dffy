@@ -65,7 +65,10 @@ fn asked(effects: &[Effect]) -> (u64, &Request) {
 }
 
 fn plugged() -> Reviewing {
-    Reviewing::new(Some("test".to_owned()))
+    Reviewing {
+        plugin: Some("test".to_owned()),
+        ..Reviewing::default()
+    }
 }
 
 /// Opening a review picked from the list prepares it; its session line

@@ -12,16 +12,19 @@
 //! sides before anything uses it.
 //!
 //! Review plugins are in [`review`] and the agent plugin in [`agent`], each
-//! over the long-lived JSON-RPC process of [`rpc`].
+//! over the long-lived JSON-RPC process of [`rpc`]. Finding plugins on PATH,
+//! and the review plugin the `review` setting picks, are here.
 
 pub(crate) mod agent;
 pub(crate) mod json;
 pub(crate) mod review;
 pub(crate) mod rpc;
 
+use std::ffi::OsStr;
 use std::fmt::Write as _;
 use std::io::{Read as _, Write as _};
 use std::ops::Range;
+use std::os::unix::ffi::OsStrExt as _;
 use std::os::unix::fs::PermissionsExt as _;
 use std::os::unix::process::CommandExt as _;
 use std::path::PathBuf;
@@ -137,6 +140,63 @@ pub(crate) fn extension(path: &[u8]) -> Option<&[u8]> {
     Some(&name[dot + 1..]).filter(|ext| !ext.is_empty())
 }
 
+/// The `review` setting: which review plugin dffy uses.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) enum Review {
+    /// The only review plugin installed, and none when there are several.
+    #[default]
+    Auto,
+    Off,
+    Named(String),
+}
+
+impl std::str::FromStr for Review {
+    type Err = String;
+
+    /// `auto`, `none`, or a name as [`check_name`] takes it. Empty is
+    /// `none`, as it was before `auto` existed.
+    fn from_str(value: &str) -> Result<Self, String> {
+        match value {
+            "auto" => Ok(Self::Auto),
+            "none" | "" => Ok(Self::Off),
+            name => check_name(name).map(|()| Self::Named(name.to_owned())),
+        }
+    }
+}
+
+impl std::fmt::Display for Review {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Auto => "auto",
+            Self::Off => "none",
+            Self::Named(name) => name,
+        })
+    }
+}
+
+impl Review {
+    /// The plugin's name, or `None` for none. A name is taken whether it's
+    /// installed or not, and what runs the plugin says when it isn't.
+    /// `auto` looks at PATH ([`installed`]), so only what would use the
+    /// plugin resolves it.
+    pub(crate) fn resolve(&self, cache: Option<&Cache>) -> Option<String> {
+        self.resolve_in(&std::env::var_os("PATH").unwrap_or_default(), cache)
+    }
+
+    fn resolve_in(&self, path: &OsStr, cache: Option<&Cache>) -> Option<String> {
+        match self {
+            Self::Off => None,
+            Self::Named(name) => Some(name.clone()),
+            Self::Auto => {
+                match <[String; 1]>::try_from(installed(REVIEW_PREFIX, path, cache, false)) {
+                    Ok([only]) => Some(only),
+                    Err(_) => None,
+                }
+            }
+        }
+    }
+}
+
 /// An installed plugin: its executable, and a stamp of it (modification
 /// time and size) that changes when it's replaced, for the disk cache.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -150,26 +210,98 @@ pub(crate) struct Program {
 /// `PATH`. Empty and relative entries are skipped: they'd resolve inside
 /// the repository being viewed, which could then supply the program.
 pub(crate) fn find(prefix: &str, name: &str) -> Option<Program> {
+    find_in(prefix, name, &std::env::var_os("PATH")?)
+}
+
+/// [`find`] in `path`, a value of `PATH`.
+fn find_in(prefix: &str, name: &str, path: &OsStr) -> Option<Program> {
     let file = format!("{prefix}{name}");
-    std::env::split_paths(&std::env::var_os("PATH")?).find_map(|dir| {
+    std::env::split_paths(path).find_map(|dir| {
         if !dir.is_absolute() {
             return None;
         }
         let path = dir.join(&file);
         let meta = std::fs::metadata(&path).ok()?;
-        (meta.is_file() && meta.permissions().mode() & 0o111 != 0).then(|| {
-            let modified = meta
-                .modified()
-                .ok()
-                .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-                .map_or(0, |d| d.as_nanos());
-            Program {
-                name: name.to_owned(),
-                path,
-                stamp: (modified, meta.len()),
-            }
+        (meta.is_file() && meta.permissions().mode() & 0o111 != 0).then(|| Program {
+            name: name.to_owned(),
+            path,
+            stamp: (modified(&meta), meta.len()),
         })
     })
+}
+
+fn modified(meta: &std::fs::Metadata) -> u128 {
+    meta.modified()
+        .ok()
+        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+        .map_or(0, |d| d.as_nanos())
+}
+
+/// The names of the plugins installed as `<prefix><name>` in the absolute
+/// directories of `path`, a value of `PATH`: each name once, sorted, and
+/// only while [`find`] finds it, so a program made executable after the
+/// listing counts.
+///
+/// Listing the directories reads every entry of each, a few milliseconds
+/// on a long PATH, so the names are kept in `cache` under PATH and each
+/// directory's modification time, which changes when a file is added to
+/// it, removed or renamed. A hit costs a stat per directory. `fresh` lists
+/// them anyway and replaces the entry.
+pub(crate) fn installed(
+    prefix: &str,
+    path: &OsStr,
+    cache: Option<&Cache>,
+    fresh: bool,
+) -> Vec<String> {
+    let dirs: Vec<PathBuf> = std::env::split_paths(path)
+        .filter(|dir| dir.is_absolute())
+        .collect();
+    let keyed = cache.map(|cache| {
+        let mut key = Vec::with_capacity(path.len() + 16 * dirs.len() + 32);
+        key.extend_from_slice(prefix.as_bytes());
+        key.push(0);
+        key.extend_from_slice(path.as_bytes());
+        key.push(0);
+        for dir in &dirs {
+            let stamp = std::fs::metadata(dir).map_or(0, |meta| modified(&meta));
+            key.extend_from_slice(&stamp.to_le_bytes());
+        }
+        (cache, key)
+    });
+    let cached = (keyed.as_ref().filter(|_| !fresh))
+        .and_then(|(cache, key)| cache.get(cache::Kind::Plugins, key));
+    let names = if let Some(bytes) = cached {
+        (String::from_utf8_lossy(&bytes).lines())
+            .map(str::to_owned)
+            .collect()
+    } else {
+        let names = listed(prefix, &dirs);
+        if let Some((cache, key)) = &keyed {
+            cache.put(cache::Kind::Plugins, key, names.join("\n").as_bytes());
+        }
+        names
+    };
+    names
+        .into_iter()
+        .filter(|name| find_in(prefix, name, path).is_some())
+        .collect()
+}
+
+/// The plugin names of the entries `<prefix><name>` in `dirs`, each once.
+fn listed(prefix: &str, dirs: &[PathBuf]) -> Vec<String> {
+    let mut names: Vec<String> = dirs
+        .iter()
+        .filter_map(|dir| std::fs::read_dir(dir).ok())
+        .flatten()
+        .filter_map(|entry| {
+            let file = entry.ok()?.file_name();
+            let name = file.to_str()?.strip_prefix(prefix)?;
+            check_name(name).is_ok().then(|| name.to_owned())
+        })
+        .collect();
+    names.sort_unstable();
+    names.dedup();
+    names
 }
 
 /// What a renderer is asked to draw. `None` for a side that doesn't exist

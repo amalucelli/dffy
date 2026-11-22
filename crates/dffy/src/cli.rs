@@ -14,6 +14,7 @@ use clap::builder::styling::{AnsiColor, Effects, Styles};
 use clap::{Args, CommandFactory, FromArgMatches, Parser, Subcommand};
 
 use crate::config::{ColorWhen, Context, Paging};
+use crate::plugin::Review;
 use crate::plugin::review::Naming;
 
 #[derive(Debug, Parser)]
@@ -68,8 +69,9 @@ pub(crate) fn with_review(command: clap::Command, review: Option<&Naming>) -> cl
                 "Review a {noun} in the viewer, through the review plugin"
             ))
             .long_about(format!(
-                "Review a {noun} in the viewer, through the review plugin (review = <name> \
-                 in the config, or --review <name>), which names this command.\n\n\
+                "Review a {noun} in the viewer, through the review plugin (the only \
+                 dffy-review-<name> on PATH, or the one review = <name> in the config or \
+                 --review <name> names), which names this command.\n\n\
                  With an id, it opens that {noun}: its diff from base to head, with its \
                  review threads, as soon as the head is in the clone. Without one, it opens \
                  the current branch's {noun}, or lists the {nouns} to pick from. \
@@ -108,9 +110,9 @@ pub(crate) fn parse(command: clap::Command, args: &[OsString]) -> Result<Cli, cl
 }
 
 /// `--review` and `--no-cache`, read before parsing: whether there's a
-/// review command to parse depends on them. A `--review` name that isn't
-/// a plugin name is left for clap to refuse.
-pub(crate) fn early_flags(args: &[OsString]) -> (Option<String>, bool) {
+/// review command to parse depends on them. A `--review` value that isn't
+/// one is left for clap to refuse.
+pub(crate) fn early_flags(args: &[OsString]) -> (Option<Review>, bool) {
     let (mut review, mut no_cache) = (None, false);
     let mut iter = args.iter().skip(1).filter_map(|a| a.to_str());
     while let Some(arg) = iter.next() {
@@ -125,10 +127,7 @@ pub(crate) fn early_flags(args: &[OsString]) -> (Option<String>, bool) {
             }
         }
     }
-    (
-        review.filter(|name| crate::plugin::check_name(name).is_ok()),
-        no_cache,
-    )
+    (review.and_then(|value| value.parse().ok()), no_cache)
 }
 
 /// Inserts `diff` before the first argument that is neither a global option
@@ -204,16 +203,12 @@ pub(crate) struct Global {
     #[arg(long, value_name = "file", global = true)]
     pub comments: Option<PathBuf>,
     /// Review plugin, dffy-review-<name>, over the config's review for this
-    /// run
-    #[arg(long, value_name = "name", global = true, value_parser = review_name)]
-    pub review: Option<String>,
+    /// run: auto takes the only one on PATH, none turns them off
+    #[arg(long, value_name = "name", global = true, value_parser = str::parse::<Review>)]
+    pub review: Option<Review>,
     /// Neither read nor write the disk cache, for debugging
     #[arg(long, global = true, hide = true)]
     pub no_cache: bool,
-}
-
-fn review_name(name: &str) -> Result<String, String> {
-    crate::plugin::check_name(name).map(|()| name.to_owned())
 }
 
 #[derive(Debug, Subcommand)]
@@ -831,14 +826,12 @@ mod tests {
             full.extend(args.iter().map(OsString::from));
             early_flags(&full)
         };
+        let gitlab = Some(Review::Named("gitlab".to_owned()));
         assert_eq!(
             early(&["--review", "gitlab", "mr"]),
-            (Some("gitlab".to_owned()), false)
+            (gitlab.clone(), false)
         );
-        assert_eq!(
-            early(&["mr", "--review=gitlab"]),
-            (Some("gitlab".to_owned()), false)
-        );
+        assert_eq!(early(&["mr", "--review=gitlab"]), (gitlab, false));
         assert_eq!(early(&["--no-cache", "mr"]), (None, true));
         assert_eq!(early(&["--review", "../evil", "mr"]), (None, false));
         assert_eq!(early(&["--", "--review", "gitlab"]), (None, false));
@@ -959,7 +952,7 @@ mod tests {
         assert_eq!(diff_args(cli).revs, ["main...HEAD"]);
         // As dffy-review-github starts it.
         let cli = parse(&["--review", "github", "--comments", "pr.json", "a...b"]);
-        assert_eq!(cli.global.review.as_deref(), Some("github"));
+        assert_eq!(cli.global.review, Some(Review::Named("github".to_owned())));
         assert_eq!(diff_args(cli).revs, ["a...b"]);
         assert!(parse_with(None, &["--review", "../evil", "HEAD"]).is_err());
     }

@@ -474,7 +474,8 @@ pub(crate) fn read_back(written: Written) -> Vec<Effect> {
 /// review shown, and the runs going on.
 #[derive(Default)]
 pub(crate) struct Reviewing {
-    /// The review plugin's name, from the config or `--review`.
+    /// The review plugin's name, from the config or `--review`, or the one
+    /// `auto` found.
     pub plugin: Option<String>,
     /// The review plugin's words, when it describes itself.
     naming: Option<Naming>,
@@ -508,13 +509,6 @@ pub(crate) struct Reviewing {
 pub(crate) const RELOAD_EVERY: Duration = Duration::from_millis(250);
 
 impl Reviewing {
-    pub(crate) fn new(plugin: Option<String>) -> Self {
-        Self {
-            plugin,
-            ..Self::default()
-        }
-    }
-
     fn next_run(&mut self) -> u64 {
         self.run_id += 1;
         self.run_id

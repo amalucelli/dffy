@@ -5,6 +5,8 @@
     reason = "fixture helpers fail the test at the step that broke"
 )]
 
+mod common;
+
 use std::io::Write;
 use std::path::Path;
 use std::process::{Command, Output, Stdio};
@@ -29,6 +31,7 @@ fn dffy_cmd(dir: &Path, args: &[&str]) -> Command {
         .env("HOME", dir.join(".git/dffy-test-home"))
         // A broker of the user's own is never asked or started.
         .env("XDG_RUNTIME_DIR", dir)
+        .env("PATH", common::path_without_review_plugins())
         .env_remove("NO_COLOR")
         .env_remove("CLICOLOR_FORCE")
         // Decides the default indicators.
@@ -1633,6 +1636,54 @@ fn the_review_command_is_the_one_the_plugin_describes() {
     let doctor = stdout(&run(&["--color=never", "doctor", "--verbose"]));
     assert!(doctor.contains(", adds dffy mr\n"), "{doctor}");
     assert!(doctor.contains("! review thing  not set up"), "{doctor}");
+}
+
+/// With no `review` set, the only review plugin on PATH adds its command.
+/// `review = none` and `--review none` turn it off, and with two on PATH
+/// there's none, which doctor says.
+#[test]
+fn the_only_review_plugin_on_path_is_used_unless_review_is_none() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let repo = repo();
+    let bin = describing_plugin(MERGE_REQUEST);
+    let path = format!("{}:/usr/bin:/bin", bin.path().display());
+    let config = tempfile::tempdir().expect("tempdir");
+    write(config.path(), "dffy/config", "review = none\n");
+    let run = |args: &[&str], config: Option<&Path>| {
+        let mut cmd = dffy_cmd(repo.path(), args);
+        if let Some(config) = config {
+            cmd.env("XDG_CONFIG_HOME", config);
+        }
+        cmd.env("PATH", &path).output().expect("spawn dffy")
+    };
+    let listed = "mr           Review a merge request in the viewer";
+    let help = stdout(&run(&["--help"], None));
+    assert!(help.contains(listed), "{help}");
+    let mr = run(&["mr", "7"], None);
+    assert!(
+        stderr(&mr).contains("dffy mr opens the viewer, which needs a terminal"),
+        "{}",
+        stderr(&mr)
+    );
+    let help = stdout(&run(&["--help"], Some(config.path())));
+    assert!(!help.contains(listed), "{help}");
+    let help = stdout(&run(&["--review", "none", "--help"], None));
+    assert!(!help.contains(listed), "{help}");
+
+    let other = bin.path().join("dffy-review-other");
+    std::fs::write(&other, include_str!("fixtures/stubs/review-plugin.sh")).expect("write");
+    std::fs::set_permissions(&other, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    let help = stdout(&run(&["--help"], None));
+    assert!(!help.contains(listed), "{help}");
+    let doctor = stdout(&run(&["--color=never", "doctor", "--verbose"], None));
+    assert!(
+        doctor.contains("! review       review plugins on PATH: other, test, so none is used"),
+        "{doctor}"
+    );
+    assert!(
+        doctor.contains("hint: pick one with review = <name>"),
+        "{doctor}"
+    );
 }
 
 /// `describe` runs once per installed version of the program.

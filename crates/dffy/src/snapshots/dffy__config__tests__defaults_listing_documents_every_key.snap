@@ -62,8 +62,8 @@ expression: text
 <dim># Show files that have a renderer (see render) rendered in the viewer, diffed block by block, instead of as lines; `r` toggles it.</>
 <hint>rendered</><dim> = </>false
 
-<dim># Experimental: the review plugin, the program dffy-review-<name> on PATH. It adds the command it names to open one of the code host's reviews in the viewer, and plain `dffy` asks it for the branch's; empty for none, and no such command. --review <name> sets it for one run. See docs/plugins.md.</>
-<hint>review</><dim> = </>
+<dim># Experimental: the review plugin, the program dffy-review-<name> on PATH. It adds the command it names to open one of the code host's reviews in the viewer, and plain `dffy` asks it for the branch's. auto uses the only such program on PATH, and no plugin when there are several (dffy doctor lists them). none, or empty, means no plugin and no such command. --review <name|auto|none> sets it for one run. See docs/plugins.md.</>
+<hint>review</><dim> = </>auto
 
 <dim># Experimental: which coding agent the agent plugin, dffy-agent on PATH, asks about a thread (`a`, or a comment starting @<name>), handed to it unread: claude, codex or pi picks the default, and a command with arguments, split at spaces, runs in their place with the prompt on its stdin. Empty leaves the pick to the plugin, Claude Code first. Fix with agent (`f`) starts the one this names of those the plugin can hand a thread to (claude, codex, pi or amp, when on PATH), else the first it lists. See docs/plugins.md.</>
 <hint>agent</><dim> = </>

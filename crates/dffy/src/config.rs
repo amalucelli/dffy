@@ -9,7 +9,7 @@ use clap::ValueEnum;
 use dffy_core::diff::Whitespace;
 
 use crate::keys::{self, Keys};
-use crate::plugin::Renderers;
+use crate::plugin::{Renderers, Review};
 use crate::render::{Canvas, escape_lines};
 use crate::theme::Role;
 
@@ -302,8 +302,8 @@ pub(crate) const KEYS: &[Key] = &[
     },
     Key {
         name: "review",
-        doc: "Experimental: the review plugin, the program dffy-review-<name> on PATH. It adds the command it names to open one of the code host's reviews in the viewer, and plain `dffy` asks it for the branch's; empty for none, and no such command. --review <name> sets it for one run. See docs/plugins.md.",
-        default: "",
+        doc: "Experimental: the review plugin, the program dffy-review-<name> on PATH. It adds the command it names to open one of the code host's reviews in the viewer, and plain `dffy` asks it for the branch's. auto uses the only such program on PATH, and no plugin when there are several (dffy doctor lists them). none, or empty, means no plugin and no such command. --review <name|auto|none> sets it for one run. See docs/plugins.md.",
+        default: "auto",
     },
     Key {
         name: "agent",
@@ -398,7 +398,7 @@ pub(crate) struct Config {
     pub syntax_diff: bool,
     pub render: Renderers,
     pub rendered: bool,
-    pub review: Option<String>,
+    pub review: Review,
     /// Handed to the agent plugin unread.
     pub agent: Option<String>,
     pub watch: bool,
@@ -444,7 +444,7 @@ impl Default for Config {
             syntax_diff: false,
             render: Renderers::default(),
             rendered: false,
-            review: None,
+            review: Review::Auto,
             agent: None,
             watch: false,
             tree: TreeMode::Auto,
@@ -471,9 +471,11 @@ impl Default for Config {
 
 impl Config {
     /// Sets `key` from its config-file form. An empty value restores the
-    /// default.
+    /// default, except an empty `review`, which is `none`, as it was before
+    /// `auto` became the default.
     pub(crate) fn set(&mut self, key: &str, value: &str) -> Result<(), String> {
         if value.is_empty()
+            && key != "review"
             && let Some(k) = KEYS.iter().find(|k| k.name == key)
             && !k.default.is_empty()
         {
@@ -513,11 +515,7 @@ impl Config {
             "syntax-diff" => self.syntax_diff = boolean(value)?,
             "render" => self.render = Renderers::parse(value)?,
             "rendered" => self.rendered = boolean(value)?,
-            "review" if value.is_empty() => self.review = None,
-            "review" => {
-                crate::plugin::check_name(value)?;
-                self.review = Some(value.to_owned());
-            }
+            "review" => self.review = value.parse()?,
             "agent" => self.agent = Some(value.to_owned()).filter(|v| !v.is_empty()),
             "watch" => self.watch = boolean(value)?,
             "tree" => self.tree = choice(value)?,
@@ -564,7 +562,7 @@ impl Config {
             "syntax-diff" => self.syntax_diff.to_string(),
             "render" => self.render.to_string(),
             "rendered" => self.rendered.to_string(),
-            "review" => self.review.clone().unwrap_or_default(),
+            "review" => self.review.to_string(),
             "agent" => self.agent.clone().unwrap_or_default(),
             "watch" => self.watch.to_string(),
             "tree" => choice_name(&self.tree),
@@ -888,6 +886,23 @@ mod tests {
         let (config, warnings) = parse("theme = mono\ntheme =\n");
         assert_eq!(warnings, []);
         assert_eq!(config.theme, "default");
+    }
+
+    /// `review` is `auto` until set. `none` turns review plugins off, and
+    /// so does an empty value, as it did before `auto`.
+    #[test]
+    fn review_is_auto_none_or_a_plugin_name() {
+        assert_eq!(Config::default().review, Review::Auto);
+        for (source, review, shown) in [
+            ("review = none\n", Review::Off, "none"),
+            ("review =\n", Review::Off, "none"),
+            ("review = test\n", Review::Named("test".to_owned()), "test"),
+        ] {
+            let (config, warnings) = parse(source);
+            assert_eq!(warnings, [], "{source}");
+            assert_eq!(config.review, review, "{source}");
+            assert_eq!(config.get("review"), shown, "{source}");
+        }
     }
 
     #[test]

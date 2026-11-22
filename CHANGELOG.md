@@ -2,6 +2,12 @@
 
 The big changes in each release. Plugins and features marked experimental can still change between releases.
 
+## 0.4.1 (2026-11-22)
+
+### Changed
+
+- A review plugin on `PATH` is used without setting `review`, when it's the only one installed, and `review = none` turns it off. See [docs/plugins.md](docs/plugins.md#enabling-one).
+
 ## 0.4.0 (2026-11-22)
 
 ### Added
@@ -24,6 +30,7 @@ The big changes in each release. Plugins and features marked experimental can st
 - In the command panel, the theme moved from `a` to `~`.
 - In the text box, `enter` sends the comment and `esc` still saves it. A new line is `shift+enter` where the terminal reports it, and `alt+enter` or `ctrl+j` everywhere.
 - While you write a new thread, its lines stay marked with a rail in the gutter.
+- Commented lines show a rail in the gutter, in their thread's color, instead of a mark on every line. A single line keeps its `◆`, `●` or `○`, and with color off the rail starts on it.
 - Threads on files the diff doesn't change open from the comments panel, or with `m` past the diff's last thread: the whole file, as the working tree has it. See [docs/viewer.md](docs/viewer.md#files-outside-the-diff).
 - `dffy doctor` runs its checks side by side, in about 0.4s instead of 1s, grouped into sections.
 

@@ -256,7 +256,7 @@ Colors a diff read from stdin and changes nothing else: one output line per inpu
 | `diff` | Changes between the working tree, the index and revisions. The default. |
 | `show [<rev>]` | A commit against its first parent, with the commit header. `<rev>` defaults to `HEAD`. A root commit is compared with the empty tree. |
 | `comments` | Lists the review comments as threads, prints them as Markdown or JSON, and changes them with `apply`, `import`, `rm --resolved` and `prompt`. See [comments.md](comments.md#reading-dffy-comments). |
-| `<review command> [<id>]` | Experimental. Opens one of a code host's reviews in the viewer, such as `dffy pr 123` with `dffy-review-github`. The plugin names the command, and it exists only while a review plugin is set (`review` or `--review`). Without an id it opens the current branch's review, or a list to pick from. Needs a terminal. Without such a plugin, `pr` is a revision like any other. See [viewer.md](viewer.md#code-host-reviews) and [plugins.md](plugins.md#the-review-command). |
+| `<review command> [<id>]` | Experimental. Opens one of a code host's reviews in the viewer, such as `dffy pr 123` with `dffy-review-github`. The plugin names the command, and it exists only while there's a review plugin: the only one on `PATH`, or the one `review` or `--review` names. Without an id it opens the current branch's review, or a list to pick from. Needs a terminal. Without such a plugin, `pr` is a revision like any other. See [viewer.md](viewer.md#code-host-reviews) and [plugins.md](plugins.md#the-review-command). |
 | `config` | The effective settings, each marked with where its value comes from. `--default` prints every key with its documentation and default. See [config.md](config.md). |
 | `themes` | The available themes, with a preview. `--dump <name>` prints a built-in theme as a file to copy and edit. See [themes.md](themes.md). |
 | `checkpoint` | Takes a checkpoint of the working tree and prints its number, for `--since-checkpoint=<n>`. See [git.md](git.md#checkpoints). |
@@ -278,7 +278,7 @@ These go before or after the subcommand.
 | `--paging auto\|always\|never` | `never` writes straight to the terminal and keeps the viewer from opening. `always` opens the viewer for a piped diff that fits one screen, which `auto` prints ([git.md](git.md#piped-input)). |
 | `--theme <name>` | A built-in theme or a file in the config's `themes/` directory. See [themes.md](themes.md). |
 | `--comments <file>` | The review comments file, relative to `-C`'s directory. The default is `dffy/comments.json` in the git directory the repository's worktrees share. See [comments.md](comments.md#where-the-file-is). |
-| `--review <name>` | The review plugin `dffy-review-<name>` for this run, over the `review` setting. It adds the plugin's command, such as `dffy pr`. See [plugins.md](plugins.md#review-plugins). |
+| `--review <name>` | The review plugin `dffy-review-<name>` for this run, over the `review` setting. It adds the plugin's command, such as `dffy pr`. `auto` uses the only one on `PATH` and `none` uses none. See [plugins.md](plugins.md#review-plugins). |
 | `-h`, `--help` | Help. `dffy diff --help` lists the diff options. |
 | `-V`, `--version` | The version. |
 

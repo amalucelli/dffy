@@ -36,6 +36,8 @@ dffy show HEAD              # a commit with its message
 dffy main.. -- src/         # limited to paths
 dffy a.txt b.txt            # two files or folders, no repository needed
 dffy --watch                # refresh on every change
+dffy checkpoint             # save the working tree, then later:
+dffy --since-checkpoint     # only what changed since, such as an agent's turn
 dffy --syntax v6.0 v6.1     # diff by syntax
 dffy --stat main..          # also --name-only, --name-status, --exit-code
 dffy --json main..          # JSON Lines for scripts and agents
@@ -55,7 +57,7 @@ In the viewer, `n`/`N` move between changes, `f`/`F` between files, `/` searches
 
 ## Plugins
 
-Plugins are separate programs that dffy runs when your config names them. All are experimental.
+Plugins are separate programs that dffy runs. All are experimental.
 
 | Plugin | What it adds | Homebrew |
 |---|---|---|
@@ -66,15 +68,14 @@ Plugins are separate programs that dffy runs when your config names them. All ar
 
 Or with the install script: `… | sh -s -- --plugin markdown --plugin mermaid --plugin review-github --plugin agent`.
 
-Then turn them on in `~/.config/dffy/config`:
+Then turn the renderers on in `~/.config/dffy/config`:
 
 ```
 render = md:markdown mmd:mermaid mermaid:mermaid
-review = github
 ```
 
 - `r` switches a Markdown or Mermaid file between its lines and its rendered form.
-- `dffy pr 123` opens a pull request. Plain `dffy` on a branch with an open PR brings in its comments.
+- `dffy-review-github` needs no config line. Once it's the only review plugin on `PATH`, `dffy pr 123` opens a pull request, and plain `dffy` on a branch with an open PR brings in its comments. `review = none` turns it off.
 - `dffy-agent` needs no config line. Once it's on `PATH`, `a` on a thread asks.
 - Fix with agent (`f` on a thread) needs no plugin. It hands the thread to Claude Code, Codex, Pi or Amp in a new tab.
 - `dffy doctor` checks that each plugin is found, and that `gh` and the agents are logged in.
@@ -119,7 +120,8 @@ The skill tells the agent to run `dffy agents show`, which prints how to use the
 - 🗒️ A [Comments panel](docs/viewer.md#the-comments-panel) beside the file tree. Picking a thread takes the diff to it.
 - 🔀 [Code host reviews](docs/viewer.md#code-host-reviews) (experimental). With the `dffy-review-github` plugin, `dffy pr 123` opens a GitHub pull request with its threads, posts your review, and follows new pushes.
 - 🤝 [Ask](docs/viewer.md#asking-an-agent) a coding agent (experimental). With the `dffy-agent` plugin, `a` on a thread has Claude Code, Codex or Pi answer in it, read-only. [Apply suggestion](docs/viewer.md#applying-a-suggestion) (`s`) puts a thread's suggestion in the working tree.
-- 🛠️ [Fix with agent](docs/viewer.md#fixing-with-an-agent) (`f`) hands a thread to your own agent session in a new tab. [Copy as prompt](docs/viewer.md#copying-a-thread) and [Open terminal here](docs/viewer.md#opening-a-terminal) are in the command panel.
+- 🛠️ [Fix with agent](docs/viewer.md#fixing-with-an-agent) (`f`) hands a thread to your own agent session in a new tab, or every open thread at once. [Copy as prompt](docs/viewer.md#copying-a-thread) and [Open terminal here](docs/viewer.md#opening-a-terminal) are in the command panel.
+- 📍 [Checkpoints](docs/git.md#checkpoints) save the working tree, so the next diff shows only what changed since, such as your agent's last turn.
 
 **Git**
 - 🧾 [Staged, unstaged and untracked](docs/git.md#staged-unstaged-and-untracked) changes in one view, or [any revision](docs/usage.md#what-to-compare).

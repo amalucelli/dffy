@@ -52,6 +52,8 @@ pub enum Kind {
     Stats = 5,
     /// A review plugin's `describe` answer.
     Described = 6,
+    /// The names of the plugins of one kind found on PATH.
+    Plugins = 7,
 }
 
 /// A cache directory with a size budget.

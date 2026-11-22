@@ -261,19 +261,21 @@ dffy runs one plugin process in the background for as long as it shows the repos
 ### Enabling one
 
 1. Install it. `dffy-review-github` comes from this repository, and [install.md](install.md#plugins) covers it. It needs [`gh`](https://cli.github.com), logged in.
-2. Name it with `review = github` in the config file, or with `--review github` for one run. The flag wins over the config.
-3. Open a review with the plugin's command: `dffy pr <number>` for dffy-review-github, or `dffy pr` for the current branch's. [viewer.md](viewer.md#code-host-reviews) covers reviewing it.
+2. Open a review with the plugin's command: `dffy pr <number>` for dffy-review-github, or `dffy pr` for the current branch's. [viewer.md](viewer.md#code-host-reviews) covers reviewing it.
 
-`dffy doctor` lists the review plugin named, whether its program is on `PATH`, the command it adds, and the plugin's own checks under it, with `!` for each that fails. For dffy-review-github the checks are whether `gh` is installed and logged in.
+With `review` unset, or `review = auto`, dffy uses the only `dffy-review-<name>` program on `PATH`. With several installed it uses none, and `dffy doctor` lists them. `review = <name>` picks one, `review = none` turns review plugins off, and `--review <name|auto|none>` does either for one run. The flag wins over the config.
+
+`dffy doctor` lists the review plugin in use, whether its program is on `PATH`, the command it adds, and the plugin's own checks under it, with `!` for each that fails. For dffy-review-github the checks are whether `gh` is installed and logged in.
 
 ### The review command
 
-The plugin names the command in its `initialize` answer: `dffy pr` for dffy-review-github, perhaps `mr` for a GitLab plugin. dffy adds the command only while a review plugin is set and names one. Otherwise `dffy pr` reads `pr` as a revision, and plain `dffy` doesn't ask for the branch's review.
+The plugin names the command in its `initialize` answer: `dffy pr` for dffy-review-github, perhaps `mr` for a GitLab plugin. dffy adds the command only while there's a review plugin and it names one. Otherwise `dffy pr` reads `pr` as a revision, and plain `dffy` doesn't ask for the branch's review.
 
 The plugin's words appear wherever dffy names what it reviews: the noun ("pull request", "pull requests") in the command's help, the command panel and the picker, the short form and id prefix in labels (`PR #7`), and its events in the post dialog. Everything else, from opening a review to posting it, is dffy's.
 
 - dffy refuses a command that isn't lowercase letters, digits and `-` starting with a letter, or that's one of its own subcommands or their aliases (`diff`, `show`, `config`, `doctor`, `help`…). `dffy doctor` says why there's no command.
 - When the arguments could name the command (help, or a first word that isn't a dffy subcommand and could be a command name), dffy starts the plugin for its `initialize` before reading them, and stops it once answered. Otherwise the viewer asks once its first frame is out, without waiting. Other runs ask only when they use the plugin.
+- Under `auto`, dffy looks for the plugin at those same moments, and printed output never looks. The names it finds are cached on disk (`cache`), keyed by `PATH` and each of its directories' modification time, so a later run costs a look at each directory. Adding, removing or renaming a program in one lists them again. `dffy doctor` always lists them again.
 - The answer is cached on disk (`cache`), keyed by the plugin program's path, modification time and size. Replacing the program asks again, and every `initialize` dffy sends refreshes the entry.
 - A failure, or no answer within 2 seconds, is cached too, as why there's no command. When the command's word is then read as a revision, the error names the plugin.
 - `dffy doctor` always asks again, and caches what it's told.

@@ -7,6 +7,8 @@
     reason = "fixture helpers fail the test at the step that broke"
 )]
 
+mod common;
+
 use std::io::{Read, Write};
 use std::num::NonZero;
 use std::path::Path;
@@ -102,6 +104,7 @@ impl Term {
         };
         cmd.env("XDG_RUNTIME_DIR", &runtime);
         cmd.env("DFFY_DAEMON_IDLE_SECS", "1");
+        cmd.env("PATH", common::path_without_review_plugins());
         for name in [
             "NO_COLOR",
             "CLICOLOR_FORCE",
@@ -1052,6 +1055,39 @@ fn plain_dffy_asks_only_a_described_plugin_for_the_review_of_the_branch() {
     term.send("q");
     assert!(term.wait_exit().success());
     assert_eq!(pull.calls(), "", "no request");
+}
+
+/// With no `review` set, plain `dffy` asks the only review plugin on PATH
+/// for the branch's review, and offers to open one; `review = none` starts
+/// no plugin.
+#[test]
+fn plain_dffy_uses_the_only_review_plugin_on_path_unless_review_is_none() {
+    let pull = Pull::new();
+    pull.verb("detect", &[NO_REVIEW]);
+    std::fs::write(pull.repo.path().join("README.md"), "# demo\n\nLocal.\n").expect("write");
+    let search = format!("{}:/usr/bin:/bin", pull.stub.path().display());
+    let mut term = Term::spawn(pull.repo.path(), 120, 16, &[("PATH", &search)]);
+    term.wait_for("detect", |_| pull.calls().starts_with("detect {}\n"));
+    term.send(" O");
+    term.wait_for("the listing", |_| pull.calls().contains("\nlist "));
+    term.send("\x1bq");
+    assert!(term.wait_exit().success());
+
+    let config = tempfile::tempdir().expect("tempdir");
+    std::fs::create_dir(config.path().join("dffy")).expect("mkdir");
+    std::fs::write(config.path().join("dffy/config"), "review = none\n").expect("write");
+    let started = pull.read("started");
+    let mut term = Term::spawn(
+        pull.repo.path(),
+        120,
+        16,
+        &[("PATH", &search), ("XDG_CONFIG_HOME", &path(&config))],
+    );
+    term.wait_for("the working tree's diff", |t| t.contains("Local."));
+    std::thread::sleep(Duration::from_millis(300));
+    term.send("q");
+    assert!(term.wait_exit().success());
+    assert_eq!(pull.read("started"), started, "no plugin started");
 }
 
 /// Plain `dffy` draws before the plugin has initialized, and asks for the

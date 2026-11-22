@@ -75,7 +75,7 @@ pub(crate) struct Facts {
     /// The `render` setting's extensions and renderers, with where each
     /// renderer's executable is, if it's on PATH.
     pub renderers: Vec<(String, String, Option<PathBuf>)>,
-    pub review: Option<ReviewFacts>,
+    pub review: Option<ReviewPlugin>,
     /// `None` when not gathered.
     pub agent: Option<AgentFacts>,
     /// dffy's skill in each place agents read skills from: the home
@@ -98,6 +98,15 @@ pub(crate) struct AgentFacts {
     /// Its own checks of the agents, from its `doctor`, or why they
     /// couldn't be read.
     pub checks: Option<Result<Vec<crate::plugin::review::Check>, String>>,
+}
+
+/// The review plugin `review` picks.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ReviewPlugin {
+    /// The one it names, or the only one `auto` found.
+    One(ReviewFacts),
+    /// The names `auto` found when there were several, so it took none.
+    Several(Vec<String>),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1123,7 +1132,20 @@ impl Facts {
     }
 
     /// The review plugin's line, then a line per check of its own.
-    fn review_checks(&self, review: &ReviewFacts, checks: &mut Vec<Check>) {
+    fn review_checks(&self, review: &ReviewPlugin, checks: &mut Vec<Check>) {
+        let review = match review {
+            ReviewPlugin::One(review) => review,
+            ReviewPlugin::Several(names) => {
+                let found = format!(
+                    "review plugins on PATH: {}, so none is used",
+                    names.join(", ")
+                );
+                checks.push(
+                    Check::new(Mark::Warn, "review", found).hint("pick one with review = <name>"),
+                );
+                return;
+            }
+        };
         let program = format!("{}{}", crate::plugin::REVIEW_PREFIX, review.name);
         let Some(path) = &review.path else {
             checks.push(
@@ -1176,11 +1198,11 @@ fn own_check(
     }
 }
 
-/// Starts asking the review plugin the config names, if any, and the agent
+/// Starts asking the review plugin the config picks, if any, and the agent
 /// plugin, side by side on threads of their own: their checks wait on
 /// programs of theirs, a few seconds at most, so they run beside dffy's
 /// own and doctor takes the slowest. What's returned waits for them.
-fn plugins(ctx: &Ctx) -> impl FnOnce() -> (Option<ReviewFacts>, AgentFacts) + use<> {
+fn plugins(ctx: &Ctx) -> impl FnOnce() -> (Option<ReviewPlugin>, AgentFacts) + use<> {
     fn joined<T>(thread: std::thread::JoinHandle<T>) -> T {
         (thread.join()).unwrap_or_else(|panic| std::panic::resume_unwind(panic))
     }
@@ -1190,8 +1212,31 @@ fn plugins(ctx: &Ctx) -> impl FnOnce() -> (Option<ReviewFacts>, AgentFacts) + us
         ctx.config.agent.clone(),
     );
     let agent = std::thread::spawn(move || self::agent(agent));
-    let review = review.map(|name| std::thread::spawn(move || self::review(&name, cache.as_ref())));
-    move || (review.map(joined), joined(agent))
+    let review = std::thread::spawn(move || review_plugin(&review, cache.as_ref()));
+    move || (joined(review), joined(agent))
+}
+
+/// The review plugin `review` picks, asked now. Under `auto` PATH is listed
+/// again, replacing the cached listing, as the plugin's description is.
+fn review_plugin(
+    review: &crate::plugin::Review,
+    cache: Option<&dffy_core::cache::Cache>,
+) -> Option<ReviewPlugin> {
+    use crate::plugin::{REVIEW_PREFIX, Review};
+    let name = match review {
+        Review::Off => return None,
+        Review::Named(name) => name.clone(),
+        Review::Auto => {
+            let path = std::env::var_os("PATH").unwrap_or_default();
+            let mut found = crate::plugin::installed(REVIEW_PREFIX, &path, cache, true);
+            match found.len() {
+                0 => return None,
+                1 => found.remove(0),
+                _ => return Some(ReviewPlugin::Several(found)),
+            }
+        }
+    };
+    Some(ReviewPlugin::One(self::review(&name, cache)))
 }
 
 /// The review plugin `name`: the command it describes and its own checks,
@@ -1328,14 +1373,26 @@ fn checks_json(checks: &[crate::plugin::review::Check]) -> Json {
     )
 }
 
-fn review_json(review: &ReviewFacts) -> Json {
-    let (command, checks) = (review.command.as_ref(), review.checks.as_ref());
+/// The review plugin in use, or the several `auto` found under `installed`
+/// with the rest null.
+fn review_json(review: &ReviewPlugin) -> Json {
+    let (review, installed) = match review {
+        ReviewPlugin::One(review) => (Some(review), Json::Null),
+        ReviewPlugin::Several(names) => (None, Json::Array(names.iter().map(Json::str).collect())),
+    };
+    let command = review.and_then(|r| r.command.as_ref());
+    let checks = review.and_then(|r| r.checks.as_ref());
     let listed = checks
         .and_then(|r| r.as_ref().ok())
         .map_or(Json::Null, |checks| checks_json(checks));
     Json::Object(vec![
-        ("name", Json::str(&review.name)),
-        ("path", review.path.as_ref().map_or(Json::Null, Json::path)),
+        ("name", review.map_or(Json::Null, |r| Json::str(&r.name))),
+        (
+            "path",
+            review
+                .and_then(|r| r.path.as_ref())
+                .map_or(Json::Null, Json::path),
+        ),
         (
             "command",
             command
@@ -1351,6 +1408,7 @@ fn review_json(review: &ReviewFacts) -> Json {
             "checks_error",
             checks.map_or(Json::Null, |r| Json::error(r.as_ref())),
         ),
+        ("installed", installed),
     ])
 }
 
@@ -2144,12 +2202,12 @@ mod tests {
         use crate::plugin::review::Check as Own;
         let review = |found: bool, command: Result<&str, &str>, checks: Result<&[Own], &str>| {
             let facts = Facts {
-                review: Some(ReviewFacts {
+                review: Some(ReviewPlugin::One(ReviewFacts {
                     name: "github".to_owned(),
                     path: found.then(|| PathBuf::from("/home/u/bin/dffy-review-github")),
                     command: found.then(|| command.map(str::to_owned).map_err(str::to_owned)),
                     checks: found.then(|| checks.map(<[Own]>::to_vec).map_err(str::to_owned)),
-                }),
+                })),
                 ..facts()
             };
             let json = facts.json().0;
@@ -2190,7 +2248,7 @@ mod tests {
               <warn>!</> render       markdown .md · .csv → csv: dffy-render-csv isn't on PATH
                   <hint>hint:</> install it, or see docs/plugins.md; files of this type show as lines
               <warn>!</> review       github · gh 2.62.0 · gh isn't logged in to github.com; run `gh auth login`
-            "review":{"name":"github","path":"/home/u/bin/dffy-review-github","command":"pr","command_error":null,"checks":[{"name":"gh","ok":true,"detail":"gh version 2.62.0"},{"name":"auth","ok":false,"detail":"gh isn't logged in to github.com; run `gh auth login`"}],"checks_error":null}
+            "review":{"name":"github","path":"/home/u/bin/dffy-review-github","command":"pr","command_error":null,"checks":[{"name":"gh","ok":true,"detail":"gh version 2.62.0"},{"name":"auth","ok":false,"detail":"gh isn't logged in to github.com; run `gh auth login`"}],"checks_error":null,"installed":null}
 
             <file-header>plugins</>
               <warn>!</> render       markdown .md · .csv → csv: dffy-render-csv isn't on PATH
@@ -2199,18 +2257,35 @@ mod tests {
                   <warn>its command 'diff' is one of dffy's own</>
                   <warn>its checks: it doesn't know doctor; it may be older than this dffy</>
                   <hint>hint:</> see docs/plugins.md; a plugin names its command with describe
-            "review":{"name":"github","path":"/home/u/bin/dffy-review-github","command":null,"command_error":"its command 'diff' is one of dffy's own","checks":null,"checks_error":"it doesn't know doctor; it may be older than this dffy"}
+            "review":{"name":"github","path":"/home/u/bin/dffy-review-github","command":null,"command_error":"its command 'diff' is one of dffy's own","checks":null,"checks_error":"it doesn't know doctor; it may be older than this dffy","installed":null}
 
             <file-header>plugins</>
               <warn>!</> render       markdown .md · .csv → csv: dffy-render-csv isn't on PATH
                   <hint>hint:</> install it, or see docs/plugins.md; files of this type show as lines
               <warn>!</> review       dffy-review-github isn't on PATH
                   <hint>hint:</> install it, or see docs/plugins.md; until then the review keys say so
-            "review":{"name":"github","path":null,"command":null,"command_error":null,"checks":null,"checks_error":null}
+            "review":{"name":"github","path":null,"command":null,"command_error":null,"checks":null,"checks_error":null,"installed":null}
             "#
         );
         assert_eq!(check(&text(&facts()).0, "review"), Vec::<&str>::new());
         assert!(facts().json().0.contains("\"review\":null"));
+        let several = Facts {
+            review: Some(ReviewPlugin::Several(vec![
+                "one".to_owned(),
+                "two".to_owned(),
+            ])),
+            ..facts()
+        };
+        insta::assert_snapshot!(check(&text(&several).0, "review").join("\n"), @r"
+        <warn>!</> review       review plugins on PATH: one, two, so none is used
+            <hint>hint:</> pick one with review = <name>
+        ");
+        assert!(
+            several
+                .json()
+                .0
+                .contains(r#""checks_error":null,"installed":["one","two"]}"#)
+        );
     }
 
     /// The agent plugin, found or not, then its own checks of the agents;

@@ -142,6 +142,55 @@ fn script(dir: &Path, name: &str) -> Program {
     }
 }
 
+/// The test review plugin, installed in `dir` as `name`.
+fn install_review(dir: &Path, name: &str) {
+    let path = dir.join(format!("{REVIEW_PREFIX}{name}"));
+    std::fs::write(
+        &path,
+        include_str!("../../tests/fixtures/stubs/review-plugin.sh"),
+    )
+    .expect("write plugin");
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+}
+
+/// `auto` takes the only review plugin on PATH. The same one in two
+/// directories is one, and with two there's none to take.
+#[test]
+fn auto_takes_the_only_review_plugin_on_path() {
+    let (first, second) = (tempfile::tempdir(), tempfile::tempdir());
+    let (first, second) = (first.expect("tempdir"), second.expect("tempdir"));
+    install_review(first.path(), "one");
+    install_review(second.path(), "one");
+    let path = std::env::join_paths([first.path(), second.path()]).expect("PATH");
+    assert_eq!(Review::Auto.resolve_in(&path, None), Some("one".to_owned()));
+    install_review(second.path(), "two");
+    assert_eq!(Review::Auto.resolve_in(&path, None), None);
+    assert_eq!(installed(REVIEW_PREFIX, &path, None, false), ["one", "two"]);
+}
+
+/// What's on PATH is cached under each directory's modification time:
+/// adding a program changes it, so the program is seen, and one added
+/// while it stays the same isn't.
+#[test]
+fn installed_plugins_are_cached_until_their_directory_changes() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let bin = dir.path().join("bin");
+    std::fs::create_dir(&bin).expect("mkdir");
+    let cache = Cache::new(dir.path().join("cache"), 1 << 20);
+    let modified_at = |secs| {
+        let time = UNIX_EPOCH + Duration::from_secs(secs);
+        (std::fs::File::open(&bin).and_then(|d| d.set_modified(time))).expect("set the time");
+    };
+    let installed = || installed(REVIEW_PREFIX, bin.as_os_str(), Some(&cache), false);
+    install_review(&bin, "one");
+    modified_at(1_000);
+    assert_eq!(installed(), ["one"]);
+    install_review(&bin, "two");
+    assert_eq!(installed(), ["one", "two"]);
+    modified_at(1_000);
+    assert_eq!(installed(), ["one"], "from the cache");
+}
+
 const REQUEST: Request<'static> = Request {
     path: "a.md",
     old: Some("a\n"),

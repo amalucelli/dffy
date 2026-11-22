@@ -407,6 +407,8 @@ pub(crate) fn run(
     if let Some(described) = described {
         app.set_naming(described.as_ref().ok().map(|d| d.naming.clone()));
     }
+    let review_name = ctx.review_name.get().cloned().flatten();
+    app.set_review_plugin(review_name.clone());
     app.set_selected(selected, ctx.config.default_diff);
     app.set_uncommitted(uncommitted);
     if let Some((description, whole, _)) = back {
@@ -487,12 +489,12 @@ pub(crate) fn run(
     let mut session = Session {
         watching: None,
         unread: Some(unread),
-        describe: described.is_none() && ctx.review_name.is_some(),
+        describe: described.is_none() && ctx.may_review(),
         detect,
         detect_described,
         review_run,
         plugin: client,
-        review_name: ctx.review_name.clone(),
+        review_name,
         cache: ctx.cache.clone(),
         tty,
         reader: None,
@@ -850,7 +852,8 @@ struct Session<'a> {
     /// The review plugin's process, started on first use, for the viewer's
     /// life.
     plugin: Option<review::Plugin>,
-    /// The review plugin set, and the cache its naming goes in.
+    /// The review plugin, and the cache its naming goes in. `None` under an
+    /// `auto` that `describe` resolves.
     review_name: Option<String>,
     cache: Option<Cache>,
     tty: &'a Tty,
@@ -1015,19 +1018,29 @@ impl Session<'_> {
             }
         }
         if std::mem::take(&mut self.describe) {
+            // Unresolved only under `auto`, as a name or `none` resolves
+            // before the viewer starts.
+            if self.review_name.is_none() {
+                self.review_name = crate::plugin::Review::Auto.resolve(self.cache.as_ref());
+                app.set_review_plugin(self.review_name.clone());
+            }
             // `detect` needs the plugin running anyway, so it's the one
             // asked; otherwise the cache, else a plugin started for it
             // alone, answers.
-            if self.detect_described {
-                self.plugin().ok();
-            } else if let Some(name) = self.review_name.clone() {
-                let (events, cache) = (self.events.clone(), self.cache.clone());
-                std::thread::Builder::new()
-                    .name("dffy-review-describe".into())
-                    .spawn(move || {
-                        let described = crate::describe_review(&name, cache.as_ref(), false);
-                        events.send(Event::Described(described.ok())).ok();
-                    })?;
+            match self.review_name.clone() {
+                None => self.detect_described = false,
+                Some(_) if self.detect_described => {
+                    self.plugin().ok();
+                }
+                Some(name) => {
+                    let (events, cache) = (self.events.clone(), self.cache.clone());
+                    std::thread::Builder::new()
+                        .name("dffy-review-describe".into())
+                        .spawn(move || {
+                            let described = crate::describe_review(&name, cache.as_ref(), false);
+                            events.send(Event::Described(described.ok())).ok();
+                        })?;
+                }
             }
         }
         if let Some(unread) = self.unread.take() {

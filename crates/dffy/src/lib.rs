@@ -157,8 +157,10 @@ pub(crate) struct Ctx {
     pub color_err: bool,
     /// `None` when the cache is off or there's nowhere to put it.
     pub cache: Option<Cache>,
-    /// The review plugin set; `None` without one.
-    pub review_name: Option<String>,
+    /// The review plugin `review` picks, once resolved: at once for a name
+    /// or `none`, and under `auto` only by what uses the plugin (see
+    /// [`Ctx::review_name`]).
+    pub review_name: OnceLock<Option<String>>,
     /// Its description, once [`Ctx::review`] asked for it, or once parsing
     /// needed its command.
     pub review: OnceLock<Result<plugin::review::Described, String>>,
@@ -181,11 +183,25 @@ impl Ctx {
         self.color_err.then_some(&self.theme)
     }
 
+    /// The review plugin's name; `None` without one. Resolving `auto` looks
+    /// at PATH, so it's done here, on first use.
+    pub(crate) fn review_name(&self) -> Option<&str> {
+        self.review_name
+            .get_or_init(|| self.config.review.resolve(self.cache.as_ref()))
+            .as_deref()
+    }
+
+    /// Whether there may be a review plugin, without looking at PATH: true
+    /// under an `auto` not resolved yet.
+    pub(crate) fn may_review(&self) -> bool {
+        self.review_name.get().is_none_or(Option::is_some)
+    }
+
     /// The review plugin set, described: `None` without one, `Err` with
     /// why it adds no command. Described on first use, as most runs never
     /// ask and describing can wait on the plugin.
     pub(crate) fn review(&self) -> Option<&Result<plugin::review::Described, String>> {
-        let name = self.review_name.as_deref()?;
+        let name = self.review_name()?;
         Some(
             self.review
                 .get_or_init(|| describe_review(name, self.cache.as_ref(), false)),
@@ -312,11 +328,14 @@ pub fn main() -> ExitCode {
         .flatten()
         .map(|dir| Cache::new(dir, loaded.config.cache_size));
     let builtin = Cli::command();
-    let review_name = review_flag.or_else(|| loaded.config.review.clone());
+    let setting = review_flag.unwrap_or_else(|| loaded.config.review.clone());
+    let parses_review = cli::parses_review(&builtin, &raw);
+    let review_name = OnceLock::new();
+    if setting != plugin::Review::Auto || parses_review {
+        review_name.get_or_init(|| setting.resolve(cache.as_ref()));
+    }
     let review = OnceLock::new();
-    if let Some(name) = &review_name
-        && cli::parses_review(&builtin, &raw)
-    {
+    if let Some(Some(name)) = review_name.get().filter(|_| parses_review) {
         review.get_or_init(|| describe_review(name, cache.as_ref(), false));
     }
     let described = review.get().and_then(|r: &Result<_, _>| r.as_ref().ok());
@@ -460,7 +479,7 @@ fn apply_flags(config: &mut Config, cli: &Cli) -> Vec<&'static str> {
         set.push("cache");
     }
     if let Some(review) = &g.review {
-        config.review = Some(review.clone());
+        config.review.clone_from(review);
         set.push("review");
     }
     let (view, watch) = match &cli.command {
@@ -820,7 +839,8 @@ fn list_comments(
 /// the plugin couldn't describe itself.
 fn without_review_command(e: Error, args: &DiffArgs, ctx: &Ctx) -> Error {
     let why = ctx.review.get().and_then(|r| r.as_ref().err());
-    match (e, args.revs.first(), why, ctx.review_name.as_deref()) {
+    let name = ctx.review_name.get().and_then(Option::as_deref);
+    match (e, args.revs.first(), why, name) {
         (Error::Fatal { message, hint }, Some(first), Some(why), Some(name))
             if message == format!("unknown revision '{first}'") =>
         {
@@ -1214,9 +1234,10 @@ fn open_review(
     viewer(revisions, label, open, &ctx)
 }
 
-/// Plain `dffy` (no revisions or paths) on a branch, with a review plugin
-/// set: the viewer asks the plugin for the branch's review once it has
-/// described itself.
+/// Plain `dffy` (no revisions or paths) on a branch, when there may be a
+/// review plugin: once the first frame is out, the viewer resolves `auto`
+/// and asks the plugin for the branch's review when it has described
+/// itself.
 fn detect_review(args: &DiffArgs, plan: &print::Plan, ctx: &Ctx) -> Option<tui::ReviewStart> {
     let unnamed = args.revs.is_empty()
         && !(args.staged || args.unstaged || args.merge_base || args.common.view.reverse)
@@ -1228,7 +1249,7 @@ fn detect_review(args: &DiffArgs, plan: &print::Plan, ctx: &Ctx) -> Option<tui::
             .and_then(|dir| std::fs::read(dir.join("HEAD")).ok())
             .is_some_and(|head| head.starts_with(b"ref: refs/heads/"))
     };
-    (ctx.review_name.is_some() && unnamed && on_branch()).then_some(tui::ReviewStart::Detect)
+    (ctx.may_review() && unnamed && on_branch()).then_some(tui::ReviewStart::Detect)
 }
 
 /// The first line on `said` that `pick` takes; `Err` with the run's
@@ -1682,17 +1703,20 @@ mod tests {
             for key in config.apply_source("review = configured\n", &mut Vec::new()) {
                 sources.set(key, config::Source::Config);
             }
-            assert_eq!(config.review.as_deref(), Some("configured"));
+            assert_eq!(
+                config.review,
+                plugin::Review::Named("configured".to_owned())
+            );
             for key in apply_flags(&mut config, &cli) {
                 sources.set(key, config::Source::Flag);
             }
             let last_used = [("review".to_owned(), "remembered".to_owned())];
             config.layer(&mut sources, &last_used, config::Source::LastUsed);
-            assert_eq!(config.review.as_deref(), Some("flag"));
+            assert_eq!(config.review, plugin::Review::Named("flag".to_owned()));
             assert_eq!(sources.get("review"), config::Source::Flag);
         }
         let mut config = Config::default();
-        assert_eq!(config.review, None);
+        assert_eq!(config.review, plugin::Review::Auto);
         assert!(config.set("review", "Not/A-Name").is_err());
     }
 }

@@ -111,7 +111,7 @@ dffy restores the terminal when it exits, panics or is interrupted. If it was ki
 | `pager` | The pager printed output goes through | Never. |
 | `cache` | The disk cache's location, size and budget | It can't be read. |
 | `dffyd` | The watch broker, its build, the repositories it polls, and brokers of other dffy versions | The broker doesn't answer (a stale socket), or comes from another build of dffy than the one running doctor. See [An old broker](#an-old-broker). |
-| `render`, `review` | The renderer and review plugins set, and the review plugin's own checks ([plugins.md](plugins.md)) | A plugin isn't on `PATH`, or one of its checks fails. |
+| `render`, `review` | The renderer plugins set, the review plugin in use, and the review plugin's own checks ([plugins.md](plugins.md)) | A plugin isn't on `PATH`, one of its checks fails, or `review` is unset with several review plugins on `PATH`, so none is used. |
 | `agents`, an agent's name | The agent plugin, then each agent it knows: its version, its recipe, and whether it's logged in ([plugins.md](plugins.md#the-agents-and-their-recipes)) | The agent's CLI doesn't know a flag its recipe uses (upgrade it), it isn't logged in, or the config names one that isn't installed. |
 | `skill` | dffy's skill in each place agents read skills, in the home directory and the repository ([agents.md](agents.md)) | It's outdated. `dffy agents setup` updates it. A missing one is information only. |
 
@@ -119,7 +119,7 @@ dffy restores the terminal when it exits, panics or is interrupted. If it was ki
 
 - `checks` is a list. Each entry has `name`, `status` (`ok`, `warn`, `fail` or `info`), `detail`, `notes` and `hints`.
 - The data behind the checks is under `git`, `repository`, `watch`, `speed`, `terminal`, `config`, `cache`, `dffyd`, `renderers`, `skills`, `review` and `agent`.
-- Every key is always present, `null` when it doesn't apply.
+- Every key is always present, `null` when it doesn't apply. `review.installed` lists the review plugins on `PATH` when `review` is unset and there are several, so none is used.
 - Durations are milliseconds as numbers (`"all_changes_ms": 127.4`).
 
 ### Repository counts

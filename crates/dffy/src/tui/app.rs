@@ -751,7 +751,7 @@ impl App {
             warned_outdated: false,
             thread_pending: None,
             annotations_changed: false,
-            reviewing: Reviewing::new(config.review.clone()),
+            reviewing: Reviewing::default(),
             asking: Asking::default(),
             agent_asks: Vec::new(),
             agent_stops: Vec::new(),
@@ -871,6 +871,11 @@ impl App {
     /// With color off the theme is attributes only, and stays so.
     pub(crate) fn set_color(&mut self, color: bool) {
         self.color = color;
+    }
+
+    /// The review plugin, which `auto` finds after the first frame.
+    pub(crate) fn set_review_plugin(&mut self, name: Option<String>) {
+        self.reviewing.plugin = name;
     }
 
     /// Redraws: the naming can arrive with the command panel open.

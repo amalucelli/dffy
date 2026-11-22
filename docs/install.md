@@ -55,7 +55,7 @@ cargo install --locked --git https://github.com/amalucelli/dffy dffy-render-mark
 
 - The script installs the plugins next to dffy and checks them against the release's `checksums.txt`.
 - dffy finds plugins on your `PATH`.
-- `dffy-review-github` needs the GitHub CLI, [`gh`](https://cli.github.com), logged in with `gh auth login`. `dffy doctor` checks both once `review = github` is set.
+- `dffy-review-github` needs the GitHub CLI, [`gh`](https://cli.github.com), logged in with `gh auth login`. `dffy doctor` checks both once it's on `PATH`.
 - `dffy-agent` needs Claude Code (`claude`), Codex (`codex`) or Pi (`pi`), logged in.
 
 [plugins.md](plugins.md) covers turning them on.

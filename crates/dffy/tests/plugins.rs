@@ -7,6 +7,8 @@
     reason = "fixture helpers fail the test at the step that broke"
 )]
 
+mod common;
+
 use std::io::{Read, Write};
 use std::num::NonZero;
 use std::os::unix::fs::PermissionsExt as _;
@@ -65,7 +67,7 @@ impl Term {
         let runtime = tempfile::tempdir().expect("tempdir");
         cmd.env("XDG_RUNTIME_DIR", runtime.path());
         cmd.env("DFFY_DAEMON_IDLE_SECS", "1");
-        let path = std::env::var("PATH").unwrap_or_default();
+        let path = common::path_without_review_plugins();
         cmd.env("PATH", format!("{}:{path}", bin.display()));
         for name in [
             "NO_COLOR",

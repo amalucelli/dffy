@@ -167,7 +167,7 @@ mod tests {
             color_out: false,
             color_err: false,
             cache: None,
-            review_name: None,
+            review_name: std::sync::OnceLock::new(),
             review: std::sync::OnceLock::new(),
             comments: None,
         }

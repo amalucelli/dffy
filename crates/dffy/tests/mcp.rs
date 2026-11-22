@@ -7,6 +7,8 @@
     reason = "fixture helpers fail the test at the step that broke"
 )]
 
+mod common;
+
 use std::fmt::Write as _;
 use std::io::{BufRead, BufReader, Write};
 use std::path::Path;
@@ -1013,6 +1015,7 @@ impl Viewer {
         cmd.env("XDG_STATE_HOME", dir.join(".git/dffy-test-state"));
         cmd.env("XDG_RUNTIME_DIR", runtime);
         cmd.env("DFFY_DAEMON_IDLE_SECS", "1");
+        cmd.env("PATH", common::path_without_review_plugins());
         let child = pair.slave.spawn_command(cmd).expect("spawn the viewer");
         drop(pair.slave);
         let mut reader = pair.master.try_clone_reader().expect("reader");

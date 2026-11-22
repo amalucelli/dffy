@@ -6,6 +6,8 @@
     reason = "fixture helpers fail the test at the step that broke"
 )]
 
+mod common;
+
 use std::io::Write;
 use std::path::Path;
 use std::process::{Command, Output, Stdio};
@@ -20,6 +22,7 @@ fn dffy_cmd(dir: &Path, args: &[&str]) -> Command {
         .env("XDG_CACHE_HOME", dir.join(".xdg/cache"))
         .env("XDG_STATE_HOME", dir.join(".xdg/state"))
         .env("XDG_RUNTIME_DIR", dir.join(".xdg"))
+        .env("PATH", common::path_without_review_plugins())
         .env_remove("NO_COLOR")
         .env_remove("CLICOLOR_FORCE")
         .env_remove("COLORTERM")

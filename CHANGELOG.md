@@ -2,22 +2,34 @@
 
 The big changes in each release. Plugins and features marked experimental can still change between releases.
 
-## 0.4.0 (2026-11-20)
+## 0.4.0 (2026-11-22)
 
 ### Added
 
-- **Ask** (experimental). With the new `dffy-agent` plugin on `PATH`, `a` on a thread asks Claude Code, Codex or Pi about it, read-only, and the answer lands in the thread as the agent's reply, with a suggestion when it proposes a change. `a` on selected lines asks a question you write, `a` again after an answer writes a follow-up to the same agent, and a comment you write starting `@claude`, `@codex` or `@pi` asks that agent. Agents' answers, mentions and follow-ups aren't posted to a code host until `A` on the thread makes them yours. The `agent` setting picks the agent or names a command of yours. See [docs/viewer.md](docs/viewer.md#asking-an-agent) and [docs/plugins.md](docs/plugins.md#agent-plugins).
-- **Apply suggestion**: `s` on a thread puts its suggestion in the working tree as an unstaged change, refused when the lines changed since. Also the control API's `comments/applySuggestion` and the MCP tool `apply_suggestion`.
-- **Fix with agent**: `f` on a thread, or `space` then `&` on selected lines, starts your own `claude`, `codex`, `pi` or `amp` in a new terminal tab, pointed at the thread, to change what it asks and reply in it.
-- **Copy as prompt**: `space` then `"` copies a thread, or the selected lines, as a prompt for a coding agent. `dffy comments prompt <id>` prints it, and the MCP tool `thread_prompt` returns it.
+- **Ask** (experimental). With the new `dffy-agent` plugin on `PATH`, `a` on a thread asks Claude Code, Codex or Pi about it, read-only, and the answer lands in the thread as the agent's reply, with a suggestion when it proposes a change. `a` on selected lines opens a box for your question first, `a` again after an answer writes a follow-up to the same agent, and a comment you write starting `@claude`, `@codex` or `@pi` asks that agent. The prompt carries the thread, its lines, the changes near them, the file's language and the function they're in. Agents' answers, questions and follow-ups are private, never posted to a code host until `A` on the thread makes them yours. The `agent` setting picks the agent or names a command of yours. See [docs/viewer.md](docs/viewer.md#asking-an-agent) and [docs/plugins.md](docs/plugins.md#agent-plugins).
+- **Fix with agent**: `f` on a thread, or `space` then `&` on selected lines with a note you write first, starts your own `claude`, `codex`, `pi` or `amp` in a new terminal tab, pointed at the thread, to change what it asks and reply in it. `space` then `^` sends every open thread of yours the same way.
+- **Apply suggestion**: `s` on a thread puts its suggestion in the working tree as an unstaged change, refused when the lines changed since; `s` again puts the old lines back. Also `dffy ctl apply-suggestion`, the control API's `comments/applySuggestion` and the MCP tool `apply_suggestion`.
+- **Checkpoints**: `dffy checkpoint`, or `space` then `;`, saves the working tree, and `dffy --since-checkpoint` (`space` then `'`) shows only what changed since, such as an agent's turn. Fix with agent takes one before it starts. The MCP tools `changed_files` and `file_diff` take `since_checkpoint`. See [docs/git.md](docs/git.md#checkpoints).
+- **`dffy agents setup`** installs a skill that teaches Claude Code, Codex, Pi and Amp to read changes and answer your threads with dffy's CLI; `dffy agents status` and `remove` check and undo it. See [docs/agents.md](docs/agents.md).
+- **Copy as prompt**: `y` on a thread, or `space` then `"`, copies the thread or the selected lines as a prompt for a coding agent. `dffy comments prompt <id>` prints it, `dffy comments prompt --open` every open thread of yours, and the MCP tool `thread_prompt` returns it.
 - **Open terminal here**: `space` then `.` opens a new tab at the working tree's root, in tmux, zellij, WezTerm, kitty, Ghostty, iTerm2, Rex, herdr, Terminal.app or Alacritty.
-- The MCP tool `reply_to_thread` writes a reply in a thread under the MCP client's name.
+- **Delete resolved threads**: `space` then `-` deletes the resolved threads shown, after a y/n. On a code host's review it deletes only what isn't posted.
+- The MCP tool `reply_to_thread` writes a reply in a thread under the MCP client's name, and `dffy comments apply --as` writes as a named agent.
+- Threads say where their comments stand: `draft`, `private · A shares` or `branch draft`.
 
 ### Changed
 
+- **The command panel** opens on `space` as a quick popup of what applies to what you're on; `space` or `tab` again shows the whole panel, in tabs (Here, View, Files, Review, Git, Copy), laid out like `?` help.
 - On a focused thread, `a` asks an agent, `A` makes comments not posted yours (adopt, which was `a`), `s` applies a suggestion and `f` fixes with agent. There they no longer stage (`A`), switch the layout (`s`) or go to the next file (`f`); those keep working everywhere else.
 - In the command panel, the theme moved from `a` to `~`.
 - In the text box, `enter` sends the comment and `esc` still saves it. A new line is `shift+enter` where the terminal reports it, and `alt+enter` or `ctrl+j` everywhere.
+- While you write a new thread, its lines stay marked with a rail in the gutter.
+- Threads on files the diff doesn't change open from the comments panel, or with `m` past the diff's last thread: the whole file, as the working tree has it. See [docs/viewer.md](docs/viewer.md#files-outside-the-diff).
+- `dffy doctor` runs its checks side by side, in about 0.4s instead of 1s, grouped into sections.
+
+### Performance
+
+- Stepping between search matches that are on most lines is about 7% faster, with up to 21% fewer allocations. Drawing and scrolling are unchanged against 0.3.0 on the reference Linux machine.
 
 ## 0.3.0 (2026-11-20)
 

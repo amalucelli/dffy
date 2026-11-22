@@ -1,7 +1,7 @@
 [package]
 name = "dffy-core"
 description = "Git, diff, highlighting and view model behind the dffy diff viewer"
-version = "0.4.0"
+version = "0.4.1"
 # Unpublished until the embedding API settles.
 publish = false
 edition.workspace = true

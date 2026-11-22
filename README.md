@@ -13,10 +13,9 @@ dffy main..HEAD        # any revision git understands
 
 Run `dffy` in a git repository and it opens your changes full screen: a file tree on the left, the diff on the right, split or unified. Pipe it and it prints the diff. It shows the first files while it diffs the rest in the background.
 
-<p align="center">
-  <img src="assets/view.png" width="49%" alt="dffy showing a split diff with the file tree on the left">
-  <img src="assets/ai.png" width="49%" alt="Claude Code answering a review thread inline in dffy">
-</p>
+<p align="center"><img src="assets/view.png" alt="dffy showing a split diff with the file tree on the left"></p>
+
+<p align="center"><img src="assets/ai.png" alt="Claude Code answering a review thread inline in dffy"></p>
 
 ## Install
 

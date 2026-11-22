@@ -3,6 +3,7 @@ source: crates/dffy/src/review/prompt/tests.rs
 expression: lost.text
 ---
 A review thread on src/lib.rs:5-6 (the new version of the file), as written: the diff has these lines nowhere now.
+Language: rust
 
 ana:
 Why edit these?

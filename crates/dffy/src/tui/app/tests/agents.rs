@@ -435,6 +435,13 @@ fn a_on_a_selection_asks_the_question_written() {
     key(&mut app, 'a');
     assert!(app.doc.writing().is_some());
     assert!(status(&mut app).contains("your question for the agent · enter asks"));
+    let heading = "you · question for the agent · lines 1–2 · enter asks";
+    assert!(screen(&mut app).contains(heading), "{}", screen(&mut app));
+    // Back from an editor that failed, the box is still a question.
+    let ctrl_g = Event::Input(Input::Key(Key::Char('g'), Mods::CTRL));
+    assert!(app.event(ctrl_g).is_some());
+    app.composed(None);
+    assert!(screen(&mut app).contains(heading), "{}", screen(&mut app));
     assert_eq!(asked(&mut app, ""), (vec![], vec![]));
     typed(&mut app, "Is this safe?");
     press(&mut app, Key::Enter);
@@ -468,6 +475,48 @@ fn a_on_a_selection_asks_the_question_written() {
         asked(&mut app, "And these?"),
         (vec![(2, None, true)], vec![])
     );
+}
+
+/// The viewer's prompts, copied or asked with, name the definitions
+/// around their lines only once the file's are found: until then they
+/// have no `In:` line, rather than a parse holding up the screen.
+#[test]
+fn the_viewers_prompts_name_definitions_only_once_found() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let prepare = File::prepare(crate::grammars(), None);
+    let file = prepare.file(super::draw::scope_diff(), Whitespace::Exact, true);
+    let mut app = app_with(&Config::default(), "uncommitted", file, (160, 30));
+    app.set_comments(dir.path().join("comments.json"));
+    screen(&mut app);
+    // From the hunk's first line, `impl Error`, into `fn fatal`.
+    let prompts = |app: &mut App| {
+        key(app, 'n');
+        key(app, 'v');
+        key(app, 'j');
+        key(app, ' ');
+        let copied = match app.event(Event::Input(Input::Key(Key::Char('"'), Mods::NONE))) {
+            Some(Action::Copy { text, .. }) => String::from_utf8(text).expect("utf-8"),
+            other => panic!("{other:?}"),
+        };
+        key(app, 'n');
+        key(app, 'v');
+        key(app, 'a');
+        typed(app, "Why?");
+        press(app, Key::Enter);
+        let [(_, asked)] = prompts(app).try_into().expect("one ask");
+        [copied, asked]
+    };
+    for prompt in prompts(&mut app) {
+        assert!(prompt.contains("\nLanguage: rust\n"), "{prompt}");
+        assert!(!prompt.contains("\nIn: "), "{prompt}");
+    }
+    let loaded = app.doc.document.file(0).expect("loaded");
+    let slot = loaded.syntax().expect("highlighted");
+    slot.get_or_init(|| prepare.syntax(loaded.diff(), false));
+    prepare.scopes(loaded.diff(), slot);
+    for prompt in prompts(&mut app) {
+        assert!(prompt.contains("\nIn: impl Error\n"), "{prompt}");
+    }
 }
 
 /// A comment you write starting `@<name>` asks that agent; until the

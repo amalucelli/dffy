@@ -116,7 +116,7 @@ fn the_title_gives_up_the_context_then_the_directory() {
 
 /// A change inside `impl Error › fn fatal` whose hunk starts above
 /// `impl Error`, so git's heading for it is the function before.
-fn scope_diff() -> FileDiff {
+pub(super) fn scope_diff() -> FileDiff {
     let old: String =
         ["pub(crate) fn grammars() {\n    let a = 1;\n}\n\nimpl Error {\n".to_owned()]
             .into_iter()

@@ -180,7 +180,7 @@ Returns one thread as the prompt `dffy comments prompt` prints ([comments.md](co
 | `session` | `false` | The thread is in the review session the viewer has open. |
 
 ```json
-{"thread":"9f3c2a71b04e5d18","path":"src/lib.rs","prompt":"A review thread on src/lib.rs:12-14 (the new version of the file).\n\n…","trimmed":false}
+{"thread":"9f3c2a71b04e5d18","path":"src/lib.rs","prompt":"A review thread on src/lib.rs:12-14 (the new version of the file).\nLanguage: rust\nIn: fn add\n\n…","trimmed":false}
 ```
 
 | Field | Meaning |

@@ -362,17 +362,20 @@ fn the_handoffs_read_as_the_protocol_says() {
     let (tx, rx) = mpsc::channel();
     let agents = tx.clone();
     plugin.on_ready(move |listed| {
-        agents.send(listed.map(|l| l.len().to_string())).ok();
+        agents.send((0, listed.map(|l| l.len().to_string()))).ok();
     });
-    for config in [None, Some("amp")] {
+    for (i, config) in [None, Some("amp")].into_iter().enumerate() {
         let tx = tx.clone();
         plugin.on_handoff(config.map(str::to_owned), move |handoff| {
-            tx.send(handoff.map(|h| format!("{h:?}"))).ok();
+            tx.send((i + 1, handoff.map(|h| format!("{h:?}")))).ok();
         });
     }
-    let said: Vec<_> = (0..3)
+    // The answers come in whatever order the plugin's thread delivers them.
+    let mut said: Vec<_> = (0..3)
         .map(|_| rx.recv_timeout(WAIT).expect("said"))
         .collect();
+    said.sort_by_key(|(i, _)| *i);
+    let said: Vec<_> = said.into_iter().map(|(_, s)| s).collect();
     plugin.close();
     assert_eq!(
         said,

@@ -3,6 +3,7 @@ source: crates/dffy/src/review/prompt/tests.rs
 expression: least.text
 ---
 A review thread on src/lib.rs:12-20 (the new version of the file).
+Language: rust
 
 ana:
 First.

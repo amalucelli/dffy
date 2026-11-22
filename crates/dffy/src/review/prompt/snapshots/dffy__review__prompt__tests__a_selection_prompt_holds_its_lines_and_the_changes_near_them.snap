@@ -3,6 +3,7 @@ source: crates/dffy/src/review/prompt/tests.rs
 expression: prompt.text
 ---
 Lines selected in a diff: src/lib.rs:2 (the old version of the file, before the change).
+Language: rust
 
 The selected lines, marked >, and the lines around them:
 

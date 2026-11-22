@@ -39,6 +39,19 @@ pub(super) const OTHER_BRANCHES: char = 'b';
 pub(crate) struct Writing {
     pub at: Writes,
     pub text: TextBox,
+    /// What `enter` does with a new thread, for its box's heading.
+    pub enter: Enter,
+}
+
+/// What `enter` does with a new thread's text box.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Enter {
+    Saves,
+    /// Saves it and asks this agent about it; `None` before the agent
+    /// plugin named its default one.
+    Asks(Option<String>),
+    /// Saves it and hands its thread to your coding agent.
+    Fixes,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -588,20 +601,63 @@ pub(crate) fn thread_rows(
 }
 
 /// Writes the text box for a new thread, `width` columns wide: a draft's
-/// box with the focus, its heading in the top border.
-pub(crate) fn new_rows(text: &mut TextBox, width: usize, c: &mut Canvas) {
+/// box with the focus. Its heading in the top border says what it writes,
+/// the lines it's on and what `enter` does, then the other keys; too
+/// narrow for all of it, the keys go from the last, then the lines, then
+/// the agent a question is for, then what it writes.
+pub(crate) fn new_rows(writing: &mut Writing, width: usize, c: &mut Canvas) {
+    let what = match &writing.enter {
+        Enter::Saves => Cow::Borrowed(" · new comment"),
+        Enter::Asks(agent) => {
+            let agent = agent.as_deref().map_or(Cow::Borrowed("the agent"), |a| {
+                Cow::Owned(escape(a.as_bytes()))
+            });
+            Cow::Owned(format!(" · question for {agent}"))
+        }
+        Enter::Fixes => Cow::Borrowed(" · fix with agent"),
+    };
+    let lines = match &writing.at {
+        Writes::New { lines, .. } if lines.len() > 1 => {
+            format!(" · lines {}–{}", lines.start + 1, lines.end)
+        }
+        Writes::New { lines, .. } => format!(" · line {}", lines.start + 1),
+        Writes::File => " · whole file".to_owned(),
+        Writes::Reply(_) | Writes::Edit { .. } => String::new(),
+    };
+    let enter = match &writing.enter {
+        Enter::Saves => " · enter saves",
+        Enter::Asks(_) => " · enter asks",
+        Enter::Fixes => " · enter sends it",
+    };
+    let dim: Ink = Role::Dim.into();
+    let mut spans = vec![
+        (dim, "▾ "),
+        (AUTHOR, "you"),
+        (dim, &*what),
+        (dim, &*lines),
+        (dim, enter),
+        (dim, " · alt+enter new line"),
+        (dim, " · ctrl+g editor"),
+    ];
+    let mut question = matches!(writing.enter, Enter::Asks(_)).then_some(" · question");
+    // The top border's room for a heading: inside its corners, a space
+    // either side.
+    while spans.len() > 2 && spans_width(&spans) > width.saturating_sub(4) {
+        match (spans.len(), question) {
+            (3, Some(short)) => {
+                spans[2].1 = short;
+                question = None;
+            }
+            _ => drop(spans.pop()),
+        }
+    }
     let mut frame = Frame {
         c,
         border: Border::new(true, true),
         width,
     };
-    frame.top(&[
-        (Role::Dim.into(), "▾ "),
-        (AUTHOR, "you"),
-        (Role::Dim.into(), " · new comment"),
-        (Role::Dim.into(), BOX_KEYS),
-    ]);
-    frame.text_box(text);
+    frame.top(&spans);
+    frame.text_box(&mut writing.text);
     frame.bottom();
 }
 
@@ -1033,5 +1089,60 @@ mod tests {
         assert_eq!(age("2026-11-14T12:00:00Z", now), "3d ago");
         assert_eq!(age("2026-09-01T12:00:00Z", now), "2026-09-01");
         assert_eq!(age("yesterday", now), "yesterday");
+    }
+
+    /// A new thread's box heading says what it writes, its lines and what
+    /// `enter` does; narrower, the keys go first, then the lines, then the
+    /// agent asked, then what it writes.
+    #[test]
+    fn a_new_threads_heading_says_its_lines_and_what_enter_does() {
+        let top = |at: Writes, enter: Enter, width: usize| {
+            let mut writing = Writing {
+                at,
+                text: TextBox::new(""),
+                enter,
+            };
+            let mut c = Canvas::default();
+            new_rows(&mut writing, width, &mut c);
+            (c.rows().next())
+                .map(|row| row.map(|(_, text)| text).collect::<String>())
+                .unwrap_or_default()
+        };
+        let lines = |lines| Writes::New {
+            side: Side::New,
+            lines,
+        };
+        let claude = || Enter::Asks(Some("claude".to_owned()));
+        // Parts go whole: only a box too narrow for `▾ you` cuts.
+        for width in 9..120 {
+            for enter in [claude(), Enter::Asks(None), Enter::Saves, Enter::Fixes] {
+                let heading = top(lines(318..331), enter, width);
+                assert!(!heading.contains('…'), "{width}: {heading}");
+            }
+        }
+        let shown = [
+            top(lines(318..331), claude(), 100),
+            top(lines(318..331), Enter::Asks(None), 100),
+            top(lines(318..331), Enter::Saves, 100),
+            top(lines(41..42), Enter::Saves, 100),
+            top(Writes::File, Enter::Saves, 100),
+            top(lines(41..42), Enter::Fixes, 100),
+            top(lines(318..331), claude(), 80),
+            top(lines(318..331), claude(), 50),
+            top(lines(318..331), claude(), 30),
+            top(lines(318..331), Enter::Fixes, 24),
+        ];
+        insta::assert_snapshot!(shown.join("\n"), @"
+        ┏ ▾ you · question for claude · lines 319–331 · enter asks · alt+enter new line · ctrl+g editor ━━━┓
+        ┏ ▾ you · question for the agent · lines 319–331 · enter asks · alt+enter new line · ctrl+g editor ┓
+        ┏ ▾ you · new comment · lines 319–331 · enter saves · alt+enter new line · ctrl+g editor ━━━━━━━━━━┓
+        ┏ ▾ you · new comment · line 42 · enter saves · alt+enter new line · ctrl+g editor ━━━━━━━━━━━━━━━━┓
+        ┏ ▾ you · new comment · whole file · enter saves · alt+enter new line · ctrl+g editor ━━━━━━━━━━━━━┓
+        ┏ ▾ you · fix with agent · line 42 · enter sends it · alt+enter new line · ctrl+g editor ━━━━━━━━━━┓
+        ┏ ▾ you · question for claude · lines 319–331 · enter asks ━━━━━━━━━━━━━━━━━━━━┓
+        ┏ ▾ you · question for claude · lines 319–331 ━━━┓
+        ┏ ▾ you · question ━━━━━━━━━━┓
+        ┏ ▾ you ━━━━━━━━━━━━━━━┓
+        ");
     }
 }

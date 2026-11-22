@@ -6,10 +6,14 @@ use crate::review::Review;
 
 /// `src/lib.rs` from `old` to `new`.
 fn diff(old: &str, new: &str) -> FileDiff {
+    diff_at("src/lib.rs", old, new)
+}
+
+fn diff_at(path: &str, old: &str, new: &str) -> FileDiff {
     let (old, new) = (Text::new(old.into()), Text::new(new.into()));
     FileDiff {
         change: FileChange {
-            path: "src/lib.rs".into(),
+            path: path.into(),
             status: Status::Modified,
             old: None,
             new: None,
@@ -62,7 +66,14 @@ fn a_thread_prompt_holds_its_comments_lines_and_the_changes_near_them() {
     let review = review(THREAD);
     let thread: Vec<&Comment> = review.comments.iter().collect();
     let diff = diff(&numbered(|_| false), &numbered(|i| i == 5 || i == 25));
-    let prompt = thread_within(false, &thread, &on_new(4..6), Some(&diff), MAX_BYTES);
+    let prompt = thread_within(
+        false,
+        &thread,
+        &on_new(4..6),
+        Some(&diff),
+        Definitions::Parse,
+        MAX_BYTES,
+    );
     assert!(!prompt.trimmed);
     insta::assert_snapshot!(prompt.text);
 }
@@ -75,11 +86,11 @@ fn a_thread_prompt_holds_its_comments_lines_and_the_changes_near_them() {
 fn a_thread_prompt_off_the_reviews_head_says_the_files_differ() {
     let review = review(THREAD);
     let thread = [&review.comments[0]];
-    let prompt = thread_within(true, &thread, &At::Lost, None, 1);
+    let prompt = thread_within(true, &thread, &At::Lost, None, Definitions::Parse, 1);
     assert!(
         prompt.text.starts_with(
-            "A review thread on src/lib.rs:5-6 (the new version of the file), as written.\n\n\
-             The files on disk aren't this review's version (HEAD isn't its head); rely on the \
+            "A review thread on src/lib.rs:5-6 (the new version of the file), as written.\n\
+             Language: rust\n\nThe files on disk aren't this review's version (HEAD isn't its head); rely on the \
              hunks quoted.\n\n"
         ),
         "{}",
@@ -91,8 +102,60 @@ fn a_thread_prompt_off_the_reviews_head_says_the_files_differ() {
 #[test]
 fn a_selection_prompt_holds_its_lines_and_the_changes_near_them() {
     let diff = diff(&numbered(|_| false), &numbered(|i| i == 2));
-    let prompt = selection_within(&diff, Side::Old, 1..2, MAX_BYTES);
+    let prompt = selection_within(&diff, Side::Old, 1..2, Definitions::Parse, MAX_BYTES);
     insta::assert_snapshot!(prompt.text);
+}
+
+/// After where it is, a prompt names the file's language and, where its
+/// language has definitions, those around all of its lines, outermost
+/// first: parsed for the prompt, or only as the caller found them.
+#[test]
+fn a_prompt_names_the_language_and_the_definitions_around_its_lines() {
+    let rust = |n: u8| {
+        format!(
+            "use std::fmt;\n\nmod tests {{\n    fn line_matches() {{\n        let a = {n};\n    \
+             }}\n\n    fn other() {{}}\n}}\n"
+        )
+    };
+    let diff = diff_at("src/lib.rs", &rust(1), &rust(2));
+    let header = |text: &str| text.split("\n\n").next().unwrap_or_default().to_owned();
+    assert_eq!(
+        header(&selection_within(&diff, Side::New, 4..5, Definitions::Parse, MAX_BYTES).text),
+        "Lines selected in a diff: src/lib.rs:5 (the new version of the file).\nLanguage: \
+         rust\nIn: mod tests > fn line_matches"
+    );
+    let across = selection_within(&diff, Side::New, 4..8, Definitions::Parse, MAX_BYTES).text;
+    assert!(across.contains("\nIn: mod tests\n\n"), "{across}");
+
+    let review = review(THREAD);
+    let thread = [&review.comments[0]];
+    let text = thread_within(
+        false,
+        &thread,
+        &on_new(4..5),
+        Some(&diff),
+        Definitions::Parse,
+        MAX_BYTES,
+    )
+    .text;
+    assert_eq!(
+        header(&text),
+        "A review thread on src/lib.rs:5 (the new version of the file).\nLanguage: rust\nIn: \
+         mod tests > fn line_matches"
+    );
+
+    // The viewer's way: only definitions found already, so no parse.
+    let found = Definitions::Found([None; 2]);
+    assert_eq!(
+        header(&selection_within(&diff, Side::New, 4..5, found, MAX_BYTES).text),
+        "Lines selected in a diff: src/lib.rs:5 (the new version of the file).\nLanguage: rust"
+    );
+
+    let json = diff_at("config.json", "{\n  \"a\": 1\n}\n", "{\n  \"a\": 2\n}\n");
+    assert_eq!(
+        header(&selection_within(&json, Side::New, 1..2, Definitions::Parse, MAX_BYTES).text),
+        "Lines selected in a diff: config.json:2 (the new version of the file).\nLanguage: json"
+    );
 }
 
 /// A thread whose lines the diff doesn't have shows them as written,
@@ -102,9 +165,23 @@ fn a_thread_whose_lines_are_gone_shows_them_as_written() {
     let review = review(THREAD);
     let thread = [&review.comments[0]];
     let diff = diff(&numbered(|_| false), &numbered(|i| i == 20));
-    let lost = thread_within(false, &thread, &At::Lost, Some(&diff), MAX_BYTES);
+    let lost = thread_within(
+        false,
+        &thread,
+        &At::Lost,
+        Some(&diff),
+        Definitions::Parse,
+        MAX_BYTES,
+    );
     insta::assert_snapshot!(lost.text);
-    let unseen = thread_within(false, &thread, &At::Lost, None, MAX_BYTES);
+    let unseen = thread_within(
+        false,
+        &thread,
+        &At::Lost,
+        None,
+        Definitions::Parse,
+        MAX_BYTES,
+    );
     assert!(
         unseen.text.starts_with(
             "A review thread on src/lib.rs:5-6 (the new version of the file), as written.\n"
@@ -141,11 +218,12 @@ fn trimming_cuts_in_order_and_marks_each_cut() {
     let (review, diff) = long_thread();
     let thread: Vec<&Comment> = review.comments.iter().collect();
     let at = on_new(11..20);
-    let full = thread_within(false, &thread, &at, Some(&diff), MAX_BYTES).text;
+    let within = |cap| thread_within(false, &thread, &at, Some(&diff), Definitions::Parse, cap);
+    let full = within(MAX_BYTES).text;
     let has = |text: &str, n: usize| text.contains(&format!("+line {n} edited"));
     assert!(has(&full, 3) && has(&full, 40));
 
-    let one = thread_within(false, &thread, &at, Some(&diff), full.len() - 1);
+    let one = within(full.len() - 1);
     assert!(one.trimmed);
     assert!(has(&one.text, 3) && !has(&one.text, 40), "{}", one.text);
     assert!(
@@ -157,7 +235,7 @@ fn trimming_cuts_in_order_and_marks_each_cut() {
     // At every cap between, a step is taken only once those before it are.
     let mut windowed_with_replies = false;
     for cap in (1..full.len()).step_by(40) {
-        let text = thread_within(false, &thread, &at, Some(&diff), cap).text;
+        let text = within(cap).text;
         let replies_cut = text.contains("reply omitted");
         let lines_cut = text.contains("> 12  line 12 edited\n[…");
         let windowed = has(&text, 21) && !has(&text, 30);
@@ -177,7 +255,7 @@ fn trimming_cuts_in_order_and_marks_each_cut() {
         "a cap cuts the hunk and keeps the replies"
     );
 
-    let least = thread_within(false, &thread, &at, Some(&diff), 1);
+    let least = within(1);
     assert!(least.trimmed);
     insta::assert_snapshot!(least.text);
 }
@@ -198,7 +276,15 @@ fn trimming_keeps_the_latest_exchange() {
     );
     let thread: Vec<&Comment> = review.comments.iter().collect();
     let diff = diff(&numbered(|_| false), &numbered(|i| i == 5));
-    let least = thread_within(false, &thread, &on_new(4..5), Some(&diff), 1).text;
+    let least = thread_within(
+        false,
+        &thread,
+        &on_new(4..5),
+        Some(&diff),
+        Definitions::Parse,
+        1,
+    )
+    .text;
     for kept in ["Is this safe?", "The latest answer.", "And then?"] {
         assert!(least.contains(kept), "{kept}: {least}");
     }

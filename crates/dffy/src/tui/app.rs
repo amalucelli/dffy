@@ -2946,7 +2946,12 @@ impl App {
                 .and_then(|(file, side, lines)| {
                     let n = lines.len();
                     let loaded = self.doc.document.file(file)?;
-                    let made = prompt::selection(model::line_diff(loaded), side, lines);
+                    let made = prompt::selection(
+                        model::line_diff(loaded),
+                        side,
+                        lines,
+                        prompt::Definitions::Found(model::line_scopes(loaded)),
+                    );
                     Some(Ok((made, session::plural(n, "line"))))
                 })
         } else {
@@ -2983,16 +2988,18 @@ impl App {
                 "a thread on another branch can't be made a prompt; move it here first",
             ));
         }
-        let diff = (comments.home_of(root))
+        let file = (comments.home_of(root))
             .and_then(|path| comments.file_of(path.as_bytes()))
-            .and_then(|file| self.doc.document.file(file))
-            .map(model::line_diff);
+            .and_then(|file| self.doc.document.file(file));
+        let diff = file.map(model::line_diff);
+        let definitions =
+            prompt::Definitions::Found(file.map(model::line_scopes).unwrap_or_default());
         // A review opened by its id, as the changes to the working tree
         // check: the one plain `dffy` found is the branch checked out.
         let elsewhere = (self.checkout())
             .zip(self.head.as_ref())
             .is_some_and(|(checkout, head)| *head != checkout.head);
-        let made = prompt::thread(&list, at, diff.map(|d| &**d), elsewhere);
+        let made = prompt::thread(&list, at, diff.map(|d| &**d), definitions, elsewhere);
         Some(Ok((made, "a thread")))
     }
 

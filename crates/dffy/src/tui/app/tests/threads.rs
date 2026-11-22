@@ -81,6 +81,42 @@ fn c_writes_a_comment_in_a_box_under_the_selection() {
     assert_eq!(read_comments(&path).comments.len(), 0);
 }
 
+/// The rail on a new thread's lines stays while its box is open, through
+/// a scroll, and goes with the box, left or saved.
+#[test]
+fn a_new_threads_rail_goes_with_its_box() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut app = app(100, 20);
+    app.set_comments(dir.path().join("comments.json"));
+    screen(&mut app);
+    // What the mark column of each unchanged line shows.
+    let marks = |app: &mut App| -> String {
+        (screen(app).lines())
+            .filter_map(|l| l.split_once(" │ line ")?.0.chars().last())
+            .filter(|&c| c != ' ')
+            .collect()
+    };
+    // Lines 1 to 7, the last of them still on screen after a scroll.
+    typed(&mut app, "vjjjjjjc");
+    assert_eq!(marks(&mut app), "┌││││└");
+    for (delta, shown) in [(1, "│││└"), (-1, "┌││││└")] {
+        app.event(Event::Input(Input::Scroll {
+            delta,
+            x: 60,
+            y: 10,
+        }));
+        assert_eq!(marks(&mut app), shown, "after a scroll by {delta}");
+    }
+    press(&mut app, Key::Esc);
+    assert_eq!(marks(&mut app), "", "left empty");
+    key(&mut app, 'v');
+    key(&mut app, 'c');
+    assert_eq!(marks(&mut app), "[");
+    typed(&mut app, "Why?");
+    press(&mut app, Key::Enter);
+    assert_eq!(marks(&mut app), "●", "saved");
+}
+
 /// A `d` armed for one draft doesn't outlast the mouse: after a click
 /// on another thread, `d` asks again rather than deleting it.
 #[test]

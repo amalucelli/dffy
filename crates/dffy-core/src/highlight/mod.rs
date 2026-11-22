@@ -316,6 +316,20 @@ impl Parsed {
     }
 }
 
+/// The definitions of `text` in `lang`, from a parse made for them alone,
+/// for a host that holds no tree of it: the highlight query isn't
+/// compiled. `None` when the language has no scope query, and as for
+/// [`parse`].
+#[must_use]
+pub fn scopes(lang: &Language, text: &Text) -> Option<Scopes> {
+    let query = lang.scope_query()?;
+    if text.bytes().len() > MAX_HIGHLIGHT_BYTES {
+        return None;
+    }
+    let tree = parse_tree(lang, text.bytes(), PARSE_BUDGET, None)?;
+    Some(scope::extract(query, &tree, text))
+}
+
 impl Parsed {
     /// The definitions of `text`, the text this was parsed from; `None`
     /// when its language has no scope query.

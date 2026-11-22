@@ -1,6 +1,7 @@
 //! A thread or a selection as a prompt a coding agent can answer: the
-//! thread's comments, where it is, the lines it's on with some around them,
-//! and the file's changes near them. Copy as prompt, `dffy comments
+//! thread's comments, where it is, the file's language and the definitions
+//! around its lines, the lines it's on with some around them, and the
+//! file's changes near them. Copy as prompt, `dffy comments
 //! prompt` and MCP's `thread_prompt` give it as made here. An agent a
 //! thread is handed to starts with only a pointer to it ([`handoff`]).
 //!
@@ -17,6 +18,7 @@ use dffy_core::annotation::Anchor;
 use dffy_core::diff::{Hunk, LineKind, Text};
 use dffy_core::document::Side;
 use dffy_core::git::FileDiff;
+use dffy_core::highlight::{self, Scopes};
 
 use super::model::At;
 use super::{Comment, fence, who};
@@ -27,8 +29,9 @@ use super::{Comment, fence, who};
 /// around, down to [`LEAST_AROUND`]; the replies between the first comment
 /// and the last two, the earliest first, but those with a suggestion; then
 /// the commented lines themselves, to their first and last few. What it's
-/// about, the first comment, the last two, the suggestions and the closing
-/// ask are never cut, so a thread longer than this makes a longer prompt.
+/// about, with its language and definitions, the first comment, the last
+/// two, the suggestions and the closing ask are never cut, so a thread
+/// longer than this makes a longer prompt.
 pub(crate) const MAX_BYTES: usize = 32 << 10;
 
 /// Lines shown on each side of the commented or selected ones.
@@ -42,6 +45,19 @@ pub(crate) struct Prompt {
     pub trimmed: bool,
 }
 
+/// Where the definitions of a prompt's line diff, for its `In:` line, come
+/// from.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum Definitions<'a> {
+    /// A parse of the side the prompt needs, made for it within the
+    /// highlighter's size and time caps: for a caller that holds none.
+    Parse,
+    /// Only those of the old and new side found already. A side without
+    /// them gets no `In:` line: the viewer's, where a parse would hold up
+    /// its frames.
+    Found([Option<&'a Scopes>; 2]),
+}
+
 /// The thread of `comments`, its first comment first, shown `at` on
 /// `diff`, its file's line diff; without one, its lines as written.
 /// `elsewhere` when HEAD isn't the head of the review the thread is on, so
@@ -51,14 +67,20 @@ pub(crate) fn thread(
     comments: &[&Comment],
     at: &At,
     diff: Option<&FileDiff>,
+    definitions: Definitions,
     elsewhere: bool,
 ) -> Prompt {
-    thread_within(elsewhere, comments, at, diff, MAX_BYTES)
+    thread_within(elsewhere, comments, at, diff, definitions, MAX_BYTES)
 }
 
 /// Lines `lines` (0-based) of `side` of `diff`, a line diff, selected.
-pub(crate) fn selection(diff: &FileDiff, side: Side, lines: Range<usize>) -> Prompt {
-    selection_within(diff, side, lines, MAX_BYTES)
+pub(crate) fn selection(
+    diff: &FileDiff,
+    side: Side,
+    lines: Range<usize>,
+    definitions: Definitions,
+) -> Prompt {
+    selection_within(diff, side, lines, definitions, MAX_BYTES)
 }
 
 /// Where `dffy comments` finds a thread handed to an agent.
@@ -152,7 +174,7 @@ pub(crate) fn open_threads(threads: &[Open], others: usize, elsewhere: bool) -> 
             continue;
         };
         let _ = write!(text, "## Thread {}\n\n", root.id);
-        let mut parts = thread_parts(false, comments, at, diff);
+        let mut parts = thread_parts(false, comments, at, diff, Definitions::Parse);
         parts.tail = String::new();
         let one = parts.fit(share);
         trimmed |= one.trimmed;
@@ -179,6 +201,7 @@ fn thread_within(
     comments: &[&Comment],
     at: &At,
     diff: Option<&FileDiff>,
+    definitions: Definitions,
     cap: usize,
 ) -> Prompt {
     if comments.is_empty() {
@@ -187,7 +210,7 @@ fn thread_within(
             trimmed: false,
         };
     }
-    thread_parts(elsewhere, comments, at, diff).fit(cap)
+    thread_parts(elsewhere, comments, at, diff, definitions).fit(cap)
 }
 
 /// [`thread_within`]'s parts, before trimming; `comments` isn't empty.
@@ -196,14 +219,23 @@ fn thread_parts<'a>(
     comments: &'a [&'a Comment],
     at: &At,
     diff: Option<&FileDiff>,
+    definitions: Definitions,
 ) -> Parts<'a> {
     let root = comments[0];
     let mut head = String::from("A review thread on ");
     let mut code = None;
     let mut anchor = None;
     let mut hunks = Vec::new();
+    let mut syntax = Syntax {
+        path: root.path.as_bytes(),
+        text: diff.map(|d| &d.new),
+        placed: None,
+    };
     match (at, diff) {
-        (At::Conversation { .. }, _) => head.push_str("the review as a whole"),
+        (At::Conversation { .. }, _) => {
+            head.push_str("the review as a whole");
+            syntax.path = b"";
+        }
         (At::File, _) => {
             let _ = write!(head, "the whole file {}", root.path);
             hunks = diff.map(|d| all_hunks(d, None)).unwrap_or_default();
@@ -213,6 +245,7 @@ fn thread_parts<'a>(
             code = Some(Code::from_text(side_text(diff, *side), lines.clone()));
             anchor = Some((*side, lines.clone()));
             hunks = all_hunks(diff, anchor.as_ref());
+            syntax = Syntax::placed(diff, *side, lines, definitions);
         }
         (At::Line { .. } | At::Lost, _) => {
             match root.range() {
@@ -239,7 +272,9 @@ fn thread_parts<'a>(
     if root.outdated {
         head.push_str(", outdated on its host");
     }
-    head.push_str(".\n\n");
+    head.push_str(".\n");
+    syntax.write(&mut head);
+    head.push('\n');
     if elsewhere {
         head.push_str(
             "The files on disk aren't this review's version (HEAD isn't its head); rely on the \
@@ -269,14 +304,19 @@ fn thread_parts<'a>(
     }
 }
 
-fn selection_within(diff: &FileDiff, side: Side, lines: Range<usize>, cap: usize) -> Prompt {
-    let path = match side {
-        Side::Old => diff.change.old_path(),
-        Side::New => diff.change.path.as_ref(),
-    };
+fn selection_within(
+    diff: &FileDiff,
+    side: Side,
+    lines: Range<usize>,
+    definitions: Definitions,
+    cap: usize,
+) -> Prompt {
     let mut head = String::from("Lines selected in a diff: ");
-    place(&mut head, &String::from_utf8_lossy(path), side, &lines);
-    head.push_str(".\n\n");
+    let path = String::from_utf8_lossy(side_path(diff, side));
+    place(&mut head, &path, side, &lines);
+    head.push_str(".\n");
+    Syntax::placed(diff, side, &lines, definitions).write(&mut head);
+    head.push('\n');
     let anchor = Some((side, lines.clone()));
     Parts {
         head,
@@ -304,6 +344,77 @@ fn place(out: &mut String, path: &str, side: Side, lines: &Range<usize>) {
         Side::Old => " (the old version of the file, before the change)",
         Side::New => " (the new version of the file)",
     });
+}
+
+/// What the header says of the code after where it is: the language of
+/// the file at `path`, detected from it and the start of `text`, and with
+/// `placed`, the definitions around lines of `text`.
+struct Syntax<'a> {
+    path: &'a [u8],
+    text: Option<&'a Text>,
+    /// The lines, as for [`place`], their side, and where that side's
+    /// definitions come from.
+    placed: Option<(Range<usize>, Side, Definitions<'a>)>,
+}
+
+impl<'a> Syntax<'a> {
+    /// For `lines` of `side` of `diff`.
+    fn placed(
+        diff: &'a FileDiff,
+        side: Side,
+        lines: &Range<usize>,
+        definitions: Definitions<'a>,
+    ) -> Self {
+        Self {
+            path: side_path(diff, side),
+            text: Some(side_text(diff, side)),
+            placed: Some((lines.clone(), side, definitions)),
+        }
+    }
+
+    /// `Language: rust`, then `In: mod tests > fn parse` for the
+    /// definitions around every one of the lines, outermost first; a line
+    /// for each only when there's something to say.
+    fn write(&self, out: &mut String) {
+        if self.path.is_empty() {
+            return;
+        }
+        let start = self
+            .text
+            .map_or(&[][..], |t| &t.bytes()[..t.bytes().len().min(256)]);
+        let Some(lang) = crate::grammars().detect(self.path, start) else {
+            return;
+        };
+        let _ = writeln!(out, "Language: {}", lang.name());
+        let (Some(text), Some((lines, side, definitions))) = (self.text, &self.placed) else {
+            return;
+        };
+        let parsed;
+        let scopes = match definitions {
+            Definitions::Found(found) => found[side.index()],
+            Definitions::Parse => {
+                parsed = highlight::scopes(lang, text);
+                parsed.as_ref()
+            }
+        };
+        let Some(scopes) = scopes else {
+            return;
+        };
+        let first = scopes.at(lines.start);
+        let last = scopes.at(lines.end.max(lines.start + 1) - 1);
+        let common = first.iter().zip(&last).take_while(|(a, b)| a == b).count();
+        if common > 0 {
+            let _ = writeln!(out, "In: {}", first[..common].join(" > "));
+        }
+    }
+}
+
+/// The path of `side` of `diff`.
+fn side_path(diff: &FileDiff, side: Side) -> &[u8] {
+    match side {
+        Side::Old => diff.change.old_path(),
+        Side::New => diff.change.path.as_ref(),
+    }
 }
 
 fn side_of(side: super::Side) -> Side {

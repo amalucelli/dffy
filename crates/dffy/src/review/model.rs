@@ -27,6 +27,7 @@ use dffy_core::annotation::{Annotated, Annotation, AnnotationSet, Placement};
 use dffy_core::bstr::BString;
 use dffy_core::document::{self, File, Side};
 use dffy_core::git::{FileDiff, Status};
+use dffy_core::highlight::Scopes;
 use dffy_core::view::{Spans, Syntax};
 
 use self::reload::{Stamp, Stat};
@@ -1146,6 +1147,15 @@ fn annotation(c: &Comment) -> Option<Annotation> {
 /// comments are anchored in.
 pub(crate) fn line_diff(file: &File) -> &Arc<FileDiff> {
     file.rendered().map_or_else(|| file.diff(), |r| r.source())
+}
+
+/// The definitions of each side of [`line_diff`] found already, for the
+/// scope line. A rendered view's are of what it draws, not of its source.
+pub(crate) fn line_scopes(file: &File) -> [Option<&Scopes>; 2] {
+    (file.rendered().is_none())
+        .then(|| file.syntax()?.get()?.scopes())
+        .flatten()
+        .unwrap_or_default()
 }
 
 #[cfg(test)]

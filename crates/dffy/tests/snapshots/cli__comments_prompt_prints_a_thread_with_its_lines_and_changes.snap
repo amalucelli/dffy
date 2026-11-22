@@ -3,6 +3,8 @@ source: crates/dffy/tests/cli.rs
 expression: stdout(&out)
 ---
 A review thread on src/lib.rs:3 (the new version of the file).
+Language: rust
+In: fn add
 
 ana:
 Overflow?

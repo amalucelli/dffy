@@ -60,6 +60,8 @@ task perf -- --rev main
 
 **Baselines.** Every run builds its baseline fresh. It makes a temporary git worktree of the commit under `target/perf/worktree/`, builds it into `target/perf/build/`, and copies the executables to `target/perf/baseline/`. When the run ends, whether it passed, failed or was interrupted with Ctrl-C, it removes its builds and keeps only `target/perf/runs/` and `target/perf/layout.tsv`. It prints what it removed and about how much space that freed.
 
+**Code alignment.** Every build the gate measures starts each function and loop on a 64-byte boundary, with `-Cllvm-args=-align-all-functions=6 -Cllvm-args=-align-loops=64` added after any `RUSTFLAGS` you set, because otherwise a timing can move between two builds with identical instruction counts just from where the code landed. The checkout's build goes to `target/aligned/`, so `target/release/` keeps an ordinary release build.
+
 **Layout bands.** Timings are held to the layout bands in `target/perf/layout.tsv`. A metric's band is how far its median moved between builds of one commit with different code layouts. One file serves every baseline, and its first line names the commit and date it was measured on.
 
 - `perf:full` measures the file again when it's missing or more than 30 days old, and says so. It builds the baseline's commit four times with shuffled code layouts and compares each with the first, which takes about three times as long as the comparison.

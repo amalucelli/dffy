@@ -71,6 +71,8 @@ Agents read the same comments through the MCP tool `list_comments` ([mcp.md](mcp
 The prompt holds, in order:
 
 1. Where the thread is: file, lines and side (`src/lib.rs:12-14 (the new version of the file)`), plus `resolved` or `outdated on its host` when it is.
+   - The file's language, as dffy highlights it: `Language: rust`.
+   - The definitions around all of the lines, outermost first, as the viewer's scope line names them: `In: mod tests > fn parse`. Only for lines placed on the diff, in a language with scopes ([viewer.md](viewer.md#the-scope-line)). The viewer leaves it out while it's still finding the file's definitions, and in a rendered view, rather than hold up the screen to find them.
 2. Each comment under its author (`you` for yours, drafts included), with its suggestion in a `suggestion` fenced block.
 3. The commented lines, numbered and marked `>`, with up to 5 lines around them.
 4. The file's nearby changes, as a unified diff in a `diff` fenced block.
@@ -88,7 +90,7 @@ A prompt is at most 32 KiB. Over that, dffy cuts in this order until it fits:
 4. replies between the first comment and the last two, earliest first, except those with a suggestion
 5. the middle of the commented lines, keeping the first and last few
 
-The location, the first comment, the last two comments, the suggestions and the ask are never cut, so a long enough thread makes a longer prompt. Each cut is marked: `[… 12 lines …]`, `[2 replies omitted]`, `[3 other hunks of this file omitted]`.
+The location, language and definitions, the first comment, the last two comments, the suggestions and the ask are never cut, so a long enough thread makes a longer prompt. Each cut is marked: `[… 12 lines …]`, `[2 replies omitted]`, `[3 other hunks of this file omitted]`.
 
 An `id` no comment has exits with status 128.
 

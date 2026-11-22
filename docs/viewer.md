@@ -196,7 +196,7 @@ Resolved threads start folded. So do outdated ones with no comment that isn't po
 
 A drag over a comment's text, or a double or triple click on it, copies its Markdown ([Copying from a comment](#copying-from-a-comment)). The menu on a thread copies the comment right-clicked, or the whole thread as text. The whole thread puts each comment under a line like `ana · 2026-11-17`, with its author (`you` for your own) and the day it was written, a blank line apart. Keys bound to `copy_comment` and `copy_thread` act on the focused thread, or the one selected in the comments panel. They copy its comment last clicked in the diff, else its first.
 
-`y` copies the focused thread as a prompt for a coding agent, or the one selected in the comments panel, when no text is selected in it. `space` then `"` (`copy_prompt`) and the menu's `Copy as prompt` copy the focused thread, else the selected lines. The prompt holds where they are, the thread's comments and suggestions, the lines with those around them, and the file's changes near them. It's at most 32 KiB, laid out as in [comments.md](comments.md#as-a-prompt-dffy-comments-prompt). The status bar says what was copied (`copied a thread as a prompt`, `copied 3 lines as a prompt`), and adds `cut to fit 32KB` when something was cut. A thread on another branch is moved here first (`V`).
+`y` copies the focused thread as a prompt for a coding agent, or the one selected in the comments panel, when no text is selected in it. `space` then `"` (`copy_prompt`) and the menu's `Copy as prompt` copy the focused thread, else the selected lines. The prompt holds where they are with the file's language and the definitions around them, the thread's comments and suggestions, the lines with those around them, and the file's changes near them. It's at most 32 KiB, laid out as in [comments.md](comments.md#as-a-prompt-dffy-comments-prompt). The status bar says what was copied (`copied a thread as a prompt`, `copied 3 lines as a prompt`), and adds `cut to fit 32KB` when something was cut. A thread on another branch is moved here first (`V`).
 
 ### Finding
 
@@ -215,6 +215,8 @@ The status bar counts the comments file's threads: `18 threads · 2 drafts`. Dra
 `S` ("Suggest change", also `space` then `S`) opens the box on the same lines, holding them as a `suggestion` fenced block below the cursor. Edit them into what they should be and say why above. Once saved, the block's lines are the comment's `suggestion`, drawn as the change it suggests. `e` edits both the same way.
 
 In the box every key types but `enter`, which saves, as in the Claude Code and Codex CLIs. The status bar says `enter saves · alt+enter new line · esc keeps it`.
+
+While the box for a new thread is open, a rail in the gutter, in the box's border color, marks its lines until it's saved or left: `┌` on the first, `│` down to `└` on the last, `[` for a single line. Their gutter is tinted and their code keeps its colors. The box's heading says what it writes, where, and what `enter` does: `you · new comment · lines 319–331 · enter saves`, or for a question (`a`) `you · question for claude · lines 319–331 · enter asks`, then the other keys. A single line reads `line 42`, a comment on the file `whole file`. On a narrow pane whole parts go from the right: the keys first, then the lines, then the agent's name.
 
 | Keys | Do |
 |---|---|

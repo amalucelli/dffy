@@ -150,7 +150,13 @@ pub(crate) fn thread_prompt(
         Some((i, at)) => (Some(&diffs[i]), at),
         None => (None, unplaced(thread[0])),
     };
-    Some(prompt::thread(&thread, &at, diff, elsewhere))
+    Some(prompt::thread(
+        &thread,
+        &at,
+        diff,
+        prompt::Definitions::Parse,
+        elsewhere,
+    ))
 }
 
 /// The open threads of yours that `branches` takes, for `dffy comments

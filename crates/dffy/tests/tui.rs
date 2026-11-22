@@ -621,7 +621,8 @@ fn the_editor_round_trip_keeps_the_place() {
     term.wait_for("the box again", |t| ran.exists() && t.contains("Begun▏"));
     term.send("X");
     term.wait_for("the cursor at the end", |t| t.contains("BegunX▏"));
-    assert_eq!(term.row(1), top);
+    // The same row, marked in its gutter as the box's line.
+    assert_eq!(term.row(1).replacen('[', " ", 1), top);
     term.send("\x07");
     // A focused thread has a heavy border.
     term.wait_for("the focused thread", |t| {

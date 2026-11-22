@@ -24,7 +24,7 @@ use crate::review::model::compose::Compose;
 use crate::review::model::{self, Comments};
 use crate::review::{Change, Op, Target, prompt, session};
 use crate::term::{Input, Key, Mods};
-use crate::tui::comments::{self, Panel, Writes, Writing};
+use crate::tui::comments::{self, Enter, Panel, Writes, Writing};
 use crate::tui::textbox::TextBox;
 use crate::tui::tree::Item;
 use crate::tui::view;
@@ -315,8 +315,7 @@ impl App {
         let Some(text) = text else {
             if let Some((text, at)) = handed {
                 let after = self.on_save;
-                self.open_box(compose, at, &text);
-                self.on_save = after;
+                self.open_box(compose, at, &text, after);
             }
             return None;
         };
@@ -377,8 +376,7 @@ impl App {
         if self.writes_held() {
             // Kept as typed, to save once the post is done.
             if let Some(at) = at {
-                self.open_box(compose, at, text);
-                self.on_save = after;
+                self.open_box(compose, at, text, after);
             }
             self.message(POSTING);
             return false;
@@ -448,8 +446,7 @@ impl App {
             return true;
         }
         if let Some((compose, at)) = retry {
-            self.open_box(compose, at, text);
-            self.on_save = after;
+            self.open_box(compose, at, text, after);
             self.save_failed = true;
             if let Some((message, _)) = &mut self.message {
                 *message = format!("not saved, esc again discards · {message}");
@@ -458,13 +455,21 @@ impl App {
         false
     }
 
-    fn open_box(&mut self, compose: Compose, at: Writes, text: &str) {
-        self.on_save = OnSave::Nothing;
+    /// Opens the text box `at` holding `text`, for `compose`; saving it
+    /// does `on_save` after.
+    fn open_box(&mut self, compose: Compose, at: Writes, text: &str, on_save: OnSave) {
+        self.on_save = on_save;
         self.composing = Some(compose);
         self.doc.selection = None;
+        let enter = match on_save {
+            OnSave::Ask => Enter::Asks(self.asking.default_agent().map(str::to_owned)),
+            OnSave::Fix => Enter::Fixes,
+            OnSave::Nothing | OnSave::Keep => Enter::Saves,
+        };
         self.doc.write(Writing {
             at,
             text: TextBox::new(text),
+            enter,
         });
         self.reveal_box();
     }
@@ -577,7 +582,12 @@ impl App {
             .map(|e| model::compose::file_draft(e.change()));
         if let Some(Ok(comment)) = draft {
             let comment = self.on_branch(comment);
-            self.open_box(Compose::New(Box::new(comment)), Writes::File, &text);
+            self.open_box(
+                Compose::New(Box::new(comment)),
+                Writes::File,
+                &text,
+                OnSave::Nothing,
+            );
             self.message(
                 "the thread you were writing in is gone; this is a comment on the file now",
             );
@@ -654,7 +664,7 @@ impl App {
         }
         if let Some((compose, at)) = self.new_comment() {
             self.doc.set_focus(None);
-            self.open_box(compose, at, "");
+            self.open_box(compose, at, "", OnSave::Nothing);
         }
     }
 
@@ -677,7 +687,7 @@ impl App {
             .unwrap_or_default();
         let text = model::compose::with_suggestion("", Some(&lines));
         self.doc.set_focus(None);
-        self.open_box(compose, at, &format!("\n\n{text}"));
+        self.open_box(compose, at, &format!("\n\n{text}"), OnSave::Nothing);
         self.doc.edit_writing(|w| w.text.rewind());
     }
 
@@ -706,7 +716,12 @@ impl App {
                 }
                 self.doc.set_focus(None);
                 let comment = self.on_branch(comment);
-                self.open_box(Compose::New(Box::new(comment)), Writes::File, "");
+                self.open_box(
+                    Compose::New(Box::new(comment)),
+                    Writes::File,
+                    "",
+                    OnSave::Nothing,
+                );
             }
             Err(why) => self.message(why),
         }
@@ -950,8 +965,7 @@ impl App {
         }
         let (compose, at) = self.new_comment()?;
         self.doc.set_focus(None);
-        self.open_box(compose, at, "");
-        self.on_save = OnSave::Ask;
+        self.open_box(compose, at, "", OnSave::Ask);
         let agent = self.asking.default_agent().unwrap_or("the agent");
         self.message(format!("your question for {agent} · enter asks"));
         None
@@ -989,8 +1003,7 @@ impl App {
         }
         let (compose, at) = self.new_comment()?;
         self.doc.set_focus(None);
-        self.open_box(compose, at, "");
-        self.on_save = OnSave::Fix;
+        self.open_box(compose, at, "", OnSave::Fix);
         self.message("what should change here · enter sends it and starts your agent");
         None
     }
@@ -1469,7 +1482,7 @@ impl App {
             }
         }
         if shown(self) {
-            self.open_box(compose, at, text);
+            self.open_box(compose, at, text, OnSave::Nothing);
             return None;
         }
         self.composing = Some(compose);

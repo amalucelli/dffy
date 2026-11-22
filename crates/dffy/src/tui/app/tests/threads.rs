@@ -49,8 +49,10 @@ fn c_writes_a_comment_in_a_box_under_the_selection() {
     assert_eq!(anchor.after, ["line 3", "line four"]);
     assert_eq!(comment.distance, Some(2));
     let shown = screen(&mut app);
-    // Outside a review session nothing is posted, so nothing's a draft.
-    let rows: Vec<&str> = shown.lines().filter(|l| l.contains('●')).collect();
+    let rows: Vec<&str> = shown
+        .lines()
+        .filter(|l| l.contains("1┌ ") || l.contains("2└ "))
+        .collect();
     assert_eq!(rows.len(), 2, "{shown}");
     assert!(rows[0].contains("line 1") && rows[1].contains("line 2"));
     let below = shown
@@ -58,6 +60,7 @@ fn c_writes_a_comment_in_a_box_under_the_selection() {
         .skip_while(|l| !l.contains("line 2"))
         .nth(1)
         .unwrap_or_default();
+    // Outside a review session nothing is posted, so it isn't a draft.
     // Saved with `enter`, the keys stay the diff's.
     assert!(below.contains("▾ you · just now ─"), "{shown}");
     assert_eq!(app.doc.focused(), None);

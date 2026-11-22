@@ -169,7 +169,7 @@ A comment on a whole file sits under the file's first row, marked `on the file`.
 
 A comment whose lines weren't found sits under the file's last row, marked with the lines it was on: `line 145 not found`, or `old lines 140–141 not found` on the old side. The top of its box shows that code as it was, with its line numbers. The commented lines are highlighted in the file's language when highlighting is on, between up to two lines of dimmed context. A commented line's sign is its side's (`+` new, `-` old), or blank when dffy recorded it unchanged. A host's threads record one side only, so theirs always carry the side's sign. Long lines are cut with `…`, as a suggestion's are, whether or not code wraps.
 
-A commented line keeps a mark after its line numbers, on its side of a split: `◆` for a thread with a draft in it, `●` open, `○` resolved. The tree shows each file's comment count beside its line counts, in the color of its most pressing thread.
+Commented lines keep a mark after their line numbers, on their side of a split, in the color of their thread: yellow for a thread with a draft in it, the hint color open, dim resolved. A single line shows `◆` draft, `●` open or `○` resolved. Several lines show a rail, `┌` on the first, `│` down to `└` on the last, unbroken by removed lines between them, and overlapping threads share one. With color off the rail starts on the thread's `◆`, `●` or `○` instead of `┌`, so the shape still says which it is. The tree shows each file's comment count beside its line counts, in the color of its most pressing thread.
 
 #### Drafts
 

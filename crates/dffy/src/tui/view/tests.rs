@@ -859,6 +859,73 @@ fn comment_marks_go_after_the_line_numbers_of_their_side() {
     ");
 }
 
+/// A thread on several lines marks them with a rail in its look's color,
+/// unbroken by removed lines between them; one on a single line keeps its
+/// glyph. Without color the rail starts on the glyph.
+#[test]
+fn a_threads_lines_are_marked_with_a_rail() {
+    let thread = |lines: Range<usize>, look| Thread {
+        root: format!("{lines:?}"),
+        at: At::Line {
+            side: document::Side::New,
+            lines,
+        },
+        look,
+        resolved: false,
+        outdated: false,
+        url: None,
+        comments: vec![thread_comment("x", "", "11:00", "Hm", true)],
+        lines: Vec::new(),
+        snippet: None,
+        local: false,
+        branch: None,
+    };
+    let (name, mono) = crate::theme::BUILTIN[1];
+    let mono = Theme::parse(name, mono, &mut Vec::new());
+    let mut shown = Vec::new();
+    for (split, theme, height) in [
+        (false, &Theme::default_theme(), 10),
+        (true, &Theme::default_theme(), 10),
+        (false, &mono, 5),
+    ] {
+        let mut doc = doc(layout(split, false), height);
+        doc.set_threads(
+            0,
+            Arc::new([thread(0..3, Look::Open), thread(3..4, Look::Draft)]),
+        );
+        doc.toggle_folds();
+        let (_, rows) = grid_rows(&mut doc, theme);
+        shown.extend(rows);
+    }
+    insta::assert_snapshot!(shown.join("\n"), @r#"
+    @@ -1,5 +1,6 @@
+    1 1┌ │ fn main() {
+    2  │-│     let total = count + 1;
+      2│+│     let total = items.len() + 1;
+    3 3└ │     println!("{total}");
+         │  │ ▸ you · just now · draft · Hm                   │
+      4◆+│     eprintln!("done");
+         │  │ ▸ you · just now · draft · Hm                   │
+    4 5  │ }
+    5   -│ // a comment long enough to wrap in a narrow split c…
+    @@ -1,5 +1,6 @@
+    1  │ fn main() {             │1┌ │ fn main() {
+    2 -│     let total = count +…│2│+│     let total = items.le…
+    3  │     println!("{total}");│3└ │     println!("{total}");
+                                 │   │  │ ▸ you · just now ·… │
+       │                         │4◆+│     eprintln!("done");
+                                 │   │  │ ▸ you · just now ·… │
+    4  │ }                       │5  │ }
+    5 -│ // a comment long enoug…│6 +│ // a comment long enough…
+       │\ No newline at end of file
+    @@ -1,5 +1,6 @@
+    1 1● │ fn main() {
+    2  │-│     let total = count + 1;
+      2│+│     let total = items.len() + 1;
+    3 3└ │     println!("{total}");
+    "#);
+}
+
 #[test]
 fn background_tints_give_moved_code_its_own_hue() {
     let old = "int a(void) { return 1; }\nint b(void) { return 2; }\n";

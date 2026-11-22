@@ -2433,10 +2433,15 @@ impl Doc {
         }
     }
 
-    /// Marks the rows of lines with comment threads in the gutter, in the
-    /// cell after the line numbers, its background kept. A unified row with
-    /// threads on both sides takes the most pressing look. `layout` is the
-    /// drawn file's.
+    /// Marks the lines of comment threads in the gutter, in the cell after
+    /// the line numbers, on their side of a split, in the color of the most
+    /// pressing thread on them, the background kept. A line alone takes its
+    /// look's glyph; lines together a rail, `┌` down through `│` to `└`,
+    /// unbroken by rows between them showing only the other side's lines.
+    /// Overlapping threads, and a unified row's two sides, share one rail.
+    /// When the theme doesn't tell the looks apart by color (`mono`, with
+    /// color off), the rail starts on the glyph instead, as its shape is
+    /// all that says the look. `layout` is the drawn file's.
     fn draw_markers(
         &mut self,
         grid: &mut Grid,
@@ -2449,62 +2454,148 @@ impl Doc {
             return;
         }
         let threads = Arc::clone(&self.boxes.threads);
+        let on_side = [Side::Old, Side::New].map(|side| {
+            (threads.iter()).any(|t| matches!(&t.at, At::Line { side: s, .. } if *s == side))
+        });
+        let color = |look| theme.style(comments::look_role(look)).fg;
+        let shapes = color(Look::Draft) == color(Look::Open)
+            || color(Look::Open) == color(Look::Resolved)
+            || color(Look::Draft) == color(Look::Resolved);
         let mut mapped = std::mem::take(&mut self.mapped);
         let mut previous = None;
+        // For the logical row being drawn: per side, its rail, and whether
+        // the row is split. `None` when nothing marks it.
+        let mut marks: Option<([Option<Rail>; 2], bool)> = None;
+        // Per side, for a run of rows with a line only on the other side,
+        // the lines of the side's line after them.
+        let mut after_run: [Option<Range<usize>>; 2] = [None, None];
         for y in 0..self.drawn.len() {
             let Some(pos) = self.drawn[y] else { continue };
             let logical = Pos { offset: 0, ..pos };
-            if pos.file != file || previous == Some(logical) {
+            if pos.file != file {
                 continue;
             }
-            previous = Some(logical);
-            let lines = self
-                .document
-                .row_lines(logical, arrange(layout, &self.boxes));
-            let looks = [Side::Old, Side::New].map(|side| {
-                let line = lines[side.index()]?;
-                let source = self.source_lines(file, side, line, line);
-                threads
-                    .iter()
-                    .filter(|t| matches!(&t.at, At::Line { side: s, lines } if *s == side && overlap(lines, &source)))
-                    .map(|t| t.look)
-                    .max()
-            });
-            if looks == [None, None] {
-                continue;
+            if previous != Some(logical) {
+                previous = Some(logical);
+                let shown = self
+                    .document
+                    .row_lines(logical, arrange(layout, &self.boxes));
+                let found = [Side::Old, Side::New].map(|side| {
+                    let i = side.index();
+                    if !on_side[i] {
+                        return None;
+                    }
+                    self.rail(&threads, (logical, side), shown, layout, &mut after_run[i])
+                });
+                marks = (found != [None, None]).then(|| {
+                    mapped.clear();
+                    self.render_code(logical, layout, &mut mapped);
+                    (found, self.split_row(logical, layout))
+                });
             }
-            mapped.clear();
-            self.render_code(logical, layout, &mut mapped);
-            let split = self.split_row(logical, layout);
+            let Some((found, split)) = marks else {
+                continue;
+            };
             let Some(map) = mapped.map() else { continue };
-            let mut put = |side: Option<usize>, look: Look| {
-                let Some(area) = map
-                    .areas
-                    .iter()
-                    .find(|a| a.row == pos.offset && side.is_none_or(|s| s == a.side))
+            let height = mapped.len();
+            let mut put = |side: Option<usize>, rail: Rail| {
+                let Some(area) =
+                    (map.areas.iter()).find(|a| a.row == 0 && side.is_none_or(|s| s == a.side))
                 else {
                     return;
                 };
+                let first = rail.starts && pos.offset == 0;
+                let mark = match (first, rail.ends && pos.offset + 1 >= height) {
+                    // A line alone keeps its glyph on its first row only.
+                    _ if rail.starts && rail.ends => match pos.offset {
+                        0 => comments::glyph(rail.look),
+                        _ => return,
+                    },
+                    (true, _) if shapes => comments::glyph(rail.look),
+                    (true, _) => "┌",
+                    (_, true) => "└",
+                    _ => "│",
+                };
                 let column = x + area.col.saturating_sub(layout.mark_width());
-                let mut style = theme.style(comments::look_role(look));
+                let mut style = theme.style(comments::look_role(rail.look));
                 style.bg = grid
                     .row(top + y)
                     .get(column)
                     .and_then(|cell| cell.style().bg)
                     .or(style.bg);
-                grid.put_str(column, top + y, end, comments::glyph(look), style);
+                grid.put_str(column, top + y, end, mark, style);
             };
             if split {
                 for side in [Side::Old, Side::New] {
-                    if let Some(look) = looks[side.index()] {
-                        put(Some(side.index()), look);
+                    if let Some(rail) = found[side.index()] {
+                        put(Some(side.index()), rail);
                     }
                 }
-            } else if let Some(look) = looks.into_iter().flatten().max() {
-                put(None, look);
+            } else if let Some(rail) = found.into_iter().flatten().reduce(|a, b| Rail {
+                look: a.look.max(b.look),
+                starts: a.starts && b.starts,
+                ends: a.ends && b.ends,
+            }) {
+                put(None, rail);
             }
         }
         self.mapped = mapped;
+    }
+
+    /// The rail of `threads` on `side` of the logical row at `pos`, whose
+    /// lines are `shown`: on its line, or between two of its lines when the
+    /// row shows only the other side's. `after_run` keeps, for a run of such
+    /// rows, the lines of `side`'s line after them, empty when there's none.
+    fn rail(
+        &mut self,
+        threads: &[Thread],
+        (pos, side): (Pos, Side),
+        shown: [Option<usize>; 2],
+        layout: &Layout,
+        after_run: &mut Option<Range<usize>>,
+    ) -> Option<Rail> {
+        let file = pos.file;
+        let lines_of = |t: &Thread| match &t.at {
+            At::Line { side: s, lines } if *s == side => Some(lines.clone()),
+            _ => None,
+        };
+        let Some(line) = shown[side.index()] else {
+            if shown[side.other().index()].is_none() {
+                *after_run = None;
+                return None;
+            }
+            let after = after_run
+                .get_or_insert_with(|| {
+                    (self.line_after_run(pos, side, layout))
+                        .map_or(0..0, |line| self.source_lines(file, side, line, line))
+                })
+                .clone();
+            let between = threads.iter().filter(|t| {
+                lines_of(t).is_some_and(|l| l.start < after.start && after.start < l.end)
+            });
+            return between.map(|t| t.look).max().map(|look| Rail {
+                look,
+                starts: false,
+                ends: false,
+            });
+        };
+        *after_run = None;
+        let source = self.source_lines(file, side, line, line);
+        let mut rail: Option<Rail> = None;
+        for t in threads {
+            let Some(lines) = lines_of(t).filter(|l| overlap(l, &source)) else {
+                continue;
+            };
+            let r = rail.get_or_insert(Rail {
+                look: t.look,
+                starts: true,
+                ends: true,
+            });
+            r.look = r.look.max(t.look);
+            r.starts &= lines.start >= source.start;
+            r.ends &= lines.end <= source.end;
+        }
+        rail
     }
 
     /// While the text box writes a new thread on lines, marks them: a rail
@@ -3367,6 +3458,15 @@ fn rule_row(
         c.push(Role::Dim, "│");
     }
     c.end_line();
+}
+
+/// How comment threads mark a row's side: the most pressing look on it, and
+/// whether their rail starts and ends there.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Rail {
+    look: Look,
+    starts: bool,
+    ends: bool,
 }
 
 fn overlap(a: &Range<usize>, b: &Range<usize>) -> bool {

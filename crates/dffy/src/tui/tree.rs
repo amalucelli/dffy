@@ -13,15 +13,17 @@
 //! counted.
 
 use std::cmp::Ordering;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 use dffy_core::bstr::{BString, ByteSlice};
-use dffy_core::document::Counts;
+use dffy_core::document::{Counts, Side};
 use dffy_core::view::Attributes;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use super::comments::look_role;
 use super::fuzzy;
+use super::picker::Paths;
 use super::view::Entry;
 use crate::render::{escape, stat};
 use crate::review::model::Comments;
@@ -36,6 +38,11 @@ const SCROLLOFF: usize = 3;
 const PLACEHOLDER_DIGITS: usize = 3;
 /// Larger counts are shown in thousands.
 const MAX_DIGITS: usize = 5;
+
+/// For the benchmarks: [`Tree::bench`].
+pub(crate) fn bench_all_files(paths: &Arc<Paths>, files: &[Entry], open: Option<&[u8]>) -> usize {
+    Tree::bench(paths, files, open)
+}
 
 /// Columns for the panel, borders included: just over a quarter of the
 /// screen.
@@ -55,6 +62,9 @@ enum Kind {
         open: bool,
     },
     File(usize),
+    /// In the all-files mode, a file the diff doesn't list: its place in
+    /// the version's list of files ([`AllFiles::paths`]).
+    Path(usize),
     /// A commit of a piped log, at the top level in input order, holding
     /// its files' tree; `entry` is its own entry in the document.
     Commit {
@@ -65,17 +75,47 @@ enum Kind {
     /// The review's conversation, the document's page: the first row,
     /// outside the root's children, which keep git's order.
     Page(usize),
-    /// The files shown whole for their comments, which the diff doesn't
-    /// list: the root's last child, holding their tree, as they come
-    /// after the diff's files.
-    Unchanged {
+    /// A top-level group of files of one kind, holding their tree, its row
+    /// counting them; shown only while there are files outside the diff
+    /// (see [`Section`]).
+    Section {
+        section: Section,
         children: Vec<usize>,
         open: bool,
+        files: usize,
     },
 }
 
-/// The [`Kind::Unchanged`] row's words, and its name among collapsed paths.
-pub(super) const UNCHANGED: &str = "comments only · no changes";
+/// The kinds of file the tree keeps apart, in the document's order: the
+/// diff's files, untracked ones among them, then those opened outside it.
+/// The diff's files are at the top level until a file outside it is
+/// opened; then each kind has its group. The files of a commit's tree go
+/// under the commit instead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(super) enum Section {
+    Changed,
+    /// Files the diff doesn't list, shown whole
+    /// ([`Source::Unchanged`](dffy_core::document::Source::Unchanged)).
+    Unlisted,
+}
+
+impl Section {
+    pub(super) fn of(entry: &Entry) -> Self {
+        if entry.is_unchanged() {
+            Self::Unlisted
+        } else {
+            Self::Changed
+        }
+    }
+
+    /// Its row's words, and its name among collapsed paths.
+    fn label(self) -> &'static str {
+        match self {
+            Self::Changed => "Changed in this diff",
+            Self::Unlisted => "Not in this diff",
+        }
+    }
+}
 
 /// The status letter of `entry`'s row; a file with no changes has a dot.
 pub(super) fn letter(entry: &Entry) -> (&'static str, Role) {
@@ -91,8 +131,8 @@ impl Node {
         match &self.kind {
             Kind::Dir { children, .. }
             | Kind::Commit { children, .. }
-            | Kind::Unchanged { children, .. } => children,
-            Kind::File(_) | Kind::Page(_) => &[],
+            | Kind::Section { children, .. } => children,
+            Kind::File(_) | Kind::Path(_) | Kind::Page(_) => &[],
         }
     }
 
@@ -100,8 +140,8 @@ impl Node {
         match &mut self.kind {
             Kind::Dir { children, .. }
             | Kind::Commit { children, .. }
-            | Kind::Unchanged { children, .. } => Some(children),
-            Kind::File(_) | Kind::Page(_) => None,
+            | Kind::Section { children, .. } => Some(children),
+            Kind::File(_) | Kind::Path(_) | Kind::Page(_) => None,
         }
     }
 
@@ -131,6 +171,9 @@ struct Row {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum Item {
     File(usize),
+    /// A file the diff doesn't list, in the all-files mode (see
+    /// [`Tree::all_path`]).
+    Path(usize),
     Dir {
         open: bool,
     },
@@ -265,6 +308,76 @@ pub(super) struct Tree {
     commented: Option<HashSet<BString>>,
     /// The page's node, shown first.
     page: Option<usize>,
+    /// Each [`Section`]'s node, once it has a file.
+    sections: [Option<usize>; 2],
+    /// There are files outside the diff: the diff's go in a group too.
+    grouped: bool,
+    /// The files opened at the diff's old side, which a tag names by the
+    /// version it is.
+    at_old: (HashSet<usize>, String),
+    /// In the all-files mode, what it lists.
+    all: Option<Box<AllFiles>>,
+}
+
+/// The all-files mode's source (see [`Tree::all_files`]): every file of a
+/// version, the diff's among them, made into nodes a folder at a time as
+/// folders open, so no frame or build walks the whole list.
+struct AllFiles {
+    /// The side of the diff the version is.
+    side: Side,
+    /// The version's files, in path order; empty while being listed.
+    paths: Arc<Paths>,
+    /// The version's files are being listed: the diff's alone show.
+    listing: bool,
+    /// The diff's files by their path in the version, sorted, with their
+    /// entry and their change's rank (see [`change_rank`]) and role.
+    listed: Vec<(BString, usize, u8, Role)>,
+    /// Folders whose children are made.
+    loaded: HashSet<usize>,
+    /// Folders with changes inside, colored as the strongest of them.
+    marks: HashMap<usize, (u8, Role)>,
+    /// Folders opened, and folders folded that would open alone (a lone
+    /// folder's), by path: the mode's fold state, kept across builds.
+    opened: HashSet<BString>,
+    closed: HashSet<BString>,
+    /// The version's name, for the title.
+    version: String,
+    /// The filter's matches, the best ones by path, and how many there
+    /// are in all; `None` until the first are scored.
+    matched: Option<(Vec<BString>, usize)>,
+    /// A worker scores the filter's matches: those shown are an older
+    /// query's.
+    scoring: bool,
+}
+
+/// The most files of a filter's matches the all-files tree shows.
+pub(super) const FILTER_SHOWN: usize = 1000;
+
+/// How strongly a change marks the folders above it: a conflict, then a
+/// deletion, an edit, an addition, an untracked file.
+fn change_rank(status: &dffy_core::git::Status) -> u8 {
+    use dffy_core::git::Status;
+    match status {
+        Status::Unmerged => 5,
+        Status::Deleted => 4,
+        Status::Modified | Status::Renamed { .. } | Status::TypeChange => 3,
+        Status::Added => 2,
+        Status::Untracked => 1,
+    }
+}
+
+/// The first of items `lo..len` `before` holds no longer for.
+fn lower_bound(lo: usize, len: usize, before: impl Fn(usize) -> bool) -> usize {
+    let (mut lo, mut hi) = (lo, len);
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2;
+        if before(mid) {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    lo
 }
 
 impl Default for Tree {
@@ -293,19 +406,30 @@ impl Default for Tree {
             hits: Vec::new(),
             commented: None,
             page: None,
+            sections: [None; 2],
+            grouped: false,
+            at_old: (HashSet::new(), String::new()),
+            all: None,
         }
     }
 }
 
 impl Tree {
-    /// Adds file `file` (the next index) at `path`.
-    pub(super) fn insert(&mut self, file: usize, path: &[u8]) {
-        let mut dir = self.base;
-        // Collapsed folders are kept by their path from the root.
-        let prefix = if self.base == ROOT || self.collapsed.is_empty() {
+    /// Adds file `file` (the next index) at `path`, in `section`: a file
+    /// the diff lists goes under the last commit when there is one, else
+    /// at the top level unless files outside the diff are listed too.
+    pub(super) fn insert(&mut self, file: usize, path: &[u8], section: Section) {
+        let top = match section {
+            Section::Changed if self.base != ROOT || !self.grouped => self.base,
+            _ => self.section(section),
+        };
+        let mut dir = top;
+        // Collapsed folders are kept by their path (see `Tree::path`).
+        let in_section = matches!(self.nodes[top].kind, Kind::Section { .. });
+        let prefix = if top == ROOT || in_section || self.collapsed.is_empty() {
             Vec::new()
         } else {
-            let mut p = self.path(self.base).to_vec();
+            let mut p = self.path(top).to_vec();
             p.push(b'/');
             p
         };
@@ -356,7 +480,44 @@ impl Tree {
             dir = child;
             end += 1;
         }
+        if let Kind::Section { files, .. } = &mut self.nodes[top].kind {
+            *files += 1;
+        }
         self.stale = true;
+    }
+
+    /// The node of `section`, added among the root's children in its
+    /// order the first time.
+    fn section(&mut self, section: Section) -> usize {
+        if let Some(node) = self.sections[section as usize] {
+            return node;
+        }
+        let id = self.nodes.len();
+        self.nodes.push(Node {
+            name: section.label().as_bytes().into(),
+            parent: ROOT,
+            kind: Kind::Section {
+                section,
+                children: Vec::new(),
+                open: !self.collapsed.contains(section.label().as_bytes()),
+                files: 0,
+            },
+        });
+        let nodes = &self.nodes;
+        let at = nodes[ROOT].children().iter().position(
+            |&c| matches!(nodes[c].kind, Kind::Section { section: s, .. } if s > section),
+        );
+        if let Some(children) = self.nodes[ROOT].children_mut() {
+            children.insert(at.unwrap_or(children.len()), id);
+        }
+        self.sections[section as usize] = Some(id);
+        id
+    }
+
+    /// Tags the files opened at the diff's old side, `files`, with `name`,
+    /// the version it is.
+    pub(super) fn set_at_old(&mut self, files: HashSet<usize>, name: String) {
+        self.at_old = (files, name);
     }
 
     /// Adds commit entry `file`, named `label`, after the last top-level
@@ -390,9 +551,11 @@ impl Tree {
             collapsed: std::mem::take(&mut self.collapsed),
             filter: std::mem::take(&mut self.filter),
             commented: self.commented.take(),
+            at_old: std::mem::take(&mut self.at_old),
             editing: self.editing,
             scroll: self.scroll,
             height: self.height,
+            grouped: files.last().is_some_and(Entry::is_unchanged),
             ..Self::default()
         };
         for (i, e) in files.iter().enumerate() {
@@ -410,32 +573,383 @@ impl Tree {
             } else if e.is_commit() {
                 self.insert_commit(i, &e.change().path);
             } else {
-                if e.is_unchanged() && !matches!(self.nodes[self.base].kind, Kind::Unchanged { .. })
-                {
-                    self.insert_unchanged();
-                }
-                self.insert(i, &e.change().path);
+                self.insert(i, &e.change().path, Section::of(e));
             }
         }
         self.stale = true;
     }
 
-    /// Adds the [`Kind::Unchanged`] group after the last top-level row;
-    /// files inserted from now on go under it.
-    fn insert_unchanged(&mut self) {
-        let id = self.nodes.len();
-        self.nodes.push(Node {
-            name: UNCHANGED.as_bytes().into(),
-            parent: ROOT,
-            kind: Kind::Unchanged {
-                children: Vec::new(),
-                open: !self.collapsed.contains(UNCHANGED.as_bytes()),
-            },
+    /// The all-files tree: every file of the version at `side` named
+    /// `version`, `paths`, or with `listing` none yet, with the diff's
+    /// `files` among them under their path in that version, keeping their
+    /// letters and counts and colored by their change. A renamed file is
+    /// at its old path in the old version. It takes the fold state,
+    /// scroll, filter and selected file of `before`, the all-files tree it
+    /// replaces, if any, and its filter's matches while it's of the same
+    /// version.
+    pub(super) fn all_files(
+        paths: Arc<Paths>,
+        files: &[Entry],
+        (side, version, listing): (Side, String, bool),
+        before: Option<Self>,
+    ) -> Self {
+        let mut listed: Vec<(BString, usize, u8, Role)> = (files.iter().enumerate())
+            .filter(|(_, e)| !e.is_commit() && !e.is_unchanged())
+            .map(|(i, e)| {
+                let change = e.change();
+                let path = match side {
+                    Side::Old => change.old_path().to_owned(),
+                    Side::New => change.path.clone(),
+                };
+                (path, i, change_rank(&change.status), letter(e).1)
+            })
+            .collect();
+        listed.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+        let mut before = before.filter(|t| t.all.is_some()).unwrap_or_default();
+        let selected = before.selected_path();
+        let old = before.all.take();
+        let same = old.as_ref().is_some_and(|a| a.side == side);
+        let (opened, closed, matched) = old.map_or_else(Default::default, |a| {
+            (a.opened, a.closed, a.matched.filter(|_| same))
         });
-        if let Some(children) = self.nodes[ROOT].children_mut() {
+        let mut tree = Self {
+            filter: before.filter,
+            editing: before.editing,
+            scroll: before.scroll,
+            height: before.height,
+            all: Some(Box::new(AllFiles {
+                side,
+                paths,
+                listing,
+                listed,
+                loaded: HashSet::new(),
+                marks: HashMap::new(),
+                opened,
+                closed,
+                version,
+                matched,
+                scoring: false,
+            })),
+            ..Self::default()
+        };
+        // The review's conversation comes first, as in the diff's tree.
+        if files.first().is_some_and(Entry::is_page) {
+            tree.page = Some(tree.nodes.len());
+            tree.nodes.push(Node {
+                name: Box::default(),
+                parent: ROOT,
+                kind: Kind::Page(0),
+            });
+            tree.leaves = vec![tree.nodes.len() - 1];
+        }
+        tree.load(ROOT);
+        tree.stale = true;
+        if let Some((path, dir)) = selected {
+            tree.refresh();
+            if let Some(node) = tree.reveal(&path, dir)
+                && let Some(row) = tree.rows.iter().position(|r| r.node == node)
+            {
+                tree.select(row);
+            }
+        }
+        tree
+    }
+
+    /// The selected row's path, and whether it's a folder's.
+    fn selected_path(&mut self) -> Option<(BString, bool)> {
+        self.refresh();
+        let node = self.rows.get(self.selected)?.node;
+        matches!(
+            self.nodes[node].kind,
+            Kind::Dir { .. } | Kind::File(_) | Kind::Path(_)
+        )
+        .then(|| (self.path(node), self.nodes[node].is_dir()))
+    }
+
+    /// For the benchmarks: the all-files tree of `paths` with the diff's
+    /// `files`, its rows flattened; then with `open` (a folder's path) set,
+    /// that folder opened. Returns how many rows it has.
+    fn bench(paths: &Arc<Paths>, files: &[Entry], open: Option<&[u8]>) -> usize {
+        let mut tree = Self::all_files(
+            Arc::clone(paths),
+            files,
+            (Side::New, "bench".to_owned(), false),
+            None,
+        );
+        tree.refresh();
+        if let Some(path) = open
+            && let Some(node) = tree.reveal(path, true)
+        {
+            if let Some(row) = tree.rows.iter().position(|r| r.node == node) {
+                tree.select(row);
+            }
+            tree.set_open(true);
+        }
+        tree.rows.len()
+    }
+
+    /// The path of the file the diff doesn't list at `i` in the
+    /// all-files tree's version (see [`Item::Path`]).
+    pub(super) fn all_path(&self, i: usize) -> Option<BString> {
+        let all = self.all.as_ref()?;
+        (i < all.paths.len()).then(|| all.paths.path(i).to_owned())
+    }
+
+    /// The all-files tree's version of files, for its filter to score,
+    /// and the side it's at; `None` while being listed.
+    pub(super) fn all_paths(&self) -> Option<(Arc<Paths>, Side)> {
+        let all = self.all.as_ref().filter(|a| !a.listing)?;
+        Some((Arc::clone(&all.paths), all.side))
+    }
+
+    /// Lets the all-files tree's list of files go, for a tree put aside:
+    /// its folds and place stay for when it comes back, listed again.
+    pub(super) fn drop_list(&mut self) {
+        if let Some(all) = self.all.as_mut() {
+            all.paths = Arc::new(Paths::default());
+            all.listing = true;
+        }
+    }
+
+    /// The diff's files the version's list doesn't have, as an untracked
+    /// file or one deleted in it: the rest of what the filter scores.
+    pub(super) fn all_extras(&self) -> Vec<BString> {
+        let Some(all) = self.all.as_ref() else {
+            return Vec::new();
+        };
+        let paths = &all.paths;
+        (all.listed.iter())
+            .filter(|(path, ..)| {
+                let at = lower_bound(0, paths.len(), |i| {
+                    paths.path(i).as_bytes() < path.as_slice()
+                });
+                at == paths.len() || paths.path(at).as_bytes() != path.as_slice()
+            })
+            .map(|(path, ..)| path.clone())
+            .collect()
+    }
+
+    /// Makes the children of folder `dir` in the all-files tree, if not
+    /// made yet, from the version's files and the diff's under its path;
+    /// then those of the folders under it that are open, or the only
+    /// folder in it, which shows as one row with it.
+    fn load(&mut self, dir: usize) {
+        let Some(all) = self.all.as_mut() else {
+            return;
+        };
+        if !all.loaded.insert(dir) {
+            return;
+        }
+        let paths = Arc::clone(&all.paths);
+        let listed = std::mem::take(&mut all.listed);
+        let mut prefix = self.path(dir).to_vec();
+        if dir != ROOT {
+            prefix.push(b'/');
+        }
+        let under = |path: &[u8]| path.starts_with(&prefix);
+        let mut p = lower_bound(0, paths.len(), |i| {
+            paths.path(i).as_bytes() < prefix.as_slice()
+        });
+        let mut l = listed.partition_point(|e| e.0.as_slice() < prefix.as_slice());
+        let mut folder: Option<usize> = None;
+        let mut open = Vec::new();
+        loop {
+            let from_paths = (p < paths.len())
+                .then(|| paths.path(p).as_bytes())
+                .filter(|x| under(x));
+            let from_diff = listed.get(l).filter(|e| under(&e.0));
+            // A file both lists is the diff's.
+            let (full, change, at): (&[u8], _, _) = match (from_paths, from_diff) {
+                (Some(a), Some(b)) if a == b.0.as_slice() => {
+                    (p, l) = (p + 1, l + 1);
+                    (b.0.as_slice(), Some(b), None)
+                }
+                (Some(a), b) if b.is_none_or(|b| a < b.0.as_slice()) => {
+                    p += 1;
+                    (a, None, Some(p - 1))
+                }
+                (_, Some(b)) => {
+                    l += 1;
+                    (b.0.as_slice(), Some(b), None)
+                }
+                (_, None) => break,
+            };
+            let rest = &full[prefix.len()..];
+            if let Some(slash) = rest.find_byte(b'/') {
+                let name = &rest[..slash];
+                if at.is_some() {
+                    // The rest of the folder's files are its own to make:
+                    // past them, `0` being the byte after `/`.
+                    let past = [&full[..prefix.len() + slash], b"0"].concat();
+                    p = lower_bound(p, paths.len(), |i| {
+                        paths.path(i).as_bytes() < past.as_slice()
+                    });
+                }
+                let node = match folder {
+                    Some(f) if &self.nodes[f].name[..] == name && self.nodes[f].is_dir() => f,
+                    _ => {
+                        let path: BString = full[..prefix.len() + slash].into();
+                        let opened = self.all.as_ref().is_some_and(|a| a.opened.contains(&path));
+                        let f = self.add(
+                            dir,
+                            name,
+                            Kind::Dir {
+                                children: Vec::new(),
+                                open: opened,
+                            },
+                        );
+                        if opened {
+                            open.push(f);
+                        }
+                        folder = Some(f);
+                        f
+                    }
+                };
+                if let (Some(&(_, _, rank, role)), Some(all)) = (change, self.all.as_mut()) {
+                    let mark = all.marks.entry(node).or_insert((rank, role));
+                    *mark = if rank > mark.0 { (rank, role) } else { *mark };
+                }
+            } else {
+                match (change, at) {
+                    (Some(&(_, entry, ..)), _) => self.add(dir, rest, Kind::File(entry)),
+                    (None, Some(i)) => self.add(dir, rest, Kind::Path(i)),
+                    (None, None) => continue,
+                };
+            }
+        }
+        if let Some(all) = self.all.as_mut() {
+            all.listed = listed;
+        }
+        // A lone folder shows as one row with this one, its children too,
+        // unless it was folded.
+        if let [only] = *self.nodes[dir].children()
+            && dir != ROOT
+            && self.nodes[only].is_dir()
+            && !(self.all.as_ref()).is_some_and(|a| a.closed.contains(&self.path(only)))
+            && let Kind::Dir { open: o, .. } = &mut self.nodes[only].kind
+        {
+            *o = true;
+            open.push(only);
+        }
+        for f in open {
+            self.load(f);
+        }
+    }
+
+    /// Adds a child named `name` to `dir`, after its others; a file of the
+    /// diff's is its entry's node.
+    fn add(&mut self, dir: usize, name: &[u8], kind: Kind) -> usize {
+        let id = self.nodes.len();
+        if let Kind::File(entry) = kind {
+            if self.leaves.len() <= entry {
+                self.leaves.resize(entry + 1, ROOT);
+            }
+            self.leaves[entry] = id;
+        }
+        self.nodes.push(Node {
+            name: name.into(),
+            parent: dir,
+            kind,
+        });
+        if let Some(children) = self.nodes[dir].children_mut() {
             children.push(id);
         }
-        self.base = id;
+        id
+    }
+
+    /// The node of `path` in the all-files tree, a folder's with `dir`,
+    /// making the folders it's in; `None` when nothing is there. A file
+    /// and a folder of one name are told apart.
+    fn reveal(&mut self, path: &[u8], dir: bool) -> Option<usize> {
+        let mut node = ROOT;
+        let mut names = path.split_str("/").peekable();
+        while let Some(name) = names.next() {
+            self.load(node);
+            let folder = dir || names.peek().is_some();
+            let children = self.nodes[node].children();
+            // Children are in git's order, as `cmp_key` compares them.
+            let i = children
+                .binary_search_by(|&c| self.nodes[c].cmp_key(name, folder))
+                .ok()?;
+            node = children[i];
+        }
+        Some(node)
+    }
+
+    /// Opens the folders down to the file at `path` in the all-files tree
+    /// and selects it, as Zed reveals a file in its project panel.
+    /// Returns false when the tree has no file there yet.
+    pub(super) fn show_path(&mut self, path: &[u8]) -> bool {
+        let Some(node) = self.reveal(path, false) else {
+            return false;
+        };
+        let mut dir = self.nodes[node].parent;
+        while dir != ROOT {
+            let at = self.path(dir);
+            if let Kind::Dir { open, .. } = &mut self.nodes[dir].kind {
+                *open = true;
+            }
+            if let Some(all) = self.all.as_mut() {
+                all.closed.remove(&at);
+                all.opened.insert(at);
+            }
+            dir = self.nodes[dir].parent;
+        }
+        self.stale = true;
+        self.refresh();
+        if let Some(row) = self.rows.iter().position(|r| r.node == node) {
+            self.select(row);
+        }
+        true
+    }
+
+    /// The all-files filter's matches, the best first by path, and how
+    /// many there are in all; with `None`, a worker scores them and those
+    /// shown stay meanwhile. With `jump`, for a query that changed, the
+    /// first match is selected.
+    pub(super) fn set_matched(&mut self, matched: Option<(Vec<BString>, usize)>, jump: bool) {
+        let Some(all) = self.all.as_mut() else {
+            return;
+        };
+        match matched {
+            Some((mut shown, total)) => {
+                shown.truncate(FILTER_SHOWN);
+                all.matched = Some((shown, total));
+                all.scoring = false;
+            }
+            None => all.scoring = true,
+        }
+        self.stale = true;
+        self.refresh();
+        if jump
+            && let Some(row) = (self.rows.iter())
+                .position(|r| matches!(self.nodes[r.node].kind, Kind::File(_) | Kind::Path(_)))
+        {
+            self.select(row);
+        }
+    }
+
+    /// Which nodes the all-files filter keeps: its matches, made with the
+    /// folders they're in, and those folders.
+    fn all_matches(&mut self) -> Vec<bool> {
+        let matched = (self.all.as_ref())
+            .and_then(|a| a.matched.as_ref())
+            .map(|m| m.0.clone())
+            .unwrap_or_default();
+        let nodes: Vec<usize> = (matched.iter())
+            .filter_map(|path| self.reveal(path, false))
+            .collect();
+        let mut keep = vec![false; self.nodes.len()];
+        for mut node in nodes {
+            while !keep[node] {
+                keep[node] = true;
+                if node == ROOT {
+                    break;
+                }
+                node = self.nodes[node].parent;
+            }
+        }
+        keep
     }
 
     /// Flattens the visible rows if the tree changed since.
@@ -459,6 +973,8 @@ impl Tree {
             });
         }
         let keep = self.filtered().then(|| self.matches());
+        // The all-files filter's matches may have made files.
+        self.file_rows.resize(self.leaves.len(), None);
         self.flatten(ROOT, 0, keep.as_deref());
         if let Some(node) = self.selected_node {
             self.selected = self.rows.iter().position(|r| r.node == node).unwrap_or(0);
@@ -472,6 +988,9 @@ impl Tree {
     /// below any commit, and the folders and commits above them. Notes
     /// each file's matched characters within its name.
     fn matches(&mut self) -> Vec<bool> {
+        if self.all.is_some() {
+            return self.all_matches();
+        }
         let mut keep = vec![false; self.nodes.len()];
         self.hits.clear();
         self.hits.resize(self.leaves.len(), None);
@@ -505,14 +1024,13 @@ impl Tree {
         keep
     }
 
-    /// A file node's path, from below its commit or group when it's under
-    /// one.
+    /// A file node's path, from below its commit or section.
     fn file_path(&self, mut node: usize) -> BString {
         let mut parts = Vec::new();
         while node != ROOT
             && !matches!(
                 self.nodes[node].kind,
-                Kind::Commit { .. } | Kind::Unchanged { .. }
+                Kind::Commit { .. } | Kind::Section { .. }
             )
         {
             parts.push(&self.nodes[node].name[..]);
@@ -527,7 +1045,8 @@ impl Tree {
     }
 
     fn filtered(&self) -> bool {
-        !self.filter.is_empty() || self.commented.is_some()
+        // The all-files tree keeps to commented files in no way of its own.
+        !self.filter.is_empty() || (self.commented.is_some() && self.all.is_none())
     }
 
     pub(super) fn commented(&self) -> bool {
@@ -564,7 +1083,8 @@ impl Tree {
 
     /// Whether `file` is one the filter keeps (every file without one).
     pub(super) fn in_scope(&mut self, file: usize) -> bool {
-        if !self.filtered() {
+        // The all-files filter is for finding a file there, not a scope.
+        if !self.filtered() || self.all.is_some() {
             return true;
         }
         self.refresh();
@@ -586,6 +1106,11 @@ impl Tree {
                         depth,
                     });
                 }
+                Kind::Path(_) => self.rows.push(Row {
+                    node: child,
+                    top: child,
+                    depth,
+                }),
                 Kind::Commit { entry, open, .. } => {
                     let row = self.rows.len();
                     self.file_rows[entry] = Some(row);
@@ -601,15 +1126,17 @@ impl Tree {
                         self.hide(child, row);
                     }
                 }
-                Kind::Unchanged { open, .. } => {
+                Kind::Section { open, .. } => {
                     let row = self.rows.len();
                     self.rows.push(Row {
                         node: child,
                         top: child,
                         depth,
                     });
+                    // A heading over its files rather than a folder: they
+                    // keep the tree's width.
                     if open || keep.is_some() {
-                        self.flatten(child, depth + 1, keep);
+                        self.flatten(child, depth, keep);
                     } else {
                         self.hide(child, row);
                     }
@@ -648,10 +1175,10 @@ impl Tree {
                 Kind::File(file) => self.file_rows[*file] = Some(row),
                 Kind::Dir { children, .. }
                 | Kind::Commit { children, .. }
-                | Kind::Unchanged { children, .. } => {
+                | Kind::Section { children, .. } => {
                     stack.extend(children);
                 }
-                Kind::Page(_) => {}
+                Kind::Path(_) | Kind::Page(_) => {}
             }
         }
     }
@@ -694,9 +1221,11 @@ impl Tree {
             .iter()
             .filter_map(|r| match self.nodes[r.node].kind {
                 Kind::File(file) => Some(file),
-                Kind::Dir { .. } | Kind::Commit { .. } | Kind::Page(_) | Kind::Unchanged { .. } => {
-                    None
-                }
+                Kind::Dir { .. }
+                | Kind::Path(_)
+                | Kind::Commit { .. }
+                | Kind::Page(_)
+                | Kind::Section { .. } => None,
             })
     }
 
@@ -724,7 +1253,8 @@ impl Tree {
         let row = self.rows.get(self.selected)?;
         Some(match self.nodes[row.node].kind {
             Kind::File(file) | Kind::Page(file) => Item::File(file),
-            Kind::Dir { open, .. } | Kind::Unchanged { open, .. } => Item::Dir { open },
+            Kind::Path(i) => Item::Path(i),
+            Kind::Dir { open, .. } | Kind::Section { open, .. } => Item::Dir { open },
             Kind::Commit { entry, open, .. } => Item::Commit { file: entry, open },
         })
     }
@@ -752,10 +1282,20 @@ impl Tree {
         let path = self.path(row.node);
         if let Kind::Dir { open: o, .. }
         | Kind::Commit { open: o, .. }
-        | Kind::Unchanged { open: o, .. } = &mut self.nodes[row.node].kind
+        | Kind::Section { open: o, .. } = &mut self.nodes[row.node].kind
         {
             *o = open;
-            if open {
+            if let Some(all) = self.all.as_mut() {
+                // Folders start folded here: the opened ones are kept.
+                if open {
+                    all.closed.remove(&path);
+                    all.opened.insert(path);
+                    self.load(row.node);
+                } else {
+                    all.opened.remove(&path);
+                    all.closed.insert(path);
+                }
+            } else if open {
                 self.collapsed.remove(&path);
             } else {
                 self.collapsed.insert(path);
@@ -780,10 +1320,16 @@ impl Tree {
         }
     }
 
+    /// A node's path, its name among collapsed ones: from below its
+    /// section, so a folder folds the same with or without the section's
+    /// heading; a section's own is its heading.
     fn path(&self, mut node: usize) -> BString {
         let mut parts = Vec::new();
+        let start = node;
         while node != ROOT {
-            parts.push(&self.nodes[node].name[..]);
+            if node == start || !matches!(self.nodes[node].kind, Kind::Section { .. }) {
+                parts.push(&self.nodes[node].name[..]);
+            }
             node = self.nodes[node].parent;
         }
         parts.reverse();
@@ -884,7 +1430,28 @@ impl Tree {
         theme: &Theme,
     ) {
         let growing = if listing { "+" } else { "" };
-        let parts = if self.filtered() {
+        let parts = if let Some(all) = &self.all {
+            let mut parts = vec![
+                (" All files".to_owned(), Role::Plain),
+                (format!(" · {}", all.version), Role::Dim),
+            ];
+            if all.listing {
+                parts.push((" · listing…".to_owned(), Role::Dim));
+            }
+            if !self.filter.is_empty() {
+                let count = match &all.matched {
+                    _ if all.scoring => " · scoring…".to_owned(),
+                    Some((shown, total)) if shown.len() < *total => {
+                        format!(" · {}/{}", shown.len(), total)
+                    }
+                    Some((_, total)) => format!(" · {total}"),
+                    None => " · scoring…".to_owned(),
+                };
+                parts.push((count, Role::Dim));
+                parts.push((format!(" · {}", self.filter), Role::Hint));
+            }
+            parts
+        } else if self.filtered() {
             let kept = self.hits.iter().filter(|h| h.is_some()).count();
             let mut parts = vec![
                 (" Files".to_owned(), Role::Plain),
@@ -957,43 +1524,19 @@ impl Tree {
                     grid.put_str(at, line, end, &count, style(Role::Hint, false));
                 }
             }
-            Kind::Dir { open, .. } | Kind::Unchanged { open, .. } => {
-                let x = grid.put_str(
-                    x,
-                    line,
-                    end,
-                    if open { "▼ " } else { "▶ " },
-                    style(Role::Dim, false),
-                );
-                let room = end.saturating_sub(x + 1);
-                let (label, role) = if self.nodes[row.node].is_dir() {
-                    let mut label = escape(&self.path_between(row.top, row.node));
-                    label.push('/');
-                    (fit_left(&label, room), Role::Plain)
+            Kind::Dir { open, .. } | Kind::Section { open, .. } | Kind::Commit { open, .. } => {
+                let glyph = if open { "▼ " } else { "▶ " };
+                let x = grid.put_str(x, line, end, glyph, style(Role::Dim, false));
+                if let Kind::Commit { .. } = self.nodes[row.node].kind {
+                    let label = escape(&self.nodes[row.node].name);
+                    let (id, subject) = label.split_once(' ').unwrap_or((&label, ""));
+                    let x = grid.put_str(x, line, end, id, style(Role::CommitHeader, false));
+                    let subject = fit_right(subject, end.saturating_sub(x + 2));
+                    grid.put_str(x + 1, line, end, &subject, named(Role::Plain, false));
                 } else {
-                    (fit_right(UNCHANGED, room), Role::Dim)
-                };
-                grid.put_str(x, line, end, &label, named(role, false));
-            }
-            Kind::Commit { open, .. } => {
-                let x = grid.put_str(
-                    x,
-                    line,
-                    end,
-                    if open { "▼ " } else { "▶ " },
-                    style(Role::Dim, false),
-                );
-                let label = escape(&self.nodes[row.node].name);
-                let (id, subject) = label.split_once(' ').unwrap_or((&label, ""));
-                let x = grid.put_str(x, line, end, id, style(Role::CommitHeader, false));
-                let room = end.saturating_sub(x + 2);
-                grid.put_str(
-                    x + 1,
-                    line,
-                    end,
-                    &fit_right(subject, room),
-                    named(Role::Plain, false),
-                );
+                    let (label, role) = self.group_label(row, end.saturating_sub(x + 1));
+                    grid.put_str(x, line, end, &label, named(role, false));
+                }
             }
             Kind::File(file) => {
                 let entry = &files[file];
@@ -1010,6 +1553,14 @@ impl Tree {
                         stats_x = at;
                     }
                 }
+                let (at_old, old) = &self.at_old;
+                if at_old.contains(&file) {
+                    let at = stats_x.saturating_sub(old.width() + 1);
+                    if at > x {
+                        grid.put_str(at, line, stats_x, old, style(Role::Dim, false));
+                        stats_x = at;
+                    }
+                }
                 let room = stats_x.saturating_sub(x + 1);
                 let shown = fit_left(&name, room);
                 // The filter's matches, when the name shows whole.
@@ -1018,18 +1569,46 @@ impl Tree {
                     .get(file)
                     .and_then(Option::as_ref)
                     .filter(|_| shown == name);
+                // The all-files tree tells changed files apart by color.
+                let name_role = self.all.as_ref().map_or(Role::Plain, |_| role);
                 fuzzy::put_marked(
                     grid,
                     (x, line, stats_x),
                     &shown,
                     hits.map_or(&[][..], Vec::as_slice),
-                    (named(Role::Plain, dim), named(Role::Hint, dim)),
+                    (named(name_role, dim), named(Role::Hint, dim)),
                 );
                 for (text, role, at) in counts {
                     grid.put_str(at, line, end, &text, style(role, dim));
                 }
             }
+            Kind::Path(_) => {
+                let name = escape(&self.nodes[row.node].name);
+                let x = x + 2;
+                let shown = fit_left(&name, end.saturating_sub(x + 1));
+                grid.put_str(x, line, end, &shown, named(Role::Plain, false));
+            }
         }
+    }
+
+    /// A folder's or a section's row label within `room` columns: a
+    /// folder's path, cut from the left, or a section's heading and count.
+    fn group_label(&self, row: Row, room: usize) -> (String, Role) {
+        if let Kind::Section { section, files, .. } = self.nodes[row.node].kind {
+            // Short of room the words are cut, never the count.
+            let count = format!(" ({files})");
+            let words = fit_right(section.label(), room.saturating_sub(count.len()));
+            return (words + &count, Role::Dim);
+        }
+        let mut label = escape(&self.path_between(row.top, row.node));
+        label.push('/');
+        // In the all-files tree, the strongest change inside colors it.
+        let mark = (self.all.as_ref())
+            .and_then(|a| a.marks.get(&row.node).or_else(|| a.marks.get(&row.top)));
+        (
+            fit_left(&label, room),
+            mark.map_or(Role::Plain, |&(_, role)| role),
+        )
     }
 
     /// The names from directory `top` down to `bottom`, joined by `/`.
@@ -1213,7 +1792,7 @@ mod tests {
     fn tree_of(files: &[Entry]) -> Tree {
         let mut tree = Tree::default();
         for (i, e) in files.iter().enumerate() {
-            tree.insert(i, &e.change().path);
+            tree.insert(i, &e.change().path, Section::of(e));
         }
         tree
     }
@@ -1280,6 +1859,157 @@ mod tests {
                 assert_eq!(a, b);
             }
         }
+    }
+
+    /// A folded folder stays folded once a file opened outside the diff
+    /// puts the diff's files under a heading, and once it's gone again.
+    #[test]
+    fn a_folded_folder_stays_folded_with_or_without_the_heading() {
+        let mut doc = sample(true);
+        let mut tree = tree_of(doc.files());
+        // The chain's row, folded.
+        tree.step(1);
+        tree.set_open(false);
+        let side = Side::Worktree {
+            mode: Mode::File,
+            id: None,
+        };
+        let opened = doc.show_unchanged(FileChange::unchanged("notes.txt".into(), side));
+        tree.rebuild(doc.files());
+        let shown = draw(&mut tree, doc.files(), 12);
+        assert!(shown.contains("Changed in this diff (5)"), "{shown}");
+        assert!(shown.contains("▶ crates/dffy/src/tui/"), "{shown}");
+        assert!(doc.close_unchanged(opened));
+        tree.rebuild(doc.files());
+        let shown = draw(&mut tree, doc.files(), 12);
+        assert!(!shown.contains("Changed in this diff"), "{shown}");
+        assert!(shown.contains("▶ crates/dffy/src/tui/"), "{shown}");
+    }
+
+    fn version(paths: &[&str]) -> Arc<Paths> {
+        let mut list = Paths::default();
+        for path in paths {
+            list.push(path.as_bytes());
+        }
+        Arc::new(list)
+    }
+
+    fn all_tree(paths: &[&str], files: &[Entry], old: bool) -> Tree {
+        let side = if old {
+            dffy_core::document::Side::Old
+        } else {
+            dffy_core::document::Side::New
+        };
+        Tree::all_files(version(paths), files, (side, "v".to_owned(), false), None)
+    }
+
+    /// The tree's rows as drawn, the border's left and right edges cut.
+    fn rows(tree: &mut Tree, files: &[Entry], height: usize) -> Vec<String> {
+        (draw(tree, files, height).lines())
+            .skip(1)
+            .map(|l| {
+                l.trim_start_matches('│')
+                    .trim_end_matches('│')
+                    .trim()
+                    .to_owned()
+            })
+            .filter(|l| !l.is_empty() && !l.starts_with('└'))
+            .collect()
+    }
+
+    /// A renamed file is at its new path in the new version and at its old
+    /// one in the old version, once each.
+    #[test]
+    fn all_files_put_a_renamed_file_at_its_path_in_each_version() {
+        let mut renamed = change("b.txt", Status::Modified);
+        renamed.status = Status::Renamed {
+            from: "a.txt".into(),
+            similarity: 90,
+        };
+        let mut doc = Document::<Body>::default();
+        doc.push(renamed, Source::Repo);
+        let files = doc.files();
+        let new = rows(
+            &mut all_tree(&["b.txt", "keep.txt"], files, false),
+            files,
+            8,
+        );
+        assert_eq!(new, ["R b.txt", "keep.txt"]);
+        let old = rows(&mut all_tree(&["a.txt", "keep.txt"], files, true), files, 8);
+        assert_eq!(old, ["R a.txt", "keep.txt"]);
+    }
+
+    /// A file deleted in the diff, gone from the version's list, still
+    /// shows; so does an untracked one, in a folder only it makes.
+    #[test]
+    fn all_files_show_the_diffs_files_the_version_lacks() {
+        let files_doc = files(&[
+            ("gone.txt", Status::Deleted, None),
+            ("new/x.rs", Status::Untracked, None),
+        ]);
+        let files = files_doc.files();
+        let mut tree = all_tree(&["keep.txt"], files, false);
+        assert_eq!(
+            rows(&mut tree, files, 8),
+            ["D gone.txt", "keep.txt", "▶ new/"]
+        );
+        assert!(tree.show_path(b"new/x.rs"));
+        assert_eq!(
+            rows(&mut tree, files, 8),
+            ["D gone.txt", "keep.txt", "▼ new/", "? x.rs"]
+        );
+    }
+
+    /// A file deleted where a folder of the same name now is: both show,
+    /// each found by what it is.
+    #[test]
+    fn all_files_tell_a_file_from_a_folder_of_its_name() {
+        let files_doc = files(&[
+            ("foo", Status::Deleted, None),
+            ("foo/bar", Status::Added, None),
+        ]);
+        let files = files_doc.files();
+        let mut tree = all_tree(&["foo/bar"], files, false);
+        assert_eq!(rows(&mut tree, files, 8), ["D foo", "▶ foo/"]);
+        assert!(tree.show_path(b"foo/bar"));
+        assert_eq!(rows(&mut tree, files, 8), ["D foo", "▼ foo/", "A bar"]);
+    }
+
+    /// The filter shows its best 1,000 matches and counts them all.
+    #[test]
+    fn all_files_show_a_thousand_matches_and_count_the_rest() {
+        let names: Vec<String> = (0..1001).map(|i| format!("f{i:04}")).collect();
+        let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+        let doc = Document::<Body>::default();
+        let mut tree = all_tree(&refs, doc.files(), false);
+        tree.set_filter("f");
+        let matched = names.iter().map(|n| BString::from(n.as_str())).collect();
+        tree.set_matched(Some((matched, 1001)), true);
+        tree.refresh();
+        assert_eq!(tree.rows.len(), 1000);
+        let shown = draw(&mut tree, doc.files(), 6);
+        assert!(shown.contains("1000/1001"), "{shown}");
+    }
+
+    /// A lone folder opens with its parent as one row; folded, it stays
+    /// folded once the tree is built again.
+    #[test]
+    fn all_files_keep_a_folded_chain_folded_across_a_build() {
+        let doc = Document::<Body>::default();
+        let files = doc.files();
+        let mut tree = all_tree(&["a/b/c.txt", "z.txt"], files, false);
+        assert_eq!(rows(&mut tree, files, 8), ["▶ a/", "z.txt"]);
+        tree.set_open(true);
+        assert_eq!(rows(&mut tree, files, 8), ["▼ a/b/", "c.txt", "z.txt"]);
+        tree.set_open(false);
+        let before = Some(tree);
+        let mut tree = Tree::all_files(
+            version(&["a/b/c.txt", "z.txt"]),
+            files,
+            (dffy_core::document::Side::New, "v".to_owned(), false),
+            before,
+        );
+        assert_eq!(rows(&mut tree, files, 8), ["▶ a/b/", "z.txt"]);
     }
 
     #[test]

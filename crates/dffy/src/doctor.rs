@@ -245,14 +245,18 @@ impl Facts {
             theme: ctx.theme.name.clone(),
             pager: crate::output::pager_command(&ctx.config.pager),
             cache: ctx.cache.as_ref().map(|cache| {
-                let (bytes, entries) = cache
-                    .usage()
-                    .map_err(|e| format!("{}: {e}", cache.dir().display()))?;
+                // Definitions are kept apart, under a budget of their own.
+                let symbols = cache.symbols();
+                let usage = |c: &dffy_core::cache::Cache| {
+                    c.usage().map_err(|e| format!("{}: {e}", c.dir().display()))
+                };
+                let (bytes, entries) = usage(cache)?;
+                let (symbol_bytes, symbol_entries) = usage(symbols.as_cache())?;
                 Ok(CacheUsage {
                     dir: cache.dir().to_owned(),
-                    bytes,
-                    entries,
-                    budget: ctx.config.cache_size,
+                    bytes: bytes + symbol_bytes,
+                    entries: entries + symbol_entries,
+                    budget: ctx.config.cache_size + symbols.budget(),
                 })
             }),
             renderers: renderers(&ctx.config.render),

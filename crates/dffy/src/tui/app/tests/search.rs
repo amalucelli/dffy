@@ -63,6 +63,7 @@ fn work(app: &mut App) {
                 version,
                 diff,
                 hidden,
+                reading,
                 blocks,
                 blocks_version,
                 needle,
@@ -74,13 +75,14 @@ fn work(app: &mut App) {
                 id,
                 matches: crate::tui::worker::find(
                     diff.as_deref(),
-                    &hidden,
+                    (&hidden, reading.as_ref()),
                     &blocks,
                     &needle,
                     || false,
                 ),
                 diff,
                 hidden,
+                reading,
                 blocks_version,
             },
             Job::Search {
@@ -99,6 +101,83 @@ fn work(app: &mut App) {
         };
         app.event(Event::Diffed(done));
     }
+}
+
+/// In file view a search goes through the side read: matches found on
+/// another side are dropped, and matches on the other side's
+/// hidden lines are counted in the status bar with the key that shows them.
+#[test]
+fn file_view_searches_the_side_read_and_counts_the_other() {
+    let mut app = search_app();
+    app.set_snapshots(Some([Snapshot::Index, Snapshot::Worktree]));
+    app.draw();
+    typed(&mut app, "/needle");
+    press(&mut app, Key::Enter);
+    key(&mut app, 'l');
+    // The scan asked for now, as if found while both sides showed.
+    for job in app.jobs() {
+        if let Job::Find {
+            file,
+            version,
+            diff,
+            hidden,
+            reading,
+            blocks_version,
+            id,
+            ..
+        } = job
+        {
+            assert_eq!(reading.map(|r| r.side), Some(document::Side::New));
+            app.event(Event::Diffed(Done::Found {
+                file,
+                version,
+                id,
+                matches: Some(document::Matches::default()),
+                diff,
+                hidden,
+                reading: None,
+                blocks_version,
+            }));
+        }
+    }
+    assert!(app.doc.document.search.is_none(), "found on both sides");
+    esc(&mut app);
+    typed(&mut app, "/two");
+    press(&mut app, Key::Enter);
+    work(&mut app);
+    let found = app.doc.document.search.as_ref().map(|m| {
+        let side = m.reading.as_ref().map(|r| r.side);
+        (side, m.matches.list.len(), m.matches.other_side)
+    });
+    assert_eq!(found, Some((Some(document::Side::New), 0, 1)));
+    let said = app.search_status().unwrap_or_default();
+    assert!(said.ends_with(" · 1 more in index (s)"), "{said}");
+}
+
+/// A file diffed again, as after the editor `e` opened, keeps the match
+/// the view went to: found again, it stays the current one.
+#[test]
+fn a_reloaded_file_keeps_the_current_match() {
+    let mut app = search_app();
+    app.draw();
+    typed(&mut app, "/needle");
+    press(&mut app, Key::Enter);
+    work(&mut app);
+    key(&mut app, 'n');
+    let current = app.doc.document.search.as_ref().and_then(|m| m.current);
+    assert_eq!(current, Some(1));
+    let version = app.version(0);
+    let fd = searchable("src/a.rs", "one\nneedle here\nand a needle\n");
+    app.event(Event::Diffed(Done::Diff {
+        placed: None,
+        file: 0,
+        version,
+        result: Ok(Box::new(loaded(fd))),
+    }));
+    assert!(app.doc.document.search.is_none(), "the old diff's matches");
+    work(&mut app);
+    let after = app.doc.document.search.as_ref().and_then(|m| m.current);
+    assert_eq!(after, current);
 }
 
 /// `/` searches as it's typed, the workers marking matches on screen
@@ -313,6 +392,7 @@ fn search_marks_follow_their_file_when_the_list_is_sorted() {
             version,
             diff,
             hidden,
+            reading,
             blocks,
             blocks_version,
             needle,
@@ -326,13 +406,14 @@ fn search_marks_follow_their_file_when_the_list_is_sorted() {
                 id,
                 matches: crate::tui::worker::find(
                     diff.as_deref(),
-                    &hidden,
+                    (&hidden, reading.as_ref()),
                     &blocks,
                     &needle,
                     || false,
                 ),
                 diff,
                 hidden,
+                reading,
                 blocks_version,
             }));
         }
@@ -588,8 +669,8 @@ fn a_newer_pattern_stops_the_scan_of_an_older_one() {
     assert!(stale());
     let needle = Needle::new("ne");
     let diff = diff.as_deref();
-    assert_eq!(find(diff, &hidden, &[], &needle, stale), None);
-    assert!(find(diff, &hidden, &[], &needle, || false).is_some());
+    assert_eq!(find(diff, (&hidden, None), &[], &needle, stale), None);
+    assert!(find(diff, (&hidden, None), &[], &needle, || false).is_some());
 }
 
 /// `/` searches the Conversation's comments: counted from another file,
@@ -631,6 +712,7 @@ fn the_search_finds_the_conversations_comments() {
             matches: document::find_blocks(&blocks, &needle, || false),
             diff: None,
             hidden,
+            reading: None,
             blocks_version,
         }),
         _ => None,

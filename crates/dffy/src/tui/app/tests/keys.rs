@@ -3,7 +3,7 @@ use super::support::*;
 #[test]
 fn every_key_works_at_forty_by_twelve() {
     let mut app = app(40, 12);
-    for c in "nnNNffFFxXXjkgG sbW?q?TT/ab\u{7f}vjjskyYv<>HL0WvG+-".chars() {
+    for c in "nnNNffFFxXXjkgG sbW?q?TT/ab\u{7f}vjjskyYv<>HL0WvG+-lsnxXXsl".chars() {
         key(&mut app, c);
         app.draw();
     }
@@ -32,6 +32,64 @@ fn every_key_works_at_forty_by_twelve() {
     app.draw();
     app.resize(1, 1);
     app.draw();
+}
+
+/// On the old side in file view, `v` selects the old side's lines and `s`
+/// while selecting keeps to them, saying why.
+#[test]
+fn file_view_selects_the_side_read() {
+    let mut app = app(100, 20);
+    app.draw();
+    for c in "lsv".chars() {
+        key(&mut app, c);
+    }
+    assert_eq!(
+        app.doc.selection.as_ref().map(|s| s.side),
+        Some(document::Side::Old)
+    );
+    key(&mut app, 's');
+    let said = status(&mut app);
+    assert!(
+        said.contains("file view copies the version shown"),
+        "{said}"
+    );
+    assert_eq!(
+        app.doc.selection.as_ref().map(|s| s.side),
+        Some(document::Side::Old)
+    );
+}
+
+/// In file view `x` opens the first change on screen in place and folds it
+/// again, saying so; `X` switches whole files for when file view is off,
+/// remembered, and says that too.
+#[test]
+fn file_view_says_what_x_and_shift_x_do() {
+    let mut app = app(100, 20);
+    app.draw();
+    key(&mut app, 'l');
+    key(&mut app, 'x');
+    let said = status(&mut app);
+    assert!(said.contains("1 line removed shown here"), "{said}");
+    assert_eq!(app.doc.document.opened(0), [0]);
+    key(&mut app, 'x');
+    let said = status(&mut app);
+    assert!(said.contains("1 line removed hidden"), "{said}");
+    assert_eq!(app.doc.document.opened(0), [] as [usize; 0]);
+    key(&mut app, 'X');
+    let said = status(&mut app);
+    assert!(
+        said.contains("whole files applies once file view is off"),
+        "{said}"
+    );
+    assert!(app.doc.document.full);
+    let remembered = app.pending_remembered();
+    assert!(
+        remembered.contains(&("context", "full".to_owned())),
+        "{remembered:?}"
+    );
+    key(&mut app, 'l');
+    assert_eq!(app.doc.document.reading(), None);
+    assert!(app.doc.document.full, "whole files once file view is off");
 }
 
 /// `esc` backs out a layer at a time: the overlay, the search, the

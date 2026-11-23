@@ -13,8 +13,8 @@ use std::process::Command;
 
 use dffy_core::diff::Options;
 use dffy_core::git::{
-    ChangeSet, DiffSpec, Error, FileChange, Mode, ObjectId, Repo, Revisions, Side, Status,
-    WhichCheckpoint, worktree_file,
+    ChangeSet, DiffSpec, Error, FileChange, Mode, ObjectId, Repo, Revisions, Side, Snapshot,
+    Status, WhichCheckpoint, worktree_file,
 };
 use dffy_core::view::Staging;
 
@@ -1126,7 +1126,11 @@ fn an_unchanged_file_is_read_once_on_a_path_git_could_track() {
         assert_eq!(worktree_file(root, refused.as_bytes()), None, "{refused}");
     }
 
-    let change = FileChange::unchanged("src/a.rs".into(), Mode::File);
+    let side = Side::Worktree {
+        mode: Mode::File,
+        id: None,
+    };
+    let change = FileChange::unchanged("src/a.rs".into(), side);
     let fd = repo.file_diff(change, &Options::default()).expect("diff");
     assert_eq!(fd.hunks.len(), 0);
     assert_eq!(fd.new.bytes(), b"fn a() {}\n");
@@ -1375,4 +1379,283 @@ fn checkpoints_keep_the_last_five_per_worktree() {
     assert_eq!(other.checkpoints().expect("listed"), []);
     assert_eq!(other.take_checkpoint().expect("checkpoint").number, 1);
     assert_eq!(repo.checkpoints().expect("listed").len(), 5);
+}
+
+fn listed(repo: &Repo, at: Snapshot, filter: &[&str]) -> Vec<(String, Mode)> {
+    let filter: Vec<_> = filter.iter().map(|p| (*p).into()).collect();
+    let mut out = Vec::new();
+    repo.list_paths(at, &filter, |path, mode| {
+        out.push((path.to_string(), mode));
+        ControlFlow::Continue(())
+    })
+    .expect("lists");
+    out
+}
+
+fn names(listed: &[(String, Mode)]) -> Vec<&str> {
+    listed.iter().map(|(path, _)| path.as_str()).collect()
+}
+
+/// A tree lists what `git ls-tree -r` does, the index what `git ls-files`
+/// does but the intent-to-add files it holds no content for, and the
+/// working tree every tracked path; all in git's order, and a filter keeps
+/// whole components only.
+#[test]
+fn list_paths_lists_a_snapshot_in_git_order() {
+    let dir = init();
+    let d = dir.path();
+    for path in ["sub-x", "sub.c", "sub/a", "sub/deep/b", "top.txt", "run.sh"] {
+        write(d, path, "x\n");
+    }
+    std::os::unix::fs::symlink("top.txt", d.join("link")).expect("symlink");
+    git(d, &["add", "-A"]);
+    git(d, &["update-index", "--chmod=+x", "run.sh"]);
+    git(d, &["commit", "-q", "-m", "base"]);
+    write(d, "staged.c", "s\n");
+    git(d, &["add", "staged.c"]);
+    write(d, "intent.c", "i\n");
+    git(d, &["add", "-N", "intent.c"]);
+    std::fs::remove_file(d.join("top.txt")).expect("rm");
+    let repo = Repo::discover(d).expect("repo");
+    let head = repo.head_tree().expect("HEAD's tree");
+    let z = |out: String| -> Vec<String> {
+        out.split('\0')
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned)
+            .collect()
+    };
+
+    let tree = listed(&repo, Snapshot::Tree(head), &[]);
+    assert_eq!(
+        names(&tree),
+        z(git(d, &["ls-tree", "-r", "-z", "--name-only", "HEAD"]))
+    );
+    assert!(tree.contains(&("run.sh".to_owned(), Mode::Executable)));
+    assert!(tree.contains(&("link".to_owned(), Mode::Symlink)));
+    let tracked = z(git(d, &["ls-files", "-z"]));
+    assert_eq!(names(&listed(&repo, Snapshot::Worktree, &[])), tracked);
+    let index: Vec<_> = tracked.iter().filter(|p| *p != "intent.c").collect();
+    assert_eq!(names(&listed(&repo, Snapshot::Index, &[])), index);
+
+    for at in [Snapshot::Tree(head), Snapshot::Index, Snapshot::Worktree] {
+        assert_eq!(
+            names(&listed(&repo, at, &["sub/"])),
+            ["sub/a", "sub/deep/b"],
+            "{at:?}"
+        );
+    }
+    let mut first = Vec::new();
+    repo.list_paths(Snapshot::Tree(head), &[], |path, _| {
+        first.push(path.to_owned());
+        ControlFlow::Break(())
+    })
+    .expect("lists");
+    assert_eq!(first, ["link"]);
+}
+
+/// Listing with sides gives, for every path a snapshot lists, the side
+/// `side_at` finds there: a blob for a tree or the index, the file on
+/// disk with the index's mode for the working tree.
+#[test]
+fn list_sides_gives_what_side_at_finds() {
+    let dir = init();
+    let d = dir.path();
+    for path in ["a.c", "sub/b.rs", "run.sh"] {
+        write(d, path, "x\n");
+    }
+    git(d, &["add", "-A"]);
+    git(d, &["update-index", "--chmod=+x", "run.sh"]);
+    git(d, &["commit", "-q", "-m", "base"]);
+    write(d, "a.c", "staged\n");
+    git(d, &["add", "a.c"]);
+    write(d, "a.c", "on disk\n");
+    let repo = Repo::discover(d).expect("repo");
+    let head = repo.head_tree().expect("HEAD's tree");
+    for at in [Snapshot::Tree(head), Snapshot::Index, Snapshot::Worktree] {
+        let mut sides = Vec::new();
+        repo.list_sides(at, &[], |path, side| {
+            sides.push((path.to_owned(), side));
+            ControlFlow::Continue(())
+        })
+        .expect("lists");
+        assert_eq!(sides.len(), 3, "{at:?}");
+        for (path, side) in sides {
+            let found = |at| repo.side_at(at, path.as_ref()).expect("reads");
+            match at {
+                Snapshot::Worktree => assert_eq!(
+                    side,
+                    Side::Worktree {
+                        mode: found(Snapshot::Index).expect("indexed").mode(),
+                        id: None
+                    }
+                ),
+                _ => assert_eq!(Some(side), found(at), "{at:?} {path}"),
+            }
+        }
+    }
+}
+
+/// A side as its mode and the bytes it loads, so the same content compares
+/// equal from the index or the working tree.
+fn content(repo: &Repo, path: &[u8], side: Option<Side>) -> Option<(Mode, Vec<u8>)> {
+    side.map(|s| (s.mode(), repo.load(path.into(), &s).expect("loads")))
+}
+
+/// Each snapshot of a diff holds, at each of its paths, the content the
+/// diff's own side there has, `-R` included; nothing where a side is
+/// missing. Two documented exceptions: a submodule is nothing at any
+/// snapshot, and the working tree has a file on disk that the diff lists
+/// as deleted from git.
+#[test]
+fn side_at_a_diffs_snapshots_agrees_with_its_changes() {
+    let dir = messy_repo();
+    let d = dir.path();
+    let repo = Repo::discover(d).expect("repo");
+    let head = repo.head_tree().expect("HEAD's tree");
+    let checkpoint = repo.take_checkpoint().expect("checkpoint").tree;
+    write(d, "keep.txt", "changed since the checkpoint\n");
+    let specs = [
+        repo.resolve(&[], false, false).expect("spec"),
+        DiffSpec::IndexToWorktree { untracked: true },
+        repo.resolve(&[], true, false).expect("spec"),
+        repo.resolve(&["HEAD"], false, false).expect("spec"),
+        DiffSpec::TreeToTree {
+            old: head,
+            new: checkpoint,
+        },
+        DiffSpec::Checkpoint { tree: checkpoint },
+    ];
+    let (mut submodules, mut kept_on_disk) = (0, 0);
+    for spec in specs {
+        for reverse in [false, true] {
+            let [old, new] = spec.snapshots(reverse).expect("a repository's diff");
+            let changes = collect(&repo, &spec, &[]);
+            assert!(!changes.is_empty(), "{spec:?}");
+            for change in changes {
+                let change = if reverse { change.reversed() } else { change };
+                let gitlink = [change.old, change.new]
+                    .iter()
+                    .flatten()
+                    .any(|s| s.mode() == Mode::Gitlink);
+                submodules += usize::from(gitlink);
+                let mut expected = |snapshot, path: &[u8], side: Option<Side>| {
+                    if gitlink {
+                        return None;
+                    }
+                    // `git rm --cached` left it on disk: the diff lists it
+                    // as deleted, the working tree still has the file.
+                    if path == b"sub/gone.c" && snapshot == Snapshot::Worktree {
+                        kept_on_disk += usize::from(side.is_none());
+                        return Some((Mode::File, b"int z;\n".to_vec()));
+                    }
+                    content(&repo, path, side)
+                };
+                let path = change.path.to_vec();
+                let old_path = change.old_path().to_vec();
+                let (want_old, want_new) = (
+                    expected(old, &old_path, change.old),
+                    expected(new, &path, change.new),
+                );
+                let at = |snapshot, path: &[u8]| {
+                    let side = repo.side_at(snapshot, path.into()).expect("looks up");
+                    content(&repo, path, side)
+                };
+                assert_eq!(
+                    at(old, &old_path),
+                    want_old,
+                    "old side of {} in {spec:?}, reverse {reverse}",
+                    change.path
+                );
+                assert_eq!(
+                    at(new, &path),
+                    want_new,
+                    "new side of {} in {spec:?}, reverse {reverse}",
+                    change.path
+                );
+            }
+        }
+    }
+    assert!(submodules > 0 && kept_on_disk > 0);
+    assert_eq!(DiffSpec::Paths.snapshots(false), None);
+}
+
+/// Folders, submodules and the files inside a submodule are nothing at
+/// any snapshot, and a submodule isn't listed.
+#[test]
+fn only_whole_files_are_found_or_listed() {
+    let dir = init();
+    let d = dir.path();
+    write(d, "dir/a.c", "a\n");
+    let module = d.join("module");
+    std::fs::create_dir(&module).expect("mkdir");
+    git(&module, &["init", "-q"]);
+    write(&module, "inner.txt", "x\n");
+    git(&module, &["add", "-A"]);
+    git(&module, &["commit", "-q", "-m", "inner"]);
+    git(d, &["add", "-A"]);
+    git(d, &["commit", "-q", "-m", "base"]);
+    let repo = Repo::discover(d).expect("repo");
+    let head = repo.head_tree().expect("HEAD's tree");
+    let side = |at, path: &str| repo.side_at(at, path.into()).expect("looks up");
+    for at in [Snapshot::Tree(head), Snapshot::Index, Snapshot::Worktree] {
+        for path in ["dir", "gone.c", "module", "module/inner.txt"] {
+            assert_eq!(side(at, path), None, "{path} at {at:?}");
+        }
+        assert_eq!(names(&listed(&repo, at, &[])), ["dir/a.c"], "{at:?}");
+    }
+}
+
+/// The index lists a conflicted path once, and its side and mode there are
+/// the stage that stands for the index: ours, then the base, then theirs.
+/// A diff of a tree with the index shows the working-tree file there
+/// instead.
+#[test]
+fn the_index_holds_a_conflicted_path_once() {
+    let dir = conflicted_repo();
+    let d = dir.path();
+    let base = git(d, &["rev-parse", ":1:uu"]);
+    let mut child = Command::new("git")
+        .arg("-C")
+        .arg(d)
+        .args(["update-index", "--index-info"])
+        .stdin(std::process::Stdio::piped())
+        .spawn()
+        .expect("git runs");
+    let mut stdin = child.stdin.take().expect("stdin");
+    writeln!(stdin, "100644 {} 1\tmode", base.trim()).expect("feed stages");
+    writeln!(stdin, "100755 {} 2\tmode", base.trim()).expect("feed stages");
+    drop(stdin);
+    assert!(child.wait().expect("git exits").success());
+    let repo = Repo::discover(d).expect("repo");
+
+    let mut tracked: Vec<String> = git(d, &["ls-files", "-z"])
+        .split('\0')
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned)
+        .collect();
+    tracked.dedup();
+    let index = listed(&repo, Snapshot::Index, &[]);
+    assert_eq!(names(&index), tracked);
+    assert!(index.contains(&("mode".to_owned(), Mode::Executable)));
+    let stage = |spec: &str, mode| {
+        let id = git(d, &["rev-parse", spec]);
+        Some(Side::Object {
+            id: ObjectId::from_hex(id.trim().as_bytes()).expect("hex"),
+            mode,
+        })
+    };
+    let side = |path: &str| {
+        repo.side_at(Snapshot::Index, path.into())
+            .expect("looks up")
+    };
+    assert_eq!(side("uu"), stage(":2:uu", Mode::File));
+    assert_eq!(side("dd"), stage(":1:dd", Mode::File));
+    assert_eq!(side("ua"), stage(":3:ua", Mode::File));
+    assert_eq!(side("mode"), stage(":2:mode", Mode::Executable));
+
+    let spec = repo.resolve(&[], true, false).expect("spec");
+    assert_eq!(spec.snapshots(false).map(|s| s[1]), Some(Snapshot::Index));
+    let uu = collect(&repo, &spec, &["uu"]);
+    assert_eq!(uu.len(), 1);
+    assert!(matches!(uu[0].new, Some(Side::Worktree { .. })), "{uu:?}");
 }

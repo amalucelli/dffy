@@ -160,13 +160,14 @@ impl Difftool {
 }
 
 /// Opens the comparison of `operands` (relative to `base`), reading stdin
-/// for `-`. Returns it with what the status line calls it.
+/// for `-`. Returns it with what the status line calls it, and the names of
+/// its old and new versions, each operand as [`label`] shows it.
 pub(crate) fn open(
     base: &Path,
     operands: &[PathBuf; 2],
     args: &DiffArgs,
     difftool: &Difftool,
-) -> Result<(Repo, String), Error> {
+) -> Result<(Repo, String, [String; 2]), Error> {
     let [old, new] = operands;
     if old == Path::new("-") && new == Path::new("-") {
         return Err(Error::fatal("only one side can be read from stdin"));
@@ -193,18 +194,19 @@ pub(crate) fn open(
         exclude: args.exclude.clone(),
         gitignore: args.gitignore,
     })?;
+    let label = |p: &Path| label(base, p, difftool.dir_diff);
+    let (a, b) = if args.common.view.reverse {
+        (new, old)
+    } else {
+        (old, new)
+    };
+    let versions = [label(a), label(b)];
     let description = if let Some((i, n)) = &difftool.file {
         format!("{} · {i}/{n}", name.display())
     } else {
-        let label = |p: &Path| label(base, p, difftool.dir_diff);
-        let (a, b) = if args.common.view.reverse {
-            (new, old)
-        } else {
-            (old, new)
-        };
-        format!("{} → {}", label(a), label(b))
+        format!("{} → {}", versions[0], versions[1])
     };
-    Ok((repo, description))
+    Ok((repo, description, versions))
 }
 
 /// The path a comparison of two files is shown under, which its language is

@@ -2,25 +2,27 @@
 source: crates/dffy/src/tui/app/tests/command_panel.rs
 expression: panel(&mut app)
 ---
-┌─ commands ──────────────────────────────────────────────────────────── esc close ─┐
-│  Here  View  Files  Review  Git  Copy                                             │
-│                                                                                   │
-│ y    Copy selection                                                               │
-│ Y    Copy file path                                                               │
-│ "    Copy as prompt                                                               │
-│ J    [ ] Copy with line numbers and signs                                         │
-│ $    [x] Mouse selection                                                          │
-│                                                                                   │
-│                                                                                   │
-│                                                                                   │
-│                                                                                   │
-│                                                                                   │
-│                                                                                   │
-│                                                                                   │
-│                                                                                   │
-│                                                                                   │
-│                                                                                   │
-│                                                                                   │
-│                                                                                   │
-│ key or enter runs · j/k move · h/l step a value                                   │
-│ tab section · / search · esc close                                                │
+┌─ commands ────────────────────────────────────────────────────────────────── esc close ─┐
+│  Here  View  Files  Review  Git  Copy                                                   │
+│                                                                                         │
+│ y    Copy selection                                                                     │
+│ Y    Copy file path                                                                     │
+│ "    Copy as prompt                                                                     │
+│ J    [ ] Copy with line numbers and signs                                               │
+│ $    [x] Mouse selection                                                                │
+│                                                                                         │
+│                                                                                         │
+│                                                                                         │
+│                                                                                         │
+│                                                                                         │
+│                                                                                         │
+│                                                                                         │
+│                                                                                         │
+│                                                                                         │
+│                                                                                         │
+│                                                                                         │
+│                                                                                         │
+│                                                                                         │
+│                                                                                         │
+│ key or enter runs · j/k move · h/l step a value                                         │
+│ tab section · / search · esc close                                                      │

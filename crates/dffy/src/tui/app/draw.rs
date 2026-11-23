@@ -6,7 +6,7 @@ use std::fmt::Write as _;
 use unicode_width::UnicodeWidthStr;
 
 use dffy_core::document::{Side, Source, State};
-use dffy_core::git::Status;
+use dffy_core::git::{Side as GitSide, Status};
 use dffy_core::view::Attributes;
 
 use super::{App, OnSave, Pane, Watch};
@@ -59,11 +59,13 @@ impl App {
         } else {
             context.heading
         };
+        // A file read alone shows whole: a hunk's numbers say nothing there.
+        let numbered = self.hunk_headers && self.doc.document.reading().is_none();
         let spans = match context.numbers {
-            Some(numbers) if self.hunk_headers && heading.is_empty() => {
+            Some(numbers) if numbered && heading.is_empty() => {
                 vec![(numbers, Role::HunkHeader)]
             }
-            Some(_) if self.hunk_headers => {
+            Some(_) if numbered => {
                 vec![("@@ ".to_owned(), Role::HunkHeader), (heading, Role::Dim)]
             }
             _ if heading.is_empty() => return None,
@@ -166,13 +168,17 @@ impl App {
             || self.commands.is_some()
             || self.reviews.is_some()
             || self.posting.is_some()
-            || self.menu.is_some();
+            || self.menu.is_some()
+            || self.navigation.names().is_some();
         self.sync_threads();
         self.doc.now = model::text::now();
         let sending = (self.posting.as_ref())
             .map(|d| (self.sending(d.with_local()), self.reviewing.checked()));
         let (tree_top, tree_rows) = self.tree_rows();
         let picker_top = self.picker_top();
+        let names = (self.picker.is_some()).then(|| {
+            [Side::Old, Side::New].map(|side| (self.version_name(side), self.version_meaning(side)))
+        });
         let (grid, last) = self.screen.frame();
         chrome.outline(grid, &self.theme);
         let last = std::mem::take(&mut self.kept).then_some(last);
@@ -202,7 +208,9 @@ impl App {
                 panel.draw(grid, place, comments, (focused, joined), look);
             } else {
                 let files = self.doc.document.files();
-                if self.pane == Pane::Diff && !files.is_empty() {
+                // The all-files tree doesn't follow: it revealed the file
+                // once.
+                if self.pane == Pane::Diff && !files.is_empty() && self.all_files.is_none() {
                     self.tree.follow(self.doc.document.pos.file);
                 }
                 let totals = Totals::of(files, self.enumerating);
@@ -238,7 +246,7 @@ impl App {
         if let Some(line) = &search_line {
             draw_search_line(grid, line, framed, &self.theme);
         }
-        if let Some(picker) = &mut self.picker {
+        if let (Some(picker), Some(names)) = (&mut self.picker, &names) {
             let progress = if !self.enumerating {
                 picker::Progress::Done
             } else if self.doc.document.files().len() >= piped::MAX_ENTRIES {
@@ -246,7 +254,14 @@ impl App {
             } else {
                 picker::Progress::Reading
             };
-            draw_picker(grid, picker, &self.doc, progress, picker_top, &self.theme);
+            draw_picker(
+                grid,
+                picker,
+                &self.doc,
+                (progress, names),
+                picker_top,
+                &self.theme,
+            );
         }
         if let Some(commands) = &mut self.commands {
             commands.draw(grid, &self.theme, &self.keys);
@@ -264,6 +279,9 @@ impl App {
         }
         if let Some(menu) = &self.menu {
             menu.draw(grid, &self.theme);
+        }
+        if let Some(names) = self.navigation.names() {
+            names.draw(grid, &self.theme);
         }
         self.kept = !overlays && !chrome.overlay;
         // The terminal scrolls whole rows, so the cell diff sends the tree's
@@ -322,12 +340,13 @@ fn draw_search_line(
     grid.put_str(after, y, end, note, theme.style(Role::Dim));
 }
 
-/// The picker over every row from `top` but the status row.
+/// The picker over every row from `top` but the status row; `names` are
+/// the diff's versions' names and meanings (see [`App::version_meaning`]).
 fn draw_picker(
     grid: &mut term::Grid,
     picker: &mut Picker,
     doc: &Doc,
-    progress: picker::Progress,
+    (progress, names): (picker::Progress, &[(String, Option<&str>); 2]),
     top: usize,
     theme: &Theme,
 ) {
@@ -339,6 +358,7 @@ fn draw_picker(
         doc.document.commits(),
         (width, rows_shown),
         progress,
+        names,
     );
     for y in top..top + rows_shown {
         grid.fill(0, y, width, Style::PLAIN);
@@ -357,7 +377,14 @@ fn draw_picker(
 fn modes(app: &App) -> String {
     let doc = &app.doc;
     let mut modes = String::new();
-    modes.push_str(if doc.layout.split { "split" } else { "unified" });
+    // File view has one column whatever the layout.
+    match doc.document.reading() {
+        Some(side) => {
+            let _ = write!(modes, "reading {}", app.version_name(side));
+        }
+        None if doc.layout.split => modes.push_str("split"),
+        None => modes.push_str("unified"),
+    }
     if doc.document.structural {
         modes.push_str(" syntax");
     }
@@ -372,11 +399,9 @@ fn modes(app: &App) -> String {
     if doc.document.rendered() && renders {
         modes.push_str(" rendered");
     }
-    if doc
-        .document
-        .files()
-        .get(doc.document.pos.file)
-        .is_some_and(|e| doc.document.is_full(e))
+    if doc.document.reading().is_none()
+        && (doc.document.files().get(doc.document.pos.file))
+            .is_some_and(|e| doc.document.is_full(e))
     {
         modes.push_str(" full");
     }
@@ -469,6 +494,9 @@ fn switcher_position(app: &App) -> String {
     }
 }
 
+/// The state a file opened outside the diff shows in the title.
+const NOT_IN_DIFF: &str = "not in this diff";
+
 /// The file shown, for the title: on wide screens its state, staging,
 /// path and counts (a commit's id and subject), on narrow ones the file
 /// switcher.
@@ -529,8 +557,14 @@ fn heading(app: &App) -> Option<Heading> {
             tail: Vec::new(),
         }));
     }
-    let mut head = vec![if entry.is_unchanged() {
-        (crate::tui::tree::UNCHANGED.to_owned(), Role::Dim)
+    if doc.document.reading().is_some() {
+        return Some(Heading::File(file_title(app, entry, dir, name)));
+    }
+    let mut head = vec![if app.opened_at_old(doc.document.pos.file) {
+        let old = app.version_name(Side::Old);
+        (format!("{NOT_IN_DIFF} · {old}"), Role::Dim)
+    } else if entry.is_unchanged() {
+        (NOT_IN_DIFF.to_owned(), Role::Dim)
     } else {
         (entry.status().word().to_owned(), Role::Plain)
     }];
@@ -555,6 +589,54 @@ fn heading(app: &App) -> Option<Heading> {
         name: (name, Role::FileHeader),
         tail,
     }))
+}
+
+/// The title of a file in file view, read as a file rather than a diff:
+/// `src/lib.rs · working tree · 3 changes`, the version shown and its
+/// changes; for a file the diff doesn't list, `not in this diff`; for one
+/// the version read hasn't, the other version, and `not in HEAD` (added) or
+/// `deleted in working tree`.
+fn file_title(app: &App, entry: &view::Entry, dir: String, name: String) -> Title {
+    let doc = &app.doc;
+    let file = doc.document.pos.file;
+    let dim = |text: &str| (text.to_owned(), Role::Dim);
+    let reading = doc.document.reading().unwrap_or(Side::New);
+    let shown = doc.document.reading_of(file);
+    let (version, tail) = if entry.is_unchanged() {
+        let side = if app.opened_at_old(file) {
+            Side::Old
+        } else {
+            Side::New
+        };
+        // One opened for its comments is the working tree's file.
+        let version = match entry.change().new {
+            Some(GitSide::Worktree { .. }) if side == Side::New => "working tree".to_owned(),
+            _ => app.version_name(side),
+        };
+        (version, "not in this diff".to_owned())
+    } else {
+        let side = shown.unwrap_or(reading);
+        let tail = match shown {
+            Some(Side::New) if reading == Side::Old => {
+                format!("not in {}", app.version_name(reading))
+            }
+            Some(Side::Old) if reading == Side::New => {
+                format!("deleted in {}", app.version_name(reading))
+            }
+            _ => match doc.document.file(file).map_or(0, |f| f.changes(side)) {
+                0 => "no changes".to_owned(),
+                1 => "1 change".to_owned(),
+                n => format!("{n} changes"),
+            },
+        };
+        (app.version_name(side), tail)
+    };
+    Title {
+        head: Vec::new(),
+        flex: (dir, Role::Dim, Cut::Left),
+        name: (name, Role::FileHeader),
+        tail: vec![dim(" · "), (version, Role::Plain), dim(" · "), dim(&tail)],
+    }
 }
 
 /// A note for the status bar, in place of the mode words: the question

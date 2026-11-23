@@ -8,6 +8,7 @@ expression: screen(&mut phone)
 │ s    Layout ‹ auto (unified here) ›            │
 │ W    [ ] Wrap long lines                       │
 │ X    [ ] Whole file                            │
+│ _ l  File view ‹ off ›                         │
 │ x    More context                              │
 │ B    Status bar ‹ bottom ›                     │
 │                                                │
@@ -18,12 +19,11 @@ expression: screen(&mut phone)
 │                                                │
 │ Display                                        │
 │ *    [x] Syntax highlighting                   │
-│ K    Indicators ‹ classic ›                    │
+│ ,    Indicators ‹ classic ›                    │
 │ %    Modified lines ‹ changed ›                │
 │ #    [x] Line numbers                          │
 │ @    [x] Hunk headers                          │
 │ ~    Theme ‹ default ›                         │
-│                                                │
 │                                                │
 │                                                │
 │                                                │

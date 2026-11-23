@@ -17,7 +17,7 @@ use std::ops::{ControlFlow, Range};
 
 use dffy_core::view::{
     self, Arrangement, Attributes, FileHeader, FileStatus, HunkHeader, Kind, Line, LineState,
-    Paint, Run,
+    Paint, Run, Side,
 };
 use unicode_width::UnicodeWidthChar;
 
@@ -334,9 +334,10 @@ pub(crate) struct Layout {
     pub tab_width: usize,
     /// Already resolved for color: classic whenever output is plain.
     pub indicators: Indicators,
-    /// The file exists on one side only (added, untracked or deleted): one
-    /// full-width pane with one column of line numbers, even when split.
-    pub one_sided: bool,
+    /// The side whose line numbers show in one full-width pane, even when
+    /// split: the side a file exists on alone (added, untracked or
+    /// deleted), or the side read alone in file view. `None` shows both.
+    pub one_sided: Option<Side>,
     /// The file is unmerged: conflict markers among its added and
     /// unchanged lines take the warning color, over syntax colors.
     pub unmerged: bool,
@@ -359,6 +360,10 @@ pub(crate) struct Layout {
     /// Lines paired with one on the other side show as modified
     /// (`modified-lines = changed`), not as removed and added.
     pub modified_lines: bool,
+    /// A side is read alone in file view: its changed lines carry a bar
+    /// in the gutter whatever the indicators, and the other side's hidden
+    /// runs show as rules across the pane.
+    pub read_alone: bool,
 }
 
 /// The narrowest text column split view accepts before falling back to
@@ -387,10 +392,11 @@ impl Layout {
     #[must_use]
     pub(crate) fn for_file(self, status: FileStatus, lines: usize) -> Self {
         Self {
-            one_sided: matches!(
-                status,
-                FileStatus::Added | FileStatus::Untracked | FileStatus::Deleted
-            ),
+            one_sided: match status {
+                FileStatus::Added | FileStatus::Untracked => Some(Side::New),
+                FileStatus::Deleted => Some(Side::Old),
+                _ => None,
+            },
             unmerged: status == FileStatus::Unmerged,
             digits: if lines == 0 { 0 } else { digits(lines) },
             ..self
@@ -574,7 +580,7 @@ impl Layout {
     pub(crate) fn arrangement(&self, header: &HunkHeader) -> Arrangement {
         let half = self.width.unwrap_or(80).saturating_sub(1) / 2;
         if self.split
-            && !self.one_sided
+            && self.one_sided.is_none()
             && half
                 >= self.lead_width()
                     + self.number_width(header)
@@ -612,13 +618,60 @@ impl Layout {
         };
         match row {
             view::Row::Header => self.hunk_header(header, c),
-            view::Row::Line(i) => unified::line(self, w, &line(i), c),
+            view::Row::Line(i) | view::Row::One { line: i, .. } => {
+                unified::line(self, w, &line(i), c);
+            }
             view::Row::Pair(old, new) => {
                 let (old, new) = (old.map(&line), new.map(&line));
                 split::row(self, w, [old.as_ref(), new.as_ref()], c);
             }
             view::Row::Marker => split::marker(self, c, w),
+            view::Row::Hidden { n, .. } => self.hidden_run(n as usize, false, None, c),
         }
+    }
+
+    /// The rule across the pane standing for `lines` lines of the side not
+    /// read in file view, or with `opened` closing the hunk showing them in
+    /// place: `── 2 lines removed · x shows them ──`, with `key` the key
+    /// that opens or closes it, left out when there's none.
+    pub(crate) fn hidden_run(&self, lines: usize, opened: bool, key: Option<&str>, c: &mut Canvas) {
+        let (what, role) = match self.one_sided {
+            Some(Side::Old) => ("added", Role::Added),
+            _ => ("removed", Role::Removed),
+        };
+        let role = if self.indicators == Indicators::None {
+            Role::Dim
+        } else {
+            role
+        };
+        let s = if lines == 1 { "" } else { "s" };
+        let hint = key.map_or_else(String::new, |k| {
+            let does = if opened { "hides" } else { "shows" };
+            format!(" · {k} {does} them")
+        });
+        let text = format!(" {lines} line{s} {what}{hint} ");
+        let width = self.width.unwrap_or(80);
+        c.push(role, "──");
+        let used = 2 + self.put_fitted(
+            c,
+            text.as_bytes(),
+            NO_MARKS,
+            (Role::Dim, Role::Dim),
+            width.saturating_sub(2),
+        );
+        c.push(role, &"─".repeat(width.saturating_sub(used)));
+        c.end_line();
+    }
+
+    /// The row above a change at the first line of a file read alone in
+    /// file view: the hunk's heading, or blank, since nothing is hidden
+    /// there and its numbers say nothing.
+    pub(crate) fn read_start(&self, h: &HunkHeader, c: &mut Canvas) {
+        if !h.heading.is_empty() {
+            let max = self.width.unwrap_or(usize::MAX);
+            self.put_fitted(c, h.heading, NO_MARKS, (Role::Dim, Role::Dim), max);
+        }
+        c.end_line();
     }
 
     fn hunk_header(&self, h: &HunkHeader, c: &mut Canvas) {
@@ -797,32 +850,45 @@ impl LineStyle {
     /// in the gutter's colors so the tinted edge runs on unbroken: the
     /// number cell's padding, the rule, then a cell of the line's tint.
     /// Classic signs sit left of the rule, so everything right of it is
-    /// code; without color they go right before the text instead.
-    fn mark(&self, c: &mut Canvas, layout: &Layout, first: bool) {
+    /// code; without color they go right before the text instead. With
+    /// `bar`, in file view, a changed line's rule is a heavy bar in its
+    /// sign's color in every style, as gitsigns marks changed lines, the
+    /// gutter's tint and the classic sign kept.
+    fn mark(&self, c: &mut Canvas, layout: &Layout, first: bool, bar: bool) {
         let sign = if first { self.sign_char } else { ' ' };
+        let bar = bar && self.changed;
+        let rule = |c: &mut Canvas, role: Role| {
+            if bar {
+                c.push(role, "┃");
+            } else {
+                c.push(Role::Dim, "│");
+            }
+        };
         match layout.indicators {
             Indicators::Background if self.changed => {
                 c.spaces(self.number, 1);
-                c.push(self.number, "│");
+                c.push(self.number, if bar { "┃" } else { "│" });
                 c.spaces(self.text, 1);
             }
             Indicators::Bars if self.changed => {
                 c.push(Role::Plain, " ");
-                c.push(self.sign, "▌");
+                c.push(self.sign, if bar { "┃" } else { "▌" });
                 c.push(Role::Plain, " ");
             }
             Indicators::Classic if layout.inline_signs => {
-                c.push(Role::Dim, " │");
+                c.spaces(Role::Dim, 1);
+                rule(c, self.sign);
                 c.push_char(self.sign, sign);
             }
             Indicators::Classic => {
                 c.push(Role::Plain, " ");
                 c.push_char(self.sign, sign);
-                c.push(Role::Dim, "│");
+                rule(c, self.sign);
                 c.push(Role::Plain, " ");
             }
             Indicators::Auto | Indicators::Background | Indicators::Bars | Indicators::None => {
-                c.push(Role::Dim, " │");
+                c.spaces(Role::Dim, 1);
+                rule(c, self.sign);
                 c.push(Role::Plain, " ");
             }
         }
@@ -932,7 +998,6 @@ fn line_style(line: &Line, layout: &Layout) -> LineStyle {
 }
 
 const NO_NEWLINE: &str = "\\ No newline at end of file";
-
 /// Position within a line's text across wrapped rows.
 #[derive(Debug, Default, Clone, Copy)]
 struct Cursor {

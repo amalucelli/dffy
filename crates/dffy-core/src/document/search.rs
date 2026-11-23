@@ -2,14 +2,14 @@
 //! selects.
 
 use std::ops::Range;
-use std::sync::LazyLock;
+use std::sync::{Arc, LazyLock};
 
 use gix::bstr::BString;
 
-use super::{Attach, Block, BlockId, Side, gaps};
-use crate::diff::{LineKind, Text};
+use super::{Attach, Block, BlockId, Side, gaps, line_on};
+use crate::diff::{Hunk, LineKind, Text};
 use crate::git::{FileChange, FileDiff, Status};
-use crate::view::display_text;
+use crate::view::{Kind, Row, display_text, side_rows};
 
 /// What a search looks for: a literal string, case ignored unless it has a
 /// capital letter (smart case).
@@ -98,6 +98,35 @@ pub enum Hit {
     Block(BlockMatch),
 }
 
+/// How a file is read alone, for [`find`]: the side, the hunks opened in
+/// place, which show both sides, and the syntax diff's hunks when they show
+/// (see [`super::Document::reading_in`]).
+#[derive(Debug, Clone)]
+pub struct Reading {
+    /// The side read.
+    pub side: Side,
+    /// The hunks opened in place, in order.
+    pub opened: Vec<usize>,
+    /// The syntax diff's hunks, which pair the hidden lines the rows stand
+    /// for otherwise than the line diff's; `None` while the line diff shows.
+    pub structural: Option<Arc<[Hunk]>>,
+}
+
+/// The same syntax diff is the same allocation: hunks aren't compared.
+impl PartialEq for Reading {
+    fn eq(&self, other: &Self) -> bool {
+        self.side == other.side
+            && self.opened == other.opened
+            && match (&self.structural, &other.structural) {
+                (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+                (None, None) => true,
+                _ => false,
+            }
+    }
+}
+
+impl Eq for Reading {}
+
 /// A file's matches in the order the diff shows them (unified), and for
 /// each side the matches on it by line, to find a row's matches while
 /// drawing. Matches in blocks' text are a second list, each placed among
@@ -109,6 +138,9 @@ pub struct Matches {
     by_side: [Vec<u32>; 2],
     /// Every match in a block's text, in order.
     pub blocks: Vec<BlockMatch>,
+    /// Matches on lines hidden while a side is read alone, the other
+    /// side's: counted, never listed or visited.
+    pub other_side: usize,
 }
 
 impl Matches {
@@ -184,11 +216,21 @@ impl Matches {
 /// separators, in order (see [`super::Document::hidden_lines`]); without
 /// it, only the hunks' lines count, and the blocks in gaps come where their
 /// gap is. `blocks` are as [`super::Document::search_blocks`] gives them.
+///
+/// With `reading`, a side read alone (see
+/// [`super::Document::reading_in`]), every line of that side counts once,
+/// in order, unchanged ones with that side's text, but for lines `hidden`
+/// still hides (a piped file's gaps never open). The other side's lines
+/// only count toward [`Matches::other_side`]; blocks on them come where
+/// the row standing for them is, as the reading's hunks pair them. A hunk
+/// opened in place counts as the diff counts it.
+///
 /// `None` once `cancelled` says so: it's asked every 4096 lines, so a
 /// search that's been typed past stops.
 pub fn find(
     diff: &FileDiff,
     hidden: Option<&[Range<usize>]>,
+    reading: Option<&Reading>,
     blocks: &[Block],
     needle: &Needle,
     cancelled: impl Fn() -> bool,
@@ -243,6 +285,11 @@ pub fn find(
     if !lead {
         scan.blocks(edge(Attach::Start))?;
     }
+    let gap_side = reading.map_or(Side::New, |r| r.side);
+    // The hunks the rows show; both lists cover the same lines.
+    let hunks = (reading.and_then(|r| r.structural.as_deref())).unwrap_or(&diff.hunks);
+    // A hunk's rows read alone, built anew in one buffer for each.
+    let mut rows = Vec::new();
     let mut runs = hidden.map(|h| h.iter().peekable());
     for (g, gap) in gaps.iter().enumerate() {
         let to_old = |new: usize| new - gap.new + gap.old;
@@ -256,7 +303,7 @@ pub fn find(
                     line = run.end;
                     continue;
                 }
-                scan.line(Side::New, line)?;
+                scan.line(gap_side, [to_old(line), line][gap_side.index()])?;
                 if !blocks.is_empty() {
                     if std::mem::take(&mut lead) {
                         scan.blocks(edge(Attach::Start))?;
@@ -269,9 +316,13 @@ pub fn find(
             let new = gap.new..gap.new + gap.len;
             scan.blocks(on(gap.old..gap.old + gap.len, new))?;
         }
-        let Some(hunk) = diff.hunks.get(g) else {
+        let Some(hunk) = hunks.get(g) else {
             continue;
         };
+        if let Some(r) = reading.filter(|r| r.opened.binary_search(&g).is_err()) {
+            read_hunk(&mut scan, (hunk, r, &mut rows), &mut lead, (&on, &edge))?;
+            continue;
+        }
         for l in &hunk.lines {
             let (side, line, old, new) = match l.kind {
                 LineKind::Removed => (Side::Old, l.old, l.old..l.old + 1, 0..0),
@@ -291,6 +342,85 @@ pub fn find(
     }
     scan.blocks(edge(Attach::End))?;
     Some(scan.matches)
+}
+
+/// [`find`]'s scan of `hunk` while a side is read alone, as `reading`
+/// says, its rows built in `rows`: `lead` says the blocks under the first
+/// row are still to come, `on` gives the blocks on ranges of old and new
+/// lines in the order rows hang them, and `edge` those at either end.
+fn read_hunk<C, O, OI, E, EI>(
+    scan: &mut Scan<'_, C>,
+    (hunk, reading, rows): (&Hunk, &Reading, &mut Vec<Row>),
+    lead: &mut bool,
+    (on, edge): (&O, &E),
+) -> Option<()>
+where
+    C: Fn() -> bool,
+    O: Fn(Range<usize>, Range<usize>) -> OI,
+    OI: IntoIterator<Item = u32>,
+    E: Fn(Attach) -> EI,
+    EI: IntoIterator<Item = u32>,
+{
+    let side = reading.side;
+    let any_blocks = !scan.blocks.is_empty();
+    // The blocks on `this` lines of the side read and `other` lines of the
+    // other side, hung under one row.
+    let mut hang = |scan: &mut Scan<'_, C>, this: Range<usize>, other: Range<usize>| {
+        if std::mem::take(lead) {
+            scan.blocks(edge(Attach::Start))?;
+        }
+        let (old, new) = match side {
+            Side::Old => (this, other),
+            Side::New => (other, this),
+        };
+        scan.blocks(on(old, new))
+    };
+    // The rows read alone lay out: a hidden line's blocks hang under the
+    // line it pairs with, or the row of the lines left unpaired.
+    let kind = |i: usize| {
+        let l = &hunk.lines[i];
+        let kind = match l.kind {
+            LineKind::Context => Kind::Context,
+            LineKind::Removed => Kind::Removed,
+            LineKind::Added => Kind::Added,
+        };
+        (kind, l.block_start)
+    };
+    rows.clear();
+    side_rows(side, hunk.lines.len(), kind, rows);
+    for &row in rows.iter() {
+        match row {
+            Row::One { line, paired } => {
+                let l = &hunk.lines[line];
+                let this = line_on(l, side);
+                let other = match (l.kind, paired) {
+                    (LineKind::Context, _) => Some(line_on(l, side.other())),
+                    (_, Some(p)) => {
+                        let hid = line_on(&hunk.lines[p], side.other());
+                        scan.count(side.other(), hid)?;
+                        Some(hid)
+                    }
+                    (_, None) => None,
+                };
+                scan.line(side, this)?;
+                if any_blocks {
+                    hang(scan, this..this + 1, other.map_or(0..0, |o| o..o + 1))?;
+                }
+            }
+            Row::Hidden { from, n } => {
+                let start = line_on(&hunk.lines[from], side.other());
+                let hid = start..start + n as usize;
+                for line in hid.clone() {
+                    scan.count(side.other(), line)?;
+                }
+                if any_blocks {
+                    hang(scan, 0..0, hid)?;
+                }
+            }
+            Row::Header | Row::Line(_) | Row::Pair(..) | Row::Marker => {}
+        }
+    }
+    Some(())
 }
 
 /// [`find`] in an entry without lines, a sheet: only in its `blocks`, those
@@ -315,7 +445,7 @@ pub fn find_blocks(
         too_large: false,
         note: None,
     });
-    find(&NO_LINES, None, blocks, needle, cancelled)
+    find(&NO_LINES, None, None, blocks, needle, cancelled)
 }
 
 /// A search under way (see [`find`]).
@@ -358,6 +488,19 @@ impl<C: Fn() -> bool> Scan<'_, C> {
                 end: u32::try_from(bytes.end).unwrap_or(u32::MAX),
             });
         }
+        Some(())
+    }
+
+    /// Counts the matches on line `line` of `side`, the side not read, in
+    /// [`Matches::other_side`].
+    fn count(&mut self, side: Side, line: usize) -> Option<()> {
+        self.tick()?;
+        let text = match side {
+            Side::Old => self.diff.old.line(line),
+            Side::New => self.diff.new.line(line),
+        };
+        let text = display_text(text.strip_suffix(b"\n").unwrap_or(text));
+        self.matches.other_side += self.needle.find_all(text).len();
         Some(())
     }
 

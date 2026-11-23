@@ -1,6 +1,6 @@
 ---
-source: crates/dffy/src/tui/app.rs
-expression: screen(&mut app)
+source: crates/dffy/src/tui/app/tests/draw.rs
+expression: "off"
 ---
  modified · src/f.c · +1 -1                                         @@ int f11(void) { return 11; }
 ┌ Files · 2 +1 -1 ─────────┐ 14 14  │ int f14(void) { return 14; }

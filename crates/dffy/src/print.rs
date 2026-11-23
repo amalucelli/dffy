@@ -60,6 +60,9 @@ pub(crate) struct Plan {
     pub reverse: bool,
     /// The threads `--show-comments` shows on each file's diff.
     pub comments: Option<Snapshot>,
+    /// For two paths compared outside git, the names the viewer gives the
+    /// diff's old and new versions: the paths as typed.
+    pub versions: Option<[String; 2]>,
     /// The directory pathspecs are relative to.
     base: PathBuf,
 }
@@ -112,6 +115,7 @@ impl Plan {
             summary,
             reverse,
             comments: None,
+            versions: None,
             base,
         })
     }
@@ -127,6 +131,7 @@ impl Plan {
             summary,
             reverse,
             comments: None,
+            versions: None,
             base: base.to_owned(),
         }
     }
@@ -1349,7 +1354,8 @@ fn file_parts(
                         }
                     }
                 }
-                Row::Marker => {}
+                // Printed output never reads one side alone.
+                Row::Marker | Row::One { .. } | Row::Hidden { .. } => {}
             }
             if c.len() >= PART_ROWS {
                 flush(c);

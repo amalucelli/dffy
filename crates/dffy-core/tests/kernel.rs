@@ -12,6 +12,7 @@ use std::process::Command;
 
 use dffy_core::diff::{Hunk, LineKind, Options, Text, Unchanged};
 use dffy_core::git::{DiffSpec, FileChange, Repo, Status};
+use dffy_core::view::Side::{New, Old};
 
 const LARGEST: &str = "drivers/net/wireless/realtek/rtw89/rtw8852c_table.c";
 
@@ -718,6 +719,337 @@ fn two_copies_of_a_kernel_folder_match_git_no_index() {
     );
 }
 
+/// Every C and Rust file's definitions at v6.0 and v6.1, built into the
+/// symbol cache as the index builds them, fit the cache's budget on disk,
+/// with nothing dropped to fit: indexes built again afterwards read every
+/// file back. Reports the cold build of each tag and the reload, from the
+/// packs and from a store shared with a live navigator, with the threads
+/// used. It loads every core, so `.config/nextest.toml` keeps it apart
+/// from the tests with wall-clock budgets.
+#[test]
+fn kernel_definitions_fit_the_symbol_budget() {
+    use std::time::Instant;
+
+    use dffy_core::cache::{Cache, SYMBOLS_BUDGET};
+    use dffy_core::navigate::Shared;
+
+    let Some(dir) = bench_repo() else { return };
+    let threads = std::thread::available_parallelism().map_or(4, std::num::NonZero::get);
+    let cache_dir = tempfile::tempdir().expect("tempdir");
+    let cache = Cache::new(cache_dir.path().to_owned(), u64::MAX).symbols();
+    assert_eq!(cache.budget(), SYMBOLS_BUDGET);
+    let index = Index::new(&dir);
+    for (tag, side) in [("v6.0", Old), ("v6.1", New)] {
+        let start = Instant::now();
+        let nav = index.navigator(side, &Shared::new());
+        let listed = start.elapsed();
+        let start = Instant::now();
+        index.build(&nav, &cache, threads);
+        let s = nav.stats();
+        eprintln!(
+            "{tag}: {} files listed in {listed:?}; cold build {:?} on {threads} threads: \
+             {} extracted, {} from the cache, {} over the size cap, {} past the parse \
+             budget, {} unreadable",
+            nav.progress().total,
+            start.elapsed(),
+            s.extracted,
+            s.cached,
+            s.too_large,
+            s.timed_out,
+            s.unreadable,
+        );
+    }
+    let (allocated, entries) = cache.usage().expect("readable");
+    eprintln!(
+        "{allocated} bytes on disk in {entries} packs, against a {SYMBOLS_BUDGET}-byte budget"
+    );
+    for (tag, side) in [("v6.0", Old), ("v6.1", New)] {
+        let nav = index.navigator(side, &Shared::new());
+        let start = Instant::now();
+        index.build(&nav, &cache, 1);
+        let s = nav.stats();
+        eprintln!(
+            "{tag}: reloaded from the packs in {:?} on 1 thread",
+            start.elapsed()
+        );
+        assert_eq!(s.extracted, 0, "{tag}: entries were dropped");
+        let shared = Shared::new();
+        let live = index.navigator(side, &shared);
+        index.build(&live, &cache, 1);
+        let again = index.navigator(side, &shared);
+        let start = Instant::now();
+        index.build(&again, &cache, 1);
+        eprintln!(
+            "{tag}: reloaded beside a live navigator sharing its store in {:?} on 1 thread",
+            start.elapsed()
+        );
+    }
+    assert!(
+        allocated <= SYMBOLS_BUDGET,
+        "{allocated} bytes of definitions on disk don't fit the {SYMBOLS_BUDGET}-byte budget"
+    );
+}
+
+/// The symbols go-to-definition must find at both kernel tags, each asked
+/// from a file that uses it, with the file its definition is in and the
+/// line that starts it (1-based) at v6.0 and at v6.1.
+const WANTED: [(&str, &str, &str, [usize; 2]); 5] = [
+    (
+        "kmalloc_array",
+        "mm/slab_common.c",
+        "include/linux/slab.h",
+        [632, 597],
+    ),
+    (
+        "list_head",
+        "mm/slab_common.c",
+        "include/linux/types.h",
+        [178, 178],
+    ),
+    ("sys_openat", "fs/namei.c", "fs/open.c", [1340, 1337]),
+    (
+        "trace_sched_switch",
+        "kernel/sched/core.c",
+        "include/trace/events/sched.h",
+        [222, 222],
+    ),
+    (
+        "drm_gem_shmem_vmap",
+        "include/drm/drm_gem_shmem_helper.h",
+        "drivers/gpu/drm/drm_gem_shmem_helper.c",
+        [359, 359],
+    ),
+];
+
+/// The process's resident memory, in MB, as `ps` reports it.
+fn resident_mb() -> u64 {
+    let out = Command::new("ps")
+        .args(["-o", "rss=", "-p", &std::process::id().to_string()])
+        .output()
+        .expect("ps runs");
+    String::from_utf8_lossy(&out.stdout)
+        .trim()
+        .parse::<u64>()
+        .expect("a size in KB")
+        >> 10
+}
+
+/// [`WANTED`]'s symbols resolve to their definitions, ranked first from the
+/// file that asks, at both tags, once the index is built. Each lookup is
+/// timed: the first from a file, held to the 100ms budget like a warm one
+/// and one of a name defined in thousands of files, and one before any
+/// index is built, from packs already stored. The resident memory with
+/// both sides built is reported.
+#[test]
+fn kernel_symbols_resolve_at_both_tags() {
+    use std::sync::atomic::AtomicBool;
+    use std::time::{Duration, Instant};
+
+    use dffy_core::cache::Cache;
+    use dffy_core::navigate::{Origin, Shared};
+
+    let Some(dir) = bench_repo() else { return };
+    let threads = std::thread::available_parallelism().map_or(4, std::num::NonZero::get);
+    let cache_dir = tempfile::tempdir().expect("tempdir");
+    let cache = Cache::new(cache_dir.path().to_owned(), u64::MAX).symbols();
+    let index = Index::new(&dir);
+    let c = index.grammars.named("c").expect("bundled").clone();
+    let origin = |from: &str| Origin {
+        path: from.into(),
+        language: c.clone(),
+    };
+    let go = AtomicBool::new(false);
+    let before = resident_mb();
+    let shared = Shared::new();
+    let navs = [Old, New].map(|side| {
+        let nav = index.navigator(side, &shared);
+        index.build(&nav, &cache, threads);
+        nav
+    });
+    eprintln!(
+        "resident memory with both sides built: {} MB ({} MB before)",
+        resident_mb(),
+        before
+    );
+    let mut wrong = Vec::new();
+    for (n, (side, nav)) in [Old, New].into_iter().zip(&navs).enumerate() {
+        for (name, from, path, lines) in WANTED {
+            // The first lookup from a file follows its includes and diffs
+            // its candidates' changed files; later ones reuse both.
+            let start = Instant::now();
+            let lookup = nav
+                .lookup(&index.repo, &cache, name, &origin(from), &go)
+                .expect("looks up");
+            let first = start.elapsed();
+            eprintln!("{side:?}: lookup of {name} from {from} in {first:?}");
+            assert!(first <= Duration::from_millis(100), "{name}: {first:?}");
+            for candidate in lookup.candidates.iter().take(5) {
+                eprintln!(
+                    "{side:?} {name} from {from}: {}:{} {:?} {:?} changed {} in a hunk {:?}",
+                    candidate.path,
+                    candidate.start + 1,
+                    candidate.kind,
+                    candidate.rank,
+                    candidate.changed,
+                    candidate.in_hunk,
+                );
+            }
+            let top = (lookup.candidates.first()).map(|c| (c.path.to_string(), c.start + 1));
+            if top != Some((path.to_owned(), lines[n])) {
+                wrong.push(format!("{side:?}: {name} from {from}: {top:?}"));
+            }
+        }
+        for name in ["kmalloc_array", "pr_fmt"] {
+            let from = origin("mm/slab_common.c");
+            nav.lookup(&index.repo, &cache, name, &from, &go)
+                .expect("looks up");
+            let start = Instant::now();
+            let lookup = nav
+                .lookup(&index.repo, &cache, name, &from, &go)
+                .expect("looks up");
+            let warm = start.elapsed();
+            eprintln!(
+                "{side:?}: warm lookup of {name}, {} definitions, in {warm:?}",
+                lookup.total
+            );
+            assert!(warm <= Duration::from_millis(100), "{name}: {warm:?}");
+        }
+        let start = Instant::now();
+        let text = nav
+            .search_text(
+                &index.repo,
+                "kmalloc_array",
+                &origin("mm/slab_common.c"),
+                200,
+                &go,
+            )
+            .expect("searches");
+        eprintln!(
+            "{side:?}: text search of kmalloc_array, {} lines (complete: {}), in {:?}",
+            text.matches.len(),
+            text.complete,
+            start.elapsed()
+        );
+    }
+    cold_lookup(&index, &cache, &origin("mm/slab_common.c"));
+    assert!(wrong.is_empty(), "first candidates:\n{}", wrong.join("\n"));
+}
+
+/// Reports a lookup from `origin` at v6.1 before any index is built, with
+/// the packs already stored: what the local tier reads.
+fn cold_lookup(
+    index: &Index,
+    cache: &dffy_core::cache::SymbolCache,
+    origin: &dffy_core::navigate::Origin,
+) {
+    let cold = index.navigator(New, &dffy_core::navigate::Shared::new());
+    let start = std::time::Instant::now();
+    let lookup = cold
+        .lookup(
+            &index.repo,
+            cache,
+            "kmalloc_array",
+            origin,
+            &std::sync::atomic::AtomicBool::new(false),
+        )
+        .expect("looks up");
+    eprintln!(
+        "New, no index built, packs stored: lookup of kmalloc_array in {:?}, {} of {} files \
+         read, first {:?}",
+        start.elapsed(),
+        lookup.progress.done,
+        lookup.progress.total,
+        (lookup.candidates.first()).map(|c| (c.path.to_string(), c.start + 1)),
+    );
+}
+
+/// A cold lookup, with nothing built or cached, finds what the asking file
+/// defines itself, whatever the local tier's time leaves for the files
+/// around it, within 300ms.
+#[test]
+fn a_cold_lookup_finds_the_asking_files_own_definition() {
+    use std::sync::atomic::AtomicBool;
+    use std::time::{Duration, Instant};
+
+    use dffy_core::cache::Cache;
+    use dffy_core::navigate::{Origin, Shared};
+
+    let Some(dir) = bench_repo() else { return };
+    let cache_dir = tempfile::tempdir().expect("tempdir");
+    let cache = Cache::new(cache_dir.path().to_owned(), u64::MAX).symbols();
+    let index = Index::new(&dir);
+    let nav = index.navigator(New, &Shared::new());
+    let origin = Origin {
+        path: "mm/slab_common.c".into(),
+        language: index.grammars.named("c").expect("bundled").clone(),
+    };
+    let start = Instant::now();
+    let lookup = nav
+        .lookup(
+            &index.repo,
+            &cache,
+            "kmem_cache_shrink",
+            &origin,
+            &AtomicBool::new(false),
+        )
+        .expect("looks up");
+    let took = start.elapsed();
+    eprintln!("cold lookup of kmem_cache_shrink from mm/slab_common.c in {took:?}");
+    let first = (lookup.candidates.first()).map(|c| (c.path.to_string(), c.start + 1));
+    assert_eq!(first, Some(("mm/slab_common.c".to_owned(), 512)));
+    assert!(took < Duration::from_millis(300), "took {took:?}");
+}
+
+/// The kernel range's repository, grammars and changes, to make a
+/// navigator of either side.
+struct Index {
+    repo: Repo,
+    grammars: dffy_core::highlight::Registry,
+    snapshots: [dffy_core::git::Snapshot; 2],
+    changes: Vec<FileChange>,
+}
+
+impl Index {
+    fn new(dir: &Path) -> Self {
+        let repo = Repo::discover(dir).expect("opens");
+        let spec = repo
+            .resolve(&["v6.0..v6.1"], false, false)
+            .expect("resolves");
+        Self {
+            changes: collect(&repo, &spec),
+            snapshots: spec.snapshots(false).expect("a range has snapshots"),
+            grammars: dffy_core::highlight::Registry::builtin(),
+            repo,
+        }
+    }
+
+    fn navigator(
+        &self,
+        side: dffy_core::view::Side,
+        shared: &dffy_core::navigate::Shared,
+    ) -> dffy_core::navigate::Navigator {
+        let diff = dffy_core::navigate::Diff {
+            snapshots: self.snapshots,
+            changes: &self.changes,
+            options: Options::default(),
+        };
+        dffy_core::navigate::Navigator::new(&self.repo, &self.grammars, shared, &diff, side)
+            .expect("lists")
+    }
+
+    fn build(
+        &self,
+        nav: &dffy_core::navigate::Navigator,
+        cache: &dffy_core::cache::SymbolCache,
+        threads: usize,
+    ) {
+        let cancel = std::sync::atomic::AtomicBool::new(false);
+        nav.build(&self.repo, cache, threads, &cancel, |_| {})
+            .expect("the queries compile");
+        assert!(nav.progress().complete());
+    }
+}
+
 /// What the size cap avoids: tree-sitter on the largest changed file,
 /// which dffy doesn't highlight.
 #[test]
@@ -759,4 +1091,39 @@ fn highlight_timings_over_the_cap() {
         text.bytes().len() >> 10,
         dffy_core::highlight::MAX_HIGHLIGHT_BYTES >> 10
     );
+}
+
+/// The range's files renamed without edits count only their text in the
+/// memory estimate until their lines show, so a range of renames evicts no
+/// sooner for highlighting that's never prepared.
+#[test]
+fn renamed_files_count_only_their_text_until_shown() {
+    let Some(dir) = bench_repo() else { return };
+    let repo = Repo::discover(&dir).expect("repo");
+    let spec = repo.resolve(&["v6.0..v6.1"], false, false).expect("spec");
+    let changes = repo
+        .detect_renames(collect(&repo, &spec), None)
+        .expect("renames");
+    let grammars = dffy_core::highlight::Registry::builtin();
+    let (mut renamed, mut estimate, mut text) = (0, 0, 0);
+    for c in changes
+        .into_iter()
+        .filter(|c| matches!(c.status, Status::Renamed { .. }))
+    {
+        let fd = repo.file_diff(c, &Options::default()).expect("diff");
+        if !fd.hunks.is_empty() {
+            continue;
+        }
+        renamed += 1;
+        text += fd.old.bytes().len() + fd.new.bytes().len();
+        let file = dffy_core::document::File::prepare(&grammars, None).file(
+            fd,
+            dffy_core::diff::Whitespace::Exact,
+            true,
+        );
+        estimate += file.bytes();
+    }
+    eprintln!("{renamed} files renamed without edits: estimate {estimate} bytes, text {text}");
+    assert!(renamed > 0);
+    assert_eq!(estimate, text);
 }

@@ -38,6 +38,9 @@ expression: text
 <dim># Lines of context around each change (-U), or full for the whole file with changes inline. In the viewer, `X` switches every file between the two and is remembered; `x` reveals hidden lines in one file, for that run.</>
 <hint>context</><dim> = </>3
 
+<dim># Start the viewer in file view: every file whole as it is in the diff's newer version, with a mark in the gutter where removed lines were. `l` toggles it and `s` flips to the older version, which isn't remembered. A piped diff has only its hunks, so it opens as the diff.</>
+<hint>file-view</><dim> = </>false
+
 <dim># Ignore all whitespace when comparing lines (-w). The command panel's Ignore whitespace entry toggles it in the viewer.</>
 <hint>ignore-all-space</><dim> = </>false
 
@@ -77,6 +80,9 @@ expression: text
 <dim># The tree's width in columns, or auto for 28% of the terminal (24 to 60 columns). `+` and `-` in the tree change it.</>
 <hint>tree-width</><dim> = </>auto
 
+<dim># Start the tree on every file of the repository, the diff's changes colored among them, rather than the diff's files alone. `a` in the tree toggles it. A piped diff and two paths compared have only their files.</>
+<hint>all-files</><dim> = </>false
+
 <dim># Where the viewer shows what's compared, the position, the modes and the key hints: bottom (in the frame's bottom border) or top (in its top border, after the file's name). The command panel's Status bar entry switches it.</>
 <hint>status-bar</><dim> = </>bottom
 
@@ -89,7 +95,7 @@ expression: text
 <dim># Copies from the viewer include each line's number and its +/- sign, for pasting into a review, rather than only the code.</>
 <hint>copy-decorations</><dim> = </>false
 
-<dim># Remember the view choices made in the viewer (layout, wrap, the tree and its width, the status bar, indicators, modified lines, syntax diff, rendered view, highlighting, theme, mouse, line numbers, hunk headers, copy decorations, whole files, ignored whitespace, watch mode) for the next run, in $XDG_STATE_HOME/dffy/state. A choice made in the viewer beats this file in the viewer; a flag beats both, for that run only. Printed output never takes them. A remembered split layout shows unified under 100 columns; --split doesn't.</>
+<dim># Remember the view choices made in the viewer (layout, wrap, the tree, its width and whether it lists all files, the status bar, indicators, modified lines, syntax diff, rendered view, highlighting, theme, mouse, line numbers, hunk headers, copy decorations, whole files, file view, ignored whitespace, watch mode) for the next run, in $XDG_STATE_HOME/dffy/state. A choice made in the viewer beats this file in the viewer; a flag beats both, for that run only. Printed output never takes them. A remembered split layout shows unified under 100 columns; --split doesn't.</>
 <hint>remember</><dim> = </>true
 
 <dim># Show the one-time tip about the command panel on the first run of the viewer.</>
@@ -104,23 +110,27 @@ expression: text
 <dim># Size the disk cache is trimmed to, least recently used first: bytes, or a number with K, M or G.</>
 <hint>cache-size</><dim> = </>256M
 
-<dim># Keys in the viewer: keybind = <key>=<action>, or <key>=unbind to free a key. A key is a character as typed (n, N, <, ?) or a name (space, enter, tab, shift+tab, esc, backspace, up, down, left, right, home, end, page_up, page_down, insert, delete, f1 to f12), with ctrl+ or alt+ before it. Keys pressed in the file tree look in its own table first, set with tree: before the key (keybind = tree:v=mark_viewed), and so do keys pressed while a comment thread is focused, in the thread's table (thread:), then while the file at the cursor has conflicts to resolve, in the conflict's table (conflict:). The command panel the leader key opens has its own table too, set with leader: (keybind = leader:z=toggle_wrap); within a group, the panel lists its entries in this order.</>
+<dim># Keys in the viewer: keybind = <key>=<action>, or <key>=unbind to free a key. A key is a character as typed (n, N, <, ?) or a name (space, enter, tab, shift+tab, esc, backspace, up, down, left, right, home, end, page_up, page_down, insert, delete, f1 to f12), with ctrl+ or alt+ before it. Keys pressed in the file tree look in its own table first, set with tree: before the key (keybind = tree:v=mark_viewed), and so do keys pressed while a comment thread is focused, in the thread's table (thread:), then while the file at the cursor has conflicts to resolve, in the conflict's table (conflict:). Keys pressed while a go-to-definition peek has the keys look in its table (peek:) before any other. The command panel the leader key opens has its own table too, set with leader: (keybind = leader:z=toggle_wrap); within a group, the panel lists its entries in this order.</>
 
 <dim># leader: open the command panel; its next key runs a command</>
 <hint>keybind</><dim> = </>space=leader
 
-<dim># scroll_down: scroll down a line; in the tree, move down</>
+<dim># scroll_down: scroll down a line; in the tree, move down; in a peek, the next definition</>
 <hint>keybind</><dim> = </>j=scroll_down
 <hint>keybind</><dim> = </>down=scroll_down
 <hint>keybind</><dim> = </>enter=scroll_down
 <hint>keybind</><dim> = </>ctrl+e=scroll_down
 <hint>keybind</><dim> = </>ctrl+n=scroll_down
+<hint>keybind</><dim> = </>peek:j=scroll_down
+<hint>keybind</><dim> = </>peek:down=scroll_down
 
-<dim># scroll_up: scroll up a line; in the tree, move up</>
+<dim># scroll_up: scroll up a line; in the tree, move up; in a peek, the definition before</>
 <hint>keybind</><dim> = </>k=scroll_up
 <hint>keybind</><dim> = </>up=scroll_up
 <hint>keybind</><dim> = </>ctrl+y=scroll_up
 <hint>keybind</><dim> = </>ctrl+p=scroll_up
+<hint>keybind</><dim> = </>peek:k=scroll_up
+<hint>keybind</><dim> = </>peek:up=scroll_up
 
 <dim># page_down: scroll down a screen</>
 <hint>keybind</><dim> = </>page_down=page_down
@@ -174,6 +184,10 @@ expression: text
 <dim># toggle_full: whole files or changes only, for every file</>
 <hint>keybind</><dim> = </>X=toggle_full
 <hint>keybind</><dim> = </>leader:X=toggle_full
+
+<dim># toggle_file_view: file view, or the diff again: every file whole as it is in one version, the newer first, with a mark in the gutter where the other version's lines were; s then flips the version</>
+<hint>keybind</><dim> = </>l=toggle_file_view
+<hint>keybind</><dim> = </>leader:_=toggle_file_view
 
 <dim># scroll_right: scroll the code right, without wrapping</>
 <hint>keybind</><dim> = </>>=scroll_right
@@ -233,10 +247,11 @@ expression: text
 <hint>keybind</><dim> = </>tree:/=filter_tree
 <hint>keybind</><dim> = </>leader:|=filter_tree
 
-<dim># open: open a file, or open or close a folder, in the tree</>
+<dim># open: open a file, or open or close a folder, in the tree; in a peek, the definition's file at its line: its entry in the diff, else the whole file</>
 <hint>keybind</><dim> = </>tree:enter=open
 <hint>keybind</><dim> = </>tree:l=open
 <hint>keybind</><dim> = </>tree:right=open
+<hint>keybind</><dim> = </>peek:enter=open
 
 <dim># collapse: collapse a folder in the tree</>
 <hint>keybind</><dim> = </>tree:h=collapse
@@ -245,8 +260,41 @@ expression: text
 <dim># parent_folder: go to the folder holding the file, in the tree</>
 <hint>keybind</><dim> = </>u=parent_folder
 
+<dim># go_to_definition: list the names on the line last tapped, else the top line; type to narrow them, and enter shows where the one picked is defined, in the line's version, in a peek under the line. ctrl+click or alt+click on a name peeks it at once</>
+<hint>keybind</><dim> = </>K=go_to_definition
+<hint>keybind</><dim> = </>leader:K=go_to_definition
+
+<dim># show_in_diff: in a peek: the definition's lines in the diff, where the diff changes its file</>
+<hint>keybind</><dim> = </>peek:d=show_in_diff
+
+<dim># other_version: in a peek: the name's definitions in the diff's other version</>
+<hint>keybind</><dim> = </>peek:s=other_version
+
+<dim># references: in a peek: the lines using the name in the peek's version, closest files first, as they're found: the first 200 files with a use, and how many there are; again shows the definitions</>
+<hint>keybind</><dim> = </>peek:r=references
+
+<dim># close_peek: close the peek</>
+<hint>keybind</><dim> = </>peek:esc=close_peek
+<hint>keybind</><dim> = </>peek:q=close_peek
+
+<dim># jump_back: back to where the last jump left, with the line that was at the top at the top again: a jump is a definition opened from a peek, or a file opened from find file, the tree or the control API. The last 100 places are kept; one whose file isn't shown any more is skipped</>
+<hint>keybind</><dim> = </>backspace=jump_back
+<hint>keybind</><dim> = </>leader:(=jump_back
+
+<dim># jump_forward: forward again, to where jump back left</>
+<hint>keybind</><dim> = </>\=jump_forward
+<hint>keybind</><dim> = </>leader:\=jump_forward
+
 <dim># mark_viewed: mark a file in the tree viewed</>
 <hint>keybind</><dim> = </>tree:v=mark_viewed
+
+<dim># close_file: close a file opened outside the diff (from find file), the one selected in the tree or else the one shown; one with comments stays</>
+<hint>keybind</><dim> = </>tree:x=close_file
+<hint>keybind</><dim> = </>leader:)=close_file
+
+<dim># toggle_all_files: the tree lists every file of the repository, the diff's changes colored among them, or the diff's files again; s in the tree then shows the other version. Folders open as you go, enter on a file outside the diff shows it whole</>
+<hint>keybind</><dim> = </>tree:a=toggle_all_files
+<hint>keybind</><dim> = </>leader:==toggle_all_files
 
 <dim># tree_wider: widen the tree</>
 <hint>keybind</><dim> = </>tree:+=tree_wider
@@ -254,7 +302,7 @@ expression: text
 <dim># tree_narrower: narrow the tree</>
 <hint>keybind</><dim> = </>tree:-=tree_narrower
 
-<dim># cycle_layout: layout: split, unified, then auto (split on wide screens); while selecting, the side copied</>
+<dim># cycle_layout: layout: split, unified, then auto (split on wide screens); while selecting, the side copied; in file view, the side read</>
 <hint>keybind</><dim> = </>s=cycle_layout
 <hint>keybind</><dim> = </>leader:s=cycle_layout
 
@@ -271,7 +319,7 @@ expression: text
 <hint>keybind</><dim> = </>leader:r=toggle_rendered
 
 <dim># cycle_indicators: how changed lines are marked: background, bars, classic signs or none</>
-<hint>keybind</><dim> = </>leader:K=cycle_indicators
+<hint>keybind</><dim> = </>leader:,=cycle_indicators
 
 <dim># cycle_modified_lines: a line and its edit in the modified color with red and green tokens, or red and green lines</>
 <hint>keybind</><dim> = </>leader:%=cycle_modified_lines

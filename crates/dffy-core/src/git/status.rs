@@ -544,7 +544,7 @@ impl<'a> Scan<'a> {
 
 /// The stage that best represents a conflicted path's index side: ours, then
 /// the base, then theirs.
-fn conflict_side(
+pub(super) fn conflict_side(
     entries: &[gix::index::Entry],
     i: usize,
     index: &gix::index::State,

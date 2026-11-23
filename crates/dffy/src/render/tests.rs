@@ -11,7 +11,7 @@ fn layout(split: bool, width: Option<usize>, wrap: bool) -> Layout {
         words: false,
         tab_width: 4,
         indicators: Indicators::Classic,
-        one_sided: false,
+        one_sided: None,
         unmerged: false,
         digits: 0,
         inline_signs: true,
@@ -19,6 +19,7 @@ fn layout(split: bool, width: Option<usize>, wrap: bool) -> Layout {
         line_numbers: true,
         hunk_headers: true,
         modified_lines: true,
+        read_alone: false,
     }
 }
 
@@ -651,7 +652,7 @@ fn traced(layout: Layout, rows: &[(Option<&str>, Option<&str>)]) -> String {
 #[test]
 fn mapped_cells_count_tabs_and_wide_characters() {
     let layout = Layout {
-        one_sided: true,
+        one_sided: Some(Side::New),
         ..layout(false, Some(40), false)
     };
     insta::assert_snapshot!(traced(layout, &[(None, Some("a\t漢x"))]), @r"
@@ -668,7 +669,7 @@ fn mapped_cells_count_tabs_and_wide_characters() {
 #[test]
 fn mapped_cells_follow_scroll_and_wrapping() {
     let scrolled = Layout {
-        one_sided: true,
+        one_sided: Some(Side::New),
         scroll: 2,
         ..layout(false, Some(40), false)
     };
@@ -680,7 +681,7 @@ fn mapped_cells_follow_scroll_and_wrapping() {
     area 0:4 1
     ");
     let wrapped = Layout {
-        one_sided: true,
+        one_sided: Some(Side::New),
         ..layout(false, Some(8), true)
     };
     insta::assert_snapshot!(traced(wrapped, &[(None, Some("abcde"))]), @r"
@@ -794,4 +795,110 @@ fn line_numbers_and_hunk_numbers_can_be_left_out() {
     <dim> │</><added>+    eprintln!("done");</>
     <dim> │</> }
     "#);
+}
+
+/// In file view, in every indicators style: a changed line of the side
+/// read carries a heavy bar for its rule in its sign's color, an unchanged
+/// line none, and each run of the other side's unpaired lines is a rule
+/// across the pane in the hidden side's color that counts them and names
+/// the key that opens them, or closes them once open. In an opened change
+/// the other side's lines have no bar. The number shown is the side read's.
+#[test]
+fn file_view_marks_changes_and_hidden_runs_in_every_style() {
+    use std::fmt::Write as _;
+    let header = HunkHeader {
+        old_start: 3,
+        old_len: 1,
+        new_start: 4,
+        new_len: 1,
+        heading: b"",
+        hidden: 0,
+    };
+    let kept = Line {
+        state: LineState::Context,
+        old: Some(3),
+        new: Some(4),
+        text: b"kept",
+        emphasis: &[],
+        syntax: None,
+        paint: &[],
+        block_start: false,
+    };
+    // The line an edit was made into, on the new side.
+    let edited = Line {
+        state: LineState::AddedPaired,
+        old: None,
+        new: Some(5),
+        text: b"edited",
+        ..kept
+    };
+    // The line it was edited from, as an opened change shows it.
+    let was = Line {
+        state: LineState::RemovedPaired,
+        old: Some(5),
+        new: None,
+        text: b"was",
+        ..kept
+    };
+    let lines = [kept, edited, was];
+    let mut out = String::new();
+    for indicators in [
+        Indicators::Background,
+        Indicators::Bars,
+        Indicators::Classic,
+        Indicators::None,
+    ] {
+        for side in [Side::New, Side::Old] {
+            let layout = Layout {
+                indicators,
+                inline_signs: false,
+                one_sided: Some(side),
+                read_alone: true,
+                ..layout(false, Some(40), false)
+            };
+            let mut c = Canvas::default();
+            layout.hidden_run(2, false, Some("x"), &mut c);
+            for row in [
+                view::Row::One {
+                    line: 0,
+                    paired: None,
+                },
+                view::Row::One {
+                    line: 1,
+                    paired: Some(2),
+                },
+                view::Row::Hidden { from: 2, n: 1 },
+            ] {
+                layout.hunk_row(&header, row, |i| lines[i], &mut c);
+            }
+            layout.hidden_run(1, true, None, &mut c);
+            layout.hunk_row(&header, view::Row::Line(2), |i| lines[i], &mut c);
+            let _ = writeln!(out, "{indicators:?} {side:?}");
+            out += &c.markup();
+        }
+    }
+    insta::assert_snapshot!(out);
+}
+
+/// In file view, the row above a change at a file's first line shows the
+/// hunk's heading, or nothing: no `⋯`, since nothing is hidden there.
+#[test]
+fn file_view_start_row_is_its_heading_or_blank() {
+    let header = |heading: &'static [u8]| HunkHeader {
+        old_start: 1,
+        old_len: 2,
+        new_start: 1,
+        new_len: 2,
+        heading,
+        hidden: 0,
+    };
+    let layout = Layout {
+        one_sided: Some(Side::New),
+        hunk_headers: false,
+        ..layout(false, Some(40), false)
+    };
+    let mut c = Canvas::default();
+    layout.read_start(&header(b""), &mut c);
+    layout.read_start(&header(b"fn main()"), &mut c);
+    assert_eq!(c.markup(), "\n<dim>fn main()</>\n");
 }

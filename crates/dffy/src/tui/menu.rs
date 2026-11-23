@@ -1,5 +1,5 @@
 //! The menu a right click opens over what it was on: a file in the tree,
-//! a line of code, a `⋯` separator or a comment thread. The mouse is a
+//! a line of code, a `⋯` separator, a comment thread or a peek. The mouse is a
 //! shortcut layer, so nothing lives only here: each entry is something a
 //! key does there, shown with that key, and choosing it does what the key
 //! would. The viewer aims at the target first, as a left click would.
@@ -23,6 +23,8 @@ pub(super) enum Run {
     Thread(Act),
     /// `x`, on this separator rather than the first on screen.
     Reveal(Pos),
+    /// An action of the peek's table, on the peek.
+    Peek(Act),
 }
 
 /// Something a key does to what it's aimed at, which this menu and the

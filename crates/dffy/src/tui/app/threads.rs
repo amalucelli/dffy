@@ -194,9 +194,7 @@ impl App {
         self.tapped = None;
         self.press = None;
         self.rebuild_tree();
-        if let Some(picker) = &mut self.picker {
-            picker.rebuild(self.doc.document.files());
-        }
+        self.rebuild_picker();
         self.sync_threads();
     }
 
@@ -1605,6 +1603,12 @@ impl App {
             self.message("no comments file here: pass --comments <file>");
             return;
         };
+        if self.all_files.is_some() {
+            self.message(
+                "the tree lists all files; keeping to those with comments is for the diff's",
+            );
+            return;
+        }
         let on = !self.tree.commented();
         self.tree.set_commented(on.then(|| comments.paths()));
         self.close_panel();
@@ -1786,13 +1790,10 @@ impl App {
             return Err(format!("{shown} isn't on disk"));
         };
         comments.set_gone(path.as_bytes(), false);
-        let change = dffy_core::git::FileChange::unchanged(path.into(), mode);
+        let side = dffy_core::git::Side::Worktree { mode, id: None };
+        let change = dffy_core::git::FileChange::unchanged(path.into(), side);
         let file = self.doc.document.show_unchanged(change);
-        self.rebuild_tree();
-        if let Some(picker) = &mut self.picker {
-            picker.rebuild(self.doc.document.files());
-        }
-        self.dirty = true;
+        self.list_changed();
         Ok(file)
     }
 

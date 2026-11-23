@@ -62,6 +62,7 @@ It matters most in Claude Code, which can defer MCP tools until the agent search
 | `list_comments` | Review comments, thread by thread. | To read what reviewers said, or a local review's notes. |
 | `thread_prompt` | One thread as a prompt, with its lines and the file's changes near them. | To answer a thread or propose a change to its lines. |
 | `reply_to_thread` | The reply it wrote, under the client's name. | To say what you changed for a thread, or answer it, optionally with a suggestion. |
+| `definitions` | Where a C or Rust name is defined at a version of the diff, and the lines using it. | To read the code a change calls, at either version, without a language server. |
 | `open_in_viewer`, `focus_thread`, `viewer_selection`, `apply_suggestion` | What the user's viewer shows, or did. | To show the user a line or a thread, read their selection, or apply a suggestion ([Viewer tools](#viewer-tools)). |
 
 These inputs work the same across the diff tools:
@@ -212,18 +213,49 @@ Writes a reply in a thread, as `dffy comments apply` does ([comments.md](comment
 - A reply starting with `@claude` asks no agent. Only a comment typed in the viewer does.
 - An unknown id is a tool error, and nothing is written.
 
+### `definitions`
+
+Finds where a name is defined, as the viewer's go to definition does ([viewer.md](viewer.md#go-to-definition)), through the same lookup in dffy-core. It needs no viewer. Names are matched, not resolved: a name defined in several places has several candidates, nearest the asking file first. Read-only.
+
+| Input | Default | Meaning |
+|---|---|---|
+| `name` | required | The name: letters, digits and `_`. |
+| `path` | | The asking file, relative to the repository root, in a language go to definition reads ([viewer.md](viewer.md#go-to-definition) lists them): its own definitions, then what it includes or imports, then its folder or crate rank first. Without it, every definition of the name counts, by path, the first 200 listed. Another language's file is a tool error, and so is a version with no file of those languages. |
+| `side` | `new` | Which version of the diff to look in: `new` or `old`. |
+| `range`, `since_checkpoint` | uncommitted changes | The diff, as for `file_diff`. Without them, `new` is the working tree and `old` is `HEAD`. |
+| `references` | `false` | Add the lines using the name. |
+| `limit` | 100 | Lines using the name per page, 1 to 1000. |
+| `cursor` | | The previous page's `next_cursor`, which continues `references`. |
+
+```json
+{"name":"kmalloc_array","side":"new","candidates":[{"path":"include/linux/slab.h","start":612,"end":621,"kind":"function","container":null,"changed":true,"in_hunk":false,"text_match":false,"text":"static inline void *kmalloc_array(size_t n, size_t size, gfp_t flags)"}],"total":4,"progress":{"indexed":55554,"files":55554},"partial":false,"complete":true,"references":null,"next_cursor":null}
+```
+
+| Field | Meaning |
+|---|---|
+| `candidates` | The definitions found, best first, at most 200. `start` and `end` are the definition's first and last lines, 1-based. `kind` is `function`, `method`, `macro`, `type`, `struct`, `union`, `enum`, `enumerator`, `trait`, `constant`, `static`, `variable` or `module`. `container` is the type a method or an item of an impl or trait is on. `changed` says the diff changes the file; `in_hunk` says it adds or removes lines inside the definition, null where that wasn't worked out (past the first few candidates). `text` is the first line. |
+| `total` | Definitions found, beyond those listed. |
+| `progress`, `partial` | How far the version's index of definitions is built. The first call starts the navigator helper ([navigate.md](navigate.md)), which builds it on 2 threads at a nice of 10 and keeps it in the disk cache for later runs; a helper that exits is started again on the next call, at most 3 times a minute, and one that can't start, or keeps exiting, is a tool error, `definitions unavailable: …`. While `partial` is true, a definition may be missing: the answer comes from the files built so far and from the asking file's own includes and uses, read on the spot. Ask again for the full answer. |
+| `text_match` | No definition was found, so `candidates` are up to 50 lines using the name as a whole word, `kind` null, closest files first. A call searches for about 2 seconds; the next call with the same arguments goes on with the same search. |
+| `complete` | False while asking again could list more: the index is `partial`, or the text search hasn't been through every file nor found its 50 lines. |
+| `references` | With `references`, `{"matches","total","files","complete"}`: a page of the lines using the name as a whole word, each `{"path","line","text","changed","more"}`, closest files first, in the first 200 files with one and the first 1000 lines of each; `more` counts a file's lines past those, on its last one listed. A use in a C or Rust comment or string doesn't count, a block comment over several lines included, nor the line inside each definition of the name that names it, once the index has its file. A call searches for about 2 seconds, until it has a line past the page, or until it has found the 200 files; the next call's cursor goes on with the same search. `total` and `files` count the lines and the files found so far. `complete` is true once every file was searched with the index whole; past the 200 files the rest isn't searched, so `complete` stays false and `files` is a lower bound. Null without `references`. |
+
+The helper keeps the navigators of the two versions asked about last, and builds only the index of the one used last; another's build goes on once it's asked about again. After 10 minutes without a `definitions` call, the server closes the helper, which gives its memory back, as the next call of any tool starts; the next `definitions` starts another. A version is read again when the core says what it answers from moved: another revision, a file of the diff edited again, the index staged to.
+
+Two paths compared outside git, and a disk cache turned off (`cache = false`, `--no-cache`), are tool errors: the index lives in the cache.
+
 ### Viewer tools
 
 These drive the dffy viewer the user has open in the repository's working tree, through the [control API](control.md). They never start a viewer. With none running there, each returns a tool error (`No dffy viewer is running in /path/to/repo: ask the user to open dffy there; …`). With several, the error lists them.
 
 | Tool | Input | Result |
 |---|---|---|
-| `open_in_viewer` | `path` (required), `line` (1-based), `side` (`new` or `old`, default `new`) | `{"view","path","line","side"}` once the file shows, at the line when given. A file not in the viewer's diff, or a line it doesn't have, is a tool error. |
+| `open_in_viewer` | `path` (required), `line` (1-based), `side` (`new` or `old`, default `new`) | `{"view","path","line","side","listed"?}` once the file shows, at the line when given. A file the viewer's diff doesn't change opens whole at `side`, and the result then has `"listed":false` ([control.md](control.md#files-outside-the-diff)). No file at that path and side, a line the file doesn't have, or a viewer still listing the diff's files (ask again) is a tool error. |
 | `focus_thread` | `id`, any comment's id from `list_comments` | `{"view","thread","path","focused"}`. `thread` is the first comment's id. `focused` is false until the thread's place in the diff has loaded. |
 | `viewer_selection` | none | `{"view","selection"}`. `selection` is `{"path","side","start","end","text"}`, or null when nothing is selected. |
 | `apply_suggestion` | `id`, a comment with a suggestion or any comment in its thread | `{"view","thread","comment","path","start","end","lines"}` once written, as `comments/applySuggestion` answers ([control.md](control.md)). |
 
-The text result says what happened (`The viewer shows src/lib.rs at line 42.`). For `viewer_selection`, it gives the place and the selected lines.
+The text result says what happened (`The viewer shows src/lib.rs at line 42.`), and for a file outside the diff adds `It isn't in the diff, so it shows whole at the new side.` For `viewer_selection`, it gives the place and the selected lines.
 
 #### `apply_suggestion`
 

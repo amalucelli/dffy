@@ -188,6 +188,55 @@ fn space_again_expands_the_quick_popup_into_the_panel() {
     );
 }
 
+/// The quick popup opens with no row highlighted, `space` expanding it.
+/// A row run by its key is highlighted, and then `space` and `enter`
+/// toggle it again, the popup staying open with the new state; the footer
+/// says what `space` does. `tab` still expands it.
+#[test]
+fn space_toggles_the_quick_popups_highlighted_row() {
+    let mut app = app(140, 40);
+    key(&mut app, ' ');
+    let footer = |app: &mut App| {
+        let popup = boxed(app, "commands");
+        popup.lines().last().unwrap_or_default().to_owned()
+    };
+    assert!(footer(&mut app).contains("space more · ? keys · esc close"));
+    press(&mut app, Key::Enter);
+    assert!(quick(&app), "enter runs no row while none is highlighted");
+    let wrap = app.wrap;
+    key(&mut app, 'W');
+    assert_eq!(app.wrap, !wrap);
+    assert!(quick(&app));
+    assert!(footer(&mut app).contains("space toggles · tab more · esc close"));
+    key(&mut app, ' ');
+    assert_eq!(app.wrap, wrap);
+    assert!(quick(&app));
+    assert!(boxed(&mut app, "commands").contains("[ ] Wrap long lines"));
+    press(&mut app, Key::Enter);
+    assert_eq!(app.wrap, !wrap);
+    press(&mut app, Key::Tab);
+    assert_eq!((quick(&app), tab(&app)), (false, "Here"));
+}
+
+/// The quick popup's View group has the all-files tree's checkbox, from
+/// the diff too: it shows the tree, lists every file and gives it the
+/// keys, and the row shows it's on.
+#[test]
+fn the_quick_popup_toggles_the_all_files_tree() {
+    let mut app = app(140, 40);
+    app.set_snapshots(Some([Snapshot::Index, Snapshot::Worktree]));
+    key(&mut app, ' ');
+    let popup = boxed(&mut app, "commands");
+    insta::assert_snapshot!("commands_quick_all_files", popup);
+    assert!(popup.contains("[ ] All files"), "{popup}");
+    key(&mut app, '=');
+    assert!(app.all_files.is_some() && app.tree_shown);
+    assert_eq!(app.pane, Pane::Tree);
+    key(&mut app, ' ');
+    let popup = boxed(&mut app, "commands");
+    assert!(popup.contains("[x] All files"), "{popup}");
+}
+
 /// Here's keys come before the popup's other groups, which leave out a
 /// row whose key a Here row takes: in a conflict once a choice is made,
 /// `w` writes the file rather than toggling watching.
@@ -547,6 +596,103 @@ fn browsing_moves_a_cursor_and_enter_runs_its_row() {
     assert_eq!(app.view, View::Auto);
 }
 
+/// The panel's file view row steps from the diff to file view at the
+/// newer version, then at the older one, each named with what it means,
+/// and back; `h` steps the other way. The layout row sets the layout even
+/// in file view, where the layout's key flips the version read.
+#[test]
+fn the_file_view_row_steps_through_the_versions() {
+    let mut app = app(140, 40);
+    app.set_snapshots(Some([Snapshot::Index, Snapshot::Worktree]));
+    let row = |app: &mut App| {
+        let (_, entries) = app.command_entries();
+        let file_view = (entries.iter())
+            .find(|e| e.action == Act::ToggleFileView)
+            .expect("the file view row");
+        (
+            file_view.label.clone(),
+            file_view.value.clone().unwrap_or_default(),
+        )
+    };
+    key(&mut app, ' ');
+    key(&mut app, '_');
+    assert_eq!(app.doc.document.reading(), Some(document::Side::New));
+    let file_view = (
+        "File view".to_owned(),
+        "working tree · your files now".to_owned(),
+    );
+    assert_eq!(row(&mut app), file_view);
+    assert!(app.commands.is_some(), "{}", status(&mut app));
+    let under = (app.commands.as_ref()).and_then(|c| c.entry(c.cursor()));
+    assert_eq!(under, Some(Act::ToggleFileView));
+    key(&mut app, 'l');
+    assert_eq!(app.doc.document.reading(), Some(document::Side::Old));
+    assert_eq!(row(&mut app).1, "index · staged");
+    key(&mut app, 'l');
+    assert_eq!(app.doc.document.reading(), None);
+    assert_eq!(row(&mut app).1, "off");
+    key(&mut app, 'h');
+    assert_eq!(app.doc.document.reading(), Some(document::Side::Old));
+    assert!(app.commands.is_some());
+    key(&mut app, 's');
+    assert_eq!(app.view, View::Split);
+    assert_eq!(app.doc.document.reading(), Some(document::Side::Old));
+}
+
+/// The panel's columns are as wide as its widest row at the widest value
+/// each row can take: a long value shows whole, and stepping one leaves
+/// the box where it was. Where the screen is too narrow for a value, it's
+/// cut with `…`, its closing mark kept.
+#[test]
+fn panel_values_show_whole_or_cut_with_an_ellipsis() {
+    let file_view_row = |app: &mut App| {
+        let shown = screen(app);
+        (shown.lines())
+            .find(|l| l.contains("File view ‹"))
+            .map_or_else(|| panic!("{shown}"), str::to_owned)
+    };
+    // The box's top left corner and its width, from its top border.
+    let corner = |row: &str| {
+        let left = row.chars().position(|c| c == '┌').expect("the box");
+        let right = row
+            .chars()
+            .skip(left)
+            .position(|c| c == '┐')
+            .expect("the box");
+        (left, right)
+    };
+    let top = |app: &mut App| {
+        let shown = screen(app);
+        (shown.lines().find(|l| l.contains("commands"))).map_or_else(|| panic!("{shown}"), corner)
+    };
+    let mut app = app(140, 40);
+    app.set_snapshots(Some([Snapshot::Index, Snapshot::Worktree]));
+    // The quick popup, then the whole panel, on its View tab.
+    key(&mut app, ' ');
+    key(&mut app, ' ');
+    app.event(Event::Input(Input::Key(Key::Tab, Mods::NONE)));
+    let off = top(&mut app);
+    assert!(file_view_row(&mut app).contains("File view ‹ off ›"));
+    key(&mut app, '_');
+    let row = file_view_row(&mut app);
+    assert!(
+        row.contains("File view ‹ working tree · your files now ›"),
+        "{row}"
+    );
+    assert_eq!(top(&mut app), off);
+    key(&mut app, 'l');
+    assert_eq!(top(&mut app), off);
+    let mut app = super::support::app(40, 40);
+    app.set_snapshots(Some([Snapshot::Index, Snapshot::Worktree]));
+    key(&mut app, ' ');
+    key(&mut app, '_');
+    let row = file_view_row(&mut app);
+    assert!(
+        row.contains("‹ working tree") && row.contains("… ›"),
+        "{row}"
+    );
+}
+
 /// In the panel `h`/`l` only step values: off a value row they do
 /// nothing. Highlighting and line numbers are on `*` and `#`, so they
 /// work from any row, the layout row `s` leaves the cursor on included,
@@ -773,7 +919,8 @@ fn expanding_the_quick_popup_leaves_none_of_it_on_screen() {
     frame(&mut app);
     key(&mut app, 'W');
     frame(&mut app);
-    key(&mut app, ' ');
+    // With a row highlighted `space` toggles it; `tab` expands.
+    press(&mut app, Key::Tab);
     assert!(!quick(&app));
     for _ in 0..2 {
         let shown = frame(&mut app);

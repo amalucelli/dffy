@@ -1,5 +1,5 @@
 ---
-source: crates/dffy/src/tui/app.rs
+source: crates/dffy/src/tui/app/tests/draw.rs
 expression: screen(&mut app)
 ---
  modified · src/some/deeply/nested/module/file.rs · +2 -2                                                                  @@ -1,7 +1,7 @@

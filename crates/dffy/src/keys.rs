@@ -9,7 +9,9 @@
 //! keys, so `r` replies there and toggles the rendered view elsewhere, and
 //! for the conflict's table (`conflict:`) while the file at the cursor has
 //! conflicts to resolve, so `o` keeps the current side there and finds a
-//! file elsewhere. A thread's keys come before a conflict's. The command
+//! file elsewhere. A thread's keys come before a conflict's, and a
+//! go-to-definition peek's (`peek:`) before both while it has the keys, so
+//! `d` shows the definition in the diff there. The command
 //! panel has a table of its own (`leader:`), whose keys mean what they mean
 //! in the diff wherever the diff binds them too.
 
@@ -55,8 +57,8 @@ macro_rules! actions {
 
 actions! {
     Leader "leader" "command panel" "open the command panel; its next key runs a command",
-    ScrollDown "scroll_down" "scroll down" "scroll down a line; in the tree, move down",
-    ScrollUp "scroll_up" "scroll up" "scroll up a line; in the tree, move up",
+    ScrollDown "scroll_down" "scroll down" "scroll down a line; in the tree, move down; in a peek, the next definition",
+    ScrollUp "scroll_up" "scroll up" "scroll up a line; in the tree, move up; in a peek, the definition before",
     PageDown "page_down" "page down" "scroll down a screen",
     PageUp "page_up" "page up" "scroll up a screen",
     HalfPageDown "half_page_down" "half page down" "scroll down half a screen",
@@ -69,6 +71,7 @@ actions! {
     PrevFile "prev_file" "prev file" "previous file",
     Expand "expand" "more context" "show more of the highlighted ⋯ gap",
     ToggleFull "toggle_full" "toggle whole file" "whole files or changes only, for every file",
+    ToggleFileView "toggle_file_view" "toggle file view" "file view, or the diff again: every file whole as it is in one version, the newer first, with a mark in the gutter where the other version's lines were; s then flips the version",
     ScrollRight "scroll_right" "scroll right" "scroll the code right, without wrapping",
     ScrollLeft "scroll_left" "scroll left" "scroll the code left",
     ScrollReset "scroll_reset" "scroll to line start" "scroll the code back to its first column",
@@ -85,13 +88,22 @@ actions! {
     OpenPicker "open_picker" "find file" "find a file: type part of its path, enter opens it",
     Search "search" "search diff" "search the diff's text; n/N then go between matches, esc clears",
     FilterTree "filter_tree" "filter tree" "filter the file tree, fuzzily; f/F and n/N keep to the files it keeps, esc clears",
-    Open "open" "open file or folder" "open a file, or open or close a folder, in the tree",
+    Open "open" "open file or folder" "open a file, or open or close a folder, in the tree; in a peek, the definition's file at its line: its entry in the diff, else the whole file",
     Collapse "collapse" "collapse folder" "collapse a folder in the tree",
     ParentFolder "parent_folder" "parent folder" "go to the folder holding the file, in the tree",
+    GoToDefinition "go_to_definition" "go to definition" "list the names on the line last tapped, else the top line; type to narrow them, and enter shows where the one picked is defined, in the line's version, in a peek under the line. ctrl+click or alt+click on a name peeks it at once",
+    ShowInDiff "show_in_diff" "show in diff" "in a peek: the definition's lines in the diff, where the diff changes its file",
+    OtherVersion "other_version" "other version" "in a peek: the name's definitions in the diff's other version",
+    References "references" "references" "in a peek: the lines using the name in the peek's version, closest files first, as they're found: the first 200 files with a use, and how many there are; again shows the definitions",
+    ClosePeek "close_peek" "close peek" "close the peek",
+    JumpBack "jump_back" "jump back" "back to where the last jump left, with the line that was at the top at the top again: a jump is a definition opened from a peek, or a file opened from find file, the tree or the control API. The last 100 places are kept; one whose file isn't shown any more is skipped",
+    JumpForward "jump_forward" "jump forward" "forward again, to where jump back left",
     MarkViewed "mark_viewed" "mark viewed" "mark a file in the tree viewed",
+    CloseFile "close_file" "close file" "close a file opened outside the diff (from find file), the one selected in the tree or else the one shown; one with comments stays",
+    ToggleAllFiles "toggle_all_files" "toggle all files" "the tree lists every file of the repository, the diff's changes colored among them, or the diff's files again; s in the tree then shows the other version. Folders open as you go, enter on a file outside the diff shows it whole",
     TreeWider "tree_wider" "widen tree" "widen the tree",
     TreeNarrower "tree_narrower" "narrow tree" "narrow the tree",
-    CycleLayout "cycle_layout" "cycle layout" "layout: split, unified, then auto (split on wide screens); while selecting, the side copied",
+    CycleLayout "cycle_layout" "cycle layout" "layout: split, unified, then auto (split on wide screens); while selecting, the side copied; in file view, the side read",
     ToggleWrap "toggle_wrap" "toggle wrap" "wrap or truncate long lines",
     ToggleSyntax "toggle_syntax" "toggle syntax diff" "diff by lines or by syntax",
     ToggleRendered "toggle_rendered" "toggle rendered view" "files with a renderer plugin rendered, or as lines (experimental, see render)",
@@ -160,15 +172,18 @@ pub(crate) enum Table {
     Tree,
     Thread,
     Conflict,
+    /// While a go-to-definition peek has the keys.
+    Peek,
     Leader,
 }
 
 impl Table {
-    const ALL: [Self; 5] = [
+    const ALL: [Self; 6] = [
         Self::Main,
         Self::Tree,
         Self::Thread,
         Self::Conflict,
+        Self::Peek,
         Self::Leader,
     ];
 
@@ -179,12 +194,13 @@ impl Table {
             Self::Tree => "tree:",
             Self::Thread => "thread:",
             Self::Conflict => "conflict:",
+            Self::Peek => "peek:",
             Self::Leader => "leader:",
         }
     }
 }
 
-use Table::{Conflict as Cf, Leader as L, Main as M, Thread as Th, Tree as T};
+use Table::{Conflict as Cf, Leader as L, Main as M, Peek as P, Thread as Th, Tree as T};
 
 /// The defaults: `(table, key, action)`. The leader's are in the order the
 /// command panel lists them within a group.
@@ -226,6 +242,7 @@ const DEFAULTS: &[(Table, &str, Action)] = &[
     (M, "alt+left", Action::PrevFile),
     (M, "x", Action::Expand),
     (M, "X", Action::ToggleFull),
+    (M, "l", Action::ToggleFileView),
     (M, ">", Action::ScrollRight),
     (M, "L", Action::ScrollRight),
     (M, "<", Action::ScrollLeft),
@@ -243,12 +260,27 @@ const DEFAULTS: &[(Table, &str, Action)] = &[
     (M, "/", Action::Search),
     (T, "/", Action::FilterTree),
     (M, "u", Action::ParentFolder),
+    (M, "K", Action::GoToDefinition),
+    (M, "backspace", Action::JumpBack),
+    (M, "\\", Action::JumpForward),
+    (P, "j", Action::ScrollDown),
+    (P, "down", Action::ScrollDown),
+    (P, "k", Action::ScrollUp),
+    (P, "up", Action::ScrollUp),
+    (P, "enter", Action::Open),
+    (P, "d", Action::ShowInDiff),
+    (P, "s", Action::OtherVersion),
+    (P, "r", Action::References),
+    (P, "esc", Action::ClosePeek),
+    (P, "q", Action::ClosePeek),
     (T, "enter", Action::Open),
     (T, "l", Action::Open),
     (T, "right", Action::Open),
     (T, "h", Action::Collapse),
     (T, "left", Action::Collapse),
     (T, "v", Action::MarkViewed),
+    (T, "x", Action::CloseFile),
+    (T, "a", Action::ToggleAllFiles),
     (T, "+", Action::TreeWider),
     (T, "-", Action::TreeNarrower),
     (M, "s", Action::CycleLayout),
@@ -306,19 +338,25 @@ const DEFAULTS: &[(Table, &str, Action)] = &[
     (L, "s", Action::CycleLayout),
     (L, "W", Action::ToggleWrap),
     (L, "X", Action::ToggleFull),
+    (L, "_", Action::ToggleFileView),
     (L, "x", Action::Expand),
     (L, "B", Action::ToggleStatusBar),
+    (L, "=", Action::ToggleAllFiles),
     (L, "d", Action::ToggleSyntax),
     (L, "r", Action::ToggleRendered),
     (L, "I", Action::ToggleWhitespace),
     (L, "*", Action::ToggleHighlight),
-    (L, "K", Action::CycleIndicators),
+    (L, ",", Action::CycleIndicators),
     (L, "%", Action::CycleModifiedLines),
     (L, "#", Action::ToggleLineNumbers),
     (L, "@", Action::ToggleHunkHeaders),
     (L, "o", Action::OpenPicker),
+    (L, "K", Action::GoToDefinition),
+    (L, "(", Action::JumpBack),
+    (L, "\\", Action::JumpForward),
     (L, "|", Action::FilterTree),
     (L, "!", Action::CommentedFiles),
+    (L, ")", Action::CloseFile),
     (L, "t", Action::ToggleTree),
     (L, "f", Action::NextFile),
     (L, "F", Action::PrevFile),
@@ -458,7 +496,14 @@ impl Action {
             | Self::PrevThread
             | Self::ScrollRight
             | Self::ScrollLeft
-            | Self::ScrollReset => Group::Navigation,
+            | Self::ScrollReset
+            | Self::GoToDefinition
+            | Self::ShowInDiff
+            | Self::OtherVersion
+            | Self::References
+            | Self::ClosePeek
+            | Self::JumpBack
+            | Self::JumpForward => Group::Navigation,
             Self::NextFile
             | Self::PrevFile
             | Self::OpenPicker
@@ -470,11 +515,14 @@ impl Action {
             | Self::Collapse
             | Self::ParentFolder
             | Self::MarkViewed
+            | Self::CloseFile
             | Self::CommentedFiles
             | Self::TreeWider
             | Self::TreeNarrower => Group::Files,
             Self::Expand
             | Self::ToggleFull
+            | Self::ToggleFileView
+            | Self::ToggleAllFiles
             | Self::CycleLayout
             | Self::ToggleWrap
             | Self::ToggleStatusBar
@@ -539,6 +587,9 @@ impl Action {
     pub(crate) fn title(self) -> &'static str {
         match self {
             Self::OpenPicker => "Find file…",
+            Self::GoToDefinition => "Go to definition…",
+            Self::JumpBack => "Back",
+            Self::JumpForward => "Forward",
             Self::FilterTree => "Filter tree…",
             Self::Search => "Search in diff…",
             Self::ToggleTree => "File tree",
@@ -550,6 +601,7 @@ impl Action {
             Self::ToggleRendered => "Rendered view",
             Self::Expand => "More context",
             Self::ToggleFull => "Whole file",
+            Self::ToggleFileView => "File view",
             Self::CycleIndicators => "Indicators",
             Self::CycleModifiedLines => "Modified lines",
             Self::ToggleHighlight => "Syntax highlighting",
@@ -584,6 +636,8 @@ impl Action {
             Self::OpenTerminal => "Open terminal here",
             Self::SuggestChange => "Suggest change",
             Self::CommentedFiles => "Files with comments",
+            Self::CloseFile => "Close file",
+            Self::ToggleAllFiles => "All files",
             Self::Comments => "Comments panel",
             Self::OpenReview => "Open review…",
             Self::SinceLastReview => "Since last review",
@@ -601,6 +655,7 @@ impl Action {
     }
 
     /// A few words for notes on the status line.
+    #[expect(clippy::too_many_lines, reason = "a few words per action")]
     pub(crate) fn label(self) -> &'static str {
         match self {
             Self::Leader => "command panel",
@@ -618,6 +673,7 @@ impl Action {
             Self::PrevFile => "previous file",
             Self::Expand => "more context",
             Self::ToggleFull => "whole file",
+            Self::ToggleFileView => "file view",
             Self::ScrollRight => "scroll right",
             Self::ScrollLeft => "scroll left",
             Self::ScrollReset => "scroll back",
@@ -637,7 +693,16 @@ impl Action {
             Self::Open => "open",
             Self::Collapse => "collapse",
             Self::ParentFolder => "parent folder",
+            Self::GoToDefinition => "go to definition",
+            Self::ShowInDiff => "show in diff",
+            Self::OtherVersion => "other version",
+            Self::References => "references",
+            Self::ClosePeek => "close peek",
+            Self::JumpBack => "jump back",
+            Self::JumpForward => "jump forward",
             Self::MarkViewed => "mark viewed",
+            Self::CloseFile => "close file",
+            Self::ToggleAllFiles => "all files",
             Self::TreeWider => "wider tree",
             Self::TreeNarrower => "narrower tree",
             Self::CycleLayout => "layout",
@@ -836,6 +901,7 @@ pub(crate) struct Keys {
     tree: Vec<(Chord, Action)>,
     thread: Vec<(Chord, Action)>,
     conflict: Vec<(Chord, Action)>,
+    peek: Vec<(Chord, Action)>,
     leader: Vec<(Chord, Action)>,
 }
 
@@ -850,6 +916,7 @@ impl Default for Keys {
             tree: Vec::new(),
             thread: Vec::new(),
             conflict: Vec::new(),
+            peek: Vec::new(),
             leader: Vec::new(),
         };
         for &(table, key, action) in DEFAULTS {
@@ -867,6 +934,7 @@ impl Keys {
             Table::Tree => &mut self.tree,
             Table::Thread => &mut self.thread,
             Table::Conflict => &mut self.conflict,
+            Table::Peek => &mut self.peek,
             Table::Leader => &mut self.leader,
         }
     }
@@ -877,6 +945,7 @@ impl Keys {
             Table::Tree => &self.tree,
             Table::Thread => &self.thread,
             Table::Conflict => &self.conflict,
+            Table::Peek => &self.peek,
             Table::Leader => &self.leader,
         }
     }
@@ -888,8 +957,8 @@ impl Keys {
 
     /// Applies a `keybind` value: `<key>=<action>`, `<key>=unbind`, either
     /// with `tree:` before the key for the tree's table, `thread:` for the
-    /// thread's, `conflict:` for the conflict's or `leader:` for the command
-    /// panel.
+    /// thread's, `conflict:` for the conflict's, `peek:` for a peek's or
+    /// `leader:` for the command panel.
     pub(crate) fn bind(&mut self, value: &str) -> Result<(), Invalid> {
         // At the last `=`, so `==` binds the `=` key.
         let Some((key, action)) = value.rsplit_once('=').filter(|(k, _)| !k.is_empty()) else {
@@ -898,7 +967,14 @@ impl Keys {
                 hint: Some("for example: keybind = ctrl+d=half_page_down".to_owned()),
             });
         };
-        let (table, key) = [Table::Tree, Table::Thread, Table::Conflict, Table::Leader]
+        let tables = [
+            Table::Tree,
+            Table::Thread,
+            Table::Conflict,
+            Table::Peek,
+            Table::Leader,
+        ];
+        let (table, key) = tables
             .into_iter()
             .find_map(|t| Some((t, key.strip_prefix(t.prefix()).filter(|k| !k.is_empty())?)))
             .unwrap_or((Table::Main, key));
@@ -986,6 +1062,20 @@ impl Keys {
         self.in_table(Table::Conflict, action)
     }
 
+    /// The action of `key` with `mods` while a peek has the keys, which
+    /// takes the key before every other table: only a key bound exactly.
+    pub(crate) fn peek_action(&self, key: Key, mods: Mods) -> Option<Action> {
+        let chord = Chord { key, mods };
+        (self.peek.iter())
+            .find(|(c, _)| *c == chord)
+            .map(|&(_, a)| a)
+    }
+
+    /// The keys bound to `action` while a peek has the keys.
+    pub(crate) fn peek_chords(&self, action: Action) -> impl Iterator<Item = Chord> + '_ {
+        self.in_table(Table::Peek, action)
+    }
+
     fn in_table(&self, table: Table, action: Action) -> impl Iterator<Item = Chord> + '_ {
         self.table(table)
             .iter()
@@ -1033,7 +1123,8 @@ pub(crate) fn render_defaults(c: &mut Canvas) {
          own table first, set with tree: before the key (keybind = tree:v=mark_viewed), and so \
          do keys pressed while a comment thread is focused, in the thread's table (thread:), \
          then while the file at the cursor has conflicts to resolve, in the conflict's table \
-         (conflict:). The command panel the leader key opens has its own table too, set with \
+         (conflict:). Keys pressed while a go-to-definition peek has the keys look in its table \
+         (peek:) before any other. The command panel the leader key opens has its own table too, set with \
          leader: (keybind = leader:z=toggle_wrap); within a group, the panel lists its entries in this order.",
     );
     let defaults = Keys::default();
@@ -1066,6 +1157,7 @@ mod tests {
             .chain(&keys.tree)
             .chain(&keys.thread)
             .chain(&keys.conflict)
+            .chain(&keys.peek)
             .chain(&keys.leader)
         {
             assert_eq!(Chord::parse(&chord.name()).ok(), Some(*chord), "{chord:?}");

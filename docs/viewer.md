@@ -36,12 +36,38 @@ These keys change what the diff shows:
 
 | Key | Does |
 |---|---|
-| `s` | Cycles the layout: split, unified, auto |
+| `s` | Cycles the layout: split, unified, auto. In file view, flips the version read |
 | `W` | Wraps long lines |
-| `x` | Shows 20 more lines of the highlighted `⋯ N unchanged lines` gap |
+| `x` | Shows 20 more lines of the highlighted `⋯ N unchanged lines` gap. In file view, opens a change in place, or closes it |
 | `X` | Shows every file whole, or changes only |
+| `l` | Turns [file view](#file-view) on or off |
 | `d` | Turns the syntax diff on or off |
 | `r` | Switches a file with a renderer plugin to its rendered view (experimental, [plugins.md](plugins.md)) |
+
+### File view
+
+`l` shows every file as it is in one version of the diff, whole, as plain code: the newer version first, and `s` flips to the older one. The title reads as a file's, not a diff's: `src/lib.rs · working tree · 3 changes`, the version named as you gave it (`working tree`, `index`, `HEAD`, `v6.1`, a short id) and the changes counted in it, or `no changes`. The status bar says which version (`reading working tree`). File view is remembered (`file-view`); the version read isn't.
+
+In the [command panel](#the-command-panel) one row picks among the three: `File view ‹ off ›`, `‹ working tree · your files now ›` and `‹ HEAD · last commit ›`, stepped with `h`/`l`. Where a version is picked, it says what it is: `your files now` for the working tree, `staged` for the index, `last commit` for HEAD, and `before` or `after` for the older or newer revision of a range. Two paths compared outside git go by their names alone.
+
+Changed lines in the version read have a heavy bar, `┃`, in the gutter, as gitsigns marks them: green for added lines, blue for modified ones, red for removed ones in the older version. Unchanged lines have none.
+
+The other version's lines don't show. A line edited into another has no row of its own: its bar marks the edit, and a comment on the old line hangs under the new one. The lines that pair with none, as split view pairs them, stand in a rule across the pane, in their place: `── 2 lines removed · x shows them ──` in the newer version for lines removed outright, `── 3 lines added · x shows them ──` in the older. `n` and `N` stop at every change and every rule, and a comment on a hidden line hangs under its rule.
+
+`x` opens a change in place, as Zed does: its lines show as the diff shows them, removed lines on their red background and added ones on their green, under a rule that closes it again (`── 2 lines removed · x hides them ──`). It acts on the rule or edited line last tapped, else the first on screen, and on an opened change it closes it. A tap on a rule, or on an edited line's bar, does the same. In an opened change only the lines of the version read carry the bar, the other version's numbers are dim, and lines select, copy, stage and search as in the diff. Changes stay open until `s` flips the version, file view ends, or a reload moves the hunks.
+
+A file the version read doesn't have shows the other version, and its title says so: an added file read in HEAD is `src/new.rs · working tree · not in HEAD`, a deleted one read in the working tree `src/gone.rs · HEAD · deleted in working tree`. A file the diff doesn't list is titled with the version it's from: `notes.md · v6.1 · not in this diff`. A renamed file, or one whose mode alone changed, shows whole too. Two files or folders compared outside git are named as you typed them: `dffy old/ new/` reads `old/` and `new/`, a long path cut from the left with `…`.
+
+What changes in file view:
+
+- Search goes through the version read and the changes opened. Matches on the other version's hidden lines are counted, not gone to: `match 3/12 · 2 more in HEAD (s)`.
+- `A`, `U` and `D` with nothing selected take the whole hunk of the line, and say so. With lines selected they're refused unless the lines are in an opened change: `staging lines needs both versions; x opens the change in place`.
+- A comment, a suggestion and a copy take the version read. `s` while selecting says `file view copies the version shown`.
+- The scope line reads the version read, and a hunk's `@@` numbers don't show.
+- `X` switches whole files anyway, for when file view is off, and says so.
+- `d` and `r` work as elsewhere, on the version read.
+
+A piped diff has only its hunks, so it has no file view, and `l` says why.
 
 ### The scope line
 
@@ -92,10 +118,45 @@ Code and paths never reach the terminal raw. Control characters show in caret no
 | `f` `F` | To the next or previous file |
 | `m` `M` | To the next or previous comment thread ([Finding](#finding)) |
 | `o` | To a file found by name ([The file picker](#the-file-picker)) |
+| `K` | To where a name is defined, in a peek under the line ([Go to definition](#go-to-definition)) |
+| `backspace` `\` | Back to where the last jump left, or forward again ([Jumping back](#jumping-back)) |
 | `tab` | The keys, between the left panel and the diff |
 | `esc` | One step back: closes a panel, ends a search or filter, cancels a selection, leaves a thread or the left panel |
 
 `t` shows or hides the left panel ([The file tree](#the-file-tree)). `e` opens `$VISUAL` or `$EDITOR` at the line last tapped, else at the top line. `q` quits.
+
+### Jumping back
+
+Opening a definition from a peek or a file from the picker, the tree or the all-files tree is a jump, and so is a control API request that shows a file (`view/open`, MCP's `open_in_viewer`, `comments/add`). Each one keeps the place it leaves: the file and the line at the top of the screen. `backspace` goes back there with that line at the top again, and `\` goes forward again. Moving through the tree shows the files it passes, so a file opened from the tree goes back to where the tree was entered from, and so does leaving the tree for the diff on another file than that. `n`, `f`, `g`, threads and search are moves, not jumps.
+
+The status bar says where each jump lands and how many places are left that way: `back to fs/namei.c:120 · 3 more`. Opening the file already shown is no jump, unless it goes to a line in it. A place whose file isn't shown any more, such as a file opened outside the diff and closed since, or whose version is another one now, is skipped and counted: `skipped 1 no longer shown`. A place is its file's path and version, so it holds when the diff's list is read again. The last 100 places are kept. A commit's page and the conversation have no path, and jumps from them aren't kept. The command panel lists `Back` and `Forward` under Go while there's somewhere to go.
+
+### Go to definition
+
+`K` lists the names on the line last tapped, else the top line of code, in a small list under it. Typing narrows them, the arrows move, and `enter` peeks at the one picked. A ctrl+click or an alt+click on a name peeks at it at once, and on a line of code the right-click menu has `Go to definition`. It works in the version of the diff the line is in, old or new alike, in files of these languages: Bash, C, C++, C#, Elixir, Go, Java, JavaScript (with JSX), Kotlin, Lua, PHP, Python, Ruby, Rust, Scala, Swift, TypeScript (with TSX) and Zig. TypeScript, TSX and JavaScript files see each other's definitions, and so do C and C++ files (a `.h` header is read as C).
+
+The peek hangs under the line, as a comment thread does, and has the keys until you click the code above it; a click on the peek gives them back. Its top edge reads `kmalloc_array · 3 definitions · include/linux/slab.h:612 · v6.1`, with `changed in this diff` when this diff changes the definition's lines. On the left is the definition's code, highlighted, a few lines above it and the rest of the body below; on the right the name's definitions, grouped by file, each with its line. On a narrow screen the list goes above the code.
+
+| Key in the peek | Does |
+|---|---|
+| `j` `k` | The next or previous definition |
+| `enter` | Opens the definition's file at its line: its entry in the diff when the diff changes it, else the whole file, listed under not in this diff |
+| `d` | Shows the definition in the diff, when the diff changes its file |
+| `s` | The name's definitions in the diff's other version |
+| `r` | The lines using the name ([References](#references)), or its definitions again |
+| `esc` `q` | Closes the peek |
+
+Names are matched, not resolved. The definitions are functions, types, constants and module-level variables, and the members a reader jumps to: methods, fields and properties, enum members, and the members of interfaces, traits and protocols, each with the type it's in. A Python module's name finds its file. Definitions are listed nearest first: the same file, then files it imports, then the same folder or Rust crate, then the rest; within each, a member of a type the file names comes first. What counts as an import is each language's: C and C++ `#include`s, Rust `use`, relative JavaScript and TypeScript imports, Python modules, the Go module's own packages, Java, Kotlin, Scala, C# and PHP imports by the folder their package starts in, and Ruby, Lua, Elixir, Zig and Bash files by their convention. An import is followed through a re-export (a Rust `pub use`, a JavaScript or TypeScript `export … from`, a Python package's `__init__.py`) to the file defining the name; the re-export is listed after the definitions. A method call lists every method of that name with the type each is on.
+
+The first `K` starts the navigator helper, a process of its own ([navigate.md](navigate.md)), which builds the asked version's index of definitions on one thread at a lower priority and keeps it in the disk cache for the next run. Until it's done a lookup answers from what's indexed, the files near the asking one read on the spot, and says how far it got: `partial: 12,000 of 55,191 files indexed`. It looks again once the index is complete, and again when the diff's list is read again (in watch mode, after a refresh), with the files as they are then. Ten minutes after the last peek closed, with no `K` since, the viewer closes the helper, which gives its memory back, and the next `K` starts another that reads the index back from the disk cache. A helper that exits is started again on the next ask, at most 3 times a minute; one that can't start, or keeps exiting, is said in the peek: `definitions unavailable: …`. A name with no definition found falls back to the lines that use it as a whole word, labelled as text matches: `no definition of foo indexed yet (12,000 of 55,191 files) · searching text…`. A tags query that doesn't compile is said in the status bar. Files over 512KB, and those too slow to parse, have no definitions indexed; a lookup that finds nothing says how many there are.
+
+#### References
+
+`r` in the peek lists the lines using the name in the peek's version in place of its definitions, as a whole-word search finds them, closest files first: the asking file, what it includes or imports, its folder or crate, then the rest. Lines stream in while the search goes, and the top edge says how far it is (`37 files so far · searching 12,000 of 78,019`), then how many files use the name (`first 200 of 4,523 files use it`): the list holds the lines of the first 200 files with a use, at most 1000 of each (the last says `+N more in this file`), and the rest are counted. In files of the languages go to definition reads, a use inside a comment or a string doesn't count, nor the line inside each definition of the name that names it, once the index has its file. A comment or string over several lines is followed to where it closes, in each language's forms: block comments, strings of three quotes, JavaScript templates (their `${…}` parts are code), raw strings, heredocs, Ruby's `=begin` and Lua's long brackets; what opens one inside another, as `/*` in a string, opens nothing. A search that ran while the index was still being built says `index partial: definitions may show`. `enter` opens a use as it opens a definition, and `r` again shows the definitions, each list keeping its place.
+
+One search runs at a time: asking for another name's uses, another version's, or closing the peek stops it. It runs after the work on screen, a little at a time, and gives way to any other work waiting. Its answer is kept for the version, the asking file and the name, so `r` on them again shows it at once, unless it ran on a partial index; the working tree's and the index's answers are dropped when the diff's list is read again, and a search of a version that moved stops and starts over on the next `r`.
+
+Go to definition needs git's versions of the files and the disk cache. A piped diff, two paths compared outside git and `cache = false` say why it's off.
 
 ## Search
 
@@ -438,9 +499,9 @@ It lists one row per line, in three titled groups:
 
 View and Go own their rows, so Here's group leaves out what they list. They in turn leave out a row whose key a Here row takes. A screen too short for all three leaves out View.
 
-Each row shows one key. It's the key that does the same outside the panel when there is one, such as `f` for fix with agent on a thread. Otherwise it's the panel's, such as `&` with lines selected. The popup has the full panel's keys on Here. A row's key runs it, whether shown or the panel's, and any other entry's key runs that entry. `j`/`k` with `enter`, `h`/`l` on a value, and a tap work the same.
+Each row shows one key. It's the key that does the same outside the panel when there is one, such as `f` for fix with agent on a thread. Otherwise it's the panel's, such as `&` with lines selected. The popup has the full panel's keys on Here. A row's key runs it, whether shown or the panel's, and any other entry's key runs that entry. `h`/`l` on a value and a tap work the same.
 
-`space` or `tab` shows the full panel on Here. `/` starts its search, `?` lists all keys, and `esc` closes. A setting's key the popup doesn't list shows the full panel on that setting's tab.
+The popup opens with no row highlighted, and `space` shows the full panel on Here (`space more`). A row run by its key, moved to with `j`/`k`, or tapped is highlighted; then `space` and `enter` run it again, a value stepping forward, and the popup stays open on the new state (`space toggles`). `tab` shows the full panel at any time. `/` starts its search, `?` lists all keys, and `esc` closes. A setting's key the popup doesn't list shows the full panel on that setting's tab.
 
 ### The command panel
 
@@ -508,11 +569,27 @@ The thread in the diff is a preview. A folded one shows whole while it's selecte
 
 `t` shows or hides the left panel. It shows the file tree unless it shows the comments (`i`). Folders collapse, and single-child folder chains show as one row. Each file has its status letter and line counts.
 
-In the tree, `enter` or `l` opens, `h` collapses, and `u` goes to the parent folder. `v` marks a file viewed, which dims it, and `+`/`-` resize the tree. The tree follows the diff as you move between files.
+Untracked files sit in their folders among the changed ones, in path order, with a dim `?`. Once a file is [opened outside the diff](#files-outside-the-diff), the diff's files go under a heading, `Changed in this diff (N)`, and the opened ones under `Not in this diff (N)` after them. Each heading counts its files and folds. The diff, `f`/`F` and the picker go through them in that order. A commit's files go under the commit instead.
+
+In the tree, `enter` or `l` opens, `h` collapses, and `u` goes to the parent folder. `v` marks a file viewed, which dims it, `x` closes a file opened outside the diff, and `+`/`-` resize the tree. The tree follows the diff as you move between files.
+
+### All files
+
+`a` in the tree, or the command panel's All files row, lists every file of the repository instead, as Zed's project panel does: one tree, the title naming the version (`All files · working tree`, `All files · v6.1`). From the diff it shows the tree and gives it the keys. It opens on the file shown, its folders opened to it, once: after that the tree stays where you leave it as you move through the diff. `a` again goes back to the diff's files, and the choice is remembered (`all-files`); coming back to all files finds its folders and place as they were.
+
+- Folders start folded and open as you go, each made from the version's list of files, read once the tree shows and kept. Until the list comes, the diff's files alone show, and the title says `listing…`. Folded and opened folders stay so across rebuilds.
+- The diff's files keep their status letter and counts, their names in their change's color, the files the version lacks included: a deleted one in the newer version, an added or untracked one in the older. A renamed file is at its path in each version. A folder with changes inside takes the color of the strongest of them: a conflict, then a deletion, an edit, an addition, an untracked file. Files without changes are plain.
+- `enter` or a tap on a changed file goes to its diff. On another it shows the file whole, as the [picker](#opening-files) does, and `x` closes it again.
+- `s` in the tree shows the repository at the other version of the diff.
+- `/` filters every file, the diff's included, scored as the picker scores them: in the background on a large repository, the matches shown staying until the new ones come. The best 1,000 show, with their folders, and the title counts them all.
+
+A piped diff and two paths compared have only their files, so `a` says why and the panel leaves the row out.
 
 ### The file picker
 
 `o` opens the picker. Type part of a path, fuzzily. Matches in file names rank before matches in folder names. `enter` or a tap opens the file. The picker reads a piped diff to the end while it's open, so it finds files not yet reached.
+
+The diff's files come first. Under a divider, `not in the diff · working tree`, come the repository's other files in the diff's newer version, and `tab` switches them to the older one (`tab HEAD (last commit)`) and back ([Opening files](#opening-files)).
 
 ### The menu
 
@@ -531,9 +608,25 @@ A right click aims first, as a click does, but without opening, folding or revea
 
 ## Files outside the diff
 
+### Opening files
+
+The [picker](#the-file-picker) opens any file in either version of the diff, not only the ones it changes. Below the diff's files it lists the others in the newer version, or after `tab` in the older one: for `v6.0..v6.1` the files of `v6.0` or `v6.1`, for plain `dffy` HEAD's or the working tree's tracked files. The list is read the first time `o` opens and kept. Each keystroke scores the diff's files at once and the others in the background, so typing doesn't wait.
+
+`enter` on one of them shows it whole after the diff's files, as it is in that version. The tree lists it under `Not in this diff`, tagged with the version's name (`v6.0`) when it's from the older one, and the title says `not in this diff`. A file the diff does list goes to its own entry. Opening an open file in the other version replaces it. A binary or very large file shows why it isn't shown, as in the diff.
+
+When the diff's sides move, as watch mode reloads, a checkpoint or a review's update, each opened file is looked up again: it shows as its version has it now, or it closes, and the status bar says so (`closed, gone: kept.txt (v6.0)`). Tree `x`, or `space` then `)`, closes one. A file with comments stays, and `x` says so.
+
+A piped diff and two files compared outside git list no other files, and the picker says why.
+
+`dffy ctl open`, and the MCP tool `open_in_viewer`, open a file the same way, at the side asked for ([control.md](control.md#dffy-ctl)).
+
+`e` opens the working tree's copy of a file. When the view shows another version of it, as a range between commits, a review or file view on the old side does, the status bar names that version: `editing the working tree · view: v6.1`. On a row of the old side alone in one of the diff's files, the editor opens at the line the change maps it to on the new side. When the view shows the file from the working tree, on either side, the file is read again once the editor exits, watch mode on or not.
+
+### Files with comments
+
 The comments panel lists threads on files this diff doesn't change. `enter` or a tap on such a thread opens its file after the diff's files, whole, as the working tree has it, with every line unchanged. `m` past the diff's last thread opens the next such file with threads that's on disk, the same way.
 
-The tree lists the file under `comments only · no changes`, and the title says the same. The thread is focused on its lines. A thread whose lines are gone shows the lines it was written on at the file's end, as in any file. Replying, asking, resolving, fixing and applying a suggestion work there as on any file in the working tree.
+The tree lists the file under `Not in this diff`, and the title says `not in this diff`. The thread is focused on its lines. A thread whose lines are gone shows the lines it was written on at the file's end, as in any file. Replying, asking, resolving, fixing and applying a suggestion work there as on any file in the working tree.
 
 The file stays for the session, or until the diff lists it. A suggestion applied there changes it, so in a diff of the working tree it then becomes one of the diff's files. A file that isn't on disk opens nothing. The status bar says so, and its thread stays in the panel.
 

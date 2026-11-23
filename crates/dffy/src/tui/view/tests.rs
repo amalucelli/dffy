@@ -53,7 +53,7 @@ fn layout(split: bool, wrap: bool) -> Layout {
         words: false,
         tab_width: 4,
         indicators: Indicators::Classic,
-        one_sided: false,
+        one_sided: None,
         unmerged: false,
         digits: 0,
         inline_signs: false,
@@ -61,6 +61,7 @@ fn layout(split: bool, wrap: bool) -> Layout {
         line_numbers: true,
         hunk_headers: true,
         modified_lines: true,
+        read_alone: false,
     }
 }
 
@@ -472,6 +473,80 @@ fn a_one_sided_file_is_one_full_width_pane_in_split_view() {
     insta::assert_snapshot!("one_sided_split", screen(&mut doc));
 }
 
+/// A file renamed without an edit has its lines as one gap: a separator
+/// in the diff, and the whole file in file view, numbered once.
+#[test]
+fn a_renamed_file_without_edits_shows_whole_in_file_view() {
+    let side = Some(Side::Worktree {
+        mode: Mode::File,
+        id: None,
+    });
+    let text = Text::new(b"one\ntwo\nthree\n".to_vec());
+    let fd = FileDiff {
+        change: FileChange {
+            path: "b.txt".into(),
+            status: Status::Renamed {
+                from: "a.txt".into(),
+                similarity: 100,
+            },
+            old: side,
+            new: side,
+            staging: None,
+        },
+        hunks: Vec::new(),
+        old: text.clone(),
+        new: text,
+        binary: false,
+        too_large: false,
+        note: None,
+    };
+    let mut doc = doc_of(fd, layout(true, false), 6);
+    assert_eq!(separators(&mut doc), ["⋯ 3 unchanged lines"]);
+    doc.set_reading(Some(document::Side::New));
+    let shown = screen(&mut doc);
+    let lines: Vec<&str> = shown.lines().take(3).collect();
+    for (row, (n, text)) in lines
+        .iter()
+        .zip([("1", "one"), ("2", "two"), ("3", "three")])
+    {
+        assert!(
+            row.starts_with(n) && row.ends_with(&format!("│ {text}")),
+            "{shown}"
+        );
+    }
+    assert!(separators(&mut doc).is_empty(), "{shown}");
+}
+
+/// In split view, file view on and off again puts the top back on the row
+/// it was on: the diff's rows come back split, as they're drawn.
+#[test]
+fn leaving_file_view_in_split_keeps_the_top_row() {
+    let old = (1..=40).fold(String::new(), |out, i| out + &format!("line {i}\n"));
+    let new = old
+        .replace("line 10\nline 11\nline 12\nline 13\n", "ten to thirteen\n")
+        .replace("line 30\n", "line 30a\nline 30b\n");
+    for k in 0..26 {
+        let mut doc = doc_of(file_diff("a.txt", &old, &new), layout(true, false), 10);
+        doc.toggle_full();
+        doc.scroll(k);
+        let top = doc.document.pos;
+        let lines = doc.row_lines(top);
+        doc.set_reading(Some(document::Side::New));
+        doc.set_reading(None);
+        let now = doc.row_lines(doc.document.pos);
+        if lines[1].is_some() {
+            assert_eq!((doc.document.pos, now), (top, lines), "scrolled {k}");
+        } else {
+            // A removed line hides under its run's mark, which comes back
+            // as the run's first line.
+            assert!(
+                now[0].is_some() && now[0] <= lines[0],
+                "scrolled {k}: {now:?}"
+            );
+        }
+    }
+}
+
 #[test]
 fn gaps_show_as_separators_and_open_twenty_lines_then_whole() {
     let mut doc = doc_of(long_diff(), layout(false, false), 40);
@@ -501,7 +576,7 @@ fn clicking_a_separator_opens_it() {
         .expect("separator");
     assert!(rows[y].starts_with("⋯ 17"), "{rows:#?}");
     // Seventeen lines open at once.
-    doc.click(y);
+    doc.click(y, true);
     assert_eq!(separators(&mut doc).len(), 1);
 }
 
@@ -2452,6 +2527,7 @@ fn search_finds_the_text_of_comments() {
     let found = document::find(
         &diff,
         Some(&hidden),
+        None,
         &blocks,
         &document::Needle::new("count"),
         || false,
@@ -2475,6 +2551,7 @@ fn search_finds_the_text_of_comments() {
         file: 0,
         hidden,
         blocks_version: doc.document.blocks_version(0),
+        reading: None,
         matches: Arc::new(found),
         current: Some(in_box),
     });

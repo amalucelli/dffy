@@ -3,7 +3,7 @@
 use gix::bstr::{BStr, ByteSlice};
 use gix::revision::plumbing::Spec;
 
-use super::{Error, ObjectId, Repo, Result, WhichCheckpoint};
+use super::{Error, ObjectId, Repo, Result, Snapshot, WhichCheckpoint};
 
 /// The two sides of a diff, with revisions resolved to trees.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -52,6 +52,50 @@ pub enum DiffSpec {
         /// The checkpoint's tree.
         tree: ObjectId,
     },
+}
+
+impl DiffSpec {
+    /// The old and new sides as snapshots of the repository, swapped when
+    /// `reverse` (`-R`), as [`FileChange::reversed`](super::FileChange::reversed)
+    /// swaps a change's. `None` for [`DiffSpec::Paths`], whose sides are
+    /// outside git.
+    #[must_use]
+    pub fn snapshots(&self, reverse: bool) -> Option<[Snapshot; 2]> {
+        let mut sides = match *self {
+            Self::Uncommitted { head: tree }
+            | Self::TreeToWorktree { tree }
+            | Self::Checkpoint { tree } => [Snapshot::Tree(tree), Snapshot::Worktree],
+            Self::IndexToWorktree { .. } => [Snapshot::Index, Snapshot::Worktree],
+            Self::TreeToIndex { tree } => [Snapshot::Tree(tree), Snapshot::Index],
+            Self::TreeToTree { old, new } => [Snapshot::Tree(old), Snapshot::Tree(new)],
+            Self::Paths => return None,
+        };
+        if reverse {
+            sides.reverse();
+        }
+        Some(sides)
+    }
+
+    /// The diff between two snapshots, and whether its changes are to be
+    /// [reversed](super::FileChange::reversed) to run from the first to the
+    /// second; `None` when neither way round is one git diffs (two working
+    /// trees). A tree against the working tree is [`DiffSpec::Uncommitted`],
+    /// untracked files included, as the index against the working tree
+    /// includes them: everything that differs between the two.
+    #[must_use]
+    pub fn between(snapshots: [Snapshot; 2]) -> Option<(Self, bool)> {
+        let spec = |[old, new]: [Snapshot; 2]| match (old, new) {
+            (Snapshot::Tree(old), Snapshot::Tree(new)) => Some(Self::TreeToTree { old, new }),
+            (Snapshot::Tree(tree), Snapshot::Index) => Some(Self::TreeToIndex { tree }),
+            (Snapshot::Tree(head), Snapshot::Worktree) => Some(Self::Uncommitted { head }),
+            (Snapshot::Index, Snapshot::Worktree) => {
+                Some(Self::IndexToWorktree { untracked: true })
+            }
+            _ => None,
+        };
+        let [old, new] = snapshots;
+        (spec(snapshots).map(|s| (s, false))).or_else(|| spec([new, old]).map(|s| (s, true)))
+    }
 }
 
 /// `git diff` arguments as typed, kept to resolve them again once refs move.
@@ -253,7 +297,12 @@ impl Repo {
         Ok(self.git()?.find_object(id)?.peel_to_tree()?.id)
     }
 
-    pub(super) fn head_tree(&self) -> Result<ObjectId> {
+    /// `HEAD`'s tree, or the empty tree before the first commit.
+    ///
+    /// # Errors
+    ///
+    /// An unreadable `HEAD` or tree; outside git.
+    pub fn head_tree(&self) -> Result<ObjectId> {
         Ok(self.git()?.head_tree_id_or_empty()?.detach())
     }
 

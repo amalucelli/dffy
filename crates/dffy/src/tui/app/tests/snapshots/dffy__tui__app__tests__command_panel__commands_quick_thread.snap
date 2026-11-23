@@ -2,26 +2,26 @@
 source: crates/dffy/src/tui/app/tests/command_panel.rs
 expression: popup
 ---
-┌─ commands ────────────────────────┐
-│                                   │
-│  On this thread                   │
-│  a  Ask agent                     │
-│  f  Fix with agent                │
-│  y  Copy as prompt                │
-│  x  Resolve                       │
-│  r  Reply                         │
-│  ^  Send open threads to agent    │
-│                                   │
-│  View                             │
-│  s  Layout ‹ auto (split here) ›  │
-│  W  [ ] Wrap long lines           │
-│  d  [ ] Syntax diff               │
-│  X  [ ] Whole file                │
-│                                   │
-│  Go                               │
-│  o  Find file…                    │
-│  i  Comments panel                │
-│  w  [ ] Watch for changes         │
-│  .  Open terminal here            │
-│                                   │
-│  space more · ? keys · esc close  │
+┌─ commands ─────────────────────────────┐
+│                                        │
+│  On this thread                        │
+│  a  Ask agent                          │
+│  f  Fix with agent                     │
+│  y  Copy as prompt                     │
+│  x  Resolve                            │
+│  r  Reply                              │
+│  ^  Send open threads to agent         │
+│                                        │
+│  View                                  │
+│  s  Layout ‹ auto (split here) ›       │
+│  W  [ ] Wrap long lines                │
+│  d  [ ] Syntax diff                    │
+│  X  [ ] Whole file                     │
+│                                        │
+│  Go                                    │
+│  o  Find file…                         │
+│  i  Comments panel                     │
+│  w  [ ] Watch for changes              │
+│  .  Open terminal here                 │
+│                                        │
+│  space more · ? keys · esc close       │

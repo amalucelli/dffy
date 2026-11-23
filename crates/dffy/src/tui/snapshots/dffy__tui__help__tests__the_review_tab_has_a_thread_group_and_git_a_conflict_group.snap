@@ -4,7 +4,6 @@ expression: "shown(&mut help, &keys, 100, 30)"
 ---
 
 
-
        ┌─ keybinds ──────────────────────────────────────────────────────────── esc close ─┐
        │  Move  Files  View  Git  Copy  Review  General                                    │
        │                                                                                   │
@@ -24,6 +23,8 @@ expression: "shown(&mut help, &keys, 100, 30)"
        │ P                 post the review                                                 │
        │ O                 open a review…                                                  │
        │ R                 since last review                                               │
+       │                                                                                   │
+       │                                                                                   │
        │                                                                                   │
        │ more settings: space · all keys: docs/keys.md                                     │
        │ tab section · / search · esc close                                                │

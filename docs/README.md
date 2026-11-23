@@ -15,6 +15,7 @@
 - [plugins.md](plugins.md): experimental plugins. Renderers, the rendered view and the Markdown plugin, review plugins, the agent plugin and its recipes, their protocols, and writing your own.
 - [review-github.md](review-github.md): `dffy-review-github`, the experimental review plugin for GitHub pull requests: how it opens, imports, posts and watches a PR, and what it keeps.
 - [comments.md](comments.md): experimental review comments: the comments file's format, anchors and placement, and the operations of `dffy comments apply` and `import`.
+- [navigate.md](navigate.md): `dffy __navigate`, the helper process go to definition runs in for the viewer and the MCP server, and its protocol.
 - [troubleshooting.md](troubleshooting.md): `dffy doctor` and its checks, copying, the mouse, colors, watch mode, a garbled terminal.
 - [architecture.md](architecture.md): crates and modules, data flow, the engine, performance, testing and releases.
 - [design.md](design.md): the approach a change follows, and step-by-step guides for adding a review plugin, an agent recipe, an annotation source, a frontend and a benchmark scenario.

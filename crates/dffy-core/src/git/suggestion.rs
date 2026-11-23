@@ -7,9 +7,9 @@
 use std::io::ErrorKind;
 use std::ops::Range;
 
-use gix::bstr::{BStr, ByteSlice};
+use gix::bstr::ByteSlice;
 
-use super::{Error, FileDiff, Mode, ObjectId, Repo, Result, Side, is_binary, worktree};
+use super::{Error, FileDiff, Mode, Repo, Result, Side, is_binary, worktree};
 use crate::diff::Text;
 use crate::view::Staging;
 
@@ -67,20 +67,6 @@ pub(crate) fn check_suggestion(diff: &FileDiff, new_side: NewSide) -> Result<()>
 }
 
 impl Repo {
-    /// The id HEAD's tree has at `path`, a blob's for a file; `None` when
-    /// nothing is there or HEAD isn't born yet.
-    ///
-    /// # Errors
-    ///
-    /// When the objects can't be read, or outside git.
-    pub fn head_blob(&self, path: &BStr) -> Result<Option<ObjectId>> {
-        let repo = self.git()?;
-        let tree = repo.head_tree_id_or_empty()?;
-        let tree = repo.find_object(tree)?.peel_to_tree()?;
-        let entry = tree.lookup_entry(path.split_str("/"))?;
-        Ok(entry.map(|e| e.object_id()))
-    }
-
     /// Puts the `replacement` lines in place of those `find` picks from the
     /// working-tree file of `shown`, as git reads it, and returns them with
     /// the file as git reads it after.

@@ -1,17 +1,27 @@
 //! Searching the diff (`/`): the jobs that find matches off the main
 //! thread, landing on them, and their counts.
 
+use std::fmt::Write as _;
 use std::ops::Range;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
-use dffy_core::document::{Found, Hit, Match, Matches, Needle, Pos, Side, Source};
+use dffy_core::document::{Found, Hit, Match, Matches, Needle, Pos, Reading, Side, Source};
 use dffy_core::git::FileDiff;
 
 use super::{App, Land, SEARCH_AHEAD, Search};
 use crate::term::{Key, Mods};
 use crate::tui::view;
 use crate::tui::worker::Job;
+
+/// What a scan's matches were found in: the diff, its hidden lines, how
+/// it was read alone and the version of its blocks.
+type Scanned<'a> = (
+    Option<&'a Arc<FileDiff>>,
+    &'a [Range<usize>],
+    Option<Reading>,
+    u64,
+);
 
 impl App {
     /// `/` in the diff: a search line at the bottom, matched as it's typed.
@@ -25,6 +35,7 @@ impl App {
             id,
             counts: vec![None; self.doc.document.files().len()],
             pending: None,
+            resume: None,
         });
         self.live_search.store(id, Ordering::Relaxed);
         self.doc.document.search = None;
@@ -59,6 +70,22 @@ impl App {
         search.id = self.search_id;
         search.counts = vec![None; self.doc.document.files().len()];
         search.pending = None;
+        search.resume = None;
+        self.live_search.store(search.id, Ordering::Relaxed);
+        self.doc.document.search = None;
+    }
+
+    /// The search, if any, starts over on the lines shown now: its counts
+    /// and matches were of others.
+    pub(super) fn restart_search(&mut self) {
+        let Some(search) = &mut self.search else {
+            return;
+        };
+        self.search_id += 1;
+        search.id = self.search_id;
+        search.counts = vec![None; self.doc.document.files().len()];
+        search.pending = None;
+        search.resume = None;
         self.live_search.store(search.id, Ordering::Relaxed);
         self.doc.document.search = None;
     }
@@ -71,13 +98,13 @@ impl App {
     }
 
     /// A file's matches from a worker. They show if they're of the search,
-    /// the diff, the revealed lines and the comments as they are now, and
-    /// an `n` or `N` that came before them lands in them.
+    /// the diff, the revealed lines, the side read and the comments as they
+    /// are now, and an `n` or `N` that came before them lands in them.
     pub(super) fn found(
         &mut self,
         file: usize,
         id: u64,
-        (diff, hidden, blocks_version): (Option<&Arc<FileDiff>>, &[Range<usize>], u64),
+        (diff, hidden, reading, blocks_version): Scanned<'_>,
         matches: Option<Matches>,
     ) {
         if self.search.as_ref().is_none_or(|s| s.id != id) {
@@ -89,6 +116,7 @@ impl App {
         let document = &self.doc.document;
         let current = document.diff_of(file).map(Arc::as_ptr) == diff.map(Arc::as_ptr)
             && document.hidden_lines(file).unwrap_or_default() == hidden
+            && document.reading_in(file) == reading
             && document.blocks_version(file) == blocks_version;
         let Some(search) = self.search.as_mut().filter(|_| current) else {
             return;
@@ -97,12 +125,15 @@ impl App {
             *count = Some(matches.len());
         }
         let land = search.pending.take_if(|(f, _)| *f == file);
+        let current = (search.resume.take_if(|(f, _)| *f == file))
+            .and_then(|(_, hit)| (0..matches.len()).find(|&i| matches.get(i) == Some(hit)));
         self.doc.document.search = Some(Found {
             file,
             hidden: hidden.to_vec(),
             blocks_version,
+            reading,
             matches: Arc::new(matches),
-            current: None,
+            current,
         });
         match land.map(|(_, land)| land) {
             Some(Land::First) => self.land_search_edge(false),
@@ -112,12 +143,18 @@ impl App {
         }
     }
 
+    /// Whether rows may hold both sides side by side, so matches go by
+    /// row; a side read alone has one column.
+    fn splits_rows(&self) -> bool {
+        self.doc.layout.split && self.doc.document.reading().is_none()
+    }
+
     /// Goes to the file shown's first match, or its `last`, as its rows
     /// show them.
     fn land_search_edge(&mut self, last: bool) {
         let file = self.doc.document.pos.file;
         let marks = (self.doc.document.search.as_ref())
-            .filter(|m| m.file == file && self.doc.layout.split)
+            .filter(|m| m.file == file && self.splits_rows())
             .map(|m| Arc::clone(&m.matches));
         match marks.and_then(|matches| self.split_edge(file, &matches, last)) {
             Some((pos, i)) => self.land_search_at(i, pos),
@@ -351,7 +388,7 @@ impl App {
         let scanned = self.doc.document.diff_of(file).is_some()
             || (self.doc.document.files().get(file)).is_some_and(|e| e.wants_diff() || e.is_page());
         match marks {
-            Some((matches, current)) if self.doc.layout.split => {
+            Some((matches, current)) if self.splits_rows() => {
                 // Matches go by row, left to right on one.
                 let at = current.and_then(|c| Some((self.doc.hit_pos(file, &matches.get(c)?)?, c)));
                 let mark = at.map_or(Mark::Top { pos: top, here }, |(pos, c)| Mark::Hit(pos, c));
@@ -482,10 +519,24 @@ impl App {
                 + i
                 + 1
         });
-        Some(match index {
+        let mut status = match index {
             Some(i) => format!("match {i}/{total}{more}"),
             None => format!("{total}{more} matches"),
-        })
+        };
+        // In file view the other side's lines are hidden: their matches are
+        // counted, never gone to.
+        let file = self.doc.document.pos.file;
+        let other = (self.doc.document.search.as_ref())
+            .filter(|m| m.file == file)
+            .map_or(0, |m| m.matches.other_side);
+        if let Some(read) = self.doc.document.reading_of(file).filter(|_| other > 0) {
+            let flip = (self.key_for(false, crate::keys::Action::CycleLayout))
+                .map(|k| format!(" ({k})"))
+                .unwrap_or_default();
+            let version = self.version_name(read.other());
+            let _ = write!(status, " · {other} more in {version}{flip}");
+        }
+        Some(status)
     }
 
     /// The search's counts of the files not shown, nearest after the one
@@ -514,6 +565,7 @@ impl App {
                         None
                     }
                 },
+                reading: self.doc.document.reading_in(file),
                 // Its comments as placed, once they are.
                 threads: (self.comments.as_ref())
                     .and_then(|c| {

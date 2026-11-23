@@ -92,7 +92,7 @@ impl Doc {
 
     /// Which side of the row at `pos` column `column` (from the pane's
     /// left) is on: the half it's in for a split row, else the side the
-    /// row has a line on, the new one first.
+    /// row has a line on, the one read alone or the new one first.
     pub(crate) fn side_at(&mut self, pos: Pos, column: usize) -> Option<Side> {
         let layout = self.file_layout(pos.file);
         let lines = self.document.row_lines(pos, arrange(&layout, &self.boxes));
@@ -101,11 +101,27 @@ impl Doc {
             let side = if column < left { Side::Old } else { Side::New };
             return lines[side.index()].map(|_| side);
         }
-        match lines {
-            [_, Some(_)] => Some(Side::New),
-            [Some(_), None] => Some(Side::Old),
-            [None, None] => None,
-        }
+        // A hidden run's row in file view stands for the other side's lines,
+        // and an opened change's rule for the change: staging there takes
+        // their hunk.
+        let side = (self.side_of(pos.file, lines)).or_else(|| {
+            let marked = self.document.mark(pos, arrange(&layout, &self.boxes));
+            marked.map(|(side, _)| side)
+        });
+        side.or_else(|| {
+            self.run_at(pos)?;
+            self.document.reading_of(pos.file)
+        })
+    }
+
+    /// The side of a row in `file` with `lines` that a selection or a
+    /// comment takes: the one read alone, or else the new one, when the
+    /// row has its line.
+    fn side_of(&self, file: usize, lines: [Option<usize>; 2]) -> Option<Side> {
+        let first = self.document.reading_of(file).unwrap_or(Side::New);
+        [first, first.other()]
+            .into_iter()
+            .find(|side| lines[side.index()].is_some())
     }
 
     /// What the cell at row `y` of the pane, `column` from its left, shows
@@ -564,12 +580,8 @@ impl Doc {
                 .filter_map(|y| self.row_at(y))
                 .collect();
             rows.into_iter().find_map(|pos| {
-                let side = match self.row_lines(pos) {
-                    [_, Some(_)] => Side::New,
-                    [Some(_), None] => Side::Old,
-                    [None, None] => return None,
-                };
-                Some((pos, side))
+                let lines = self.row_lines(pos);
+                Some((pos, self.side_of(pos.file, lines)?))
             })
         });
         let (pos, side) = start?;

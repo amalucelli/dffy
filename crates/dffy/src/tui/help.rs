@@ -1,7 +1,7 @@
 //! The `?` overlay: the key bindings in effect, the config's included, in
 //! seven tabs shown one at a time, a tab of several groups titling each.
 //! Each action gets a row in each table it's bound in (the diff's, and the
-//! tree's, a thread's and a conflict's under titles of their own): its
+//! tree's, a thread's, a conflict's and a peek's under titles of their own): its
 //! first key there, at most one other (dimmed), and a few words. Actions
 //! without a key are left out, since the command panel reaches them;
 //! docs/keys.md has every key and the full descriptions. `/` searches all
@@ -66,10 +66,11 @@ enum Section {
     Tree,
     Thread,
     Conflict,
+    Peek,
 }
 
 impl Section {
-    const TITLED: [Self; 3] = [Self::Tree, Self::Thread, Self::Conflict];
+    const TITLED: [Self; 4] = [Self::Tree, Self::Thread, Self::Conflict, Self::Peek];
 
     fn title(self) -> &'static str {
         match self {
@@ -77,6 +78,7 @@ impl Section {
             Self::Tree => "in the tree",
             Self::Thread => "on a thread",
             Self::Conflict => "in a conflict",
+            Self::Peek => "in a peek",
         }
     }
 }
@@ -120,6 +122,7 @@ fn rows(keys: &Keys) -> Vec<Row> {
         Section::Tree,
         Section::Thread,
         Section::Conflict,
+        Section::Peek,
     ];
     let mut rows: Vec<Row> = Action::ALL
         .iter()
@@ -130,6 +133,7 @@ fn rows(keys: &Keys) -> Vec<Row> {
                     Section::Tree => Box::new(keys.chords(true, action)),
                     Section::Thread => Box::new(keys.thread_chords(action)),
                     Section::Conflict => Box::new(keys.conflict_chords(action)),
+                    Section::Peek => Box::new(keys.peek_chords(action)),
                 };
                 let first = chords.next()?;
                 Some(Row {
@@ -139,6 +143,7 @@ fn rows(keys: &Keys) -> Vec<Row> {
                         Section::Tree => Tab::Files,
                         Section::Thread => Tab::Review,
                         Section::Conflict => Tab::Git,
+                        Section::Peek => Tab::Move,
                     }),
                     section,
                     key: first.name(),
@@ -849,7 +854,7 @@ mod tests {
             }
         }
         press(&mut help, &keys, "G");
-        assert!(shown(&mut help, &keys, 50, 15).contains("scroll to line start"));
+        assert!(shown(&mut help, &keys, 50, 15).contains("close peek"));
     }
 
     #[test]
@@ -862,7 +867,8 @@ mod tests {
             let text = shown(&mut help, &keys, width, 15);
             let row = text.lines().find(|l| l.contains("next file"));
             assert!(
-                row.is_some_and(|r| r.trim_end_matches(['│', ' ']).ends_with("Files")),
+                // Past the tab's name, the frame and the scrollbar.
+                row.is_some_and(|r| r.trim_end_matches(['│', '┃', ' ']).ends_with("Files")),
                 "{width}:\n{text}"
             );
         }

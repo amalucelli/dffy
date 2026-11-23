@@ -1,0 +1,60 @@
+---
+source: crates/dffy/src/render/tests.rs
+expression: out
+---
+Background New
+<removed>──</><dim> 2 lines removed · x shows them </><removed>──────</>
+ <line-number>4</><dim> │</> kept
+<modified-number> 5 ┃</><modified-line> edited</>
+<removed>──</><dim> 1 line removed </><removed>──────────────────────</>
+<removed>──</><dim> 1 line removed </><removed>──────────────────────</>
+<modified-number> </><dim>5</><modified-number> │</><modified-line> was</>
+Background Old
+<added>──</><dim> 2 lines added · x shows them </><added>────────</>
+ <line-number>3</><dim> │</> kept
+<modified-number> </><dim>5</><modified-number> │</><modified-line> edited</>
+<added>──</><dim> 1 line added </><added>────────────────────────</>
+<added>──</><dim> 1 line added </><added>────────────────────────</>
+<modified-number> 5 ┃</><modified-line> was</>
+Bars New
+<removed>──</><dim> 2 lines removed · x shows them </><removed>──────</>
+<line-number>4</><dim> │</> kept
+<modified-number>5</> <modified>┃</> <modified>edited</>
+<removed>──</><dim> 1 line removed </><removed>──────────────────────</>
+<removed>──</><dim> 1 line removed </><removed>──────────────────────</>
+<dim>5</> <modified>▌</> <modified>was</>
+Bars Old
+<added>──</><dim> 2 lines added · x shows them </><added>────────</>
+<line-number>3</><dim> │</> kept
+<dim>5</> <modified>▌</> <modified>edited</>
+<added>──</><dim> 1 line added </><added>────────────────────────</>
+<added>──</><dim> 1 line added </><added>────────────────────────</>
+<modified-number>5</> <modified>┃</> <modified>was</>
+Classic New
+<removed>──</><dim> 2 lines removed · x shows them </><removed>──────</>
+<line-number>4</>  <dim>│</> kept
+<modified-number>5</> <modified>+┃</> <modified>edited</>
+<removed>──</><dim> 1 line removed </><removed>──────────────────────</>
+<removed>──</><dim> 1 line removed </><removed>──────────────────────</>
+<dim>5</> <modified>-</><dim>│</> <modified>was</>
+Classic Old
+<added>──</><dim> 2 lines added · x shows them </><added>────────</>
+<line-number>3</>  <dim>│</> kept
+<dim>5</> <modified>+</><dim>│</> <modified>edited</>
+<added>──</><dim> 1 line added </><added>────────────────────────</>
+<added>──</><dim> 1 line added </><added>────────────────────────</>
+<modified-number>5</> <modified>-┃</> <modified>was</>
+None New
+<dim>── 2 lines removed · x shows them ──────</>
+<line-number>4</><dim> │</> kept
+<modified-number>5</><dim> </><modified>┃</> <modified>edited</>
+<dim>── 1 line removed ──────────────────────</>
+<dim>── 1 line removed ──────────────────────</>
+<dim>5 │</> <modified>was</>
+None Old
+<dim>── 2 lines added · x shows them ────────</>
+<line-number>3</><dim> │</> kept
+<dim>5 │</> <modified>edited</>
+<dim>── 1 line added ────────────────────────</>
+<dim>── 1 line added ────────────────────────</>
+<modified-number>5</><dim> </><modified>┃</> <modified>was</>

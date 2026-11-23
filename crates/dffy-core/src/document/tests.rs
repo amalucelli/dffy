@@ -95,11 +95,11 @@ fn missing_names_the_work_for_the_rows_shown() {
     );
     assert_eq!(
         missing(&doc, at(0, 3, 10), at(0, 3, 11)),
-        [Missing::GapSyntax(1)]
+        [Missing::GapSyntax(1, Side::New)]
     );
     assert_eq!(
         missing(&doc, at(0, 2, 0), at(0, 3, 0)),
-        [Missing::GapSyntax(1)]
+        [Missing::GapSyntax(1, Side::New)]
     );
 
     doc.structural = true;
@@ -107,10 +107,40 @@ fn missing_names_the_work_for_the_rows_shown() {
         missing(&doc, top, bottom),
         [
             Missing::Emphasis(1),
-            Missing::GapSyntax(1),
+            Missing::GapSyntax(1, Side::New),
             Missing::Structural
         ]
     );
+}
+
+/// A file renamed without edits counts only its text until its lines show
+/// and their highlighting is prepared, as when it had no gap to show; then
+/// the highlighting counts, in the document's estimate too.
+#[test]
+fn a_renamed_files_highlighting_counts_once_prepared() {
+    let mut fd = long_diff("new.c");
+    fd.new = fd.old.clone();
+    fd.hunks = Vec::new();
+    fd.change.status = Status::Renamed {
+        from: "old.c".into(),
+        similarity: 100,
+    };
+    let text = fd.old.bytes().len() + fd.new.bytes().len();
+    let mut doc = Document::<()>::default();
+    doc.push(fd.change.clone(), Source::Repo);
+    let _ = doc.load(0, Ok(prepared(fd)));
+    let file = doc.file(0).expect("loaded");
+    assert_eq!(file.bytes(), text, "no highlighting counted yet");
+    let (diff, slot) = (
+        Arc::clone(file.diff()),
+        file.syntax().cloned().expect("highlighted"),
+    );
+    let lines = file.gap_lines(0, Side::New);
+    let spans = File::prepare(&GRAMMARS, None).gap_syntax(&diff, &slot, Side::New, lines);
+    doc.set_gap_syntax(0, &diff, 0, Side::New, spans);
+    let file = doc.file(0).expect("loaded");
+    assert_eq!(file.bytes(), text + 20 * text);
+    assert_eq!(doc.loaded_bytes(), file.bytes());
 }
 
 /// A file's definitions are their own step, asked for once its
@@ -317,6 +347,40 @@ fn a_saved_place_follows_a_reveal_after_the_list_moved() {
     assert_eq!(doc.pos, at(1, 3, 15 + 6));
 }
 
+/// A file shown outside the diff closes, the position moving with the
+/// entries after it or to the one before; one of the diff's doesn't. One
+/// read at another snapshot takes its place, not diffed yet.
+#[test]
+fn an_unchanged_file_closes_and_takes_another_side_in_place() {
+    let mut doc = Document::<()>::default();
+    doc.push(long_diff("b.c").change, Source::Repo);
+    let side = |id: u8| GitSide::Object {
+        id: ObjectId::from_bytes_or_panic(&[id; 20]),
+        mode: Mode::File,
+    };
+    let x = doc.show_unchanged(FileChange::unchanged("x.c".into(), side(1)));
+    let y = doc.show_unchanged(FileChange::unchanged("y.c".into(), side(2)));
+    assert!(!doc.close_unchanged(0), "the diff's own file");
+    doc.pos.file = y;
+    assert!(doc.close_unchanged(x));
+    assert_eq!(doc.pos.file, 1, "on y.c, moved up");
+    assert!(doc.replace_unchanged(1, FileChange::unchanged("y.c".into(), side(3))));
+    let entry = &doc.files()[1];
+    assert_eq!(entry.change().new, Some(side(3)));
+    assert!(entry.wants_diff());
+    assert!(doc.close_unchanged(1));
+    assert_eq!(doc.pos.file, 0, "from the file closed to the one before");
+    assert_eq!(doc.files().len(), 1);
+
+    // The only entry, of an empty diff: none is left.
+    let mut empty = Document::<()>::default();
+    let only = empty.show_unchanged(FileChange::unchanged("x.c".into(), side(1)));
+    empty.pos.file = only;
+    assert!(empty.close_unchanged(only));
+    assert!(empty.files().is_empty());
+    assert_eq!(empty.pos, Pos::default());
+}
+
 /// A file the diff doesn't list shows whole after the files, every line
 /// unchanged and highlighted, whatever the view shows of the others. It
 /// needs no counts and no syntax diff, is added once, isn't a commit's,
@@ -335,7 +399,13 @@ fn an_unchanged_file_shows_every_line_after_the_files() {
     doc.push(label, Source::Commit(commit));
     doc.push(long_diff("z.c").change, Source::Repo);
     doc.push(long_diff("b.c").change, Source::Repo);
-    let change = FileChange::unchanged("a.c".into(), Mode::File);
+    let change = FileChange::unchanged(
+        "a.c".into(),
+        GitSide::Worktree {
+            mode: Mode::File,
+            id: None,
+        },
+    );
     assert_eq!(doc.show_unchanged(change.clone()), 3);
     assert_eq!(doc.show_unchanged(change.clone()), 3, "added once");
     assert_eq!(
@@ -378,7 +448,7 @@ fn an_unchanged_file_shows_every_line_after_the_files() {
         doc.missing(at(3, part, 0), at(3, part, 9))
             .collect::<Vec<_>>()
     };
-    assert_eq!(missing(&doc), [Missing::GapSyntax(0)]);
+    assert_eq!(missing(&doc), [Missing::GapSyntax(0, Side::New)]);
 
     let prepare = File::prepare(&GRAMMARS, None);
     let file = doc.file(3).expect("loaded");
@@ -386,9 +456,9 @@ fn an_unchanged_file_shows_every_line_after_the_files() {
         Arc::clone(file.diff()),
         file.syntax().cloned().expect("highlighted"),
     );
-    let spans = prepare.gap_syntax(&diff, &slot, file.gap_lines(0));
+    let spans = prepare.gap_syntax(&diff, &slot, Side::New, file.gap_lines(0, Side::New));
     assert!(spans.is_some());
-    doc.set_gap_syntax(3, &diff, 0, spans);
+    doc.set_gap_syntax(3, &diff, 0, Side::New, spans);
     assert_eq!(missing(&doc), [Missing::Scopes]);
     prepare.scopes(&diff, &slot);
     assert_eq!(missing(&doc), Vec::<Missing>::new());
@@ -577,7 +647,7 @@ proptest::proptest! {
             body,
             rows: arranged,
             starts: Vec::new(),
-            arrangement: Some(arrangement),
+            layout: Some(Layout::Arranged(arrangement)),
             other: None,
             emphasis: None,
             syntax: None,
@@ -594,7 +664,7 @@ proptest::proptest! {
             view.rows.iter().position(|r| match *r {
                 Row::Line(i) => i == body,
                 Row::Pair(old, new) => old == Some(body) || new == Some(body),
-                Row::Header | Row::Marker => false,
+                Row::Header | Row::Marker | Row::One { .. } | Row::Hidden { .. } => false,
             })
         };
         for (side, len) in [(Side::Old, old), (Side::New, new)] {

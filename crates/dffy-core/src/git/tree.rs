@@ -138,6 +138,75 @@ fn entry_order(a: &EntryRef<'_>, b: &EntryRef<'_>) -> Ordering {
     })
 }
 
+/// Hands each file under `tree` to `emit`, depth-first, which is path order
+/// (see [`entry_order`]).
+pub(super) fn list_tree(
+    repo: &gix::Repository,
+    tree: &gix::oid,
+    filter: &Filter,
+    emit: &mut dyn FnMut(&BStr, Side) -> ControlFlow<()>,
+) -> Result<ControlFlow<()>> {
+    fn walk(
+        repo: &gix::Repository,
+        tree: &gix::oid,
+        filter: &Filter,
+        prefix: &mut BString,
+        emit: &mut dyn FnMut(&BStr, Side) -> ControlFlow<()>,
+    ) -> Result<ControlFlow<()>> {
+        let mut buf = Vec::new();
+        for e in repo.objects.find_tree(tree, &mut buf)?.entries {
+            let len = prefix.len();
+            prefix.extend_from_slice(e.filename);
+            let flow = if e.mode.is_tree() {
+                if filter.may_contain(prefix) {
+                    prefix.push(b'/');
+                    walk(repo, e.oid, filter, prefix, emit)?
+                } else {
+                    ControlFlow::Continue(())
+                }
+            } else if let Some(side) = object_side(&e)
+                && side.mode() != Mode::Gitlink
+                && filter.matches(prefix)
+            {
+                emit(prefix.as_bstr(), side)
+            } else {
+                ControlFlow::Continue(())
+            };
+            prefix.truncate(len);
+            if flow.is_break() {
+                return Ok(flow);
+            }
+        }
+        Ok(ControlFlow::Continue(()))
+    }
+    walk(repo, tree, filter, &mut BString::default(), emit)
+}
+
+/// The non-tree entry at `path` under `tree`, walked a component at a time
+/// so a path through a submodule is simply not there.
+pub(super) fn entry_at(
+    repo: &gix::Repository,
+    tree: ObjectId,
+    path: &BStr,
+) -> Result<Option<Side>> {
+    let (mut id, mut buf) = (tree, Vec::new());
+    let mut names = path.split_str("/").peekable();
+    while let Some(name) = names.next() {
+        let entries = repo.objects.find_tree(&id, &mut buf)?.entries;
+        let Some(e) = entries.iter().find(|e| e.filename == name) else {
+            return Ok(None);
+        };
+        if names.peek().is_none() {
+            return Ok(object_side(e));
+        }
+        if !e.mode.is_tree() {
+            return Ok(None);
+        }
+        id = e.oid.to_owned();
+    }
+    Ok(None)
+}
+
 pub(super) fn diff_tree_index(
     repo: &Repo,
     tree: ObjectId,

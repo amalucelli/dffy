@@ -615,7 +615,7 @@ mod tests {
             words: false,
             tab_width: 4,
             indicators: Indicators::Classic,
-            one_sided: false,
+            one_sided: None,
             unmerged: false,
             digits: 0,
             inline_signs: false,
@@ -623,6 +623,7 @@ mod tests {
             line_numbers: true,
             hunk_headers: true,
             modified_lines: true,
+            read_alone: false,
         };
         let mut doc = Doc::new(layout, 20);
         doc.document.push(fd.change.clone(), Source::Repo);

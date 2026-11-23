@@ -204,6 +204,22 @@ pub enum Side {
     },
 }
 
+/// A state of the repository's files that one side of a diff is taken
+/// from; [`DiffSpec::snapshots`] gives a diff's two.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Snapshot {
+    /// A tree in the object database.
+    Tree(ObjectId),
+    /// The index. A conflicted path stands as one of its stages: ours,
+    /// then the base, then theirs, as a diff of the index with the working
+    /// tree compares it. A diff of a tree with the index shows the
+    /// working-tree file for that path instead, so the two differ there;
+    /// a path the diff lists is shown through its own change.
+    Index,
+    /// The files on disk in the working tree, tracked or not.
+    Worktree,
+}
+
 /// One of the two paths [`Repo::compare`] was given.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum PathRoot {
@@ -311,13 +327,13 @@ impl FileChange {
         }
     }
 
-    /// The working-tree file at `path`, of `mode` (see [`worktree_file`]),
-    /// compared with itself: a file shown for what's on it rather than for
-    /// what changed. [`Repo::file_diff`] reads it once and finds no hunks.
+    /// The file at `path` with `side` as both its sides, as
+    /// [`Repo::side_at`] finds it at a snapshot: a file shown for what's on
+    /// it rather than for what changed. [`Repo::file_diff`] reads it once
+    /// and finds no hunks.
     #[must_use]
-    pub fn unchanged(path: BString, mode: Mode) -> Self {
-        let side = Some(Side::Worktree { mode, id: None });
-        Self::new(path, side, side)
+    pub fn unchanged(path: BString, side: Side) -> Self {
+        Self::new(path, Some(side), Some(side))
     }
 
     /// Both sides are one side, read from one place: nothing can differ.
@@ -647,6 +663,135 @@ impl Repo {
         Ok(())
     }
 
+    /// Hands each file at `at` to `emit` with its mode, in path order
+    /// (bytewise, as git sorts), until `emit` returns
+    /// [`ControlFlow::Break`]. `filter` restricts it to path prefixes as
+    /// for [`Repo::for_each_change`]; empty lists every file.
+    ///
+    /// A tree lists what `git ls-tree -r` does, but submodules: a submodule
+    /// isn't a file to show whole, so no snapshot lists one. The index
+    /// lists each path once, with the mode of the stage that stands for a
+    /// conflicted one (see [`Snapshot::Index`]), and leaves out
+    /// intent-to-add entries, which hold no content. The working tree
+    /// lists the index's paths with the index's modes, as `git ls-files`
+    /// does: untracked files aren't listed, and a tracked file deleted from
+    /// disk still is. A sparse index's folder entries are left out, and
+    /// with them the files they stand for. A bare repository's index is
+    /// empty.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::NoWorktree`] for the working tree of a bare repository; an
+    /// unreadable tree or index; outside git.
+    pub fn list_paths(
+        &self,
+        at: Snapshot,
+        filter: &[BString],
+        mut emit: impl FnMut(&BStr, Mode) -> ControlFlow<()>,
+    ) -> Result<()> {
+        self.list_sides(at, filter, |path, side| emit(path, side.mode()))
+    }
+
+    /// [`Repo::list_paths`] with where each file is: its blob for a tree
+    /// or the index, as [`Repo::side_at`] would find it; for the working
+    /// tree, the file on disk with the index's mode and no id.
+    ///
+    /// # Errors
+    ///
+    /// As [`Repo::list_paths`].
+    pub fn list_sides(
+        &self,
+        at: Snapshot,
+        filter: &[BString],
+        mut emit: impl FnMut(&BStr, Side) -> ControlFlow<()>,
+    ) -> Result<()> {
+        let filter = Filter::new(filter);
+        match at {
+            Snapshot::Tree(tree) => {
+                let _: ControlFlow<()> = tree::list_tree(self.git()?, &tree, &filter, &mut emit)?;
+            }
+            Snapshot::Worktree if self.workdir().is_none() => return Err(Error::NoWorktree),
+            Snapshot::Index | Snapshot::Worktree => {
+                let index = self.load_index()?;
+                let entries = index.entries();
+                let mut last = None;
+                for (i, e) in entries.iter().enumerate() {
+                    let path = e.path(&index);
+                    // A conflicted path's stages are adjacent.
+                    if last == Some(path) {
+                        continue;
+                    }
+                    last = Some(path);
+                    let side = if e.stage_raw() != 0 {
+                        status::conflict_side(entries, i, &index)
+                    } else if at == Snapshot::Index
+                        && e.flags.contains(gix::index::entry::Flags::INTENT_TO_ADD)
+                    {
+                        None
+                    } else {
+                        Mode::from_index(e.mode).map(|mode| Side::Object { id: e.id, mode })
+                    };
+                    let side = match side {
+                        Some(side) if at == Snapshot::Worktree => Some(Side::Worktree {
+                            mode: side.mode(),
+                            id: None,
+                        }),
+                        side => side,
+                    };
+                    if let Some(side) = side.filter(|s| s.mode() != Mode::Gitlink)
+                        && filter.matches(path)
+                        && emit(path, side).is_break()
+                    {
+                        break;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Where the file at `path` is at `at`: a blob for a tree or the index,
+    /// or the file on disk, tracked or not, with its mode there (see
+    /// [`worktree_file`]). `None` when no file is there: a folder, a
+    /// submodule or a path inside one, an index entry that is only an
+    /// intent to add, a path a sparse index holds only as part of a
+    /// folder, and anything in a bare repository's index, which is empty.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::NoWorktree`] for the working tree of a bare repository; an
+    /// unreadable tree or index; outside git.
+    pub fn side_at(&self, at: Snapshot, path: &BStr) -> Result<Option<Side>> {
+        let side = match at {
+            Snapshot::Tree(tree) => tree::entry_at(self.git()?, tree, path)?,
+            Snapshot::Index => {
+                // Parses the index per call; take a loaded index if this
+                // runs per file.
+                let index = self.load_index()?;
+                let entries = index.entries();
+                let i = entries.partition_point(|e| e.path(&index) < path);
+                let Some(e) = entries.get(i).filter(|e| e.path(&index) == path) else {
+                    return Ok(None);
+                };
+                if e.stage_raw() != 0 {
+                    status::conflict_side(entries, i, &index)
+                } else if e.flags.contains(gix::index::entry::Flags::INTENT_TO_ADD) {
+                    None
+                } else {
+                    Mode::from_index(e.mode).map(|mode| Side::Object { id: e.id, mode })
+                }
+            }
+            Snapshot::Worktree => {
+                let root = self.workdir().ok_or(Error::NoWorktree)?;
+                if in_nested_repository(root, path) {
+                    return Ok(None);
+                }
+                worktree_file(root, path).map(|mode| Side::Worktree { mode, id: None })
+            }
+        };
+        Ok(side.filter(|s| s.mode() != Mode::Gitlink))
+    }
+
     /// What `HEAD` points at.
     ///
     /// # Errors
@@ -924,7 +1069,13 @@ impl Repo {
         Ok((Contents::Text(Text::new(old), Text::new(new)), note))
     }
 
-    fn size(&self, path: &BStr, side: &Side) -> Result<u64> {
+    /// The byte size of the file at `path` on `side`, as [`Repo::sizes`]
+    /// reads it, without loading it.
+    ///
+    /// # Errors
+    ///
+    /// A missing object or an unreadable file.
+    pub fn size(&self, path: &BStr, side: &Side) -> Result<u64> {
         match *side {
             Side::Object {
                 mode: Mode::Gitlink,
@@ -1014,6 +1165,24 @@ pub fn worktree_file(root: &Path, path: &[u8]) -> Option<Mode> {
     } else {
         Some(Mode::File)
     }
+}
+
+/// Whether a folder leading to `path` in the working tree at `root` is
+/// another repository's, a submodule's or a nested clone's, as git tells
+/// one: it holds a `.git`.
+fn in_nested_repository(root: &Path, path: &[u8]) -> bool {
+    let mut dir = root.to_path_buf();
+    let mut folders = path.split(|&b| b == b'/').peekable();
+    while let Some(folder) = folders.next() {
+        if folders.peek().is_none() {
+            break;
+        }
+        dir.push(std::ffi::OsStr::from_bytes(folder));
+        if dir.join(".git").symlink_metadata().is_ok() {
+            return true;
+        }
+    }
+    false
 }
 
 /// Git's binary heuristic: a NUL byte near the start.

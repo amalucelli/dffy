@@ -32,6 +32,7 @@ use dffy_core::view::{Arrangement, Attributes, HunkHeader, Row, display_text};
 
 use super::comments::{self, CommentRows, Writes, Writing};
 use super::markdown;
+use super::peek::{self, Peek};
 use super::piped::Body;
 use crate::pager;
 use crate::render::{Canvas, Layout, Mapped};
@@ -62,6 +63,8 @@ pub(crate) type Entry = document::Entry<Body>;
 
 /// The block of the text box writing a new thread; threads take the rest.
 const NEW: BlockId = BlockId(u32::MAX);
+/// The go-to-definition peek's block, below the ids threads fall back to.
+const PEEK: BlockId = BlockId(u32::MAX - 2);
 
 /// How a file's rows are laid out, for the core's row queries: `layout`'s
 /// arrangement of a hunk, and the boxes' rows at its width. Every query on
@@ -213,6 +216,16 @@ pub(crate) enum Block {
     Thread(usize),
     /// The text box writing a new thread.
     New,
+    /// The go-to-definition peek.
+    Peek,
+}
+
+/// The peek open under a line of the file shown.
+struct PeekBox {
+    peek: Peek,
+    at: Attach,
+    /// The layout's tab width when it opened, for its code.
+    tab: usize,
 }
 
 /// Where [`Doc::step_thread`] went.
@@ -412,6 +425,8 @@ pub(crate) struct Boxes {
     writing: Option<Writing>,
     /// Where the text box for a new thread hung when the blocks were set.
     new_at: Option<Attach>,
+    /// The go-to-definition peek, while it's open on `file`.
+    peek: Option<PeekBox>,
 }
 
 impl Boxes {
@@ -428,6 +443,7 @@ impl Boxes {
             fold: Fold::default(),
             writing: None,
             new_at: None,
+            peek: None,
         }
     }
 
@@ -435,12 +451,16 @@ impl Boxes {
         if id == NEW {
             return self.new_at.map(|_| Block::New);
         }
+        if id == PEEK {
+            return self.peek.as_ref().map(|_| Block::Peek);
+        }
         self.of.get(&id).map(|&i| Block::Thread(i))
     }
 
     fn id(&self, block: Block) -> Option<BlockId> {
         match block {
             Block::New => Some(NEW),
+            Block::Peek => Some(PEEK),
             Block::Thread(i) => self.ids.get(&self.threads.get(i)?.root).copied(),
         }
     }
@@ -463,6 +483,12 @@ impl Boxes {
         out.extend(self.new_at.map(|at| document::Block {
             id: NEW,
             at,
+            text: Arc::from(""),
+        }));
+        // No text: the search finds nothing in what it shows.
+        out.extend(self.peek.as_ref().map(|p| document::Block {
+            id: PEEK,
+            at: p.at,
             text: Arc::from(""),
         }));
         out
@@ -513,8 +539,10 @@ impl Boxes {
                 }) => Some(*side),
                 _ => None,
             },
+            Block::Peek => None,
         };
-        let split = !layout.one_sided && layout.arrangement(&ANY_HUNK) == Arrangement::Split;
+        let split =
+            layout.one_sided.is_none() && layout.arrangement(&ANY_HUNK) == Arrangement::Split;
         let half = layout.lead_width() + numbers + layout.mark_width();
         let left = width.saturating_sub(1) / 2;
         let (start, gutter, end) = match (split, side) {
@@ -522,7 +550,7 @@ impl Boxes {
             (true, Some(Side::New)) => (left + 1, half, width),
             (true, None) => (0, half, width),
             (false, _) => {
-                let columns = if layout.one_sided { 1 } else { 2 };
+                let columns = if layout.one_sided.is_some() { 1 } else { 2 };
                 let numbers = if numbers == 0 {
                     0
                 } else {
@@ -541,6 +569,9 @@ impl Boxes {
 
     /// Rows `block`'s box takes in `layout`.
     fn height(&self, block: Block, layout: &Layout) -> usize {
+        if block == Block::Peek {
+            return peek::HEIGHT;
+        }
         let (_, _, boxed, _) = self.columns(block, layout);
         // The text box changes with every key, so a box holding it is
         // counted afresh.
@@ -607,6 +638,12 @@ impl Boxes {
             Block::New => {
                 if let Some(writing) = writing {
                     comments::new_rows(writing, boxed, c);
+                }
+                None
+            }
+            Block::Peek => {
+                if let Some(p) = &self.peek {
+                    p.peek.rows(boxed, p.tab, c);
                 }
                 None
             }
@@ -776,6 +813,9 @@ pub(crate) struct Doc {
     box_drawn: Option<(BlockId, Canvas, Option<Card>)>,
     /// What the conversation page's first row says: the review's title.
     pub page_title: String,
+    /// The key that opens a hidden run in place in file view, and folds it,
+    /// for its rule to name.
+    pub open_key: Option<String>,
 }
 
 impl Doc {
@@ -802,30 +842,44 @@ impl Doc {
             ages_until: u64::MAX,
             box_drawn: None,
             page_title: String::new(),
+            open_key: None,
         }
     }
 
     /// The layout of a file's hunks. A rendered view always wraps, since
     /// renderers leave paragraphs as single lines, and numbers its source.
     fn file_layout(&self, file: usize) -> Layout {
+        self.layout_reading(file, self.document.reading_of(file))
+    }
+
+    /// [`Doc::file_layout`] for `file` read on `reading` alone, or with
+    /// `None` both sides.
+    fn layout_reading(&self, file: usize, reading: Option<Side>) -> Layout {
         let Some(entry) = self.document.files().get(file) else {
             return self.layout;
         };
         let loaded = entry.file();
-        if let Some(rendered) = loaded.and_then(File::rendered) {
+        let layout = if let Some(rendered) = loaded.and_then(File::rendered) {
             let layout = Layout {
                 wrap: true,
                 words: true,
                 scroll: 0,
                 ..self.layout
             };
-            return layout.for_file(entry.status(), rendered.source_len());
-        }
-        let lines = loaded.map_or(0, |l| l.diff().old.len().max(l.diff().new.len()));
-        let layout = self.layout.for_file(entry.status(), lines);
+            layout.for_file(entry.status(), rendered.source_len())
+        } else {
+            let lines = loaded.map_or(0, |l| l.diff().old.len().max(l.diff().new.len()));
+            self.layout.for_file(entry.status(), lines)
+        };
         Layout {
             // Both sides are the same lines: one column says it.
-            one_sided: layout.one_sided || entry.is_unchanged(),
+            one_sided: reading
+                .or(layout.one_sided)
+                .or_else(|| entry.is_unchanged().then_some(Side::New)),
+            // Read alone, a file shows whole: a hunk's numbers say nothing,
+            // so the row above a change at its first line shows as without.
+            hunk_headers: layout.hunk_headers && reading.is_none(),
+            read_alone: reading.is_some(),
             ..layout
         }
     }
@@ -918,6 +972,90 @@ impl Doc {
         self.document
             .relayout(arrange, arrange, |doc| doc.structural = on);
         self.normalize();
+    }
+
+    /// Reads every file on `reading` alone, or both sides again, the row at
+    /// the top kept on what it showed (see [`Document::set_reading`]). The
+    /// gutter takes another width, so the boxes are measured again.
+    pub(crate) fn set_reading(&mut self, reading: Option<Side>) {
+        let file = self.document.pos.file;
+        let before = self.file_layout(file);
+        let after = self.layout_reading(file, self.document.read_on(file, reading));
+        self.selection = None;
+        let (old, new) = (arrange(&before, &self.boxes), arrange(&after, &self.boxes));
+        self.document.set_reading(reading, old, new);
+        if self.boxes.file != file {
+            self.remeasure_boxes();
+        }
+        self.normalize();
+    }
+
+    /// In file view, the hunk whose hidden run or edited line is the row at
+    /// `pos`, or which is opened in place there, and whether it's opened.
+    fn run_at(&mut self, pos: Pos) -> Option<(usize, bool)> {
+        let file = pos.file;
+        self.document.reading_of(file)?;
+        let Some(Segment::Hunk(h)) = self.document.segment(file, pos.part) else {
+            return None;
+        };
+        let layout = self.file_layout(file);
+        let opened = self.document.opened(file).binary_search(&h).is_ok();
+        match self.document.row(pos, arrange(&layout, &self.boxes))? {
+            Content::Hunk { .. } if opened => Some((h, true)),
+            Content::Hunk {
+                row:
+                    Row::Hidden { .. }
+                    | Row::One {
+                        paired: Some(_), ..
+                    },
+                ..
+            } => Some((h, false)),
+            _ => None,
+        }
+    }
+
+    /// Whether the selection lies within one hunk opened in place in file
+    /// view, which shows both sides as the diff does.
+    pub(crate) fn selection_opened(&self) -> bool {
+        let Some(s) = &self.selection else {
+            return false;
+        };
+        let file = s.anchor.file;
+        let hunk = |pos: Pos| match self.document.segment(file, pos.part) {
+            Some(Segment::Hunk(h)) => self.document.opened(file).binary_search(&h).ok(),
+            _ => None,
+        };
+        hunk(s.anchor).is_some() && hunk(s.anchor) == hunk(s.cursor)
+    }
+
+    /// `x` in file view: opens the hunk of the hidden run at `at`, the row
+    /// last tapped, or folds it at its closing rule; else the first run or
+    /// rule on screen. Returns the hunk's hidden lines and whether it's
+    /// open now, `Ok(None)` with neither on screen, or `Err` when the one
+    /// found couldn't toggle.
+    pub(crate) fn toggle_run(&mut self, at: Option<Pos>) -> Result<Option<(usize, bool)>, ()> {
+        let on_screen: Vec<Pos> = (0..self.drawn.len())
+            .filter_map(|y| self.row_at(y))
+            .collect();
+        let found =
+            (at.into_iter().chain(on_screen)).find_map(|pos| Some((pos, self.run_at(pos)?)));
+        let Some((pos, (h, opened))) = found else {
+            return Ok(None);
+        };
+        let file = pos.file;
+        let side = self.document.reading_of(file).ok_or(())?;
+        let layout = self.file_layout(file);
+        if file != self.document.pos.file
+            || !(self.document).set_opened(pos, !opened, arrange(&layout, &self.boxes))
+        {
+            return Err(());
+        }
+        self.selection = None;
+        self.normalize();
+        let hidden = (self.document.file(file)).map_or(0, |f| {
+            f.lines(self.document.structural, h).only_on(side.other())
+        });
+        Ok(Some((hidden, !opened)))
     }
 
     /// Puts the view where `settle` says, once the core moved the position.
@@ -1231,6 +1369,10 @@ impl Doc {
         }
         match entry.state() {
             document::State::Pending => Some("loading…"),
+            // Its lines fill the pane, under where the note would go.
+            document::State::Loaded(l) if self.document.is_full(entry) && !l.gaps().is_empty() => {
+                None
+            }
             document::State::Loaded(l) => l.note(),
             document::State::Failed(e) => Some(e.as_str()),
         }
@@ -1259,12 +1401,22 @@ impl Doc {
     /// [`Doc::render`]'s code rows; what it leaves to draw for blocks.
     fn render_code(&mut self, pos: Pos, layout: &Layout, c: &mut Canvas) -> Drawn {
         let target = self.target == Some(Pos { offset: 0, ..pos });
+        let read = self.document.reading_of(pos.file);
         match self.document.row(pos, arrange(layout, &self.boxes)) {
+            Some(Content::Start(header)) if read.is_some() => layout.read_start(&header, c),
             Some(Content::Start(header)) => {
                 layout.hunk_row(&header, Row::Header, |_| NO_NEWLINE_LINE, c);
             }
             Some(Content::Hunk { header, row, lines }) => {
-                layout.hunk_row(&header, row, |i| lines.line(i), c);
+                let key = self.open_key.as_deref();
+                match (row, read) {
+                    (Row::Hidden { n, .. }, _) => layout.hidden_run(n as usize, false, key, c),
+                    // An opened hunk's header row closes it again.
+                    (Row::Header, Some(side)) => {
+                        layout.hidden_run(lines.only_on(side.other()), true, key, c);
+                    }
+                    _ => layout.hunk_row(&header, row, |i| lines.line(i), c),
+                }
             }
             Some(Content::Separator { hidden, next }) => {
                 layout.separator(hidden, next.as_ref(), target, c);
@@ -1430,15 +1582,18 @@ impl Doc {
         if same && file == self.boxes.file {
             return;
         }
-        // Measured as the boxes it had, before they're replaced.
+        // Measured as the boxes it had, before they're replaced. A peek
+        // hangs under a line of the file it opened on.
         if file != self.boxes.file {
             self.set_blocks(self.boxes.file, Vec::new());
+            self.boxes.peek = None;
         }
         // Another file, and still no boxes: no rows changed.
         if threads.is_empty()
             && self.boxes.threads.is_empty()
             && self.boxes.new_at.is_none()
             && self.boxes.writing.is_none()
+            && self.boxes.peek.is_none()
         {
             self.boxes.file = file;
             return;
@@ -1577,6 +1732,80 @@ impl Doc {
         if let Some(block) = self.writing_block() {
             self.remeasure(block);
         }
+    }
+
+    /// Opens `peek` under the row showing `at` of the file shown, in place
+    /// of one open before, and scrolls as far as it takes to show it.
+    pub(crate) fn open_peek(&mut self, peek: Peek, at: Attach) {
+        let file = self.document.pos.file;
+        if self.boxes.file != file {
+            self.set_threads(file, Arc::new([]));
+        }
+        self.boxes.peek = Some(PeekBox {
+            peek,
+            at,
+            tab: self.layout.tab_width,
+        });
+        let list = self.boxes.list();
+        self.set_blocks(file, list);
+        self.painted = None;
+        self.fit();
+        self.reveal_block(Block::Peek, true);
+    }
+
+    /// The go-to-definition peek, while it's open.
+    pub(crate) fn def_peek(&self) -> Option<&Peek> {
+        self.boxes.peek.as_ref().map(|p| &p.peek)
+    }
+
+    /// Changes the peek with `f`. It keeps its height, so only the next
+    /// frame needs drawing whole.
+    pub(crate) fn edit_peek(&mut self, f: impl FnOnce(&mut Peek)) {
+        if let Some(p) = &mut self.boxes.peek {
+            f(&mut p.peek);
+            self.painted = None;
+        }
+    }
+
+    /// Closes the peek, keeping the position on what it showed.
+    pub(crate) fn close_peek(&mut self) -> Option<Peek> {
+        let closed = self.boxes.peek.take()?;
+        let list = self.boxes.list();
+        self.set_blocks(self.boxes.file, list);
+        self.painted = None;
+        self.fit();
+        Some(closed.peek)
+    }
+
+    /// Whether any row of the peek is on screen, counted from the position.
+    pub(crate) fn peek_shown(&mut self) -> bool {
+        let Some((first, rows)) = self.block_rows(Block::Peek) else {
+            return false;
+        };
+        let top = Pos {
+            offset: 0,
+            ..self.document.pos
+        };
+        let last = Pos {
+            row: first.row + rows - 1,
+            ..first
+        };
+        last >= top && (first <= top || self.rows_to(first).is_some())
+    }
+
+    /// The peek's candidate on row `y` of the pane, at column `column` of
+    /// the pane, as drawn in the last frame.
+    pub(crate) fn peek_hit(&mut self, y: usize, column: usize) -> Option<usize> {
+        let (id, line) = self.block_line_at(y)?;
+        if id != PEEK {
+            return None;
+        }
+        let layout = self.file_layout(self.boxes.file);
+        let (start, gutter, boxed, _) = self.boxes.columns(Block::Peek, &layout);
+        let peek = &self.boxes.peek.as_ref()?.peek;
+        // As `Doc::draw_box` puts it after the gutter's rule.
+        let left = start + gutter.saturating_sub(2) + 3;
+        peek.candidate_at(boxed, line, column.checked_sub(left)?)
     }
 
     /// Keeps the position within its row and the screen full.
@@ -1719,8 +1948,9 @@ impl Doc {
     }
 
     /// The definitions around the code at the top, outermost first (see
-    /// [`File::scopes`]): around the top row's new line, or its old line
-    /// on a row with only that. A box's row stands for the row it hangs
+    /// [`File::scopes`]): around the top row's line of the side read alone,
+    /// else its new line, or its other line on a row with only that. A
+    /// box's row stands for the row it hangs
     /// under, and a row without code (a hunk's header, a separator) for the
     /// next row with some. `None` when the file has no definitions to look
     /// in.
@@ -1737,11 +1967,13 @@ impl Doc {
         {}
         // A separator, then a header: code is at most two own rows on.
         let mut own = 0;
+        let first = self.document.reading_of(pos.file).unwrap_or(Side::New);
         while own < 3 {
-            let (side, line) = match self.document.row_lines(pos, arrange(&layout, &self.boxes)) {
-                [_, Some(new)] => (Side::New, new),
-                [Some(old), None] => (Side::Old, old),
-                [None, None] => {
+            let lines = self.document.row_lines(pos, arrange(&layout, &self.boxes));
+            let (side, line) = match (lines[first.index()], lines[first.other().index()]) {
+                (Some(line), _) => (first, line),
+                (None, Some(line)) => (first.other(), line),
+                (None, None) => {
                     own += usize::from(!self.in_block(pos));
                     if !self
                         .document
@@ -1907,13 +2139,49 @@ impl Doc {
     }
 
     /// A click on screen row `y` of the document: reveals more of the gap
-    /// when it's a separator.
-    pub(crate) fn click(&mut self, y: usize) {
+    /// when it's a separator; with `toggle`, in file view, opens a hidden
+    /// run's hunk in place, or folds it at its closing rule, as
+    /// [`Doc::toggle_run`] says.
+    pub(crate) fn click(&mut self, y: usize, toggle: bool) -> Option<(usize, bool)> {
         if let Some(p) = self.separator_at(y)
             && let Some(Segment::Gap(g)) = self.document.segment(p.file, p.part)
         {
             self.expand(p.file, g);
+            return None;
         }
+        let pos = Pos {
+            offset: 0,
+            ..self.row_at(y)?
+        };
+        if !toggle {
+            return None;
+        }
+        self.run_at(pos)?;
+        // Lines are for selecting: a run or a rule toggles, an edited line
+        // from its gutter.
+        let layout = self.file_layout(pos.file);
+        let rule = matches!(
+            self.document.row(pos, arrange(&layout, &self.boxes)),
+            Some(Content::Hunk {
+                row: Row::Hidden { .. } | Row::Header,
+                ..
+            })
+        );
+        if !rule {
+            return None;
+        }
+        self.toggle_run(Some(pos)).ok().flatten()
+    }
+
+    /// A tap on the gutter of the row at `pos`: in file view, an edited
+    /// line's hunk opens in place, as [`Doc::toggle_run`] says.
+    pub(crate) fn gutter_click(&mut self, pos: Pos) -> Option<(usize, bool)> {
+        let pos = Pos { offset: 0, ..pos };
+        let (_, opened) = self.run_at(pos)?;
+        if opened {
+            return None;
+        }
+        self.toggle_run(Some(pos)).ok().flatten()
     }
 
     /// `X`: switches every file between its changes and its full text,
@@ -2809,7 +3077,14 @@ impl Doc {
                 .collect(),
         };
         for pos in rows {
-            let lines = self.document.row_lines(pos, arrange(&layout, &self.boxes));
+            let mut lines = self.document.row_lines(pos, arrange(&layout, &self.boxes));
+            // A mark alone on its row in file view: the lines it stands for.
+            if lines == [None, None]
+                && let Some((side, hidden)) =
+                    (self.document).mark(pos, arrange(&layout, &self.boxes))
+            {
+                lines[side.index()] = Some(hidden.start);
+            }
             if let Some(h) = diff.hunks.iter().find(|h| within(h, lines)) {
                 return Ok((file, Picked::hunk(h)));
             }
@@ -2884,28 +3159,39 @@ impl Doc {
     /// [`Doc::goto_match`] shows a row, revealing it with a few lines
     /// around when a gap hides it. False when no row shows that line.
     pub(crate) fn goto_line(&mut self, file: usize, side: Side, line: usize) -> bool {
+        self.line_pos(file, side, line)
+            .map(|pos| self.goto_match(pos))
+            .is_some()
+    }
+
+    /// Puts line `line` (0-based) of `side` of `file`, a loaded file, at
+    /// the top of the pane, revealed as [`Doc::goto_line`] reveals it.
+    /// False when no row shows that line.
+    pub(crate) fn line_to_top(&mut self, file: usize, side: Side, line: usize) -> bool {
+        let Some(pos) = self.line_pos(file, side, line) else {
+            return false;
+        };
+        self.document.pos = pos;
+        self.clamp();
+        true
+    }
+
+    /// The row of line `line` of `side` of `file`, revealing it with a few
+    /// lines around when a gap hides it.
+    fn line_pos(&mut self, file: usize, side: Side, line: usize) -> Option<Pos> {
         let layout = self.file_layout(file);
         let around = OPEN_CONTEXT.unsigned_abs();
         let lines = line..line + 1;
         if (self.document).reveal_lines(file, side, lines, around, arrange(&layout, &self.boxes)) {
             self.normalize();
         }
-        let Ok(line) = u32::try_from(line) else {
-            return false;
-        };
         let m = document::Match {
             side,
-            line,
+            line: u32::try_from(line).ok()?,
             start: 0,
             end: 0,
         };
-        match (self.document).match_pos(file, &m, arrange(&layout, &self.boxes)) {
-            Some(pos) => {
-                self.goto_match(pos);
-                true
-            }
-            None => false,
-        }
+        (self.document).match_pos(file, &m, arrange(&layout, &self.boxes))
     }
 
     /// The old and new lines (0-based) of the first row drawn in the last

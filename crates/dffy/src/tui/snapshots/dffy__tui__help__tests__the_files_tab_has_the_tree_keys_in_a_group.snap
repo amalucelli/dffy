@@ -10,11 +10,11 @@ expression: "shown(&mut help, &keys, 100, 20)"
        │ tab shift+tab     switch panel/diff       enter l           open file or folder   │
        │ T t               toggle tree             h left            collapse folder       │
        │ o                 find file               v                 mark viewed           │
-       │ /                 search diff             +                 widen tree            │
-       │ u                 parent folder           -                 narrow tree           │
+       │ /                 search diff             x                 close file            │
+       │ u                 parent folder           a                 toggle all files      │
+       │                                           +                 widen tree            │
+       │                                           -                 narrow tree           │
        │                                           c                 files with comments   │
-       │                                                                                   │
-       │                                                                                   │
        │                                                                                   │
        │                                                                                   │
        │                                                                                   │

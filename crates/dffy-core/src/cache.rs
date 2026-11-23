@@ -11,7 +11,7 @@
 use std::fs;
 use std::hash::Hasher as _;
 use std::io::{self, Write as _};
-use std::os::unix::fs::DirBuilderExt as _;
+use std::os::unix::fs::{DirBuilderExt as _, MetadataExt as _};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime};
@@ -54,13 +54,60 @@ pub enum Kind {
     Described = 6,
     /// The names of the plugins of one kind found on PATH.
     Plugins = 7,
+    /// A blob's definitions (see [`crate::highlight::blob_definitions`]),
+    /// kept in [`Cache::symbols`].
+    Symbols = 8,
 }
+
+/// The budget of [`Cache::symbols`]: the kernel's v6.0 and v6.1 together,
+/// with room for as much again.
+pub const SYMBOLS_BUDGET: u64 = 128 << 20;
 
 /// A cache directory with a size budget.
 #[derive(Debug, Clone)]
 pub struct Cache {
     dir: PathBuf,
     budget: u64,
+    /// Entries count the blocks they take on disk rather than their
+    /// length.
+    blocks: bool,
+}
+
+/// The cache of definitions, [`Cache::symbols`]: its own directory and
+/// budget, apart from the cache it's made from.
+#[derive(Debug, Clone)]
+pub struct SymbolCache(Cache);
+
+impl SymbolCache {
+    /// The cache underneath, to read its usage or budget.
+    #[must_use]
+    pub fn as_cache(&self) -> &Cache {
+        &self.0
+    }
+
+    /// The budget in bytes on disk.
+    #[must_use]
+    pub fn budget(&self) -> u64 {
+        self.0.budget
+    }
+
+    /// Bytes the entries take on disk, and how many there are.
+    ///
+    /// # Errors
+    ///
+    /// When the directory exists but can't be read.
+    pub fn usage(&self) -> io::Result<(u64, usize)> {
+        self.0.usage()
+    }
+
+    /// Each entry's bytes on disk, with whether it's the entry of `kind`
+    /// for `key`.
+    pub(crate) fn sizes(&self, kind: Kind, key: &[u8]) -> io::Result<Vec<(u64, bool)>> {
+        let own = self.0.path(kind, key);
+        Ok((self.0.entries()?.into_iter())
+            .map(|(path, size, _)| (size, path == own))
+            .collect())
+    }
 }
 
 impl Cache {
@@ -68,7 +115,11 @@ impl Cache {
     /// bytes by eviction.
     #[must_use]
     pub fn new(dir: PathBuf, budget: u64) -> Self {
-        Self { dir, budget }
+        Self {
+            dir,
+            budget,
+            blocks: false,
+        }
     }
 
     /// `$XDG_CACHE_HOME/dffy`, falling back to `~/.cache/dffy`.
@@ -80,6 +131,26 @@ impl Cache {
         let base =
             xdg.or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cache")))?;
         Some(base.join("dffy"))
+    }
+
+    /// The cache for [`Kind::Symbols`]: a directory inside this one with
+    /// its own budget, [`SYMBOLS_BUDGET`] or this cache's if smaller. A
+    /// revision's definitions are tens of thousands of entries, which in a
+    /// shared budget would evict every highlight; this cache's scans don't
+    /// see them, and theirs don't see this cache's. Its entries are few
+    /// and large, and count the blocks they take on disk.
+    #[must_use]
+    pub fn symbols(&self) -> SymbolCache {
+        SymbolCache(Self {
+            blocks: true,
+            ..Self::new(self.dir.join("symbols"), SYMBOLS_BUDGET.min(self.budget))
+        })
+    }
+
+    /// The budget in bytes on disk.
+    #[must_use]
+    pub fn budget(&self) -> u64 {
+        self.budget
     }
 
     /// Where the entries live; it may not exist yet.
@@ -123,7 +194,7 @@ impl Cache {
         self.maybe_evict();
     }
 
-    /// Total bytes and number of entries.
+    /// Bytes the entries take, and how many there are.
     ///
     /// # Errors
     ///
@@ -153,7 +224,12 @@ impl Cache {
                     && meta.is_file()
                 {
                     let modified = meta.modified().unwrap_or(SystemTime::UNIX_EPOCH);
-                    out.push((file.path(), meta.len(), modified));
+                    let size = if self.blocks {
+                        meta.blocks() * 512
+                    } else {
+                        meta.len()
+                    };
+                    out.push((file.path(), size, modified));
                 }
             }
         }

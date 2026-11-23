@@ -261,6 +261,11 @@ pub(crate) const KEYS: &[Key] = &[
         default: "3",
     },
     Key {
+        name: "file-view",
+        doc: "Start the viewer in file view: every file whole as it is in the diff's newer version, with a mark in the gutter where removed lines were. `l` toggles it and `s` flips to the older version, which isn't remembered. A piped diff has only its hunks, so it opens as the diff.",
+        default: "false",
+    },
+    Key {
         name: "ignore-all-space",
         doc: "Ignore all whitespace when comparing lines (-w). The command panel's Ignore whitespace entry toggles it in the viewer.",
         default: "false",
@@ -326,6 +331,11 @@ pub(crate) const KEYS: &[Key] = &[
         default: "auto",
     },
     Key {
+        name: "all-files",
+        doc: "Start the tree on every file of the repository, the diff's changes colored among them, rather than the diff's files alone. `a` in the tree toggles it. A piped diff and two paths compared have only their files.",
+        default: "false",
+    },
+    Key {
         name: "status-bar",
         doc: "Where the viewer shows what's compared, the position, the modes and the key hints: bottom (in the frame's bottom border) or top (in its top border, after the file's name). The command panel's Status bar entry switches it.",
         default: "bottom",
@@ -347,7 +357,7 @@ pub(crate) const KEYS: &[Key] = &[
     },
     Key {
         name: "remember",
-        doc: "Remember the view choices made in the viewer (layout, wrap, the tree and its width, the status bar, indicators, modified lines, syntax diff, rendered view, highlighting, theme, mouse, line numbers, hunk headers, copy decorations, whole files, ignored whitespace, watch mode) for the next run, in $XDG_STATE_HOME/dffy/state. A choice made in the viewer beats this file in the viewer; a flag beats both, for that run only. Printed output never takes them. A remembered split layout shows unified under 100 columns; --split doesn't.",
+        doc: "Remember the view choices made in the viewer (layout, wrap, the tree, its width and whether it lists all files, the status bar, indicators, modified lines, syntax diff, rendered view, highlighting, theme, mouse, line numbers, hunk headers, copy decorations, whole files, file view, ignored whitespace, watch mode) for the next run, in $XDG_STATE_HOME/dffy/state. A choice made in the viewer beats this file in the viewer; a flag beats both, for that run only. Printed output never takes them. A remembered split layout shows unified under 100 columns; --split doesn't.",
         default: "true",
     },
     Key {
@@ -391,6 +401,7 @@ pub(crate) struct Config {
     pub wrap: bool,
     pub tab_width: usize,
     pub context: Context,
+    pub file_view: bool,
     pub whitespace: Whitespace,
     pub default_diff: DefaultDiff,
     pub renames: bool,
@@ -405,6 +416,7 @@ pub(crate) struct Config {
     pub tree: TreeMode,
     /// `None` follows the terminal's width.
     pub tree_width: Option<usize>,
+    pub all_files: bool,
     pub status_bar: StatusBar,
     pub line_numbers: bool,
     pub hunk_headers: bool,
@@ -437,6 +449,7 @@ impl Default for Config {
             wrap: false,
             tab_width: 0,
             context: Context::Lines(0),
+            file_view: false,
             whitespace: Whitespace::Exact,
             default_diff: DefaultDiff::All,
             renames: true,
@@ -449,6 +462,7 @@ impl Default for Config {
             watch: false,
             tree: TreeMode::Auto,
             tree_width: None,
+            all_files: false,
             status_bar: StatusBar::Bottom,
             line_numbers: true,
             hunk_headers: true,
@@ -494,6 +508,7 @@ impl Config {
             "wrap" => self.wrap = boolean(value)?,
             "tab-width" => self.tab_width = number(value, 1)?,
             "context" => self.context = value.parse()?,
+            "file-view" => self.file_view = boolean(value)?,
             "ignore-all-space" => {
                 self.whitespace = match (boolean(value)?, self.whitespace) {
                     (true, _) => Whitespace::IgnoreAll,
@@ -525,6 +540,7 @@ impl Config {
                     n => Some(number(n, 1).map_err(|e| format!("{e}, or auto"))?),
                 };
             }
+            "all-files" => self.all_files = boolean(value)?,
             "status-bar" => self.status_bar = choice(value)?,
             "line-numbers" => self.line_numbers = boolean(value)?,
             "hunk-headers" => self.hunk_headers = boolean(value)?,
@@ -554,6 +570,7 @@ impl Config {
             "wrap" => self.wrap.to_string(),
             "tab-width" => self.tab_width.to_string(),
             "context" => self.context.to_string(),
+            "file-view" => self.file_view.to_string(),
             "ignore-all-space" => (self.whitespace == Whitespace::IgnoreAll).to_string(),
             "ignore-space-change" => (self.whitespace == Whitespace::IgnoreChange).to_string(),
             "default-diff" => choice_name(&self.default_diff),
@@ -569,6 +586,7 @@ impl Config {
             "tree-width" => self
                 .tree_width
                 .map_or_else(|| "auto".to_owned(), |n| n.to_string()),
+            "all-files" => self.all_files.to_string(),
             "status-bar" => choice_name(&self.status_bar),
             "line-numbers" => self.line_numbers.to_string(),
             "hunk-headers" => self.hunk_headers.to_string(),

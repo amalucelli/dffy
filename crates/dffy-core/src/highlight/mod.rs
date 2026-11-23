@@ -14,6 +14,7 @@
 
 mod lang;
 mod scope;
+mod tags;
 
 use std::ops::{ControlFlow, Range};
 use std::sync::OnceLock;
@@ -24,6 +25,13 @@ use tree_sitter::{InputEdit, Parser, Point, Query, QueryCursor, StreamingIterato
 
 pub use lang::{Grammar, Language, LanguageSource, Registry, Words};
 pub use scope::Scopes;
+pub use tags::{
+    Definition, DefinitionKind, Definitions, MAX_TAGS_BYTES, Skipped, TagsError, blob_definitions,
+    definitions,
+};
+pub(crate) use tags::{
+    PACKS, Pack, TAGS_PARSE_BUDGET, cached_definitions, extract_blob, pack_key, pack_of,
+};
 
 use crate::cache::{self, Cache};
 use crate::diff::{Emphasis, Hunk, LineKind, Text, emphasize_with};
@@ -845,6 +853,12 @@ impl FileSyntax {
     #[must_use]
     pub fn new_spans(&self, new: &Text, lines: Range<usize>) -> Option<Spans> {
         self.new.as_ref().map(|h| h.spans(new, lines))
+    }
+
+    /// The spans of `lines` of the `old` side, if it's highlighted.
+    #[must_use]
+    pub fn old_spans(&self, old: &Text, lines: Range<usize>) -> Option<Spans> {
+        self.old.as_ref().map(|h| h.spans(old, lines))
     }
 
     /// The spans of the lines `hunk` shows on each side of `old` and

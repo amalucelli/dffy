@@ -5,19 +5,19 @@ expression: "shown(&mut help, &keys, 100, 20)"
 
        ┌─ keybinds ──────────────────────────────────────────────────────────── esc close ─┐
        │  Move  Files  View  Git  Copy  Review  General                                    │
-       │ j J               scroll down             }                 next change           │
-       │ k up              scroll up               N {               prev change           │
-       │ page_down ctrl+f  page down               > L               scroll right          │
-       │ b page_up         page up                 < H               scroll left           │
-       │ ctrl+d            half page down          0                 scroll to line start  │
-       │ ctrl+u            half page up            m                 next thread           │
-       │ g home            top of file             M                 prev thread           │
-       │ G end             bottom of file                                                  │
-       │                                                                                   │
-       │                                                                                   │
-       │                                                                                   │
-       │                                                                                   │
-       │                                                                                   │
+       │ j J               scroll down             in a peek                              ┃│
+       │ k up              scroll up               j down            scroll down          ┃│
+       │ page_down ctrl+f  page down               k up              scroll up            ┃│
+       │ b page_up         page up                 enter             open file or folder  ┃│
+       │ ctrl+d            half page down          d                 show in diff         ┃│
+       │ ctrl+u            half page up            s                 other version        ┃│
+       │ g home            top of file             r                 references           ┃│
+       │ G end             bottom of file          esc q             close peek           ┃│
+       │ }                 next change                                                    ┃│
+       │ N {               prev change                                                    ││
+       │ > L               scroll right                                                   ││
+       │ < H               scroll left                                                    ││
+       │ 0                 scroll to line start                                           ││
        │ more settings: space · all keys: docs/keys.md                                     │
        │ tab section · / search · esc close                                                │
        └───────────────────────────────────────────────────────────────────────────────────┘

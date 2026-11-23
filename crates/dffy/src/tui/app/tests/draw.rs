@@ -555,3 +555,114 @@ fn auto_splits_from_the_split_min_width() {
     assert!(!app.doc.layout.split);
     insta::assert_snapshot!("auto_below_split_min_width", screen(&mut app));
 }
+
+/// In file view the title names the version read as given: a commit shown
+/// and its parent, the revisions of `-R` the other way round, the index of
+/// `--staged`.
+#[test]
+fn file_view_titles_name_the_side_as_given() {
+    let tree = |b: u8| {
+        let hex = format!("{b:02x}").repeat(20);
+        Snapshot::Tree(dffy_core::git::ObjectId::from_hex(hex.as_bytes()).expect("hex"))
+    };
+    let title = |description: &str, revisions: Revisions, at: [Snapshot; 2], old: bool| {
+        let fd = diff("src/a.rs");
+        let mut app = app_of(&Config::default(), description, fd, (120, 20));
+        app.set_selected(revisions, DefaultDiff::All);
+        app.set_snapshots(Some(at));
+        app.set_reverse(description.ends_with(" reversed"));
+        key(&mut app, 'l');
+        if old {
+            key(&mut app, 's');
+        }
+        let shown = screen(&mut app);
+        shown.lines().next().unwrap_or_default().to_owned()
+    };
+    let show = Revisions {
+        revs: vec!["0123456789abcdef0123456789abcdef01234567^!".to_owned()],
+        ..Revisions::default()
+    };
+    let at = [tree(1), tree(2)];
+    let row = title("show", show.clone(), at, false);
+    assert!(row.contains("a.rs · 0123456 · 2 changes"), "{row}");
+    let row = title("show", show, at, true);
+    assert!(row.contains("a.rs · 0123456^ · "), "{row}");
+    assert!(!row.contains("FILE") && !row.contains("side"), "{row}");
+    let range = Revisions {
+        revs: vec!["v1..v2".to_owned()],
+        ..Revisions::default()
+    };
+    // `-R`: the new side is the one typed first.
+    let row = title("v1..v2 reversed", range, [tree(2), tree(1)], false);
+    assert!(row.contains("a.rs · v1 · "), "{row}");
+    let staged = Revisions {
+        staged: true,
+        ..Revisions::default()
+    };
+    let row = title("staged", staged, [tree(1), Snapshot::Index], false);
+    assert!(row.contains("a.rs · index · "), "{row}");
+}
+
+/// Two paths compared outside git name their versions by the paths as
+/// typed.
+#[test]
+fn file_view_titles_name_compared_paths_as_typed() {
+    let mut app = app_of(
+        &Config::default(),
+        "old/ → new/",
+        diff("src/a.rs"),
+        (120, 20),
+    );
+    app.versions = Some(["old/".to_owned(), "new/".to_owned()]);
+    key(&mut app, 'l');
+    let shown = screen(&mut app);
+    let row = shown.lines().next().unwrap_or_default();
+    assert!(row.contains("a.rs · new/ · 2 changes"), "{row}");
+    key(&mut app, 's');
+    let shown = screen(&mut app);
+    let row = shown.lines().next().unwrap_or_default();
+    assert!(row.contains("a.rs · old/ · 2 changes"), "{row}");
+    assert!(
+        status(&mut app).contains("reading old/"),
+        "{}",
+        status(&mut app)
+    );
+}
+
+/// A file the version read hasn't shows the other, and says so: an added
+/// file read on HEAD isn't in it, a deleted one read on the working tree
+/// was deleted there.
+#[test]
+fn file_view_titles_say_a_version_lacks_the_file() {
+    let title = |added: bool, old: bool| {
+        let mut fd = diff("src/a.rs");
+        let (gone, side) = if added {
+            (&mut fd.old, &mut fd.change.old)
+        } else {
+            (&mut fd.new, &mut fd.change.new)
+        };
+        (*gone, *side) = (Text::new(Vec::new()), None);
+        fd.change.status = if added {
+            Status::Added
+        } else {
+            Status::Deleted
+        };
+        fd.hunks = hunks(&fd.old, &fd.new, &Options::default());
+        let mut app = app_of(&Config::default(), "working tree", fd, (120, 20));
+        app.set_selected(Revisions::default(), DefaultDiff::All);
+        app.set_snapshots(Some([Snapshot::Index, Snapshot::Worktree]));
+        key(&mut app, 'l');
+        if old {
+            key(&mut app, 's');
+        }
+        let shown = screen(&mut app);
+        shown.lines().next().unwrap_or_default().to_owned()
+    };
+    let row = title(true, true);
+    assert!(row.contains("a.rs · working tree · not in index"), "{row}");
+    let row = title(false, false);
+    assert!(
+        row.contains("a.rs · index · deleted in working tree"),
+        "{row}"
+    );
+}

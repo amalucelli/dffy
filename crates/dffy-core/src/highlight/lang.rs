@@ -10,6 +10,7 @@ use gix::bstr::ByteSlice;
 
 use super::Compiled;
 use super::scope::ScopeQuery;
+use super::tags::{TagsError, TagsQuery};
 use crate::git::ObjectId;
 
 /// A list of words or query parts: borrowed for text compiled into the
@@ -41,6 +42,10 @@ pub struct Grammar {
     /// definition, for where a line is (see [`super::Scopes`]). Empty
     /// for a language without one.
     pub scopes: Words,
+    /// The definitions query, as parts concatenated in order: what a file
+    /// defines, for go-to-definition (see [`super::definitions`]). Empty
+    /// for a language without one.
+    pub tags: Words,
     /// A line's indentation is syntax: changing it can move code into or
     /// out of a block with the same tokens in the same order, so the
     /// syntax diff never calls such a change only reformatting.
@@ -72,7 +77,9 @@ struct Entry {
     loaded: OnceLock<tree_sitter::Language>,
     compiled: OnceLock<Option<Compiled>>,
     scopes: OnceLock<Option<ScopeQuery>>,
+    tags: OnceLock<Option<Result<TagsQuery, TagsError>>>,
     identity: OnceLock<ObjectId>,
+    tags_identity: OnceLock<ObjectId>,
     #[cfg(test)]
     compiles: std::sync::atomic::AtomicUsize,
 }
@@ -98,7 +105,9 @@ impl Language {
             loaded: OnceLock::new(),
             compiled: OnceLock::new(),
             scopes: OnceLock::new(),
+            tags: OnceLock::new(),
             identity: OnceLock::new(),
+            tags_identity: OnceLock::new(),
             #[cfg(test)]
             compiles: std::sync::atomic::AtomicUsize::new(0),
         }))
@@ -123,31 +132,46 @@ impl Language {
     /// one. Computed on first use, which loads the grammar.
     #[must_use]
     pub fn identity(&self) -> &ObjectId {
-        self.0.identity.get_or_init(|| {
-            let g = &self.0.grammar;
-            let mut hasher = gix::hash::hasher(gix::hash::Kind::Sha1);
-            let number = |hasher: &mut gix::hash::Hasher, n: usize| {
-                hasher.update(&(n as u64).to_le_bytes());
-            };
-            number(&mut hasher, g.name.len());
-            hasher.update(g.name.as_bytes());
-            let ts = self.grammar();
-            number(&mut hasher, ts.abi_version());
-            let version = ts.metadata().map_or([u8::MAX; 3], |m| {
-                [m.major_version, m.minor_version, m.patch_version]
-            });
-            hasher.update(&version);
-            number(&mut hasher, ts.node_kind_count());
-            number(&mut hasher, ts.parse_state_count());
-            number(&mut hasher, ts.field_count());
-            for part in g.highlights.iter().chain(g.scopes.iter()) {
-                number(&mut hasher, part.len());
-                hasher.update(part.as_bytes());
-            }
-            hasher
-                .try_finalize()
-                .unwrap_or_else(|_| ObjectId::null(gix::hash::Kind::Sha1))
+        let g = &self.0.grammar;
+        (self.0.identity).get_or_init(|| self.digest(g.highlights.iter().chain(g.scopes.iter())))
+    }
+
+    /// [`Language::identity`] for definitions: the grammar, its
+    /// [`Grammar::tags`] and the rules extraction walks it with, so editing
+    /// a highlight or scope query keeps the definitions cached under it,
+    /// and editing the tags query or the rules keeps the highlights.
+    pub(super) fn tags_identity(&self) -> &ObjectId {
+        (self.0.tags_identity).get_or_init(|| {
+            let rules = Cow::Owned(super::tags::rules_identity(self.name()));
+            self.digest(self.0.grammar.tags.iter().chain([&rules]))
         })
+    }
+
+    /// A digest of the grammar's name and tables, then of `queries`.
+    fn digest<'q>(&self, queries: impl Iterator<Item = &'q Cow<'static, str>>) -> ObjectId {
+        let g = &self.0.grammar;
+        let mut hasher = gix::hash::hasher(gix::hash::Kind::Sha1);
+        let number = |hasher: &mut gix::hash::Hasher, n: usize| {
+            hasher.update(&(n as u64).to_le_bytes());
+        };
+        number(&mut hasher, g.name.len());
+        hasher.update(g.name.as_bytes());
+        let ts = self.grammar();
+        number(&mut hasher, ts.abi_version());
+        let version = ts.metadata().map_or([u8::MAX; 3], |m| {
+            [m.major_version, m.minor_version, m.patch_version]
+        });
+        hasher.update(&version);
+        number(&mut hasher, ts.node_kind_count());
+        number(&mut hasher, ts.parse_state_count());
+        number(&mut hasher, ts.field_count());
+        for part in queries {
+            number(&mut hasher, part.len());
+            hasher.update(part.as_bytes());
+        }
+        hasher
+            .try_finalize()
+            .unwrap_or_else(|_| ObjectId::null(gix::hash::Kind::Sha1))
     }
 
     pub(crate) fn grammar(&self) -> &tree_sitter::Language {
@@ -215,6 +239,21 @@ impl Language {
             .as_ref()
     }
 
+    /// The compiled definitions query, compiling it on first use. `None`
+    /// for a language without one; an error, for the host to show, when it
+    /// doesn't compile.
+    pub(super) fn tags_query(&self) -> Option<Result<&TagsQuery, &TagsError>> {
+        let g = &self.0.grammar;
+        self.0
+            .tags
+            .get_or_init(|| {
+                (!g.tags.is_empty())
+                    .then(|| TagsQuery::new(self.grammar(), &g.name, &g.tags.concat()))
+            })
+            .as_ref()
+            .map(Result::as_ref)
+    }
+
     #[cfg(test)]
     pub(super) fn compiles(&self) -> usize {
         self.0.compiles.load(std::sync::atomic::Ordering::Relaxed)
@@ -223,6 +262,12 @@ impl Language {
     /// Whether the query was compiled (or failed to) already.
     pub(super) fn is_compiled(&self) -> bool {
         self.0.compiled.get().is_some()
+    }
+
+    /// Whether [`Grammar::tags`] has a query, compiled or not.
+    #[must_use]
+    pub fn has_tags(&self) -> bool {
+        !self.0.grammar.tags.is_empty()
     }
 }
 
@@ -332,6 +377,7 @@ fn builtin() -> [Grammar; 30] {
         language: LanguageSource::Fn(language),
         highlights: words![],
         scopes: words![],
+        tags: words![],
         indentation_is_syntax: false,
     };
     [
@@ -351,12 +397,14 @@ fn builtin() -> [Grammar; 30] {
             extensions: words!["sh", "bash", "zsh", "ksh", "bats", "ebuild"],
             interpreters: words!["sh", "bash", "zsh", "dash", "ksh", "ash"],
             highlights: words![tree_sitter_bash::HIGHLIGHT_QUERY],
+            tags: words![include_str!("queries/bash/tags.scm")],
             ..grammar("bash", || tree_sitter_bash::LANGUAGE.into())
         },
         Grammar {
             extensions: words!["c", "h"],
             highlights: words![tree_sitter_c::HIGHLIGHT_QUERY],
             scopes: words![include_str!("queries/c/scopes.scm")],
+            tags: words![include_str!("queries/c/tags.scm")],
             ..grammar("c", || tree_sitter_c::LANGUAGE.into())
         },
         Grammar {
@@ -371,11 +419,16 @@ fn builtin() -> [Grammar; 30] {
                 include_str!("queries/c/scopes.scm"),
                 include_str!("queries/cpp/scopes.scm")
             ],
+            tags: words![
+                include_str!("queries/cpp/tags.scm"),
+                include_str!("queries/c/tags.scm"),
+            ],
             ..grammar("cpp", || tree_sitter_cpp::LANGUAGE.into())
         },
         Grammar {
             extensions: words!["cs"],
             highlights: words![tree_sitter_c_sharp::HIGHLIGHTS_QUERY],
+            tags: words![include_str!("queries/csharp/tags.scm")],
             ..grammar("csharp", || tree_sitter_c_sharp::LANGUAGE.into())
         },
         Grammar {
@@ -393,12 +446,14 @@ fn builtin() -> [Grammar; 30] {
             extensions: words!["ex", "exs"],
             interpreters: words!["elixir"],
             highlights: words![tree_sitter_elixir::HIGHLIGHTS_QUERY],
+            tags: words![include_str!("queries/elixir/tags.scm")],
             ..grammar("elixir", || tree_sitter_elixir::LANGUAGE.into())
         },
         Grammar {
             extensions: words!["go"],
             highlights: words![tree_sitter_go::HIGHLIGHTS_QUERY],
             scopes: words![include_str!("queries/go/scopes.scm")],
+            tags: words![include_str!("queries/go/tags.scm")],
             ..grammar("go", || tree_sitter_go::LANGUAGE.into())
         },
         Grammar {
@@ -415,6 +470,7 @@ fn builtin() -> [Grammar; 30] {
             extensions: words!["java"],
             highlights: words![tree_sitter_java::HIGHLIGHTS_QUERY],
             scopes: words![include_str!("queries/java/scopes.scm")],
+            tags: words![include_str!("queries/java/tags.scm")],
             ..grammar("java", || tree_sitter_java::LANGUAGE.into())
         },
         Grammar {
@@ -425,6 +481,10 @@ fn builtin() -> [Grammar; 30] {
                 tree_sitter_javascript::JSX_HIGHLIGHT_QUERY,
             ],
             scopes: words![include_str!("queries/javascript/scopes.scm")],
+            tags: words![
+                include_str!("queries/javascript/tags.scm"),
+                include_str!("queries/javascript/fields.scm"),
+            ],
             ..grammar("javascript", || tree_sitter_javascript::LANGUAGE.into())
         },
         Grammar {
@@ -436,12 +496,14 @@ fn builtin() -> [Grammar; 30] {
             extensions: words!["kt", "kts"],
             highlights: words![tree_sitter_kotlin_sg::HIGHLIGHTS_QUERY, KOTLIN_JUMPS],
             scopes: words![include_str!("queries/kotlin/scopes.scm")],
+            tags: words![include_str!("queries/kotlin/tags.scm")],
             ..grammar("kotlin", || tree_sitter_kotlin_sg::LANGUAGE.into())
         },
         Grammar {
             extensions: words!["lua"],
             interpreters: words!["lua", "luajit"],
             highlights: words![tree_sitter_lua::HIGHLIGHTS_QUERY],
+            tags: words![include_str!("queries/lua/tags.scm")],
             ..grammar("lua", || tree_sitter_lua::LANGUAGE.into())
         },
         Grammar {
@@ -460,6 +522,7 @@ fn builtin() -> [Grammar; 30] {
             extensions: words!["php"],
             interpreters: words!["php"],
             highlights: words![tree_sitter_php::HIGHLIGHTS_QUERY],
+            tags: words![include_str!("queries/php/tags.scm")],
             ..grammar("php", || tree_sitter_php::LANGUAGE_PHP.into())
         },
         Grammar {
@@ -468,6 +531,7 @@ fn builtin() -> [Grammar; 30] {
             highlights: words![tree_sitter_python::HIGHLIGHTS_QUERY],
             indentation_is_syntax: true,
             scopes: words![include_str!("queries/python/scopes.scm")],
+            tags: words![include_str!("queries/python/tags.scm")],
             ..grammar("python", || tree_sitter_python::LANGUAGE.into())
         },
         Grammar {
@@ -475,17 +539,20 @@ fn builtin() -> [Grammar; 30] {
             extensions: words!["rb", "rake", "gemspec", "ru"],
             interpreters: words!["ruby"],
             highlights: words![tree_sitter_ruby::HIGHLIGHTS_QUERY],
+            tags: words![include_str!("queries/ruby/tags.scm")],
             ..grammar("ruby", || tree_sitter_ruby::LANGUAGE.into())
         },
         Grammar {
             extensions: words!["rs"],
             highlights: words![tree_sitter_rust::HIGHLIGHTS_QUERY],
             scopes: words![include_str!("queries/rust/scopes.scm")],
+            tags: words![include_str!("queries/rust/tags.scm")],
             ..grammar("rust", || tree_sitter_rust::LANGUAGE.into())
         },
         Grammar {
             extensions: words!["scala", "sc", "sbt"],
             highlights: words![tree_sitter_scala::HIGHLIGHTS_QUERY],
+            tags: words![include_str!("queries/scala/tags.scm")],
             indentation_is_syntax: true,
             ..grammar("scala", || tree_sitter_scala::LANGUAGE.into())
         },
@@ -498,6 +565,7 @@ fn builtin() -> [Grammar; 30] {
             extensions: words!["swift"],
             highlights: words![tree_sitter_swift::HIGHLIGHTS_QUERY],
             scopes: words![include_str!("queries/swift/scopes.scm")],
+            tags: words![include_str!("queries/swift/tags.scm")],
             ..grammar("swift", || tree_sitter_swift::LANGUAGE.into())
         },
         Grammar {
@@ -517,6 +585,10 @@ fn builtin() -> [Grammar; 30] {
                 include_str!("queries/javascript/scopes.scm"),
                 include_str!("queries/typescript/scopes.scm")
             ],
+            tags: words![
+                include_str!("queries/javascript/tags.scm"),
+                include_str!("queries/typescript/tags.scm"),
+            ],
             ..grammar("tsx", || tree_sitter_typescript::LANGUAGE_TSX.into())
         },
         Grammar {
@@ -528,6 +600,10 @@ fn builtin() -> [Grammar; 30] {
             scopes: words![
                 include_str!("queries/javascript/scopes.scm"),
                 include_str!("queries/typescript/scopes.scm")
+            ],
+            tags: words![
+                include_str!("queries/javascript/tags.scm"),
+                include_str!("queries/typescript/tags.scm"),
             ],
             ..grammar("typescript", || {
                 tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into()
@@ -547,6 +623,7 @@ fn builtin() -> [Grammar; 30] {
         Grammar {
             extensions: words!["zig", "zon"],
             highlights: words![tree_sitter_zig::HIGHLIGHTS_QUERY],
+            tags: words![include_str!("queries/zig/tags.scm")],
             ..grammar("zig", || tree_sitter_zig::LANGUAGE.into())
         },
     ]

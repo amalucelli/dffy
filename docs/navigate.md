@@ -1,0 +1,41 @@
+# The navigator helper
+
+Go to definition keeps an index of every definition in a version of the diff: tens of megabytes on a kernel-sized repository. An allocator keeps memory once it's freed, so the only way to give it back is for the process holding it to exit. The index therefore lives in a helper process, `dffy __navigate`, which the viewer and `dffy mcp` each start for their repository and speak to over its stdin and stdout. The viewer keeps reading and highlighting a definition's file itself; the helper finds where the definitions and uses are.
+
+`__navigate` is hidden: it's for dffy itself, not for scripts. This page is its contract. `crates/dffy/tests/fixtures/navigate-protocol/messages.json` holds a request and its answer for each method on a small repository, a push, and the errors; the helper's tests (`crates/dffy/tests/navigate.rs`) hold it to them, and the host side's (`crates/dffy/src/navigator/tests.rs`) writes the same params and reads the same answers.
+
+## Lifetime
+
+- A host starts the helper in the repository's working tree, through `nice -n 10` when `nice` is in one of `PATH`'s absolute folders and can be run (macOS and Linux), so its index build runs behind the user's own work; otherwise as is. The whole process is lowered: dffy uses no unsafe code, which a priority of one thread alone would need. The helper starts a session and process group of its own.
+- It exits when its stdin closes (its host went away), on `exit`, and when no request came for 10 minutes and no request or index build runs. The next ask then starts another, which reads back what it built from the disk cache.
+- A host doesn't start a helper that exited again by itself: it starts another on its next ask, at most 3 within a minute, after which it says `definitions unavailable: the helper keeps exiting: …`. A helper that can't start is said the same way, where go to definition answers; nothing runs in the host's own process instead.
+- Each helper a host starts is a new generation, and every navigator and search id a host keeps is tagged with the generation it came from: ids start from 0 in every helper, so an id is never asked of a helper other than its own.
+- Each host has its own helper. A viewer and an MCP server on the same repository at once each hold an index, a helper of about 190 MB once built on the Linux kernel, and each builds it; the second build reads most of what the first wrote to the disk cache. One helper per repository would need a socket server of its own for several hosts, which the stdio protocol leaves out.
+- It answers `initialize` within about 10ms of starting on the Linux kernel: it finds the repository and nothing else until asked.
+- `dffy __navigate --build` prints which build it is and exits: dffy's tests refuse a helper binary left from other sources.
+
+## Messages
+
+JSON-RPC 2.0, one message a line. Requests are answered as they finish, not in order: each runs on a thread of its own, so a lookup doesn't wait for a search's step. `$/cancelRequest` with `{"id"}` stops a lookup, which then answers error -32800, or a step, which answers at the next file with what it found so far, the rest left for the next step. Fields a method doesn't know are left alone. Paths are UTF-8 strings; a byte that isn't UTF-8 is replaced.
+
+| Method | Params | Result |
+|---|---|---|
+| `initialize` | `{"protocol":1,"client":{"name","version"},"threads","cache":{"dir","bytes"},"idle_ms"?}` | `{"protocol":1,"capabilities":{"methods":[…]}}` |
+| `open` | `{"snapshots":[S,S],"side":"old"\|"new","whitespace":"exact"\|"ignore_all"\|"ignore_change"}` | `{"navigator","fit","fingerprint","languages","progress"}` |
+| `lookup` | `{"navigator","name","origin":{"path","language"}}` | `{"candidates":[C…],"total","progress"}` |
+| `progress` | `{"navigator"}` | `{"progress","building","error","skipped"}` |
+| `search/start` | `{"navigator","kind":"references"\|"text","name","origin","cap"?}` | `{"search"}` |
+| `search/step` | `{"search","budget_ms","until"?,"past_cap"?}` | `{"hits":[…],"files","searched","done","indexed"}` |
+| `search/close` | `{"search"}`, a notification | none |
+| `shutdown`, then `exit` | `{}` | `null`; `exit` is a notification |
+
+The helper sends one notification, `progress`, with `{"navigator","progress","building","error","skipped"}`, the same as `progress` answers: as its build of that navigator's index starts, at most 4 times a second while it runs, and once when it ends, `building` false, whether it finished or stopped for another's build. A host shows how far an index is from these alone, and asks nothing while no build runs.
+
+- **initialize**: the repository is the one the helper runs in. `threads` is how many threads an index build uses: 1 for the viewer, 2 for the MCP server. `cache` is the disk cache the index is kept in; a host with the cache off doesn't start the helper. `idle_ms` replaces the 10 minutes. Another protocol is refused with error -32000.
+- **open**: a snapshot `S` is `{"kind":"tree","id"}`, `{"kind":"index"}` or `{"kind":"worktree"}`, as `--json`'s header has them. The helper lists what differs between the two, and keeps the navigator it has for that side while the core says it still fits ([architecture.md](architecture.md), `Navigator::refit`): `fit` is `same`, `changes` (it took the diff's changes again) or `new` (made again; its `navigator` id is new). `fingerprint` is what it answers from, in hex: a host keys what it keeps of its answers on it. A host opens again whenever its diff's list was read again. The helper keeps 2 navigators, the least recently used dropped first, and builds the index only of the one used last: opened, looked up in or searched. Another's build stops and goes on once it's used again. `progress` is `{"done","total"}` in files.
+- **lookup**: `origin` is the asking file and its language's name (`c`, `rust`). A candidate `C` is `{"path","file","kind","start","end","container","rank","changed","in_hunk"}`: lines are 0-based, `file` is where it's read, `{"kind":"blob","id","mode"}`, `{"kind":"worktree","mode","id"}` (`id` null when the scan didn't hash it) or `{"kind":"path","mode","root"}` (outside git, which no navigator lists), `kind` is a definition kind's name or null for a line using the name, `rank` is `same_file`, `imported`, `near` or `elsewhere`, and `in_hunk` is null where it wasn't worked out.
+- **progress**: how far the index is built; `building`, whether its build runs (an incomplete index without one isn't being built: another's is); why a language has no definitions (`error`, a tags query that doesn't compile, else null); and `skipped`, `{"too_large","timed_out","unreadable"}`, the files built so far left without definitions.
+- **search/start**: the uses of a name (`references`), or its whole-word text matches (`text`, at most `cap` lines, 50 by default). The helper keeps 8 searches; one of a navigator it dropped goes too.
+- **search/step**: the search's next files, for about `budget_ms`, at least one file; with `until`, it stops once it has that many lines in all. A search for uses lists the lines of its first 200 files with one and counts the rest; with `past_cap` false it stops at those 200 files instead of counting. A hit of `references` is a candidate with `"text"` (the line, trimmed, at most 200 bytes) and `"more"` (on a file's last line listed, its lines past 1000); a hit of `text` is a candidate. `files` counts the files with a use so far (0 for `text`), `searched` the files searched of the side's, `done` says nothing more comes, and `indexed` that the navigator's index was whole when the step started, so the definitions' own lines were left out.
+
+Errors, with the reason as the message: -32700 for a line that isn't a JSON object (with a null id, which couldn't be read), -32600 for one with an id but no method, -32601 for a method the helper doesn't have, -32602 for params it can't read, -32002 for a request before `initialize`, -32001 for a navigator or search it no longer holds (open or start it again), -32800 when cancelled, and -32000 for anything else, a request that failed inside the helper included.

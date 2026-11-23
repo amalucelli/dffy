@@ -173,10 +173,10 @@ fn fill(doc: &mut Document<()>, first: Pos, last: Pos) {
                     let (emphasis, syntax) = prepare.emphasis(&diff, hunk, file.syntax());
                     doc.set_emphasis(first.file, &diff, hunk, emphasis, syntax);
                 }
-                Missing::GapSyntax(gap) => {
+                Missing::GapSyntax(gap, side) => {
                     let slot = Arc::clone(file.syntax().expect("highlighted"));
-                    let spans = prepare.gap_syntax(&diff, &slot, file.gap_lines(gap));
-                    doc.set_gap_syntax(first.file, &diff, gap, spans);
+                    let spans = prepare.gap_syntax(&diff, &slot, side, file.gap_lines(gap, side));
+                    doc.set_gap_syntax(first.file, &diff, gap, side, spans);
                 }
                 Missing::Scopes => prepare.scopes(&diff, file.syntax().expect("highlighted")),
                 Missing::Structural => {
@@ -202,13 +202,13 @@ fn rows<P>(
         .map(|r| match doc.row(at(file, part, r), arrange) {
             Some(Content::Hunk { row, lines, .. }) => {
                 let states = match row {
-                    Row::Line(i) => vec![lines.line(i).state],
+                    Row::Line(i) | Row::One { line: i, .. } => vec![lines.line(i).state],
                     Row::Pair(old, new) => old
                         .into_iter()
                         .chain(new)
                         .map(|i| lines.line(i).state)
                         .collect(),
-                    Row::Header | Row::Marker => Vec::new(),
+                    Row::Header | Row::Marker | Row::Hidden { .. } => Vec::new(),
                 };
                 (row, states)
             }
@@ -239,7 +239,7 @@ fn a_host_fills_the_work_missing_for_the_rows_it_shows() {
         [
             Missing::Emphasis(0),
             Missing::Emphasis(1),
-            Missing::GapSyntax(1),
+            Missing::GapSyntax(1, Side::New),
             Missing::Structural
         ],
         "the last gap shows only its separator"
@@ -401,7 +401,15 @@ fn search_counts_matches_with_smart_case_and_finds_their_rows() {
     let diff = Arc::clone(doc.diff_of(l).expect("loaded"));
     let search = |doc: &Document<()>, needle: &str| {
         let hidden = doc.hidden_lines(l).expect("loaded");
-        find(&diff, Some(&hidden), &[], &Needle::new(needle), || false).expect("not cancelled")
+        find(
+            &diff,
+            Some(&hidden),
+            None,
+            &[],
+            &Needle::new(needle),
+            || false,
+        )
+        .expect("not cancelled")
     };
 
     let folded = search(&doc, "line_60");

@@ -7,7 +7,7 @@ use std::ops::ControlFlow;
 
 use gix::bstr::{BStr, BString, ByteSlice};
 
-use super::{DiffSpec, FileChange, Filter, Repo, Result, Revisions, Side, Status};
+use super::{DiffSpec, FileChange, Filter, Repo, Result, Revisions, Side, Snapshot, Status};
 use crate::cache::Cache;
 
 /// The changed files of one diff, re-evaluated per path as the working tree
@@ -41,6 +41,9 @@ struct Renames {
 pub struct Update {
     /// The whole list, in enumeration order.
     pub files: Vec<FileChange>,
+    /// The snapshots the list's sides were taken from (see
+    /// [`ChangeSet::snapshots`]): a rescan resolves the revisions again.
+    pub snapshots: Option<[Snapshot; 2]>,
     dirty: Dirty,
 }
 
@@ -55,6 +58,14 @@ enum Dirty {
 }
 
 impl Update {
+    /// Whether the list was read whole ([`ChangeSet::rescan`]), the
+    /// revisions resolved again and the index reloaded, rather than for
+    /// some paths of the working tree.
+    #[must_use]
+    pub fn rescanned(&self) -> bool {
+        matches!(self.dirty, Dirty::Worktree)
+    }
+
     /// Whether the content behind `change` may differ from when it was last
     /// diffed even though the change itself compares equal: a working-tree
     /// side without a hash, or either side of compared paths, looks the
@@ -118,6 +129,13 @@ impl ChangeSet {
         self.revisions = revisions;
     }
 
+    /// The snapshots the list's sides are taken from, oriented, as the
+    /// last [`ChangeSet::rescan`] resolved them (see [`DiffSpec::snapshots`]).
+    #[must_use]
+    pub fn snapshots(&self) -> Option<[Snapshot; 2]> {
+        self.spec.snapshots(self.reverse)
+    }
+
     /// The current list, in enumeration order, without renames.
     #[must_use]
     pub fn files(&self) -> Vec<FileChange> {
@@ -162,6 +180,7 @@ impl ChangeSet {
         let paired = self.renames.as_ref().is_some_and(|r| !r.pairs.is_empty());
         Ok(paired.then_some(Update {
             files,
+            snapshots: self.snapshots(),
             dirty: Dirty::Nothing,
         }))
     }
@@ -251,6 +270,7 @@ impl ChangeSet {
         self.files.sort_by(|a, b| order(a).cmp(&order(b)));
         Ok(Some(Update {
             files: self.listed()?,
+            snapshots: self.snapshots(),
             dirty: Dirty::Paths(changed),
         }))
     }
@@ -281,6 +301,7 @@ impl ChangeSet {
         (self.spec, self.index, self.files) = (spec, index, files);
         Ok(Some(Update {
             files: self.listed()?,
+            snapshots: self.snapshots(),
             dirty: Dirty::Worktree,
         }))
     }

@@ -1,13 +1,16 @@
 //! What the control API's requests do to this view (`crate::control`),
 //! and the events pushed to its subscribers. A request on a file whose diff
 //! isn't loaded yet shows the file and waits for its diff, answered once
-//! it's in. With nobody subscribed and nothing waiting, nothing here runs.
+//! it's in. A request on a file the diff doesn't list waits before that
+//! for the loop to find it, then opens it as the picker does
+//! ([`App::other_found`]). With nobody subscribed and nothing waiting,
+//! nothing here runs.
 
 use std::time::{Duration, Instant};
 
-use dffy_core::bstr::BString;
-use dffy_core::document::{Pos, Side, State};
-use dffy_core::git::Status;
+use dffy_core::bstr::{BStr, BString};
+use dffy_core::document::{File, Pos, Side, State};
+use dffy_core::git::{Snapshot, Status};
 
 use super::{Action, App, Pane, Seek};
 use crate::control::viewer::{self, Command, Inbound, Push, Reply};
@@ -43,7 +46,8 @@ type Looks = (Option<(usize, Side, usize, usize)>, Pos);
 /// A `view/open` or `comments/add` waiting for its file's diff.
 struct Waiting {
     path: BString,
-    file: usize,
+    /// `None` while the loop looks up a file the diff doesn't list.
+    file: Option<usize>,
     side: Side,
     line: Option<usize>,
     /// The text and the author of the comment to add on `line`, for a
@@ -176,7 +180,16 @@ impl App {
             Command::Selection => {
                 reply.send(Ok(object(vec![("selection", self.control_selection())])));
             }
-            Command::Open { path, line, side } => self.control_open(path, line, side, None, reply),
+            Command::Open { path, line, side } => {
+                return self.control_open(Waiting {
+                    path: path.into(),
+                    file: None,
+                    side,
+                    line,
+                    comment: None,
+                    reply,
+                });
+            }
             Command::Comment {
                 path,
                 line,
@@ -191,7 +204,14 @@ impl App {
                     )));
                     return None;
                 }
-                self.control_open(path, Some(line), side, Some((text, author)), reply);
+                return self.control_open(Waiting {
+                    path: path.into(),
+                    file: None,
+                    side,
+                    line: Some(line),
+                    comment: Some((text, author)),
+                    reply,
+                });
             }
             Command::Focus { id } => reply.send(self.control_focus(&id)),
             Command::ApplySuggestion { id } => return self.control_apply(&id, reply),
@@ -242,26 +262,34 @@ impl App {
         })
     }
 
-    fn control_open(
-        &mut self,
-        path: String,
-        line: Option<usize>,
-        side: Side,
-        comment: Option<(String, String)>,
-        reply: Reply,
-    ) {
-        let Some(file) = self.control_file(path.as_bytes()) else {
-            let listing = if self.enumerating {
-                "; files are still being listed"
-            } else {
-                ""
+    /// Shows `waiting`'s file and answers once its diff is in. One the
+    /// diff doesn't list is for the loop to find first, at its side.
+    fn control_open(&mut self, mut waiting: Waiting) -> Option<Action> {
+        // A file opened outside the diff is looked up again, as the request
+        // may ask for its other side.
+        waiting.file = self.listed_entry(waiting.path.as_ref());
+        let Some(file) = waiting.file else {
+            // The view stays as it is until the file is found.
+            return match self.unlisted_at(waiting.side) {
+                Ok(at) => {
+                    let path = waiting.path.clone();
+                    let side = waiting.side;
+                    self.control.waiting.push(waiting);
+                    Some(Action::OpenOther { path, at, side })
+                }
+                Err(why) => {
+                    let missing = format!("{} isn't in this diff; {why}", lossy(&waiting.path));
+                    waiting.reply.send(Err(Fault::new("not_found", missing)));
+                    None
+                }
             };
-            reply.send(Err(Fault::new(
-                "not_found",
-                format!("{path} isn't in this diff{listing}"),
-            )));
-            return;
         };
+        // A line, even in the file shown, is a jump.
+        if waiting.line.is_some() {
+            self.leave();
+        } else {
+            self.leave_for(file);
+        }
         if self.pane == Pane::Tree {
             self.leave_panel();
         }
@@ -270,37 +298,101 @@ impl App {
             self.doc.goto_file(file);
         }
         self.dirty = true;
-        let waiting = Waiting {
-            path: path.into(),
-            file,
-            side,
-            line,
-            comment,
-            reply,
-        };
         if let Some(waiting) = self.settle_waiting(waiting) {
             self.control.waiting.push(waiting);
         }
+        None
+    }
+
+    /// Whether a request waiting for the loop to find `path` at `side`
+    /// goes to a line in it.
+    pub(super) fn control_wants_line(&self, path: &BStr, side: Side) -> bool {
+        (self.control.waiting.iter())
+            .any(|w| w.file.is_none() && w.side == side && w.path == path && w.line.is_some())
+    }
+
+    /// The snapshot to find a path the diff doesn't list at, for `side`;
+    /// else why it isn't found.
+    fn unlisted_at(&self, side: Side) -> Result<Snapshot, &'static str> {
+        // A path the list hasn't reached yet would arrive as a second entry,
+        // after one opened for it.
+        if self.enumerating {
+            return Err("still reading the diff's files");
+        }
+        self.snapshot(side)
+    }
+
+    /// Where the loop found `path`, which the diff didn't list, for the
+    /// requests waiting on it at `side`: its entry, opened and shown;
+    /// `Err(None)` when no file is there; `Err(Some(why))` when looking
+    /// failed. Returns whether any were waiting, and so were told.
+    pub(super) fn control_found(
+        &mut self,
+        path: &BStr,
+        side: Side,
+        found: Result<usize, Option<&str>>,
+    ) -> bool {
+        let (found_now, rest): (Vec<_>, Vec<_>) = std::mem::take(&mut self.control.waiting)
+            .into_iter()
+            .partition(|w| w.file.is_none() && w.side == side && w.path == path);
+        self.control.waiting = rest;
+        let any = !found_now.is_empty();
+        for mut waiting in found_now {
+            let shown = lossy(&waiting.path);
+            let fault = match found {
+                Ok(file) => {
+                    self.doc.selection = None;
+                    waiting.file = Some(file);
+                    if let Some(waiting) = self.settle_waiting(waiting) {
+                        self.control.waiting.push(waiting);
+                    }
+                    continue;
+                }
+                Err(None) => Fault::new(
+                    "not_found",
+                    format!(
+                        "{shown} isn't in this diff, nor at its {} side",
+                        encode::side(side)
+                    ),
+                ),
+                Err(Some(why)) => Fault::new("failed", format!("couldn't open {shown}: {why}")),
+            };
+            waiting.reply.send(Err(fault));
+        }
+        any
     }
 
     /// Answers `waiting` once its file's diff is loaded; hands it back
     /// while it's on its way.
     fn settle_waiting(&mut self, mut waiting: Waiting) -> Option<Waiting> {
+        let Some(mut file) = waiting.file else {
+            return Some(waiting);
+        };
         let shown = lossy(&waiting.path);
         let files = self.doc.document.files();
         // The list may have been sorted or refreshed since.
         if files
-            .get(waiting.file)
+            .get(file)
             .is_none_or(|e| e.change().path != waiting.path)
         {
-            let Some(file) = self.control_file(&waiting.path) else {
-                let gone = format!("{shown} left the diff");
+            let Some(found) = self.control_file(&waiting.path) else {
+                let gone = format!("{shown} isn't shown any more");
                 waiting.reply.send(Err(Fault::new("not_found", gone)));
                 return None;
             };
-            waiting.file = file;
+            file = found;
+            waiting.file = Some(file);
         }
-        let file = waiting.file;
+        // Its line would be read on the wrong version.
+        if self.doc.document.files()[file].is_unchanged()
+            && let Some(&at) = self.opened.get(waiting.path.as_slice())
+            && at != waiting.side
+        {
+            let name = self.version_name(at);
+            let moved = format!("{shown} was opened at {name} before it showed");
+            waiting.reply.send(Err(Fault::new("failed", moved)));
+            return None;
+        }
         match self.doc.document.files()[file].state() {
             State::Loaded(_) => {}
             State::Failed(why) => {
@@ -319,19 +411,27 @@ impl App {
         if let Some(line) = waiting.line
             && !self.doc.goto_line(file, waiting.side, line)
         {
-            let missing = format!("{shown} has no line {} on its {side} side here", line + 1);
+            let diff = (self.doc.document.files()[file].file()).map(File::diff);
+            let missing = if diff.is_some_and(|d| d.binary) {
+                format!("{shown} is binary; no lines")
+            } else if diff.is_some_and(|d| d.too_large) {
+                format!("{shown} is too large to show; no lines")
+            } else {
+                format!("{shown} has no line {} on its {side} side here", line + 1)
+            };
             waiting.reply.send(Err(Fault::new("not_found", missing)));
             return None;
         }
         self.dirty = true;
         self.kept = false;
+        let listed = !self.doc.document.files()[file].is_unchanged();
         let added = match (waiting.comment, waiting.line) {
             (Some(comment), Some(line)) => self
                 .control_comment(file, (waiting.side, line), comment)
                 .map(Some),
             _ => Ok(None),
         };
-        let result = added.map(|id| viewer::shown(id, shown, waiting.line, waiting.side));
+        let result = added.map(|id| viewer::shown(id, shown, waiting.line, waiting.side, listed));
         waiting.reply.send(result);
         None
     }

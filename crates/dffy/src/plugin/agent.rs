@@ -293,6 +293,7 @@ const KIND: rpc::Kind<Init, State, Ask> = rpc::Kind {
     protocol: PROTOCOL,
     init_params,
     grace: GRACE,
+    restarts: true,
     initialized: |_, result| Init::decode(result),
     answered,
     notified,

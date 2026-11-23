@@ -366,7 +366,8 @@ fn changed_files_pages_through_the_list_after_the_handshake() {
             "apply_suggestion",
             "open_in_viewer",
             "focus_thread",
-            "viewer_selection"
+            "viewer_selection",
+            "definitions"
         ]
     );
 
@@ -1110,6 +1111,40 @@ fn the_viewer_tools_drive_the_viewer_running_in_the_repository() {
     );
 }
 
+/// `open_in_viewer` of a file the viewer's diff doesn't change shows it
+/// whole and says so; a path with no file there, or one into `.git`, is a
+/// tool error.
+#[test]
+fn open_in_viewer_shows_a_file_outside_the_diff() {
+    let repo = repo();
+    let d = repo.path();
+    write(d, "long.txt", &long_file(|i| i == 3));
+    let runtime = tempfile::tempdir().expect("tempdir");
+    let mut server = Server::start_in(d, runtime.path());
+    initialize(&mut server);
+    let _viewer = Viewer::start(d, runtime.path(), &[]);
+    let opened = server.call("open_in_viewer", r#"{"path":"lib.rs","line":2}"#);
+    assert!(!opened.is_error(), "{}", opened.line);
+    let at = opened.structured();
+    assert_eq!(at.get("line").and_then(Value::as_usize), Some(2));
+    assert_eq!(at.get("listed"), Some(&Value::Bool(false)));
+    assert_eq!(
+        opened.text(),
+        "The viewer shows lib.rs at line 2. It isn't in the diff, so it shows whole at the new side."
+    );
+    for path in ["nope.rs", ".git/HEAD"] {
+        let missing = server.call("open_in_viewer", &format!(r#"{{"path":"{path}"}}"#));
+        assert!(missing.is_error(), "{path}");
+        assert!(
+            missing
+                .text()
+                .contains(&format!("{path} isn't in this diff, nor at its new side")),
+            "{}",
+            missing.text()
+        );
+    }
+}
+
 /// A comments file with thread `s1` on new line 10 of long.txt, whose
 /// suggestion is `line ten`.
 fn suggested(d: &Path) {
@@ -1282,4 +1317,198 @@ fn ctl_apply_suggestion_writes_the_working_tree_through_the_viewer() {
     let (code, _, said) = ctl(&["apply-suggestion", "s1"]);
     assert_eq!(code, Some(128));
     assert!(said.contains("applied already"), "{said}");
+}
+
+/// A C repository: `include/slab.h` defines `kmalloc_array`, which the
+/// second commit changes, `mm/use.c` calls it twice, and
+/// `tools/include/slab.h` defines another.
+fn definitions_repo() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let d = dir.path();
+    git(d, &["init", "-q", "-b", "main"]);
+    let slab = |body: &str| {
+        format!(
+            "#ifndef SLAB_H\n#define SLAB_H\n\n\
+             static inline void *kmalloc_array(unsigned long n, unsigned long size)\n\
+             {{\n\treturn {body};\n}}\n\n#endif\n"
+        )
+    };
+    write(d, "include/slab.h", &slab("alloc(n * size)"));
+    write(
+        d,
+        "tools/include/slab.h",
+        "static inline void *kmalloc_array(unsigned long n, unsigned long size)\n{\n\treturn 0;\n}\n",
+    );
+    let user = |size: &str| {
+        format!(
+            "#include <slab.h>\n\nint use(void)\n{{\n\tvoid *p = kmalloc_array(4, {size});\n\
+             \tvoid *q = kmalloc_array(2, 2);\n\treturn p != q;\n}}\n"
+        )
+    };
+    write(d, "mm/use.c", &user("8"));
+    write(d, "README.md", "# notes\n");
+    git(d, &["add", "-A"]);
+    git(d, &["commit", "-q", "-m", "first"]);
+    write(d, "include/slab.h", &slab("alloc_checked(n, size)"));
+    write(d, "mm/use.c", &user("16"));
+    git(d, &["commit", "-q", "-am", "second"]);
+    dir
+}
+
+/// `definitions` looks a name up as the viewer's peek does, without a
+/// viewer: nearest first, saying whether this diff changes each and how
+/// far the index is built, which the first calls may not have whole. A
+/// name with no definition gets its text matches; `references` pages the
+/// lines using it.
+#[test]
+fn definitions_look_names_up_without_a_viewer() {
+    let repo = definitions_repo();
+    let d = repo.path();
+    let mut server = Server::start(d);
+    initialize(&mut server);
+    let ask = r#"{"name":"kmalloc_array","path":"mm/use.c","range":"HEAD~1..HEAD"}"#;
+    let mut call = server.call("definitions", ask);
+    for _ in 0..200 {
+        if call.structured().get("partial") == Some(&Value::Bool(false)) {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        call = server.call("definitions", ask);
+    }
+    let found = call.structured();
+    assert_eq!(
+        found.get("partial"),
+        Some(&Value::Bool(false)),
+        "{}",
+        call.line
+    );
+    assert_eq!(found.get("total").and_then(Value::as_usize), Some(2));
+    let first = &found
+        .get("candidates")
+        .and_then(Value::as_array)
+        .expect("candidates")[0];
+    let field = |v: &Value, k: &str| v.get(k).cloned().unwrap_or(Value::Null);
+    assert_eq!(field(first, "path").as_str(), Some("include/slab.h"));
+    assert_eq!(field(first, "start").as_usize(), Some(4));
+    assert_eq!(field(first, "kind").as_str(), Some("function"));
+    assert_eq!(field(first, "changed"), Value::Bool(true));
+    assert_eq!(field(first, "in_hunk"), Value::Bool(true));
+    assert_eq!(field(first, "text_match"), Value::Bool(false));
+    assert!(call.text().contains("include/slab.h:4"), "{}", call.text());
+
+    let old = server.call(
+        "definitions",
+        r#"{"name":"kmalloc_array","path":"mm/use.c","range":"HEAD~1..HEAD","side":"old"}"#,
+    );
+    assert_eq!(
+        old.structured().get("side").and_then(Value::as_str),
+        Some("old")
+    );
+
+    let text = server.call(
+        "definitions",
+        r#"{"name":"alloc_checked","path":"mm/use.c","range":"HEAD~1..HEAD"}"#,
+    );
+    let first = &text
+        .structured()
+        .get("candidates")
+        .and_then(Value::as_array)
+        .expect("candidates")[0];
+    assert_eq!(
+        field(first, "text_match"),
+        Value::Bool(true),
+        "{}",
+        text.line
+    );
+    assert_eq!(field(first, "path").as_str(), Some("include/slab.h"));
+
+    let page = |cursor: Option<&str>| {
+        let cursor = cursor.map_or(String::new(), |c| format!(r#","cursor":"{c}""#));
+        format!(
+            r#"{{"name":"kmalloc_array","path":"mm/use.c","range":"HEAD~1..HEAD","references":true,"limit":1{cursor}}}"#
+        )
+    };
+    let refs = server.call("definitions", &page(None));
+    let uses = |call: &Call| -> Vec<String> {
+        let refs = call.structured().get("references").expect("references");
+        (refs.get("matches").and_then(Value::as_array))
+            .expect("matches")
+            .iter()
+            .map(|m| {
+                format!(
+                    "{}:{}",
+                    field(m, "path").as_str().unwrap_or(""),
+                    field(m, "line").as_usize().unwrap_or(0)
+                )
+            })
+            .collect()
+    };
+    assert_eq!(uses(&refs), ["mm/use.c:5"]);
+    let refs_of =
+        |call: &Call, k: &str| field(call.structured().get("references").expect("references"), k);
+    let counts = |call: &Call| ["files", "total", "complete"].map(|k| refs_of(call, k));
+    let [one, two] = [1.0, 2.0].map(Value::Number);
+    // The search stops once the page is full.
+    assert_eq!(
+        counts(&refs),
+        [one.clone(), two.clone(), Value::Bool(false)]
+    );
+    let next = refs.cursor().expect("a next page").to_owned();
+    let rest = server.call("definitions", &page(Some(&next)));
+    assert_eq!(
+        (uses(&rest), rest.cursor()),
+        (vec!["mm/use.c:6".to_owned()], None)
+    );
+    assert_eq!(counts(&rest), [one, two, Value::Bool(true)]);
+}
+
+/// Asked from a file of a language without definitions, `definitions`
+/// says so.
+#[test]
+fn definitions_refuse_a_file_of_another_language() {
+    let repo = definitions_repo();
+    let mut server = Server::start(repo.path());
+    initialize(&mut server);
+    let readme = server.call("definitions", r#"{"name":"notes","path":"README.md"}"#);
+    assert!(readme.is_error());
+    assert!(
+        readme.text().contains("doesn't read README.md's language"),
+        "{}",
+        readme.text()
+    );
+}
+
+/// A working-tree file the diff already modifies, edited again between two
+/// calls, is read again: the second call's lines are the file's new ones.
+#[test]
+fn definitions_read_a_file_edited_again_between_calls() {
+    let repo = definitions_repo();
+    let d = repo.path();
+    let defines = "static inline void *kmalloc_array(unsigned long n, unsigned long size)\n{\n\treturn 0;\n}\n";
+    write(d, "include/slab.h", &format!("/* one */\n{defines}"));
+    let mut server = Server::start(d);
+    initialize(&mut server);
+    let ask = r#"{"name":"kmalloc_array","path":"mm/use.c"}"#;
+    let start = |server: &mut Server| {
+        let call = server.call("definitions", ask);
+        let found = call.structured();
+        let first = &found
+            .get("candidates")
+            .and_then(Value::as_array)
+            .expect("candidates")[0];
+        assert_eq!(
+            first.get("path").and_then(Value::as_str),
+            Some("include/slab.h"),
+            "{}",
+            call.line
+        );
+        first.get("start").and_then(Value::as_usize)
+    };
+    assert_eq!(start(&mut server), Some(2));
+    write(
+        d,
+        "include/slab.h",
+        &format!("/* one */\n/* two */\n/* three */\n{defines}"),
+    );
+    assert_eq!(start(&mut server), Some(4), "the file's lines as edited");
 }

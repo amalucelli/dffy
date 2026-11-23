@@ -414,7 +414,7 @@ fn back_into_file_view_lands_a_removed_line_on_its_mark() {
     let shown = screen(&mut app);
     let first = shown.lines().find(|l| l.contains("line "));
     assert!(
-        first.is_some_and(|l| l.contains("4 +┃ line four")),
+        first.is_some_and(|l| l.contains("4❯+┃ line four")),
         "{shown}"
     );
 }

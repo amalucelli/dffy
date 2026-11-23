@@ -15,7 +15,7 @@ use std::time::Duration;
 use dffy_core::cache::Cache;
 use dffy_core::diff::Whitespace;
 use dffy_core::git::Snapshot;
-use dffy_core::navigate::{Candidate, Lookup, Progress, Reference};
+use dffy_core::navigate::{Candidate, Filter, Lookup, Progress, Reference, Use};
 use dffy_core::view::Side;
 
 use super::wire::{self, field, flag, number};
@@ -279,6 +279,9 @@ pub(crate) struct Built {
     /// Files with no definitions: over 512KB, too slow to parse, and
     /// unreadable.
     pub skipped: [usize; 3],
+    /// Why the helper keeps the index in memory rather than in its store
+    /// file, if it does.
+    pub note: Option<String>,
 }
 
 /// A step of a search: what it found, and how far it is.
@@ -393,29 +396,36 @@ impl Helper {
         read_opened(&result).map_err(Refused::unreadable)
     }
 
+    /// Where `name` is defined, used at `at` in the asking file when that's
+    /// known.
     pub(crate) fn lookup(
         &self,
         navigator: u64,
         name: &str,
         (path, language): (&[u8], &str),
+        at: Option<Use>,
         cancel: Option<&Cancel>,
     ) -> Result<Lookup, Refused> {
-        let params = asking_params(navigator, name, (path, language), "");
+        let mut extra = String::new();
+        wire::at(at, &mut extra);
+        let params = asking_params(navigator, name, (path, language), &extra);
         let result = self.request("lookup", params, cancel)?;
         read_lookup(&result).map_err(Refused::unreadable)
     }
 
-    /// Starts a search for `name`'s uses (`references`) or its text matches
-    /// (`text`, at most `cap` lines); its id.
+    /// Starts a search for `name`'s uses (`references`, the uses `filter`
+    /// keeps) or its text matches (`text`, at most `cap` lines); its id.
     pub(crate) fn start_search(
         &self,
         navigator: u64,
         kind: &str,
         name: &str,
         origin: (&[u8], &str),
-        cap: usize,
+        (cap, filter): (usize, Filter),
     ) -> Result<u64, Refused> {
-        let params = asking_params(navigator, name, origin, &search_extra(kind, cap));
+        let mut extra = search_extra(kind, cap);
+        wire::filter(filter, &mut extra);
+        let params = asking_params(navigator, name, origin, &extra);
         let result = self.request("search/start", params, None)?;
         number(&result, "search")
             .map(|s| s as u64)
@@ -657,5 +667,9 @@ pub(crate) fn read_progress(result: &Value) -> Result<Built, String> {
             number(skipped, "timed_out")?,
             number(skipped, "unreadable")?,
         ],
+        note: match field(result, "note")? {
+            Value::Null => None,
+            other => Some(other.as_str().ok_or("note isn't a string")?.to_owned()),
+        },
     })
 }

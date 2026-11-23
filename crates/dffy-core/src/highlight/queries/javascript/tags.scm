@@ -68,11 +68,12 @@
       right: [(arrow_function) (function_expression)])) @definition.function
   (#eq? @exports "exports"))
 
-; `export { a, b as c } from "./x"` re-exports `a` and `c`.
+; `export { a, b as c } from "./x"` re-exports `a`, and `c` with `b` as
+; its @original name.
 
 (export_statement
   (export_clause [
     (export_specifier name: (_) @name !alias)
-    (export_specifier alias: (_) @name)
+    (export_specifier name: (_) @original alias: (_) @name)
   ])
   source: (string)) @definition.reexport

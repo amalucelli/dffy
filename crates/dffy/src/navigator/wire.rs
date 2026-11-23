@@ -8,7 +8,7 @@ use dffy_core::bstr::BString;
 use dffy_core::diff::Whitespace;
 use dffy_core::git::{self, Mode, ObjectId, Snapshot};
 use dffy_core::highlight::DefinitionKind;
-use dffy_core::navigate::{Candidate, Progress, Rank, Reference};
+use dffy_core::navigate::{Candidate, Filter, Progress, Rank, Reference, Use};
 use dffy_core::view::Side;
 
 use crate::plugin::json::{Value, string};
@@ -39,6 +39,62 @@ pub(crate) fn flag(value: &Value, key: &str) -> Result<bool, String> {
 
 fn id(value: &Value, key: &str) -> Result<ObjectId, String> {
     ObjectId::from_hex(text(value, key)?.as_bytes()).map_err(|_| format!("{key} isn't an id"))
+}
+
+/// A use's place in the asking file, `,"at":{"line","column"}`: 0-based,
+/// the column a byte of the line, or null for the name's first use in
+/// code on it. Nothing without a place.
+pub(crate) fn at(at: Option<Use>, s: &mut String) {
+    let Some(at) = at else {
+        return;
+    };
+    let _ = write!(s, r#","at":{{"line":{},"column":"#, at.line);
+    match at.column {
+        Some(column) => {
+            let _ = write!(s, "{column}");
+        }
+        None => s.push_str("null"),
+    }
+    s.push('}');
+}
+
+/// A uses search's `filter`, `,"calls_only","in_diff"` after a comma, each
+/// only when it's set.
+pub(crate) fn filter(filter: Filter, s: &mut String) {
+    if filter.calls_only {
+        s.push_str(r#","calls_only":true"#);
+    }
+    if filter.in_diff {
+        s.push_str(r#","in_diff":true"#);
+    }
+}
+
+/// The filter of `params`: each flag false when it's left out.
+pub(crate) fn read_filter(params: &Value) -> Result<Filter, String> {
+    let set = |key| match params.get(key) {
+        None | Some(Value::Null) => Ok(false),
+        Some(_) => flag(params, key),
+    };
+    Ok(Filter {
+        calls_only: set("calls_only")?,
+        in_diff: set("in_diff")?,
+    })
+}
+
+/// The `at` of `params`, when it has one.
+pub(crate) fn read_use(params: &Value) -> Result<Option<Use>, String> {
+    let at = match params.get("at") {
+        None | Some(Value::Null) => return Ok(None),
+        Some(at) => at,
+    };
+    let column = match at.get("column") {
+        None | Some(Value::Null) => None,
+        Some(_) => Some(number(at, "column")?),
+    };
+    Ok(Some(Use {
+        line: number(at, "line")?,
+        column,
+    }))
 }
 
 /// `{"kind":"tree","id":…}`, `{"kind":"index"}` or `{"kind":"worktree"}`.

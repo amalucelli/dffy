@@ -10,7 +10,9 @@ use dffy_core::git::{DiffSpec, Revisions};
 use super::support::*;
 use crate::navigator::client::{Built, Pushed};
 use crate::tui::peek::Found;
-use crate::tui::worker::{self, Job, Settings, Unanswered};
+use dffy_core::navigate;
+
+use crate::tui::worker::{self, Job, Referenced, Settings, Unanswered};
 
 fn git(dir: &Path, args: &[&str]) {
     let ok = std::process::Command::new("git")
@@ -127,11 +129,16 @@ impl Fixture {
 
     /// Draws and runs the jobs `which` keeps until none is asked for,
     /// taking what the helper pushed meanwhile; with `built`, waits for
-    /// pushes until the index of the version asked about is built.
+    /// pushes until the index of the version asked about is built, and the
+    /// search for uses with it: steps run on a partial index list the
+    /// definitions' own lines too, as many as the build hadn't reached.
     fn run_jobs(&mut self, which: impl Fn(&Job) -> bool, built: bool) {
         for _ in 0..10_000 {
             self.app.draw();
-            let jobs: Vec<Job> = self.app.jobs().into_iter().filter(|j| which(j)).collect();
+            let building = built && self.app.peek_building();
+            let jobs: Vec<Job> = (self.app.jobs().into_iter())
+                .filter(|j| which(j) && !(building && matches!(j, Job::References(_))))
+                .collect();
             if jobs.is_empty() {
                 if let Ok(pushed) = self.pushed.1.try_recv() {
                     self.app.event(pushed);
@@ -233,7 +240,20 @@ fn a_partial_answer_is_asked_again_once_indexed_with_the_cursor_kept() {
         .retain(|c| c.path == "include/slab.h" || c.path == "mm/x.c");
     looked.total = looked.candidates.len();
     let whole = looked.progress;
-    looked.progress.done = 1;
+    let push = |progress| Event::IndexBuilt {
+        generation,
+        pushed: Pushed {
+            navigator,
+            built: Built {
+                progress,
+                building: !progress.complete(),
+                ..Built::default()
+            },
+        },
+    };
+    let half = navigate::Progress { done: 1, ..whole };
+    f.app.event(push(half));
+    looked.progress = half;
     f.app.event(Event::Diffed(Done::Looked {
         id,
         result: Ok(looked),
@@ -248,18 +268,6 @@ fn a_partial_answer_is_asked_again_once_indexed_with_the_cursor_kept() {
     assert_eq!(current, "include/slab.h");
     f.key(Key::Char('j'));
     assert_eq!(f.found().expect("listed").2, "mm/x.c");
-    let push = |progress| Event::IndexBuilt {
-        generation,
-        pushed: Pushed {
-            navigator,
-            built: Built {
-                progress,
-                building: !progress.complete(),
-                ..Built::default()
-            },
-        },
-    };
-    let half = dffy_core::navigate::Progress { done: 1, ..whole };
     f.app.event(push(half));
     f.app.dirty = false;
     f.app.event(push(half));
@@ -270,6 +278,45 @@ fn a_partial_answer_is_asked_again_once_indexed_with_the_cursor_kept() {
     let (total, note, current) = f.found().expect("listed");
     assert_eq!((total, note), (4, None), "the whole index's answer");
     assert_eq!(current, "mm/x.c", "the cursor stayed on its definition");
+}
+
+/// An answer from a partial index that comes after the push saying the
+/// index is complete is asked again all the same.
+#[test]
+fn a_partial_answer_after_the_index_is_complete_is_asked_again() {
+    let mut f = Fixture::new(160, false);
+    f.peek();
+    f.run_jobs(|j| matches!(j, Job::Navigator(_)), true);
+    let lookup = (f.app.jobs().into_iter())
+        .find(|j| matches!(j, Job::Lookup(_)))
+        .expect("a lookup asked for");
+    let Done::Looked {
+        id,
+        result: Ok(mut looked),
+    } = worker::run(lookup, Some(&f.repo), &f.settings)
+    else {
+        panic!("the lookup answers");
+    };
+    let (generation, navigator) = f.app.peek_navigator(document::Side::New).expect("opened");
+    f.app.event(Event::IndexBuilt {
+        generation,
+        pushed: Pushed {
+            navigator,
+            built: Built {
+                progress: looked.progress,
+                ..Built::default()
+            },
+        },
+    });
+    looked.progress.done = 1;
+    f.app.event(Event::Diffed(Done::Looked {
+        id,
+        result: Ok(looked),
+    }));
+    assert!(
+        f.app.jobs().iter().any(|j| matches!(j, Job::Lookup(_))),
+        "asked again"
+    );
 }
 
 /// A refresh brings the version the peek shows up to date and asks again:
@@ -367,20 +414,24 @@ fn a_helper_that_dies_is_started_again_a_few_times() {
         }
     };
     let both = |f: &mut Fixture| {
+        let listed = |f: &mut Fixture, side: &str| {
+            f.found()
+                .unwrap_or_else(|| panic!("listed on the {side} side:\n{}", screen(&mut f.app)))
+        };
         f.peek();
         f.run(|_| true);
-        let new = f.found().expect("listed on the new side");
+        let new = listed(f, "new");
         f.key(Key::Char('s'));
         f.run(|_| true);
-        let old = f.found().expect("listed on the old side");
+        let old = listed(f, "old");
         (new, old)
     };
     let before = both(&mut f);
     let first = [document::Side::New, document::Side::Old].map(|s| f.app.peek_navigator(s));
     f.key(Key::Esc);
+    f.app.navigation.forget_references();
     f.peek();
-    f.run(|_| true);
-    f.key(Key::Char('r'));
+    f.run(|j| !matches!(j, Job::References(_)));
     let searched = f.app.peek_search_generation();
     assert_eq!(searched, first[0].map(|(g, _)| g), "a search for uses");
     kill(&f);
@@ -389,7 +440,7 @@ fn a_helper_that_dies_is_started_again_a_few_times() {
     assert_ne!(now, searched, "another helper");
     let shown = screen(&mut f.app);
     assert!(
-        shown.contains("kmalloc_array · 2 files use it"),
+        shown.contains("Uses · 2 files"),
         "the search started again: {shown}"
     );
     f.key(Key::Esc);
@@ -434,8 +485,7 @@ fn the_peeks_code_is_read_before_work_off_screen() {
 fn a_search_of_a_helper_gone_is_started_over() {
     let mut f = Fixture::new(160, false);
     f.peek();
-    f.run(|_| true);
-    f.key(Key::Char('r'));
+    f.run(|j| !matches!(j, Job::References(_)));
     let (generation, _) = f.app.peek_navigator(document::Side::New).expect("opened");
     f.app.tag_peek_search(generation - 1);
     assert!(
@@ -445,7 +495,7 @@ fn a_search_of_a_helper_gone_is_started_over() {
     f.app.reopen_peek_navigator(document::Side::New);
     f.run(|_| true);
     let shown = screen(&mut f.app);
-    assert!(shown.contains("kmalloc_array · 2 files use it"), "{shown}");
+    assert!(shown.contains("Uses · 2 files"), "{shown}");
 }
 
 /// A click on a candidate in the list shows it; on a narrow screen the
@@ -542,22 +592,25 @@ fn a_ctrl_click_off_code_is_a_click() {
     );
 }
 
-/// `r` in the peek lists the lines using the name, as they're found, past
-/// its definitions; closing the peek stops the search, and the answer is
-/// kept for the next ask. `enter` opens a use as it opens a definition.
+/// The peek lists the name's definitions and, below them as they're
+/// found, the lines using it, with no key: the search starts with the
+/// peek, closing the peek stops it, and its answer is kept for the next
+/// ask. `r` jumps between the two groups; `enter` opens a use as it opens
+/// a definition.
 #[test]
-fn r_lists_the_uses_and_keeps_them() {
+fn the_peek_lists_the_uses_below_the_definitions_by_itself() {
     let mut f = Fixture::new(160, false);
     f.peek();
-    f.run(|_| true);
-    f.key(Key::Char('r'));
     assert!(
-        f.app.jobs().iter().any(|j| matches!(j, Job::References(_))),
-        "a search asked for"
+        (f.app.doc.def_peek()).is_some_and(|p| p.references().is_some()),
+        "the search starts with the peek"
     );
     f.run(|_| true);
     let shown = screen(&mut f.app);
-    assert!(shown.contains("kmalloc_array · 2 files use it"), "{shown}");
+    assert!(
+        shown.contains("Definitions (4)") && shown.contains("Uses · 2 files"),
+        "{shown}"
+    );
     let peek = f.app.doc.def_peek().expect("open");
     let uses: Vec<String> = (peek.references().expect("searched").hits.iter())
         .map(|c| format!("{}:{}", c.path, c.start + 1))
@@ -567,21 +620,25 @@ fn r_lists_the_uses_and_keeps_them() {
         ["mm/use.c:5", "README.md:1"],
         "the definitions left out"
     );
-
+    assert_eq!(f.found().expect("listed").2, "include/slab.h");
     f.key(Key::Char('r'));
-    assert!(
-        screen(&mut f.app).contains("4 definitions"),
+    assert_eq!(f.found().expect("listed").2, "mm/use.c", "r: the first use");
+    f.key(Key::Char('r'));
+    assert_eq!(
+        f.found().expect("listed").2,
+        "include/slab.h",
         "r again: the definitions"
     );
+
     f.key(Key::Esc);
     f.peek();
-    f.run(|_| true);
-    f.key(Key::Char('r'));
     assert!(
         !f.app.jobs().iter().any(|j| matches!(j, Job::References(_))),
         "kept from before"
     );
-    assert!(screen(&mut f.app).contains("2 files use it"));
+    f.run(|_| true);
+    assert!(screen(&mut f.app).contains("Uses · 2 files"));
+    f.key(Key::Char('r'));
     f.key(Key::Enter);
     f.run(|_| true);
     assert!(f.app.doc.def_peek().is_none());
@@ -592,10 +649,8 @@ fn r_lists_the_uses_and_keeps_them() {
         "mm/use.c"
     );
 
-    f.peek();
-    f.run(|_| true);
     f.app.navigation.forget_references();
-    f.key(Key::Char('r'));
+    f.peek();
     f.key(Key::Esc);
     assert!(
         !f.app.jobs().iter().any(|j| matches!(j, Job::References(_))),
@@ -603,15 +658,124 @@ fn r_lists_the_uses_and_keeps_them() {
     );
 }
 
+/// The search for uses waits for the peek's first lookup, which shares
+/// the helper's time with it, and goes once that's answered.
+#[test]
+fn the_uses_wait_for_the_first_lookup() {
+    let mut f = Fixture::new(160, false);
+    f.peek();
+    f.run(|j| matches!(j, Job::Navigator(_)));
+    let jobs = f.app.jobs();
+    assert!(
+        jobs.iter().any(|j| matches!(j, Job::Lookup(_))),
+        "a lookup asked for"
+    );
+    assert!(
+        !jobs.iter().any(|j| matches!(j, Job::References(_))),
+        "the uses wait"
+    );
+    f.run(|j| matches!(j, Job::Lookup(_)));
+    assert!(
+        f.app.jobs().iter().any(|j| matches!(j, Job::References(_))),
+        "then go"
+    );
+}
+
+/// Asked from the line defining the name, the peek opens on its uses: the
+/// definition is where the reader already is.
+#[test]
+fn a_peek_at_the_definition_itself_opens_on_its_uses() {
+    let mut f = Fixture::new(160, false);
+    f.key(Key::Char('f'));
+    f.run(|_| true);
+    let file = f.app.doc.document.pos.file;
+    assert_eq!(f.app.doc.document.files()[file].change().path, "mm/x.c");
+    assert!(
+        f.app.peek_name("kmalloc_array", document::Side::New, 1),
+        "asks"
+    );
+    f.run(|_| true);
+    assert_eq!(f.found().expect("listed").2, "mm/use.c", "on the first use");
+    f.key(Key::Char('r'));
+    assert_eq!(f.found().expect("listed").2, "mm/x.c", "r: the definitions");
+}
+
+/// A peek key while the diff has the keys goes to the peek, which takes
+/// them: `r` jumps to the uses rather than toggling the rendered view.
+#[test]
+fn a_peek_key_takes_the_keys_back_to_the_peek() {
+    let mut f = Fixture::new(160, false);
+    f.peek();
+    f.run(|_| true);
+    f.app.blur_peek();
+    f.key(Key::Char('r'));
+    let peek = f.app.doc.def_peek().expect("open");
+    assert!(peek.focused, "the peek has the keys again");
+    assert_eq!(f.found().expect("listed").2, "mm/use.c", "and r ran");
+}
+
+/// `c` keeps only the uses calling the name and `i` those in files the
+/// diff changes, each searching again; past the first 200 files the search
+/// stops until `m` asks for more.
+#[test]
+fn uses_are_filtered_and_go_past_their_first_files_when_asked() {
+    let mut f = Fixture::new(160, false);
+    f.peek();
+    f.run(|_| true);
+    f.key(Key::Char('c'));
+    f.run(|_| true);
+    let peek = f.app.doc.def_peek().expect("open");
+    let uses: Vec<String> = (peek.references().expect("searched").hits.iter())
+        .map(|c| format!("{}:{}", c.path, c.start + 1))
+        .collect();
+    assert_eq!(uses, ["mm/use.c:5"], "the call, not the README's word");
+    assert!(screen(&mut f.app).contains("calls only"));
+    f.key(Key::Char('i'));
+    f.run(|_| true);
+    assert!(screen(&mut f.app).contains("in this diff"));
+
+    // In this diff alone: not searched yet.
+    f.key(Key::Char('c'));
+    let id = (f.app.jobs().into_iter())
+        .find_map(|j| match j {
+            Job::References(job) => Some(job.id),
+            _ => None,
+        })
+        .expect("searched again");
+    f.app.event(Event::Diffed(Done::Referenced {
+        id,
+        result: Ok(Referenced {
+            hits: Vec::new(),
+            files: navigate::MAX_REFERENCE_FILES,
+            searched: navigate::Progress { done: 9, total: 99 },
+            done: false,
+            indexed: true,
+        }),
+    }));
+    assert!(
+        !f.app.jobs().iter().any(|j| matches!(j, Job::References(_))),
+        "stopped at its first files"
+    );
+    let shown = screen(&mut f.app);
+    assert!(
+        shown.contains("first 200 files") && shown.contains("m more"),
+        "{shown}"
+    );
+    f.key(Key::Char('m'));
+    assert!(
+        f.app.jobs().iter().any(|j| matches!(j, Job::References(_))),
+        "goes on"
+    );
+}
+
 /// A refresh that moves the version a search for uses reads stops it and
-/// clears its lines: they're of files no longer there. `r` again searches
-/// the version as it is now.
+/// clears its lines: they're of files no longer there. The version as it
+/// is now is searched again.
 #[test]
 fn a_refresh_moving_the_searched_version_stops_the_search() {
     let mut f = Fixture::new(160, false);
     f.peek();
-    f.run(|_| true);
-    f.key(Key::Char('r'));
+    f.run(|j| !matches!(j, Job::References(_)));
     assert!(
         f.app.jobs().iter().any(|j| matches!(j, Job::References(_))),
         "a search asked for"
@@ -636,15 +800,12 @@ fn a_refresh_moving_the_searched_version_stops_the_search() {
     f.app.set_snapshots(update.snapshots);
     f.app.event(Event::Refreshed(update));
     f.app.draw();
-    assert!(
-        !f.app.jobs().iter().any(|j| matches!(j, Job::References(_))),
-        "the search of the version before stopped"
-    );
     let peek = f.app.doc.def_peek().expect("open");
-    assert!(!peek.on_references() && peek.references().is_none_or(|r| r.hits.is_empty()));
+    assert!(
+        peek.references().is_none_or(|r| r.hits.is_empty()),
+        "the lines of the version before cleared"
+    );
 
-    f.run(|_| true);
-    f.key(Key::Char('r'));
     f.run(|_| true);
     let peek = f.app.doc.def_peek().expect("open");
     let uses: Vec<String> = (peek.references().expect("searched").hits.iter())
@@ -659,8 +820,7 @@ fn a_refresh_moving_the_searched_version_stops_the_search() {
 fn jobs_are_valid_after_a_refresh_shrinks_the_list() {
     let mut f = Fixture::new(160, false);
     f.peek();
-    f.run(|_| true);
-    f.key(Key::Char('r'));
+    f.run(|j| !matches!(j, Job::References(_)));
     drop(f.app.jobs());
     let d = f.dir.path();
     std::fs::write(d.join("mm/z.c"), "void z(void) { kmalloc_array(1, 2); }\n").expect("write");

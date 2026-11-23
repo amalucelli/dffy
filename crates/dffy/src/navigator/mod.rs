@@ -17,28 +17,90 @@ pub(crate) mod wire;
 mod tests;
 
 /// The dffy binary built with the unit tests, which aren't dffy
-/// themselves: what their helpers run as. It's the first `dffy` in the
-/// folders above the test binary, the profile's, and only when it says it
-/// is this very build: one left from an older build is refused.
+/// themselves: what their helpers run as, the profile's `dffy`, and only
+/// when it says it is this very build: one left from an older build is
+/// refused.
+///
+/// The helpers run a copy of it, one per build, in the profile's
+/// `test-helpers/`: a build relinking the profile's `dffy` while tests run
+/// (another `cargo build` on the checkout) would otherwise leave a helper
+/// nothing to start while it's rewritten. The copy is taken only of a
+/// binary answering as this build, asked again for a while as it may be
+/// halfway written, and moved into place whole; once there, the profile's
+/// `dffy` isn't read again.
 #[cfg(test)]
 pub(crate) fn built_program() -> std::path::PathBuf {
-    let exe = std::env::current_exe().unwrap_or_default();
-    let found = (exe.ancestors().skip(1))
-        .map(|dir| dir.join("dffy"))
-        .find(|path| path.is_file())
-        .unwrap_or_else(|| panic!("no dffy binary above {}: build it", exe.display()));
-    let said = std::process::Command::new(&found)
-        .args([COMMAND, "--build"])
-        .output()
-        .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_owned())
-        .unwrap_or_default();
-    assert_eq!(
-        said,
-        crate::BUILD,
-        "{} is another build than these tests: build it again",
-        found.display()
-    );
-    found
+    static COPY: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+    COPY.get_or_init(|| {
+        let exe = std::env::current_exe().unwrap_or_default();
+        // The profile's folder: the one cargo keeps its fingerprints in.
+        let profile = (exe.ancestors())
+            .find(|dir| dir.join(".fingerprint").is_dir())
+            .unwrap_or(&exe)
+            .to_owned();
+        // What `path` says it is, in at most a few seconds: an exec racing a
+        // relink of the file can hang before it runs any of it.
+        let build = |path: &std::path::Path| {
+            use std::io::Read as _;
+            use std::process::{Command, Stdio};
+            let Ok(mut child) = Command::new(path)
+                .args([COMMAND, "--build"])
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null())
+                .spawn()
+            else {
+                return String::new();
+            };
+            let start = std::time::Instant::now();
+            while matches!(child.try_wait(), Ok(None)) {
+                if start.elapsed() > Duration::from_secs(5) {
+                    child.kill().ok();
+                    child.wait().ok();
+                    return String::new();
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            let mut said = String::new();
+            (child.stdout.take()).map(|mut out| out.read_to_string(&mut said).ok());
+            said.trim().to_owned()
+        };
+        let dir = profile.join("test-helpers");
+        let copy = dir.join(format!("dffy-{}", crate::BUILD));
+        if build(&copy) == crate::BUILD {
+            return copy;
+        }
+        let found = profile.join("dffy");
+        let start = std::time::Instant::now();
+        loop {
+            let said = build(&found);
+            if said == crate::BUILD {
+                break;
+            }
+            // Another build's answer is final; none may be a binary being written.
+            assert!(
+                said.is_empty() && start.elapsed() < Duration::from_secs(30),
+                "{} isn't of this build (it says {said:?}): build it",
+                found.display()
+            );
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        std::fs::create_dir_all(&dir).expect("a folder for the helpers' binary");
+        let part = dir.join(format!("dffy-{}.{}", crate::BUILD, std::process::id()));
+        std::fs::copy(&found, &part).expect("the helpers' binary copied");
+        std::fs::rename(&part, &copy).expect("the copy moved into place");
+        // Older builds' copies: fine to drop once nothing started lately runs them.
+        let old = std::time::SystemTime::now() - Duration::from_secs(3600);
+        for entry in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
+            let stale = (entry.metadata().and_then(|m| m.modified())).is_ok_and(|t| t < old);
+            if stale && entry.path() != copy {
+                std::fs::remove_file(entry.path()).ok();
+            }
+        }
+        assert_eq!(build(&copy), crate::BUILD, "the copy answers as this build");
+        copy
+    })
+    .clone()
 }
 
 use std::time::Duration;

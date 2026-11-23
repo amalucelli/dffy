@@ -4,7 +4,8 @@
 //!
 //! A language's tags query says what counts. Each pattern captures the
 //! definition as `@definition.<kind>` (a [`DefinitionKind::name`]), what
-//! it's called as `@name`, and for a member (a method, a field, an enum
+//! it's called as `@name`, for a re-export that renames what it exports
+//! the name it had as `@original`, and for a member (a method, a field, an enum
 //! member, an interface's or a trait's member) the type it's in as
 //! `@container`. Where the name sits at the end of a chain of C
 //! declarators (pointers, parentheses, arrays, function parameters), the
@@ -69,7 +70,7 @@ pub(crate) const TAGS_PARSE_BUDGET: Duration = Duration::from_secs(2);
 /// when the same query finds something else (see the module's steps) or
 /// the encoding changes. A query's own changes change the key by
 /// themselves.
-const TAGS_VERSION: u8 = 6;
+const TAGS_VERSION: u8 = 7;
 
 /// What a definition defines. The numbers are the cached form's.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -116,10 +117,18 @@ pub enum DefinitionKind {
     /// JavaScript's `export { x } from`, a Python package's `__init__.py`
     /// importing it): where it's defined is in the other module.
     Reexport = 16,
+    /// A variable a function defines, found in the asking file at the
+    /// use; never in the index.
+    Local = 17,
+    /// A function's parameter, found as [`DefinitionKind::Local`] is.
+    Parameter = 18,
+    /// The import that brings a name in, in the asking file: one from
+    /// outside the repository, or a Go package's; never in the index.
+    Import = 19,
 }
 
 impl DefinitionKind {
-    const ALL: [Self; 17] = [
+    const ALL: [Self; 20] = [
         Self::Function,
         Self::Method,
         Self::Macro,
@@ -137,6 +146,9 @@ impl DefinitionKind {
         Self::Interface,
         Self::Field,
         Self::Reexport,
+        Self::Local,
+        Self::Parameter,
+        Self::Import,
     ];
 
     /// Its word, as a tags query captures it after `definition.`.
@@ -160,6 +172,9 @@ impl DefinitionKind {
             Self::Interface => "interface",
             Self::Field => "field",
             Self::Reexport => "reexport",
+            Self::Local => "local",
+            Self::Parameter => "parameter",
+            Self::Import => "import",
         }
     }
 
@@ -622,6 +637,8 @@ pub(super) struct TagsQuery {
     name: Option<u32>,
     declarator: Option<u32>,
     container: Option<u32>,
+    /// A renamed re-export's original name.
+    original: Option<u32>,
     /// The kind each capture stands for, by capture index.
     kinds: Vec<Option<DefinitionKind>>,
     pub(super) roots: Option<Vec<bool>>,
@@ -671,6 +688,7 @@ impl TagsQuery {
             name,
             declarator,
             container: query.capture_index_for_name("container"),
+            original: query.capture_index_for_name("original"),
             kinds,
             roots: roots(grammar, &query, source),
             prune: by_kind(|r| r.prune),
@@ -694,6 +712,8 @@ const NONE: u32 = u32::MAX;
 struct Def {
     name: u32,
     container: u32,
+    /// A renamed re-export's original name; [`NONE`] for any other.
+    original: u32,
     kind: DefinitionKind,
     start: u32,
     end: u32,
@@ -727,6 +747,9 @@ pub struct Definition<'a> {
     /// parameters (`Point` for `impl<T> crate::geo::Point<T>`). `None`
     /// when the type has no name to give (`impl<T> Draw for &T`).
     pub container: Option<&'a str>,
+    /// For a re-export that renames what it exports (`export { x as y }
+    /// from`, `pub use a::x as y`), the name it has where it's defined.
+    pub original: Option<&'a str>,
 }
 
 impl Definitions {
@@ -738,6 +761,7 @@ impl Definitions {
             start: d.start as usize,
             end: d.end as usize,
             container: (d.container != NONE).then(|| self.name(d.container)),
+            original: (d.original != NONE).then(|| self.name(d.original)),
         })
     }
 
@@ -790,6 +814,10 @@ impl Definitions {
             put(&mut out, d.start - line);
             put(&mut out, d.end - d.start);
             put(&mut out, d.container.wrapping_add(1));
+            // Only a re-export has one, so the others pay nothing for it.
+            if d.kind == DefinitionKind::Reexport {
+                put(&mut out, d.original.wrapping_add(1));
+            }
             line = d.start;
         }
         out
@@ -841,14 +869,18 @@ impl Definitions {
             let start = line.checked_add(get(&mut input)?)?;
             let end = start.checked_add(get(&mut input)?)?;
             let container = get(&mut input)?.wrapping_sub(1);
-            if name as usize >= ends.len()
-                || (container != NONE && container as usize >= ends.len())
-            {
+            let original = match kind {
+                DefinitionKind::Reexport => get(&mut input)?.wrapping_sub(1),
+                _ => NONE,
+            };
+            let known = |i: u32| i == NONE || (i as usize) < ends.len();
+            if name as usize >= ends.len() || !known(container) || !known(original) {
                 return None;
             }
             defs.push(Def {
                 name,
                 container,
+                original,
                 kind,
                 start,
                 end,
@@ -1212,6 +1244,7 @@ struct Found {
     pattern: usize,
     name: String,
     container: Option<String>,
+    original: Option<String>,
     kind: DefinitionKind,
     lines: (u32, u32),
 }
@@ -1258,7 +1291,11 @@ fn extract(query: &TagsQuery, tree: &Tree, source: &[u8]) -> Definitions {
     });
     found.dedup_by(|b, a| a.bytes == b.bytes && a.name == b.name);
     let mut names: Vec<&str> = (found.iter())
-        .flat_map(|f| std::iter::once(f.name.as_str()).chain(f.container.as_deref()))
+        .flat_map(|f| {
+            std::iter::once(f.name.as_str())
+                .chain(f.container.as_deref())
+                .chain(f.original.as_deref())
+        })
         .collect();
     names.sort_unstable();
     names.dedup();
@@ -1268,6 +1305,7 @@ fn extract(query: &TagsQuery, tree: &Tree, source: &[u8]) -> Definitions {
         defs.defs.push(Def {
             name: id(&f.name),
             container: f.container.as_deref().map_or(NONE, id),
+            original: f.original.as_deref().map_or(NONE, id),
             kind: f.kind,
             start: f.lines.0,
             end: f.lines.1,
@@ -1285,6 +1323,7 @@ fn extract(query: &TagsQuery, tree: &Tree, source: &[u8]) -> Definitions {
 fn definition_of(query: &TagsQuery, m: &QueryMatch, source: &[u8]) -> Option<Found> {
     let text = |node: Node| String::from_utf8_lossy(&source[node.byte_range()]).into_owned();
     let (mut definition, mut name, mut container, mut scope) = (None, None, None, None);
+    let mut original = None;
     for c in m.captures() {
         if Some(c.index) == query.name {
             name = Some(c.node);
@@ -1303,6 +1342,8 @@ fn definition_of(query: &TagsQuery, m: &QueryMatch, source: &[u8]) -> Option<Fou
             scope = declared.and_then(|(_, scope)| scope);
         } else if Some(c.index) == query.container {
             container = Some(c.node);
+        } else if Some(c.index) == query.original {
+            original = Some(c.node);
         } else if let Some(kind) = query.kinds[c.index as usize] {
             definition = Some((c.node, kind));
         }
@@ -1319,6 +1360,7 @@ fn definition_of(query: &TagsQuery, m: &QueryMatch, source: &[u8]) -> Option<Fou
     }
     let mut name = named(text(name));
     let container = container.map(|c| named(text(c)));
+    let original = original.map(|o| named(text(o))).filter(|o| *o != name);
     if let Some(rules) = query.rules {
         name.truncate(name.trim_end_matches(rules.name_suffixes).len());
         // A function found in a class body is a method its class's pattern
@@ -1346,6 +1388,7 @@ fn definition_of(query: &TagsQuery, m: &QueryMatch, source: &[u8]) -> Option<Fou
         pattern: m.pattern_index,
         name,
         container,
+        original,
         kind,
         lines: (
             to_u32(definition.start_position().row),
@@ -1487,6 +1530,7 @@ fn macro_definition(
         pattern: usize::MAX,
         name: format!("{}{arg}{}", m.prefix, m.suffix),
         container: None,
+        original: None,
         kind: m.kind,
         lines: (to_u32(row), last),
     })

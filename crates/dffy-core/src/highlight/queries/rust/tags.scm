@@ -5,7 +5,8 @@
 ; they're what a call through the trait names. A struct's or a union's
 ; named fields and an enum's variants have their type as @container. A
 ; const or static outside a trait without a value only declares one, and
-; `_` names nothing. A `pub use` re-exports each name it ends at.
+; `_` names nothing. A `pub use` re-exports each name it ends at, one it
+; renames with the name it had as @original.
 
 (impl_item
   type: [
@@ -72,11 +73,15 @@
   argument: [
     (identifier) @name
     (scoped_identifier name: (identifier) @name)
-    (use_as_clause alias: (identifier) @name)
+    (use_as_clause
+      path: [(identifier) @original (scoped_identifier name: (identifier) @original)]
+      alias: (identifier) @name)
     (scoped_use_list list: (use_list [
       (identifier) @name
       (scoped_identifier name: (identifier) @name)
-      (use_as_clause alias: (identifier) @name)
+      (use_as_clause
+        path: [(identifier) @original (scoped_identifier name: (identifier) @original)]
+        alias: (identifier) @name)
     ]))
   ]
   (#not-eq? @name "self")) @definition.reexport

@@ -158,6 +158,11 @@ fn built(navigator: &Navigator, building: bool, error: Option<&str>) -> String {
         r#","skipped":{{"too_large":{},"timed_out":{},"unreadable":{}}}"#,
         stats.too_large, stats.timed_out, stats.unreadable
     );
+    s.push_str(r#","note":"#);
+    match navigator.note() {
+        Some(note) => string(&mut s, &note),
+        None => s.push_str("null"),
+    }
     s
 }
 
@@ -628,9 +633,11 @@ impl Server {
         Ok((navigator, Origin { path, language }))
     }
 
-    /// `{"navigator","name","origin"}`: where the name is defined.
+    /// `{"navigator","name","origin","at"?}`: where the name is defined, as
+    /// used at `at` in the asking file when that's given.
     fn lookup(&self, params: &Value, cancel: &AtomicBool) -> Result<String, Failure> {
         let name = text(params, "name").map_err(invalid)?.to_owned();
+        let at = wire::read_use(params).map_err(invalid)?;
         let (navigator, origin) = self.navigator_and_origin(params)?;
         let (repo, cache) = {
             let state = self.state();
@@ -638,7 +645,7 @@ impl Server {
             (setup.repo.clone(), setup.cache.symbols())
         };
         let found = navigator
-            .lookup(&repo, &cache, &name, &origin, cancel)
+            .lookup_at(&repo, &cache, &name, &origin, at, cancel)
             .map_err(|e| failed(&e))?;
         let mut s = String::from(r#"{"candidates":["#);
         for (i, c) in found.candidates.iter().enumerate() {
@@ -677,11 +684,12 @@ impl Server {
         let name = text(params, "name").map_err(invalid)?.to_owned();
         let kind = text(params, "kind").map_err(invalid)?.to_owned();
         let (navigator, origin) = self.navigator_and_origin(params)?;
+        let filter = wire::read_filter(params).map_err(invalid)?;
         let repo = self.state().setup()?.repo.clone();
         let search = match kind.as_str() {
             "references" => Search::References {
                 search: navigator
-                    .references(&repo, &name, &origin, cancel)
+                    .references(&repo, &name, &origin, filter, cancel)
                     .map_err(|e| failed(&e))?,
                 navigator,
                 found: 0,

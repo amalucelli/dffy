@@ -46,6 +46,10 @@ mod select;
 /// Rows kept above a file's first change when it opens there.
 const OPEN_CONTEXT: isize = 3;
 
+/// The mark in the gutter of the line a jump landed on. Not the tree's
+/// folder arrow (`▶`) nor a folded thread's (`▸`).
+const LANDED_MARK: &str = "❯";
+
 /// A hunk header that says nothing of its hunk, for how the layout
 /// arranges rows that aren't in one.
 const ANY_HUNK: HunkHeader<'static> = HunkHeader {
@@ -816,6 +820,16 @@ pub(crate) struct Doc {
     /// The key that opens a hidden run in place in file view, and folds it,
     /// for its rule to name.
     pub open_key: Option<String>,
+    /// The line a jump landed on, marked until the viewer lets it go: its
+    /// file, version and line. Its row is looked up as it's drawn, so
+    /// rows that come or go above it move the mark with it.
+    landed: Option<(usize, Side, usize)>,
+    /// How many times a line was marked, for the viewer to tell whether an
+    /// event marked one.
+    landings: u64,
+    /// The last frame marked a line: the next one draws every row, so a
+    /// mark let go doesn't stay in rows copied from it.
+    landed_drawn: bool,
 }
 
 impl Doc {
@@ -843,7 +857,31 @@ impl Doc {
             box_drawn: None,
             page_title: String::new(),
             open_key: None,
+            landed: None,
+            landings: 0,
+            landed_drawn: false,
         }
+    }
+
+    /// Marks line `line` of `side` of `file` as where a jump landed.
+    pub(crate) fn mark_landed(&mut self, file: usize, side: Side, line: usize) {
+        self.landed = Some((file, side, line));
+        self.landings += 1;
+    }
+
+    /// The line marked as where a jump landed.
+    pub(crate) fn landed(&self) -> Option<(usize, Side, usize)> {
+        self.landed
+    }
+
+    /// How many times a line was marked so far.
+    pub(crate) fn landings(&self) -> u64 {
+        self.landings
+    }
+
+    /// Lets the landed line's mark go. Returns whether there was one.
+    pub(crate) fn clear_landed(&mut self) -> bool {
+        self.landed.take().is_some()
     }
 
     /// The layout of a file's hunks. A rendered view always wraps, since
@@ -2372,6 +2410,7 @@ impl Doc {
             .copied()
             .flatten()
             .map_or(last, |p| Pos { offset: 0, ..p });
+        self.landed_drawn = self.landed.is_some() && self.draw_landed(grid, area, theme, &layout);
         self.draw_selection(grid, area, &layout);
         self.draw_comment_selection(grid, area);
         if self.boxes.writing.is_some() {
@@ -2452,6 +2491,67 @@ impl Doc {
         (y, last)
     }
 
+    /// Marks the screen rows of the line a jump landed on, when the file
+    /// shown has it: the landed role laid over each, and the mark in the
+    /// gutter of the line's side on the first. Returns whether any showed.
+    fn draw_landed(
+        &mut self,
+        grid: &mut Grid,
+        (x, end, top): (usize, usize, usize),
+        theme: &Theme,
+        layout: &Layout,
+    ) -> bool {
+        let Some((file, side, line)) = self.landed.filter(|l| l.0 == self.document.pos.file) else {
+            return false;
+        };
+        let m = document::Match {
+            side,
+            line: u32::try_from(line).unwrap_or(u32::MAX),
+            start: 0,
+            end: 0,
+        };
+        let Some(row) = (self.document).match_pos(file, &m, arrange(layout, &self.boxes)) else {
+            return false;
+        };
+        let style = theme.style(Role::Landed);
+        let mut shown = false;
+        for y in 0..self.drawn.len() {
+            let Some(pos) = self.drawn[y].filter(|p| Pos { offset: 0, ..*p } == row) else {
+                continue;
+            };
+            grid.map_styles(x, top + y, end, |s| Style {
+                fg: style.fg.or(s.fg),
+                bg: style.bg.or(s.bg),
+                attributes: s.attributes | style.attributes,
+            });
+            if pos.offset == 0
+                && let Some(column) = self.mark_column(row, side, layout, x)
+            {
+                grid.put_str(column, top + y, end, LANDED_MARK, style);
+            }
+            shown = true;
+        }
+        shown
+    }
+
+    /// The screen column of the mark cell in the gutter of `side` on the
+    /// code row at `row`, drawn from column `x`.
+    fn mark_column(&mut self, row: Pos, side: Side, layout: &Layout, x: usize) -> Option<usize> {
+        let split = self.split_row(row, layout);
+        let mut mapped = std::mem::take(&mut self.mapped);
+        mapped.clear();
+        self.render_code(row, layout, &mut mapped);
+        let column = (mapped.map())
+            .and_then(|map| {
+                map.areas
+                    .iter()
+                    .find(|a| a.row == 0 && (!split || a.side == side.index()))
+            })
+            .map(|area| (x + area.col).saturating_sub(layout.mark_width()));
+        self.mapped = mapped;
+        column
+    }
+
     /// Draws the first separator on screen again, highlighted as what `x`
     /// reveals. `copied` is the separator highlighted in the rows copied
     /// from the last frame: when one scrolled in above it, it's drawn
@@ -2512,6 +2612,8 @@ impl Doc {
             || self.note(pos.file).is_some()
             || self.selection.is_some()
             || self.comment_selection.is_some()
+            || self.landed.is_some()
+            || self.landed_drawn
             || self.now >= self.ages_until
             || (previous.width(), previous.height()) != (grid.width(), grid.height())
         {
@@ -3157,11 +3259,15 @@ impl Doc {
 
     /// Shows line `line` (0-based) of `side` of `file`, a loaded file, as
     /// [`Doc::goto_match`] shows a row, revealing it with a few lines
-    /// around when a gap hides it. False when no row shows that line.
+    /// around when a gap hides it, and marks it as where a jump landed.
+    /// False when no row shows that line.
     pub(crate) fn goto_line(&mut self, file: usize, side: Side, line: usize) -> bool {
-        self.line_pos(file, side, line)
-            .map(|pos| self.goto_match(pos))
-            .is_some()
+        let Some(pos) = self.line_pos(file, side, line) else {
+            return false;
+        };
+        self.goto_match(pos);
+        self.mark_landed(file, side, line);
+        true
     }
 
     /// Puts line `line` (0-based) of `side` of `file`, a loaded file, at

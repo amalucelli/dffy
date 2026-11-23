@@ -184,7 +184,9 @@ fn references_list_the_uses_closest_first_and_count_past_the_cap() {
         language: grammars.named("c").expect("bundled").clone(),
     };
     let go = AtomicBool::new(false);
-    let mut search = nav.references(&repo, "frob", &origin, &go).expect("starts");
+    let mut search = nav
+        .references(&repo, "frob", &origin, Filter::default(), &go)
+        .expect("starts");
     let mut asked = 0;
     let first = search.step(&nav, &repo, || {
         asked += 1;
@@ -278,7 +280,9 @@ fn references_skip_multiline_definitions_and_block_comments_and_cap_a_file() {
         language: grammars.named("c").expect("bundled").clone(),
     };
     let go = AtomicBool::new(false);
-    let mut search = nav.references(&repo, "frob", &origin, &go).expect("starts");
+    let mut search = nav
+        .references(&repo, "frob", &origin, Filter::default(), &go)
+        .expect("starts");
     let hits = search.step(&nav, &repo, || false);
     let lines: Vec<String> = (hits.iter())
         .filter(|r| r.candidate.path == "a.c")
@@ -294,10 +298,14 @@ fn references_skip_multiline_definitions_and_block_comments_and_cap_a_file() {
 
     let other =
         Navigator::new(&repo, &grammars, &Shared::new(), &diff, view::Side::New).expect("lists");
-    let mut search = nav.references(&repo, "frob", &origin, &go).expect("starts");
+    let mut search = nav
+        .references(&repo, "frob", &origin, Filter::default(), &go)
+        .expect("starts");
     assert_eq!(search.step(&other, &repo, || false), []);
     assert!(search.done(), "another navigator's search ends");
-    let mut empty = nav.references(&repo, "", &origin, &go).expect("starts");
+    let mut empty = nav
+        .references(&repo, "", &origin, Filter::default(), &go)
+        .expect("starts");
     assert!(empty.done() && empty.step(&nav, &repo, || false).is_empty());
 }
 
@@ -391,4 +399,293 @@ fn a_cold_lookup_finds_what_the_asking_file_defines() {
         .map(|c| format!("{}:{}", c.path, c.start + 1))
         .collect();
     assert_eq!(at, ["a.c:2"]);
+}
+
+/// Two commits of a small C project, `src/use.c` changed in the second,
+/// and the diff between them: `frob` is defined in `src/b.c`.
+fn stored_project() -> (tempfile::TempDir, Repo, Vec<FileChange>, [Snapshot; 2]) {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let d = dir.path();
+    git(d, &["init", "-q", "-b", "main"]);
+    std::fs::create_dir_all(d.join("src")).expect("mkdir");
+    std::fs::write(d.join("src/a.h"), "struct frobber { int n; };\n").expect("write");
+    std::fs::write(d.join("src/b.c"), "int frob(int x)\n{\n\treturn x;\n}\n").expect("write");
+    std::fs::write(d.join("src/use.c"), "int use(void) { return frob(1); }\n").expect("write");
+    git(d, &["add", "-A"]);
+    git(d, &["commit", "-q", "-m", "first"]);
+    std::fs::write(d.join("src/use.c"), "int use(void) { return frob(2); }\n").expect("write");
+    git(d, &["commit", "-q", "-am", "second"]);
+    let repo = Repo::discover(d).expect("repo");
+    let spec = repo
+        .resolve(&["HEAD~1", "HEAD"], false, false)
+        .expect("resolves");
+    let mut changes = Vec::new();
+    repo.for_each_change(&spec, &[], |c| {
+        changes.push(c);
+        std::ops::ControlFlow::Continue(())
+    })
+    .expect("enumerates");
+    let snapshots = spec.snapshots(false).expect("snapshots");
+    (dir, repo, changes, snapshots)
+}
+
+fn built(
+    repo: &Repo,
+    changes: &[FileChange],
+    snapshots: [Snapshot; 2],
+    (shared, cache): (&Shared, &SymbolCache),
+    side: view::Side,
+) -> Navigator {
+    let diff = Diff {
+        snapshots,
+        changes,
+        options: Options::default(),
+    };
+    let nav = Navigator::new(repo, &Registry::builtin(), shared, &diff, side).expect("lists");
+    nav.build(repo, cache, 1, &AtomicBool::new(false), |_| {})
+        .expect("the queries compile");
+    nav
+}
+
+/// Where `frob` is defined, asked from `src/use.c`.
+fn frob(nav: &Navigator, repo: &Repo, cache: &SymbolCache) -> Vec<String> {
+    let origin = Origin {
+        path: "src/use.c".into(),
+        language: Registry::builtin().named("c").expect("bundled").clone(),
+    };
+    let found =
+        (nav.lookup(repo, cache, "frob", &origin, &AtomicBool::new(false))).expect("looks up");
+    (found.candidates.iter())
+        .map(|c| format!("{}:{}", c.path, c.start))
+        .collect()
+}
+
+/// A built index answers from the store's file and its postings there,
+/// which nothing in the cache's folder names: the symbol cache gone, its
+/// packs evicted, the answers stay.
+#[test]
+fn a_built_index_answers_from_the_store_with_the_cache_gone() {
+    let (_dir, repo, changes, snapshots) = stored_project();
+    let cache_dir = tempfile::tempdir().expect("tempdir");
+    let cache = crate::cache::Cache::new(cache_dir.path().to_owned(), 1 << 24).symbols();
+    let shared = Shared::new();
+    let nav = built(
+        &repo,
+        &changes,
+        snapshots,
+        (&shared, &cache),
+        view::Side::New,
+    );
+    assert!(nav.postings_written());
+    assert!(shared.stored_bytes() > 0);
+    assert_eq!(frob(&nav, &repo, &cache), ["src/b.c:0"]);
+    let left: Vec<String> = std::fs::read_dir(cache.as_cache().dir())
+        .expect("the cache's folder")
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|name| name.starts_with("navigate"))
+        .collect();
+    assert!(left.is_empty(), "the store's file is unlinked: {left:?}");
+
+    std::fs::remove_dir_all(cache_dir.path()).expect("removes");
+    assert_eq!(frob(&nav, &repo, &cache), ["src/b.c:0"]);
+    assert_eq!(nav.note(), None);
+}
+
+/// Both versions of a diff share the store: a blob they both have is
+/// stored once, by whichever navigator read it first.
+#[test]
+fn both_versions_store_an_unchanged_blob_once() {
+    let (_dir, repo, changes, snapshots) = stored_project();
+    let cache_dir = tempfile::tempdir().expect("tempdir");
+    let cache = crate::cache::Cache::new(cache_dir.path().to_owned(), 1 << 24).symbols();
+    let shared = Shared::new();
+    let old = built(
+        &repo,
+        &changes,
+        snapshots,
+        (&shared, &cache),
+        view::Side::Old,
+    );
+    let after_old = shared.stored_bytes();
+    let new = built(
+        &repo,
+        &changes,
+        snapshots,
+        (&shared, &cache),
+        view::Side::New,
+    );
+    assert_eq!(new.stats().cached, 2, "a.h and b.c from the store");
+    assert!(
+        shared.stored_bytes() - after_old < after_old,
+        "only use.c's, and the postings, added"
+    );
+    assert_eq!(frob(&old, &repo, &cache), frob(&new, &repo, &cache));
+}
+
+/// A store whose file can't be read back whole takes the index's files out
+/// to be read again: a lookup then answers once they are.
+#[test]
+fn a_store_read_that_fails_reads_the_index_again() {
+    let (_dir, repo, changes, snapshots) = stored_project();
+    let cache_dir = tempfile::tempdir().expect("tempdir");
+    let cache = crate::cache::Cache::new(cache_dir.path().to_owned(), 1 << 24).symbols();
+    let shared = Shared::new();
+    let nav = built(
+        &repo,
+        &changes,
+        snapshots,
+        (&shared, &cache),
+        view::Side::New,
+    );
+    nav.shared.store().damage();
+    frob(&nav, &repo, &cache);
+    assert!(!nav.progress().complete(), "taken out to be read again");
+    nav.build(&repo, &cache, 1, &AtomicBool::new(false), |_| {})
+        .expect("the queries compile");
+    assert!(nav.progress().complete());
+    assert_eq!(frob(&nav, &repo, &cache), ["src/b.c:0"]);
+}
+
+/// Where the store's file can't be made, as on a full disk, the
+/// definitions are kept in memory and the navigator says so.
+#[test]
+fn a_store_that_cant_be_made_keeps_definitions_in_memory() {
+    let (_dir, repo, changes, snapshots) = stored_project();
+    let blocked = tempfile::NamedTempFile::new().expect("a file");
+    let cache = crate::cache::Cache::new(blocked.path().to_owned(), 1 << 24).symbols();
+    let shared = Shared::new();
+    let nav = built(
+        &repo,
+        &changes,
+        snapshots,
+        (&shared, &cache),
+        view::Side::New,
+    );
+    assert_eq!(frob(&nav, &repo, &cache), ["src/b.c:0"]);
+    let note = nav.note().expect("said");
+    assert!(note.contains("kept in memory"), "{note}");
+}
+
+/// Navigators made again and dropped, as a watched working tree's are,
+/// don't grow the store: one made when the file holds more dead than live
+/// starts another. One still held keeps its file, and its answers.
+#[test]
+fn navigators_made_again_keep_the_store_bounded() {
+    let (_dir, repo, changes, snapshots) = stored_project();
+    let cache_dir = tempfile::tempdir().expect("tempdir");
+    let cache = crate::cache::Cache::new(cache_dir.path().to_owned(), 1 << 24).symbols();
+    let shared = Shared::new();
+    let kept = built(
+        &repo,
+        &changes,
+        snapshots,
+        (&shared, &cache),
+        view::Side::Old,
+    );
+    let one = shared.stored_bytes();
+    for _ in 0..8 {
+        let nav = built(
+            &repo,
+            &changes,
+            snapshots,
+            (&shared, &cache),
+            view::Side::New,
+        );
+        assert_eq!(frob(&nav, &repo, &cache), ["src/b.c:0"]);
+    }
+    assert!(
+        shared.stored_bytes() <= 3 * one,
+        "{} bytes stored, one navigator's {one}",
+        shared.stored_bytes()
+    );
+    assert_eq!(frob(&kept, &repo, &cache), ["src/b.c:0"]);
+}
+
+/// A use calls the name when its arguments follow, past a Rust macro's
+/// `!` or type arguments; a definition's own name doesn't.
+#[test]
+fn a_call_is_the_name_before_its_arguments() {
+    let call = |line: &str, name: &str| {
+        let at = line.find(name).expect("the name");
+        let bytes = line.as_bytes();
+        references::calls(&bytes[..at], &bytes[at + name.len()..])
+    };
+    assert!(call("x = frob(1);", "frob"));
+    assert!(call("\treturn frob (1);", "frob"));
+    assert!(call("let v = vec![1];", "vec"));
+    assert!(call("s.parse::<u32>()", "parse"));
+    assert!(call("make<Item>(x)", "make"));
+    assert!(call("Map[int](x)", "Map"));
+    assert!(!call("let f = frob;", "frob"));
+    assert!(!call("fn frob(x: u32) {", "frob"));
+    assert!(!call("def frob(x):", "frob"));
+    assert!(!call("if a < frob {", "frob"));
+}
+
+/// The uses a filter keeps: those calling the name, those in the files
+/// the diff changes.
+#[test]
+fn filters_keep_the_calls_and_the_uses_in_the_diff() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let d = dir.path();
+    git(d, &["init", "-q", "-b", "main"]);
+    let user = |n: u32| format!("int use(void) {{ return frob({n}); }}\nint (*f)(int) = frob;\n");
+    std::fs::write(d.join("a.c"), user(1)).expect("write");
+    std::fs::write(d.join("b.c"), user(1)).expect("write");
+    git(d, &["add", "-A"]);
+    git(d, &["commit", "-q", "-m", "first"]);
+    std::fs::write(d.join("b.c"), user(2)).expect("write");
+    git(d, &["commit", "-q", "-am", "second"]);
+    let repo = Repo::discover(d).expect("repo");
+    let spec = repo
+        .resolve(&["HEAD~1", "HEAD"], false, false)
+        .expect("resolves");
+    let mut changes = Vec::new();
+    repo.for_each_change(&spec, &[], |c| {
+        changes.push(c);
+        std::ops::ControlFlow::Continue(())
+    })
+    .expect("enumerates");
+    let diff = Diff {
+        snapshots: spec.snapshots(false).expect("snapshots"),
+        changes: &changes,
+        options: Options::default(),
+    };
+    let grammars = Registry::builtin();
+    let nav =
+        Navigator::new(&repo, &grammars, &Shared::new(), &diff, view::Side::New).expect("lists");
+    let origin = Origin {
+        path: "b.c".into(),
+        language: grammars.named("c").expect("bundled").clone(),
+    };
+    let go = AtomicBool::new(false);
+    let kept = |filter| {
+        let mut search = nav
+            .references(&repo, "frob", &origin, filter, &go)
+            .expect("starts");
+        let mut found: Vec<String> = Vec::new();
+        while !search.done() {
+            found.extend(
+                (search.step(&nav, &repo, || false).iter())
+                    .map(|r| format!("{}:{}", r.candidate.path, r.candidate.start + 1)),
+            );
+        }
+        found.sort();
+        found
+    };
+    assert_eq!(
+        kept(Filter::default()),
+        ["a.c:1", "a.c:2", "b.c:1", "b.c:2"]
+    );
+    let calls = Filter {
+        calls_only: true,
+        ..Filter::default()
+    };
+    assert_eq!(kept(calls), ["a.c:1", "b.c:1"]);
+    let in_diff = Filter {
+        in_diff: true,
+        ..Filter::default()
+    };
+    assert_eq!(kept(in_diff), ["b.c:1", "b.c:2"]);
 }

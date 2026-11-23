@@ -1324,6 +1324,14 @@ impl App {
             self.last_input = Instant::now();
             self.reviewing.input();
         }
+        // The mark of the line a jump landed on goes as the user moves: on
+        // a key that moves the view, or any press, drag or wheel step.
+        let keyed = matches!(&event, Event::Input(Input::Key(..) | Input::Paste(_)));
+        let pointer = matches!(&event, Event::Input(input) if !keyed && !matches!(
+            input,
+            Input::Release { .. } | Input::Background { .. }
+        ));
+        let before = (self.doc.landings(), self.doc.document.pos);
         let mut action = self.handle(event);
         self.release_held_agents();
         if matches!(
@@ -1352,6 +1360,10 @@ impl App {
         self.peek_settle();
         self.jump_settle();
         self.peek_sync();
+        let moved = pointer || (keyed && self.doc.document.pos != before.1);
+        if moved && self.doc.landings() == before.0 && self.doc.clear_landed() {
+            self.dirty = true;
+        }
         self.kept = kept && self.scrolled;
         // Stopping a post halfway leaves the review half sent until the
         // next post, so the first quit asks again.
@@ -2387,7 +2399,13 @@ impl App {
             Act::OpenPicker => self.open_picker(),
             Act::JumpBack | Act::JumpForward => self.jump(action == Act::JumpForward),
             Act::GoToDefinition => self.go_to_definition(),
-            Act::ShowInDiff | Act::OtherVersion | Act::References | Act::ClosePeek => {
+            Act::ShowInDiff
+            | Act::OtherVersion
+            | Act::References
+            | Act::MoreUses
+            | Act::CallsOnly
+            | Act::UsesInDiff
+            | Act::ClosePeek => {
                 return self.peek_act(action);
             }
             Act::CloseFile => self.close_file(),

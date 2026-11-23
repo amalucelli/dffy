@@ -69,12 +69,16 @@ pub(crate) enum Role {
     Selection,
     /// The tree's selected row while the diff has the keys.
     SelectionInactive,
+    /// The line a jump landed on, until the next key: its background and
+    /// attributes go over the row's, its foreground over theirs when it
+    /// sets one, and the mark in its gutter takes the whole style.
+    Landed,
 }
 
 impl Role {
     /// Every role a theme can set, in the order `dffy config` and theme files
     /// list them.
-    pub(crate) const THEMED: [Self; 28] = [
+    pub(crate) const THEMED: [Self; 29] = [
         Self::Context,
         Self::Added,
         Self::Removed,
@@ -103,6 +107,7 @@ impl Role {
         Self::StatusTag,
         Self::Selection,
         Self::SelectionInactive,
+        Self::Landed,
     ];
 
     pub(crate) fn key(self) -> &'static str {
@@ -136,6 +141,7 @@ impl Role {
             Self::StatusTag => "status-tag",
             Self::Selection => "selection",
             Self::SelectionInactive => "selection-inactive",
+            Self::Landed => "landed",
         }
     }
 
@@ -518,6 +524,7 @@ search-current = bold black on bright-cyan
 status-tag = black on blue
 selection = on bright-black
 selection-inactive = on bright-black
+landed = black on bright-blue
 syntax-keyword = magenta
 syntax-string = green
 syntax-escape = cyan
@@ -566,6 +573,7 @@ search-current = reverse
 status-tag = reverse
 selection = reverse
 selection-inactive = reverse
+landed = bold underline
 syntax-keyword = bold
 syntax-string =
 syntax-escape =
@@ -648,6 +656,7 @@ impl Palette {
             }
         };
         let (search, current, tag) = (chip(yellow), chip(orange), chip(blue));
+        let landed = hex(color::blend(rgb(bg), rgb(cyan), LANDED_MIX));
         // Modified lines take the blue, unless it's a purple or a teal
         // (Dracula, Gruvbox, Nord) that moved or added code would share:
         // then a blue as light and colorful as it.
@@ -690,6 +699,7 @@ search-current = bold {current}
 status-tag = {tag}
 selection = on {selection}
 selection-inactive = on {inactive}
+landed = on {landed}
 {syntax}"
         )
     }
@@ -700,6 +710,11 @@ selection-inactive = on {inactive}
 /// that the colored text on it still reads. The inactive selection moves
 /// half as far.
 const SELECTION_LIFT: f64 = 0.08;
+
+/// How much of the cyan a bundled theme's landed line mixes into its
+/// background: a hue no changed line is tinted with, strong enough to
+/// stand out from the selection's grey.
+const LANDED_MIX: f64 = 0.22;
 
 /// How much of an accent a chip mixes into the background when the theme's
 /// text goes on it.
@@ -1748,6 +1763,36 @@ mod tests {
         assert_eq!(Style::parse("").expect("valid").sgr(), "");
         assert!(Style::parse("grean").is_err());
         assert!(Style::parse("red on").is_err());
+    }
+
+    /// Every built-in marks the landed line, apart from the selection, the
+    /// search's matches and the tints of changed lines.
+    #[test]
+    fn every_builtin_sets_the_landed_line_apart() {
+        for name in builtin_names() {
+            let source = builtin_source(name).expect("a built-in");
+            let mut theme = Theme::parse(name, &source, &mut Vec::new());
+            theme.tint(DARK_BACKGROUND);
+            let landed = theme.style(Role::Landed);
+            assert_ne!(landed, Style::default(), "{name}");
+            for role in [
+                Role::Selection,
+                Role::SelectionInactive,
+                Role::SearchMatch,
+                Role::SearchCurrent,
+                Role::StatusTag,
+                Role::AddedLine,
+                Role::RemovedLine,
+                Role::ModifiedLine,
+                Role::Moved,
+            ] {
+                let other = theme.style(role);
+                assert_ne!(other, landed, "{name}: {}", role.key());
+                if landed.bg.is_some() {
+                    assert_ne!(other.bg, landed.bg, "{name}: {}", role.key());
+                }
+            }
+        }
     }
 
     #[test]

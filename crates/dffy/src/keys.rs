@@ -21,7 +21,7 @@ use crate::term::{Key, Mods};
 use crate::theme::Role;
 
 macro_rules! actions {
-    ($($variant:ident $name:literal $short:literal $doc:literal,)*) => {
+    ($($variant:ident $group:ident $name:literal $short:literal $doc:literal,)*) => {
         /// Everything a key can do, in the order the help lists them.
         #[derive(Debug, Clone, Copy, PartialEq, Eq)]
         pub(crate) enum Action {
@@ -51,116 +51,126 @@ macro_rules! actions {
                     $(Self::$variant => $doc,)*
                 }
             }
+
+            /// The group the help lists it in.
+            pub(crate) fn group(self) -> Group {
+                match self {
+                    $(Self::$variant => Group::$group,)*
+                }
+            }
         }
     };
 }
 
 actions! {
-    Leader "leader" "command panel" "open the command panel; its next key runs a command",
-    ScrollDown "scroll_down" "scroll down" "scroll down a line; in the tree, move down; in a peek, the next definition",
-    ScrollUp "scroll_up" "scroll up" "scroll up a line; in the tree, move up; in a peek, the definition before",
-    PageDown "page_down" "page down" "scroll down a screen",
-    PageUp "page_up" "page up" "scroll up a screen",
-    HalfPageDown "half_page_down" "half page down" "scroll down half a screen",
-    HalfPageUp "half_page_up" "half page up" "scroll up half a screen",
-    Top "top" "top of file" "top of the file",
-    Bottom "bottom" "bottom of file" "bottom of the file",
-    NextChange "next_change" "next change" "next change, on into the next file",
-    PrevChange "prev_change" "prev change" "previous change, back into the previous file",
-    NextFile "next_file" "next file" "next file",
-    PrevFile "prev_file" "prev file" "previous file",
-    Expand "expand" "more context" "show more of the highlighted ⋯ gap",
-    ToggleFull "toggle_full" "toggle whole file" "whole files or changes only, for every file",
-    ToggleFileView "toggle_file_view" "toggle file view" "file view, or the diff again: every file whole as it is in one version, the newer first, with a mark in the gutter where the other version's lines were; s then flips the version",
-    ScrollRight "scroll_right" "scroll right" "scroll the code right, without wrapping",
-    ScrollLeft "scroll_left" "scroll left" "scroll the code left",
-    ScrollReset "scroll_reset" "scroll to line start" "scroll the code back to its first column",
-    Select "select" "select lines" "select lines, from the top line or the one tapped",
-    Copy "copy" "copy selection" "copy the selected lines' code",
-    CopyPath "copy_path" "copy path" "copy the file's path",
-    CopyAbsolutePath "copy_absolute_path" "copy absolute path" "copy where the file is on disk, from the filesystem's root",
-    CopyComment "copy_comment" "copy comment" "copy a comment of the focused thread as written, in Markdown: the one last clicked, else its first",
-    CopyThread "copy_thread" "copy thread" "copy the focused thread: each comment under its author and date, as written",
-    CopyPrompt "copy_prompt" "copy as prompt" "copy the focused thread, else the selected lines, as a prompt for a coding agent: the comments, the lines with those around them and the file's changes near them",
-    Cancel "cancel" "cancel selection" "end the selection; in the tree, clear the filter",
-    SwitchPane "switch_pane" "switch panel/diff" "switch between the left panel (the file tree, or the comments) and the diff",
-    ToggleTree "toggle_tree" "toggle tree" "show or hide the file tree",
-    OpenPicker "open_picker" "find file" "find a file: type part of its path, enter opens it",
-    Search "search" "search diff" "search the diff's text; n/N then go between matches, esc clears",
-    FilterTree "filter_tree" "filter tree" "filter the file tree, fuzzily; f/F and n/N keep to the files it keeps, esc clears",
-    Open "open" "open file or folder" "open a file, or open or close a folder, in the tree; in a peek, the definition's file at its line: its entry in the diff, else the whole file",
-    Collapse "collapse" "collapse folder" "collapse a folder in the tree",
-    ParentFolder "parent_folder" "parent folder" "go to the folder holding the file, in the tree",
-    GoToDefinition "go_to_definition" "go to definition" "list the names on the line last tapped, else the top line; type to narrow them, and enter shows where the one picked is defined, in the line's version, in a peek under the line. ctrl+click or alt+click on a name peeks it at once",
-    ShowInDiff "show_in_diff" "show in diff" "in a peek: the definition's lines in the diff, where the diff changes its file",
-    OtherVersion "other_version" "other version" "in a peek: the name's definitions in the diff's other version",
-    References "references" "references" "in a peek: the lines using the name in the peek's version, closest files first, as they're found: the first 200 files with a use, and how many there are; again shows the definitions",
-    ClosePeek "close_peek" "close peek" "close the peek",
-    JumpBack "jump_back" "jump back" "back to where the last jump left, with the line that was at the top at the top again: a jump is a definition opened from a peek, or a file opened from find file, the tree or the control API. The last 100 places are kept; one whose file isn't shown any more is skipped",
-    JumpForward "jump_forward" "jump forward" "forward again, to where jump back left",
-    MarkViewed "mark_viewed" "mark viewed" "mark a file in the tree viewed",
-    CloseFile "close_file" "close file" "close a file opened outside the diff (from find file), the one selected in the tree or else the one shown; one with comments stays",
-    ToggleAllFiles "toggle_all_files" "toggle all files" "the tree lists every file of the repository, the diff's changes colored among them, or the diff's files again; s in the tree then shows the other version. Folders open as you go, enter on a file outside the diff shows it whole",
-    TreeWider "tree_wider" "widen tree" "widen the tree",
-    TreeNarrower "tree_narrower" "narrow tree" "narrow the tree",
-    CycleLayout "cycle_layout" "cycle layout" "layout: split, unified, then auto (split on wide screens); while selecting, the side copied; in file view, the side read",
-    ToggleWrap "toggle_wrap" "toggle wrap" "wrap or truncate long lines",
-    ToggleSyntax "toggle_syntax" "toggle syntax diff" "diff by lines or by syntax",
-    ToggleRendered "toggle_rendered" "toggle rendered view" "files with a renderer plugin rendered, or as lines (experimental, see render)",
-    CycleIndicators "cycle_indicators" "cycle indicators" "how changed lines are marked: background, bars, classic signs or none",
-    CycleModifiedLines "cycle_modified_lines" "cycle modified lines" "a line and its edit in the modified color with red and green tokens, or red and green lines",
-    ToggleHighlight "toggle_highlight" "toggle highlighting" "syntax highlighting on or off",
-    ToggleWhitespace "toggle_whitespace" "ignore whitespace" "ignore whitespace (-w) or not, diffing again",
-    ToggleLineNumbers "toggle_line_numbers" "toggle line numbers" "show or hide line numbers",
-    ToggleHunkHeaders "toggle_hunk_headers" "toggle hunk headers" "show or hide the @@ numbers of hunks",
-    ToggleStatusBar "toggle_status_bar" "move status bar" "the status bar in the frame's bottom border or its top one",
-    CycleTheme "cycle_theme" "next theme" "the next theme, built-in or yours",
-    ToggleWatch "toggle_watch" "toggle watch" "watch for changes",
-    TakeCheckpoint "take_checkpoint" "take checkpoint" "take a checkpoint of the working tree: its files as plain dffy lists them, staged or not and untracked, kept under a local ref of this worktree, the last 5 of them; starting Fix with agent takes one too",
-    SinceCheckpoint "since_checkpoint" "since checkpoint" "show only what changed since the latest checkpoint, such as an agent's turn since Fix with agent started it, or the diff shown before again; the status bar says how long ago it was taken",
-    ToggleMouse "toggle_mouse" "toggle mouse" "take mouse input, or leave it to the terminal's own selection (many terminals select natively with shift held while dragging)",
-    ToggleCopyDecorations "toggle_copy_decorations" "copy decorations" "copies include line numbers and +/- signs, or only the code",
-    Stage "stage" "stage lines" "stage the selected lines, else the hunk of the line last tapped or the first on screen: their working-tree version goes in the index (uncommitted changes only)",
-    Unstage "unstage" "unstage lines" "unstage the selected lines, else the hunk of the line last tapped or the first on screen: their HEAD version goes back in the index (uncommitted changes only)",
-    Discard "discard" "discard lines" "discard the selected lines' unstaged changes, else the hunk's, after a y/n: the working tree gets back the index's version, and an untracked file is deleted (uncommitted changes only)",
-    NextConflict "next_conflict" "next conflict" "in a conflicted file, the next conflict",
-    PrevConflict "prev_conflict" "prev conflict" "in a conflicted file, the previous conflict",
-    KeepCurrent "keep_current" "keep current" "resolve the conflict last gone to, else the first on screen, to the current side (ours); again takes the choice back. Choices show as a preview until written",
-    TakeIncoming "take_incoming" "take incoming" "resolve the conflict to the incoming side (theirs); again takes the choice back",
-    KeepBoth "keep_both" "keep both" "resolve the conflict to both sides, the current one first; again takes the choice back",
-    TakeBase "take_base" "take base" "resolve the conflict to the common ancestor's lines, when git wrote them (merge.conflictStyle diff3 or zdiff3); again takes the choice back",
-    WriteResolution "write_resolution" "write resolved" "write the conflicted file as the choices resolve it, asking first when some conflicts have none; then git add it after a y/n",
-    Edit "edit" "open in editor" "open the file in $EDITOR at the line last tapped, else the top line",
-    OpenTerminal "open_terminal" "open terminal here" "open a new tab in your terminal, or a window where that's all it offers, at the working tree's root; where dffy can't, it copies a cd there instead",
-    Comment "comment" "comment on lines" "comment on the selected lines, or the line v would start on, in a text box under them; enter sends it",
-    SuggestChange "suggest_change" "suggest change" "suggest a change to the selected lines, or the line v would start on: a comment's text box holding them, to edit into what they should be; enter sends it",
-    CommentFile "comment_file" "comment on file" "comment on the whole file shown, in a text box under its first row; enter sends it",
-    Comments "comments" "comments panel" "the left panel lists every comment thread in place of the files, or the files again; moving through the threads shows each in the diff, enter or tab goes to it; the thread keys act on the selected thread, and c filters them by state",
-    NextThread "next_thread" "next thread" "next comment thread, on into the next file with comments; it takes the focus, where r replies, e edits, x resolves, d deletes and o opens it on its host",
-    PrevThread "prev_thread" "prev thread" "previous comment thread, back into the previous file with comments",
-    ToggleThread "toggle_thread" "fold thread" "fold or unfold the focused comment thread, or the first on screen",
-    ToggleThreads "toggle_threads" "fold all threads" "fold every comment thread to one row, or unfold them all",
-    MoveThread "move_thread" "move thread here" "move the focused thread, or the comments panel's selected one, from the branch it was written on to the current branch",
-    AskAgent "ask_agent" "ask agent" "ask a coding agent, through the agent plugin dffy-agent, about the focused thread: write your question in a reply box, which enter sends with the thread to the agent that answered last, else the default one; enter on the empty box asks about the thread as it is, and esc keeps the question without asking. Elsewhere, write the question on the selected lines, or the line v would start on, in a text box, and enter asks. The answer comes as the agent's reply, with a suggestion when it proposes a change; esc on the thread stops it. A comment you write starting @ and an agent's name, as @name, asks that agent too (experimental, see agent)",
-    Reply "reply" "reply to thread" "on a thread: reply in a text box under it; enter sends it",
-    EditDraft "edit_draft" "edit thread draft" "on a thread: edit your last draft in it, in a text box; enter sends it",
-    DeleteDraft "delete_draft" "delete thread draft" "on a thread: delete your last draft in it, the whole thread when that's its first comment or the thread is resolved with nothing on the host, once the key comes again",
-    Resolve "resolve" "resolve thread" "on a thread: resolve it, or reopen it",
-    Adopt "adopt" "make it yours" "on a thread: someone else's comments in it not posted, as an agent's, become your drafts, which posting sends under your name",
-    ApplySuggestion "apply_suggestion" "apply suggestion" "on a thread: put its suggestion, the one last clicked or else its last, in place of the lines it's on in the working tree, refused when they changed since; an unstaged change, which discard undoes. On one applied already, put back the lines it replaced",
-    FixWithAgent "fix_with_agent" "fix with agent" "on a thread, or the selected lines with a note you write first: start your coding agent in a new tab, or here until it exits, pointed at the thread to change what it asks and reply in it",
-    SendOpenThreads "send_open_threads" "send open threads" "take a checkpoint, then start your coding agent as fix with agent does, pointed at every open thread of yours in view (those you started or replied in) to change what each asks and reply in each; since checkpoint then shows its turn",
-    OpenOnHost "open_on_host" "open thread on host" "on a thread: open it on its code host, in the browser",
-    ClearResolved "clear_resolved" "delete resolved threads" "delete the resolved threads shown, after a y/n; on a code host's review only what isn't posted, as the host's threads would come back",
-    CommentInEditor "comment_in_editor" "continue in editor" "write in $EDITOR: your draft in the focused thread, else a reply to it, else a comment on the line; ctrl+g does it from the text box",
-    CommentedFiles "commented_files" "files with comments" "the tree shows only the files with comments, or every file; f/F and n/N keep to them. In the comments panel, it steps through all threads, open ones, drafts and resolved ones, and its capital steps back",
-    ReviewPull "review_pull" "update the review" "on a review a review plugin opened, fetch its new commits and threads and show them in place (experimental, see review)",
-    ReviewPost "review_post" "post the review" "on a review a review plugin opened, open the dialog that posts your drafts, replies and resolves as a review (experimental, see review)",
-    OpenReview "open_review" "open a review…" "list the reviews the review plugin offers, such as this branch's, yours and those waiting on you, to open one (experimental, see review)",
-    SinceLastReview "since_last_review" "since last review" "on a review a review plugin opened, show only what changed since the head of your last review, as the review plugin records it, or the whole review again",
-    WholeReview "whole_review" "show the whole review" "on the branch's review that plain dffy found, show the whole review against the working tree, or the working tree's changes again",
-    Help "help" "show this help" "show or hide this help",
-    Quit "quit" "quit" "quit",
+    Leader General "leader" "command panel" "open the command panel; its next key runs a command",
+    ScrollDown Navigation "scroll_down" "scroll down" "scroll down a line; in the tree, move down; in a peek, the next definition",
+    ScrollUp Navigation "scroll_up" "scroll up" "scroll up a line; in the tree, move up; in a peek, the definition before",
+    PageDown Navigation "page_down" "page down" "scroll down a screen",
+    PageUp Navigation "page_up" "page up" "scroll up a screen",
+    HalfPageDown Navigation "half_page_down" "half page down" "scroll down half a screen",
+    HalfPageUp Navigation "half_page_up" "half page up" "scroll up half a screen",
+    Top Navigation "top" "top of file" "top of the file",
+    Bottom Navigation "bottom" "bottom of file" "bottom of the file",
+    NextChange Navigation "next_change" "next change" "next change, on into the next file",
+    PrevChange Navigation "prev_change" "prev change" "previous change, back into the previous file",
+    NextFile Files "next_file" "next file" "next file",
+    PrevFile Files "prev_file" "prev file" "previous file",
+    Expand Layout "expand" "more context" "show more of the highlighted ⋯ gap",
+    ToggleFull Layout "toggle_full" "toggle whole file" "whole files or changes only, for every file",
+    ToggleFileView Layout "toggle_file_view" "toggle file view" "file view, or the diff again: every file whole as it is in one version, the newer first, with a mark in the gutter where the other version's lines were; s then flips the version",
+    ScrollRight Navigation "scroll_right" "scroll right" "scroll the code right, without wrapping",
+    ScrollLeft Navigation "scroll_left" "scroll left" "scroll the code left",
+    ScrollReset Navigation "scroll_reset" "scroll to line start" "scroll the code back to its first column",
+    Select Copy "select" "select lines" "select lines, from the top line or the one tapped",
+    Copy Copy "copy" "copy selection" "copy the selected lines' code",
+    CopyPath Copy "copy_path" "copy path" "copy the file's path",
+    CopyAbsolutePath Copy "copy_absolute_path" "copy absolute path" "copy where the file is on disk, from the filesystem's root",
+    CopyComment Comments "copy_comment" "copy comment" "copy a comment of the focused thread as written, in Markdown: the one last clicked, else its first",
+    CopyThread Comments "copy_thread" "copy thread" "copy the focused thread: each comment under its author and date, as written",
+    CopyPrompt Copy "copy_prompt" "copy as prompt" "copy the focused thread, else the selected lines, as a prompt for a coding agent: the comments, the lines with those around them and the file's changes near them",
+    Cancel Copy "cancel" "cancel selection" "end the selection; in the tree, clear the filter",
+    SwitchPane Files "switch_pane" "switch panel/diff" "switch between the left panel (the file tree, or the comments) and the diff",
+    ToggleTree Files "toggle_tree" "toggle tree" "show or hide the file tree",
+    OpenPicker Files "open_picker" "find file" "find a file: type part of its path, enter opens it",
+    Search Files "search" "search diff" "search the diff's text; n/N then go between matches, esc clears",
+    FilterTree Files "filter_tree" "filter tree" "filter the file tree, fuzzily; f/F and n/N keep to the files it keeps, esc clears",
+    Open Files "open" "open file or folder" "open a file, or open or close a folder, in the tree; in a peek, the definition's file at its line: its entry in the diff, else the whole file",
+    Collapse Files "collapse" "collapse folder" "collapse a folder in the tree",
+    ParentFolder Files "parent_folder" "parent folder" "go to the folder holding the file, in the tree",
+    GoToDefinition Navigation "go_to_definition" "go to definition" "list the names on the line last tapped, else the top line; type to narrow them, and enter shows where the one picked is defined, in the line's version, in a peek under the line. ctrl+click or alt+click on a name peeks it at once",
+    ShowInDiff Peek "show_in_diff" "show in diff" "in a peek: the definition's lines in the diff, where the diff changes its file",
+    OtherVersion Peek "other_version" "other version" "in a peek: the name's definitions in the diff's other version",
+    References Peek "references" "definitions/uses" "in a peek: jump between the name's definitions and the lines using it, which the peek lists below them as they're found, closest files first",
+    MoreUses Peek "more_uses" "more uses" "in a peek: go on past the first 200 files using the name, counting the rest",
+    CallsOnly Peek "calls_only" "calls only" "in a peek: list only the uses calling the name, or every use again",
+    UsesInDiff Peek "uses_in_diff" "uses in diff" "in a peek: list only the uses in files the diff changes, or those in every file again",
+    ClosePeek Peek "close_peek" "close peek" "close the peek",
+    JumpBack Navigation "jump_back" "jump back" "back to where the last jump left, with the line that was at the top at the top again: a jump is a definition opened from a peek, or a file opened from find file, the tree or the control API. The last 100 places are kept; one whose file isn't shown any more is skipped",
+    JumpForward Navigation "jump_forward" "jump forward" "forward again, to where jump back left",
+    MarkViewed Files "mark_viewed" "mark viewed" "mark a file in the tree viewed",
+    CloseFile Files "close_file" "close file" "close a file opened outside the diff (from find file), the one selected in the tree or else the one shown; one with comments stays",
+    ToggleAllFiles Layout "toggle_all_files" "toggle all files" "the tree lists every file of the repository, the diff's changes colored among them, or the diff's files again; s in the tree then shows the other version. Folders open as you go, enter on a file outside the diff shows it whole",
+    TreeWider Files "tree_wider" "widen tree" "widen the tree",
+    TreeNarrower Files "tree_narrower" "narrow tree" "narrow the tree",
+    CycleLayout Layout "cycle_layout" "cycle layout" "layout: split, unified, then auto (split on wide screens); while selecting, the side copied; in file view, the side read",
+    ToggleWrap Layout "toggle_wrap" "toggle wrap" "wrap or truncate long lines",
+    ToggleSyntax Diff "toggle_syntax" "toggle syntax diff" "diff by lines or by syntax",
+    ToggleRendered Diff "toggle_rendered" "toggle rendered view" "files with a renderer plugin rendered, or as lines (experimental, see render)",
+    CycleIndicators Display "cycle_indicators" "cycle indicators" "how changed lines are marked: background, bars, classic signs or none",
+    CycleModifiedLines Display "cycle_modified_lines" "cycle modified lines" "a line and its edit in the modified color with red and green tokens, or red and green lines",
+    ToggleHighlight Display "toggle_highlight" "toggle highlighting" "syntax highlighting on or off",
+    ToggleWhitespace Diff "toggle_whitespace" "ignore whitespace" "ignore whitespace (-w) or not, diffing again",
+    ToggleLineNumbers Display "toggle_line_numbers" "toggle line numbers" "show or hide line numbers",
+    ToggleHunkHeaders Display "toggle_hunk_headers" "toggle hunk headers" "show or hide the @@ numbers of hunks",
+    ToggleStatusBar Layout "toggle_status_bar" "move status bar" "the status bar in the frame's bottom border or its top one",
+    CycleTheme Display "cycle_theme" "next theme" "the next theme, built-in or yours",
+    ToggleWatch Modes "toggle_watch" "toggle watch" "watch for changes",
+    TakeCheckpoint Modes "take_checkpoint" "take checkpoint" "take a checkpoint of the working tree: its files as plain dffy lists them, staged or not and untracked, kept under a local ref of this worktree, the last 5 of them; starting Fix with agent takes one too",
+    SinceCheckpoint Modes "since_checkpoint" "since checkpoint" "show only what changed since the latest checkpoint, such as an agent's turn since Fix with agent started it, or the diff shown before again; the status bar says how long ago it was taken",
+    ToggleMouse Copy "toggle_mouse" "toggle mouse" "take mouse input, or leave it to the terminal's own selection (many terminals select natively with shift held while dragging)",
+    ToggleCopyDecorations Copy "toggle_copy_decorations" "copy decorations" "copies include line numbers and +/- signs, or only the code",
+    Stage Changes "stage" "stage lines" "stage the selected lines, else the hunk of the line last tapped or the first on screen: their working-tree version goes in the index (uncommitted changes only)",
+    Unstage Changes "unstage" "unstage lines" "unstage the selected lines, else the hunk of the line last tapped or the first on screen: their HEAD version goes back in the index (uncommitted changes only)",
+    Discard Changes "discard" "discard lines" "discard the selected lines' unstaged changes, else the hunk's, after a y/n: the working tree gets back the index's version, and an untracked file is deleted (uncommitted changes only)",
+    NextConflict Changes "next_conflict" "next conflict" "in a conflicted file, the next conflict",
+    PrevConflict Changes "prev_conflict" "prev conflict" "in a conflicted file, the previous conflict",
+    KeepCurrent Changes "keep_current" "keep current" "resolve the conflict last gone to, else the first on screen, to the current side (ours); again takes the choice back. Choices show as a preview until written",
+    TakeIncoming Changes "take_incoming" "take incoming" "resolve the conflict to the incoming side (theirs); again takes the choice back",
+    KeepBoth Changes "keep_both" "keep both" "resolve the conflict to both sides, the current one first; again takes the choice back",
+    TakeBase Changes "take_base" "take base" "resolve the conflict to the common ancestor's lines, when git wrote them (merge.conflictStyle diff3 or zdiff3); again takes the choice back",
+    WriteResolution Changes "write_resolution" "write resolved" "write the conflicted file as the choices resolve it, asking first when some conflicts have none; then git add it after a y/n",
+    Edit General "edit" "open in editor" "open the file in $EDITOR at the line last tapped, else the top line",
+    OpenTerminal Agents "open_terminal" "open terminal here" "open a new tab in your terminal, or a window where that's all it offers, at the working tree's root; where dffy can't, it copies a cd there instead",
+    Comment Comments "comment" "comment on lines" "comment on the selected lines, or the line v would start on, in a text box under them; enter sends it",
+    SuggestChange Comments "suggest_change" "suggest change" "suggest a change to the selected lines, or the line v would start on: a comment's text box holding them, to edit into what they should be; enter sends it",
+    CommentFile Comments "comment_file" "comment on file" "comment on the whole file shown, in a text box under its first row; enter sends it",
+    Comments Comments "comments" "comments panel" "the left panel lists every comment thread in place of the files, or the files again; moving through the threads shows each in the diff, enter or tab goes to it; the thread keys act on the selected thread, and c filters them by state",
+    NextThread Navigation "next_thread" "next thread" "next comment thread, on into the next file with comments; it takes the focus, where r replies, e edits, x resolves, d deletes and o opens it on its host",
+    PrevThread Navigation "prev_thread" "prev thread" "previous comment thread, back into the previous file with comments",
+    ToggleThread Layout "toggle_thread" "fold thread" "fold or unfold the focused comment thread, or the first on screen",
+    ToggleThreads Layout "toggle_threads" "fold all threads" "fold every comment thread to one row, or unfold them all",
+    MoveThread Comments "move_thread" "move thread here" "move the focused thread, or the comments panel's selected one, from the branch it was written on to the current branch",
+    AskAgent Agents "ask_agent" "ask agent" "ask a coding agent, through the agent plugin dffy-agent, about the focused thread: write your question in a reply box, which enter sends with the thread to the agent that answered last, else the default one; enter on the empty box asks about the thread as it is, and esc keeps the question without asking. Elsewhere, write the question on the selected lines, or the line v would start on, in a text box, and enter asks. The answer comes as the agent's reply, with a suggestion when it proposes a change; esc on the thread stops it. A comment you write starting @ and an agent's name, as @name, asks that agent too (experimental, see agent)",
+    Reply Comments "reply" "reply to thread" "on a thread: reply in a text box under it; enter sends it",
+    EditDraft Comments "edit_draft" "edit thread draft" "on a thread: edit your last draft in it, in a text box; enter sends it",
+    DeleteDraft Comments "delete_draft" "delete thread draft" "on a thread: delete your last draft in it, the whole thread when that's its first comment or the thread is resolved with nothing on the host, once the key comes again",
+    Resolve Comments "resolve" "resolve thread" "on a thread: resolve it, or reopen it",
+    Adopt Comments "adopt" "make it yours" "on a thread: someone else's comments in it not posted, as an agent's, become your drafts, which posting sends under your name",
+    ApplySuggestion Comments "apply_suggestion" "apply suggestion" "on a thread: put its suggestion, the one last clicked or else its last, in place of the lines it's on in the working tree, refused when they changed since; an unstaged change, which discard undoes. On one applied already, put back the lines it replaced",
+    FixWithAgent Agents "fix_with_agent" "fix with agent" "on a thread, or the selected lines with a note you write first: start your coding agent in a new tab, or here until it exits, pointed at the thread to change what it asks and reply in it",
+    SendOpenThreads Agents "send_open_threads" "send open threads" "take a checkpoint, then start your coding agent as fix with agent does, pointed at every open thread of yours in view (those you started or replied in) to change what each asks and reply in each; since checkpoint then shows its turn",
+    OpenOnHost Comments "open_on_host" "open thread on host" "on a thread: open it on its code host, in the browser",
+    ClearResolved Comments "clear_resolved" "delete resolved threads" "delete the resolved threads shown, after a y/n; on a code host's review only what isn't posted, as the host's threads would come back",
+    CommentInEditor Comments "comment_in_editor" "continue in editor" "write in $EDITOR: your draft in the focused thread, else a reply to it, else a comment on the line; ctrl+g does it from the text box",
+    CommentedFiles Files "commented_files" "files with comments" "the tree shows only the files with comments, or every file; f/F and n/N keep to them. In the comments panel, it steps through all threads, open ones, drafts and resolved ones, and its capital steps back",
+    ReviewPull Review "review_pull" "update the review" "on a review a review plugin opened, fetch its new commits and threads and show them in place (experimental, see review)",
+    ReviewPost Review "review_post" "post the review" "on a review a review plugin opened, open the dialog that posts your drafts, replies and resolves as a review (experimental, see review)",
+    OpenReview Review "open_review" "open a review…" "list the reviews the review plugin offers, such as this branch's, yours and those waiting on you, to open one (experimental, see review)",
+    SinceLastReview Review "since_last_review" "since last review" "on a review a review plugin opened, show only what changed since the head of your last review, as the review plugin records it, or the whole review again",
+    WholeReview Review "whole_review" "show the whole review" "on the branch's review that plain dffy found, show the whole review against the working tree, or the working tree's changes again",
+    Help General "help" "show this help" "show or hide this help",
+    Quit General "quit" "quit" "quit",
 }
 
 /// Where a binding applies: the diff (and the tree, for keys its own
@@ -271,6 +281,9 @@ const DEFAULTS: &[(Table, &str, Action)] = &[
     (P, "d", Action::ShowInDiff),
     (P, "s", Action::OtherVersion),
     (P, "r", Action::References),
+    (P, "m", Action::MoreUses),
+    (P, "c", Action::CallsOnly),
+    (P, "i", Action::UsesInDiff),
     (P, "esc", Action::ClosePeek),
     (P, "q", Action::ClosePeek),
     (T, "enter", Action::Open),
@@ -391,6 +404,7 @@ const DEFAULTS: &[(Table, &str, Action)] = &[
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum Group {
     Navigation,
+    Peek,
     Files,
     Layout,
     Diff,
@@ -405,8 +419,9 @@ pub(crate) enum Group {
 }
 
 impl Group {
-    pub(crate) const ALL: [Self; 12] = [
+    pub(crate) const ALL: [Self; 13] = [
         Self::Navigation,
+        Self::Peek,
         Self::Files,
         Self::Layout,
         Self::Diff,
@@ -423,6 +438,7 @@ impl Group {
     pub(crate) fn title(self) -> &'static str {
         match self {
             Self::Navigation => "Navigation",
+            Self::Peek => "In a peek",
             Self::Files => "Files/tree",
             Self::Layout => "Layout",
             Self::Diff => "Diff",
@@ -441,7 +457,7 @@ impl Group {
     /// several groups titles each with its name.
     pub(crate) fn tab(self) -> Tab {
         match self {
-            Self::Navigation => Tab::Move,
+            Self::Navigation | Self::Peek => Tab::Move,
             Self::Files => Tab::Files,
             Self::Layout | Self::Diff | Self::Display => Tab::View,
             Self::Changes | Self::Modes => Tab::Git,
@@ -480,108 +496,6 @@ impl Tab {
 }
 
 impl Action {
-    pub(crate) fn group(self) -> Group {
-        match self {
-            Self::ScrollDown
-            | Self::ScrollUp
-            | Self::PageDown
-            | Self::PageUp
-            | Self::HalfPageDown
-            | Self::HalfPageUp
-            | Self::Top
-            | Self::Bottom
-            | Self::NextChange
-            | Self::PrevChange
-            | Self::NextThread
-            | Self::PrevThread
-            | Self::ScrollRight
-            | Self::ScrollLeft
-            | Self::ScrollReset
-            | Self::GoToDefinition
-            | Self::ShowInDiff
-            | Self::OtherVersion
-            | Self::References
-            | Self::ClosePeek
-            | Self::JumpBack
-            | Self::JumpForward => Group::Navigation,
-            Self::NextFile
-            | Self::PrevFile
-            | Self::OpenPicker
-            | Self::SwitchPane
-            | Self::ToggleTree
-            | Self::Search
-            | Self::FilterTree
-            | Self::Open
-            | Self::Collapse
-            | Self::ParentFolder
-            | Self::MarkViewed
-            | Self::CloseFile
-            | Self::CommentedFiles
-            | Self::TreeWider
-            | Self::TreeNarrower => Group::Files,
-            Self::Expand
-            | Self::ToggleFull
-            | Self::ToggleFileView
-            | Self::ToggleAllFiles
-            | Self::CycleLayout
-            | Self::ToggleWrap
-            | Self::ToggleStatusBar
-            | Self::ToggleThread
-            | Self::ToggleThreads => Group::Layout,
-            Self::ToggleSyntax | Self::ToggleRendered | Self::ToggleWhitespace => Group::Diff,
-            Self::CycleIndicators
-            | Self::CycleModifiedLines
-            | Self::ToggleHighlight
-            | Self::ToggleLineNumbers
-            | Self::ToggleHunkHeaders
-            | Self::CycleTheme => Group::Display,
-            Self::Select
-            | Self::Copy
-            | Self::CopyPath
-            | Self::CopyAbsolutePath
-            | Self::Cancel
-            | Self::CopyPrompt
-            | Self::ToggleCopyDecorations
-            | Self::ToggleMouse => Group::Copy,
-            Self::Stage
-            | Self::Unstage
-            | Self::Discard
-            | Self::NextConflict
-            | Self::PrevConflict
-            | Self::KeepCurrent
-            | Self::TakeIncoming
-            | Self::KeepBoth
-            | Self::TakeBase
-            | Self::WriteResolution => Group::Changes,
-            Self::ToggleWatch | Self::TakeCheckpoint | Self::SinceCheckpoint => Group::Modes,
-            Self::Comment
-            | Self::SuggestChange
-            | Self::CommentFile
-            | Self::Comments
-            | Self::MoveThread
-            | Self::CommentInEditor
-            | Self::Reply
-            | Self::EditDraft
-            | Self::DeleteDraft
-            | Self::Resolve
-            | Self::Adopt
-            | Self::OpenOnHost
-            | Self::ApplySuggestion
-            | Self::CopyComment
-            | Self::CopyThread
-            | Self::ClearResolved => Group::Comments,
-            Self::AskAgent | Self::FixWithAgent | Self::SendOpenThreads | Self::OpenTerminal => {
-                Group::Agents
-            }
-            Self::ReviewPull
-            | Self::ReviewPost
-            | Self::OpenReview
-            | Self::SinceLastReview
-            | Self::WholeReview => Group::Review,
-            Self::Leader | Self::Help | Self::Edit | Self::Quit => Group::General,
-        }
-    }
-
     /// The command panel's name for it; settings with a value get it
     /// after a colon there.
     pub(crate) fn title(self) -> &'static str {
@@ -696,7 +610,10 @@ impl Action {
             Self::GoToDefinition => "go to definition",
             Self::ShowInDiff => "show in diff",
             Self::OtherVersion => "other version",
-            Self::References => "references",
+            Self::References => "definitions/uses",
+            Self::MoreUses => "more uses",
+            Self::CallsOnly => "calls only",
+            Self::UsesInDiff => "uses in diff",
             Self::ClosePeek => "close peek",
             Self::JumpBack => "jump back",
             Self::JumpForward => "jump forward",

@@ -31,6 +31,9 @@ fn outline(lang: &str, source: &str) -> String {
         if let Some(container) = d.container {
             let _ = write!(out, " in {container}");
         }
+        if let Some(original) = d.original {
+            let _ = write!(out, " from {original}");
+        }
         out.push('\n');
     }
     out
@@ -313,7 +316,7 @@ fn rust_methods_carry_the_type_they_are_on() {
 38-38 constant MAX in Point
 39-39 type Item in Point
 45-45 reexport Circle
-45-45 reexport Sq
+45-45 reexport Sq from Square
 "
     );
 }
@@ -378,7 +381,7 @@ fn typescript_definitions_leave_out_signatures_and_locals() {
 40-40 function fn
 41-41 variable counter
 49-49 constant obj
-50-50 reexport fmt
+50-50 reexport fmt from format
 50-50 reexport helper
 52-52 function main
 54-57 class Widget
@@ -668,6 +671,7 @@ fn c_with_tags(tags: &'static str) -> Registry {
         highlights: Cow::Owned(Vec::new()),
         scopes: Cow::Owned(Vec::new()),
         tags: Cow::Owned(vec![Cow::Borrowed(tags)]),
+        locals: Cow::Owned(Vec::new()),
         indentation_is_syntax: false,
     }])
 }
@@ -690,14 +694,23 @@ fn a_tags_query_that_fails_to_compile_is_an_error() {
     }
 }
 
+/// Re-exports with their original names among them, and without.
 #[test]
 fn definitions_round_trip_through_their_encoding() {
+    let mut reexports = (0, 0);
     for &(lang, source) in [("c", C), ("rust", RUST)].iter().chain(FIXTURES) {
         let lang = GRAMMARS.named(lang).expect("bundled");
         let defs = definitions(lang, source.as_bytes())
             .expect("compiles")
             .expect("a tags query")
             .expect("parsed");
+        for d in defs.iter().filter(|d| d.kind == DefinitionKind::Reexport) {
+            if d.original.is_some() {
+                reexports.0 += 1;
+            } else {
+                reexports.1 += 1;
+            }
+        }
         let bytes = defs.encode();
         assert_eq!(Definitions::decode(&bytes), Some(defs));
         for len in 0..bytes.len() {
@@ -707,6 +720,7 @@ fn definitions_round_trip_through_their_encoding() {
         longer.push(0);
         assert_eq!(Definitions::decode(&longer), None);
     }
+    assert!(reexports.0 > 0 && reexports.1 > 0, "{reexports:?}");
 }
 
 #[test]
@@ -933,6 +947,9 @@ fn definition_kinds_keep_their_numbers() {
             (14, "interface"),
             (15, "field"),
             (16, "reexport"),
+            (17, "local"),
+            (18, "parameter"),
+            (19, "import"),
         ]
     );
 }
@@ -956,7 +973,7 @@ fn tags_version_follows_what_extraction_finds() {
     let digest = cache::digest(&yielded).to_hex().to_string();
     assert_eq!(
         (TAGS_VERSION, digest.as_str()),
-        (6, "d8c2a9ab6aa3d6176a2cc76f37f127299ffb0e91"),
+        (7, "ddec616fe9c72ae99bebbabdeb512ad6d7308b65"),
         "the fixtures yield something else: bump TAGS_VERSION and update the digest"
     );
 }

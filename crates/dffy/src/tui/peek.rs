@@ -10,6 +10,7 @@
 
 use std::sync::Arc;
 
+use dffy_core::highlight::DefinitionKind;
 use dffy_core::navigate::{self, MAX_REFERENCE_FILES};
 use dffy_core::view::{Attributes, Run};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
@@ -200,25 +201,37 @@ pub(crate) struct Refs {
     pub partial: bool,
     /// Why the search stopped.
     pub failed: Option<String>,
+    /// It stopped at its first [`navigate::MAX_REFERENCE_FILES`] files,
+    /// to go on only when asked.
+    pub capped: bool,
 }
 
-/// A peek at a name's definitions in one version of the diff.
+/// A peek at a name in one version of the diff: its definitions, and below
+/// them the lines using it, each group filling in as it's found.
 pub(crate) struct Peek {
     pub name: String,
     /// The version's name, as the viewer says it.
     pub version: String,
     found: Found,
-    /// The uses, once asked for.
+    /// The uses, once their search started.
     refs: Option<Refs>,
-    /// The list shows the uses rather than the definitions.
-    on_refs: bool,
     /// The list's rows, made when what it shows changes.
     items: Vec<Item>,
     /// Said after the header: how far the index is built when it's not.
     pub note: Option<String>,
-    /// The candidate shown, of those listed, and the other list's.
+    /// What the uses' group says of the filters on, and of the key going
+    /// past the first files.
+    pub uses_words: String,
+    pub more_key: String,
+    /// The candidate shown, of the definitions then the uses, and where it
+    /// was in the other group.
     cursor: usize,
     parked: usize,
+    /// The cursor goes to the first use once there is one, untouched: the
+    /// name was asked from its own definition.
+    on_uses: bool,
+    /// The cursor was moved since the peek opened.
+    moved: bool,
     /// The code of the file of the candidate at `cursor`, or why there's
     /// none; `None` while it's read.
     pub code: Option<Result<Arc<Code>, String>>,
@@ -228,24 +241,33 @@ pub(crate) struct Peek {
     pub hints: String,
 }
 
-/// A row of the list: a file's path, then its candidates' lines.
+/// A row of the list: a group's heading, a file's path, then its
+/// candidates' lines. Candidates are numbered through both groups, the
+/// definitions first.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Item {
+    Group(Group),
     /// The file of the candidate at this index, and those after it.
     File(usize),
     Candidate(usize),
 }
 
-/// Pushes the list's rows for `listed`'s candidates from `from` on, after
-/// those of the ones before it.
-fn push_items(listed: &[navigate::Candidate], from: usize, out: &mut Vec<Item>) {
-    let mut last = from.checked_sub(1).map(|i| listed[i].path.as_slice());
-    for (i, c) in listed.iter().enumerate().skip(from) {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Group {
+    Definitions,
+    Uses,
+}
+
+/// Pushes the list's rows for `listed`'s candidates, numbered from
+/// `first`.
+fn push_items(listed: &[navigate::Candidate], first: usize, out: &mut Vec<Item>) {
+    let mut last = None;
+    for (i, c) in listed.iter().enumerate() {
         if last != Some(c.path.as_slice()) {
-            out.push(Item::File(i));
+            out.push(Item::File(first + i));
             last = Some(c.path.as_slice());
         }
-        out.push(Item::Candidate(i));
+        out.push(Item::Candidate(first + i));
     }
 }
 
@@ -317,11 +339,14 @@ impl Peek {
             version,
             found: Found::Waiting(waiting),
             refs: None,
-            on_refs: false,
             items: Vec::new(),
             note: None,
+            uses_words: String::new(),
+            more_key: String::new(),
             cursor: 0,
             parked: 0,
+            on_uses: false,
+            moved: false,
             code: None,
             focused: true,
             hints,
@@ -332,117 +357,180 @@ impl Peek {
         &self.found
     }
 
-    /// Shows `found`, the cursor on candidate `cursor`.
-    pub(crate) fn set_found(&mut self, found: Found, cursor: usize) {
-        self.found = found;
-        if self.on_refs {
-            self.parked = cursor;
-            return;
+    /// The definitions listed, or the text search's lines.
+    fn definitions(&self) -> &[navigate::Candidate] {
+        match &self.found {
+            Found::Listed(looked) => &looked.candidates,
+            Found::Waiting(_) | Found::Nothing(_) => &[],
         }
-        self.items = self.make_items();
-        self.cursor = cursor.min(self.listed().len().saturating_sub(1));
-        self.code = None;
     }
 
-    /// The uses, once asked for.
+    fn uses(&self) -> &[navigate::Candidate] {
+        self.refs.as_ref().map_or(&[], |r| &r.hits)
+    }
+
+    /// Shows `found`, the cursor on definition `cursor` unless it was moved
+    /// to a use, where it stays.
+    pub(crate) fn set_found(&mut self, found: Found, cursor: usize) {
+        let before = self.definitions().len();
+        let on_use = self.moved && self.cursor >= before && !self.uses().is_empty();
+        self.found = found;
+        let after = self.definitions().len();
+        if on_use {
+            self.cursor = self.cursor - before + after;
+        } else {
+            self.cursor = cursor.min(after.saturating_sub(1));
+            self.code = None;
+        }
+        self.items = self.make_items();
+        self.settle_on_uses();
+    }
+
+    /// The cursor goes to the first use once there is one, as long as it
+    /// wasn't moved: the name was asked from its own definition.
+    pub(crate) fn open_on_uses(&mut self) {
+        self.on_uses = true;
+        self.settle_on_uses();
+    }
+
+    fn settle_on_uses(&mut self) {
+        if self.on_uses && !self.moved && !self.uses().is_empty() {
+            self.parked = self.cursor;
+            self.cursor = self.definitions().len();
+            self.on_uses = false;
+            self.code = None;
+        }
+    }
+
+    /// The uses, once their search started.
     pub(crate) fn references(&self) -> Option<&Refs> {
         self.refs.as_ref()
     }
 
-    /// Whether the list shows the uses.
-    pub(crate) fn on_references(&self) -> bool {
-        self.on_refs
+    /// The cursor is on a use.
+    pub(crate) fn on_a_use(&self) -> bool {
+        self.cursor >= self.definitions().len() && !self.uses().is_empty()
     }
 
     /// Changes the uses with `f`.
     pub(crate) fn edit_references(&mut self, f: impl FnOnce(&mut Refs)) {
+        let defs = self.definitions().len();
         f(self.refs.get_or_insert_with(Refs::default));
-        if self.on_refs {
-            self.items = self.make_items();
+        let len = defs + self.uses().len();
+        if self.cursor >= len {
+            self.cursor = len.saturating_sub(1);
+            self.code = None;
         }
+        self.items = self.make_items();
     }
 
     /// Adds a step's uses after those listed, as `f` puts them in; the
-    /// list's rows grow by theirs, and its cursor stays on its candidate.
+    /// cursor stays on its candidate.
     pub(crate) fn add_references(&mut self, f: impl FnOnce(&mut Refs)) {
-        let refs = self.refs.get_or_insert_with(Refs::default);
-        let had = refs.hits.len();
-        f(refs);
-        if self.on_refs {
-            push_items(&refs.hits, had, &mut self.items);
-        }
-    }
-
-    /// Lists the uses, or the definitions again, each list keeping its
-    /// cursor.
-    pub(crate) fn show_references(&mut self, on: bool) {
-        if on == self.on_refs {
-            return;
-        }
-        self.refs.get_or_insert_with(Refs::default);
-        self.on_refs = on;
-        std::mem::swap(&mut self.cursor, &mut self.parked);
+        f(self.refs.get_or_insert_with(Refs::default));
         self.items = self.make_items();
-        self.cursor = self.cursor.min(self.listed().len().saturating_sub(1));
-        self.code = None;
+        self.settle_on_uses();
     }
 
-    /// The lines of the candidates listed.
-    fn lines(&self) -> &[Option<String>] {
-        match (&self.found, &self.refs) {
-            (_, Some(refs)) if self.on_refs => &refs.lines,
-            (Found::Listed(looked), _) if !self.on_refs => &looked.lines,
-            _ => &[],
-        }
+    /// Jumps between the definitions and the uses, each group keeping
+    /// where it was; whether it moved.
+    pub(crate) fn jump_group(&mut self) -> bool {
+        let (defs, uses) = (self.definitions().len(), self.uses().len());
+        let to = if self.cursor >= defs {
+            if defs == 0 {
+                return false;
+            }
+            if self.parked < defs { self.parked } else { 0 }
+        } else {
+            if uses == 0 {
+                return false;
+            }
+            if (defs..defs + uses).contains(&self.parked) {
+                self.parked
+            } else {
+                defs
+            }
+        };
+        self.parked = self.cursor;
+        self.cursor = to;
+        self.moved = true;
+        self.code = None;
+        true
+    }
+
+    /// Candidate `i`'s line, as read.
+    fn line(&self, i: usize) -> Option<&String> {
+        let defs = self.definitions().len();
+        let lines = match (&self.found, &self.refs) {
+            (Found::Listed(looked), _) if i < defs => looked.lines.get(i),
+            (_, Some(refs)) if i >= defs => refs.lines.get(i - defs),
+            _ => None,
+        };
+        lines.and_then(Option::as_ref)
     }
 
     /// Puts the cursor on candidate `i`; whether it moved.
     pub(crate) fn set_cursor(&mut self, i: usize) -> bool {
-        let moved = i != self.cursor && i < self.listed().len();
+        let moved = i != self.cursor && self.get(i).is_some();
         if moved {
             self.cursor = i;
+            self.moved = true;
         }
         moved
     }
 
-    fn listed(&self) -> &[navigate::Candidate] {
-        match (&self.found, &self.refs) {
-            (_, Some(refs)) if self.on_refs => &refs.hits,
-            (Found::Listed(looked), _) if !self.on_refs => &looked.candidates,
-            _ => &[],
+    /// Candidate `i`, of the definitions then the uses.
+    fn get(&self, i: usize) -> Option<&navigate::Candidate> {
+        let defs = self.definitions();
+        match i.checked_sub(defs.len()) {
+            None => defs.get(i),
+            Some(u) => self.uses().get(u),
         }
     }
 
     /// The candidate shown, if any.
     pub(crate) fn current(&self) -> Option<&navigate::Candidate> {
-        self.listed().get(self.cursor)
+        self.get(self.cursor)
     }
 
-    /// Moves the cursor by `by` candidates, within the list; whether it
-    /// moved.
+    /// Moves the cursor by `by` candidates, through both groups; whether
+    /// it moved.
     pub(crate) fn step(&mut self, by: isize) -> bool {
-        let len = self.listed().len();
+        let len = self.definitions().len() + self.uses().len();
         let to = self
             .cursor
             .saturating_add_signed(by)
             .min(len.saturating_sub(1));
         let moved = to != self.cursor;
         self.cursor = to;
+        self.moved |= moved;
         moved
     }
 
     fn make_items(&self) -> Vec<Item> {
         let mut out = Vec::new();
-        push_items(self.listed(), 0, &mut out);
+        let defs = self.definitions();
+        // Without definitions, the group's row says why, over the uses.
+        if !defs.is_empty() || self.refs.is_some() {
+            out.push(Item::Group(Group::Definitions));
+            push_items(defs, 0, &mut out);
+        }
+        if self.refs.is_some() {
+            out.push(Item::Group(Group::Uses));
+            push_items(self.uses(), defs.len(), &mut out);
+        }
         out
     }
 
     /// The items shown in `rows` rows, from the first: the cursor's
     /// candidate shows, with its file's row when there's room.
     fn window(&self, rows: usize) -> &[Item] {
-        let cursor = self.cursor;
-        // Items go by candidate, each file's row before its first.
+        let (cursor, defs) = (self.cursor, self.definitions().len());
+        // Items go by candidate, each file's and group's row before its
+        // first.
         let at = self.items.partition_point(|item| match *item {
+            Item::Group(Group::Definitions) => true,
+            Item::Group(Group::Uses) => defs <= cursor,
             Item::File(i) => i <= cursor,
             Item::Candidate(i) => i < cursor,
         });
@@ -481,6 +569,7 @@ impl Peek {
         }
         match self.window(rows).get(row)? {
             Item::Candidate(i) | Item::File(i) => Some(*i),
+            Item::Group(_) => None,
         }
     }
 
@@ -550,42 +639,16 @@ impl Peek {
         };
         cells.put(name, &self.name);
         let dot = |cells: &mut Cells| cells.put(Role::Dim, " · ");
-        match (&self.found, self.refs.as_ref().filter(|_| self.on_refs)) {
-            (_, Some(refs)) => {
-                dot(cells);
-                let files = |n: usize| {
-                    let s = if n == 1 { "" } else { "s" };
-                    format!("{} file{s}", thousands(n))
-                };
-                let what = match (refs.done, refs.files > MAX_REFERENCE_FILES) {
-                    (true, true) => format!(
-                        "first {} of {} use it",
-                        MAX_REFERENCE_FILES,
-                        files(refs.files)
-                    ),
-                    (true, false) if refs.files == 1 => "1 file uses it".to_owned(),
-                    (true, false) => format!("{} use it", files(refs.files)),
-                    (false, _) => format!(
-                        "{} so far · searching {} of {}",
-                        files(refs.files),
-                        thousands(refs.searched.done),
-                        thousands(refs.searched.total)
-                    ),
-                };
-                cells.put(Role::Plain, &what);
-                if refs.partial {
-                    cells.put(Role::Dim, " (index partial: definitions may show)");
-                }
-            }
-            (Found::Waiting(_), None) => {
+        match &self.found {
+            Found::Waiting(_) => {
                 dot(cells);
                 cells.put(Role::Dim, "looking…");
             }
-            (Found::Nothing(_), None) => {
+            Found::Nothing(words) => {
                 dot(cells);
-                cells.put(Role::Dim, "no definition found");
+                cells.put(Role::Dim, words);
             }
-            (Found::Listed(looked), None) => {
+            Found::Listed(looked) => {
                 dot(cells);
                 let what = match (looked.text, looked.total) {
                     (true, 1) => "1 text match".to_owned(),
@@ -619,7 +682,7 @@ impl Peek {
                 cells.put(Role::Dim, "its file changed in this diff");
             }
         }
-        if let Some(note) = self.note.as_ref().filter(|_| !self.on_refs) {
+        if let Some(note) = &self.note {
             dot(cells);
             cells.put(Role::Dim, note);
         }
@@ -627,18 +690,45 @@ impl Peek {
 
     /// What the code's place says while nothing is listed.
     fn empty(&self) -> String {
-        match (&self.found, self.refs.as_ref().filter(|_| self.on_refs)) {
-            (
-                _,
-                Some(Refs {
-                    failed: Some(why), ..
-                }),
-            ) => format!("the search for its uses failed: {why}"),
-            (_, Some(refs)) if refs.done => format!("no line uses {}", self.name),
-            (_, Some(_)) => "searching for its uses…".to_owned(),
-            (Found::Waiting(words) | Found::Nothing(words), None) => words.clone(),
-            (Found::Listed(_), None) => String::new(),
+        match &self.found {
+            Found::Waiting(words) | Found::Nothing(words) => words.clone(),
+            Found::Listed(_) => String::new(),
         }
+    }
+
+    /// The uses' group's heading: how far their search is, and the filters
+    /// on.
+    fn uses_heading(&self) -> String {
+        let Some(refs) = &self.refs else {
+            return String::new();
+        };
+        let files = |n: usize| {
+            let s = if n == 1 { "" } else { "s" };
+            format!("{} file{s}", thousands(n))
+        };
+        let mut words = match (&refs.failed, refs.done, refs.capped) {
+            (Some(why), ..) => format!("Uses · the search stopped: {why}"),
+            (None, true, _) if refs.files == 0 => "Uses · none".to_owned(),
+            (None, true, _) => format!("Uses · {}", files(refs.files)),
+            (None, false, true) => format!(
+                "Uses · first {} files · {}",
+                MAX_REFERENCE_FILES, self.more_key
+            ),
+            (None, false, false) => format!(
+                "Uses · {} so far · searching {} of {}",
+                files(refs.files),
+                thousands(refs.searched.done),
+                thousands(refs.searched.total)
+            ),
+        };
+        if !self.uses_words.is_empty() {
+            words.push_str(" · ");
+            words.push_str(&self.uses_words);
+        }
+        if refs.partial {
+            words.push_str(" (index partial: definitions may show)");
+        }
+        words
     }
 
     /// Row `row` of the code, `room` columns wide.
@@ -685,13 +775,32 @@ impl Peek {
     /// A row of the list, `room` columns wide.
     fn list_row(&self, item: Option<Item>, room: usize, tab: usize, c: &mut Canvas) {
         let mut cells = Cells::new(c, room, tab);
-        let (listed, lines) = (self.listed(), self.lines());
-        let text_matches = !self.on_refs && matches!(&self.found, Found::Listed(l) if l.text);
+        let defs = self.definitions().len();
+        let text_matches = matches!(&self.found, Found::Listed(l) if l.text);
         match item {
+            Some(Item::Group(Group::Definitions)) => {
+                let what = match &self.found {
+                    Found::Waiting(_) => "Definitions · looking…".to_owned(),
+                    Found::Nothing(_) => "Definitions · none".to_owned(),
+                    Found::Listed(_) if text_matches => {
+                        format!("Text matches ({})", thousands(defs))
+                    }
+                    Found::Listed(_) => format!("Definitions ({})", thousands(defs)),
+                };
+                cells.put(Role::Dim, &what);
+                cells.fill(Role::Plain, ' ');
+            }
+            Some(Item::Group(Group::Uses)) => {
+                cells.put(Role::Dim, &self.uses_heading());
+                cells.fill(Role::Plain, ' ');
+            }
             Some(Item::File(i)) => {
-                let c = &listed[i];
+                let Some(c) = self.get(i) else {
+                    cells.fill(Role::Plain, ' ');
+                    return;
+                };
                 cells.put(Role::FileHeader, &String::from_utf8_lossy(&c.path));
-                if text_matches {
+                if text_matches && i < defs {
                     cells.put(Role::Dim, " · text match");
                 } else if c.changed {
                     cells.put(Role::Dim, " · changed");
@@ -699,7 +808,10 @@ impl Peek {
                 cells.fill(Role::Plain, ' ');
             }
             Some(Item::Candidate(i)) => {
-                let cand = &listed[i];
+                let Some(cand) = self.get(i) else {
+                    cells.fill(Role::Plain, ' ');
+                    return;
+                };
                 let selected = i == self.cursor;
                 let ink = |role: Role| -> Ink {
                     if selected {
@@ -709,7 +821,7 @@ impl Peek {
                     }
                 };
                 cells.put(ink(Role::LineNumber), &format!("{:>5}  ", cand.start + 1));
-                let text = lines.get(i).cloned().flatten();
+                let text = self.line(i).cloned();
                 let shown = match (&text, cand.kind) {
                     (Some(text), _) => text.clone(),
                     (None, Some(kind)) => format!("{kind:?}").to_lowercase(),
@@ -719,12 +831,23 @@ impl Peek {
                 if let Some(container) = &cand.container {
                     cells.put(ink(Role::Dim), &format!("  in {container}"));
                 }
-                let more = (self.refs.as_ref().filter(|_| self.on_refs)).and_then(|r| {
-                    r.more
-                        .binary_search_by_key(&i, |&(at, _)| at)
-                        .ok()
-                        .map(|k| r.more[k].1)
+                // What the asking file itself defines the name as, past
+                // what the line shows.
+                let local = cand.kind.filter(|k| {
+                    matches!(
+                        k,
+                        DefinitionKind::Local | DefinitionKind::Parameter | DefinitionKind::Import
+                    )
                 });
+                if let Some(kind) = local {
+                    cells.put(ink(Role::Dim), &format!("  {}", kind.name()));
+                }
+                let more = (self.refs.as_ref())
+                    .zip(i.checked_sub(defs))
+                    .and_then(|(r, u)| {
+                        let k = r.more.binary_search_by_key(&u, |&(at, _)| at).ok()?;
+                        Some(r.more[k].1)
+                    });
                 if let Some(more) = more {
                     cells.put(
                         ink(Role::Dim),

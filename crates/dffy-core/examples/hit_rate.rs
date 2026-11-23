@@ -30,6 +30,13 @@
 //!
 //! It measures a fully built index: the index is built before the first
 //! lookup, so the local tier's time budget never leaves a file out.
+//!
+//! `HIT_RATE_CASES` names a file of the sampled uses and the server's
+//! answers: written when it's missing, and read instead of asking a server
+//! when it's there, so runs after a change score the same uses. The named
+//! subset (defined in another file, or listed by the index then) is fixed
+//! when it's written. With `HIT_RATE_NO_PLACE` set, each use is looked up
+//! by its name and file alone, as a host that sends no place does.
 #![expect(
     clippy::expect_used,
     reason = "a measuring harness: a failed step leaves nothing to measure"
@@ -48,7 +55,9 @@ use dffy_core::cache::Cache;
 use dffy_core::diff::Options;
 use dffy_core::git::Repo;
 use dffy_core::highlight::{self, Registry};
-use dffy_core::navigate::{Candidate, Diff, Navigator, Origin, Shared, name_at, names};
+use dffy_core::navigate::{
+    Candidate, Diff, Navigator, Origin, Shared, Use as Place, name_at, names,
+};
 use dffy_core::view;
 use serde_json::{Value, json};
 
@@ -66,15 +75,26 @@ fn main() {
         eprintln!("usage: hit_rate <repo> <language> [uses] [seed] -- <server> [args…]");
         std::process::exit(2);
     };
-    if server.is_empty() {
-        eprintln!("hit_rate: no server command after --");
-        std::process::exit(2);
-    }
     let wanted: usize = rest.first().map_or(300, |n| n.parse().expect("a count"));
     let seed: u64 = rest.get(1).map_or(1, |n| n.parse().expect("a seed"));
     let root = PathBuf::from(root).canonicalize().expect("the repository");
-    let tally = run(&root, language, wanted, seed, server);
-    tally.report(language, seed);
+    let index = Indexed::build(&root, language);
+    let saved = std::env::var_os("HIT_RATE_CASES").map(PathBuf::from);
+    let cases = if let Some(path) = saved.as_deref().filter(|p| p.exists()) {
+        let text = std::fs::read_to_string(path).expect("the cases");
+        Cases::from_json(&serde_json::from_str(&text).expect("cases as JSON"))
+    } else {
+        if server.is_empty() {
+            eprintln!("hit_rate: no server command after --, and no cases to replay");
+            std::process::exit(2);
+        }
+        let cases = record(&index, wanted, seed, server);
+        if let Some(path) = saved {
+            std::fs::write(path, cases.to_json().to_string()).expect("writes the cases");
+        }
+        cases
+    };
+    score(&index, &cases).report(language, seed);
 }
 
 /// A word to look up: its file, line and byte columns.
@@ -85,62 +105,109 @@ struct Use {
     end: usize,
 }
 
+/// What a recording keeps of a sample, so later runs score the same uses
+/// against the same answers: the counts left out, and each use the server
+/// resolved in the repository with its answer.
+struct Cases {
+    sampled: usize,
+    unresolved: usize,
+    outside: usize,
+    itself: usize,
+    uses: Vec<Case>,
+}
+
+struct Case {
+    path: String,
+    line: usize,
+    start: usize,
+    name: String,
+    target_path: String,
+    target_line: usize,
+    /// Defined in another file, or a definition the index listed when the
+    /// cases were recorded: the named subset, fixed at that baseline.
+    named: bool,
+}
+
+impl Cases {
+    fn to_json(&self) -> Value {
+        let uses: Vec<Value> = (self.uses.iter())
+            .map(|c| {
+                json!({
+                    "path": c.path, "line": c.line, "start": c.start, "name": c.name,
+                    "target_path": c.target_path, "target_line": c.target_line,
+                    "named": c.named,
+                })
+            })
+            .collect();
+        json!({
+            "sampled": self.sampled, "unresolved": self.unresolved,
+            "outside": self.outside, "itself": self.itself, "uses": uses,
+        })
+    }
+
+    fn from_json(v: &Value) -> Self {
+        let n =
+            |v: &Value, k: &str| usize::try_from(v[k].as_u64().expect("a number")).expect("fits");
+        let s = |v: &Value, k: &str| v[k].as_str().expect("a string").to_owned();
+        Self {
+            sampled: n(v, "sampled"),
+            unresolved: n(v, "unresolved"),
+            outside: n(v, "outside"),
+            itself: n(v, "itself"),
+            uses: (v["uses"].as_array().expect("uses").iter())
+                .map(|c| Case {
+                    path: s(c, "path"),
+                    line: n(c, "line"),
+                    start: n(c, "start"),
+                    name: s(c, "name"),
+                    target_path: s(c, "target_path"),
+                    target_line: n(c, "target_line"),
+                    named: c["named"].as_bool().expect("a bool"),
+                })
+                .collect(),
+        }
+    }
+}
+
 #[derive(Default)]
 struct Tally {
     sampled: usize,
     unresolved: usize,
     outside: usize,
     itself: usize,
+    /// Over every use, and over the named subset.
+    all: Score,
+    named: Score,
+    misses: Vec<String>,
+}
+
+#[derive(Default)]
+struct Score {
+    counted: usize,
     first: usize,
-    found: usize,
-    /// In the asking file, where the index lists no definition of the
-    /// name there: a local, a parameter, an import, a member it doesn't
-    /// list.
-    local: usize,
-    /// In another file, where the index lists no definition of the name:
-    /// a field, a member it doesn't list.
-    unlisted: Vec<String>,
-    /// Listed, but not first, or not among the candidates.
-    lower: Vec<String>,
+    among: usize,
 }
 
 impl Tally {
     fn report(&self, language: &str, seed: u64) {
-        let named = self.first + self.unlisted.len() + self.lower.len();
-        let counted = named + self.local;
         println!("{language}: {} uses sampled (seed {seed})", self.sampled);
         println!(
             "  not counted: {} unresolved by the server, {} defined outside the repository, \
              {} a definition's own name",
             self.unresolved, self.outside, self.itself
         );
-        println!(
-            "  all {counted}: top-1 {}, among the candidates {}",
-            percent(self.first, counted),
-            percent(self.first + self.found, counted),
-        );
-        println!(
-            "  the {named} defined in another file or listed: top-1 {} ({}), among the \
-             candidates {} ({})",
-            percent(self.first, named),
-            self.first,
-            percent(self.first + self.found, named),
-            self.first + self.found
-        );
-        println!(
-            "  misses: {} in the asking file and not listed (locals, parameters, imports, \
-             members it doesn't list), {} in another file and not listed, {} listed but \
-             ranked lower or not found",
-            self.local,
-            self.unlisted.len(),
-            self.lower.len()
-        );
-        println!("not listed in another file:");
-        for line in self.unlisted.iter().take(40) {
-            println!("{line}");
+        for (what, s) in [("all", &self.all), ("named", &self.named)] {
+            println!(
+                "  {what} {}: top-1 {} ({}), among the candidates {} ({})",
+                s.counted,
+                percent(s.first, s.counted),
+                s.first,
+                percent(s.among, s.counted),
+                s.among
+            );
         }
-        println!("ranked lower:");
-        for line in self.lower.iter().take(40) {
+        println!("misses:");
+        for line in self.misses.iter().take(60) {
             println!("{line}");
         }
     }
@@ -174,49 +241,73 @@ fn language_id(language: &str) -> &str {
     }
 }
 
-#[expect(clippy::too_many_lines, reason = "one measuring run, start to end")]
-fn run(root: &Path, language: &str, wanted: usize, seed: u64, server: &[String]) -> Tally {
-    let repo = Repo::discover(root).expect("a repository");
-    let spec = repo.resolve(&[], false, false).expect("resolves");
-    let mut changes = Vec::new();
-    repo.for_each_change(&spec, &[], |c| {
-        changes.push(c);
-        ControlFlow::Continue(())
-    })
-    .expect("enumerates");
-    let grammars = Registry::builtin();
-    let lang = grammars
-        .named(language)
-        .expect("a bundled language")
-        .clone();
-    let diff = Diff {
-        snapshots: spec.snapshots(false).expect("snapshots"),
-        changes: &changes,
-        options: Options::default(),
-    };
-    let nav =
-        Navigator::new(&repo, &grammars, &Shared::new(), &diff, view::Side::New).expect("lists");
-    let cache_dir = tempfile::tempdir().expect("tempdir");
-    let cache = Cache::new(cache_dir.path().to_owned(), u64::MAX).symbols();
-    nav.build(&repo, &cache, 4, &AtomicBool::new(false), |_| {})
-        .expect("the queries compile");
+/// A repository's working tree with its index built, for a language.
+struct Indexed {
+    root: PathBuf,
+    language: String,
+    repo: Repo,
+    grammars: Registry,
+    lang: highlight::Language,
+    nav: Navigator,
+    cache: dffy_core::cache::SymbolCache,
+    _cache_dir: tempfile::TempDir,
+    snapshot: dffy_core::git::Snapshot,
+}
 
-    // Every word the tokenizer offers in the language's files.
+impl Indexed {
+    fn build(root: &Path, language: &str) -> Self {
+        let repo = Repo::discover(root).expect("a repository");
+        let spec = repo.resolve(&[], false, false).expect("resolves");
+        let mut changes = Vec::new();
+        repo.for_each_change(&spec, &[], |c| {
+            changes.push(c);
+            ControlFlow::Continue(())
+        })
+        .expect("enumerates");
+        let grammars = Registry::builtin();
+        let lang = grammars
+            .named(language)
+            .expect("a bundled language")
+            .clone();
+        let snapshots = spec.snapshots(false).expect("snapshots");
+        let diff = Diff {
+            snapshots,
+            changes: &changes,
+            options: Options::default(),
+        };
+        let nav = Navigator::new(&repo, &grammars, &Shared::new(), &diff, view::Side::New)
+            .expect("lists");
+        let cache_dir = tempfile::tempdir().expect("tempdir");
+        let cache = Cache::new(cache_dir.path().to_owned(), u64::MAX).symbols();
+        nav.build(&repo, &cache, 4, &AtomicBool::new(false), |_| {})
+            .expect("the queries compile");
+        Self {
+            root: root.to_owned(),
+            language: language.to_owned(),
+            repo,
+            grammars,
+            lang,
+            nav,
+            cache,
+            _cache_dir: cache_dir,
+            snapshot: snapshots[1],
+        }
+    }
+}
+
+/// Every word the tokenizer offers in the language's files, and the
+/// files' texts by path.
+fn every_use(index: &Indexed) -> (Vec<Use>, HashMap<String, String>) {
+    let (root, language) = (&index.root, index.language.as_str());
     let mut files: Vec<String> = Vec::new();
-    repo.list_paths(
-        spec.snapshots(false).expect("snapshots")[1],
-        &[],
-        |path, _| {
+    index
+        .repo
+        .list_paths(index.snapshot, &[], |path, _| {
             files.push(path.to_string());
             ControlFlow::Continue(())
-        },
-    )
-    .expect("lists");
-    files.retain(|p| {
-        grammars
-            .detect(p.as_bytes(), b"")
-            .is_some_and(|l| *l == lang)
-    });
+        })
+        .expect("lists");
+    files.retain(|p| (index.grammars.detect(p.as_bytes(), b"")).is_some_and(|l| *l == index.lang));
     let mut texts: HashMap<String, String> = HashMap::new();
     let mut uses = Vec::new();
     for path in &files {
@@ -241,14 +332,28 @@ fn run(root: &Path, language: &str, wanted: usize, seed: u64, server: &[String])
         texts.insert(path.clone(), text);
     }
     eprintln!("{} files, {} uses", files.len(), uses.len());
+    (uses, texts)
+}
 
+/// Samples `wanted` uses with `seed` and asks the server for each one's
+/// definition.
+fn record(index: &Indexed, wanted: usize, seed: u64, server: &[String]) -> Cases {
+    let root = &index.root;
+    let language = index.language.as_str();
+    let (uses, texts) = every_use(index);
     let mut lsp = Lsp::start(root, server);
     let mut opened = std::collections::HashSet::new();
     let started = Instant::now();
     let mut warm = false;
-    let mut tally = Tally::default();
+    let mut cases = Cases {
+        sampled: 0,
+        unresolved: 0,
+        outside: 0,
+        itself: 0,
+        uses: Vec::new(),
+    };
     for i in shuffled(uses.len(), seed) {
-        if tally.sampled == wanted {
+        if cases.sampled == wanted {
             break;
         }
         let u = &uses[i];
@@ -282,72 +387,99 @@ fn run(root: &Path, language: &str, wanted: usize, seed: u64, server: &[String])
             answer = lsp.request("textDocument/definition", &params);
         }
         warm |= answer.as_ref().is_some_and(|a| first_location(a).is_some());
-        tally.sampled += 1;
-        let Some(target) = answer.as_ref().and_then(first_location) else {
-            tally.unresolved += 1;
+        cases.sampled += 1;
+        let Some((target_uri, target_line)) = answer.as_ref().and_then(first_location) else {
+            cases.unresolved += 1;
             continue;
         };
-        let (target_uri, target_line) = target;
         let prefix = format!("file://{}/", root.display());
         let Some(target_path) = target_uri.strip_prefix(&prefix).map(str::to_owned) else {
-            tally.outside += 1;
+            cases.outside += 1;
             continue;
         };
         if target_path == u.path && target_line == u.line {
-            tally.itself += 1;
+            cases.itself += 1;
             continue;
         }
+        let named =
+            target_path != u.path || listed(&index.grammars, root, &target_path, target_line, name);
+        cases.uses.push(Case {
+            path: u.path.clone(),
+            line: u.line,
+            start: u.start,
+            name: name.to_owned(),
+            target_path,
+            target_line,
+            named,
+        });
+    }
+    lsp.stop();
+    cases
+}
+
+/// Looks each case up from where it's used, against the server's answer.
+fn score(index: &Indexed, cases: &Cases) -> Tally {
+    let placed = std::env::var_os("HIT_RATE_NO_PLACE").is_none();
+    let mut tally = Tally {
+        sampled: cases.sampled,
+        unresolved: cases.unresolved,
+        outside: cases.outside,
+        itself: cases.itself,
+        ..Tally::default()
+    };
+    for case in &cases.uses {
         let origin = Origin {
-            path: u.path.as_str().into(),
-            language: lang.clone(),
+            path: case.path.as_str().into(),
+            language: index.lang.clone(),
         };
-        let lookup = nav
-            .lookup(&repo, &cache, name, &origin, &AtomicBool::new(false))
+        let at = placed.then_some(Place {
+            line: case.line,
+            column: Some(case.start),
+        });
+        let lookup = (index.nav)
+            .lookup_at(
+                &index.repo,
+                &index.cache,
+                &case.name,
+                &origin,
+                at,
+                &AtomicBool::new(false),
+            )
             .expect("looks up");
         let holds = |c: &Candidate| {
-            c.path == target_path.as_str() && (c.start..=c.end).contains(&target_line)
+            c.path == case.target_path.as_str() && (c.start..=c.end).contains(&case.target_line)
         };
-        let at = format!("{}:{}", u.path, u.line + 1);
-        let defined = texts
-            .get(&target_path)
-            .and_then(|t| t.lines().nth(target_line))
-            .map(str::trim)
-            .unwrap_or_default()
-            .chars()
-            .take(80)
-            .collect::<String>();
-        if lookup.candidates.first().is_some_and(holds) {
-            tally.first += 1;
-        } else if lookup.candidates.iter().any(holds) {
-            tally.found += 1;
-            let top = &lookup.candidates[0];
-            tally.lower.push(format!(
-                "  {name} at {at}: first {}:{} of {}, server {target_path}:{} `{defined}`",
-                top.path,
-                top.start + 1,
-                lookup.candidates.len(),
-                target_line + 1,
-            ));
-        } else if listed(&grammars, root, &target_path, target_line, name) {
+        let first = lookup.candidates.first().is_some_and(holds);
+        let among = lookup.candidates.iter().any(holds);
+        for score in [&mut tally.all]
+            .into_iter()
+            .chain(case.named.then_some(&mut tally.named))
+        {
+            score.counted += 1;
+            score.first += usize::from(first);
+            score.among += usize::from(among);
+        }
+        if !first {
             let top = lookup.candidates.first().map_or_else(
                 || "none".to_owned(),
-                |c| format!("{}:{}", c.path, c.start + 1),
+                |c| {
+                    let kind = c.kind.map_or("text", |k| k.name());
+                    format!("{}:{} {kind}", c.path, c.start + 1)
+                },
             );
-            tally.lower.push(format!(
-                "  {name} at {at}: not among {} (first {top}), server {target_path}:{} `{defined}`",
+            tally.misses.push(format!(
+                "  {}{} at {}:{}: first {top} of {}{}, server {}:{}",
+                if case.named { "" } else { "(local) " },
+                case.name,
+                case.path,
+                case.line + 1,
                 lookup.candidates.len(),
-                target_line + 1,
-            ));
-        } else if target_path == u.path {
-            tally.local += 1;
-        } else {
-            tally.unlisted.push(format!(
-                "  {name} at {at}: server {target_path}:{} `{defined}`",
-                target_line + 1
+                if among { ", listed lower" } else { "" },
+                case.target_path,
+                case.target_line + 1,
             ));
         }
     }
-    lsp.stop();
     tally
 }
 

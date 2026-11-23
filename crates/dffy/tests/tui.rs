@@ -5781,6 +5781,46 @@ fn back_returns_from_a_definition_and_forward_goes_again() {
     assert!(term.wait_exit().success());
 }
 
+/// The line a definition opens at is marked, `❯` in its gutter, until the
+/// view moves.
+#[test]
+fn the_line_a_definition_opens_at_is_marked_until_the_view_moves() {
+    let repo = definitions_repo();
+    let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_dffy"));
+    cmd.args(["HEAD~1", "HEAD"]);
+    let mut term = Term::spawn_command(cmd, repo.path(), 160, 40, &[]);
+    term.wait_for("the first file", |t| t.contains("alloc_checked(n, size)"));
+    term.send("f");
+    term.wait_for("the caller", |t| t.contains("kmalloc_array(4, 16)"));
+    assert!(!term.contains("❯"));
+    term.click("kmalloc_array(4, 16)");
+    term.send("K");
+    term.wait_for("the line's names", |t| t.contains(" go to definition "));
+    term.send("kmal\r");
+    term.wait_for("the peek", |t| t.contains("kmalloc_array · 2 definitions"));
+    term.send("j");
+    term.wait_for("the tools definition", |t| {
+        t.contains("tools/include/slab.h:1")
+    });
+    term.send("\r");
+    term.wait_for("the definition's line marked", |t| {
+        let screen = t.vt.screen().contents();
+        screen
+            .lines()
+            .any(|l| l.contains('❯') && l.contains("kmalloc_array(unsigned long n"))
+    });
+    term.send("F");
+    term.wait_for("the caller, unmarked", |t| {
+        t.contains("kmalloc_array(4, 16)") && !t.contains("❯")
+    });
+    term.send("f");
+    term.wait_for("the definition's file, unmarked", |t| {
+        t.contains("tools_alloc(n * size)") && !t.contains("❯")
+    });
+    term.send("q");
+    assert!(term.wait_exit().success());
+}
+
 /// Plain `dffy` peeks into the working tree, whose changed files are read
 /// from disk over HEAD's, and `s` into HEAD.
 #[test]
@@ -5911,6 +5951,56 @@ fn a_peek_starts_the_helper_and_the_idle_drop_ends_it() {
     assert_eq!(helpers_of(viewer).len(), 1, "another helper");
     term.send("\x1b");
     term.wait_for("the peek closed again", |t| !t.contains("2 definitions"));
+    term.send("q");
+    assert!(term.wait_exit().success());
+}
+
+/// A ctrl+click on a name peeks at what the use itself names first: a
+/// parameter of the function it's in, and the function an import brings
+/// in under another name.
+#[test]
+fn a_peek_at_a_use_finds_its_parameter_and_aliased_import() {
+    let repo = tempfile::tempdir().expect("tempdir");
+    let d = repo.path();
+    git(d, &["init", "-q", "-b", "main"]);
+    let write = |path: &str, text: &str| {
+        let path = d.join(path);
+        std::fs::create_dir_all(path.parent().expect("a folder")).expect("mkdir");
+        std::fs::write(path, text).expect("write");
+    };
+    let sized = "int size(int count)\n{\n\treturn count + 1;\n}\n";
+    let main = "import { parse as p } from \"../z/util\";\np(\"x\");\n";
+    write("a.c", sized);
+    write("b.c", "int count(void)\n{\n\treturn 0;\n}\n");
+    write("app/main.ts", main);
+    write(
+        "z/util.ts",
+        "export function parse(s: string) {\n  return s;\n}\n",
+    );
+    write("a/util.ts", "export function p() {}\n");
+    git(d, &["add", "-A"]);
+    git(d, &["commit", "-q", "-m", "first"]);
+    write("a.c", &format!("{sized}/* sized */\n"));
+    write("app/main.ts", &format!("{main}p(\"y\");\n"));
+    git(d, &["commit", "-q", "-am", "second"]);
+
+    let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_dffy"));
+    cmd.args(["HEAD~1", "HEAD"]);
+    let mut term = Term::spawn_command(cmd, d, 160, 40, &[]);
+    term.wait_for("a.c", |t| t.contains("return count + 1;"));
+    term.press_on(16, "count + 1");
+    term.wait_for("the parameter", |t| {
+        t.contains("count · 2 definitions · a.c:1") && t.contains("parameter")
+    });
+    term.send("\x1b");
+    term.wait_for("the peek closed", |t| !t.contains("2 definitions"));
+    term.send("f");
+    term.wait_for("main.ts", |t| t.contains("p(\"y\");"));
+    term.press_on(16, "p(\"x\")");
+    term.wait_for("the aliased import's function", |t| {
+        t.contains("z/util.ts:1")
+    });
+    term.send("\x1b");
     term.send("q");
     assert!(term.wait_exit().success());
 }

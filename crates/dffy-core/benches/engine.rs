@@ -488,7 +488,7 @@ fn lookup_warm(bencher: divan::Bencher, name: &str) {
     sample_size = 1
 )]
 fn references_kernel(bencher: divan::Bencher, case: &str) {
-    use dffy_core::navigate::{Diff, MAX_REFERENCE_FILES, Navigator, Origin, Shared};
+    use dffy_core::navigate::{Diff, Filter, MAX_REFERENCE_FILES, Navigator, Origin, Shared};
 
     let (name, until) = case.split_once(' ').expect("a name and how far");
     let repo = Repo::discover(root()).expect("opens");
@@ -515,7 +515,9 @@ fn references_kernel(bencher: divan::Bencher, case: &str) {
     };
     let go = AtomicBool::new(false);
     let search = || {
-        let mut search = nav.references(&repo, name, &origin, &go).expect("starts");
+        let mut search = nav
+            .references(&repo, name, &origin, Filter::default(), &go)
+            .expect("starts");
         let mut hits = 0;
         while !search.done() && (until == "all" || search.files() < MAX_REFERENCE_FILES) {
             let mut files = 0;

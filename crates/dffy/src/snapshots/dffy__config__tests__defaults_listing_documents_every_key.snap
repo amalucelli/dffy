@@ -270,8 +270,17 @@ expression: text
 <dim># other_version: in a peek: the name's definitions in the diff's other version</>
 <hint>keybind</><dim> = </>peek:s=other_version
 
-<dim># references: in a peek: the lines using the name in the peek's version, closest files first, as they're found: the first 200 files with a use, and how many there are; again shows the definitions</>
+<dim># references: in a peek: jump between the name's definitions and the lines using it, which the peek lists below them as they're found, closest files first</>
 <hint>keybind</><dim> = </>peek:r=references
+
+<dim># more_uses: in a peek: go on past the first 200 files using the name, counting the rest</>
+<hint>keybind</><dim> = </>peek:m=more_uses
+
+<dim># calls_only: in a peek: list only the uses calling the name, or every use again</>
+<hint>keybind</><dim> = </>peek:c=calls_only
+
+<dim># uses_in_diff: in a peek: list only the uses in files the diff changes, or those in every file again</>
+<hint>keybind</><dim> = </>peek:i=uses_in_diff
 
 <dim># close_peek: close the peek</>
 <hint>keybind</><dim> = </>peek:esc=close_peek

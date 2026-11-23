@@ -860,6 +860,27 @@ impl Repo {
         self.load_noted(path, side).map(|(bytes, _)| bytes)
     }
 
+    /// [`Repo::load`] into `out`, whose allocation a blob reuses: a scan
+    /// reading thousands of files keeps one buffer rather than allocating
+    /// one each, which the allocator would keep once freed.
+    ///
+    /// # Errors
+    ///
+    /// See [`Repo::load`].
+    pub fn load_into(&self, path: &BStr, side: &Side, out: &mut Vec<u8>) -> Result<()> {
+        match *side {
+            Side::Object { id, mode } if mode != Mode::Gitlink => {
+                use gix::prelude::FindExt as _;
+                self.git()?.objects.find(&id, out)?;
+                Ok(())
+            }
+            _ => {
+                *out = self.load(path, side)?;
+                Ok(())
+            }
+        }
+    }
+
     /// [`Repo::load`], with why a worktree file is as read from disk when
     /// its conversion failed.
     fn load_noted(&self, path: &BStr, side: &Side) -> Result<(Vec<u8>, Option<String>)> {

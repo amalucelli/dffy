@@ -11,11 +11,11 @@ expression: "shown(&mut help, &keys, 100, 20)"
        │ b page_up         page up                 enter             open file or folder  ┃│
        │ ctrl+d            half page down          d                 show in diff         ┃│
        │ ctrl+u            half page up            s                 other version        ┃│
-       │ g home            top of file             r                 references           ┃│
-       │ G end             bottom of file          esc q             close peek           ┃│
-       │ }                 next change                                                    ┃│
-       │ N {               prev change                                                    ││
-       │ > L               scroll right                                                   ││
+       │ g home            top of file             r                 definitions/uses     ┃│
+       │ G end             bottom of file          m                 more uses            ┃│
+       │ }                 next change             c                 calls only           ┃│
+       │ N {               prev change             i                 uses in diff         ││
+       │ > L               scroll right            esc q             close peek           ││
        │ < H               scroll left                                                    ││
        │ 0                 scroll to line start                                           ││
        │ more settings: space · all keys: docs/keys.md                                     │

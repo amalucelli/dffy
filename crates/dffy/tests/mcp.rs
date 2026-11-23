@@ -1512,3 +1512,82 @@ fn definitions_read_a_file_edited_again_between_calls() {
     );
     assert_eq!(start(&mut server), Some(4), "the file's lines as edited");
 }
+
+/// A repository where `count` is a parameter in `a.c` and a function in
+/// `b.c`, and `app/main.ts` imports `parse` as `p`, which `a/util.ts`
+/// defines a function of; the second commit adds a line to each user.
+fn places_repo() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let d = dir.path();
+    git(d, &["init", "-q", "-b", "main"]);
+    let sized = "int size(int count)\n{\n\treturn count + 1;\n}\n";
+    let main = "import { parse as p } from \"../z/util\";\np(\"x\");\n";
+    write(d, "a.c", sized);
+    write(d, "b.c", "int count(void)\n{\n\treturn 0;\n}\n");
+    write(d, "app/main.ts", main);
+    write(
+        d,
+        "z/util.ts",
+        "export function parse(s: string) {\n  return s;\n}\n",
+    );
+    write(d, "a/util.ts", "export function p() {}\n");
+    git(d, &["add", "-A"]);
+    git(d, &["commit", "-q", "-m", "first"]);
+    write(d, "a.c", &format!("{sized}/* sized */\n"));
+    write(d, "app/main.ts", &format!("{main}p(\"y\");\n"));
+    git(d, &["commit", "-q", "-am", "second"]);
+    dir
+}
+
+/// With the use's line and column, `definitions` answers a parameter with
+/// its line, and an import under another name with what it names.
+#[test]
+fn definitions_at_a_use_find_its_parameter_and_aliased_import() {
+    let repo = places_repo();
+    let mut server = Server::start(repo.path());
+    initialize(&mut server);
+    let first = |server: &mut Server, ask: &str| {
+        let mut call = server.call("definitions", ask);
+        for _ in 0..200 {
+            if call.structured().get("partial") == Some(&Value::Bool(false)) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            call = server.call("definitions", ask);
+        }
+        let found = call.structured();
+        let first = &found
+            .get("candidates")
+            .and_then(Value::as_array)
+            .expect("candidates")[0];
+        let field = |k: &str| first.get(k).cloned().unwrap_or(Value::Null);
+        (
+            format!(
+                "{}:{} {}",
+                field("path").as_str().unwrap_or_default(),
+                field("start").as_usize().unwrap_or_default(),
+                field("kind").as_str().unwrap_or_default()
+            ),
+            call.text().to_owned(),
+        )
+    };
+    let (found, text) = first(
+        &mut server,
+        r#"{"name":"count","path":"a.c","line":3,"column":9,"range":"HEAD~1..HEAD"}"#,
+    );
+    assert_eq!(found, "a.c:1 parameter");
+    assert!(text.contains("a.c:1 parameter"), "{text}");
+    let (found, _) = first(
+        &mut server,
+        r#"{"name":"count","path":"a.c","range":"HEAD~1..HEAD"}"#,
+    );
+    assert_eq!(
+        found, "b.c:1 function",
+        "without the place, the index alone"
+    );
+    let (found, _) = first(
+        &mut server,
+        r#"{"name":"p","path":"app/main.ts","line":2,"column":1,"range":"HEAD~1..HEAD"}"#,
+    );
+    assert_eq!(found, "z/util.ts:1 function");
+}

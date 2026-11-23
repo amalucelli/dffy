@@ -4,6 +4,7 @@
 
 use std::ops::RangeInclusive;
 use std::sync::atomic::AtomicBool;
+use std::sync::{Mutex, PoisonError};
 
 use super::names::{Comments, uses};
 use super::{
@@ -11,7 +12,6 @@ use super::{
     is_word_byte,
 };
 use crate::git::{self, Repo};
-use crate::highlight::Definitions;
 
 /// The files a search reports the uses of; past them, it only counts files.
 pub const MAX_REFERENCE_FILES: usize = 200;
@@ -34,6 +34,16 @@ pub struct Reference {
     pub more: usize,
 }
 
+/// Which uses a search reports.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub struct Filter {
+    /// Only the uses calling the name: followed by its arguments, `(`,
+    /// past a Rust macro's `!` or the type arguments a call names.
+    pub calls_only: bool,
+    /// Only the uses in files the diff changes.
+    pub in_diff: bool,
+}
+
 /// A search for a name's uses at a navigator's side, from
 /// [`Navigator::references`]. Each [`References::step`] searches the next
 /// files; the lines of the first [`MAX_REFERENCE_FILES`] files with a use
@@ -49,6 +59,10 @@ pub struct References {
     next: usize,
     /// Files with a use found so far.
     files: usize,
+    filter: Filter,
+    /// The indexed files defining the name, as of how many files the
+    /// index had: a host steps a file at a time.
+    defined_in: (usize, Vec<u32>),
 }
 
 impl Navigator {
@@ -59,8 +73,9 @@ impl Navigator {
     /// language with a tags query, a use inside a comment (a block comment
     /// over several lines included) or a string is left out, and so is the
     /// first use inside each of the name's definitions there, which is the
-    /// definition naming it, once the index has the file. An empty name
-    /// finds nothing.
+    /// definition naming it, once the index has the file. `filter` keeps
+    /// only some uses; a file counts when it has one it keeps. An empty
+    /// name finds nothing.
     ///
     /// # Errors
     ///
@@ -71,14 +86,23 @@ impl Navigator {
         repo: &Repo,
         name: &str,
         origin: &Origin,
+        filter: Filter,
         cancel: &AtomicBool,
     ) -> Result<References, Error> {
-        let order = if name.is_empty() {
+        let mut order = if name.is_empty() {
             Vec::new()
         } else {
             let related = self.related(repo, origin, cancel)?;
             self.search_order(&related, origin)
         };
+        if filter.in_diff {
+            let changes = self.changes();
+            order.retain(|&(_, l)| {
+                changes
+                    .get(&self.listed[l as usize].path)
+                    .is_some_and(differs)
+            });
+        }
         Ok(References {
             navigator: self.id,
             name: name.to_owned(),
@@ -86,17 +110,30 @@ impl Navigator {
             order,
             next: 0,
             files: 0,
+            filter,
+            defined_in: (usize::MAX, Vec::new()),
         })
+    }
+
+    /// The indexed files the index has definitions of `name` in so far,
+    /// ascending.
+    fn defined_in(&self, name: &str) -> Vec<u32> {
+        let mut state = self.state();
+        state
+            .posted(self.shared.store(), hash(name))
+            .unwrap_or_else(|| {
+                self.reindex(&mut state);
+                Vec::new()
+            })
     }
 
     /// The lines the definitions of `name` in indexed file `file` span, as
     /// far as the index has it.
     fn defining(&self, file: u32, name: &str) -> Vec<RangeInclusive<usize>> {
-        let entry = match &self.state().slots[file as usize] {
-            Slot::Found(Some(entry)) if entry.has(hash(name)) => std::sync::Arc::clone(entry),
-            _ => return Vec::new(),
+        let Slot::Found(Some(at)) = self.state().slots[file as usize] else {
+            return Vec::new();
         };
-        (Definitions::decode(&entry.encoded))
+        (self.read(at))
             .map(|defs| {
                 defs.iter()
                     .filter(|d| d.name == name)
@@ -151,7 +188,15 @@ impl References {
             return Vec::new();
         }
         let in_diff = navigator.changes();
+        let indexed = navigator.progress().done;
+        if self.defined_in.0 != indexed {
+            self.defined_in = (indexed, navigator.defined_in(&self.name));
+        }
+        let defined_in = &self.defined_in.1;
         let mut out = Vec::new();
+        // From the pool and back to it each step: a search stopped part way,
+        // or left at its first files, holds none.
+        let mut text = take_buffer();
         while let Some(&(rank, l)) = self.order.get(self.next) {
             if stop() {
                 break;
@@ -165,10 +210,7 @@ impl References {
             {
                 continue;
             }
-            let Ok(text) = repo.load(path, side) else {
-                continue;
-            };
-            if git::is_binary(&text) {
+            if repo.load_into(path, side, &mut text).is_err() || git::is_binary(&text) {
                 continue;
             }
             let language = listed.indexed.map(|i| {
@@ -179,9 +221,11 @@ impl References {
                 text: &text,
                 name: &self.name,
                 finder: &self.finder,
+                calls_only: self.filter.calls_only,
                 language: language.map(|(_, name)| name),
-                defining: language
-                    .map_or_else(Vec::new, |(i, _)| navigator.defining(i, &self.name)),
+                defining: (language.map(|(i, _)| i))
+                    .filter(|i| defined_in.binary_search(i).is_ok())
+                    .map_or_else(Vec::new, |i| navigator.defining(i, &self.name)),
             };
             let reported = self.files < MAX_REFERENCE_FILES;
             let changed = in_diff.get(&listed.path).is_some_and(differs);
@@ -209,7 +253,33 @@ impl References {
             }
             self.files += usize::from(found);
         }
+        give_back(text);
         out
+    }
+}
+
+/// The read buffers of searches done, for the next to take. A buffer
+/// grows to the largest file its search reads; one made anew for each
+/// search would leave the allocator holding each one's memory once freed.
+static BUFFERS: Mutex<Vec<Vec<u8>>> = Mutex::new(Vec::new());
+
+/// Buffers [`BUFFERS`] keeps: as many searches as usually run at once.
+const POOLED: usize = 2;
+
+/// A read buffer for a search, from those of searches done if any.
+pub(super) fn take_buffer() -> Vec<u8> {
+    let mut pool = BUFFERS.lock().unwrap_or_else(PoisonError::into_inner);
+    pool.pop().unwrap_or_default()
+}
+
+/// Gives a search's read buffer back for the next, its room kept: given
+/// back smaller, each search would grow it again through allocations the
+/// allocator keeps once freed.
+pub(super) fn give_back(mut buffer: Vec<u8>) {
+    buffer.clear();
+    let mut pool = BUFFERS.lock().unwrap_or_else(PoisonError::into_inner);
+    if pool.len() < POOLED {
+        pool.push(buffer);
     }
 }
 
@@ -221,6 +291,8 @@ struct File<'a> {
     /// Its language, when it has a tags query: comments and strings are
     /// told apart.
     language: Option<&'a str>,
+    /// Only the uses calling the name count.
+    calls_only: bool,
     /// The lines each definition of the name in it spans, as indexed.
     defining: Vec<RangeInclusive<usize>>,
 }
@@ -253,6 +325,9 @@ impl File<'_> {
             starts = line_start;
             stops = memchr::memchr(b'\n', &text[at..]).map_or(text.len(), |i| at + i);
             let bytes = &text[starts..stops];
+            if self.calls_only && !calls(&text[starts..at], &text[end..stops]) {
+                continue;
+            }
             if let Some(language) = self.language {
                 if fed < starts {
                     comments.skip(&text[fed..starts]);
@@ -281,6 +356,56 @@ impl File<'_> {
         }
         (listed + more > 0, more)
     }
+}
+
+/// Whether a use of a name, `before` it and `after` it on its line, calls
+/// it: the arguments come next, after a Rust macro's `!`, a turbofish
+/// `::<…>`, or type arguments in `<…>` or Go's `[…]`. A definition's own
+/// name (`fn f(`, `def f(`, `func f(`, `function f(`) doesn't. A line-level
+/// rule: a C declaration `int f(void);` reads as a call, unless the index
+/// has it as the name's definition.
+pub(super) fn calls(before: &[u8], after: &[u8]) -> bool {
+    let keyword = before.trim_ascii_end();
+    let defines = [&b"fn"[..], b"def", b"func", b"function"].iter().any(|k| {
+        keyword.ends_with(k)
+            && keyword[..keyword.len() - k.len()]
+                .last()
+                .is_none_or(|&b| !is_word_byte(b))
+    });
+    if defines {
+        return false;
+    }
+    let mut rest = after.trim_ascii_start();
+    if let Some(r) = rest.strip_prefix(b"!") {
+        rest = r.trim_ascii_start();
+        return matches!(rest.first(), Some(b'(' | b'[' | b'{'));
+    }
+    if let Some(r) = rest.strip_prefix(b"::") {
+        rest = r;
+    }
+    if let Some(&open @ (b'<' | b'[')) = rest.first() {
+        let close = if open == b'<' { b'>' } else { b']' };
+        let mut depth = 0usize;
+        let mut end = None;
+        for (i, &b) in rest.iter().enumerate() {
+            if b == open {
+                depth += 1;
+            } else if b == close {
+                depth -= 1;
+                if depth == 0 {
+                    end = Some(i);
+                    break;
+                }
+            } else if matches!(b, b';' | b'{' | b'=') {
+                break;
+            }
+        }
+        let Some(end) = end else {
+            return false;
+        };
+        rest = rest[end + 1..].trim_ascii_start();
+    }
+    rest.first() == Some(&b'(')
 }
 
 /// `line` trimmed, cut to [`LINE_BYTES`] at a character boundary.

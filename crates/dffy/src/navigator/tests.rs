@@ -11,7 +11,7 @@ use rustix::process::{Pid, Signal, kill_process};
 
 use dffy_core::git::{Mode, ObjectId, PathRoot, Side as GitSide, Snapshot};
 use dffy_core::highlight::DefinitionKind;
-use dffy_core::navigate::{Candidate, Progress, Rank, Reference};
+use dffy_core::navigate::{Candidate, Filter, Progress, Rank, Reference, Use};
 use dffy_core::view::Side;
 
 use super::{PROTOCOL, client, wire};
@@ -42,6 +42,9 @@ const KINDS: &[&str] = &[
     "interface",
     "field",
     "reexport",
+    "local",
+    "parameter",
+    "import",
 ];
 
 fn round_trip<T: PartialEq + std::fmt::Debug + Clone>(
@@ -198,6 +201,40 @@ fn the_host_side_speaks_the_fixture() {
     assert_eq!(json(&lookup), params(&f, "lookup"));
     let found = client::read_lookup(message(message(&f, "lookup"), "result")).expect("reads");
     assert_eq!(found.candidates.len(), 1);
+    let at = Use {
+        line: 5,
+        column: Some(8),
+    };
+    let mut place = String::new();
+    wire::at(Some(at), &mut place);
+    let lookup_at = client::asking_params(opened.navigator, "frob", origin, &place);
+    assert_eq!(json(&lookup_at), params(&f, "lookupAt"));
+    assert_eq!(wire::read_use(&params(&f, "lookupAt")), Ok(Some(at)));
+    let line = Use { column: None, ..at };
+    let mut place = String::new();
+    wire::at(Some(line), &mut place);
+    let lookup_line = json(&client::asking_params(
+        opened.navigator,
+        "frob",
+        origin,
+        &place,
+    ));
+    assert_eq!(wire::read_use(&lookup_line), Ok(Some(line)));
+    assert_eq!(wire::read_use(&params(&f, "lookup")), Ok(None));
+    let filter = Filter {
+        calls_only: true,
+        in_diff: true,
+    };
+    let mut extra = String::new();
+    wire::filter(filter, &mut extra);
+    assert_eq!(
+        wire::read_filter(&json(&format!(r#"{{"x":1{extra}}}"#))),
+        Ok(filter)
+    );
+    assert_eq!(
+        wire::read_filter(&params(&f, "referencesStart")),
+        Ok(Filter::default())
+    );
 
     let extra = client::search_extra("references", 0);
     let start = client::asking_params(opened.navigator, "frob", origin, &extra);

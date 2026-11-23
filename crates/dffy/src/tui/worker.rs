@@ -333,6 +333,10 @@ pub(crate) struct ReferencesJob {
     pub search: Arc<Mutex<Option<u64>>>,
     pub name: String,
     pub origin: navigate::Origin,
+    /// Which uses it keeps.
+    pub filter: navigate::Filter,
+    /// It goes on past the first files with a use, counting the rest.
+    pub past_cap: bool,
     pub id: u64,
     pub cancel: Arc<Cancel>,
 }
@@ -369,6 +373,8 @@ pub(crate) struct LookupJob {
     pub navigator: u64,
     pub name: String,
     pub origin: navigate::Origin,
+    /// Where the name is used in the asking file, when that's known.
+    pub at: Option<navigate::Use>,
     /// The whole-word text search, for a name with no definition found.
     pub text: bool,
     pub id: u64,
@@ -1285,7 +1291,13 @@ fn references(job: &ReferencesJob) -> Result<Referenced, Unanswered> {
         id
     } else {
         let origin = (job.origin.path.as_slice(), job.origin.language.name());
-        let id = (job.helper).start_search(job.navigator, "references", &job.name, origin, 0)?;
+        let id = (job.helper).start_search(
+            job.navigator,
+            "references",
+            &job.name,
+            origin,
+            (0, job.filter),
+        )?;
         let mut search = job.search.lock().unwrap_or_else(PoisonError::into_inner);
         match *search {
             // Another step started one meanwhile: that one goes on.
@@ -1297,8 +1309,11 @@ fn references(job: &ReferencesJob) -> Result<Referenced, Unanswered> {
             None => *search.insert(id),
         }
     };
-    let step =
-        (job.helper).step_references(id, (REFERENCES_STEP, None, true), Some(&job.cancel))?;
+    let step = (job.helper).step_references(
+        id,
+        (REFERENCES_STEP, None, job.past_cap),
+        Some(&job.cancel),
+    )?;
     if job.cancel.is_set() {
         return Err(Unanswered::Cancelled);
     }
@@ -1383,8 +1398,13 @@ fn lookup(job: &LookupJob, repo: Option<&Repo>) -> Result<Looked, Unanswered> {
     let cancel = &*job.cancel;
     let origin = (job.origin.path.as_slice(), job.origin.language.name());
     let mut looked = if job.text {
-        let search =
-            (job.helper).start_search(job.navigator, "text", &job.name, origin, TEXT_MATCHES)?;
+        let search = (job.helper).start_search(
+            job.navigator,
+            "text",
+            &job.name,
+            origin,
+            (TEXT_MATCHES, navigate::Filter::default()),
+        )?;
         let mut candidates = Vec::new();
         let done = loop {
             let step = (job.helper).step_text(search, TEXT_STEP, Some(cancel));
@@ -1411,7 +1431,7 @@ fn lookup(job: &LookupJob, repo: Option<&Repo>) -> Result<Looked, Unanswered> {
             lines: Vec::new(),
         }
     } else {
-        let found = (job.helper).lookup(job.navigator, &job.name, origin, Some(cancel))?;
+        let found = (job.helper).lookup(job.navigator, &job.name, origin, job.at, Some(cancel))?;
         Looked {
             candidates: found.candidates,
             total: found.total,
@@ -1751,6 +1771,8 @@ mod tests {
                 path: "a.c".into(),
                 language: crate::grammars().named("c").expect("bundled").clone(),
             },
+            filter: navigate::Filter::default(),
+            past_cap: true,
             id: 3,
             cancel: Arc::new(Cancel::default()),
         };

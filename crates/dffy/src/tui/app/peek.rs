@@ -28,7 +28,7 @@ use dffy_core::bstr::{BStr, BString};
 use dffy_core::document::{Attach, Pos, Side, State};
 use dffy_core::git::{self, Snapshot};
 use dffy_core::highlight::Language;
-use dffy_core::navigate::{self, Origin, Progress};
+use dffy_core::navigate::{self, Filter, Origin, Progress, Use};
 
 use super::{Action, App, Pane};
 use crate::keys::{Action as Act, Chord};
@@ -50,8 +50,8 @@ const IDLE: Duration = Duration::from_secs(10 * 60);
 const KEPT_REFERENCES: usize = 8;
 
 /// A search for a name's uses: its version's snapshot, the asking file
-/// (whose neighbours come first) and the name.
-type RefKey = (Snapshot, BString, String);
+/// (whose neighbours come first), the name and which uses it keeps.
+type RefKey = (Snapshot, BString, String, Filter);
 
 /// The search for the peek's name's uses, until it's done.
 struct RefSearch {
@@ -59,6 +59,10 @@ struct RefSearch {
     key: RefKey,
     side: Side,
     origin: Origin,
+    /// It goes on past its first files with a use: asked to.
+    past_cap: bool,
+    /// It stopped at its first files, until asked to go on.
+    capped: bool,
     /// The generation of the helper its search runs in: one from a helper
     /// gone is started over.
     generation: u64,
@@ -119,6 +123,10 @@ struct Ask {
     /// The asking file's path in each version.
     paths: [BString; 2],
     attach: Attach,
+    /// Where the name is used in the asking file: its line, and its column
+    /// when the name was clicked. None in the other version, whose lines
+    /// differ.
+    at: Option<Use>,
 }
 
 /// A lookup asked for, until its answer comes.
@@ -171,6 +179,8 @@ pub(crate) struct Navigation {
     codes: Vec<(BString, git::Side, Arc<Code>)>,
     /// The one search for uses the viewer runs.
     refs: Option<RefSearch>,
+    /// Which uses the peek lists.
+    filter: Filter,
     /// The uses found by searches that finished, most recent last.
     kept_refs: Vec<(RefKey, Refs)>,
     land: Option<Land>,
@@ -194,6 +204,7 @@ impl Default for Navigation {
             code: None,
             codes: Vec::new(),
             refs: None,
+            filter: Filter::default(),
             kept_refs: Vec::new(),
             land: None,
             used: None,
@@ -271,6 +282,18 @@ impl Navigation {
         self.stop_references();
         self.kept_refs.clear();
     }
+}
+
+/// What the uses' group says of `filter`.
+fn uses_words(filter: Filter) -> String {
+    let mut words = Vec::new();
+    if filter.calls_only {
+        words.push("calls only");
+    }
+    if filter.in_diff {
+        words.push("in this diff");
+    }
+    words.join(" · ")
 }
 
 /// The line the row at `pos` shows on `side`, else on the other side, with
@@ -360,12 +383,16 @@ impl App {
             language: language.clone(),
         };
         let attach = Attach::Line { side, line };
+        // K's list names each name once: the core takes the line alone for
+        // the name's first use in code on it.
+        let at = Some(Use { line, column: None });
         Some((
             Ask {
                 side,
                 origin,
                 paths,
                 attach,
+                at,
             },
             bytes,
         ))
@@ -475,16 +502,21 @@ impl App {
         };
         self.tapped = Some((pos, side));
         self.pane = Pane::Diff;
-        let Some((ask, text)) = self.ask_from(pos.file, side, line) else {
+        let Some((mut ask, text)) = self.ask_from(pos.file, side, line) else {
             return;
         };
         let text = text.strip_suffix(b"\n").unwrap_or(&text);
-        let Some(name) = navigate::name_at(text, bytes.start)
-            .and_then(|range| std::str::from_utf8(&text[range]).ok().map(str::to_owned))
-        else {
+        let Some((name, column)) = navigate::name_at(text, bytes.start).and_then(|range| {
+            let name = std::str::from_utf8(&text[range.clone()]).ok()?;
+            Some((name.to_owned(), range.start))
+        }) else {
             self.message("no name here to look up");
             return;
         };
+        ask.at = Some(Use {
+            line,
+            column: Some(column),
+        });
         self.look_up(name, ask);
     }
 
@@ -574,6 +606,9 @@ impl App {
         self.doc.set_focus(None);
         self.sync_threads();
         self.doc.open_peek(peek, attach);
+        // The uses fill in below the definitions as they're found, each
+        // group drawn as it comes.
+        self.start_uses();
         self.dirty = true;
         self.kept = false;
     }
@@ -675,22 +710,30 @@ impl App {
         let text = (nav.asked.as_ref())
             .filter(|a| a.text)
             .and_then(|a| self.lookup_job(a));
-        let references = nav.refs.as_ref().and_then(|search| {
-            let (helper, navigator) = nav.asking(search.side)?;
-            let (generation, _) = nav.sides[search.side.index()].answering()?;
-            // A search of a helper gone is started over first.
-            (generation == search.generation).then(|| {
-                Job::References(ReferencesJob {
-                    helper,
-                    navigator,
-                    search: Arc::clone(&search.search),
-                    name: search.key.2.clone(),
-                    origin: search.origin.clone(),
-                    id: search.id,
-                    cancel: Arc::clone(&search.cancel),
+        // Stopped at its first files, a search waits to be asked to go on;
+        // and it waits for the peek's first lookup, which shares the
+        // helper's time with it, to answer.
+        let first_lookup = nav.asked.as_ref().is_some_and(|a| !a.again && !a.text);
+        let references = (nav.refs.as_ref())
+            .filter(|s| !s.capped && !first_lookup)
+            .and_then(|search| {
+                let (helper, navigator) = nav.asking(search.side)?;
+                let (generation, _) = nav.sides[search.side.index()].answering()?;
+                // A search of a helper gone is started over first.
+                (generation == search.generation).then(|| {
+                    Job::References(ReferencesJob {
+                        helper,
+                        navigator,
+                        search: Arc::clone(&search.search),
+                        name: search.key.2.clone(),
+                        origin: search.origin.clone(),
+                        filter: search.key.3,
+                        past_cap: search.past_cap,
+                        id: search.id,
+                        cancel: Arc::clone(&search.cancel),
+                    })
                 })
-            })
-        });
+            });
         text.into_iter().chain(references)
     }
 
@@ -701,6 +744,7 @@ impl App {
             navigator,
             name: asked.name.clone(),
             origin: asked.ask.origin.clone(),
+            at: asked.ask.at,
             text: asked.text,
             id: asked.id,
             cancel: Arc::clone(&asked.cancel),
@@ -823,7 +867,7 @@ impl App {
             return;
         }
         slot.built = pushed.built.clone();
-        let error = slot.built.error.clone();
+        let error = (slot.built.error.clone()).or_else(|| slot.built.note.clone());
         let say = error.filter(|_| !std::mem::replace(&mut slot.said, true));
         if let Some(error) = say {
             self.failed(format!("go to definition: {error}"));
@@ -903,7 +947,9 @@ impl App {
             Ok(looked) => looked,
         };
         let slot = &mut self.navigation.sides[asked.ask.side.index()];
-        if slot.answering().is_some() {
+        // A push of the index's end can come before an answer from before
+        // it: the answer doesn't take the index back.
+        if slot.answering().is_some() && looked.progress.done > slot.built.progress.done {
             slot.built.progress = looked.progress;
         }
         // Only a lookup of definitions says how complete the answer is; the
@@ -962,9 +1008,17 @@ impl App {
             }
             (false, false) => None,
         };
+        // Asked from the definition itself, what's new is where it's used.
+        let here = !looked.text
+            && (looked.candidates.first()).is_some_and(|c| {
+                c.path == asked.ask.origin.path && asked.ask.at.is_some_and(|at| at.line == c.start)
+            });
         self.doc.edit_peek(|p| {
             p.set_found(Found::Listed(looked), cursor);
             p.note = note;
+            if here {
+                p.open_on_uses();
+            }
         });
         self.read_code();
         self.ask_again_when_indexed();
@@ -1025,14 +1079,31 @@ impl App {
 
     /// A key while the peek has the keys: `Break` with what it did when its
     /// table binds it.
+    /// A peek open without the keys takes them back for one of its own:
+    /// moving through it, opening, the other version, the uses. Its
+    /// filters' keys stay the diff's (`m` goes to the next thread there).
     pub(super) fn peek_key(&mut self, key: Key, mods: Mods) -> ControlFlow<Option<Action>> {
-        if !self.peek_focused() {
+        let Some(action) = self.keys.peek_action(key, mods) else {
             return ControlFlow::Continue(());
+        };
+        if !self.peek_focused() {
+            let own = matches!(
+                action,
+                Act::ScrollDown
+                    | Act::ScrollUp
+                    | Act::Open
+                    | Act::ShowInDiff
+                    | Act::OtherVersion
+                    | Act::References
+            );
+            if !own || self.doc.def_peek().is_none() {
+                return ControlFlow::Continue(());
+            }
+            self.doc.set_focus(None);
+            self.doc.edit_peek(|p| p.focused = true);
+            self.dirty = true;
         }
-        match self.keys.peek_action(key, mods) {
-            Some(action) => ControlFlow::Break(self.peek_act(action)),
-            None => ControlFlow::Continue(()),
-        }
+        ControlFlow::Break(self.peek_act(action))
     }
 
     /// What `action` does to the peek.
@@ -1058,7 +1129,10 @@ impl App {
             Act::Open => return self.open_definition(false),
             Act::ShowInDiff => return self.open_definition(true),
             Act::OtherVersion => self.other_version(),
-            Act::References => self.toggle_references(),
+            Act::References => self.jump_uses(),
+            Act::MoreUses => self.more_uses(),
+            Act::CallsOnly => self.filter_uses(|f| f.calls_only = !f.calls_only),
+            Act::UsesInDiff => self.filter_uses(|f| f.in_diff = !f.in_diff),
             Act::ClosePeek => self.close_peek(),
             // Rebound in the peek's table to something else: as elsewhere.
             other => return self.act(other),
@@ -1160,28 +1234,37 @@ impl App {
         action
     }
 
-    /// `r` in the peek: the lines using the name, kept from a search before
-    /// or found now, or the definitions again.
-    fn toggle_references(&mut self) {
+    /// Starts the search for the peek's name's uses, with the filter on,
+    /// unless it runs or its answer is kept from before.
+    fn start_uses(&mut self) {
         let Some(shown) = self.navigation.shown.clone() else {
             return;
         };
-        if self.doc.def_peek().is_some_and(Peek::on_references) {
-            self.doc.edit_peek(|p| p.show_references(false));
-            self.read_code();
-            return;
-        }
         let side = shown.ask.side;
         let Ok(at) = self.snapshot(side) else {
             return;
         };
-        let key = (at, shown.ask.origin.path.clone(), shown.name.clone());
+        let filter = self.navigation.filter;
+        let words = uses_words(filter);
+        let more = (self.keys.peek_chords(Act::MoreUses).next())
+            .map_or_else(String::new, |k| format!("{} more", k.name()));
+        self.doc.edit_peek(|p| {
+            p.uses_words = words;
+            p.more_key = more;
+        });
+        let key = (
+            at,
+            shown.ask.origin.path.clone(),
+            shown.name.clone(),
+            filter,
+        );
         let nav = &mut self.navigation;
         let kept = (nav.kept_refs.iter())
             .find(|(k, _)| *k == key)
             .map(|(_, r)| r.clone());
         let running = nav.refs.as_ref().is_some_and(|r| r.key == key);
         if let Some(refs) = kept {
+            nav.stop_references();
             self.doc.edit_peek(|p| p.edit_references(|r| *r = refs));
         } else if !running {
             nav.stop_references();
@@ -1192,6 +1275,8 @@ impl App {
                 key,
                 side,
                 origin: shown.ask.origin,
+                past_cap: false,
+                capped: false,
                 generation: generation.unwrap_or_default(),
                 search: Arc::new(Mutex::new(None)),
                 cancel: Arc::new(Cancel::default()),
@@ -1200,9 +1285,45 @@ impl App {
                 .edit_peek(|p| p.edit_references(|r| *r = Refs::default()));
             self.ensure_navigator(side);
         }
-        self.doc.edit_peek(|p| p.show_references(true));
-        self.read_code();
         self.dirty = true;
+    }
+
+    /// `r` in the peek: from the definitions to the uses, or back.
+    fn jump_uses(&mut self) {
+        let mut moved = false;
+        self.doc.edit_peek(|p| moved = p.jump_group());
+        if moved {
+            self.read_code();
+            self.dirty = true;
+        } else {
+            let on_use = self.doc.def_peek().is_some_and(Peek::on_a_use);
+            self.message(if on_use {
+                "no definition listed"
+            } else {
+                "no use found yet"
+            });
+        }
+    }
+
+    /// `m` in the peek: the search for uses goes on past its first files.
+    fn more_uses(&mut self) {
+        let Some(search) = self.navigation.refs.as_mut().filter(|s| s.capped) else {
+            self.message("no more uses to search for");
+            return;
+        };
+        search.past_cap = true;
+        search.capped = false;
+        self.doc
+            .edit_peek(|p| p.edit_references(|r| r.capped = false));
+        self.dirty = true;
+    }
+
+    /// `c` or `i` in the peek: the uses listed through another filter,
+    /// searched again.
+    fn filter_uses(&mut self, change: impl FnOnce(&mut Filter)) {
+        change(&mut self.navigation.filter);
+        self.start_uses();
+        self.read_code();
     }
 
     /// A step of reference search `id` came, or why it stopped.
@@ -1236,6 +1357,15 @@ impl App {
             }
             Ok(step) => step,
         };
+        // Stopped at its first files, it goes on only when asked.
+        let capped = !step.done && step.files >= navigate::MAX_REFERENCE_FILES;
+        if let Some(search) = self.navigation.refs.as_mut()
+            && !search.past_cap
+            && capped
+        {
+            search.capped = true;
+        }
+        let capped = capped && self.navigation.refs.as_ref().is_some_and(|s| s.capped);
         let had = self.doc.def_peek().and_then(Peek::current).is_some();
         self.doc.edit_peek(|p| {
             p.add_references(|r| {
@@ -1249,6 +1379,7 @@ impl App {
                 r.files = step.files;
                 r.searched = step.searched;
                 r.done = step.done;
+                r.capped = capped;
                 r.partial |= !step.indexed;
             });
         });
@@ -1287,6 +1418,7 @@ impl App {
                 path: shown.ask.paths[side.index()].clone(),
                 language: shown.ask.origin.language.clone(),
             },
+            at: None,
             ..shown.ask
         };
         self.look_up(shown.name, ask);
@@ -1347,10 +1479,8 @@ impl App {
             .is_some_and(|r| !tree(&r.key) || self.snapshot(r.side).ok() != Some(r.key.0));
         if moved {
             self.navigation.stop_references();
-            self.doc.edit_peek(|p| {
-                p.edit_references(|r| *r = Refs::default());
-                p.show_references(false);
-            });
+            self.doc
+                .edit_peek(|p| p.edit_references(|r| *r = Refs::default()));
         }
         let shown = (self.navigation.shown.as_ref()).map(|s| s.ask.side);
         for side in [Side::Old, Side::New] {
@@ -1366,6 +1496,7 @@ impl App {
         }
         if shown.is_some() {
             self.ask_again();
+            self.start_uses();
         }
     }
 
@@ -1422,7 +1553,13 @@ impl App {
             parts.push(format!("{k} {}", self.version_name(side.other())));
         }
         if let Some(k) = key(Act::References) {
-            parts.push(format!("{k} uses"));
+            parts.push(format!("{k} definitions/uses"));
+        }
+        if let Some(k) = key(Act::CallsOnly) {
+            parts.push(format!("{k} calls"));
+        }
+        if let Some(k) = key(Act::UsesInDiff) {
+            parts.push(format!("{k} in diff"));
         }
         if let Some(k) = key(Act::ClosePeek) {
             parts.push(format!("{k} close"));
@@ -1450,12 +1587,14 @@ impl App {
                 Act::OtherVersion,
             ));
         }
-        let uses = if self.doc.def_peek().is_some_and(Peek::on_references) {
+        let uses = if self.doc.def_peek().is_some_and(Peek::on_a_use) {
             "Definitions"
         } else {
-            "References"
+            "Uses"
         };
         entries.push(entry(uses, Act::References));
+        entries.push(entry("Calls only", Act::CallsOnly));
+        entries.push(entry("Uses in diff", Act::UsesInDiff));
         entries.push(entry("Close", Act::ClosePeek));
         entries
     }

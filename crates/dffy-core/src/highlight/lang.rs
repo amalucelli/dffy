@@ -9,6 +9,7 @@ use std::sync::{Arc, OnceLock};
 use gix::bstr::ByteSlice;
 
 use super::Compiled;
+use super::locals::LocalsQuery;
 use super::scope::ScopeQuery;
 use super::tags::{TagsError, TagsQuery};
 use crate::git::ObjectId;
@@ -46,6 +47,10 @@ pub struct Grammar {
     /// defines, for go-to-definition (see [`super::definitions`]). Empty
     /// for a language without one.
     pub tags: Words,
+    /// The locals query, as parts concatenated in order: the scopes of a
+    /// function and the names they define, for what a name used there
+    /// names (see [`super::locals`]). Empty for a language without one.
+    pub locals: Words,
     /// A line's indentation is syntax: changing it can move code into or
     /// out of a block with the same tokens in the same order, so the
     /// syntax diff never calls such a change only reformatting.
@@ -78,6 +83,7 @@ struct Entry {
     compiled: OnceLock<Option<Compiled>>,
     scopes: OnceLock<Option<ScopeQuery>>,
     tags: OnceLock<Option<Result<TagsQuery, TagsError>>>,
+    locals: OnceLock<Option<LocalsQuery>>,
     identity: OnceLock<ObjectId>,
     tags_identity: OnceLock<ObjectId>,
     #[cfg(test)]
@@ -106,6 +112,7 @@ impl Language {
             compiled: OnceLock::new(),
             scopes: OnceLock::new(),
             tags: OnceLock::new(),
+            locals: OnceLock::new(),
             identity: OnceLock::new(),
             tags_identity: OnceLock::new(),
             #[cfg(test)]
@@ -264,6 +271,26 @@ impl Language {
         self.0.compiled.get().is_some()
     }
 
+    /// The compiled locals query, compiling it on first use. `None` for a
+    /// language without one, or if it doesn't compile.
+    pub(super) fn locals_query(&self) -> Option<&LocalsQuery> {
+        let g = &self.0.grammar;
+        self.0
+            .locals
+            .get_or_init(|| {
+                (!g.locals.is_empty())
+                    .then(|| LocalsQuery::new(self.grammar(), &g.locals.concat()))
+                    .flatten()
+            })
+            .as_ref()
+    }
+
+    /// Whether [`Grammar::locals`] has a query, compiled or not.
+    #[must_use]
+    pub fn has_locals(&self) -> bool {
+        !self.0.grammar.locals.is_empty()
+    }
+
     /// Whether [`Grammar::tags`] has a query, compiled or not.
     #[must_use]
     pub fn has_tags(&self) -> bool {
@@ -378,6 +405,7 @@ fn builtin() -> [Grammar; 30] {
         highlights: words![],
         scopes: words![],
         tags: words![],
+        locals: words![],
         indentation_is_syntax: false,
     };
     [
@@ -405,6 +433,7 @@ fn builtin() -> [Grammar; 30] {
             highlights: words![tree_sitter_c::HIGHLIGHT_QUERY],
             scopes: words![include_str!("queries/c/scopes.scm")],
             tags: words![include_str!("queries/c/tags.scm")],
+            locals: words![include_str!("queries/c/locals.scm")],
             ..grammar("c", || tree_sitter_c::LANGUAGE.into())
         },
         Grammar {
@@ -423,6 +452,7 @@ fn builtin() -> [Grammar; 30] {
                 include_str!("queries/cpp/tags.scm"),
                 include_str!("queries/c/tags.scm"),
             ],
+            locals: words![include_str!("queries/c/locals.scm")],
             ..grammar("cpp", || tree_sitter_cpp::LANGUAGE.into())
         },
         Grammar {
@@ -454,6 +484,7 @@ fn builtin() -> [Grammar; 30] {
             highlights: words![tree_sitter_go::HIGHLIGHTS_QUERY],
             scopes: words![include_str!("queries/go/scopes.scm")],
             tags: words![include_str!("queries/go/tags.scm")],
+            locals: words![include_str!("queries/go/locals.scm")],
             ..grammar("go", || tree_sitter_go::LANGUAGE.into())
         },
         Grammar {
@@ -484,6 +515,10 @@ fn builtin() -> [Grammar; 30] {
             tags: words![
                 include_str!("queries/javascript/tags.scm"),
                 include_str!("queries/javascript/fields.scm"),
+            ],
+            locals: words![
+                include_str!("queries/javascript/locals.scm"),
+                include_str!("queries/javascript/parameters.scm"),
             ],
             ..grammar("javascript", || tree_sitter_javascript::LANGUAGE.into())
         },
@@ -532,6 +567,7 @@ fn builtin() -> [Grammar; 30] {
             indentation_is_syntax: true,
             scopes: words![include_str!("queries/python/scopes.scm")],
             tags: words![include_str!("queries/python/tags.scm")],
+            locals: words![include_str!("queries/python/locals.scm")],
             ..grammar("python", || tree_sitter_python::LANGUAGE.into())
         },
         Grammar {
@@ -547,6 +583,7 @@ fn builtin() -> [Grammar; 30] {
             highlights: words![tree_sitter_rust::HIGHLIGHTS_QUERY],
             scopes: words![include_str!("queries/rust/scopes.scm")],
             tags: words![include_str!("queries/rust/tags.scm")],
+            locals: words![include_str!("queries/rust/locals.scm")],
             ..grammar("rust", || tree_sitter_rust::LANGUAGE.into())
         },
         Grammar {
@@ -589,6 +626,10 @@ fn builtin() -> [Grammar; 30] {
                 include_str!("queries/javascript/tags.scm"),
                 include_str!("queries/typescript/tags.scm"),
             ],
+            locals: words![
+                include_str!("queries/javascript/locals.scm"),
+                include_str!("queries/typescript/locals.scm"),
+            ],
             ..grammar("tsx", || tree_sitter_typescript::LANGUAGE_TSX.into())
         },
         Grammar {
@@ -604,6 +645,10 @@ fn builtin() -> [Grammar; 30] {
             tags: words![
                 include_str!("queries/javascript/tags.scm"),
                 include_str!("queries/typescript/tags.scm"),
+            ],
+            locals: words![
+                include_str!("queries/javascript/locals.scm"),
+                include_str!("queries/typescript/locals.scm"),
             ],
             ..grammar("typescript", || {
                 tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into()

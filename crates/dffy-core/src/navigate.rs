@@ -27,7 +27,7 @@
 use std::cmp::Reverse;
 use std::hash::{Hash as _, Hasher as _};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak, mpsc};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError, mpsc};
 use std::time::Duration;
 
 use gix::bstr::{BStr, BString, ByteSlice};
@@ -44,9 +44,12 @@ use crate::view;
 mod imports;
 mod names;
 mod references;
+mod resolve;
+mod store;
 
 pub use names::{name_at, names};
-pub use references::{MAX_REFERENCE_FILES, MAX_REFERENCE_LINES, Reference, References};
+pub use references::{Filter, MAX_REFERENCE_FILES, MAX_REFERENCE_LINES, Reference, References};
+use store::{Locator, Postings, Store};
 
 /// How many of the asking file's included files, directly or through
 /// others, count as included. Past it a kernel source's headers are mostly
@@ -75,6 +78,10 @@ const MAX_CANDIDATES: usize = 200;
 /// Files the text search skips, by their size before they're read:
 /// generated tables, not code a name is used in.
 const MAX_SEARCH_BYTES: u64 = 8 << 20;
+
+/// Postings an index keeps in memory before it writes them to the store
+/// as a run.
+const FRESH_POSTINGS: usize = 1 << 16;
 
 /// Files of a working-tree overlay per chunk of the index build.
 const OVERLAY_CHUNK: usize = 64;
@@ -192,17 +199,27 @@ pub struct Diff<'a> {
 }
 
 /// Definitions read once and shared by every navigator a host makes with
-/// it, both sides of a diff and those made again after a reload, by blob.
-/// It holds them weakly: a blob's stay as long as a navigator has them.
+/// it, both sides of a diff and those made again after a reload: each
+/// file's are kept in a store file (see `store.rs`), and a blob's are
+/// written there once, whichever navigator reads them first. The file is
+/// unlinked from the start and goes once no navigator holds it.
+///
+/// What the navigators gone held stays in the file, dead. A navigator made
+/// when the file holds more dead bytes than live starts another, which the
+/// navigators after it share: a watched working tree's navigators, made
+/// again on each change, keep the files no larger than about twice what
+/// the live navigators hold, three times where both sides hold a blob.
 /// Cloning shares it.
 #[derive(Debug, Clone, Default)]
-pub struct Shared(Arc<Mutex<SharedEntries>>);
+pub struct Shared(Arc<Mutex<Arc<Generation>>>);
 
+/// One store file, and what's in it: the blobs' definitions by key, and
+/// the bytes its live navigators hold.
 #[derive(Debug, Default)]
-struct SharedEntries {
-    by_key: FxHashMap<ObjectId, Weak<Entry>>,
-    /// The size past which entries no navigator holds are dropped.
-    prune_at: usize,
+struct Generation {
+    by_key: Mutex<FxHashMap<ObjectId, Locator>>,
+    store: Store,
+    held: AtomicU64,
 }
 
 impl Shared {
@@ -212,22 +229,49 @@ impl Shared {
         Self::default()
     }
 
-    fn entries(&self) -> MutexGuard<'_, SharedEntries> {
-        // Nothing panics while the map is held half changed.
-        self.0.lock().unwrap_or_else(PoisonError::into_inner)
+    fn current(&self) -> Arc<Generation> {
+        // Nothing panics while it's held half changed.
+        Arc::clone(&self.0.lock().unwrap_or_else(PoisonError::into_inner))
     }
 
-    fn get(&self, key: &ObjectId) -> Option<Arc<Entry>> {
-        self.entries().by_key.get(key)?.upgrade()
-    }
-
-    fn insert(&self, key: ObjectId, entry: &Arc<Entry>) {
-        let mut shared = self.entries();
-        shared.by_key.insert(key, Arc::downgrade(entry));
-        if shared.by_key.len() > shared.prune_at {
-            shared.by_key.retain(|_, e| e.strong_count() > 0);
-            shared.prune_at = (2 * shared.by_key.len()).max(1024);
+    /// The generation a new navigator stores in: the current one, or
+    /// another when the current holds more dead bytes than live.
+    fn for_new(&self) -> Arc<Generation> {
+        let mut current = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        let (stored, held) = (current.store.len(), current.held.load(Ordering::Relaxed));
+        if stored.saturating_sub(held) > held {
+            *current = Arc::default();
         }
+        Arc::clone(&current)
+    }
+
+    /// Why definitions are kept in memory rather than in the store's file,
+    /// when it couldn't be made or written: a host shows it.
+    #[must_use]
+    pub fn note(&self) -> Option<String> {
+        self.current().store.note()
+    }
+
+    /// Bytes written to the current store file so far.
+    #[must_use]
+    pub fn stored_bytes(&self) -> u64 {
+        self.current().store.len()
+    }
+}
+
+impl Generation {
+    fn get(&self, key: &ObjectId) -> Option<Locator> {
+        let by_key = self.by_key.lock().unwrap_or_else(PoisonError::into_inner);
+        by_key.get(key).copied()
+    }
+
+    fn insert(&self, key: ObjectId, at: Locator) {
+        let mut by_key = self.by_key.lock().unwrap_or_else(PoisonError::into_inner);
+        by_key.insert(key, at);
+    }
+
+    fn store(&self) -> &Store {
+        &self.store
     }
 }
 
@@ -241,6 +285,18 @@ pub struct Origin {
     /// C headers for C++). With an empty path, no file asks, and only the
     /// language's own files answer.
     pub language: Language,
+}
+
+/// Where in the asking file a lookup's name is used, for what the use
+/// tells about it: the local or parameter it names, the import it came in
+/// through, the type of the value it's a member of.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Use {
+    /// The line, 0-based.
+    pub line: usize,
+    /// The byte of the line where the name starts; `None` when only the
+    /// line is known, for the name's first use in code on it.
+    pub column: Option<usize>,
 }
 
 /// How close a candidate is to the asking file, closest first.
@@ -408,6 +464,7 @@ impl TextMatches {
         let word = self.name.as_bytes();
         let mut out = Vec::new();
         let mut stopped = false;
+        let mut text = references::take_buffer();
         while !self.done() {
             if stop() {
                 stopped = true;
@@ -423,10 +480,7 @@ impl TextMatches {
             {
                 continue;
             }
-            let Ok(text) = repo.load(path, side) else {
-                continue;
-            };
-            if git::is_binary(&text) {
+            if repo.load_into(path, side, &mut text).is_err() || git::is_binary(&text) {
                 continue;
             }
             let (mut line, mut counted, mut last) = (0, 0, None);
@@ -460,6 +514,7 @@ impl TextMatches {
                 }
             }
         }
+        references::give_back(text);
         // Stopped, it doesn't diff files for the facts either.
         navigator.facts_from(repo, &mut out, self.found, &AtomicBool::new(stopped));
         self.found += out.len();
@@ -501,28 +556,16 @@ struct Indexed {
     key: Option<ObjectId>,
 }
 
-/// A file's definitions, kept compact: the cached form, and the hashes of
-/// the names in it to tell without decoding whether it has a name.
-#[derive(Debug)]
-struct Entry {
-    encoded: Box<[u8]>,
-    hashes: Box<[u32]>,
-}
+/// A file's definitions as the index takes them in: where they're stored,
+/// and the [`hash`]es of their names, for its postings.
+type Stored = (Locator, Vec<u32>);
 
-impl Entry {
-    fn new(defs: &Definitions, encoded: Box<[u8]>) -> Self {
-        let mut hashes: Vec<u32> = defs.names().map(hash).collect();
-        hashes.sort_unstable();
-        hashes.dedup();
-        Self {
-            encoded,
-            hashes: hashes.into(),
-        }
-    }
-
-    fn has(&self, hash: u32) -> bool {
-        self.hashes.binary_search(&hash).is_ok()
-    }
+/// The [`hash`]es of the names `defs` has, each once.
+fn name_hashes(defs: &Definitions) -> Vec<u32> {
+    let mut hashes: Vec<u32> = defs.names().map(hash).collect();
+    hashes.sort_unstable();
+    hashes.dedup();
+    hashes
 }
 
 /// The [`hash`] of each word of letters, digits and `_` in `text`.
@@ -548,7 +591,7 @@ enum Slot {
     Taken,
     /// `None` for a file with no definitions to give: too large, timed
     /// out, unreadable.
-    Found(Option<Arc<Entry>>),
+    Found(Option<Locator>),
 }
 
 /// The files the index hasn't got yet, a chunk each: one of the symbol
@@ -568,10 +611,15 @@ struct State {
     stats: BuildStats,
     related: FxHashMap<BString, Arc<Related>>,
     /// Each name's [`hash`] with each indexed file whose definitions have
-    /// it, sorted, so a lookup reads only those files; and those taken in
-    /// since it was last sorted.
-    postings: Vec<(u32, u32)>,
+    /// it, so a lookup reads only those files: those taken in last, and
+    /// runs of earlier ones written to the store, merged into one once
+    /// every file is in. None of them grow large in memory: memory freed
+    /// stays with the process.
     fresh: Vec<(u32, u32)>,
+    runs: Vec<Postings>,
+    merged: bool,
+    /// The store's bytes its definitions and postings take.
+    held: u64,
     /// Files whose parse took longer than the local tier gives one: later
     /// lookups leave them to the index build.
     timed_out: FxHashSet<u32>,
@@ -581,30 +629,41 @@ struct State {
 
 impl State {
     /// The indexed files whose definitions have a name hashed `wanted`,
-    /// sorting in what was taken in since the last ask.
-    fn posted(&mut self, wanted: u32) -> impl Iterator<Item = u32> + '_ {
-        if !self.fresh.is_empty() {
-            let mut fresh = std::mem::take(&mut self.fresh);
-            fresh.sort_unstable();
-            let old = std::mem::take(&mut self.postings);
-            let mut merged = Vec::with_capacity(old.len() + fresh.len());
-            let (mut i, mut j) = (0, 0);
-            while i < old.len() && j < fresh.len() {
-                if old[i] <= fresh[j] {
-                    merged.push(old[i]);
-                    i += 1;
-                } else {
-                    merged.push(fresh[j]);
-                    j += 1;
-                }
-            }
-            merged.extend_from_slice(&old[i..]);
-            merged.extend_from_slice(&fresh[j..]);
-            self.postings = merged;
+    /// ascending; `None` when the postings in the store can't be read.
+    fn posted(&self, store: &Store, wanted: u32) -> Option<Vec<u32>> {
+        let mut files: Vec<u32> = (self.fresh.iter())
+            .filter(|p| p.0 == wanted)
+            .map(|p| p.1)
+            .collect();
+        for run in &self.runs {
+            files.extend(store.posted(run, wanted)?);
         }
-        let start = self.postings.partition_point(|p| p.0 < wanted);
-        let end = self.postings.partition_point(|p| p.0 <= wanted);
-        self.postings[start..end].iter().map(|p| p.1)
+        files.sort_unstable();
+        files.dedup();
+        Some(files)
+    }
+
+    /// Writes the postings taken in last to the store as a run, once there
+    /// are [`FRESH_POSTINGS`] of them, or with `all` every one, the runs
+    /// merged into one. `None` when the runs can't be read back.
+    fn flush(&mut self, store: &Store, all: bool) -> Option<()> {
+        if (!all && self.fresh.len() < FRESH_POSTINGS) || !store.ready() {
+            return Some(());
+        }
+        self.fresh.sort_unstable();
+        let fresh = std::mem::take(&mut self.fresh);
+        if all {
+            let run = store.merge_postings(&self.runs, fresh.into_iter())?;
+            self.held -= self.runs.iter().map(Postings::len).sum::<u64>();
+            self.held += run.len();
+            self.runs = vec![run];
+            self.merged = true;
+        } else {
+            let run = store.put_postings(fresh);
+            self.held += run.len();
+            self.runs.push(run);
+        }
+        Some(())
     }
 }
 
@@ -663,11 +722,14 @@ pub struct Navigator {
     /// The folders holding a `Cargo.toml`, with a trailing `/`; empty for
     /// the root.
     crates: Vec<BString>,
-    shared: Shared,
+    /// The store file it keeps its definitions in.
+    shared: Arc<Generation>,
     state: Mutex<State>,
     touched: Mutex<FxHashMap<BString, Arc<Touched>>>,
     /// [`LOCAL_BUDGET`], but in tests.
     local_budget: Duration,
+    /// The last asking files' parses, for what a use tells.
+    kept: resolve::Kept,
 }
 
 impl Navigator {
@@ -740,8 +802,10 @@ impl Navigator {
             done: 0,
             stats: BuildStats::default(),
             related: FxHashMap::default(),
-            postings: Vec::new(),
             fresh: Vec::new(),
+            runs: Vec::new(),
+            merged: false,
+            held: 0,
             timed_out: FxHashSet::default(),
             front: FxHashSet::default(),
         };
@@ -760,10 +824,11 @@ impl Navigator {
             languages,
             arches,
             crates,
-            shared: shared.clone(),
+            shared: shared.for_new(),
             state: Mutex::new(state),
             touched: Mutex::new(FxHashMap::default()),
             local_budget: LOCAL_BUDGET,
+            kept: resolve::Kept::default(),
         })
     }
 
@@ -880,7 +945,7 @@ impl Navigator {
                 return Some(Chunk {
                     pack: queued.pack,
                     work,
-                    shared: self.shared.clone(),
+                    shared: Arc::clone(&self.shared),
                 });
             }
         }
@@ -915,19 +980,88 @@ impl Navigator {
         self.requeue(chunk.pack, chunk.work.into_iter().map(|w| w.file).collect());
     }
 
-    fn take_in(&self, found: Vec<(u32, Option<Arc<Entry>>)>, did: BuildStats) {
+    fn take_in(&self, found: Vec<(u32, Option<Stored>)>, did: BuildStats) {
         let mut state = self.state();
-        for (f, entry) in found {
+        let before = state.held;
+        for (f, stored) in found {
             if matches!(state.slots[f as usize], Slot::Found(_)) {
                 continue;
             }
-            if let Some(entry) = &entry {
-                state.fresh.extend(entry.hashes.iter().map(|&h| (h, f)));
-            }
-            state.slots[f as usize] = Slot::Found(entry);
+            let at = stored.map(|(at, hashes)| {
+                state.fresh.extend(hashes.into_iter().map(|h| (h, f)));
+                state.held += at.len();
+                at
+            });
+            state.slots[f as usize] = Slot::Found(at);
             state.done += 1;
         }
         state.stats.add(did);
+        let built = state.done == self.indexed.len();
+        let flushed = if built && !state.merged {
+            state.flush(self.shared.store(), true)
+        } else {
+            state.flush(self.shared.store(), false)
+        };
+        self.held(before, state.held);
+        if flushed.is_none() {
+            self.reindex(&mut state);
+        }
+    }
+
+    /// Tells the store this navigator holds `after` bytes of it where it
+    /// held `before`.
+    fn held(&self, before: u64, after: u64) {
+        let held = &self.shared.held;
+        if after >= before {
+            held.fetch_add(after - before, Ordering::Relaxed);
+        } else {
+            held.fetch_sub(before - after, Ordering::Relaxed);
+        }
+    }
+
+    /// Takes every file out of the index, to be read again: its postings
+    /// in the store couldn't be.
+    fn reindex(&self, state: &mut State) {
+        self.held(std::mem::take(&mut state.held), 0);
+        state.slots.fill_with(|| Slot::Todo);
+        state.queue = queue(&self.indexed);
+        state.done = 0;
+        state.fresh = Vec::new();
+        state.runs = Vec::new();
+        state.merged = false;
+        state.front.clear();
+    }
+
+    /// Takes `files` (indexed numbers) out of the index, to be read again:
+    /// their stored definitions couldn't be.
+    fn unread(&self, files: &[u32]) {
+        let mut state = self.state();
+        let before = state.held;
+        for &f in files {
+            if let Slot::Found(at) = state.slots[f as usize] {
+                state.held -= at.map_or(0, Locator::len);
+                state.slots[f as usize] = Slot::Todo;
+                state.done -= 1;
+                state.front.remove(&f);
+            }
+        }
+        self.held(before, state.held);
+        drop(state);
+        self.prioritize(files.iter().copied());
+    }
+
+    /// Why the definitions are kept in memory rather than in the store's
+    /// file, if they are: for the host to show.
+    #[must_use]
+    pub fn note(&self) -> Option<String> {
+        self.shared.store.note()
+    }
+
+    /// The index's postings are in the store's file, as one run.
+    #[cfg(test)]
+    fn postings_written(&self) -> bool {
+        let state = self.state();
+        state.merged && state.runs.len() == 1 && state.fresh.is_empty()
     }
 
     /// Puts those of `files` (indexed numbers) not built yet first in the
@@ -1076,7 +1210,7 @@ impl Navigator {
                 .map(|p| packs.entry(p).or_insert_with(|| LazyPack::new(cache, p)));
             match self
                 .work(f)
-                .entry(repo, pack, &self.shared, budget, &mut stats)
+                .entry(repo, (cache, pack), &self.shared, budget, &mut stats)
             {
                 Ok(Got::Entry(entry)) => found.push((f, entry)),
                 Ok(Got::TimedOut) => {
@@ -1122,6 +1256,25 @@ impl Navigator {
         cache: &SymbolCache,
         name: &str,
         origin: &Origin,
+        cancel: &AtomicBool,
+    ) -> Result<Lookup, Error> {
+        self.lookup_at(repo, cache, name, origin, None, cancel)
+    }
+
+    /// [`Navigator::lookup`] of the name used at `at` in the asking file:
+    /// what the use itself tells comes first (see [`Use`]). Without a
+    /// place, as [`Navigator::lookup`].
+    ///
+    /// # Errors
+    ///
+    /// As [`Navigator::lookup`].
+    pub fn lookup_at(
+        &self,
+        repo: &Repo,
+        cache: &SymbolCache,
+        name: &str,
+        origin: &Origin,
+        at: Option<Use>,
         cancel: &AtomicBool,
     ) -> Result<Lookup, Error> {
         if name.is_empty() {
@@ -1174,13 +1327,18 @@ impl Navigator {
         let wanted = hash(name);
         let (hits, progress) = {
             let mut state = self.state();
-            let posted: Vec<u32> = state.posted(wanted).collect();
-            let hits: Vec<(u32, Arc<Entry>)> = (posted.into_iter())
-                .filter_map(|f| match &state.slots[f as usize] {
-                    Slot::Found(Some(entry)) => {
+            let posted = state
+                .posted(self.shared.store(), wanted)
+                .unwrap_or_else(|| {
+                    self.reindex(&mut state);
+                    Vec::new()
+                });
+            let hits: Vec<(u32, Locator)> = (posted.into_iter())
+                .filter_map(|f| match state.slots.get(f as usize) {
+                    Some(&Slot::Found(Some(at))) => {
                         let indexed = &self.indexed[f as usize];
                         let of = self.languages[usize::from(indexed.language)].name();
-                        sees(of).then(|| (indexed.listed, Arc::clone(entry)))
+                        sees(of).then_some((f, at))
                     }
                     _ => None,
                 })
@@ -1193,6 +1351,7 @@ impl Navigator {
         };
         let mut candidates = self.defined(hits, name, language);
         self.rank(&mut candidates, &related, origin);
+        self.resolve(repo, cache, (name, at), origin, &mut candidates, cancel);
         let total = candidates.len();
         candidates.truncate(MAX_CANDIDATES);
         self.facts(repo, &mut candidates, cancel);
@@ -1209,7 +1368,7 @@ impl Navigator {
     /// The definitions of `name` in `hits`, the indexed files that have
     /// it, with a re-export only where it is one, and the files that are
     /// module `name` in `language`; unranked.
-    fn defined(&self, hits: Vec<(u32, Arc<Entry>)>, name: &str, language: &str) -> Vec<Candidate> {
+    fn defined(&self, hits: Vec<(u32, Locator)>, name: &str, language: &str) -> Vec<Candidate> {
         let candidate = |l: u32, kind, start, end, container| {
             let listed = &self.listed[l as usize];
             Candidate {
@@ -1225,10 +1384,13 @@ impl Navigator {
             }
         };
         let mut candidates = Vec::new();
-        for (l, entry) in hits {
-            let Some(defs) = Definitions::decode(&entry.encoded) else {
+        let mut unread = Vec::new();
+        for (f, at) in hits {
+            let Some(defs) = self.read(at) else {
+                unread.push(f);
                 continue;
             };
+            let l = self.indexed[f as usize].listed;
             let path = self.listed[l as usize].path.as_ref();
             for d in defs.iter().filter(|d| d.name == name) {
                 if d.kind != DefinitionKind::Reexport || imports::reexports(path) {
@@ -1240,7 +1402,16 @@ impl Navigator {
         for l in self.module_files(name, language) {
             candidates.push(candidate(l, DefinitionKind::Module, 0, 0, None));
         }
+        if !unread.is_empty() {
+            self.unread(&unread);
+        }
         candidates
+    }
+
+    /// The definitions stored at `at`; `None` when they can't be read
+    /// whole.
+    fn read(&self, at: Locator) -> Option<Definitions> {
+        Definitions::decode(&self.shared.store().read(at)?)
     }
 
     /// Each line of the side's files that uses `name` as a whole word, the
@@ -1359,13 +1530,19 @@ impl Navigator {
                 origin,
             );
         }
+        let from_test = resolve::is_test(origin.path.as_ref());
+        let mut packages = FxHashMap::default();
+        let own = self.package_of(origin.path.as_ref(), &mut packages);
         candidates.sort_by_cached_key(|c| {
             let unmentioned = (c.container.as_deref())
                 .is_some_and(|container| !related.words.contains(&hash(container)));
             (
                 c.kind == Some(DefinitionKind::Reexport),
                 c.rank,
+                resolve::kept_out(c.path.as_ref()),
                 unmentioned,
+                !from_test && resolve::is_test(c.path.as_ref()),
+                own.is_some() && self.package_of(c.path.as_ref(), &mut packages) != own,
                 depths.get(c.path.as_bstr()).copied().unwrap_or(u8::MAX),
                 foreign_arch(c.path.as_ref(), arch),
                 Reverse(shared_folders(&c.path, &origin.path)),
@@ -1621,13 +1798,20 @@ impl Navigator {
     }
 }
 
+impl Drop for Navigator {
+    fn drop(&mut self) {
+        let held = self.state().held;
+        self.held(held, 0);
+    }
+}
+
 /// A chunk of the index to build: the files of one of the symbol cache's
 /// packs, or a run of working-tree files.
 #[derive(Debug)]
 pub struct Chunk {
     pack: Option<usize>,
     work: Vec<Work>,
-    shared: Shared,
+    shared: Arc<Generation>,
 }
 
 #[derive(Debug)]
@@ -1643,7 +1827,7 @@ struct Work {
 #[derive(Debug)]
 pub struct Done {
     pack: Option<usize>,
-    found: Vec<(u32, Option<Arc<Entry>>)>,
+    found: Vec<(u32, Option<Stored>)>,
     rest: Vec<u32>,
     stats: BuildStats,
     error: Option<TagsError>,
@@ -1697,7 +1881,8 @@ impl Chunk {
                 break;
             }
             let budget = highlight::TAGS_PARSE_BUDGET;
-            match w.entry(repo, pack.as_mut(), &self.shared, budget, &mut done.stats) {
+            let stores = (cache, pack.as_mut());
+            match w.entry(repo, stores, &self.shared, budget, &mut done.stats) {
                 Ok(Got::Entry(entry)) => done.found.push((w.file, entry)),
                 Ok(Got::TimedOut) => {
                     done.stats.timed_out += 1;
@@ -1749,25 +1934,29 @@ impl<'c> LazyPack<'c> {
 /// What reading a file's definitions came to.
 enum Got {
     /// `None` for a file with none to give.
-    Entry(Option<Arc<Entry>>),
+    Entry(Option<Stored>),
     /// Its parse took longer than it was given.
     TimedOut,
 }
 
 impl Work {
     /// The file's definitions: from `shared` or `pack` when they have them,
-    /// else extracted with a parse given `budget`, and added to both.
+    /// else extracted with a parse given `budget`, and added to both; put in
+    /// `shared`'s store, in `cache`'s directory, either way.
     fn entry(
         &self,
         repo: &Repo,
-        pack: Option<&mut LazyPack>,
-        shared: &Shared,
+        (cache, pack): (&SymbolCache, Option<&mut LazyPack>),
+        shared: &Generation,
         budget: Duration,
         stats: &mut BuildStats,
     ) -> Result<Got, TagsError> {
-        if let Some(entry) = self.key.and_then(|key| shared.get(&key)) {
+        let dir = cache.as_cache().dir();
+        if let Some(at) = self.key.and_then(|key| shared.get(&key))
+            && let Some(defs) = Definitions::decode(&shared.store().read(at).unwrap_or_default())
+        {
             stats.cached += 1;
-            return Ok(Got::Entry(Some(entry)));
+            return Ok(Got::Entry(Some((at, name_hashes(&defs)))));
         }
         let mut stored = self.key.zip(pack);
         if let Some((key, pack)) = &mut stored
@@ -1779,9 +1968,9 @@ impl Work {
                 stats.too_large += 1;
                 return Ok(Got::Entry(None));
             };
-            let entry = Arc::new(Entry::new(&defs, raw.into()));
-            shared.insert(*key, &entry);
-            return Ok(Got::Entry(Some(entry)));
+            let at = shared.store().append(dir, raw);
+            shared.insert(*key, at);
+            return Ok(Got::Entry(Some((at, name_hashes(&defs)))));
         }
         let Ok(size) = repo.size(self.path.as_ref(), &self.side) else {
             stats.unreadable += 1;
@@ -1801,11 +1990,11 @@ impl Work {
             Ok(defs) => {
                 stats.extracted += 1;
                 let encoded = entry.unwrap_or_else(|| defs.encode());
-                let entry = Arc::new(Entry::new(&defs, encoded.into()));
+                let at = shared.store().append(dir, &encoded);
                 if let Some(key) = self.key {
-                    shared.insert(key, &entry);
+                    shared.insert(key, at);
                 }
-                Got::Entry(Some(entry))
+                Got::Entry(Some((at, name_hashes(&defs))))
             }
             Err(Skipped::TooLarge) => {
                 stats.too_large += 1;

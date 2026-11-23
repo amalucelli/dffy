@@ -215,15 +215,18 @@ Writes a reply in a thread, as `dffy comments apply` does ([comments.md](comment
 
 ### `definitions`
 
-Finds where a name is defined, as the viewer's go to definition does ([viewer.md](viewer.md#go-to-definition)), through the same lookup in dffy-core. It needs no viewer. Names are matched, not resolved: a name defined in several places has several candidates, nearest the asking file first. Read-only.
+Finds where a name is defined, as the viewer's go to definition does ([viewer.md](viewer.md#go-to-definition)), through the same lookup in dffy-core. It needs no viewer. Names are matched, and resolved where the asking file's imports tell: a name defined in several places has several candidates, nearest the asking file first. Read-only.
 
 | Input | Default | Meaning |
 |---|---|---|
 | `name` | required | The name: letters, digits and `_`. |
 | `path` | | The asking file, relative to the repository root, in a language go to definition reads ([viewer.md](viewer.md#go-to-definition) lists them): its own definitions, then what it includes or imports, then its folder or crate rank first. Without it, every definition of the name counts, by path, the first 200 listed. Another language's file is a tool error, and so is a version with no file of those languages. |
+| `line`, `column` | | Where the name is used in `path`, 1-based, in the version looked in; `column` is a byte of the line, and without it the name's first use in code on the line counts. With them the answer is much better: what the use itself names comes first, a local variable, a parameter or the import that brings the name in, and an import under another name finds what it names. They need `path`. |
 | `side` | `new` | Which version of the diff to look in: `new` or `old`. |
 | `range`, `since_checkpoint` | uncommitted changes | The diff, as for `file_diff`. Without them, `new` is the working tree and `old` is `HEAD`. |
 | `references` | `false` | Add the lines using the name. |
+| `calls_only` | `false` | With `references`, only the lines calling the name: followed by its arguments, past a Rust macro's `!` or type arguments. |
+| `in_diff` | `false` | With `references`, only the lines in files this diff changes. |
 | `limit` | 100 | Lines using the name per page, 1 to 1000. |
 | `cursor` | | The previous page's `next_cursor`, which continues `references`. |
 
@@ -233,7 +236,7 @@ Finds where a name is defined, as the viewer's go to definition does ([viewer.md
 
 | Field | Meaning |
 |---|---|
-| `candidates` | The definitions found, best first, at most 200. `start` and `end` are the definition's first and last lines, 1-based. `kind` is `function`, `method`, `macro`, `type`, `struct`, `union`, `enum`, `enumerator`, `trait`, `constant`, `static`, `variable` or `module`. `container` is the type a method or an item of an impl or trait is on. `changed` says the diff changes the file; `in_hunk` says it adds or removes lines inside the definition, null where that wasn't worked out (past the first few candidates). `text` is the first line. |
+| `candidates` | The definitions found, best first, at most 200. `start` and `end` are the definition's first and last lines, 1-based. `kind` is `function`, `method`, `macro`, `type`, `struct`, `union`, `enum`, `enumerator`, `trait`, `constant`, `static`, `variable`, `module`, or, with `line`, `local`, `parameter` or `import` for what the asking file itself defines the name as. `container` is the type a method or an item of an impl or trait is on. `changed` says the diff changes the file; `in_hunk` says it adds or removes lines inside the definition, null where that wasn't worked out (past the first few candidates). `text` is the first line. |
 | `total` | Definitions found, beyond those listed. |
 | `progress`, `partial` | How far the version's index of definitions is built. The first call starts the navigator helper ([navigate.md](navigate.md)), which builds it on 2 threads at a nice of 10 and keeps it in the disk cache for later runs; a helper that exits is started again on the next call, at most 3 times a minute, and one that can't start, or keeps exiting, is a tool error, `definitions unavailable: …`. While `partial` is true, a definition may be missing: the answer comes from the files built so far and from the asking file's own includes and uses, read on the spot. Ask again for the full answer. |
 | `text_match` | No definition was found, so `candidates` are up to 50 lines using the name as a whole word, `kind` null, closest files first. A call searches for about 2 seconds; the next call with the same arguments goes on with the same search. |

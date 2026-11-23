@@ -359,16 +359,20 @@ const TOOLS: &str = r#"[
 {
   "name": "definitions",
   "title": "Where a name is defined",
-  "description": "Find where a name (a function, macro, type, class, struct, enum, constant, method, field...) is defined, in Bash, C, C++, C#, Elixir, Go, Java, JavaScript, Kotlin, Lua, PHP, Python, Ruby, Rust, Scala, Swift, TypeScript or Zig code, at either version of a diff, without a language server: names are matched, not resolved, so a common name may have several candidates, nearest first (the same file, then the files it includes or imports, then the same folder or crate, then the rest). Each candidate says whether this diff changes its file (changed) and its lines (in_hunk). With path, the asking file and what it includes or imports rank first; without it, every definition of the name counts. The index of the version's definitions builds in the background from the first call: until it's done, partial is true and a definition may be missing; ask again for the full answer. A name with no definition found returns the lines using it, text_match true. references: true adds the lines using the name, past its definitions, comments and strings, in the first 200 files with one, paged: when next_cursor isn't null, call again with it as cursor and the same arguments. Read-only.",
+  "description": "Find where a name (a function, macro, type, class, struct, enum, constant, method, field...) is defined, in Bash, C, C++, C#, Elixir, Go, Java, JavaScript, Kotlin, Lua, PHP, Python, Ruby, Rust, Scala, Swift, TypeScript or Zig code, at either version of a diff, without a language server: names are matched, not resolved, so a common name may have several candidates, nearest first (the same file, then the files it includes or imports, then the same folder or crate, then the rest). Each candidate says whether this diff changes its file (changed) and its lines (in_hunk). With path, the asking file and what it includes or imports rank first; without it, every definition of the name counts. With line and column of the use in path as well, the answer is much better: a local variable, a parameter or an import the use refers to comes first, and an imported name under another name finds what it names. The index of the version's definitions builds in the background from the first call: until it's done, partial is true and a definition may be missing; ask again for the full answer. A name with no definition found returns the lines using it, text_match true. references: true adds the lines using the name, past its definitions, comments and strings, in the first 200 files with one, paged: when next_cursor isn't null, call again with it as cursor and the same arguments. Read-only.",
   "inputSchema": {
     "type": "object",
     "properties": {
       "name": {"type": "string", "description": "The name, as an identifier: letters, digits and _."},
       "path": {"type": "string", "description": "The file asking, relative to the repository root, a C or Rust file."},
+      "line": {"type": "integer", "minimum": 1, "description": "The line of path the name is used on, 1-based, in the version looked in."},
+      "column": {"type": "integer", "minimum": 1, "description": "Where on line the name starts, 1-based, in bytes; without it, the name's first use in code on the line."},
       "side": {"type": "string", "enum": ["old", "new"], "default": "new", "description": "Which version of the diff to look in: new for the files as changed, old for them before."},
       "range": {"type": ["string", "array"], "items": {"type": "string"}, "description": "The diff, as for changed_files. Omit for uncommitted changes: new is then the working tree."},
       "since_checkpoint": {"type": ["string", "integer"], "description": "As for changed_files, instead of range."},
       "references": {"type": "boolean", "default": false, "description": "Add the lines using the name."},
+      "calls_only": {"type": "boolean", "default": false, "description": "With references, only the lines calling the name."},
+      "in_diff": {"type": "boolean", "default": false, "description": "With references, only the lines in files this diff changes."},
       "limit": {"type": "integer", "minimum": 1, "maximum": 1000, "default": 100, "description": "Lines using the name per page."},
       "cursor": {"type": "string", "description": "next_cursor from the previous page."}
     },
@@ -836,6 +840,23 @@ impl Args<'_> {
                 .ok_or_else(|| {
                     "since_checkpoint must be \"latest\" or a checkpoint's number".to_owned()
                 }),
+        }
+    }
+
+    /// `definitions`' `line` and `column` of the use, 1-based, as the
+    /// core's 0-based place.
+    fn place(&self) -> Result<Option<navigate::Use>, String> {
+        let most = u32::MAX as usize;
+        match (
+            self.number("line", 0, [1, most])?,
+            self.number("column", 0, [1, most])?,
+        ) {
+            (0, 0) => Ok(None),
+            (0, _) => Err("column needs line".to_owned()),
+            (line, column) => Ok(Some(navigate::Use {
+                line: line - 1,
+                column: column.checked_sub(1),
+            })),
         }
     }
 
@@ -1822,6 +1843,8 @@ type SearchKey = (u64, String, BString, String);
 /// A search for a name's uses in the helper and the lines it found so far.
 struct Search {
     key: SearchKey,
+    /// Which uses it keeps.
+    filter: navigate::Filter,
     /// Its id in the helper.
     id: u64,
     hits: Vec<navigate::Reference>,
@@ -1949,10 +1972,14 @@ impl Server<'_> {
         args.only(&[
             "name",
             "path",
+            "line",
+            "column",
             "side",
             "range",
             "since_checkpoint",
             "references",
+            "calls_only",
+            "in_diff",
             "limit",
             "cursor",
         ])?;
@@ -1976,6 +2003,10 @@ impl Server<'_> {
             .as_deref()
             .map(|path| asking_file(&range.plan, path))
             .transpose()?;
+        let at = args.place()?;
+        if at.is_some() && asking.is_none() {
+            return Err("line and column are of the use in path: give path too".to_owned());
+        }
         let (helper, opened) = self.navigator(&repo, snapshots, side)?;
         let origins: Vec<(BString, String)> = asking.map_or_else(
             || {
@@ -1991,7 +2022,7 @@ impl Server<'_> {
         let deadline = Deadline::start(self.navigation.budget);
         let found = found_definitions(
             (&helper, &opened),
-            (&name, &origins),
+            (&name, &origins, at),
             &mut self.navigation.texts,
             &deadline,
         )?;
@@ -1999,17 +2030,33 @@ impl Server<'_> {
         let lines = candidate_lines(&repo, &found.candidates);
 
         let mut h = request_hash("definitions", &range);
-        (&name, &path, side == Side::Old, &opened.fingerprint, limit).hash(&mut h);
+        let filter = navigate::Filter {
+            calls_only: args.bool("calls_only", false)?,
+            in_diff: args.bool("in_diff", false)?,
+        };
+        (
+            &name,
+            &path,
+            side == Side::Old,
+            &opened.fingerprint,
+            limit,
+            filter,
+        )
+            .hash(&mut h);
         let fingerprint = h.finish();
         let start = cursor.map_or(Ok((0, 0)), |c| c.check(fingerprint))?.0;
         let wanted = start.saturating_add(limit);
         let search = if with_references {
             let found = (&helper, &opened, progress);
-            Some(self.references(found, origin, &name, wanted, &deadline)?)
+            Some(self.references(found, origin, (&name, filter), wanted, &deadline)?)
         } else {
             None
         };
         let page = search.map(|search| Page::of(search, start..wanted, fingerprint));
+        let note = helper
+            .progress(opened.navigator)
+            .ok()
+            .and_then(|built| built.note);
         let answer = Answer {
             name: &name,
             side: if side == Side::Old { "old" } else { "new" },
@@ -2017,6 +2064,7 @@ impl Server<'_> {
             lines: &lines,
             progress,
             page,
+            note: note.as_deref(),
         };
         Ok(Output {
             structured: answer.object(),
@@ -2070,6 +2118,8 @@ struct Answer<'a> {
     progress: navigate::Progress,
     /// The page of uses, when they were asked for.
     page: Option<Page<'a>>,
+    /// Why the helper keeps the index in memory, when it does.
+    note: Option<&'a str>,
 }
 
 impl Answer<'_> {
@@ -2081,6 +2131,7 @@ impl Answer<'_> {
             lines,
             progress,
             page,
+            ..
         } = self;
         let mut s = String::from(r#"{"name":"#);
         string(&mut s, name);
@@ -2133,6 +2184,7 @@ impl Answer<'_> {
             lines,
             progress,
             page,
+            note,
         } = self;
         let FoundDefinitions {
             candidates,
@@ -2163,12 +2215,12 @@ impl Answer<'_> {
                 progress.done, progress.total
             );
         }
+        if let Some(note) = note {
+            let _ = write!(text, "\nNote: {note}.");
+        }
         text.push('\n');
         for (i, c) in candidates.iter().enumerate() {
-            let what = c.kind.map_or_else(
-                || "text match".to_owned(),
-                |k| format!("{k:?}").to_lowercase(),
-            );
+            let what = c.kind.map_or("text match", |k| k.name());
             let _ = write!(text, "{}:{}", c.path, c.start + 1);
             if c.end > c.start {
                 let _ = write!(text, "-{}", c.end + 1);
@@ -2236,7 +2288,7 @@ impl Server<'_> {
         &mut self,
         (helper, opened, progress): (&Helper, &Opened, navigate::Progress),
         (path, language): &(BString, String),
-        name: &str,
+        (name, filter): (&str, navigate::Filter),
         wanted: usize,
         deadline: &Deadline,
     ) -> Result<&Search, String> {
@@ -2247,7 +2299,9 @@ impl Server<'_> {
             path.clone(),
             name.to_owned(),
         );
-        let kept = (searches.iter().position(|s| s.key == key)).map(|at| searches.remove(at));
+        let kept = (searches.iter())
+            .position(|s| s.key == key && s.filter == filter)
+            .map(|at| searches.remove(at));
         let kept = kept.filter(|s| s.indexed || !(progress.complete() && s.done));
         let mut search = match kept {
             Some(search) => search,
@@ -2258,10 +2312,11 @@ impl Server<'_> {
                         "references",
                         name,
                         (path.as_slice(), language),
-                        0,
+                        (0, filter),
                     )
                     .map_err(|e| e.message)?,
                 key,
+                filter,
                 hits: Vec::new(),
                 files: 0,
                 done: false,
@@ -2330,7 +2385,7 @@ struct FoundDefinitions {
 /// it has [`TEXT_MATCHES`] lines or every file is searched.
 fn found_definitions(
     (helper, opened): (&Helper, &Opened),
-    (name, origins): (&str, &[(BString, String)]),
+    (name, origins, at): (&str, &[(BString, String)], Option<navigate::Use>),
     texts: &mut Vec<TextSearch>,
     deadline: &Deadline,
 ) -> Result<FoundDefinitions, String> {
@@ -2339,7 +2394,13 @@ fn found_definitions(
     let mut progress = opened.progress;
     for (path, language) in origins {
         let found = helper
-            .lookup(opened.navigator, name, (path.as_slice(), language), None)
+            .lookup(
+                opened.navigator,
+                name,
+                (path.as_slice(), language),
+                at,
+                None,
+            )
             .map_err(|e| e.message)?;
         total += found.total;
         progress = found.progress;
@@ -2367,7 +2428,7 @@ fn found_definitions(
                             "text",
                             name,
                             (path.as_slice(), language),
-                            TEXT_MATCHES,
+                            (TEXT_MATCHES, navigate::Filter::default()),
                         )
                         .map_err(|e| e.message)?,
                     key,
@@ -2828,6 +2889,58 @@ mod tests {
     /// A call searches for uses for its budget, at least a file, and
     /// answers with what it found: `complete` false and a cursor that
     /// continues the same search on the next call, until every file is.
+    /// `in_diff` keeps the uses in the files the diff changes, and
+    /// `calls_only` those calling the name: each a search of its own.
+    #[test]
+    fn uses_are_filtered_to_the_diff_and_to_calls() {
+        let (dir, cache) = (
+            tempfile::tempdir().expect("tempdir"),
+            tempfile::tempdir().expect("tempdir"),
+        );
+        let ctx = navigating(dir.path(), cache.path());
+        let mut server = server(dir.path(), &ctx);
+        indexed(&mut server, r#"{"name":"frob","path":"b.c"}"#);
+        let files = |server: &mut Server, filters: &str| {
+            let ask = format!(r#"{{"name":"frob","path":"b.c","references":true{filters}}}"#);
+            loop {
+                let found = tool(server, "definitions", &ask);
+                let refs = found.get("references").cloned().unwrap_or(Value::Null);
+                if refs.get("complete") == Some(&Value::Bool(true)) {
+                    let paths: Vec<String> = (refs.get("matches").and_then(Value::as_array))
+                        .expect("matches")
+                        .iter()
+                        .filter_map(|m| m.get("path").and_then(Value::as_str).map(str::to_owned))
+                        .collect();
+                    return paths;
+                }
+            }
+        };
+        assert_eq!(files(&mut server, ""), ["b.c", "a.c", "c.c", "d.c"]);
+        assert_eq!(files(&mut server, r#","in_diff":true"#), ["a.c"]);
+        assert_eq!(
+            files(&mut server, r#","calls_only":true"#),
+            ["b.c", "a.c", "c.c", "d.c"]
+        );
+    }
+
+    /// Where the helper can't keep the index in the cache's folder, a full
+    /// disk, the answer's text says it's kept in memory.
+    #[test]
+    fn the_answer_says_when_the_index_is_kept_in_memory() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let blocked = tempfile::NamedTempFile::new().expect("a file where the cache would be");
+        let ctx = navigating(dir.path(), blocked.path());
+        let mut server = server(dir.path(), &ctx);
+        indexed(&mut server, r#"{"name":"frob","path":"b.c"}"#);
+        let call = r#"{"name":"definitions","arguments":{"name":"frob","path":"b.c"}}"#;
+        let members =
+            (server.call(Some(&parse(call.as_bytes()).expect("json")))).expect("a tool result");
+        assert!(
+            members.contains("the definitions index is kept in memory"),
+            "{members}"
+        );
+    }
+
     #[test]
     fn a_search_for_uses_answers_within_its_budget_and_goes_on_next_call() {
         let (dir, cache) = (

@@ -36,7 +36,7 @@ struct Browsed {
     at: usize,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 struct Place {
     path: BString,
     /// The version a file opened outside the diff shows; `None` for the
@@ -51,6 +51,17 @@ struct Place {
     /// above it drawn then, as negative; rows of a wrapped line scrolled
     /// past, as positive.
     shift: isize,
+    /// The line a jump landed on, marked when the place was left, to mark
+    /// again on coming back; else the top line is. Not part of where the
+    /// place is.
+    mark: Option<(Side, usize)>,
+}
+
+impl PartialEq for Place {
+    fn eq(&self, other: &Self) -> bool {
+        (&self.path, self.whole, self.line, self.at, self.shift)
+            == (&other.path, other.whole, other.line, other.at, other.shift)
+    }
 }
 
 impl Place {
@@ -118,6 +129,8 @@ impl App {
             None => self.place(),
         };
         self.jumps.record(place);
+        // The place took the mark; where the jump lands marks its own.
+        self.doc.clear_landed();
     }
 
     /// Before showing entry `file`: a jump, unless it's the file shown, or
@@ -128,6 +141,7 @@ impl App {
             None if file != self.doc.document.pos.file => {
                 let place = self.place();
                 self.jumps.record(place);
+                self.doc.clear_landed();
             }
             Some(_) | None => {}
         }
@@ -251,6 +265,8 @@ impl App {
                 if let Some((side, line)) = place.line {
                     if self.doc.line_to_top(file, side, line) {
                         self.doc.scroll(place.shift);
+                        let (side, line) = place.mark.unwrap_or((side, line));
+                        self.doc.mark_landed(file, side, line);
                     } else {
                         let version = self.version_name(side);
                         self.message(format!("no line {} in {version} here", line + 1));
@@ -294,12 +310,16 @@ impl App {
                 (new.map(|line| (Side::New, line))).or_else(|| old.map(|line| (Side::Old, line)))
             }
         };
+        let mark = (self.doc.landed())
+            .filter(|&(f, ..)| f == file)
+            .map(|(_, side, line)| (side, line));
         let mut place = Place {
             path,
             whole,
             line,
             at: None,
             shift,
+            mark,
         };
         place.at = self.snapshot(place.side()).ok();
         Some(place)

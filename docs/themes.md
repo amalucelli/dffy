@@ -86,6 +86,7 @@ For example `bold #f8f8f2 on #44475a`.
 | `status-tag` | The chip in the status bar naming what's compared (`uncommitted`, `v6.0..v6.1`). |
 | `selection` | The selected row of the file tree, the picker and the command panel. Its background and attributes go over the row. Its text color applies only where the row's text has none, so status letters and counts keep their colors. Its background also tints a folded review thread that has the focus. |
 | `selection-inactive` | The tree's selected row while the diff has the focus. Its background also tints a folded review thread. |
+| `landed` | The line a jump landed on (a definition, back and forward, the control API's `view/open`), until the view moves. Its background and attributes go over the row, and its text color over the row's when it sets one; the `❯` in the line's gutter takes the whole style. The built-ins use `black on bright-blue` in `default`, `bold underline` in `mono`, and the palette's cyan mixed into its background in the others. |
 | `syntax-keyword` | Keywords. |
 | `syntax-string` | Strings. |
 | `syntax-escape` | Escape sequences in strings. |

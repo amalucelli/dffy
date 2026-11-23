@@ -13,6 +13,7 @@
 //! dropping patterns dffy doesn't draw saves little.
 
 mod lang;
+mod locals;
 mod scope;
 mod tags;
 
@@ -24,6 +25,7 @@ use rustc_hash::FxHashMap;
 use tree_sitter::{InputEdit, Parser, Point, Query, QueryCursor, StreamingIterator, Tree};
 
 pub use lang::{Grammar, Language, LanguageSource, Registry, Words};
+pub use locals::{Local, Receiver};
 pub use scope::Scopes;
 pub use tags::{
     Definition, DefinitionKind, Definitions, MAX_TAGS_BYTES, Skipped, TagsError, blob_definitions,
@@ -159,6 +161,37 @@ pub fn parse(lang: &Language, source: &[u8]) -> Option<Parsed> {
         tree,
         lang: lang.clone(),
     })
+}
+
+/// The local, the parameter or (for C) the file-scope variable the name
+/// at bytes `at` of `source`, in `lang` and parsed as `tree`, is, by the
+/// language's locals query; `None` for a language without one, or a name
+/// that isn't one.
+pub(crate) fn local_at(
+    lang: &Language,
+    tree: &Tree,
+    source: &[u8],
+    at: Range<usize>,
+) -> Option<Local> {
+    locals::resolve(lang.locals_query()?, lang.name(), tree, source, at)
+}
+
+/// The receiver of the member at bytes `at` of `source`, in `lang` and
+/// parsed as `tree`: what the asking file tells of its type; `None` when
+/// the name is no member.
+pub(crate) fn receiver_at(
+    lang: &Language,
+    tree: &Tree,
+    source: &[u8],
+    at: Range<usize>,
+) -> Option<Receiver> {
+    locals::receiver(lang.locals_query(), lang.name(), tree, source, at)
+}
+
+/// Whether the name at bytes `at` of the source parsed as `tree` is a
+/// member (`x.p`) or a path's last segment (`a::p`).
+pub(crate) fn is_member(tree: &Tree, at: Range<usize>) -> bool {
+    locals::is_member(tree, at)
 }
 
 /// The syntax tree of `source`, or `None` when parsing takes longer than

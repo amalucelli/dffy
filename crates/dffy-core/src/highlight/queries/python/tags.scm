@@ -70,5 +70,5 @@
     module_name: (relative_import)
     name: [
       (dotted_name . (identifier) @name .)
-      (aliased_import alias: (identifier) @name)
+      (aliased_import name: (dotted_name (identifier) @original .) alias: (identifier) @name)
     ]) @definition.reexport)

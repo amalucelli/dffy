@@ -52,14 +52,22 @@ keybind = leader:z=toggle_wrap
 | `scroll_left` | `<` `H` |  | Scroll the code left |
 | `scroll_reset` | `0` |  | Scroll the code back to its first column |
 | `go_to_definition` | `K` | `K` | List the names on the line last tapped, else the top line; type to narrow them, and enter shows where the one picked is defined, in the line's version, in a peek under the line. ctrl+click or alt+click on a name peeks it at once |
-| `show_in_diff` | `d` in a peek |  | In a peek: the definition's lines in the diff, where the diff changes its file |
-| `other_version` | `s` in a peek |  | In a peek: the name's definitions in the diff's other version |
-| `references` | `r` in a peek |  | In a peek: the lines using the name in the peek's version, closest files first, as they're found: the first 200 files with a use, and how many there are; again shows the definitions |
-| `close_peek` | `esc` `q` in a peek |  | Close the peek |
 | `jump_back` | `backspace` | `(` | Back to where the last jump left, with the line that was at the top at the top again: a jump is a definition opened from a peek, or a file opened from find file, the tree or the control API. The last 100 places are kept; one whose file isn't shown any more is skipped |
 | `jump_forward` | `\` | `\` | Forward again, to where jump back left |
 | `next_thread` | `m` |  | Next comment thread, on into the next file with comments; it takes the focus, where r replies, e edits, x resolves, d deletes and o opens it on its host |
 | `prev_thread` | `M` |  | Previous comment thread, back into the previous file with comments |
+
+### In a peek
+
+| Action | Keys | Command panel | Description |
+|---|---|---|---|
+| `show_in_diff` | `d` in a peek |  | In a peek: the definition's lines in the diff, where the diff changes its file |
+| `other_version` | `s` in a peek |  | In a peek: the name's definitions in the diff's other version |
+| `references` | `r` in a peek |  | In a peek: jump between the name's definitions and the lines using it, which the peek lists below them as they're found, closest files first |
+| `more_uses` | `m` in a peek |  | In a peek: go on past the first 200 files using the name, counting the rest |
+| `calls_only` | `c` in a peek |  | In a peek: list only the uses calling the name, or every use again |
+| `uses_in_diff` | `i` in a peek |  | In a peek: list only the uses in files the diff changes, or those in every file again |
+| `close_peek` | `esc` `q` in a peek |  | Close the peek |
 
 ### Files/tree
 
@@ -257,7 +265,10 @@ While a go-to-definition peek has the keys, these keys come before every other t
 | `enter` | `open` | Open a file, or open or close a folder, in the tree; in a peek, the definition's file at its line: its entry in the diff, else the whole file |
 | `d` | `show_in_diff` | In a peek: the definition's lines in the diff, where the diff changes its file |
 | `s` | `other_version` | In a peek: the name's definitions in the diff's other version |
-| `r` | `references` | In a peek: the lines using the name in the peek's version, closest files first, as they're found: the first 200 files with a use, and how many there are; again shows the definitions |
+| `r` | `references` | In a peek: jump between the name's definitions and the lines using it, which the peek lists below them as they're found, closest files first |
+| `m` | `more_uses` | In a peek: go on past the first 200 files using the name, counting the rest |
+| `c` | `calls_only` | In a peek: list only the uses calling the name, or every use again |
+| `i` | `uses_in_diff` | In a peek: list only the uses in files the diff changes, or those in every file again |
 | `esc` `q` | `close_peek` | Close the peek |
 
 ## Command panel

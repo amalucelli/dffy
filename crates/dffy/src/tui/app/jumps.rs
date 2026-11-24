@@ -32,9 +32,13 @@ struct Browsed {
     /// The place left; `None` on a commit or the conversation.
     place: Option<Place>,
     /// The entry shown as the tree took the keys, and the one it shows now.
-    from: usize,
-    at: usize,
+    from: EntryKey,
+    at: EntryKey,
 }
+
+/// An entry wherever the list moves it: the commit it's under, as several
+/// commits may change a path, and its path. A page has neither.
+type EntryKey = (Option<usize>, BString);
 
 #[derive(Debug, Clone)]
 struct Place {
@@ -137,7 +141,9 @@ impl App {
     /// after the tree's moves the one shown as the tree took the keys.
     pub(super) fn leave_for(&mut self, file: usize) {
         match self.take_browsed() {
-            Some(browsed) if browsed.from != file => self.jumps.record(browsed.place),
+            Some(browsed) if Some(&browsed.from) != self.entry_key(file).as_ref() => {
+                self.jumps.record(browsed.place);
+            }
             None if file != self.doc.document.pos.file => {
                 let place = self.place();
                 self.jumps.record(place);
@@ -149,15 +155,21 @@ impl App {
 
     /// The tree's moves while the diff still shows what they showed last.
     fn take_browsed(&mut self) -> Option<Browsed> {
-        let shown = self.doc.document.pos.file;
-        (self.jumps.browsed.take()).filter(|b| b.at == shown)
+        let browsed = self.jumps.browsed.take()?;
+        (self.entry_key(self.doc.document.pos.file).as_ref() == Some(&browsed.at))
+            .then_some(browsed)
+    }
+
+    fn entry_key(&self, file: usize) -> Option<EntryKey> {
+        let path = self.doc.document.files().get(file)?.change().path.clone();
+        Some((self.doc.document.commit_of(file), path))
     }
 
     /// The tree's moves showed another file than the one shown as it took
     /// the keys: that was a jump from there.
     fn settle_browsed(&mut self) {
         if let Some(browsed) = self.take_browsed()
-            && browsed.from != self.doc.document.pos.file
+            && browsed.from != browsed.at
         {
             self.jumps.record(browsed.place);
         }
@@ -166,17 +178,20 @@ impl App {
     /// The tree shows `file` as its selection moves onto it. The first of
     /// these moves keeps the place it leaves.
     pub(super) fn browse(&mut self, file: usize) {
-        let shown = self.doc.document.pos.file;
+        let Some(shown) = self.entry_key(self.doc.document.pos.file) else {
+            return;
+        };
         if (self.jumps.browsed.as_ref()).is_none_or(|b| b.at != shown) {
             self.jumps.browsed = Some(Browsed {
                 place: self.place(),
-                from: shown,
+                from: shown.clone(),
                 at: shown,
             });
         }
         self.doc.goto_file(file);
-        if let Some(browsed) = &mut self.jumps.browsed {
-            browsed.at = self.doc.document.pos.file;
+        let now = self.entry_key(self.doc.document.pos.file);
+        if let (Some(browsed), Some(now)) = (&mut self.jumps.browsed, now) {
+            browsed.at = now;
         }
     }
 
@@ -266,7 +281,7 @@ impl App {
                     if self.doc.line_to_top(file, side, line) {
                         self.doc.scroll(place.shift);
                         let (side, line) = place.mark.unwrap_or((side, line));
-                        self.doc.mark_landed(file, side, line);
+                        self.doc.mark_landed(side, line);
                     } else {
                         let version = self.version_name(side);
                         self.message(format!("no line {} in {version} here", line + 1));
@@ -310,9 +325,7 @@ impl App {
                 (new.map(|line| (Side::New, line))).or_else(|| old.map(|line| (Side::Old, line)))
             }
         };
-        let mark = (self.doc.landed())
-            .filter(|&(f, ..)| f == file)
-            .map(|(_, side, line)| (side, line));
+        let mark = self.doc.landed();
         let mut place = Place {
             path,
             whole,

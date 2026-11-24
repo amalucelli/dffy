@@ -1309,6 +1309,12 @@ fn references(job: &ReferencesJob) -> Result<Referenced, Unanswered> {
             None => *search.insert(id),
         }
     };
+    // Its peek closed while the search started, before there was an id to
+    // close it by.
+    if kept.is_none() && job.cancel.is_set() {
+        job.helper.close_search(id);
+        return Err(Unanswered::Cancelled);
+    }
     let step = (job.helper).step_references(
         id,
         (REFERENCES_STEP, None, job.past_cap),
@@ -1476,7 +1482,7 @@ fn peek_code(job: &PeekCodeJob, repo: Option<&Repo>) -> Result<Code, String> {
     }
     let text = Text::new(bytes);
     let spans = (job.language.as_ref())
-        .and_then(|lang| highlight::parse(lang, text.bytes()))
+        .and_then(|lang| highlight::parse(lang.of_text(&job.path, text.bytes()), text.bytes()))
         .map(|parsed| parsed.spans(&text, 0..text.len()));
     let lines = (0..text.len())
         .map(|i| {
@@ -1599,6 +1605,47 @@ mod tests {
         })
     }
 
+    /// The peek's code of a C++ header is highlighted as C++, though its
+    /// name says C.
+    #[test]
+    fn a_cpp_headers_peeked_code_is_cpp() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .arg("-C")
+                .arg(dir.path())
+                .args(args)
+                .output()
+                .expect("git runs");
+            assert!(out.status.success(), "git {args:?}");
+        };
+        git(&["init", "-q", "-b", "main"]);
+        let source = b"namespace a {\nclass DB : public Base {\n  virtual int x() = 0;\n};\n}\n";
+        std::fs::write(dir.path().join("db.h"), source).expect("write");
+        let repo = Repo::discover(dir.path()).expect("repo");
+        let job = PeekCodeJob {
+            path: "db.h".into(),
+            side: Side::Worktree {
+                mode: Mode::File,
+                id: None,
+            },
+            language: crate::grammars().detect(b"db.h", b"").cloned(),
+            id: 0,
+        };
+        let code = peek_code(&job, Some(&repo)).expect("reads");
+        let text = Text::new(source.to_vec());
+        let spans = |name| {
+            let lang = crate::grammars().named(name).expect("bundled");
+            let parsed = highlight::parse(lang, text.bytes()).expect("parses");
+            format!("{:?}", parsed.spans(&text, 0..text.len()))
+        };
+        assert_ne!(spans("c"), spans("cpp"));
+        assert_eq!(
+            format!("{:?}", code.spans.expect("highlighted")),
+            spans("cpp")
+        );
+    }
+
     /// Compiling queries ahead waits for every job asked for, takes one
     /// worker at a time, and comes before the count pass.
     #[test]
@@ -1675,6 +1722,24 @@ mod tests {
         let (done, left) = count(&shared, None, &settings, chunk, false);
         assert_eq!(done.len(), 1, "stops after the file it's on");
         assert_eq!(left.iter().map(|f| f.0).collect::<Vec<_>>(), [11, 12]);
+    }
+
+    /// A search for the uses of `f` seen from `a.c`, not started yet.
+    fn uses_of_f(helper: &Helper, navigator: u64) -> ReferencesJob {
+        ReferencesJob {
+            helper: helper.clone(),
+            navigator,
+            search: Arc::new(Mutex::new(None)),
+            name: "f".to_owned(),
+            origin: navigate::Origin {
+                path: "a.c".into(),
+                language: crate::grammars().named("c").expect("bundled").clone(),
+            },
+            filter: navigate::Filter::default(),
+            past_cap: true,
+            id: 3,
+            cancel: Arc::new(Cancel::default()),
+        }
     }
 
     /// Go to definition's jobs ask the navigator helper, which the first
@@ -1762,20 +1827,7 @@ mod tests {
             }
         }
 
-        let job = ReferencesJob {
-            helper: helper.clone(),
-            navigator: opened.navigator,
-            search: Arc::new(Mutex::new(None)),
-            name: "f".to_owned(),
-            origin: navigate::Origin {
-                path: "a.c".into(),
-                language: crate::grammars().named("c").expect("bundled").clone(),
-            },
-            filter: navigate::Filter::default(),
-            past_cap: true,
-            id: 3,
-            cancel: Arc::new(Cancel::default()),
-        };
+        let job = uses_of_f(&helper, opened.navigator);
         let mut hits = 0;
         loop {
             let step = references(&job).expect("steps");
@@ -1785,6 +1837,15 @@ mod tests {
             }
         }
         assert!(hits >= 3, "{hits} uses");
+
+        // Its peek closed while its search started: the helper drops it.
+        let left = uses_of_f(&helper, opened.navigator);
+        left.cancel.cancel();
+        let step = references(&left);
+        assert!(matches!(step, Err(Unanswered::Cancelled)));
+        let id = left.search.lock().expect("lock").expect("started");
+        let gone = helper.step_references(id, (Duration::ZERO, None, true), None);
+        assert_eq!(gone.err().map(|e| e.code), Some(client::GONE));
         helper.close();
     }
 

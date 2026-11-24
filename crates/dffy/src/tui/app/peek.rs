@@ -24,8 +24,10 @@ use std::ops::ControlFlow;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
+use dffy_core::annotation::Anchor;
 use dffy_core::bstr::{BStr, BString};
-use dffy_core::document::{Attach, Pos, Side, State};
+use dffy_core::diff::Text;
+use dffy_core::document::{Attach, Entry, Pos, Side, State};
 use dffy_core::git::{self, Snapshot};
 use dffy_core::highlight::Language;
 use dffy_core::navigate::{self, Filter, Origin, Progress, Use};
@@ -69,6 +71,8 @@ struct RefSearch {
     /// The helper's search, once its first job started it.
     search: Arc<Mutex<Option<u64>>>,
     cancel: Arc<Cancel>,
+    /// The helper went away in its last step: not asked of a third.
+    died: bool,
 }
 
 /// Files whose highlighted lines the peek keeps, for moving between
@@ -141,6 +145,42 @@ struct Asked {
     keep: Option<(BString, usize)>,
     /// Asked again: the peek shows what it did until the answer.
     again: bool,
+    /// The helper went away on it once: not asked of a third, which leaves
+    /// a start for the next name.
+    died: bool,
+}
+
+/// Where line `at`, whose text and neighbours `held` has, is in `text`, and
+/// whether it's still the same line rather than one changed in place,
+/// between the same neighbours. Its neighbours come before its old number:
+/// an insertion can put an equal line there.
+fn find_line(held: &Anchor, text: &Text, at: usize) -> Option<(usize, bool)> {
+    let above = at.checked_sub(held.before.len())?;
+    let find = |lines: Vec<String>, at| {
+        let anchor = Anchor {
+            lines,
+            ..Anchor::default()
+        };
+        Some(anchor.place(text, at)?.start)
+    };
+    let whole = [&held.before[..], &held.lines, &held.after].concat();
+    if let Some(start) = find(whole, above) {
+        return Some((start + held.before.len(), true));
+    }
+    if let Some(found) = held.place(text, at) {
+        return Some((found.start, true));
+    }
+    let line = match find(held.before.clone(), above) {
+        Some(start) => start + held.before.len(),
+        None if held.before.is_empty() => 0,
+        None => return None,
+    };
+    let below = match find(held.after.clone(), line + 1) {
+        Some(below) => below,
+        None if held.after.is_empty() => text.len(),
+        None => return None,
+    };
+    (below == line + 1).then_some((line, false))
 }
 
 /// The lookup the peek shows.
@@ -155,6 +195,12 @@ struct Shown {
     partial: bool,
     /// It shows the text search's lines.
     text: bool,
+    /// The line it hangs under, with its neighbours, to find it again in
+    /// the file's next diff.
+    line: Anchor,
+    /// Its file changed and the new diff isn't in: until it tells where the
+    /// line went, the lookup waits.
+    moving: bool,
 }
 
 /// A line to go to once its file's diff is loaded.
@@ -377,14 +423,14 @@ impl App {
         if line >= text.len() {
             return None;
         }
+        let language = language.of_text(path, text.bytes());
         let bytes = text.line(line).to_vec();
         let origin = Origin {
             path: path.clone(),
             language: language.clone(),
         };
         let attach = Attach::Line { side, line };
-        // K's list names each name once: the core takes the line alone for
-        // the name's first use in code on it.
+        // The line alone, until the use picked or clicked gives its column.
         let at = Some(Use { line, column: None });
         Some((
             Ask {
@@ -423,7 +469,7 @@ impl App {
         let Some((ask, text)) = self.ask_from(pos.file, side, line) else {
             return;
         };
-        let names = navigate::names(&text, ask.origin.language.name());
+        let names = navigate::names_at(&text, ask.origin.language.name());
         if names.is_empty() {
             self.message("no names on this line");
             return;
@@ -453,8 +499,14 @@ impl App {
         match picked {
             Picked::Stay => {}
             Picked::Close => self.navigation.names = None,
-            Picked::Name(name) => {
-                let (_, ask) = self.navigation.names.take()?;
+            Picked::Name(name, column) => {
+                let (_, mut ask) = self.navigation.names.take()?;
+                // The use picked, where it is: the same name twice on a
+                // line may be of two scopes.
+                ask.at = ask.at.map(|at| Use {
+                    column: Some(column),
+                    ..at
+                });
                 self.look_up(name, ask);
             }
         }
@@ -584,6 +636,16 @@ impl App {
         })
     }
 
+    /// Line `line` of `side` of entry `file`, with its neighbours.
+    fn held_line(&self, file: usize, side: Side, line: usize) -> Option<Anchor> {
+        let diff = self.doc.document.diff_of(file)?;
+        let text = match side {
+            Side::Old => &diff.old,
+            Side::New => &diff.new,
+        };
+        (line < text.len()).then(|| Anchor::new(text, line..line + 1))
+    }
+
     /// Looks `name` up from `ask`, in a peek under its line, in place of
     /// any peek or lookup before.
     fn look_up(&mut self, name: String, ask: Ask) {
@@ -595,13 +657,20 @@ impl App {
         let version = self.version_name(side);
         let peek = Peek::new(name.clone(), version, waiting, self.peek_hints(side));
         self.navigation.code = None;
-        let file = self.doc.document.files().get(self.doc.document.pos.file);
+        let file = self.doc.document.pos.file;
+        let line = match attach {
+            Attach::Line { side, line } => self.held_line(file, side, line),
+            Attach::Start | Attach::End => None,
+        };
+        let entry = self.doc.document.files().get(file);
         self.navigation.shown = Some(Shown {
             name,
             ask,
-            file: file.map(|e| e.change().path.clone()).unwrap_or_default(),
+            file: entry.map(|e| e.change().path.clone()).unwrap_or_default(),
             partial: false,
             text: false,
+            line: line.unwrap_or_default(),
+            moving: entry.is_some_and(Entry::is_stale),
         });
         self.doc.set_focus(None);
         self.sync_threads();
@@ -626,6 +695,7 @@ impl App {
             cancel: Arc::new(Cancel::default()),
             keep,
             again,
+            died: false,
         });
     }
 
@@ -738,6 +808,9 @@ impl App {
     }
 
     fn lookup_job(&self, asked: &Asked) -> Option<Job> {
+        if self.navigation.shown.as_ref().is_some_and(|s| s.moving) {
+            return None;
+        }
         let (helper, navigator) = self.navigation.asking(asked.ask.side)?;
         Some(Job::Lookup(LookupJob {
             helper,
@@ -766,9 +839,9 @@ impl App {
         search.cancel = Arc::new(Cancel::default());
         search.search = Arc::new(Mutex::new(None));
         search.id = id;
+        search.capped = false;
         search.generation = generation.unwrap_or_default();
-        self.doc
-            .edit_peek(|p| p.edit_references(|r| *r = Refs::default()));
+        self.edit_listed(|p| p.edit_references(|r| *r = Refs::default()));
     }
 
     /// The navigator of `side` asked for as `id` came, with the generation
@@ -829,18 +902,34 @@ impl App {
                 }
             }
             Err(why) => {
+                // Those of a helper gone are opened again on the next ask.
+                let running = nav.helper().map(|(generation, _)| generation);
+                for slot in &mut nav.sides {
+                    if slot.ready.is_some_and(|(g, ..)| Some(g) != running) {
+                        slot.ready = None;
+                        slot.built = Built::default();
+                    }
+                }
+                let version = self.version_name(side);
+                let words = match why {
+                    Unanswered::Unavailable(why) => why,
+                    Unanswered::Failed(why) => {
+                        format!("couldn't list the files in {version}: {why}")
+                    }
+                    Unanswered::Gone | Unanswered::Cancelled => {
+                        format!("couldn't list the files in {version}: the helper went away")
+                    }
+                };
+                if self
+                    .navigation
+                    .refs
+                    .as_ref()
+                    .is_some_and(|r| r.side == side)
+                {
+                    self.references_failed(words.clone());
+                }
                 if waiting {
                     self.navigation.stop_lookup();
-                    let version = self.version_name(side);
-                    let words = match why {
-                        Unanswered::Unavailable(why) => why,
-                        Unanswered::Failed(why) => {
-                            format!("couldn't list the files in {version}: {why}")
-                        }
-                        Unanswered::Gone | Unanswered::Cancelled => {
-                            format!("couldn't list the files in {version}: the helper went away")
-                        }
-                    };
                     self.peek_says(Found::Nothing(words));
                 }
             }
@@ -848,7 +937,7 @@ impl App {
     }
 
     fn peek_says(&mut self, found: Found) {
-        self.doc.edit_peek(|p| p.set_found(found, 0));
+        self.edit_listed(|p| p.set_found(found, 0));
         self.dirty = true;
     }
 
@@ -936,8 +1025,17 @@ impl App {
                 // and asked again once it is.
                 let side = asked.ask.side;
                 self.navigation.sides[side.index()].stale = true;
+                if asked.died {
+                    let words =
+                        format!("looking up {name} failed: the navigator helper went away twice");
+                    self.peek_says(Found::Nothing(words));
+                    return;
+                }
                 self.ensure_navigator(side);
-                self.navigation.asked = Some(asked);
+                self.navigation.asked = Some(Asked {
+                    died: true,
+                    ..asked
+                });
                 return;
             }
             Err(Unanswered::Failed(why) | Unanswered::Unavailable(why)) => {
@@ -1024,6 +1122,22 @@ impl App {
         self.ask_again_when_indexed();
     }
 
+    /// Changes what the peek lists with `edit`, and reads the code of the
+    /// candidate shown when that's another one now, or its code is gone.
+    fn edit_listed(&mut self, edit: impl FnOnce(&mut Peek)) {
+        let current = |doc: &Doc| {
+            let c = doc.def_peek().and_then(Peek::current)?;
+            Some((c.path.clone(), c.side, c.start))
+        };
+        let before = current(&self.doc);
+        self.doc.edit_peek(edit);
+        let unread = self.navigation.code.is_none()
+            && (self.doc.def_peek()).is_some_and(|p| p.code.is_none());
+        if unread || current(&self.doc) != before {
+            self.read_code();
+        }
+    }
+
     /// Shows the code of the peek's candidate: kept from before, or asked
     /// for.
     fn read_code(&mut self) {
@@ -1078,10 +1192,10 @@ impl App {
     }
 
     /// A key while the peek has the keys: `Break` with what it did when its
-    /// table binds it.
-    /// A peek open without the keys takes them back for one of its own:
-    /// moving through it, opening, the other version, the uses. Its
-    /// filters' keys stay the diff's (`m` goes to the next thread there).
+    /// table binds it. A peek on screen without the keys takes them back,
+    /// unless a thread has them, for one of its own: moving through it,
+    /// opening, the other version, the uses. Its filters' keys stay the
+    /// diff's (`m` goes to the next thread there).
     pub(super) fn peek_key(&mut self, key: Key, mods: Mods) -> ControlFlow<Option<Action>> {
         let Some(action) = self.keys.peek_action(key, mods) else {
             return ControlFlow::Continue(());
@@ -1096,10 +1210,9 @@ impl App {
                     | Act::OtherVersion
                     | Act::References
             );
-            if !own || self.doc.def_peek().is_none() {
+            if !own || self.doc.focused().is_some() || !self.doc.peek_shown() {
                 return ControlFlow::Continue(());
             }
-            self.doc.set_focus(None);
             self.doc.edit_peek(|p| p.focused = true);
             self.dirty = true;
         }
@@ -1265,7 +1378,7 @@ impl App {
         let running = nav.refs.as_ref().is_some_and(|r| r.key == key);
         if let Some(refs) = kept {
             nav.stop_references();
-            self.doc.edit_peek(|p| p.edit_references(|r| *r = refs));
+            self.edit_listed(|p| p.edit_references(|r| *r = refs));
         } else if !running {
             nav.stop_references();
             let id = nav.id();
@@ -1280,9 +1393,9 @@ impl App {
                 generation: generation.unwrap_or_default(),
                 search: Arc::new(Mutex::new(None)),
                 cancel: Arc::new(Cancel::default()),
+                died: false,
             });
-            self.doc
-                .edit_peek(|p| p.edit_references(|r| *r = Refs::default()));
+            self.edit_listed(|p| p.edit_references(|r| *r = Refs::default()));
             self.ensure_navigator(side);
         }
         self.dirty = true;
@@ -1323,7 +1436,17 @@ impl App {
     fn filter_uses(&mut self, change: impl FnOnce(&mut Filter)) {
         change(&mut self.navigation.filter);
         self.start_uses();
-        self.read_code();
+    }
+
+    /// Stops the search for uses, the peek saying why.
+    fn references_failed(&mut self, why: String) {
+        self.navigation.stop_references();
+        self.edit_listed(|p| {
+            p.edit_references(|r| {
+                r.failed = Some(why);
+                r.done = true;
+            });
+        });
     }
 
     /// A step of reference search `id` came, or why it stopped.
@@ -1341,22 +1464,25 @@ impl App {
                 // Its navigator, or the helper, went away: opened again,
                 // and the search started over with it.
                 self.navigation.sides[side.index()].stale = true;
+                let died = (self.navigation.refs.as_mut())
+                    .is_some_and(|r| std::mem::replace(&mut r.died, true));
+                if died {
+                    self.references_failed("the navigator helper went away twice".to_owned());
+                    return;
+                }
                 self.restart_references(side);
                 self.ensure_navigator(side);
                 return;
             }
             Err(Unanswered::Failed(why) | Unanswered::Unavailable(why)) => {
-                self.navigation.stop_references();
-                self.doc.edit_peek(|p| {
-                    p.edit_references(|r| {
-                        r.failed = Some(why);
-                        r.done = true;
-                    });
-                });
+                self.references_failed(why);
                 return;
             }
             Ok(step) => step,
         };
+        if let Some(search) = &mut self.navigation.refs {
+            search.died = false;
+        }
         // Stopped at its first files, it goes on only when asked.
         let capped = !step.done && step.files >= navigate::MAX_REFERENCE_FILES;
         if let Some(search) = self.navigation.refs.as_mut()
@@ -1366,8 +1492,7 @@ impl App {
             search.capped = true;
         }
         let capped = capped && self.navigation.refs.as_ref().is_some_and(|s| s.capped);
-        let had = self.doc.def_peek().and_then(Peek::current).is_some();
-        self.doc.edit_peek(|p| {
+        self.edit_listed(|p| {
             p.add_references(|r| {
                 for hit in step.hits {
                     if hit.more > 0 {
@@ -1396,9 +1521,6 @@ impl App {
                     kept.remove(0);
                 }
             }
-        }
-        if !had && self.doc.def_peek().and_then(Peek::current).is_some() {
-            self.read_code();
         }
     }
 
@@ -1456,16 +1578,62 @@ impl App {
         self.navigation.land = None;
     }
 
+    /// `file` has a new diff: a peek in it follows the line it hangs under,
+    /// which a lookup waiting for that asks from; one changed in place asks
+    /// by name alone, where the name is on it not known any more. The peek
+    /// closes when the line is gone.
+    pub(super) fn peek_diffed(&mut self, file: usize) {
+        let Some(shown) = &mut self.navigation.shown else {
+            return;
+        };
+        let Attach::Line { side, line } = shown.ask.attach else {
+            return;
+        };
+        let here = self.doc.threads_file() == file
+            && (self.doc.document.files().get(file)).is_some_and(|e| e.change().path == shown.file);
+        if !here {
+            return;
+        }
+        let found = self.doc.document.diff_of(file).and_then(|diff| {
+            let text = match side {
+                Side::Old => &diff.old,
+                Side::New => &diff.new,
+            };
+            let (line, same) = find_line(&shown.line, text, line)?;
+            Some((line, same, Anchor::new(text, line..line + 1)))
+        });
+        let Some((line, same, held)) = found else {
+            self.close_peek();
+            self.message("the peek's line is gone; the peek closed");
+            return;
+        };
+        let attach = Attach::Line { side, line };
+        let moved = std::mem::replace(&mut shown.ask.attach, attach) != attach;
+        shown.ask.at = (shown.ask.at.filter(|_| same)).map(|at| Use { line, ..at });
+        shown.line = held;
+        if std::mem::take(&mut shown.moving)
+            && let Some(asked) = &mut self.navigation.asked
+        {
+            asked.ask = shown.ask.clone();
+        }
+        if moved {
+            self.doc.move_peek(attach);
+        }
+    }
+
     /// The diff's list was read again, after the document took it. A peek
     /// whose file another took the place of closes. The navigator of the
     /// version the peek shows is brought up to date now and its lookup
     /// asked again; the other's on its next ask.
     pub(super) fn navigators_refreshed(&mut self) {
-        if let Some(shown) = &self.navigation.shown {
+        if let Some(shown) = &mut self.navigation.shown {
             let file = self.doc.threads_file();
             let entry = self.doc.document.files().get(file);
-            if entry.is_none_or(|e| e.change().path != shown.file) {
+            if let Some(entry) = entry.filter(|e| e.change().path == shown.file) {
+                shown.moving |= entry.is_stale();
+            } else {
                 self.close_peek();
+                self.message("the peek's file moved in the list; the peek closed");
             }
         }
         // A working-tree file's lines may have changed under the same name,
@@ -1479,8 +1647,7 @@ impl App {
             .is_some_and(|r| !tree(&r.key) || self.snapshot(r.side).ok() != Some(r.key.0));
         if moved {
             self.navigation.stop_references();
-            self.doc
-                .edit_peek(|p| p.edit_references(|r| *r = Refs::default()));
+            self.edit_listed(|p| p.edit_references(|r| *r = Refs::default()));
         }
         let shown = (self.navigation.shown.as_ref()).map(|s| s.ask.side);
         for side in [Side::Old, Side::New] {

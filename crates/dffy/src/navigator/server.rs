@@ -82,20 +82,49 @@ pub(crate) fn serve() -> ExitCode {
     ExitCode::SUCCESS
 }
 
+/// How long after the last request the searches' read buffers go: a
+/// whole-side search leaves one the size of the largest file it read.
+const RELEASE: Duration = Duration::from_secs(30);
+
+/// Whether they go at all: only where the allocator gives freed memory
+/// back. Measured on the Linux kernel: glibc returns the freed buffer (the
+/// helper went from 94 MB back to 46 MB); macOS's allocator keeps freed
+/// large blocks counted in the footprint, and releasing then regrowing
+/// across searches ended at ~140 MB where the kept buffer stays at ~82 MB.
+const RELEASES: bool = cfg!(target_os = "linux");
+
 /// Exits once no request came for the idle time, `initialize`'s or
-/// [`IDLE`], and no request or index build runs.
+/// [`IDLE`], and no request or index build runs; [`RELEASE`] after the
+/// last request, gives the searches' read buffers back where [`RELEASES`].
 fn exit_when_idle(server: &Server, activity: &mpsc::Receiver<Duration>) {
     let mut idle = IDLE;
+    let mut last = Instant::now();
+    let mut held = RELEASES;
     loop {
-        match activity.recv_timeout(idle) {
+        let since = last.elapsed();
+        let mut wait = idle.saturating_sub(since);
+        if held {
+            wait = wait.min(RELEASE.saturating_sub(since));
+        }
+        match activity.recv_timeout(wait) {
             Ok(set) => {
                 if !set.is_zero() {
                     idle = set;
                 }
+                last = Instant::now();
+                held = RELEASES;
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {
-                if server.busy.load(Ordering::Relaxed) == 0 {
-                    leave();
+                if held && last.elapsed() >= RELEASE {
+                    navigate::release_search_buffers();
+                    held = false;
+                }
+                if last.elapsed() >= idle {
+                    if server.busy.load(Ordering::Relaxed) == 0 {
+                        leave();
+                    }
+                    // Busy: another idle time from now.
+                    last = Instant::now();
                 }
             }
             Err(mpsc::RecvTimeoutError::Disconnected) => return,
@@ -216,9 +245,9 @@ struct Held {
     snapshots: [Snapshot; 2],
     side: Side,
     navigator: Arc<Navigator>,
-    /// The one it replaced, until its index is built: it holds the
-    /// definitions read so far, which the build takes from the shared
-    /// store.
+    /// The one it replaced, or the one before that when its index got
+    /// further, until this one's is built: it holds the definitions read so
+    /// far, which the build takes from the shared store.
     previous: Option<Arc<Navigator>>,
     /// Its index build while one may run: the flag that stops it, and its
     /// thread.
@@ -354,8 +383,8 @@ impl State {
     }
 
     /// Holds `navigator`, of `side` of the diff between `snapshots`, as the
-    /// one used last: the one it replaces stays as its `previous`, the
-    /// least recently used past [`NAVIGATORS`] goes, with its searches.
+    /// one used last: the one it replaces, or that one's
+    /// `previous` when its index got further, stays as its `previous`; the least recently used past [`NAVIGATORS`] goes, with its searches.
     fn hold(&mut self, snapshots: [Snapshot; 2], side: Side, navigator: Arc<Navigator>) {
         let Self {
             navigators,
@@ -369,7 +398,9 @@ impl State {
         {
             let mut old = navigators.remove(at);
             old.stop_build(stopping);
-            previous = Some(old.navigator);
+            let at = old.navigator.progress();
+            let further = |p: &Arc<Navigator>| !at.complete() && p.progress().done > at.done;
+            previous = old.previous.filter(further).or(Some(old.navigator));
         }
         while navigators.len() >= NAVIGATORS {
             let mut gone = navigators.remove(0);
@@ -637,6 +668,10 @@ impl Server {
     /// used at `at` in the asking file when that's given.
     fn lookup(&self, params: &Value, cancel: &AtomicBool) -> Result<String, Failure> {
         let name = text(params, "name").map_err(invalid)?.to_owned();
+        #[cfg(debug_assertions)]
+        if name == super::DEADLY {
+            std::process::exit(1);
+        }
         let at = wire::read_use(params).map_err(invalid)?;
         let (navigator, origin) = self.navigator_and_origin(params)?;
         let (repo, cache) = {
@@ -806,5 +841,62 @@ fn failed(e: &navigate::Error) -> Failure {
     match e {
         navigate::Error::Cancelled => (CANCELLED, "cancelled".to_owned()),
         e => (FAILED, e.to_string()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use dffy_core::diff::Options;
+    use dffy_core::highlight::Registry;
+
+    /// Navigators made again in quick succession, none built, keep the last
+    /// built one, whose definitions the next build takes.
+    #[test]
+    fn an_unbuilt_navigator_made_again_keeps_the_built_one_before() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let git = |args: &[&str]| {
+            let ok = std::process::Command::new("git")
+                .arg("-C")
+                .arg(dir.path())
+                .args(["-c", "user.name=t", "-c", "user.email=t@t"])
+                .args(["-c", "commit.gpgsign=false"])
+                .args(args)
+                .status()
+                .expect("git runs")
+                .success();
+            assert!(ok, "git {args:?}");
+        };
+        git(&["init", "-q"]);
+        std::fs::write(dir.path().join("a.c"), "int f(void) { return 0; }\n").expect("write");
+        git(&["add", "-A"]);
+        git(&["commit", "-q", "-m", "base"]);
+        let repo = Repo::discover(dir.path()).expect("repo");
+        let spec = repo.resolve(&[], false, false).expect("resolves");
+        let snapshots = spec.snapshots(false).expect("snapshots");
+        let mut state = State::new(
+            Arc::new(Mutex::new(io::stdout())),
+            Arc::new(AtomicUsize::new(0)),
+        );
+        let made = || {
+            let diff = navigate::Diff {
+                snapshots,
+                changes: &[],
+                options: Options::default(),
+            };
+            let shared = navigate::Shared::new();
+            let made = Navigator::new(&repo, &Registry::builtin(), &shared, &diff, Side::Old);
+            Arc::new(made.expect("lists"))
+        };
+        let built = made();
+        let cache = Cache::new(dir.path().join("cache"), 1 << 20).symbols();
+        (built.build(&repo, &cache, 1, &AtomicBool::new(false), |_| {}))
+            .expect("the queries compile");
+        state.hold(snapshots, Side::Old, Arc::clone(&built));
+        for _ in 0..2 {
+            state.hold(snapshots, Side::Old, made());
+        }
+        let previous = (state.navigators.last()).and_then(|h| h.previous.as_ref());
+        assert_eq!(previous.map(|n| n.id()), Some(built.id()));
     }
 }

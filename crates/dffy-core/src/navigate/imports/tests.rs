@@ -699,3 +699,20 @@ fn a_barrel_statement_over_lines_is_followed() {
         ]
     );
 }
+
+/// What's read of a statement that never ends, and of a file of nothing but
+/// imports, is bounded.
+#[test]
+fn statements_and_imports_are_read_up_to_a_bound() {
+    use super::{MAX_IMPORTS, STATEMENT_BYTES, aliased_uses, reexported_from, statement};
+    assert_eq!(statement(b" a from \"b\"; c").len(), 11);
+    assert_eq!(statement(b" a\nimport b").len(), 2);
+    assert_eq!(
+        statement("a ".repeat(STATEMENT_BYTES).as_bytes()).len(),
+        STATEMENT_BYTES
+    );
+    let exports = "export { a } from \"./b\";\n".repeat(10_000);
+    assert_eq!(reexported_from(exports.as_bytes()).len(), MAX_IMPORTS);
+    let uses = "use a::b;\n".repeat(10_000);
+    assert_eq!(aliased_uses(uses.as_bytes()).len(), MAX_IMPORTS);
+}

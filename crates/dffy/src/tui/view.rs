@@ -776,6 +776,18 @@ fn writes_in(writing: &Writing, thread: &Thread) -> bool {
     }
 }
 
+/// The line a jump landed on. It's of the file shown, which the document
+/// keeps showing as the list changes: the path tells whether it still is.
+/// Its row is looked up as it's drawn, so rows that come or go above it
+/// move the mark with it.
+struct Landed {
+    path: BString,
+    /// The entry's version as `line` was last known to be of its text.
+    entry: u64,
+    side: Side,
+    line: usize,
+}
+
 pub(crate) struct Doc {
     pub document: Document<Body>,
     pub layout: Layout,
@@ -820,10 +832,9 @@ pub(crate) struct Doc {
     /// The key that opens a hidden run in place in file view, and folds it,
     /// for its rule to name.
     pub open_key: Option<String>,
-    /// The line a jump landed on, marked until the viewer lets it go: its
-    /// file, version and line. Its row is looked up as it's drawn, so
-    /// rows that come or go above it move the mark with it.
-    landed: Option<(usize, Side, usize)>,
+    /// The line a jump landed on, marked until the viewer lets it go or
+    /// its file is no longer the one shown.
+    landed: Option<Landed>,
     /// How many times a line was marked, for the viewer to tell whether an
     /// event marked one.
     landings: u64,
@@ -863,15 +874,36 @@ impl Doc {
         }
     }
 
-    /// Marks line `line` of `side` of `file` as where a jump landed.
-    pub(crate) fn mark_landed(&mut self, file: usize, side: Side, line: usize) {
-        self.landed = Some((file, side, line));
+    /// Marks line `line` of `side` of the file shown as where a jump
+    /// landed.
+    pub(crate) fn mark_landed(&mut self, side: Side, line: usize) {
+        let Some(shown) = self.document.files().get(self.document.pos.file) else {
+            return;
+        };
+        self.landed = Some(Landed {
+            path: shown.change().path.clone(),
+            entry: shown.version(),
+            side,
+            line,
+        });
         self.landings += 1;
     }
 
-    /// The line marked as where a jump landed.
-    pub(crate) fn landed(&self) -> Option<(usize, Side, usize)> {
-        self.landed
+    /// The line of the file shown marked as where a jump landed, and its
+    /// version.
+    pub(crate) fn landed(&self) -> Option<(Side, usize)> {
+        let shown = self.document.files().get(self.document.pos.file)?;
+        (self.landed.as_ref())
+            .filter(|l| !shown.is_commit() && shown.change().path == l.path)
+            .map(|l| (l.side, l.line))
+    }
+
+    /// Lets the landed line's mark go when its file isn't the one shown,
+    /// so it doesn't come back with a file listed again at its path.
+    fn keep_landed(&mut self) {
+        if self.landed().is_none() {
+            self.landed = None;
+        }
     }
 
     /// How many times a line was marked so far.
@@ -1115,6 +1147,7 @@ impl Doc {
     fn settle_render(&mut self, settle: Settle) {
         if let Settle::Open { .. } = settle {
             self.selection = None;
+            self.landed = None;
             self.remeasure_boxes();
             self.settle(settle);
             self.normalize();
@@ -1155,6 +1188,7 @@ impl Doc {
             selection.cursor.file = file;
             self.selection = Some(selection);
         }
+        self.keep_landed();
         if let Some(file) = open {
             self.normalize();
             self.place(file, false);
@@ -1194,12 +1228,40 @@ impl Doc {
         moved
     }
 
+    /// Whether the landed line is still that line in `result`, the diff to
+    /// load for `file`, the one shown: it's of the same content, or the
+    /// text of the line's version is the same. A diff let go meanwhile has
+    /// no text to compare.
+    fn landed_in(&self, file: usize, result: &Result<Box<File>, String>) -> bool {
+        let (Some(mark), Some(entry)) = (&self.landed, self.document.files().get(file)) else {
+            return true;
+        };
+        let (Some(shown), Ok(loaded)) = (entry.file(), result) else {
+            return entry.version() == mark.entry;
+        };
+        let (shown, loaded) = (shown.diff(), loaded.diff());
+        entry.version() == mark.entry
+            || match mark.side {
+                Side::Old => shown.old == loaded.old,
+                Side::New => shown.new == loaded.new,
+            }
+    }
+
     /// Stores a worker's diff (see [`Document::load`]); a selection in the
-    /// file goes with the diff it was of.
+    /// file goes with the diff it was of, and the landed line's mark with
+    /// the text it was of.
     pub(crate) fn load(&mut self, file: usize, result: Result<Box<File>, String>) -> bool {
+        let keeps_landed = file != self.document.pos.file || self.landed_in(file, &result);
         let Some(settle) = self.document.load(file, result) else {
             return false;
         };
+        if !keeps_landed {
+            self.landed = None;
+        } else if let Some(mark) = &mut self.landed
+            && file == self.document.pos.file
+        {
+            mark.entry = self.document.files()[file].version();
+        }
         if self
             .selection
             .as_ref()
@@ -1789,6 +1851,17 @@ impl Doc {
         self.painted = None;
         self.fit();
         self.reveal_block(Block::Peek, true);
+    }
+
+    /// Hangs the peek under the row showing `at` of its file instead.
+    pub(crate) fn move_peek(&mut self, at: Attach) {
+        if let Some(peek) = &mut self.boxes.peek {
+            peek.at = at;
+            let list = self.boxes.list();
+            self.set_blocks(self.boxes.file, list);
+            self.painted = None;
+            self.fit();
+        }
     }
 
     /// The go-to-definition peek, while it's open.
@@ -2420,7 +2493,7 @@ impl Doc {
         self.draw_markers(grid, area, theme, &layout);
         self.document.touch(file, frame);
         if let Some(note) = self.note(file) {
-            let text_width = unicode_width::UnicodeWidthStr::width(note);
+            let text_width = crate::columns::Columns::width(note);
             let left = x + end.saturating_sub(x + text_width) / 2;
             let line = top + y.max(self.height / 2).min(self.height.saturating_sub(1));
             grid.put_str(left, line, end, note, theme.style(Role::Dim));
@@ -2501,7 +2574,9 @@ impl Doc {
         theme: &Theme,
         layout: &Layout,
     ) -> bool {
-        let Some((file, side, line)) = self.landed.filter(|l| l.0 == self.document.pos.file) else {
+        self.keep_landed();
+        let file = self.document.pos.file;
+        let Some((side, line)) = self.landed() else {
             return false;
         };
         let m = document::Match {
@@ -3266,7 +3341,7 @@ impl Doc {
             return false;
         };
         self.goto_match(pos);
-        self.mark_landed(file, side, line);
+        self.mark_landed(side, line);
         true
     }
 

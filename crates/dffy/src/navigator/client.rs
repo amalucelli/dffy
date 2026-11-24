@@ -484,6 +484,8 @@ pub(crate) struct Helpers {
     running: Option<(u64, Helper)>,
     generation: u64,
     starts: Vec<std::time::Instant>,
+    /// Why the last one failed.
+    failed: String,
 }
 
 impl Helpers {
@@ -505,6 +507,9 @@ impl Helpers {
         gone: Option<(u64, &str)>,
         start: impl FnOnce(u64) -> io::Result<Helper>,
     ) -> Result<(u64, Helper), String> {
+        if let Some((_, why)) = gone {
+            why.clone_into(&mut self.failed);
+        }
         match (&self.running, gone) {
             // Another took the place of the one that failed: it's asked.
             (Some((generation, helper)), Some((failed, _))) if *generation != failed => {
@@ -520,14 +525,17 @@ impl Helpers {
         self.starts
             .retain(|at| now.saturating_duration_since(*at) < STARTS_WINDOW);
         if self.starts.len() >= MAX_STARTS {
-            let why = gone.map_or("", |(_, why)| why);
             return Err(format!(
-                "definitions unavailable: the helper keeps exiting: {why}"
+                "definitions unavailable: the helper keeps exiting: {}",
+                self.failed
             ));
         }
         self.starts.push(now);
         self.generation += 1;
-        let helper = start(self.generation).map_err(|e| format!("definitions unavailable: {e}"))?;
+        let helper = start(self.generation).map_err(|e| {
+            self.failed = e.to_string();
+            format!("definitions unavailable: {e}")
+        })?;
         self.running = Some((self.generation, helper.clone()));
         Ok((self.generation, helper))
     }

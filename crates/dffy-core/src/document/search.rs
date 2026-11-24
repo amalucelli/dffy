@@ -387,7 +387,8 @@ where
         (kind, l.block_start)
     };
     rows.clear();
-    side_rows(side, hunk.lines.len(), kind, rows);
+    // The core hunk has no markers, which name no line to search.
+    side_rows(side, hunk.lines.len(), (kind, |_| false), rows);
     for &row in rows.iter() {
         match row {
             Row::One { line, paired } => {

@@ -202,7 +202,7 @@ fn side_rows(bencher: divan::Bencher, side: &str) {
         let mut shown = 0;
         for hunk in &kinds {
             let mut rows = Vec::new();
-            view::side_rows(side, hunk.len(), |i| hunk[i], &mut rows);
+            view::side_rows(side, hunk.len(), (|i| hunk[i], |_| false), &mut rows);
             shown += rows.len();
         }
         shown
@@ -284,12 +284,22 @@ fn list_paths(bencher: divan::Bencher) {
 
 /// The files `extract_definitions` reads at v6.1: a large source file, and
 /// a header that is mostly `#define`s.
-const DEFINING: [&str; 2] = [FAIR, "drivers/gpu/drm/i915/i915_reg.h"];
+///
+/// The perf gate counts a benchmark alone by its name, with each `/` read as
+/// a level of divan's path, so the names hold none.
+const DEFINING: [(&str, &str); 2] = [
+    ("fair.c", FAIR),
+    ("i915_reg.h", "drivers/gpu/drm/i915/i915_reg.h"),
+];
 
 /// A file's definitions as the symbol index reads a blob: parsed for them,
 /// then walked outside function bodies, with the macro table's.
-#[divan::bench(args = DEFINING)]
-fn extract_definitions(bencher: divan::Bencher, path: &str) {
+#[divan::bench(args = DEFINING.map(|(name, _)| name))]
+fn extract_definitions(bencher: divan::Bencher, name: &str) {
+    let (_, path) = DEFINING
+        .into_iter()
+        .find(|&(n, _)| n == name)
+        .expect("a name of the list");
     let repo = Repo::discover(root()).expect("opens");
     let spec = repo
         .resolve(&["v6.0..v6.1"], false, false)

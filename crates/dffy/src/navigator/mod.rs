@@ -16,6 +16,18 @@ pub(crate) mod wire;
 #[cfg(test)]
 mod tests;
 
+/// The profile's folder, from the test binary `exe` somewhere in it: the
+/// nearest with a `dffy`, or with the copies of it made before, as while
+/// the `dffy` is relinked.
+#[cfg(test)]
+fn profile(exe: &std::path::Path) -> Option<&std::path::Path> {
+    (exe.ancestors().skip(1)).find(|dir| dir.join("dffy").is_file() || dir.join(COPIES).is_dir())
+}
+
+/// The folder of the copies [`built_program`] makes, in the profile's.
+#[cfg(test)]
+const COPIES: &str = "test-helpers";
+
 /// The dffy binary built with the unit tests, which aren't dffy
 /// themselves: what their helpers run as, the profile's `dffy`, and only
 /// when it says it is this very build: one left from an older build is
@@ -33,10 +45,8 @@ pub(crate) fn built_program() -> std::path::PathBuf {
     static COPY: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
     COPY.get_or_init(|| {
         let exe = std::env::current_exe().unwrap_or_default();
-        // The profile's folder: the one cargo keeps its fingerprints in.
-        let profile = (exe.ancestors())
-            .find(|dir| dir.join(".fingerprint").is_dir())
-            .unwrap_or(&exe)
+        let profile = profile(&exe)
+            .unwrap_or_else(|| panic!("no dffy built above {}: build it", exe.display()))
             .to_owned();
         // What `path` says it is, in at most a few seconds: an exec racing a
         // relink of the file can hang before it runs any of it.
@@ -65,7 +75,7 @@ pub(crate) fn built_program() -> std::path::PathBuf {
             (child.stdout.take()).map(|mut out| out.read_to_string(&mut said).ok());
             said.trim().to_owned()
         };
-        let dir = profile.join("test-helpers");
+        let dir = profile.join(COPIES);
         let copy = dir.join(format!("dffy-{}", crate::BUILD));
         if build(&copy) == crate::BUILD {
             return copy;
@@ -104,6 +114,11 @@ pub(crate) fn built_program() -> std::path::PathBuf {
 }
 
 use std::time::Duration;
+
+/// A name whose lookup a debug build's helper exits on, as on a file that
+/// overflows its stack, for tests of what its hosts do then.
+#[cfg(debug_assertions)]
+pub(crate) const DEADLY: &str = "dffy_deadly_name";
 
 /// The first argument that makes `dffy` the helper.
 pub(crate) const COMMAND: &str = "__navigate";

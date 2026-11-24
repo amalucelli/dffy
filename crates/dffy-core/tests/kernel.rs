@@ -1127,3 +1127,45 @@ fn renamed_files_count_only_their_text_until_shown() {
     assert!(renamed > 0);
     assert_eq!(estimate, text);
 }
+
+/// The kernel's headers are C by their text but for a handful under
+/// `scripts/` and `tools/` that are C++: a C header that keeps C++ for its
+/// C++ readers (`#ifdef __cplusplus`) stays C.
+#[test]
+fn kernel_headers_read_as_cpp_are_cpp() {
+    let Some(root) = bench_repo() else {
+        return;
+    };
+    let repo = Repo::discover(&root).expect("repo");
+    let spec = repo
+        .resolve(&["v6.0..v6.1"], false, false)
+        .expect("resolves");
+    let [_, new] = spec.snapshots(false).expect("a range has snapshots");
+    let mut headers = Vec::new();
+    repo.list_sides(new, &[], |path, side| {
+        if path.ends_with(b".h") {
+            headers.push((path.to_vec(), side));
+        }
+        ControlFlow::Continue(())
+    })
+    .expect("lists");
+    let mut cpp: Vec<String> = Vec::new();
+    for (path, side) in &headers {
+        let text = repo.load(path.as_slice().into(), side).expect("loads");
+        if dffy_core::highlight::reads_as_cpp(&text) {
+            cpp.push(String::from_utf8_lossy(path).into_owned());
+        }
+    }
+    assert_eq!(
+        cpp,
+        [
+            "scripts/gcc-plugins/gcc-common.h",
+            "scripts/gcc-plugins/gcc-generate-gimple-pass.h",
+            "scripts/gcc-plugins/gcc-generate-ipa-pass.h",
+            "scripts/gcc-plugins/gcc-generate-rtl-pass.h",
+            "scripts/gcc-plugins/gcc-generate-simple_ipa-pass.h",
+            "scripts/kconfig/qconf.h",
+            "tools/perf/util/c++/clang.h",
+        ]
+    );
+}

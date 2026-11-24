@@ -8,7 +8,7 @@
 
 use gix::bstr::{BStr, BString, ByteSlice};
 
-use crate::highlight::DefinitionKind;
+use crate::highlight::{DefinitionKind, MAX_TAGS_BYTES};
 
 use super::{MAX_INCLUDED, Navigator, Related, folder, joined};
 use crate::git::Repo;
@@ -25,6 +25,14 @@ pub(super) fn shares_definitions(from: &str, of: &str) -> bool {
             .iter()
             .any(|f| f.contains(&from) && f.contains(&of))
 }
+
+/// How many names a file's imports are read for: past what code has, and a
+/// bound on what a file of nothing else costs.
+const MAX_IMPORTS: usize = 2000;
+
+/// How far a script's import or export statement is read, and how far its
+/// line is before a `require`.
+const STATEMENT_BYTES: usize = 16 << 10;
 
 /// A name a file brings in by an import, and where it comes from.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -58,6 +66,9 @@ impl Navigator {
     ///   with their files.
     /// - Java, Kotlin and C#: imported types, a Kotlin `as` rename and a
     ///   C# `using X = A.B` included.
+    ///
+    /// Up to [`MAX_IMPORTS`] of them, and none of a file larger than
+    /// definitions are read of.
     pub(super) fn imported_names(
         &self,
         repo: &Repo,
@@ -65,6 +76,9 @@ impl Navigator {
         language: &str,
         text: &[u8],
     ) -> Vec<Imported> {
+        if text.len() > MAX_TAGS_BYTES {
+            return Vec::new();
+        }
         let path = self.listed[from as usize].path.clone();
         let path = path.as_ref();
         let mut out = Vec::new();
@@ -78,6 +92,7 @@ impl Navigator {
             "csharp" => self.packaged_names(path, text, Packaged::CSHARP, &mut out),
             _ => {}
         }
+        out.truncate(MAX_IMPORTS);
         out.retain(|i| !i.name.is_empty() && i.name.bytes().all(super::is_word_byte));
         let first = first_import(text);
         for i in &mut out {
@@ -89,17 +104,14 @@ impl Navigator {
     fn script_names(&self, from: &BStr, text: &[u8], out: &mut Vec<Imported>) {
         let word = |b: &[u8]| -> String { String::from_utf8_lossy(b.trim()).into_owned() };
         for at in memchr::memmem::find_iter(text, b"import") {
+            if out.len() >= MAX_IMPORTS {
+                return;
+            }
             let starts = at == 0 || matches!(text[at - 1], b'\n' | b';' | b' ' | b'\t');
             if !starts || text.get(at + 6).is_some_and(|&b| super::is_word_byte(b)) {
                 continue;
             }
-            let rest = &text[at + 6..];
-            let end = [&b";"[..], b"\nimport", b"\nexport"]
-                .iter()
-                .filter_map(|stop| memchr::memmem::find(rest, stop))
-                .min()
-                .unwrap_or(rest.len());
-            let statement = &rest[..end];
+            let statement = statement(&text[at + 6..]);
             let Some(from_at) = memchr::memmem::rfind(statement, b"from") else {
                 continue;
             };
@@ -117,8 +129,11 @@ impl Navigator {
         }
         // `const x = require("./m")`, `const { a: b } = require("./m")`.
         for at in memchr::memmem::find_iter(text, b"require(") {
-            let line_start = memchr::memrchr(b'\n', &text[..at]).map_or(0, |i| i + 1);
-            let left = &text[line_start..at];
+            if out.len() >= MAX_IMPORTS {
+                return;
+            }
+            let line = &text[at.saturating_sub(STATEMENT_BYTES)..at];
+            let left = &line[memchr::memrchr(b'\n', line).map_or(0, |i| i + 1)..];
             let Some(eq) = memchr::memrchr(b'=', left) else {
                 continue;
             };
@@ -127,7 +142,8 @@ impl Navigator {
                 .iter()
                 .find_map(|k| lhs.strip_prefix(k.as_bytes()))
                 .unwrap_or(lhs);
-            let Some(spec) = quoted_after(&text[at..], &[b"require"]).first().copied() else {
+            let call = statement(&text[at..]);
+            let Some(spec) = quoted_after(call, &[b"require"]).first().copied() else {
                 continue;
             };
             let mut found = Found::default();
@@ -171,13 +187,23 @@ impl Navigator {
         let lines: Vec<&[u8]> = text.lines().collect();
         let mut i = 0;
         while i < lines.len() {
-            let mut line = lines[i].trim_start().to_vec();
+            let first = lines[i].trim_start();
             i += 1;
+            if !(first.starts_with(b"import ") || first.starts_with(b"from ")) {
+                continue;
+            }
+            if out.len() >= MAX_IMPORTS {
+                return;
+            }
+            let uncommented = |line: &[u8]| -> Vec<u8> {
+                line[..line.find_byte(b'#').unwrap_or(line.len())].to_vec()
+            };
+            let mut line = uncommented(first);
             // A parenthesized list over lines.
-            if line.contains(&b'(') && !line.contains(&b')') {
-                while i < lines.len() && !line.contains(&b')') {
+            if line.contains(&b'(') {
+                while i < lines.len() && !line.contains(&b')') && line.len() < STATEMENT_BYTES {
                     line.extend_from_slice(b" ");
-                    line.extend_from_slice(lines[i].trim());
+                    line.extend_from_slice(&uncommented(lines[i].trim()));
                     i += 1;
                 }
             }
@@ -259,6 +285,9 @@ impl Navigator {
             .and_then(|krate| self.find(&[krate.as_bytes(), b"Cargo.toml"].concat()))
             .and_then(|l| package_name(&self.text(repo, l)?));
         for (mut segments, alias) in aliased_uses(text) {
+            if out.len() >= MAX_IMPORTS {
+                return;
+            }
             if let Some(own) = &own
                 && segments.len() > 1
                 && segments[0] == own.as_slice()
@@ -586,55 +615,18 @@ fn aliased_uses(text: &[u8]) -> Vec<(Vec<BString>, Option<BString>)> {
         let Some(end) = rest.find_byte(b';') else {
             break;
         };
-        expand_aliased(&rest[..end], &mut Vec::new(), &mut out);
+        if out.len() >= MAX_IMPORTS {
+            break;
+        }
+        super::use_paths(&rest[..end], |path, alias| {
+            out.push((
+                path.iter().map(|&s| s.into()).collect(),
+                alias.map(BString::from),
+            ));
+        });
         rest = &rest[end..];
     }
     out
-}
-
-fn expand_aliased(
-    tree: &[u8],
-    prefix: &mut Vec<BString>,
-    out: &mut Vec<(Vec<BString>, Option<BString>)>,
-) {
-    let tree = tree.trim();
-    let len = prefix.len();
-    let (path, group) = match tree.find_byte(b'{') {
-        Some(open) if tree.ends_with(b"}") => {
-            (&tree[..open], Some(&tree[open + 1..tree.len() - 1]))
-        }
-        _ => (tree, None),
-    };
-    let mut alias = None;
-    for segment in path.split_str("::") {
-        let mut words = segment.fields();
-        let Some(first) = words.next() else {
-            continue;
-        };
-        prefix.push(first.into());
-        if let (Some(b"as"), Some(name)) = (words.next(), words.next()) {
-            alias = Some(BString::from(name));
-        }
-    }
-    match group {
-        Some(group) => {
-            let (mut depth, mut start) = (0, 0);
-            for (i, &b) in group.iter().enumerate() {
-                match b {
-                    b'{' => depth += 1,
-                    b'}' => depth -= 1,
-                    b',' if depth == 0 => {
-                        expand_aliased(&group[start..i], prefix, out);
-                        start = i + 1;
-                    }
-                    _ => {}
-                }
-            }
-            expand_aliased(&group[start..], prefix, out);
-        }
-        None => out.push((prefix.clone(), alias)),
-    }
-    prefix.truncate(len);
 }
 
 /// Go's imports, each with its alias: `import u "p"`, the lines of an
@@ -1264,15 +1256,25 @@ fn reexported_from(text: &[u8]) -> Vec<&[u8]> {
         if !starts || text.get(at + 6).is_some_and(|&b| super::is_word_byte(b)) {
             continue;
         }
-        let rest = &text[at + 6..];
-        let end = [&b";"[..], b"\nexport", b"\nimport"]
-            .iter()
-            .filter_map(|stop| memchr::memmem::find(rest, stop))
-            .min()
-            .unwrap_or(rest.len());
-        out.extend(quoted_after(&rest[..end], &[b"from"]));
+        out.extend(quoted_after(statement(&text[at + 6..]), &[b"from"]));
+        if out.len() >= MAX_IMPORTS {
+            break;
+        }
     }
     out
+}
+
+/// The script statement at the start of `rest`: to its `;`, or to the next
+/// line starting an `import` or an `export` when it has none, or
+/// [`STATEMENT_BYTES`].
+fn statement(rest: &[u8]) -> &[u8] {
+    let mut rest = &rest[..rest.len().min(STATEMENT_BYTES)];
+    for stop in [&b";"[..], b"\nimport", b"\nexport"] {
+        if let Some(end) = memchr::memmem::find(rest, stop) {
+            rest = &rest[..end];
+        }
+    }
+    rest
 }
 
 /// The `pub use` declarations of Rust source `text`, of any visibility

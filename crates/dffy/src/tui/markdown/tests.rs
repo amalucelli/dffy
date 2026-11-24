@@ -287,3 +287,41 @@ fn cells_without_text_stand_for_the_nearest_glyph() {
     let last = REVIEW.len() - 1;
     assert_eq!(body.map.at(99, 0), last..last, "below the text");
 }
+
+/// Each cell of a comment stands for the character the grid draws there,
+/// for text whose measures have disagreed: in a paragraph, wrapped in any
+/// narrow box, and in a table, whose rows stay one width.
+#[test]
+fn cells_stand_for_what_the_grid_draws_there() {
+    let drawn = |body: &Body| -> Vec<crate::term::Grid> {
+        let mut grids = Vec::new();
+        for row in body.rows.rows() {
+            let mut grid = crate::term::Grid::new(60, 1);
+            let mut x = 0;
+            for (_, piece) in row {
+                x = grid.put_str(x, 0, 60, piece, crate::theme::Style::PLAIN);
+            }
+            grids.push(grid);
+        }
+        grids
+    };
+    for s in columns::TRICKY {
+        let source = format!("z{s} abc {s}{s}def");
+        for width in 2..20 {
+            let body = render(&source, width, true);
+            let grids = drawn(&body);
+            assert_eq!(body.map.text(), 0..source.len(), "{source:?}");
+            for g in &body.map.glyphs {
+                let cells = &grids[g.row].row(0)[g.col..g.col + g.width];
+                let shown: String = cells.iter().flat_map(|c| c.text().chars()).collect();
+                assert_eq!(shown, source[g.src.clone()], "{source:?} at {width}");
+                assert!(g.col + g.width <= width, "{source:?} past {width}");
+            }
+        }
+        let table = format!("| a | b |\n|---|---|\n| {s}x | y |\n| longer cell | z |\n");
+        let ends: Vec<_> = (drawn(&render(&table, 40, true)).iter())
+            .map(|grid| grid.row(0).iter().rposition(|c| c.text() != " "))
+            .collect();
+        assert!(ends.windows(2).all(|w| w[0] == w[1]), "{table}: {ends:?}");
+    }
+}

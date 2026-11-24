@@ -19,9 +19,9 @@ use dffy_core::diff::Text;
 use dffy_core::highlight;
 use dffy_core::view::{Attributes, Syntax};
 use pulldown_cmark::{Alignment, CodeBlockKind, Event, Parser, Tag, TagEnd};
-use unicode_width::{UnicodeWidthChar as _, UnicodeWidthStr as _};
 
 use super::view::rendered::language;
+use crate::columns::{self, Columns as _};
 use crate::render::{Canvas, plain};
 use crate::review::model::snippet::pieces;
 use crate::review::model::text::{checkbox, markdown_options as options, uncomment};
@@ -306,7 +306,9 @@ fn push(spans: &mut Spans, ink: Ink, text: &str) {
 }
 
 fn width_of(spans: &[(Ink, String)]) -> usize {
-    spans.iter().map(|(_, s)| s.width()).sum()
+    let mut before = None;
+    let chars = spans.iter().flat_map(|(_, s)| s.chars());
+    chars.map(|c| columns::added(before.replace(c), c)).sum()
 }
 
 /// A list that's open.
@@ -397,9 +399,17 @@ impl Writer<'_> {
         }
         let row = self.c.len();
         let mut col = width_of(lead);
+        let mut before = None;
         for (i, ch) in spans.iter().flat_map(|(_, s)| s.chars()).enumerate() {
-            let width = ch.width().unwrap_or(0);
-            if width > 0
+            let width = columns::added(before.replace(ch), ch);
+            if let Some(Some(src)) = src.get(i)
+                && (width == 0 || ch == columns::SELECTOR)
+                && let Some(last) = self.map.glyphs.last_mut().filter(|g| g.row == row)
+                && last.col + last.width == col
+            {
+                last.width += width;
+                last.src.end = last.src.end.max(src.end);
+            } else if width > 0
                 && let Some(Some(src)) = src.get(i)
             {
                 self.map.glyphs.push(Glyph {
@@ -863,13 +873,12 @@ fn wrap(spans: &[(Ink, String)], first: usize, rest: usize) -> Vec<Spans> {
                 used += text.width();
                 continue;
             }
-            for ch in text.chars() {
-                let w = ch.width().unwrap_or(0);
+            for (_, piece, w) in text.clusters() {
                 if used > 0 && used + w > room(&rows) {
                     rows.push(std::mem::take(&mut row));
                     used = 0;
                 }
-                push(&mut row, ink, ch.encode_utf8(&mut [0; 4]));
+                push(&mut row, ink, piece);
                 used += w;
             }
         }

@@ -137,6 +137,47 @@ fn document_at(path: &str, old: &str, new: &str) -> Document<()> {
     doc
 }
 
+/// Ignoring whitespace, a last line that differs only by its newline is
+/// unchanged: read alone, the no-newline marker follows the side read,
+/// whichever side lacks the newline, as the diff shows it after the new
+/// side's.
+#[test]
+fn the_no_newline_marker_follows_the_side_read() {
+    let rows_of = |old: &str, new: &str, side: Option<Side>| {
+        let mut fd = diff(old, new);
+        let options = Options {
+            whitespace: Whitespace::IgnoreAll,
+            ..Options::default()
+        };
+        fd.hunks = hunks(&fd.old, &fd.new, &options);
+        let mut doc = Document::default();
+        doc.push(fd.change.clone(), Source::Repo);
+        let file = File::prepare(&GRAMMARS, None).file(fd, Whitespace::IgnoreAll, true);
+        let _ = doc.load(0, Ok(Box::new(file)));
+        let (_, m) = on_lines(&[]);
+        doc.set_reading(side, &m, &m);
+        let rows = walk(&mut doc, &m);
+        (rows.iter())
+            .filter(|&&(p, _)| {
+                matches!(doc.row(p, &m), Some(Content::Hunk { row, lines, .. })
+                    if row == Row::Marker
+                        || matches!(row, Row::Line(i) | Row::One { line: i, .. }
+                            if lines.line(i).state == LineState::NoNewline))
+            })
+            .count()
+    };
+    // The old side lacks the newline.
+    let (old, new) = ("x\ny\nb", "X\ny\nb\n");
+    assert_eq!(rows_of(old, new, None), 0, "the diff shows the new side's");
+    assert_eq!(rows_of(old, new, Some(Side::Old)), 1);
+    assert_eq!(rows_of(old, new, Some(Side::New)), 0);
+    // The new side lacks it.
+    let (old, new) = ("x\ny\nb\n", "X\ny\nb");
+    assert_eq!(rows_of(old, new, None), 1);
+    assert_eq!(rows_of(old, new, Some(Side::Old)), 0);
+    assert_eq!(rows_of(old, new, Some(Side::New)), 1);
+}
+
 /// What a row shows, without borrowing the document.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Shows {
@@ -1227,7 +1268,7 @@ fn hidden_runs(hunks: &[crate::diff::Hunk], side: Side) -> Vec<Range<usize>> {
             (kind, l.block_start)
         };
         let mut rows = Vec::new();
-        crate::view::side_rows(side, hunk.lines.len(), kind, &mut rows);
+        crate::view::side_rows(side, hunk.lines.len(), (kind, |_| false), &mut rows);
         for row in rows {
             if let Row::Hidden { from, n } = row {
                 let start = line_on(&hunk.lines[from], side.other());
@@ -1691,6 +1732,50 @@ fn an_edited_line_has_no_mark_and_its_old_line_pairs_with_it() {
     doc.pos = at;
     assert!(doc.set_opened(doc.pos, true, &m));
     assert_eq!(doc.row_lines(doc.pos, &m), [Some(10), None]);
+}
+
+/// Hunks opened in place stay open over a reload that leaves the hunks
+/// where they were, and close over one that doesn't, the diff evicted in
+/// between or not: an opened hunk is never another one's number.
+#[test]
+fn opened_hunks_stay_open_while_the_hunks_stay() {
+    let old = (0..60).fold(String::new(), |out, i| out + &format!("line {i}\n"));
+    let new = old
+        .replace("line 5\n", "line  5\n")
+        .replace("line 25\n", "line twenty five\n")
+        .replace("line 45\n", "line forty five\n");
+    let loaded = |whitespace: Whitespace| {
+        let mut fd = diff(&old, &new);
+        let options = Options {
+            whitespace,
+            ..Options::default()
+        };
+        fd.hunks = hunks(&fd.old, &fd.new, &options);
+        Box::new(File::prepare(&GRAMMARS, None).file(fd, whitespace, true))
+    };
+    for evicted in [false, true] {
+        let (_, m) = on_lines(&[]);
+        let mut doc = document(&old, &new);
+        doc.set_reading(Some(Side::New), &m, &m);
+        let at = (walk(&mut doc, &m).into_iter())
+            .map(|(pos, _)| pos)
+            .find(|&pos| doc.row_lines(pos, &m)[1] == Some(25))
+            .expect("the second hunk");
+        assert!(doc.set_opened(at, true, &m));
+        assert_eq!(doc.opened(0), [1]);
+
+        let mut reload = |whitespace: Whitespace| {
+            if evicted {
+                doc.evict(0, &(0..0));
+                assert!(doc.diff_of(0).is_none());
+            }
+            doc.restale();
+            let _ = doc.load(0, Ok(loaded(whitespace)));
+            doc.opened(0).to_vec()
+        };
+        assert_eq!(reload(Whitespace::Exact), [1], "evicted: {evicted}");
+        assert_eq!(reload(Whitespace::IgnoreAll), [0; 0], "evicted: {evicted}");
+    }
 }
 
 /// The hunk opened is the one of the row asked for, wherever the top is:

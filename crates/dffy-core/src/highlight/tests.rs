@@ -112,6 +112,65 @@ fn detects_by_name_extension_and_shebang() {
     assert_eq!(detect("README", "text"), None);
 }
 
+/// A `.h` is C++ by what its text shows only C++ has, within its first
+/// 16 KB; any other `.h` stays C, and no other file changes language.
+#[test]
+fn a_header_is_cpp_by_its_text() {
+    let cpp = [
+        "namespace leveldb {\n",
+        "namespace a::b {\n",
+        "template <typename T>\nT max(T a, T b);\n",
+        "template<class T> struct Box;\n",
+        "struct A {\npublic:\n  int x;\n};\n",
+        "class LEVELDB_EXPORT DB {\n};\n",
+        "class Pair : public Base {\n};\n",
+        "class Leaf final {\n};\n",
+        "#include <string>\nvoid f(std::string s);\n",
+        "extern \"C++\" {\n",
+        "#ifndef __cplusplus\n#error C++ only\n#endif\nnamespace x {\n",
+        "#ifdef __cplusplus\nint a;\n#else\nint b;\n#endif\nclass X {\n};\n",
+        "const char *glob = \"src/*.c\";\nnamespace x {\n",
+        "const char *url = \"a//b\"; std::string s;\n",
+        "/* a note */ class X {\n};\n",
+        "#if X\nint a;\n#endif\nnamespace x {\n",
+        "#ifdef __cplusplus\n#if X\n#else\n#endif\n#endif\nnamespace x {\n",
+    ];
+    for text in cpp {
+        assert_eq!(detect("include/db.h", text), Some("cpp"), "{text}");
+        assert_eq!(detect("src/db.c", text), Some("c"), "{text}");
+    }
+    let c = [
+        // The kernel's.
+        "struct class {\n\tconst char *name;\n};\nint class_register(struct class *class);\n",
+        "#ifdef __cplusplus\nextern \"C\" {\n#endif\nint f(void);\n",
+        "/*\n * Like std::vector, or a template <T> of it.\n */\nint f(void);\n",
+        "// namespace foo {\nint g(void);\n",
+        "int class;\nclass = 1;\n",
+        // SystemTap's sdt.h: C++ only where C++ reads it.
+        "#ifdef __cplusplus\n#if 1\ntemplate<typename T> struct a;\n#endif\n#else\nint b;\n#endif\nint c;\n",
+        "#if defined(__cplusplus) && __cplusplus >= 201103L\nnamespace x {\n#endif\n",
+        "#ifndef __cplusplus\n#include <stdatomic.h>\n#else\n#include <atomic>\nusing std::atomic_int;\n#endif\n",
+        "#if !defined(__cplusplus)\nint a;\n#elif X\nnamespace x {\n#endif\n",
+        "#if X\nint a;\n#elif defined(__cplusplus)\ntemplate <typename T> T f();\n#endif\n",
+        "#if defined(__cplusplus) && !defined(X)\nnamespace x {\n#endif\n",
+        "#if __cplusplus != 0\nclass X {\n};\n#endif\n",
+        "# if X /* C */\n#  ifdef __cplusplus\nclass X {\n};\n#  endif\n# endif\nint a;\n",
+        "int f(void); // as std::sort does\nint g(void); /* std::swap */ int h;\n",
+        "/*\nThe handle's layout. In C++:\nclass X {\n  std::string s;\n};\n*/\nint f(void);\n",
+        "int a; /* a note\nnamespace x {\n*/ int b;\n",
+        "#define SPEC \"std::sort\"\nint f(void);\n",
+    ];
+    for text in c {
+        assert_eq!(detect("include/linux/device.h", text), Some("c"), "{text}");
+    }
+    let far = format!("{}namespace leveldb {{\n", "int x;\n".repeat(3000));
+    assert_eq!(
+        detect("include/late.h", &far),
+        Some("c"),
+        "past the first 16 KB"
+    );
+}
+
 #[test]
 fn csharp_roles() {
     assert_eq!(detect("src/App.cs", ""), Some("csharp"));

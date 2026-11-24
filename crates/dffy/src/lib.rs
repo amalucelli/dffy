@@ -3,6 +3,7 @@
 
 mod agents;
 mod cli;
+mod columns;
 mod config;
 mod control;
 mod daemon;

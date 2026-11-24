@@ -376,6 +376,37 @@ fn a_place_in_a_version_gone_since_is_skipped() {
     );
 }
 
+/// A screen whose top row is partway down a wrapped line shows as it was
+/// on going back, not from the line's first row.
+#[test]
+fn back_restores_a_top_row_partway_down_a_wrapped_line() {
+    let long = format!("line thirty {}", "and more ".repeat(30));
+    let mut fd = diff(FILE);
+    let new = String::from_utf8_lossy(fd.new.bytes()).replace("line 30\n", &format!("{long}\n"));
+    fd.new = Text::new(new.into_bytes());
+    fd.hunks = hunks(&fd.old, &fd.new, &Options::default());
+    let mut app = app_of(&Config::default(), "working tree", fd, (100, 24));
+    key(&mut app, 'X');
+    key(&mut app, 'W');
+    screen(&mut app);
+    for _ in 0..80 {
+        if app.doc.document.pos.offset > 0 {
+            break;
+        }
+        key(&mut app, 'j');
+    }
+    assert!(
+        app.doc.document.pos.offset > 0,
+        "the top row is partway down"
+    );
+    screen(&mut app);
+    let top = app.doc.document.pos;
+    pick(&mut app, "zz");
+    back(&mut app);
+    screen(&mut app);
+    assert_eq!(app.doc.document.pos, top);
+}
+
 /// The rows above the first line of code at the top, here the hunk's
 /// header, show again as they did.
 #[test]
@@ -436,4 +467,25 @@ fn back_from_the_tree_after_moving_returns_where_it_was_entered() {
     assert_ne!(app.doc.document.pos.file, entered);
     back(&mut app);
     assert_eq!(app.doc.document.pos.file, entered);
+}
+
+/// A list that changes while the keys are in the tree doesn't change
+/// where back goes from a file opened there.
+#[test]
+fn the_list_changing_under_the_tree_keeps_where_it_was_entered() {
+    let mut app = app(120, 24);
+    for i in 0..4 {
+        app.event(Event::Enumerated(diff(&format!("src/zz{i}.rs")).change));
+    }
+    screen(&mut app);
+    press(&mut app, Key::Tab);
+    for _ in 0..8 {
+        key(&mut app, 'j');
+    }
+    assert_ne!(app.doc.document.pos.file, 0);
+    app.doc.set_page(Some(1));
+    app.list_changed();
+    press(&mut app, Key::Enter);
+    back(&mut app);
+    assert_eq!(message(&app), format!("back to {FILE}:1"));
 }

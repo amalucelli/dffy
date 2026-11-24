@@ -4,14 +4,21 @@
 
 use std::ops::RangeInclusive;
 use std::sync::atomic::AtomicBool;
-use std::sync::{Mutex, PoisonError};
+use std::sync::{Arc, Mutex, PoisonError};
 
-use super::names::{Comments, uses};
+use gix::bstr::BString;
+use rustc_hash::{FxHashMap, FxHashSet};
+
+use super::names::{Comments, uses, uses_at};
 use super::{
     Candidate, Error, MAX_SEARCH_BYTES, Navigator, Origin, Progress, Rank, Slot, differs, hash,
     is_word_byte,
 };
-use crate::git::{self, Repo};
+use crate::git::{self, FileChange, Repo};
+use crate::highlight::DefinitionKind;
+
+/// What a diff changes, by path.
+type Changes = FxHashMap<BString, FileChange>;
 
 /// The files a search reports the uses of; past them, it only counts files.
 pub const MAX_REFERENCE_FILES: usize = 200;
@@ -60,9 +67,21 @@ pub struct References {
     /// Files with a use found so far.
     files: usize,
     filter: Filter,
+    /// Of a search in the diff alone.
+    diffed: Option<Diffed>,
     /// The indexed files defining the name, as of how many files the
     /// index had: a host steps a file at a time.
     defined_in: (usize, Vec<u32>),
+}
+
+/// What a search in the diff alone picks its files from: a navigator takes a
+/// diff's changes again.
+#[derive(Debug)]
+struct Diffed {
+    /// Every file of the side, in the search's order.
+    all: Vec<(Rank, u32)>,
+    /// The changes they were picked by.
+    by: Arc<Changes>,
 }
 
 impl Navigator {
@@ -95,13 +114,12 @@ impl Navigator {
             let related = self.related(repo, origin, cancel)?;
             self.search_order(&related, origin)
         };
+        let mut diffed = None;
         if filter.in_diff {
             let changes = self.changes();
-            order.retain(|&(_, l)| {
-                changes
-                    .get(&self.listed[l as usize].path)
-                    .is_some_and(differs)
-            });
+            let all = order.clone();
+            order.retain(|&(_, l)| self.differs(&changes, l));
+            diffed = Some(Diffed { all, by: changes });
         }
         Ok(References {
             navigator: self.id,
@@ -111,8 +129,14 @@ impl Navigator {
             next: 0,
             files: 0,
             filter,
+            diffed,
             defined_in: (usize::MAX, Vec::new()),
         })
+    }
+
+    /// Whether the diff whose `changes` these are changes listed file `l`.
+    fn differs(&self, changes: &Changes, l: u32) -> bool {
+        (changes.get(&self.listed[l as usize].path)).is_some_and(differs)
     }
 
     /// The indexed files the index has definitions of `name` in so far,
@@ -127,9 +151,9 @@ impl Navigator {
             })
     }
 
-    /// The lines the definitions of `name` in indexed file `file` span, as
-    /// far as the index has it.
-    fn defining(&self, file: u32, name: &str) -> Vec<RangeInclusive<usize>> {
+    /// The definitions of `name` in indexed file `file`, as far as the index
+    /// has it.
+    fn defining(&self, file: u32, name: &str) -> Vec<Defining> {
         let Slot::Found(Some(at)) = self.state().slots[file as usize] else {
             return Vec::new();
         };
@@ -137,7 +161,13 @@ impl Navigator {
             .map(|defs| {
                 defs.iter()
                     .filter(|d| d.name == name)
-                    .map(|d| d.start..=d.end)
+                    .map(|d| Defining {
+                        lines: d.start..=d.end,
+                        function: matches!(
+                            d.kind,
+                            DefinitionKind::Function | DefinitionKind::Method
+                        ),
+                    })
                     .collect()
             })
             .unwrap_or_default()
@@ -188,6 +218,18 @@ impl References {
             return Vec::new();
         }
         let in_diff = navigator.changes();
+        if let Some(Diffed { all, by }) = &mut self.diffed
+            && !Arc::ptr_eq(by, &in_diff)
+        {
+            // What's searched stays; the rest is what the diff has now.
+            self.order.truncate(self.next);
+            let searched: FxHashSet<u32> = self.order.iter().map(|&(_, l)| l).collect();
+            self.order.extend(
+                all.iter()
+                    .filter(|&&(_, l)| !searched.contains(&l) && navigator.differs(&in_diff, l)),
+            );
+            *by = Arc::clone(&in_diff);
+        }
         let indexed = navigator.progress().done;
         if self.defined_in.0 != indexed {
             self.defined_in = (indexed, navigator.defined_in(&self.name));
@@ -215,7 +257,9 @@ impl References {
             }
             let language = listed.indexed.map(|i| {
                 let indexed = &navigator.indexed[i as usize];
-                (i, navigator.languages[usize::from(indexed.language)].name())
+                let language = &navigator.languages[usize::from(indexed.language)];
+                // A header's is what its text reads as.
+                (i, language.of_text(path, &text).name())
             });
             let file = File {
                 text: &text,
@@ -272,6 +316,20 @@ pub(super) fn take_buffer() -> Vec<u8> {
     pool.pop().unwrap_or_default()
 }
 
+/// Drops the read buffers kept for the next search, giving their memory
+/// back: a host calls it once searches have stopped for a while. The next
+/// search grows one again.
+pub fn release_search_buffers() {
+    let mut pool = BUFFERS.lock().unwrap_or_else(PoisonError::into_inner);
+    *pool = Vec::new();
+}
+
+/// The buffers kept, for tests.
+#[cfg(test)]
+pub(super) fn pooled() -> usize {
+    BUFFERS.lock().unwrap_or_else(PoisonError::into_inner).len()
+}
+
 /// Gives a search's read buffer back for the next, its room kept: given
 /// back smaller, each search would grow it again through allocations the
 /// allocator keeps once freed.
@@ -293,8 +351,15 @@ struct File<'a> {
     language: Option<&'a str>,
     /// Only the uses calling the name count.
     calls_only: bool,
-    /// The lines each definition of the name in it spans, as indexed.
-    defining: Vec<RangeInclusive<usize>>,
+    /// The definitions of the name in it, as indexed.
+    defining: Vec<Defining>,
+}
+
+/// A definition of the name searched for.
+struct Defining {
+    /// The lines it spans.
+    lines: RangeInclusive<usize>,
+    function: bool,
 }
 
 impl File<'_> {
@@ -325,24 +390,21 @@ impl File<'_> {
             starts = line_start;
             stops = memchr::memchr(b'\n', &text[at..]).map_or(text.len(), |i| at + i);
             let bytes = &text[starts..stops];
-            if self.calls_only && !calls(&text[starts..at], &text[end..stops]) {
-                continue;
-            }
+            // The part of the line that is code, past a comment or a string
+            // open at its start.
+            let mut code = bytes;
             if let Some(language) = self.language {
                 if fed < starts {
                     comments.skip(&text[fed..starts]);
                 }
                 fed = (stops + 1).min(text.len());
-                let code = comments.line(bytes);
-                if !code.is_some_and(|code| uses(code, language, self.name)) {
-                    continue;
+                match comments.line(bytes) {
+                    Some(part) if uses(part, language, self.name) => code = part,
+                    _ => continue,
                 }
-                if let Some(i) = (self.defining.iter().zip(&taken))
-                    .position(|(span, taken)| !taken && span.contains(&line))
-                {
-                    taken[i] = true;
-                    continue;
-                }
+            }
+            if !self.counts(bytes, code, line, &mut taken) {
+                continue;
             }
             if !reported {
                 return (true, 0);
@@ -356,56 +418,118 @@ impl File<'_> {
         }
         (listed + more > 0, more)
     }
+
+    /// Whether line number `line`, `bytes` whose part `code` uses the name,
+    /// has a use that counts: one that isn't what defines it there, and with
+    /// calls alone asked for, one that calls it. A definition whose defining
+    /// use is on the line is marked in `taken`.
+    fn counts(&self, bytes: &[u8], code: &[u8], line: usize, taken: &mut [bool]) -> bool {
+        let defined =
+            |taken: &[bool], i: usize| !taken[i] && self.defining[i].lines.contains(&line);
+        if !self.calls_only && !(0..taken.len()).any(|i| defined(taken, i)) {
+            return true;
+        }
+        // Each use's part of the line before it and past it.
+        let past = bytes.len() - code.len();
+        let mut left: Vec<(&[u8], &[u8])> = (uses_at(code, self.language, self.name).into_iter())
+            .map(|at| past + at)
+            .map(|at| (&bytes[..at], &bytes[at + self.name.len()..]))
+            .collect();
+        for i in 0..taken.len() {
+            if defined(taken, i)
+                && let Some(defining) = defining_use(&left, self.defining[i].function)
+            {
+                taken[i] = true;
+                left.remove(defining);
+            }
+        }
+        (left.iter()).any(|(before, after)| !self.calls_only || calls(before, after))
+    }
+}
+
+/// Which of a line's `uses` of a name, each by what's before and after it, is
+/// the one a definition of it names it by: the one past a word that defines,
+/// else the first; for a function, the first that isn't a type before the
+/// name (C's `struct foo *foo(`), if any.
+fn defining_use(uses: &[(&[u8], &[u8])], function: bool) -> Option<usize> {
+    let by_word = uses.iter().position(|(before, _)| defines(before));
+    if by_word.is_some() || !function {
+        return by_word.or_else(|| (!uses.is_empty()).then_some(0));
+    }
+    uses.iter().position(|(_, after)| {
+        let next = after.trim_ascii_start().first();
+        next.is_some_and(|&b| !(is_word_byte(b) || matches!(b, b'*' | b'&')))
+    })
+}
+
+/// Whether what's `before` a name on its line ends in a word that defines a
+/// function of it.
+fn defines(before: &[u8]) -> bool {
+    let before = before.trim_ascii_end();
+    [&b"fn"[..], b"def", b"func", b"fun", b"function"]
+        .iter()
+        .any(|k| {
+            (before.strip_suffix(*k)).is_some_and(|b| b.last().is_none_or(|&b| !is_word_byte(b)))
+        })
 }
 
 /// Whether a use of a name, `before` it and `after` it on its line, calls
 /// it: the arguments come next, after a Rust macro's `!`, a turbofish
-/// `::<…>`, or type arguments in `<…>` or Go's `[…]`. A definition's own
-/// name (`fn f(`, `def f(`, `func f(`, `function f(`) doesn't. A line-level
-/// rule: a C declaration `int f(void);` reads as a call, unless the index
-/// has it as the name's definition.
+/// `::<…>`, or type arguments right after it, in `<…>` or Go's `[…]`. A
+/// definition's own name (`fn f(`, `def f(`, `func f(`, `fun f(`,
+/// `function f(`) doesn't. A line-level rule: a C declaration `int f(void);`
+/// reads as a call, unless the index has it as the name's definition.
 pub(super) fn calls(before: &[u8], after: &[u8]) -> bool {
-    let keyword = before.trim_ascii_end();
-    let defines = [&b"fn"[..], b"def", b"func", b"function"].iter().any(|k| {
-        keyword.ends_with(k)
-            && keyword[..keyword.len() - k.len()]
-                .last()
-                .is_none_or(|&b| !is_word_byte(b))
-    });
-    if defines {
+    if defines(before) {
         return false;
     }
-    let mut rest = after.trim_ascii_start();
-    if let Some(r) = rest.strip_prefix(b"!") {
-        rest = r.trim_ascii_start();
+    let rest = after.trim_ascii_start();
+    if let Some(rest) = rest.strip_prefix(b"!") {
+        let rest = rest.trim_ascii_start();
         return matches!(rest.first(), Some(b'(' | b'[' | b'{'));
     }
-    if let Some(r) = rest.strip_prefix(b"::") {
-        rest = r;
-    }
-    if let Some(&open @ (b'<' | b'[')) = rest.first() {
-        let close = if open == b'<' { b'>' } else { b']' };
-        let mut depth = 0usize;
-        let mut end = None;
-        for (i, &b) in rest.iter().enumerate() {
-            if b == open {
-                depth += 1;
-            } else if b == close {
+    // A comparison has a space before its `<`.
+    let (turbofish, arguments) = match rest.strip_prefix(b"::") {
+        Some(rest) => (true, rest),
+        None => (false, after),
+    };
+    let rest = match arguments.first() {
+        Some(b'<' | b'[') => match type_arguments(arguments, turbofish) {
+            Some(end) => arguments[end..].trim_ascii_start(),
+            None => return false,
+        },
+        _ if turbofish => arguments,
+        _ => rest,
+    };
+    rest.first() == Some(&b'(')
+}
+
+/// Where the type arguments `text` opens with close, `None` when they don't
+/// on the line or hold what no type does: a `turbofish` is nothing else, so
+/// it may hold a `const` argument's braces.
+fn type_arguments(text: &[u8], turbofish: bool) -> Option<usize> {
+    let open = *text.first()?;
+    let close = if open == b'<' { b'>' } else { b']' };
+    let mut depth = 0usize;
+    for (i, &b) in text.iter().enumerate() {
+        let next = text.get(i + 1);
+        match b {
+            _ if b == open => depth += 1,
+            // Not the `>` of `->` or `=>`.
+            _ if b == close && !(b == b'>' && matches!(text[i - 1], b'-' | b'=')) => {
                 depth -= 1;
                 if depth == 0 {
-                    end = Some(i);
-                    break;
+                    return Some(i + 1);
                 }
-            } else if matches!(b, b';' | b'{' | b'=') {
-                break;
             }
+            b';' => return None,
+            b'{' if !turbofish => return None,
+            b'&' | b'|' if next == Some(&b) => return None,
+            b'=' if next == Some(&b'=') || (!turbofish && next != Some(&b'>')) => return None,
+            _ => {}
         }
-        let Some(end) = end else {
-            return false;
-        };
-        rest = rest[end + 1..].trim_ascii_start();
     }
-    rest.first() == Some(&b'(')
+    None
 }
 
 /// `line` trimmed, cut to [`LINE_BYTES`] at a character boundary.
@@ -417,3 +541,6 @@ fn shortened(line: &[u8]) -> String {
     }
     text[..end].to_owned()
 }
+
+#[cfg(test)]
+mod tests;

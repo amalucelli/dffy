@@ -14,6 +14,9 @@ use super::text::epoch;
 use super::{Comments, Posting, Standing};
 use crate::review::{self, Comment, Op};
 
+/// Why posting leaves a local draft whose lines weren't found.
+pub(crate) const NO_LINES: &str = "its lines aren't here";
+
 impl Comments {
     /// Takes [`Comments::drafts_key`] as the drafts are now.
     pub(super) fn key_drafts(&mut self) {
@@ -64,14 +67,12 @@ impl Comments {
         pending
     }
 
-    /// The drafts posting sends, in file order, local ones in view
-    /// included: each one's id, whether it's from the local review's file,
+    /// The drafts posting sends, in file order, local ones placed on this
+    /// diff included: each one's id, whether it's from the local review's file,
     /// and whether the host refused it before.
     pub(crate) fn drafts(&self) -> impl Iterator<Item = (&str, bool, bool)> {
-        self.review
-            .comments
-            .iter()
-            .filter(|c| self.standing(c) == Standing::Draft && !self.hides(c))
+        (self.drafts_shown())
+            .filter(|c| !self.lost_local(c))
             .map(|c| {
                 (
                     c.id.as_str(),
@@ -79,6 +80,22 @@ impl Comments {
                     c.post_error.is_some(),
                 )
             })
+    }
+
+    /// Every draft in view, in file order.
+    pub(super) fn drafts_shown(&self) -> impl Iterator<Item = &Comment> {
+        self.review
+            .comments
+            .iter()
+            .filter(|c| self.standing(c) == Standing::Draft && !self.hides(c))
+    }
+
+    /// The local drafts in view that posting leaves in the local file, as
+    /// their lines weren't found: their ids, in file order.
+    pub(crate) fn staying(&self) -> impl Iterator<Item = &str> {
+        (self.drafts_shown())
+            .filter(|c| self.lost_local(c))
+            .map(|c| c.id.as_str())
     }
 
     /// [`Comments::drafts`] as of the last read, hashed: when it changes
@@ -129,12 +146,14 @@ impl Comments {
         self.find(id).is_some_and(|c| c.post_error.is_some())
     }
 
-    /// The local drafts in view, replies included: what posting moves.
+    /// The local drafts placed on this diff, replies included: what posting
+    /// moves.
     fn local_shown(&self) -> impl Iterator<Item = &Comment> {
         self.review
             .comments
             .iter()
-            .filter(|c| self.from_local.contains(&c.id) && !self.hides(c))
+            .filter(|c| self.from_local.contains(&c.id))
+            .filter(|c| !self.hides(c) && !self.lost_local(c))
     }
 
     /// How many drafts [`Comments::move_local`] would move.
@@ -168,11 +187,18 @@ impl Comments {
             .collect()
     }
 
-    /// What posting draft `c` does, when that's news: the host refused it
+    /// What posting draft `c` does, when that's news: it stays, in a local
+    /// thread whose lines weren't found (`lost`), or the host refused it
     /// before, else what the last plan said.
-    pub(super) fn posting(&self, c: &Comment) -> Option<Posting> {
+    pub(super) fn posting(&self, c: &Comment, lost: bool) -> Option<Posting> {
         if self.standing(c) != Standing::Draft {
             return None;
+        }
+        if lost {
+            return Some(Posting {
+                warn: true,
+                words: format!("stays on the branch: {NO_LINES}"),
+            });
         }
         match &c.post_error {
             Some(why) => Some(Posting {

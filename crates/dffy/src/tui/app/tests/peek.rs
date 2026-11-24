@@ -199,6 +199,50 @@ impl Fixture {
         (self.app.message.as_ref()).map_or_else(String::new, |(m, _)| m.clone())
     }
 
+    /// The peek shows code read, and it has a line with `text`.
+    fn shows_code(&self, text: &str) -> bool {
+        let code = self.app.doc.def_peek().and_then(|p| p.code.as_ref());
+        code.and_then(|c| c.as_ref().ok())
+            .is_some_and(|c| c.lines.iter().any(|l| l.contains(text)))
+    }
+
+    /// `path` becomes `text` on disk, and the list is read again.
+    fn rewrite(&mut self, path: &str, text: &str) {
+        std::fs::write(self.dir.path().join(path), text).expect("write");
+        let mut set = ChangeSet::new(
+            self.repo.clone(),
+            self.spec,
+            Revisions::default(),
+            &[],
+            false,
+        );
+        set.enumerate(|_| ControlFlow::Continue(()))
+            .expect("enumerates");
+        let update = set
+            .refresh(&[path.into()])
+            .expect("refreshes")
+            .expect("a change");
+        self.app.event(Event::Refreshed(update));
+    }
+
+    /// The line number, as drawn, of the row right above the peek.
+    fn above_peek(&mut self) -> String {
+        let screen = screen(&mut self.app);
+        let lines: Vec<&str> = screen.lines().collect();
+        let at = lines
+            .iter()
+            .position(|l| l.contains("│  ┌ "))
+            .unwrap_or_else(|| panic!("no peek:\n{screen}"));
+        lines[at - 1].to_owned()
+    }
+
+    /// The candidate shown, as `path:line`.
+    fn current(&self) -> String {
+        let peek = self.app.doc.def_peek().expect("open");
+        let c = peek.current().expect("a candidate");
+        format!("{}:{}", c.path, c.start + 1)
+    }
+
     /// The screen cell `text` starts at, the first time it shows.
     fn cell_of(&mut self, text: &str) -> (u16, u16) {
         let screen = screen(&mut self.app);
@@ -392,6 +436,21 @@ fn failures_are_said() {
     assert!(!f.app.dirty, "the same push draws nothing");
 }
 
+/// Kills the helper; its client sees it go before the next ask.
+fn kill(f: &Fixture) {
+    let pid = f
+        .app
+        .peek_helper()
+        .and_then(|h| h.pid())
+        .expect("a helper runs");
+    rustix::process::kill_process(pid, rustix::process::Signal::KILL).ok();
+    let start = Instant::now();
+    while f.app.peek_helper().is_some_and(|h| h.pid().is_some()) {
+        assert!(start.elapsed() < Duration::from_secs(10), "it never went");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
 /// The helper killed while the viewer runs: the next ask starts another,
 /// whose ids never meet the dead one's, the other version's navigator and
 /// the search for uses of the dead one started again with it, and after
@@ -399,20 +458,6 @@ fn failures_are_said() {
 #[test]
 fn a_helper_that_dies_is_started_again_a_few_times() {
     let mut f = Fixture::new(160, false);
-    let kill = |f: &Fixture| {
-        let pid = f
-            .app
-            .peek_helper()
-            .and_then(|h| h.pid())
-            .expect("a helper runs");
-        rustix::process::kill_process(pid, rustix::process::Signal::KILL).ok();
-        // Its client sees it go before the next ask.
-        let start = Instant::now();
-        while f.app.peek_helper().is_some_and(|h| h.pid().is_some()) {
-            assert!(start.elapsed() < Duration::from_secs(10), "it never went");
-            std::thread::sleep(Duration::from_millis(10));
-        }
-    };
     let both = |f: &mut Fixture| {
         let listed = |f: &mut Fixture, side: &str| {
             f.found()
@@ -460,6 +505,67 @@ fn a_helper_that_dies_is_started_again_a_few_times() {
         shown.contains("definitions unavailable: the helper keeps exiting"),
         "{shown}"
     );
+    // Asked again, of either version, it's said again.
+    f.key(Key::Esc);
+    f.peek();
+    for _ in 0..2 {
+        f.run(|_| true);
+        let shown = screen(&mut f.app);
+        assert!(
+            shown.contains("the helper keeps exiting"),
+            "asked again: {shown}"
+        );
+        f.key(Key::Char('s'));
+    }
+}
+
+/// A name each helper asked about it dies on is said to be, rather than
+/// asked again up to the restart limit: the next name is looked up.
+#[cfg(debug_assertions)]
+#[test]
+fn a_name_the_helper_dies_on_leaves_the_next_one_working() {
+    let mut f = Fixture::new(160, false);
+    let name = crate::navigator::DEADLY;
+    assert!(f.app.peek_name(name, document::Side::New, 4), "asks");
+    f.run_asked();
+    let shown = screen(&mut f.app);
+    let said = format!("looking up {name} failed: the navigator helper went away");
+    assert!(shown.contains(&said), "{shown}");
+    f.peek();
+    f.run(|_| true);
+    assert_eq!(f.found().map(|found| found.0), Some(4));
+}
+
+/// A search for uses each helper stepping it dies in stops, saying so, and
+/// the next name is looked up.
+#[test]
+fn a_search_the_helper_dies_in_says_so() {
+    let mut f = Fixture::new(160, false);
+    f.peek();
+    for _ in 0..10 {
+        f.run(|j| !matches!(j, Job::References(_)));
+        let Some(job) = f
+            .app
+            .jobs()
+            .into_iter()
+            .find(|j| matches!(j, Job::References(_)))
+        else {
+            break;
+        };
+        kill(&f);
+        let done = worker::run(job, Some(&f.repo), &f.settings);
+        f.app.event(Event::Diffed(done));
+    }
+    let failed = (f.app.doc.def_peek().and_then(|p| p.references())).and_then(|r| r.failed.clone());
+    assert!(
+        failed.is_some_and(|why| why.contains("the navigator helper went away")),
+        "{}",
+        screen(&mut f.app)
+    );
+    f.key(Key::Esc);
+    f.app.peek_name("use", document::Side::New, 2);
+    f.run(|_| true);
+    assert_eq!(f.found().map(|found| found.0), Some(1));
 }
 
 /// The peek's code is read right after the work on the files on screen,
@@ -696,8 +802,304 @@ fn a_peek_at_the_definition_itself_opens_on_its_uses() {
     );
     f.run(|_| true);
     assert_eq!(f.found().expect("listed").2, "mm/use.c", "on the first use");
+    assert!(f.shows_code("int use(void)"), "the use's code");
     f.key(Key::Char('r'));
     assert_eq!(f.found().expect("listed").2, "mm/x.c", "r: the definitions");
+}
+
+/// A peek at `kmalloc_array`'s own definition in `mm/x.c`, its definitions
+/// listed and its search for uses asked for, not run; the search's id.
+fn at_definition(f: &mut Fixture) -> u64 {
+    f.key(Key::Char('f'));
+    f.run(|_| true);
+    assert!(
+        f.app.peek_name("kmalloc_array", document::Side::New, 1),
+        "asks"
+    );
+    f.run(|j| !matches!(j, Job::References(_) | Job::PeekCode(_)));
+    (f.app.jobs().into_iter())
+        .find_map(|j| match j {
+            Job::References(job) => Some(job.id),
+            _ => None,
+        })
+        .expect("a search asked for")
+}
+
+/// The first step of search `id` finds the use in `mm/use.c`.
+fn a_use(f: &Fixture, id: u64) -> Event {
+    let side = (f.app.doc.document.files().iter())
+        .find(|e| e.change().path == "mm/use.c")
+        .and_then(|e| e.change().new)
+        .expect("listed");
+    Event::Diffed(Done::Referenced {
+        id,
+        result: Ok(Referenced {
+            hits: vec![navigate::Reference {
+                candidate: navigate::Candidate {
+                    path: "mm/use.c".into(),
+                    side,
+                    kind: None,
+                    start: 4,
+                    end: 4,
+                    container: None,
+                    rank: navigate::Rank::Near,
+                    changed: true,
+                    in_hunk: None,
+                },
+                text: "void *p = kmalloc_array(4, 16);".to_owned(),
+                more: 0,
+            }],
+            files: 1,
+            searched: navigate::Progress { done: 1, total: 9 },
+            done: false,
+            indexed: true,
+        }),
+    })
+}
+
+/// A use the cursor goes to on its own has its code read, and a read that
+/// comes for the definition it left isn't shown.
+#[test]
+fn a_read_for_a_candidate_left_isnt_shown() {
+    let mut f = Fixture::new(160, false);
+    let id = at_definition(&mut f);
+    let read = (f.app.jobs().into_iter())
+        .find(|j| matches!(j, Job::PeekCode(_)))
+        .expect("the definition's code asked for");
+    let use_found = a_use(&f, id);
+    f.app.event(use_found);
+    assert_eq!(f.current(), "mm/use.c:5");
+    let done = worker::run(read, Some(&f.repo), &f.settings);
+    f.app.event(Event::Diffed(done));
+    assert!(!f.shows_code("int x;"), "the definition's file");
+    f.run(|j| matches!(j, Job::PeekCode(_)));
+    assert!(f.shows_code("int use(void)"), "the use's");
+}
+
+/// A search that starts over takes its uses away: the cursor goes back to
+/// a definition, whose code shows.
+#[test]
+fn a_search_started_over_leaves_the_definitions_code() {
+    let mut f = Fixture::new(160, false);
+    let id = at_definition(&mut f);
+    let use_found = a_use(&f, id);
+    f.app.event(use_found);
+    f.run(|j| matches!(j, Job::PeekCode(_)));
+    assert!(f.shows_code("int use(void)"));
+    f.app.event(Event::Diffed(Done::Referenced {
+        id,
+        result: Err(Unanswered::Gone),
+    }));
+    let path = f.current();
+    assert!(!path.starts_with("mm/use.c"), "{path}");
+    f.run(|j| matches!(j, Job::PeekCode(_)));
+    assert!(f.shows_code("*kmalloc_array(unsigned long n"), "{path}");
+}
+
+/// A search stopped at its first files that starts over, as when its
+/// navigator went away, runs again.
+#[test]
+fn a_capped_search_started_over_runs_again() {
+    let mut f = Fixture::new(160, false);
+    f.peek();
+    f.run(|j| !matches!(j, Job::References(_)));
+    let id = (f.app.jobs().into_iter())
+        .find_map(|j| match j {
+            Job::References(job) => Some(job.id),
+            _ => None,
+        })
+        .expect("a search asked for");
+    f.app.event(Event::Diffed(Done::Referenced {
+        id,
+        result: Ok(Referenced {
+            hits: Vec::new(),
+            files: navigate::MAX_REFERENCE_FILES,
+            searched: navigate::Progress { done: 9, total: 99 },
+            done: false,
+            indexed: true,
+        }),
+    }));
+    f.app.tag_peek_search(0);
+    f.app.reopen_peek_navigator(document::Side::New);
+    f.run(|_| true);
+    let shown = screen(&mut f.app);
+    assert!(shown.contains("Uses · 2 files"), "{shown}");
+}
+
+/// A lookup asked again that fails says why, over the uses listed, the
+/// code of the one shown read.
+#[test]
+fn a_failed_lookup_keeps_the_uses_code() {
+    let mut f = Fixture::new(160, true);
+    f.peek();
+    f.run(|_| true);
+    f.rewrite("mm/x.c", "int x, y;\n");
+    f.run(|j| !matches!(j, Job::Lookup(_) | Job::References(_)));
+    let lookup = (f.app.jobs().into_iter())
+        .find_map(|j| match j {
+            Job::Lookup(job) => Some(job.id),
+            _ => None,
+        })
+        .expect("asked again");
+    f.run(|j| !matches!(j, Job::Lookup(_)));
+    f.app.event(Event::Diffed(Done::Looked {
+        id: lookup,
+        result: Err(Unanswered::Failed("boom".to_owned())),
+    }));
+    f.run(|_| true);
+    let shown = screen(&mut f.app);
+    assert!(shown.contains("failed: boom"), "{shown}");
+    assert_eq!(f.current(), "mm/use.c:5");
+    assert!(f.shows_code("int use(void)"), "{shown}");
+}
+
+/// `mm/use.c`'s function, asked about its local `p` from its `return`.
+const USES: &str = "int use(void)\n{\n\tvoid *p = kmalloc_array(4, 16);\n\treturn p != 0;\n}\n";
+
+/// A peek at the local `p` of `mm/use.c`, from the line returning it.
+fn at_local() -> Fixture {
+    let mut f = Fixture::new(160, true);
+    f.rewrite("mm/use.c", &format!("#include <slab.h>\n\n{USES}"));
+    f.run(|_| true);
+    assert!(f.app.peek_name("p", document::Side::New, 5), "asks");
+    f.run(|_| true);
+    assert_eq!(f.current(), "mm/use.c:5", "the local");
+    assert!(f.above_peek().contains("return p != 0;"));
+    f
+}
+
+/// After a refresh, a name is looked up where its line went, under which
+/// the peek hangs: lines above the asking one that put another function's
+/// on its old number don't answer for it.
+#[test]
+fn a_peek_follows_its_line_through_a_refresh() {
+    let mut f = at_local();
+    let above = "int other(int p)\n{\n\tp++;\n\treturn p != 0;\n}\n\n";
+    f.rewrite("mm/use.c", &format!("#include <slab.h>\n\n{above}{USES}"));
+    f.run(|_| true);
+    assert_eq!(f.current(), "mm/use.c:11", "still its local");
+    let row = f.above_peek();
+    assert!(
+        row.contains("12") && row.contains("return p != 0;"),
+        "{row}"
+    );
+}
+
+/// A line changed where it is keeps its peek, and its name is looked up
+/// alone: where it's used on the line isn't known any more.
+#[test]
+fn a_peek_at_a_line_changed_in_place_asks_by_name() {
+    let mut f = at_local();
+    let text = USES.replace("return p != 0;", "return !!p;");
+    f.rewrite("mm/use.c", &format!("#include <slab.h>\n\n\n{text}"));
+    f.run(|j| !matches!(j, Job::Lookup(_)));
+    let at = (f.app.jobs().into_iter()).find_map(|j| match j {
+        Job::Lookup(job) => Some(job.at),
+        _ => None,
+    });
+    assert_eq!(at, Some(None), "asked again, by name");
+    f.run(|_| true);
+    let row = f.above_peek();
+    assert!(row.contains("return !!p;"), "{row}");
+}
+
+/// A peek whose line is gone closes, saying so; until the file's new diff
+/// tells, nothing is asked from where the line was.
+#[test]
+fn a_peek_whose_line_is_gone_closes() {
+    let mut f = at_local();
+    f.rewrite("mm/use.c", "int nothing;\n");
+    assert!(
+        !f.app.jobs().iter().any(|j| matches!(j, Job::Lookup(_))),
+        "asked before the new diff came"
+    );
+    f.run(|_| true);
+    assert!(f.app.doc.def_peek().is_none());
+    assert_eq!(f.message(), "the peek's line is gone; the peek closed");
+}
+
+/// A peek that gave the keys back opens over `app`'s first line.
+fn blurred(app: &mut App) {
+    let peek = crate::tui::peek::Peek::new(
+        "name".to_owned(),
+        "version".to_owned(),
+        "waiting".to_owned(),
+        String::new(),
+    );
+    let at = document::Attach::Line {
+        side: document::Side::New,
+        line: 0,
+    };
+    app.doc.open_peek(peek, at);
+    app.blur_peek();
+    screen(app);
+}
+
+/// A focused thread has the keys a peek open without them would take.
+#[test]
+fn a_blurred_peek_leaves_a_focused_threads_keys() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    for pressed in ['j', 'k', 'd', 's', 'r', '\n'] {
+        let (mut app, path) = commented(&dir);
+        blurred(&mut app);
+        assert!(app.doc.focus_thread("d1"));
+        screen(&mut app);
+        let code = if pressed == '\n' {
+            Key::Enter
+        } else {
+            Key::Char(pressed)
+        };
+        press(&mut app, code);
+        let peek = app.doc.def_peek().expect("open");
+        assert!(!peek.focused, "{pressed:?} took the keys");
+        match pressed {
+            'r' => assert_eq!(
+                app.doc.writing().map(|w| w.at.clone()),
+                Some(Writes::Reply("d1".to_owned()))
+            ),
+            'd' => {
+                press(&mut app, code);
+                let left = read_comments(&path).comments;
+                assert!(left.iter().all(|c| c.id != "d2"), "{left:?}");
+            }
+            _ => {}
+        }
+    }
+}
+
+/// A focused suggestion is applied by `s`, whatever peek is open.
+#[test]
+fn a_blurred_peek_leaves_s_to_a_suggestion() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut app = app(100, 30);
+    app.set_comments(dir.path().join("comments.json"));
+    screen(&mut app);
+    key(&mut app, 'S');
+    typed(&mut app, "Shorter");
+    press(&mut app, Key::Esc);
+    screen(&mut app);
+    let root = focused(&app).expect("the suggestion's thread").to_owned();
+    blurred(&mut app);
+    assert!(app.doc.focus_thread(&root));
+    screen(&mut app);
+    let applied = press(&mut app, Key::Char('s'));
+    assert!(matches!(applied, Some(Action::ApplySuggestion(_))));
+}
+
+/// A peek scrolled off screen leaves the diff its keys.
+#[test]
+fn a_blurred_peek_off_screen_leaves_the_diffs_keys() {
+    let mut app = app(100, 12);
+    blurred(&mut app);
+    key(&mut app, 'G');
+    screen(&mut app);
+    assert!(!app.doc.peek_shown());
+    let at = app.doc.document.pos;
+    key(&mut app, 'k');
+    assert!(app.doc.document.pos < at, "k scrolls");
+    key(&mut app, 'j');
+    assert_eq!(app.doc.document.pos, at, "j scrolls back");
+    assert!(app.doc.def_peek().is_some_and(|p| !p.focused));
 }
 
 /// A peek key while the diff has the keys goes to the peek, which takes

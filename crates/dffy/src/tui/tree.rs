@@ -19,12 +19,12 @@ use std::sync::Arc;
 use dffy_core::bstr::{BString, ByteSlice};
 use dffy_core::document::{Counts, Side};
 use dffy_core::view::Attributes;
-use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use super::comments::look_role;
 use super::fuzzy;
 use super::picker::Paths;
 use super::view::Entry;
+use crate::columns::Columns as _;
 use crate::render::{escape, stat};
 use crate::review::model::Comments;
 use crate::term::Grid;
@@ -1687,11 +1687,12 @@ pub(super) fn fit_right(text: &str, max: usize) -> String {
     }
     let mut used = 1;
     let mut out: String = text
-        .chars()
-        .take_while(|c| {
-            used += c.width().unwrap_or(0);
+        .clusters()
+        .take_while(|(.., w)| {
+            used += w;
             used <= max
         })
+        .map(|(_, piece, _)| piece)
         .collect();
     if max > 0 {
         out.push('…');
@@ -1704,17 +1705,17 @@ pub(super) fn fit_left(path: &str, max: usize) -> String {
     if path.width() <= max {
         return path.to_owned();
     }
-    let mut kept = Vec::new();
+    let clusters: Vec<_> = path.clusters().collect();
+    let mut start = path.len();
     let mut used = 1;
-    for c in path.chars().rev() {
-        let w = c.width().unwrap_or(0);
+    for &(i, _, w) in clusters.iter().rev() {
         if used + w > max {
             break;
         }
         used += w;
-        kept.push(c);
+        start = i;
     }
-    std::iter::once('…').chain(kept.into_iter().rev()).collect()
+    format!("…{}", &path[start..])
 }
 
 #[cfg(test)]

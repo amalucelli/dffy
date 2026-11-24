@@ -15,7 +15,7 @@ use gix::bstr::BString;
 
 use super::blocks::{Arrange, At, Attach, Block, BlockId, Blocks, Placed};
 use super::{
-    Anchor, Content, Context, Counts, File, Headings, Hit, Mark, Match, Matches, Pos, Reading,
+    Anchor, Content, Context, Counts, File, Gap, Headings, Hit, Mark, Match, Matches, Pos, Reading,
     Reveal, Segment, Shape, Shown, Side, file_status,
 };
 use crate::annotation::{Placement, REVEAL_CONTEXT};
@@ -74,7 +74,7 @@ impl Look {
     fn shape<'a, P, A>(
         self,
         (file, change, source): (usize, &FileChange, &Source<P>),
-        (reveal, opened): (&'a [Reveal], &'a [(usize, Vec<usize>)]),
+        (reveal, opened): (&'a [Reveal], &'a [Opened]),
         blocks: Option<&'a Blocks>,
         arrange: &'a A,
     ) -> Shape<'a, A> {
@@ -219,12 +219,23 @@ pub struct Entry<P> {
 // have lives on the document instead.
 const _: () = assert!(size_of::<Entry<()>>() <= 304);
 
-/// The hunks of entry `file` opened in place, among `opened` (see
-/// [`Document::set_opened`]).
-fn opened_in(opened: &[(usize, Vec<usize>)], file: usize) -> &[usize] {
+/// A file's hunks opened in place (see [`Document::set_opened`]).
+struct Opened {
+    /// The entry.
+    file: usize,
+    /// In order.
+    hunks: Vec<usize>,
+    /// The gaps around the hunks they were opened among. Kept here, as the
+    /// diff may be evicted before the one a reload brings: the numbers in
+    /// `hunks` are that one's only when its gaps are the same.
+    gaps: Box<[Gap]>,
+}
+
+/// The hunks of entry `file` opened in place, among `opened`.
+fn opened_in(opened: &[Opened], file: usize) -> &[usize] {
     (opened.iter())
-        .find(|&&(f, _)| f == file)
-        .map_or(&[], |(_, hunks)| hunks)
+        .find(|o| o.file == file)
+        .map_or(&[], |o| &o.hunks)
 }
 
 /// A version no entry has had (see [`Entry::version`]).
@@ -586,10 +597,10 @@ pub struct Document<P> {
     /// The side files are read on alone, if any (see
     /// [`Document::set_reading`]).
     reading: Option<Side>,
-    /// The hunks opened in place while a side is read alone, by entry, each
-    /// list in order (see [`Document::set_opened`]). Apart from the
-    /// entries, which every pass over the list goes through: few have any.
-    opened: Vec<(usize, Vec<usize>)>,
+    /// The hunks opened in place while a side is read alone, by entry (see
+    /// [`Document::set_opened`]). Apart from the entries, which every pass
+    /// over the list goes through: few have any.
+    opened: Vec<Opened>,
     /// The change the view last landed on, and the position it took.
     landed: Option<(Pos, Pos)>,
     /// A file not diffed yet was opened by change at this position (see
@@ -719,8 +730,8 @@ impl<P> Document<P> {
         self.release(old);
         self.counts_version = next_version();
         self.unopen(file);
-        for (f, _) in &mut self.opened {
-            *f -= usize::from(*f > file);
+        for o in &mut self.opened {
+            o.file -= usize::from(o.file > file);
         }
         if self.search.as_ref().is_some_and(|found| found.file == file) {
             self.search = None;
@@ -837,8 +848,8 @@ impl<P> Document<P> {
             found.file = found.file.saturating_add_signed(moved);
         }
         // The page has none opened: it's no diff.
-        for (f, _) in &mut self.opened {
-            *f = f.saturating_add_signed(moved);
+        for o in &mut self.opened {
+            o.file = o.file.saturating_add_signed(moved);
         }
         self.forget_positions();
         moved
@@ -884,17 +895,15 @@ impl<P> Document<P> {
         if self.opened.is_empty() {
             return reorder(self);
         }
-        let held: Vec<(BString, Vec<usize>)> = std::mem::take(&mut self.opened)
+        let held: Vec<(BString, Opened)> = std::mem::take(&mut self.opened)
             .into_iter()
-            .filter_map(|(f, hunks)| Some((self.files.get(f)?.change.path.clone(), hunks)))
+            .filter_map(|o| Some((self.files.get(o.file)?.change.path.clone(), o)))
             .collect();
         let result = reorder(self);
         self.opened = (held.into_iter())
-            .filter_map(|(path, hunks)| {
-                Some((
-                    self.files.iter().position(|e| e.change.path == path)?,
-                    hunks,
-                ))
+            .filter_map(|(path, o)| {
+                let file = self.files.iter().position(|e| e.change.path == path)?;
+                Some(Opened { file, ..o })
             })
             .collect();
         result
@@ -1041,7 +1050,8 @@ impl<P> Document<P> {
     /// Stores the host's diff for a file that wants one (see
     /// [`Entry::wants_diff`]); `None` when it doesn't. A file whose hunks
     /// moved loses its revealed lines; one reloaded after eviction keeps
-    /// them. Its rendering, of the diff replaced, is dropped.
+    /// them. Hunks opened in place stay open when the hunks are where they
+    /// were. Its rendering, of the diff replaced, is dropped.
     pub fn load(&mut self, file: usize, result: Result<Box<File>, String>) -> Option<Settle> {
         let entry = self.files.get_mut(file)?;
         if !entry.wants_diff() {
@@ -1060,9 +1070,10 @@ impl<P> Document<P> {
             entry.reveal.clear();
             entry.host_reveal.clear();
         }
-        if !keep_reveal || rendered {
-            self.opened.retain(|&(f, _)| f != file);
-        }
+        self.opened.retain(|o| {
+            let same = || !rendered && result.as_ref().is_ok_and(|new| *o.gaps == *new.gaps());
+            o.file != file || same()
+        });
         entry.stale = false;
         entry.recount = false;
         self.counts_version = next_version();
@@ -1289,7 +1300,7 @@ impl<P> Document<P> {
     /// No hunk of `file` stays opened in place: the rendered view and the
     /// line diff number their hunks apart, and an entry gone has none.
     fn unopen(&mut self, file: usize) {
-        self.opened.retain(|&(f, _)| f != file);
+        self.opened.retain(|o| o.file != file);
     }
 
     /// [`Entry::drop_render`] for `file`, which closes the rendered view's
@@ -2370,12 +2381,17 @@ impl<P> Document<P> {
         };
         let before = self.row_lines(top, arrange);
         self.relayout(arrange, arrange, |doc| {
-            let held = doc.opened.iter().position(|&(f, _)| f == file);
+            let held = doc.opened.iter().position(|o| o.file == file);
             let held = held.unwrap_or_else(|| {
-                doc.opened.push((file, Vec::new()));
+                let gaps = doc.file(file).map_or(&[][..], File::gaps).into();
+                doc.opened.push(Opened {
+                    file,
+                    hunks: Vec::new(),
+                    gaps,
+                });
                 doc.opened.len() - 1
             });
-            let opened = &mut doc.opened[held].1;
+            let opened = &mut doc.opened[held].hunks;
             match at {
                 Ok(i) => {
                     opened.remove(i);

@@ -7,11 +7,15 @@ proptest! {
     /// in order, a no-newline marker with the line it follows. A changed
     /// line pairs with the hidden line split view pairs it with, and the
     /// hidden lines split view leaves unpaired, and only those, stand in
-    /// rows of their own: every hidden line is on exactly one row.
+    /// rows of their own: every hidden line is on exactly one row. An
+    /// unchanged last line, whose sides may disagree on the newline when
+    /// whitespace is ignored, has the marker of the side read: the body's,
+    /// which is the new side's, or else a row of its own.
     #[test]
     fn side_rows_show_one_side_and_pair_the_other_as_split_does(
         picks in prop::collection::vec((0..3u8, any::<bool>()), 0..40),
         (old_marker, marker) in any::<(bool, bool)>(),
+        ends in any::<[bool; 2]>(),
         old in any::<bool>(),
     ) {
         let mut lines: Vec<(Kind, bool)> = (picks.into_iter())
@@ -29,20 +33,33 @@ proptest! {
         {
             lines.insert(r + 1, (Kind::NoNewline, false));
         }
-        if marker && lines.last().is_some_and(|(k, _)| *k != Kind::NoNewline) {
+        let side = if old { Side::Old } else { Side::New };
+        // An unchanged last line ends each side as `ends` says; the body
+        // has the new side's marker.
+        let last_context = lines.last().is_some_and(|(k, _)| *k == Kind::Context);
+        let ends_at = last_context.then(|| lines.len() - 1);
+        if (last_context && ends[1])
+            || (!last_context
+                && marker
+                && lines.last().is_some_and(|(k, _)| *k != Kind::NoNewline))
+        {
             lines.push((Kind::NoNewline, false));
         }
-        let side = if old { Side::Old } else { Side::New };
         let hidden = if old { Kind::Added } else { Kind::Removed };
+        let ends_side = |i: usize| ends_at == Some(i) && ends[side.index()];
         let mut rows = Vec::new();
-        side_rows(side, lines.len(), |i| lines[i], &mut rows);
+        side_rows(side, lines.len(), (|i| lines[i], ends_side), &mut rows);
         let mut split = Vec::new();
         super::rows(Arrangement::Split, lines.len(), |i| lines[i], &mut split);
 
         let kept = |i: usize| match lines[i].0 {
+            Kind::NoNewline if lines[i - 1].0 == Kind::Context => ends_side(i - 1),
             Kind::NoNewline => lines[i - 1].0 != hidden,
             k => k != hidden,
         };
+        // A row of its own where the body has no marker for the side read.
+        let own_marker = ends_at.is_some_and(ends_side) && !ends[1];
+        prop_assert_eq!(rows.contains(&Row::Marker), own_marker);
         let shown: Vec<usize> = (0..lines.len()).filter(|&i| kept(i)).collect();
         let one: Vec<usize> = (rows.iter())
             .filter_map(|r| match *r {

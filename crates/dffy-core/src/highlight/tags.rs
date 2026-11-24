@@ -19,6 +19,12 @@
 //! symbol without its `:`, an instance variable without its `@`, a dotted
 //! name by its last part.
 //!
+//! A function's declared return type is read from its node by the
+//! language's [`Rules::returns`], not the query, whose patterns TypeScript
+//! shares with JavaScript, which has no such field. It's kept by its name
+//! (past wrappers, with `Self` as the container) for a receiver a call
+//! gives; never posted, as no lookup asks for it.
+//!
 //! A definition a macro makes (`SYSCALL_DEFINE3(openat, …)` makes
 //! `sys_openat`) is read from the macro's arguments instead, as the grammar
 //! parses the same macro in many shapes. What the query finds under a
@@ -49,8 +55,9 @@
 use std::ops::Range;
 use std::time::Duration;
 
-use tree_sitter::{Node, Query, QueryCursor, QueryMatch, StreamingIterator, Tree};
+use tree_sitter::{Node, Query, QueryCursor, QueryMatch, StreamingIterator, Tree, TreeCursor};
 
+use super::lang::SNIFF_VERSION;
 use super::scope::{kinds_named, roots};
 use super::{Language, parse_tree};
 use rustc_hash::FxHashSet;
@@ -70,7 +77,7 @@ pub(crate) const TAGS_PARSE_BUDGET: Duration = Duration::from_secs(2);
 /// when the same query finds something else (see the module's steps) or
 /// the encoding changes. A query's own changes change the key by
 /// themselves.
-const TAGS_VERSION: u8 = 7;
+const TAGS_VERSION: u8 = 8;
 
 /// What a definition defines. The numbers are the cached form's.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -241,6 +248,12 @@ struct Rules {
     /// Attribute macros the grammar takes for a definition's name where
     /// they follow it (`struct { … } __packed;`): never a definition.
     attribute_names: &'static [&'static str],
+    /// Where a function's declared return type is: by the kind of its
+    /// definition's node, the field holding it, or none where the grammar
+    /// names no field for it (Kotlin's, Swift's), and it's the last child
+    /// past the name of one of [`Rules::return_kinds`].
+    returns: &'static [(&'static str, &'static str)],
+    return_kinds: &'static [&'static str],
 }
 
 /// Whether [`Rules::constructors`] are definitions.
@@ -256,7 +269,7 @@ impl Rules {
     /// [`TAGS_VERSION`]).
     fn identity(&self) -> String {
         format!(
-            "{:?} {:?} {:?} {:?} {:?} {:?} {:?} {:?} {:?}",
+            "{:?} {:?} {:?} {:?} {:?} {:?} {:?} {:?} {:?} {:?} {:?}",
             self.prune,
             self.identifiers,
             self.not_under,
@@ -266,6 +279,8 @@ impl Rules {
             self.name_suffixes,
             self.constructors,
             self.attribute_names,
+            self.returns,
+            self.return_kinds,
         )
     }
 }
@@ -321,6 +336,8 @@ const fn pruning(prune: &'static [&'static str]) -> Rules {
         name_suffixes: &[],
         constructors: Constructors::Kept,
         attribute_names: &[],
+        returns: &[],
+        return_kinds: &[],
     }
 }
 
@@ -328,62 +345,86 @@ const fn pruning(prune: &'static [&'static str]) -> Rules {
 /// body is a block too. Class bodies, enum bodies and module-scope
 /// variables are read by patterns starting at the class, the enum and the
 /// file.
-static JAVASCRIPT: Rules = pruning(&[
-    "function_declaration",
-    "generator_function_declaration",
-    "function_expression",
-    "generator_function",
-    "arrow_function",
-    "method_definition",
-    "class",
-    "class_body",
-    "interface_body",
-    "object_type",
-    "enum_body",
-    "lexical_declaration",
-    "variable_declaration",
-    "type_alias_declaration",
-    "ambient_declaration",
-    "call_expression",
-    "object",
-    "array",
-    "template_string",
-    "if_statement",
-    "for_statement",
-    "for_in_statement",
-    "while_statement",
-    "do_statement",
-    "try_statement",
-    "switch_statement",
-    "jsx_element",
-    "jsx_self_closing_element",
-]);
+static JAVASCRIPT: Rules = Rules {
+    returns: &[
+        ("function_declaration", "return_type"),
+        ("method_definition", "return_type"),
+        ("method_signature", "return_type"),
+        ("abstract_method_signature", "return_type"),
+        ("function_signature", "return_type"),
+    ],
+    ..pruning(&[
+        "function_declaration",
+        "generator_function_declaration",
+        "function_expression",
+        "generator_function",
+        "arrow_function",
+        "method_definition",
+        "class",
+        "class_body",
+        "interface_body",
+        "object_type",
+        "enum_body",
+        "lexical_declaration",
+        "variable_declaration",
+        "type_alias_declaration",
+        "ambient_declaration",
+        "call_expression",
+        "object",
+        "array",
+        "template_string",
+        "if_statement",
+        "for_statement",
+        "for_in_statement",
+        "while_statement",
+        "do_statement",
+        "try_statement",
+        "switch_statement",
+        "jsx_element",
+        "jsx_self_closing_element",
+    ])
+};
 
 /// A class's body is a block like a function's: the functions are skipped
 /// instead. Assignments are read by patterns starting at the module and
 /// the class.
-static PYTHON: Rules = pruning(&[
-    "function_definition",
-    "lambda",
-    "expression_statement",
-    "decorator",
-    "call",
-]);
+static PYTHON: Rules = Rules {
+    returns: &[("function_definition", "return_type")],
+    ..pruning(&[
+        "function_definition",
+        "lambda",
+        "expression_statement",
+        "decorator",
+        "call",
+    ])
+};
 
-static GO: Rules = pruning(&[
-    "block",
-    "field_declaration_list",
-    "interface_type",
-    "parameter_list",
-    "expression_list",
-    "func_literal",
-    "composite_literal",
-    "argument_list",
-]);
+static GO: Rules = Rules {
+    returns: &[
+        ("function_declaration", "result"),
+        ("method_declaration", "result"),
+        ("method_elem", "result"),
+    ],
+    ..pruning(&[
+        "block",
+        "field_declaration_list",
+        "interface_type",
+        "parameter_list",
+        "expression_list",
+        "func_literal",
+        "composite_literal",
+        "argument_list",
+    ])
+};
 
 /// C's walk without its definition macros, which are the kernel's: class
 /// bodies are entered for the classes nested in them.
 static CPP: Rules = Rules {
+    returns: &[
+        ("function_definition", "type"),
+        ("field_declaration", "type"),
+        ("declaration", "type"),
+    ],
     prune: &[
         "compound_statement",
         "initializer_list",
@@ -400,48 +441,61 @@ static CPP: Rules = Rules {
 
 /// Members are read by patterns starting at their type; the walk only
 /// enters type bodies for the types nested in them.
-static JAVA: Rules = pruning(&[
-    "method_declaration",
-    "constructor_declaration",
-    "compact_constructor_declaration",
-    "field_declaration",
-    "constant_declaration",
-    "enum_constant",
-    "static_initializer",
-    "block",
-    "modifiers",
-    "formal_parameters",
-]);
+static JAVA: Rules = Rules {
+    returns: &[("method_declaration", "type")],
+    ..pruning(&[
+        "method_declaration",
+        "constructor_declaration",
+        "compact_constructor_declaration",
+        "field_declaration",
+        "constant_declaration",
+        "enum_constant",
+        "static_initializer",
+        "block",
+        "modifiers",
+        "formal_parameters",
+    ])
+};
 
-static CSHARP: Rules = pruning(&[
-    "method_declaration",
-    "constructor_declaration",
-    "destructor_declaration",
-    "operator_declaration",
-    "conversion_operator_declaration",
-    "indexer_declaration",
-    "property_declaration",
-    "field_declaration",
-    "event_field_declaration",
-    "event_declaration",
-    "enum_member_declaration_list",
-    "block",
-    "parameter_list",
-    "attribute_list",
-]);
+static CSHARP: Rules = Rules {
+    returns: &[
+        ("method_declaration", "returns"),
+        ("local_function_statement", "type"),
+    ],
+    ..pruning(&[
+        "method_declaration",
+        "constructor_declaration",
+        "destructor_declaration",
+        "operator_declaration",
+        "conversion_operator_declaration",
+        "indexer_declaration",
+        "property_declaration",
+        "field_declaration",
+        "event_field_declaration",
+        "event_declaration",
+        "enum_member_declaration_list",
+        "block",
+        "parameter_list",
+        "attribute_list",
+    ])
+};
 
-static KOTLIN: Rules = pruning(&[
-    "function_body",
-    "function_value_parameters",
-    "property_declaration",
-    "primary_constructor",
-    "secondary_constructor",
-    "anonymous_initializer",
-    "enum_class_body",
-    "modifiers",
-    "call_expression",
-    "lambda_literal",
-]);
+static KOTLIN: Rules = Rules {
+    returns: &[("function_declaration", "")],
+    return_kinds: &["user_type", "nullable_type"],
+    ..pruning(&[
+        "function_body",
+        "function_value_parameters",
+        "property_declaration",
+        "primary_constructor",
+        "secondary_constructor",
+        "anonymous_initializer",
+        "enum_class_body",
+        "modifiers",
+        "call_expression",
+        "lambda_literal",
+    ])
+};
 
 static RUBY: Rules = Rules {
     name_suffixes: &['?', '!', '='],
@@ -463,22 +517,31 @@ static PHP: Rules = pruning(&[
     "attribute_list",
 ]);
 
-static SCALA: Rules = pruning(&[
-    "function_definition",
-    "val_definition",
-    "var_definition",
-    "given_definition",
-    "call_expression",
-    "block",
-]);
+static SCALA: Rules = Rules {
+    returns: &[
+        ("function_definition", "return_type"),
+        ("function_declaration", "return_type"),
+    ],
+    ..pruning(&[
+        "function_definition",
+        "val_definition",
+        "var_definition",
+        "given_definition",
+        "call_expression",
+        "block",
+    ])
+};
 
-static ZIG: Rules = pruning(&[
-    "block",
-    "parameters",
-    "struct_initializer",
-    "call_expression",
-    "builtin_function",
-]);
+static ZIG: Rules = Rules {
+    returns: &[("function_declaration", "type")],
+    ..pruning(&[
+        "block",
+        "parameters",
+        "struct_initializer",
+        "call_expression",
+        "builtin_function",
+    ])
+};
 
 static LUA: Rules = pruning(&[
     "block",
@@ -511,18 +574,30 @@ static BASH: Rules = pruning(&[
     "string",
 ]);
 
-static SWIFT: Rules = pruning(&[
-    "function_body",
-    "property_declaration",
-    "init_declaration",
-    "deinit_declaration",
-    "subscript_declaration",
-    "protocol_body",
-    "modifiers",
-    "attribute",
-    "call_expression",
-    "lambda_literal",
-]);
+static SWIFT: Rules = Rules {
+    returns: &[
+        ("function_declaration", ""),
+        ("protocol_function_declaration", ""),
+    ],
+    return_kinds: &[
+        "user_type",
+        "optional_type",
+        "array_type",
+        "dictionary_type",
+    ],
+    ..pruning(&[
+        "function_body",
+        "property_declaration",
+        "init_declaration",
+        "deinit_declaration",
+        "subscript_declaration",
+        "protocol_body",
+        "modifiers",
+        "attribute",
+        "call_expression",
+        "lambda_literal",
+    ])
+};
 
 static C: Rules = Rules {
     prune: &[
@@ -562,9 +637,16 @@ static C: Rules = Rules {
         "__cacheline_aligned",
         "__cacheline_aligned_in_smp",
     ],
+    // A C function's return type is never followed: C has no methods.
+    returns: &[],
+    return_kinds: &[],
 };
 
 static RUST: Rules = Rules {
+    returns: &[
+        ("function_item", "return_type"),
+        ("function_signature_item", "return_type"),
+    ],
     prune: &[
         "block",
         "token_tree",
@@ -708,12 +790,17 @@ impl TagsQuery {
 /// No container.
 const NONE: u32 = u32::MAX;
 
+/// The bit of an encoded kind that says a return type follows.
+const RETURNS: u8 = 0x80;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Def {
     name: u32,
     container: u32,
-    /// A renamed re-export's original name; [`NONE`] for any other.
-    original: u32,
+    /// A renamed re-export's original name, or the type a function or a
+    /// method is declared to return; [`NONE`] for neither. One slot, as no
+    /// definition has both.
+    extra: u32,
     kind: DefinitionKind,
     start: u32,
     end: u32,
@@ -750,6 +837,10 @@ pub struct Definition<'a> {
     /// For a re-export that renames what it exports (`export { x as y }
     /// from`, `pub use a::x as y`), the name it has where it's defined.
     pub original: Option<&'a str>,
+    /// For a function or a method, the name of the type it's declared to
+    /// return, past wrappers (`Option<T>`, `Promise<T>`) and with `Self`
+    /// as its type; `None` for a primitive or none declared.
+    pub returns: Option<&'a str>,
 }
 
 impl Definitions {
@@ -761,7 +852,10 @@ impl Definitions {
             start: d.start as usize,
             end: d.end as usize,
             container: (d.container != NONE).then(|| self.name(d.container)),
-            original: (d.original != NONE).then(|| self.name(d.original)),
+            original: (d.kind == DefinitionKind::Reexport && d.extra != NONE)
+                .then(|| self.name(d.extra)),
+            returns: (d.kind != DefinitionKind::Reexport && d.extra != NONE)
+                .then(|| self.name(d.extra)),
         })
     }
 
@@ -777,9 +871,23 @@ impl Definitions {
         self.defs.is_empty()
     }
 
-    /// Every name a definition has or is in, once each, sorted.
+    /// Every name a definition has, is in or re-exports, once each,
+    /// sorted: not a return type, which no lookup asks for.
     pub(crate) fn names(&self) -> impl Iterator<Item = &str> {
-        (0..self.ends.len()).map(|i| self.name(to_u32(i)))
+        let mut ids: Vec<u32> = (self.defs.iter())
+            .flat_map(|d| {
+                let original = if d.kind == DefinitionKind::Reexport {
+                    d.extra
+                } else {
+                    NONE
+                };
+                [d.name, d.container, original]
+            })
+            .filter(|&i| i != NONE)
+            .collect();
+        ids.sort_unstable();
+        ids.dedup();
+        ids.into_iter().map(|i| self.name(i))
     }
 
     fn name(&self, i: u32) -> &str {
@@ -810,13 +918,23 @@ impl Definitions {
         let mut line = 0;
         for d in &self.defs {
             put(&mut out, d.name);
-            out.push(d.kind as u8);
+            // The kind's high bit says a return type follows, so a
+            // definition without one, all of C's, pays nothing for it.
+            let reexport = d.kind == DefinitionKind::Reexport;
+            let returns = if reexport || d.extra == NONE {
+                0
+            } else {
+                RETURNS
+            };
+            out.push(d.kind as u8 | returns);
             put(&mut out, d.start - line);
             put(&mut out, d.end - d.start);
             put(&mut out, d.container.wrapping_add(1));
             // Only a re-export has one, so the others pay nothing for it.
-            if d.kind == DefinitionKind::Reexport {
-                put(&mut out, d.original.wrapping_add(1));
+            if reexport {
+                put(&mut out, d.extra.wrapping_add(1));
+            } else if returns != 0 {
+                put(&mut out, d.extra);
             }
             line = d.start;
         }
@@ -863,24 +981,26 @@ impl Definitions {
         let mut line = 0u32;
         for _ in 0..count {
             let name = get(&mut input)?;
-            let (&kind, rest) = input.split_first()?;
+            let (&byte, rest) = input.split_first()?;
             input = rest;
-            let kind = DefinitionKind::from_u8(kind)?;
+            let kind = DefinitionKind::from_u8(byte & !RETURNS)?;
             let start = line.checked_add(get(&mut input)?)?;
             let end = start.checked_add(get(&mut input)?)?;
             let container = get(&mut input)?.wrapping_sub(1);
-            let original = match kind {
-                DefinitionKind::Reexport => get(&mut input)?.wrapping_sub(1),
-                _ => NONE,
+            let extra = match (kind, byte & RETURNS) {
+                (DefinitionKind::Reexport, 0) => get(&mut input)?.wrapping_sub(1),
+                (DefinitionKind::Reexport, _) => return None,
+                (_, 0) => NONE,
+                _ => get(&mut input)?,
             };
             let known = |i: u32| i == NONE || (i as usize) < ends.len();
-            if name as usize >= ends.len() || !known(container) || !known(original) {
+            if name as usize >= ends.len() || !known(container) || !known(extra) {
                 return None;
             }
             defs.push(Def {
                 name,
                 container,
-                original,
+                extra,
                 kind,
                 start,
                 end,
@@ -949,9 +1069,10 @@ fn blank_attributes(names: &[&str], source: &[u8]) -> Option<Vec<u8>> {
     let word = |b: &u8| b.is_ascii_alphanumeric() || *b == b'_';
     let mut out: Option<Vec<u8>> = None;
     for name in names {
+        let mut line = 0;
         for at in memchr::memmem::find_iter(source, name.as_bytes()) {
             let end = at + name.len();
-            let line = memchr::memrchr(b'\n', &source[..at]).map_or(0, |i| i + 1);
+            line = memchr::memrchr(b'\n', &source[line..at]).map_or(line, |i| line + i + 1);
             if (at > 0 && word(&source[at - 1]))
                 || source.get(end).is_some_and(word)
                 || source[line..at].trim_ascii_start().starts_with(b"#")
@@ -962,13 +1083,11 @@ fn blank_attributes(names: &[&str], source: &[u8]) -> Option<Vec<u8>> {
             if source.get(open) != Some(&b'(') {
                 continue;
             }
-            let Some((_, close)) = macro_args(source, open) else {
+            let Some((_, close)) = macro_args(source, open, &mut { MAX_ATTRIBUTE_ARGS }) else {
                 continue;
             };
             let args = &source[open..=close];
-            if args.len() > MAX_ATTRIBUTE_ARGS
-                || args.iter().any(|b| matches!(b, b';' | b'{' | b'}' | b'"'))
-            {
+            if args.iter().any(|b| matches!(b, b';' | b'{' | b'}' | b'"')) {
                 continue;
             }
             let out = out.get_or_insert_with(|| source.to_vec());
@@ -1005,12 +1124,12 @@ pub fn blob_definitions(
     if !lang.has_tags() {
         return Ok(None);
     }
-    let key = pack_key(lang, id);
+    let key = pack_key(lang, b"", id);
     let mut pack = Pack::read(cache, key);
     if let Some(found) = pack.get(&key).and_then(cached_definitions) {
         return Ok(Some(found));
     }
-    let found = extract_blob(lang, size, TAGS_PARSE_BUDGET, load)?;
+    let found = extract_blob(lang, b"", size, TAGS_PARSE_BUDGET, load)?;
     if let Some((entry, found)) = found {
         if let Some(entry) = entry {
             pack.insert(key, entry);
@@ -1033,13 +1152,16 @@ pub(crate) fn cached_definitions(entry: &[u8]) -> Option<Result<Definitions, Ski
 /// What [`extract_blob`] found: the entry to cache, and the definitions.
 pub(crate) type Extracted = (Option<Vec<u8>>, Result<Definitions, Skipped>);
 
-/// The definitions of a blob of `size` bytes in `lang` (which has a tags
-/// query), from what `load` reads unless it's too large to read, with the
+/// The definitions of a blob of `size` bytes at `path` in `lang` (which has
+/// a tags query, and for a `.h` may be C++ by its text: see
+/// [`Language::of_text`]), from what `load` reads unless it's too large to
+/// read, with the
 /// parse abandoned after `budget`, and the entry to cache for them: `None`
 /// for a parse that timed out, which the next try may finish. `None`
 /// overall when `load` can't read the blob.
 pub(crate) fn extract_blob(
     lang: &Language,
+    path: &[u8],
     size: u64,
     budget: Duration,
     load: impl FnOnce() -> Option<Vec<u8>>,
@@ -1051,7 +1173,7 @@ pub(crate) fn extract_blob(
         let Some(source) = load() else {
             return Ok(None);
         };
-        match definitions_within(lang, &source, budget)? {
+        match definitions_within(lang.of_text(path, &source), &source, budget)? {
             Some(found) => found,
             None => return Ok(None),
         }
@@ -1080,11 +1202,20 @@ const PACKS_FILL_PERCENT: u64 = 90;
 /// The key of blob `id`'s definitions in `lang` within the symbol cache: a
 /// digest of [`TAGS_VERSION`], the language's tags identity and the id, so
 /// every language shares the packs and an entry made by another grammar or
-/// query is never read.
-pub(crate) fn pack_key(lang: &Language, id: ObjectId) -> ObjectId {
-    let mut key = Vec::with_capacity(1 + 2 * id.as_bytes().len());
+/// query is never read. A `.h` at `path` whose language its text decides
+/// is keyed by both languages' identities and what decides between them
+/// ([`SNIFF_VERSION`]), under a mark of its own: no entry of a C or a C++
+/// parse of the blob is read for it.
+pub(crate) fn pack_key(lang: &Language, path: &[u8], id: ObjectId) -> ObjectId {
+    let mut key = Vec::with_capacity(2 + 3 * id.as_bytes().len());
     key.push(TAGS_VERSION);
     key.extend_from_slice(lang.tags_identity().as_bytes());
+    if lang.sniffs(path)
+        && let Some(cpp) = lang.header()
+    {
+        key.extend_from_slice(&[b'h', SNIFF_VERSION]);
+        key.extend_from_slice(cpp.tags_identity().as_bytes());
+    }
     key.extend_from_slice(id.as_bytes());
     cache::digest(&key)
 }
@@ -1245,6 +1376,7 @@ struct Found {
     name: String,
     container: Option<String>,
     original: Option<String>,
+    returns: Option<String>,
     kind: DefinitionKind,
     lines: (u32, u32),
 }
@@ -1257,6 +1389,8 @@ struct Found {
 fn extract(query: &TagsQuery, tree: &Tree, source: &[u8]) -> Definitions {
     let mut found = Vec::new();
     let mut braces = Braces::default();
+    // Macros nest in each other's arguments, so some are read over again.
+    let mut left = 8 * source.len();
     let mut cursor = QueryCursor::new();
     cursor.set_max_start_depth(Some(0));
     let mut walk = tree.walk();
@@ -1272,7 +1406,13 @@ fn extract(query: &TagsQuery, tree: &Tree, source: &[u8]) -> Definitions {
         }
         if let Some(rules) = query.rules
             && query.identifiers.get(kind).copied().unwrap_or(false)
-            && let Some(f) = macro_definition(rules, node, tree.root_node(), source, &mut braces)
+            && let Some(f) = macro_definition(
+                rules,
+                &walk,
+                tree.root_node(),
+                source,
+                (&mut braces, &mut left),
+            )
         {
             found.push(f);
         }
@@ -1295,6 +1435,7 @@ fn extract(query: &TagsQuery, tree: &Tree, source: &[u8]) -> Definitions {
             std::iter::once(f.name.as_str())
                 .chain(f.container.as_deref())
                 .chain(f.original.as_deref())
+                .chain(f.returns.as_deref())
         })
         .collect();
     names.sort_unstable();
@@ -1305,7 +1446,9 @@ fn extract(query: &TagsQuery, tree: &Tree, source: &[u8]) -> Definitions {
         defs.defs.push(Def {
             name: id(&f.name),
             container: f.container.as_deref().map_or(NONE, id),
-            original: f.original.as_deref().map_or(NONE, id),
+            extra: (f.original.as_deref())
+                .or(f.returns.as_deref())
+                .map_or(NONE, id),
             kind: f.kind,
             start: f.lines.0,
             end: f.lines.1,
@@ -1358,6 +1501,7 @@ fn definition_of(query: &TagsQuery, m: &QueryMatch, source: &[u8]) -> Option<Fou
             kind = DefinitionKind::Method;
         }
     }
+    let name_node = name;
     let mut name = named(text(name));
     let container = container.map(|c| named(text(c)));
     let original = original.map(|o| named(text(o))).filter(|o| *o != name);
@@ -1380,6 +1524,13 @@ fn definition_of(query: &TagsQuery, m: &QueryMatch, source: &[u8]) -> Option<Fou
     if name.is_empty() {
         return None;
     }
+    let returns = (query.rules)
+        .filter(|_| matches!(kind, DefinitionKind::Function | DefinitionKind::Method))
+        .and_then(|rules| return_type(rules, definition, name_node, source))
+        .and_then(|ty| match ty.as_str() {
+            "Self" | "self" | "this" => container.clone(),
+            _ => Some(ty),
+        });
     Some(Found {
         bytes: (
             to_u32(definition.start_byte()),
@@ -1389,12 +1540,40 @@ fn definition_of(query: &TagsQuery, m: &QueryMatch, source: &[u8]) -> Option<Fou
         name,
         container,
         original,
+        returns,
         kind,
         lines: (
             to_u32(definition.start_position().row),
             last_line(definition),
         ),
     })
+}
+
+/// The name of the type the function `definition`, named at `name`, is
+/// declared to return, by `rules`; `None` for none declared, or a
+/// primitive's, whose members no lookup follows.
+fn return_type(rules: &Rules, definition: Node, name: Node, source: &[u8]) -> Option<String> {
+    const PRIMITIVES: &[&str] = &[
+        "void", "None", "bool", "boolean", "int", "str", "string", "number", "any", "unknown",
+        "never", "Unit", "Nothing", "Void", "Any", "object", "error", "char", "float", "double",
+        "long", "short", "byte", "usize", "isize", "u8", "u16", "u32", "u64", "u128", "i8", "i16",
+        "i32", "i64", "i128", "f32", "f64", "float32", "float64", "int8", "int16", "int32",
+        "int64", "uint", "uint8", "uint16", "uint32", "uint64", "rune", "Int", "Long", "Short",
+        "Byte", "Double", "Float", "Boolean", "Bool", "Char", "String",
+    ];
+    let node = rules.returns.iter().find_map(|&(kind, field)| {
+        if kind != definition.kind() {
+            None
+        } else if field.is_empty() {
+            (definition.named_children(&mut definition.walk()))
+                .filter(|c| c.start_byte() >= name.end_byte())
+                .filter(|c| rules.return_kinds.contains(&c.kind()))
+                .last()
+        } else {
+            definition.child_by_field_name(field)
+        }
+    })?;
+    super::locals::type_name(node, source).filter(|ty| !PRIMITIVES.contains(&ty.as_str()))
 }
 
 /// The name code looks `captured` up by: past a Ruby symbol's `:` or an
@@ -1472,27 +1651,30 @@ fn last_line(node: Node) -> u32 {
     })
 }
 
-/// The definition `leaf` makes when it names one of `rules`' macros at file
-/// scope and its argument is a plain name. Its lines run from the macro to
-/// its closing parenthesis and `;`, or over the body after it when one
-/// follows.
+/// The definition the leaf `at` is on makes when it names one of `rules`'
+/// macros at file scope and its argument is a plain name. Its lines run from
+/// the macro to its closing parenthesis and `;`, or over the body after it
+/// when one follows.
 fn macro_definition(
     rules: &Rules,
-    leaf: Node,
+    at: &TreeCursor,
     root: Node,
     source: &[u8],
-    braces: &mut Braces,
+    (braces, left): (&mut Braces, &mut usize),
 ) -> Option<Found> {
+    let leaf = at.node();
     let word = std::str::from_utf8(&source[leaf.byte_range()]).ok()?;
     let m = (rules.macros)(word)?;
     let open = skip_space(source, leaf.end_byte());
     if source.get(open) != Some(&b'(') {
         return None;
     }
-    let (args, close) = macro_args(source, open)?;
+    let (args, close) = macro_args(source, open, left)?;
     let arg = plain_name(&source[args.get(m.arg)?.clone()])?;
-    let (mut child, mut above, mut error) = (leaf, leaf.parent(), None);
-    while let Some(node) = above {
+    // Up by the cursor: a node's own parent is searched for from the root.
+    let (mut child, mut above, mut error) = (leaf, at.clone(), None);
+    while above.goto_parent() {
+        let node = above.node();
         let excluded = rules.not_under.iter().any(|&(kind, field)| {
             node.kind() == kind && field.is_none_or(|f| node.child_by_field_name(f) == Some(child))
         });
@@ -1502,7 +1684,7 @@ fn macro_definition(
         if node.is_error() {
             error = Some(node);
         }
-        (child, above) = (node, node.parent());
+        child = node;
     }
     // Inside an error, a function's body may be loose braces around the
     // macro rather than a body node the walk skips.
@@ -1531,6 +1713,7 @@ fn macro_definition(
         name: format!("{}{arg}{}", m.prefix, m.suffix),
         container: None,
         original: None,
+        returns: None,
         kind: m.kind,
         lines: (to_u32(row), last),
     })
@@ -1577,8 +1760,17 @@ fn skip_space(source: &[u8], mut i: usize) -> usize {
 }
 
 /// The arguments of the macro call whose `(` is at `open`, split at
-/// top-level commas, and the index of its `)`.
-fn macro_args(source: &[u8], open: usize) -> Option<(Vec<Range<usize>>, usize)> {
+/// top-level commas, and the index of its `)`; `None` when it closes past
+/// `left` bytes, parentheses included. Takes what it read off `left`, so a
+/// file of calls that never close is read a bounded number of times.
+fn macro_args(source: &[u8], open: usize, left: &mut usize) -> Option<(Vec<Range<usize>>, usize)> {
+    let limit = source.len().min(open.saturating_add(*left));
+    let found = closed_args(&source[..limit], open);
+    *left -= found.as_ref().map_or(limit, |(_, close)| close + 1) - open;
+    found
+}
+
+fn closed_args(source: &[u8], open: usize) -> Option<(Vec<Range<usize>>, usize)> {
     let mut args = Vec::new();
     let (mut depth, mut start, mut i) = (0usize, open + 1, open + 1);
     while let Some(&b) = source.get(i) {

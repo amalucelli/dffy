@@ -34,6 +34,9 @@ fn outline(lang: &str, source: &str) -> String {
         if let Some(original) = d.original {
             let _ = write!(out, " from {original}");
         }
+        if let Some(returns) = d.returns {
+            let _ = write!(out, " -> {returns}");
+        }
         out.push('\n');
     }
     out
@@ -306,7 +309,7 @@ fn rust_methods_carry_the_type_they_are_on() {
 15-15 constant LIMIT
 16-16 static COUNT
 17-19 macro square
-21-24 method new in Point
+21-24 method new in Point -> Point
 27-27 method draw in Circle
 30-30 method draw
 32-32 function main
@@ -469,10 +472,10 @@ fn go_methods_carry_their_receivers_type() {
 29-29 type Alias
 32-32 type Pair
 33-33 struct Empty
-36-40 function New
+36-40 function New -> Point
 42-44 method Move in Point
-46-48 method First in Pair
-50-52 function Max
+46-48 method First in Pair -> T
+50-52 function Max -> T
 "
     );
 }
@@ -499,7 +502,7 @@ fn java_members_carry_their_type() {
 35-41 enum Color
 36-36 enumerator RED in Color
 36-36 enumerator GREEN in Color
-38-40 method next in Color
+38-40 method next in Color -> Color
 43-47 class Pair
 43-43 field a in Pair
 43-43 field b in Pair
@@ -531,7 +534,7 @@ fn cpp_methods_carry_their_class_in_or_out_of_it() {
 18-18 field b in Pair
 19-19 method sum in Pair
 22-25 method area2 in Point
-34-36 function max
+34-36 function max -> T
 40-40 enum Color
 40-40 enumerator Red
 40-40 enumerator Green
@@ -540,7 +543,7 @@ fn cpp_methods_carry_their_class_in_or_out_of_it() {
 45-47 module detail
 46-46 function helper
 52-55 class Box
-53-53 method get in Box
+53-53 method get in Box -> T
 54-54 field value in Box
 57-57 method reset in Pair
 59-63 struct Shape
@@ -648,12 +651,12 @@ fn swift_types_are_told_apart_by_their_keyword() {
 28-28 method sum in Pair
 31-33 interface Shape
 32-32 method area in Shape
-36-36 method moved in Point
+36-36 method moved in Point -> Point
 39-44 enum Color
 40-40 enumerator red in Color
 40-40 enumerator green in Color
 41-41 enumerator blue in Color
-43-43 method next in Color
+43-43 method next in Color -> Color
 46-48 class Counter
 47-47 method increment in Counter
 50-50 type Id
@@ -694,16 +697,18 @@ fn a_tags_query_that_fails_to_compile_is_an_error() {
     }
 }
 
-/// Re-exports with their original names among them, and without.
+/// Re-exports with their original names among them, and without, and
+/// functions with a return type.
 #[test]
 fn definitions_round_trip_through_their_encoding() {
-    let mut reexports = (0, 0);
+    let (mut reexports, mut returns) = ((0, 0), 0);
     for &(lang, source) in [("c", C), ("rust", RUST)].iter().chain(FIXTURES) {
         let lang = GRAMMARS.named(lang).expect("bundled");
         let defs = definitions(lang, source.as_bytes())
             .expect("compiles")
             .expect("a tags query")
             .expect("parsed");
+        returns += defs.iter().filter(|d| d.returns.is_some()).count();
         for d in defs.iter().filter(|d| d.kind == DefinitionKind::Reexport) {
             if d.original.is_some() {
                 reexports.0 += 1;
@@ -721,6 +726,7 @@ fn definitions_round_trip_through_their_encoding() {
         assert_eq!(Definitions::decode(&longer), None);
     }
     assert!(reexports.0 > 0 && reexports.1 > 0, "{reexports:?}");
+    assert!(returns > 0);
 }
 
 #[test]
@@ -973,7 +979,7 @@ fn tags_version_follows_what_extraction_finds() {
     let digest = cache::digest(&yielded).to_hex().to_string();
     assert_eq!(
         (TAGS_VERSION, digest.as_str()),
-        (7, "ddec616fe9c72ae99bebbabdeb512ad6d7308b65"),
+        (8, "e584a8f5937998d9b6d47a4e926c88d145b550a5"),
         "the fixtures yield something else: bump TAGS_VERSION and update the digest"
     );
 }
@@ -1061,13 +1067,13 @@ fn scala_members_carry_their_type() {
 18-18 field size in Point
 19-19 method area in Point
 21-23 class Point
-22-22 method origin in Point
+22-22 method origin in Point -> Point
 24-26 enum Color
 25-25 enumerator Red in Color
 25-25 enumerator Green in Color
 27-27 type Id
 29-29 variable ordering
-32-32 method moved in Point
+32-32 method moved in Point -> Point
 "
     );
 }
@@ -1092,7 +1098,7 @@ fn zig_containers_are_named_by_their_declaration() {
 22-29 enum Color
 23-23 enumerator red in Color
 24-24 enumerator green in Color
-26-28 method next in Color
+26-28 method next in Color -> Color
 31-34 union Value
 32-32 field int in Value
 33-33 field none in Value
@@ -1198,4 +1204,122 @@ fn attribute_macros_after_a_member_are_no_fields() {
         outline("c", source),
         "1-7 struct frame\n6-6 field __pad in frame\n"
     );
+}
+
+/// A function's declared return type, by each grammar's form: past a
+/// pointer, a wrapper, a second result and a quote, with `Self` as its type,
+/// and none for a primitive.
+#[test]
+fn functions_carry_the_type_they_return() {
+    let returned = |lang: &str, source: &str| -> Vec<String> {
+        let lang = GRAMMARS.named(lang).expect("bundled");
+        let defs = definitions(lang, source.as_bytes())
+            .expect("compiles")
+            .expect("a tags query")
+            .expect("parsed");
+        defs.iter()
+            .filter_map(|d| Some(format!("{} {}", d.name, d.returns?)))
+            .collect()
+    };
+    assert_eq!(
+        returned(
+            "go",
+            "package p\n\nfunc NewFoo() (*Foo, error) { return nil, nil }\n"
+        ),
+        ["NewFoo Foo"]
+    );
+    assert_eq!(
+        returned(
+            "rust",
+            "impl Foo {\n    fn new() -> Option<Self> { None }\n    fn len(&self) -> usize { 0 }\n}\n"
+        ),
+        ["new Foo"]
+    );
+    assert_eq!(
+        returned(
+            "typescript",
+            "export function make(): Promise<Foo> { return x; }\nclass A {\n  get(): Bar { return y; }\n}\n"
+        ),
+        ["make Foo", "get Bar"]
+    );
+    assert_eq!(
+        returned(
+            "python",
+            "def session() -> \"Session\":\n    pass\n\n\ndef find() -> Optional[Model]:\n    pass\n"
+        ),
+        ["session Session", "find Model"]
+    );
+    assert_eq!(
+        returned(
+            "kotlin",
+            "fun Foo.build(): Bar = Bar()\nfun Foo.size() = 1\n"
+        ),
+        ["build Bar"]
+    );
+    assert_eq!(
+        returned(
+            "csharp",
+            "class A {\n  public Foo Make() { return null; }\n}\n"
+        ),
+        ["Make Foo"]
+    );
+    assert_eq!(
+        returned("swift", "func make() -> Foo { Foo() }\n"),
+        ["make Foo"]
+    );
+}
+
+/// Argument lists that never close cost a file a bounded number of reads:
+/// each call's scan comes off the file's allowance, an attribute's off its
+/// own.
+#[test]
+fn unclosed_macro_arguments_are_read_within_an_allowance() {
+    let source = "DEFINE_MUTEX(".repeat(1_000);
+    let (mut left, mut scans) = (8 * source.len(), 0);
+    for at in source.match_indices('(').map(|(at, _)| at) {
+        assert_eq!(macro_args(source.as_bytes(), at, &mut left), None);
+        scans += usize::from(left > 0);
+    }
+    assert!(
+        left == 0 && scans < 20,
+        "{left} bytes left after {scans} scans"
+    );
+    let mut left = 64;
+    let closed = macro_args(b"(a, b) c", 0, &mut left).map(|(args, close)| (args.len(), close));
+    assert_eq!((closed, left), (Some((2, 5)), 58));
+    assert_eq!(macro_args(b"(a, b)", 0, &mut 5), None, "closes past it");
+}
+
+/// Macros nested thousands deep are read on a request's 2 MB stack.
+#[test]
+fn deeply_nested_macros_are_read() {
+    let source = format!("{}DEFINE_MUTEX(a);{}", "(".repeat(2_000), ")".repeat(2_000));
+    let found = std::thread::Builder::new()
+        .stack_size(2 << 20)
+        .spawn(move || {
+            let lang = GRAMMARS.named("c").expect("bundled");
+            definitions(lang, source.as_bytes())
+                .expect("compiles")
+                .is_some()
+        })
+        .expect("spawns")
+        .join()
+        .expect("no overflow");
+    assert!(found);
+}
+
+/// A header's key is none of a C or a C++ parse's, and no other file's is
+/// changed by what decides a header's language.
+#[test]
+fn a_headers_key_is_its_own() {
+    let (c, cpp) = (
+        GRAMMARS.named("c").expect("c"),
+        GRAMMARS.named("cpp").expect("cpp"),
+    );
+    let id = ObjectId::from_hex(b"0123456789abcdef0123456789abcdef01234567").expect("hex");
+    let header = pack_key(c, b"a.h", id);
+    assert_ne!(header, pack_key(c, b"a.c", id));
+    assert_ne!(header, pack_key(cpp, b"a.h", id));
+    assert_eq!(pack_key(c, b"a.c", id), pack_key(c, b"", id));
+    assert_eq!(pack_key(cpp, b"a.hpp", id), pack_key(cpp, b"", id));
 }

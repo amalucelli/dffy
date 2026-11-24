@@ -10,8 +10,8 @@
 //! go to the same file in blocks of [`BLOCK`] names, with one hash and
 //! place per block kept in memory.
 //!
-//! When the file can't be made or written (a full disk), what comes after
-//! is kept in memory, and [`Store::note`] says so.
+//! When the file can't be made or written (a full disk), or read back,
+//! what comes after is kept in memory, and [`Store::note`] says so.
 
 use std::collections::VecDeque;
 use std::fs::File;
@@ -20,6 +20,7 @@ use std::os::unix::fs::FileExt;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::time::Duration;
 
 use rustc_hash::FxHashMap;
 
@@ -31,6 +32,10 @@ const BLOCK: usize = 64;
 /// Bytes of the entries read last kept in memory, so a lookup asked again
 /// doesn't read them again.
 const RECENT_BYTES: usize = 2 << 20;
+
+/// How old a store file still named is to be taken for one a killed
+/// process left: they're named for less than a second.
+const LEFT_AFTER: Duration = Duration::from_secs(60 * 60);
 
 /// Store files made in this process, for their names.
 static STORES: AtomicU64 = AtomicU64::new(0);
@@ -83,13 +88,15 @@ impl Store {
             let offset = inner.end;
             match make(dir) {
                 Ok(file) => inner.file = Some(Arc::new(file)),
-                Err(e) => inner.keep_in_memory(offset, &e),
+                Err(e) => inner.keep_in_memory(offset, "take it", &e),
             }
         }
         inner.append(bytes)
     }
 
-    /// The bytes at `at`; `None` when they can't be read whole.
+    /// The bytes at `at`; `None` when they can't be read whole, after which
+    /// what's appended is kept in memory: read again and appended there,
+    /// they are.
     pub(super) fn read(&self, at: Locator) -> Option<Arc<[u8]>> {
         let file = {
             let inner = self.inner();
@@ -106,10 +113,32 @@ impl Store {
             Arc::clone(inner.file.as_ref()?)
         };
         let mut bytes = vec![0; at.len as usize];
-        file.read_exact_at(&mut bytes, at.offset).ok()?;
+        if let Err(e) = file.read_exact_at(&mut bytes, at.offset) {
+            self.distrust(&e);
+            return None;
+        }
         let bytes: Arc<[u8]> = bytes.into();
         self.inner().recent.put(at.offset, Arc::clone(&bytes));
         Some(bytes)
+    }
+
+    /// The block of postings at `at`; `None`, as [`Store::read`], when it
+    /// can't be read or isn't one.
+    fn block(&self, at: Locator) -> Option<Vec<(u32, u32)>> {
+        let bytes = self.read(at)?;
+        let block = decode_block(&bytes);
+        if block.is_none() {
+            self.distrust(&io::Error::from(io::ErrorKind::InvalidData));
+        }
+        block
+    }
+
+    /// Keeps what's appended from now on in memory: the file doesn't give
+    /// back what it took.
+    fn distrust(&self, e: &io::Error) {
+        let mut inner = self.inner();
+        let end = inner.end;
+        inner.keep_in_memory(end, "give it back", e);
     }
 
     /// Why definitions are kept in memory rather than in the file, if they
@@ -130,6 +159,15 @@ impl Store {
         if let Some(file) = &inner.file {
             file.set_len(0).ok();
         }
+        inner.recent = Recent::default();
+    }
+
+    /// Reads of the file fail from now on and writes don't, for tests.
+    #[cfg(test)]
+    pub(super) fn break_reads(&self) {
+        let mut inner = self.inner();
+        let file = File::options().write(true).open("/dev/null");
+        inner.file = file.ok().map(Arc::new);
         inner.recent = Recent::default();
     }
 
@@ -172,10 +210,10 @@ impl Store {
     /// `None` when a run can't be read back.
     pub(super) fn merge_postings(
         &self,
-        runs: &[Postings],
+        runs: &[Arc<Postings>],
         fresh: impl Iterator<Item = (u32, u32)>,
     ) -> Option<Postings> {
-        let mut cursors: Vec<Cursor> = runs.iter().map(Cursor::new).collect();
+        let mut cursors: Vec<Cursor> = runs.iter().map(|run| Cursor::new(run)).collect();
         let mut heap = std::collections::BinaryHeap::new();
         for (i, cursor) in cursors.iter_mut().enumerate() {
             if let Some(p) = cursor.next(self).ok()? {
@@ -185,6 +223,9 @@ impl Store {
         let mut fresh = fresh.peekable();
         let mut failed = false;
         let merged = std::iter::from_fn(|| {
+            if failed {
+                return None;
+            }
             let from_runs = heap.peek().map(|std::cmp::Reverse((p, _))| *p);
             match (from_runs, fresh.peek()) {
                 (Some(r), Some(&f)) if f < r => fresh.next(),
@@ -211,7 +252,7 @@ impl Store {
         let Some(&(_, at)) = block.checked_sub(1).and_then(|b| run.blocks.get(b)) else {
             return Some(Vec::new());
         };
-        let postings = decode_block(&self.read(at)?)?;
+        let postings = self.block(at)?;
         Some(
             (postings.into_iter())
                 .filter(|p| p.0 == hash)
@@ -231,7 +272,7 @@ impl Inner {
             _ => Ok(()),
         };
         if let Err(e) = written {
-            self.keep_in_memory(offset, &e);
+            self.keep_in_memory(offset, "take it", &e);
         }
         if self.memory_from.is_some() {
             self.memory.extend_from_slice(bytes);
@@ -240,11 +281,12 @@ impl Inner {
         Locator { offset, len }
     }
 
-    /// Keeps what's appended from `offset` on in memory.
-    fn keep_in_memory(&mut self, offset: u64, e: &io::Error) {
+    /// Keeps what's appended from `offset` on in memory: the file can't do
+    /// `what`.
+    fn keep_in_memory(&mut self, offset: u64, what: &str, e: &io::Error) {
         self.memory_from.get_or_insert(offset);
         self.note.get_or_insert_with(|| {
-            format!("the definitions index is kept in memory: the symbol cache can't take it ({e})")
+            format!("the definitions index is kept in memory: the symbol cache can't {what} ({e})")
         });
     }
 }
@@ -262,19 +304,56 @@ impl Postings {
     }
 }
 
+/// The number the next store file made takes, for tests.
+#[cfg(test)]
+pub(super) fn next() -> u64 {
+    STORES.load(Ordering::Relaxed)
+}
+
 /// Makes the store's file in `dir` and unlinks it: it lives as long as
-/// the process holds it.
+/// the process holds it. A name taken is of a process gone with this one's
+/// id, killed before it unlinked its file: the next one is tried.
 fn make(dir: &Path) -> io::Result<File> {
     std::fs::create_dir_all(dir)?;
-    let n = STORES.fetch_add(1, Ordering::Relaxed);
-    let path = dir.join(format!("navigate-{}-{n}", std::process::id()));
-    let file = File::options()
-        .read(true)
-        .write(true)
-        .create_new(true)
-        .open(&path)?;
-    std::fs::remove_file(&path)?;
-    Ok(file)
+    remove_left(dir);
+    loop {
+        let n = STORES.fetch_add(1, Ordering::Relaxed);
+        let path = dir.join(format!("navigate-{}-{n}", std::process::id()));
+        let made = File::options()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&path);
+        let file = match made {
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
+            made => made?,
+        };
+        return match std::fs::remove_file(&path) {
+            // Suspended here for an hour, its name is another process's to
+            // remove.
+            Err(e) if e.kind() != io::ErrorKind::NotFound => Err(e),
+            _ => Ok(file),
+        };
+    }
+}
+
+/// Removes the store files processes killed before unlinking them left in
+/// `dir`, told by their age: one a live process is about to unlink was made
+/// just now, and one that isn't is held without its name.
+fn remove_left(dir: &Path) {
+    for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+        if !entry
+            .file_name()
+            .as_encoded_bytes()
+            .starts_with(b"navigate-")
+        {
+            continue;
+        }
+        let age = (entry.metadata().and_then(|m| m.modified())).map(|at| at.elapsed());
+        if matches!(age, Ok(Ok(age)) if age > LEFT_AFTER) {
+            std::fs::remove_file(entry.path()).ok();
+        }
+    }
 }
 
 /// The entries read last, up to [`RECENT_BYTES`], the oldest dropped
@@ -364,8 +443,7 @@ impl<'r> Cursor<'r> {
             let Some(&(_, at)) = self.blocks.next() else {
                 return Ok(None);
             };
-            let block = store.read(at).and_then(|bytes| decode_block(&bytes));
-            self.read = block.ok_or(Unreadable)?.into_iter();
+            self.read = store.block(at).ok_or(Unreadable)?.into_iter();
         }
     }
 }
@@ -373,8 +451,6 @@ impl<'r> Cursor<'r> {
 /// A block of postings that can't be read back.
 #[derive(Debug)]
 struct Unreadable;
-
-impl Cursor<'_> {}
 
 /// A block's postings, in order; `None` when it doesn't decode.
 fn decode_block(mut input: &[u8]) -> Option<Vec<(u32, u32)>> {

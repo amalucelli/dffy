@@ -669,3 +669,131 @@ fn file_view_titles_say_a_version_lacks_the_file() {
         "{row}"
     );
 }
+
+/// Two viewers of the same diff and comments given the same input: `shown`
+/// draws each frame from the last, as the loop does, and sends it to a
+/// terminal emulator; `whole` lays out every frame afresh.
+struct Twin {
+    shown: App,
+    whole: App,
+    terminal: vt100::Parser,
+    _dirs: [tempfile::TempDir; 2],
+}
+
+impl Twin {
+    /// [`commented`] at 160×30 in `view`, the draft thread on line 2
+    /// starting with an emoji.
+    fn new(view: View) -> Self {
+        let dirs = [(); 2].map(|()| tempfile::tempdir().expect("tempdir"));
+        let viewer = |dir: &tempfile::TempDir| {
+            let mut app = app(160, 30);
+            let path = dir.path().join("comments.json");
+            let json =
+                review_json("src/zz9.rs").replace("Why two?", "⚠\u{fe0f} Why two, not there?");
+            std::fs::write(&path, json).expect("write");
+            app.set_comments(path);
+            app.view = view;
+            app.relayout();
+            app
+        };
+        let size = |n| std::num::NonZero::new(n).expect("non-zero");
+        let mut twin = Self {
+            shown: viewer(&dirs[0]),
+            whole: viewer(&dirs[1]),
+            terminal: vt100::Parser::new(size(30), size(160), 0),
+            _dirs: dirs,
+        };
+        twin.frames("the first frame");
+        twin
+    }
+
+    fn input(&mut self, steps: &str, f: impl Fn(&mut App)) {
+        f(&mut self.shown);
+        f(&mut self.whole);
+        self.frames(steps);
+    }
+
+    /// Draws both until the comments are placed, checking each frame.
+    fn frames(&mut self, steps: &str) {
+        loop {
+            if let Some(bytes) = self.shown.draw() {
+                self.terminal.process(bytes);
+            }
+            self.whole.kept = false;
+            self.whole.draw();
+            let (shown, whole) = (
+                self.shown.screen.shown_grid(),
+                self.whole.screen.shown_grid(),
+            );
+            for y in 0..shown.height() {
+                let row = u16::try_from(y).expect("small");
+                let on_terminal: String = (0..u16::try_from(shown.width()).expect("small"))
+                    .filter_map(|x| self.terminal.screen().cell(row, x))
+                    .filter(|cell| !cell.is_wide_continuation())
+                    .map(|cell| match cell.contents() {
+                        "" => " ",
+                        text => text,
+                    })
+                    .collect();
+                let drawn = shown.row_text(y);
+                assert_eq!(on_terminal, drawn, "row {y} on the terminal, after {steps}");
+                assert_eq!(
+                    drawn,
+                    whole.row_text(y),
+                    "row {y} drawn afresh, after {steps}"
+                );
+            }
+            let placed = place(&mut self.shown);
+            assert_eq!(placed, place(&mut self.whole));
+            if !placed {
+                return;
+            }
+        }
+    }
+}
+
+/// The draft thread's lines rewritten into thirty added ones, reloaded as
+/// watch mode reloads them: the thread loses its place.
+fn rewrite_commented_lines(app: &mut App) {
+    let mut fd = diff(FILE);
+    let new: String = (1..=60)
+        .map(|i| match i {
+            2 => "rewritten\n".repeat(30),
+            4 => "line four\n".to_owned(),
+            _ => format!("line {i}\n"),
+        })
+        .collect();
+    fd.new = Text::new(new.into());
+    fd.hunks = hunks(&fd.old, &fd.new, &Options::default());
+    app.doc.document.reread(0);
+    let reloaded = diffed(app, 0, fd);
+    app.event(Event::Diffed(reloaded));
+}
+
+/// Every frame, drawn from the last and scrolled by the terminal, shows
+/// what one drawn afresh shows, on the terminal too, after a thread box
+/// goes or moves: its lines rewritten, the thread resolved, folded or
+/// deleted, file view.
+#[test]
+fn frames_drawn_from_the_last_match_a_fresh_one_as_thread_boxes_go() {
+    // Keys typed, or with none the reload.
+    let changes = [
+        ("a reload", None),
+        ("resolving", Some("mx")),
+        ("folding", Some("mz")),
+        ("deleting", Some("md")),
+        ("file view", Some("l")),
+    ];
+    for view in [View::Split, View::Unified] {
+        for (change, keys) in changes {
+            let mut twin = Twin::new(view);
+            match keys {
+                Some(keys) => twin.input(change, |app| typed(app, keys)),
+                None => twin.input(change, rewrite_commented_lines),
+            }
+            for c in ['j', 'j', 'j', 'k', 'k', 'G', 'g'] {
+                twin.input(&format!("{change} then {c} ({view:?})"), |app| key(app, c));
+            }
+        }
+    }
+}

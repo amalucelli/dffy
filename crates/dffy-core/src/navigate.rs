@@ -28,7 +28,7 @@ use std::cmp::Reverse;
 use std::hash::{Hash as _, Hasher as _};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, mpsc};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use gix::bstr::{BStr, BString, ByteSlice};
 use rustc_hash::{FxHashMap, FxHashSet, FxHasher};
@@ -47,8 +47,10 @@ mod references;
 mod resolve;
 mod store;
 
-pub use names::{name_at, names};
-pub use references::{Filter, MAX_REFERENCE_FILES, MAX_REFERENCE_LINES, Reference, References};
+pub use names::{name_at, names, names_at};
+pub use references::{
+    Filter, MAX_REFERENCE_FILES, MAX_REFERENCE_LINES, Reference, References, release_search_buffers,
+};
 use store::{Locator, Postings, Store};
 
 /// How many of the asking file's included files, directly or through
@@ -616,8 +618,14 @@ struct State {
     /// every file is in. None of them grow large in memory: memory freed
     /// stays with the process.
     fresh: Vec<(u32, u32)>,
-    runs: Vec<Postings>,
+    runs: Vec<Arc<Postings>>,
     merged: bool,
+    /// The postings are being merged: they stay as they are, those taken in
+    /// meanwhile after them.
+    merging: bool,
+    /// Times the index was read again from nothing: a merge from before one
+    /// is dropped.
+    reread: u64,
     /// The store's bytes its definitions and postings take.
     held: u64,
     /// Files whose parse took longer than the local tier gives one: later
@@ -644,27 +652,35 @@ impl State {
     }
 
     /// Writes the postings taken in last to the store as a run, once there
-    /// are [`FRESH_POSTINGS`] of them, or with `all` every one, the runs
-    /// merged into one. `None` when the runs can't be read back.
-    fn flush(&mut self, store: &Store, all: bool) -> Option<()> {
-        if (!all && self.fresh.len() < FRESH_POSTINGS) || !store.ready() {
-            return Some(());
+    /// are [`FRESH_POSTINGS`] of them.
+    fn flush(&mut self, store: &Store) {
+        if self.merging || self.fresh.len() < FRESH_POSTINGS || !store.ready() {
+            return;
         }
         self.fresh.sort_unstable();
-        let fresh = std::mem::take(&mut self.fresh);
-        if all {
-            let run = store.merge_postings(&self.runs, fresh.into_iter())?;
-            self.held -= self.runs.iter().map(Postings::len).sum::<u64>();
-            self.held += run.len();
-            self.runs = vec![run];
-            self.merged = true;
-        } else {
-            let run = store.put_postings(fresh);
-            self.held += run.len();
-            self.runs.push(run);
-        }
-        Some(())
+        let run = store.put_postings(std::mem::take(&mut self.fresh));
+        self.held += run.len();
+        self.runs.push(Arc::new(run));
     }
+
+    /// Every posting, to merge into one run; lookups read them here until
+    /// [`Navigator::merge`] has it.
+    fn start_merge(&mut self) -> Merge {
+        self.fresh.sort_unstable();
+        self.merging = true;
+        Merge {
+            runs: self.runs.clone(),
+            fresh: self.fresh.clone(),
+            reread: self.reread,
+        }
+    }
+}
+
+/// A built index's postings, to merge into one run.
+struct Merge {
+    runs: Vec<Arc<Postings>>,
+    fresh: Vec<(u32, u32)>,
+    reread: u64,
 }
 
 /// The files close to an asking file: itself at depth 0, then those it
@@ -779,7 +795,7 @@ impl Navigator {
                         languages.len() - 1
                     });
                 let key = match file {
-                    Side::Object { id, .. } => Some(highlight::pack_key(language, id)),
+                    Side::Object { id, .. } => Some(highlight::pack_key(language, &path, id)),
                     Side::Worktree { .. } | Side::Path { .. } => None,
                 };
                 indexed.push(Indexed {
@@ -805,6 +821,8 @@ impl Navigator {
             fresh: Vec::new(),
             runs: Vec::new(),
             merged: false,
+            merging: false,
+            reread: 0,
             held: 0,
             timed_out: FxHashSet::default(),
             front: FxHashSet::default(),
@@ -996,16 +1014,46 @@ impl Navigator {
             state.done += 1;
         }
         state.stats.add(did);
+        let store = self.shared.store();
         let built = state.done == self.indexed.len();
-        let flushed = if built && !state.merged {
-            state.flush(self.shared.store(), true)
+        let merge = if built && !state.merged && !state.merging && store.ready() {
+            Some(state.start_merge())
         } else {
-            state.flush(self.shared.store(), false)
+            state.flush(store);
+            None
         };
         self.held(before, state.held);
-        if flushed.is_none() {
-            self.reindex(&mut state);
+        drop(state);
+        if let Some(merge) = merge {
+            self.merge(merge);
         }
+    }
+
+    /// Merges the postings into one run, without the state held: on a large
+    /// repository it takes long enough for a lookup to wait on.
+    fn merge(&self, merge: Merge) {
+        let Merge {
+            runs,
+            fresh,
+            reread,
+        } = merge;
+        let merged = (self.shared.store()).merge_postings(&runs, fresh.iter().copied());
+        let mut state = self.state();
+        if state.reread != reread {
+            return;
+        }
+        let Some(run) = merged else {
+            self.reindex(&mut state);
+            return;
+        };
+        let before = state.held;
+        state.held -= runs.iter().map(|run| run.len()).sum::<u64>();
+        state.held += run.len();
+        state.runs = vec![Arc::new(run)];
+        state.fresh = state.fresh.split_off(fresh.len());
+        state.merged = true;
+        state.merging = false;
+        self.held(before, state.held);
     }
 
     /// Tells the store this navigator holds `after` bytes of it where it
@@ -1020,7 +1068,8 @@ impl Navigator {
     }
 
     /// Takes every file out of the index, to be read again: its postings
-    /// in the store couldn't be.
+    /// in the store couldn't be. The store keeps what it's given after that
+    /// in memory, so it happens once.
     fn reindex(&self, state: &mut State) {
         self.held(std::mem::take(&mut state.held), 0);
         state.slots.fill_with(|| Slot::Todo);
@@ -1029,6 +1078,8 @@ impl Navigator {
         state.fresh = Vec::new();
         state.runs = Vec::new();
         state.merged = false;
+        state.merging = false;
+        state.reread += 1;
         state.front.clear();
     }
 
@@ -1159,34 +1210,32 @@ impl Navigator {
 
     /// Fills the entries of `files` (indexed numbers) not built yet, in
     /// their order: from the shared store or the symbol cache, a pack read
-    /// once and written once for all of its files, or by a parse. The first
-    /// file is the asking one: it's always read, with the build's parse
-    /// budget, so its own definitions never wait for the build. The rest
-    /// get [`INLINE_PARSE`] each within [`LOCAL_BUDGET`] in all; one whose
-    /// parse takes longer, and those left when the time is up, stay for the
-    /// index build, first in its queue, and one that took too long isn't
-    /// parsed here again.
+    /// once and written once for all of its files, or by a parse. `asking`,
+    /// first among them, is always read, with the build's parse budget, so
+    /// the asking file's own definitions never wait for the build. The rest
+    /// get [`INLINE_PARSE`] each until `deadline`; one whose parse takes
+    /// longer, and those left when the time is up, stay for the index build,
+    /// first in its queue, and one that took too long isn't parsed here
+    /// again.
     fn fill(
         &self,
         repo: &Repo,
         cache: &SymbolCache,
         files: &[u32],
+        (asking, deadline): (Option<u32>, Instant),
         cancel: &AtomicBool,
     ) -> Result<(), Error> {
-        let deadline = std::time::Instant::now() + self.local_budget;
         let todo: Vec<u32> = {
             let state = self.state();
             let mut seen = FxHashSet::default();
-            (files.iter().enumerate())
-                .filter(|&(i, &f)| {
+            (files.iter().copied())
+                .filter(|&f| {
                     seen.insert(f)
                         && !matches!(state.slots[f as usize], Slot::Found(_))
-                        && (i == 0 || !state.timed_out.contains(&f))
+                        && (Some(f) == asking || !state.timed_out.contains(&f))
                 })
-                .map(|(_, &f)| f)
                 .collect()
         };
-        let asking = files.first().copied();
         let mut packs: FxHashMap<usize, LazyPack> = FxHashMap::default();
         let (mut found, mut stats, mut error) = (Vec::new(), BuildStats::default(), None);
         let (mut cancelled, mut left) = (false, Vec::new());
@@ -1198,7 +1247,7 @@ impl Navigator {
             let budget = if Some(f) == asking {
                 highlight::TAGS_PARSE_BUDGET
             } else {
-                let budget = deadline.saturating_duration_since(std::time::Instant::now());
+                let budget = deadline.saturating_duration_since(Instant::now());
                 if budget.is_zero() {
                     left.push(f);
                     continue;
@@ -1316,7 +1365,8 @@ impl Navigator {
         }
         changed.sort_unstable();
         local.extend(changed.iter().map(|&(_, f)| f));
-        self.fill(repo, cache, &local, cancel)?;
+        let until = Instant::now() + self.local_budget;
+        self.fill(repo, cache, &local, (local.first().copied(), until), cancel)?;
         self.prioritize(
             related
                 .files
@@ -1976,7 +2026,7 @@ impl Work {
             stats.unreadable += 1;
             return Ok(Got::Entry(None));
         };
-        let extracted = highlight::extract_blob(&self.language, size, budget, || {
+        let extracted = highlight::extract_blob(&self.language, &self.path, size, budget, || {
             repo.load(self.path.as_ref(), &self.side).ok()
         })?;
         let Some((entry, found)) = extracted else {
@@ -2193,51 +2243,97 @@ fn uses(text: &[u8]) -> Vec<Vec<BString>> {
         let Some(end) = rest.find_byte(b';') else {
             break;
         };
-        expand(&rest[..end], &mut Vec::new(), &mut out);
+        use_paths(&rest[..end], |path, _| {
+            out.push(
+                (path.iter())
+                    .filter(|s| !matches!(**s, b"*" | b"self"))
+                    .map(|&s| s.into())
+                    .collect(),
+            );
+        });
         rest = &rest[end..];
     }
     out
 }
 
-/// Expands a use tree under `prefix`.
-fn expand(tree: &[u8], prefix: &mut Vec<BString>, out: &mut Vec<Vec<BString>>) {
-    let tree = tree.trim();
-    let len = prefix.len();
-    let (path, group) = match tree.find_byte(b'{') {
-        Some(open) if tree.ends_with(b"}") => {
-            (&tree[..open], Some(&tree[open + 1..tree.len() - 1]))
-        }
-        _ => (tree, None),
-    };
-    for segment in path.split_str("::") {
-        // `d as e` is `d`.
-        let Some(segment) = segment.fields().next() else {
-            continue;
-        };
-        if !matches!(segment, b"*" | b"self") {
-            prefix.push(segment.into());
-        }
-    }
-    match group {
-        Some(group) => {
-            let mut depth = 0;
-            let mut start = 0;
-            for (i, &b) in group.iter().enumerate() {
-                match b {
-                    b'{' => depth += 1,
-                    b'}' => depth -= 1,
-                    b',' if depth == 0 => {
-                        expand(&group[start..i], prefix, out);
-                        start = i + 1;
-                    }
-                    _ => {}
+/// How deep a use tree's groups and how long its paths are read: past what
+/// code has, and a bound on what one made to be expanded costs.
+const USE_DEPTH: usize = 32;
+const USE_SEGMENTS: usize = 64;
+
+/// Hands `each` every path the use tree `tree` names, as its segments, with
+/// the name an `as` gives it: `a::{b, c::{self, d as e}}` is `a::b`,
+/// `a::c::self` and `a::c::d` as `e`. It stops at a tree deeper than
+/// [`USE_DEPTH`], and leaves out paths longer than [`USE_SEGMENTS`].
+fn use_paths<'t>(tree: &'t [u8], mut each: impl FnMut(&[&'t [u8]], Option<&'t [u8]>)) {
+    let mut path: Vec<&[u8]> = Vec::new();
+    let mut alias = None;
+    // Where each open group's items start in `path`.
+    let mut groups: Vec<usize> = Vec::new();
+    // Whether a name comes next, as at an item's start and past a `::`, and
+    // whether the item ends in a group, which names what it holds.
+    let (mut expects, mut grouped, mut long) = (true, false, false);
+    let mut i = 0;
+    while i <= tree.len() {
+        let here = &tree[i..];
+        match here.first() {
+            None | Some(b',' | b'}') => {
+                let base = groups.last().copied().unwrap_or_default();
+                if path.len() > base && !grouped && !long {
+                    each(&path, alias);
                 }
+                path.truncate(base);
+                (alias, expects, grouped, long) = (None, true, false, false);
+                if here.first() == Some(&b'}') && groups.pop().is_some() {
+                    (grouped, expects) = (true, false);
+                }
+                i += 1;
             }
-            expand(&group[start..], prefix, out);
+            Some(b'{') => {
+                if groups.len() == USE_DEPTH {
+                    return;
+                }
+                groups.push(path.len());
+                (expects, alias) = (true, None);
+                i += 1;
+            }
+            Some(_) if here.starts_with(b"//") => {
+                i += memchr::memchr(b'\n', here).unwrap_or(here.len());
+            }
+            Some(_) if here.starts_with(b"/*") => {
+                i += memchr::memmem::find(here, b"*/").map_or(here.len(), |end| end + 2);
+            }
+            Some(_) if here.starts_with(b"::") => {
+                expects = true;
+                i += 2;
+            }
+            Some(b) if b.is_ascii_whitespace() || *b == b':' => i += 1,
+            Some(_) => {
+                let ends = |b: &u8| b.is_ascii_whitespace() || b",{}:/".contains(b);
+                let word = &here[..here
+                    .iter()
+                    .skip(1)
+                    .position(ends)
+                    .map_or(here.len(), |e| e + 1)];
+                if expects {
+                    if path.len() == USE_SEGMENTS {
+                        long = true;
+                    } else {
+                        path.push(word);
+                    }
+                    expects = false;
+                } else if word == b"as" {
+                    // The next word is the name: kept apart from the path.
+                    let rest = &here[word.len()..];
+                    let name = rest.trim_ascii_start();
+                    let end = name.iter().position(ends).unwrap_or(name.len());
+                    alias = Some(&name[..end]).filter(|n| !n.is_empty());
+                    i += rest.len() - name.len() + end;
+                }
+                i += word.len();
+            }
         }
-        None => out.push(prefix.clone()),
     }
-    prefix.truncate(len);
 }
 
 #[cfg(test)]

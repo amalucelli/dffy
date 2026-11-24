@@ -986,14 +986,26 @@ fn is_name_byte(b: u8) -> bool {
 /// preprocessor line's directive, and an `#include`'s file.
 #[must_use]
 pub fn names(line: &[u8], language: &str) -> Vec<String> {
-    let keywords = syntax(language).keywords;
     let mut out: Vec<String> = Vec::new();
-    scan(line, language, |word| {
+    for (word, _) in names_at(line, language) {
+        if !out.contains(&word) {
+            out.push(word);
+        }
+    }
+    out
+}
+
+/// Each use of [`names`] on `line`, in order, with the byte of `line` it
+/// starts at: a name used twice is there twice.
+#[must_use]
+pub fn names_at(line: &[u8], language: &str) -> Vec<(String, usize)> {
+    let keywords = syntax(language).keywords;
+    let mut out = Vec::new();
+    scan(line, language, |word, at| {
         if let Ok(word) = std::str::from_utf8(word)
             && !keywords.iter().any(|k| k.contains(&word))
-            && !out.iter().any(|w| w == word)
         {
-            out.push(word.to_owned());
+            out.push((word.to_owned(), at));
         }
         ControlFlow::Continue(())
     });
@@ -1004,7 +1016,7 @@ pub fn names(line: &[u8], language: &str) -> Vec<String> {
 /// allocating.
 pub(crate) fn uses(line: &[u8], language: &str, name: &str) -> bool {
     let mut found = false;
-    scan(line, language, |word| {
+    scan(line, language, |word, _| {
         found = word == name.as_bytes();
         if found {
             ControlFlow::Break(())
@@ -1015,9 +1027,32 @@ pub(crate) fn uses(line: &[u8], language: &str, name: &str) -> bool {
     found
 }
 
+/// The byte of `line` each use of `name` starts at, as [`uses`] finds them;
+/// without a language, wherever it's a whole word.
+pub(crate) fn uses_at(line: &[u8], language: Option<&str>, name: &str) -> Vec<usize> {
+    let mut out = Vec::new();
+    if let Some(language) = language {
+        scan(line, language, |word, at| {
+            if word == name.as_bytes() {
+                out.push(at);
+            }
+            ControlFlow::Continue(())
+        });
+    } else {
+        let word = |b: Option<&u8>| b.is_some_and(|&b| super::is_word_byte(b));
+        out.extend(
+            memchr::memmem::find_iter(line, name.as_bytes()).filter(|&at| {
+                !word(at.checked_sub(1).and_then(|i| line.get(i)))
+                    && !word(line.get(at + name.len()))
+            }),
+        );
+    }
+    out
+}
+
 /// Hands each word of `line` that [`names`] would weigh, keywords
-/// included, to `each`, until it breaks.
-fn scan(line: &[u8], language: &str, mut each: impl FnMut(&[u8]) -> ControlFlow<()>) {
+/// included, to `each` with the byte it starts at, until it breaks.
+fn scan(line: &[u8], language: &str, mut each: impl FnMut(&[u8], usize) -> ControlFlow<()>) {
     let syntax = syntax(language);
     let rust = language == "rust";
     let mut i = 0;
@@ -1069,7 +1104,7 @@ fn scan(line: &[u8], language: &str, mut each: impl FnMut(&[u8]) -> ControlFlow<
         if syntax.prefixes.contains(&word) && matches!(line.get(i), Some(b'"' | b'\'')) {
             continue;
         }
-        if !word[0].is_ascii_digit() && each(word).is_break() {
+        if !word[0].is_ascii_digit() && each(word, start).is_break() {
             return;
         }
     }

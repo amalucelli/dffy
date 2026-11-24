@@ -5,14 +5,15 @@
 //! parsed once and kept for the next lookups from it.
 
 use std::ops::Range;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
+use std::time::Instant;
 
 use gix::bstr::{BStr, BString, ByteSlice};
 use rustc_hash::{FxHashMap, FxHashSet};
 use tree_sitter::Tree;
 
-use super::imports::{Imported, default_export, word_line};
+use super::imports::{Imported, default_export, shares_definitions, word_line};
 use super::{Candidate, Navigator, Origin, Rank, Slot, Use, is_word_byte};
 use crate::cache::SymbolCache;
 use crate::git::Repo;
@@ -28,6 +29,8 @@ const KEPT: usize = 4;
 pub(super) struct Asking {
     path: BString,
     text: Vec<u8>,
+    /// Its language by its text: a `.h` may be C++.
+    language: highlight::Language,
     /// Parsed on the first lookup that asks; `None` when it's larger than
     /// definitions are read for or its parse takes too long.
     tree: OnceLock<Option<Tree>>,
@@ -36,10 +39,12 @@ pub(super) struct Asking {
 }
 
 impl Asking {
-    fn tree(&self, language: &highlight::Language) -> Option<&Tree> {
+    fn tree(&self) -> Option<&Tree> {
         (self.tree.get_or_init(|| {
             (self.text.len() <= highlight::MAX_TAGS_BYTES)
-                .then(|| highlight::parse_tree(language, &self.text, super::INLINE_PARSE, None))
+                .then(|| {
+                    highlight::parse_tree(&self.language, &self.text, super::INLINE_PARSE, None)
+                })
                 .flatten()
         }))
         .as_ref()
@@ -51,6 +56,23 @@ impl std::fmt::Debug for Asking {
         f.debug_struct("Asking")
             .field("path", &self.path)
             .finish_non_exhaustive()
+    }
+}
+
+/// A lookup being resolved, and when its work past the index's ends.
+struct Ask<'a> {
+    repo: &'a Repo,
+    cache: &'a SymbolCache,
+    origin: &'a Origin,
+    cancel: &'a AtomicBool,
+    deadline: Instant,
+}
+
+impl Ask<'_> {
+    /// It's cancelled, or its time is up: what's left of what the asking
+    /// file says of the name goes unsaid.
+    fn stopped(&self) -> bool {
+        self.cancel.load(Ordering::Relaxed) || Instant::now() >= self.deadline
     }
 }
 
@@ -69,6 +91,8 @@ impl Navigator {
     ///   it is.
     ///
     /// And a Rust `mod x;` found is the module's file.
+    /// All of it ends within the local tier's budget, past reading the file,
+    /// or once it's cancelled.
     pub(super) fn resolve(
         &self,
         repo: &Repo,
@@ -78,15 +102,31 @@ impl Navigator {
         candidates: &mut Vec<Candidate>,
         cancel: &AtomicBool,
     ) {
+        // The parse has a budget of its own, and the language's query is
+        // compiled once: neither is this lookup's work.
+        if at.is_some()
+            && !cancel.load(Ordering::Relaxed)
+            && let Some(asking) = self.asking(repo, origin)
+            && asking.tree().is_some()
+        {
+            highlight::prepare_locals(&asking.language);
+        }
+        let ask = &Ask {
+            repo,
+            cache,
+            origin,
+            cancel,
+            deadline: Instant::now() + self.local_budget,
+        };
         let language = origin.language.name();
         self.generated_last(repo, candidates);
         if language == "rust" {
             self.declared_modules(candidates);
         }
         if let Some(at) = at {
-            self.by_receiver(repo, cache, (name, at), origin, candidates, cancel);
+            self.by_receiver(ask, (name, at), candidates);
         }
-        let imported = self.imported_definitions(repo, cache, name, origin, at, cancel);
+        let imported = self.imported_definitions(ask, name, at);
         for found in imported.into_iter().rev() {
             pin(candidates, found);
         }
@@ -102,7 +142,7 @@ impl Navigator {
             }
             _ => {}
         }
-        if let Some(local) = self.local(repo, name, origin, at) {
+        if let Some(local) = self.local(ask, name, at) {
             pin(candidates, local);
         }
     }
@@ -148,21 +188,21 @@ impl Navigator {
             b"build.gradle",
             b"build.gradle.kts",
         ];
-        let dir = super::folder(path);
-        if let Some(found) = known.get(dir) {
-            return found.clone();
-        }
-        let found = if MANIFESTS
-            .iter()
-            .any(|m| self.find(&[dir.as_bytes(), m].concat()).is_some())
-        {
-            Some(dir.to_owned())
-        } else if dir.is_empty() {
-            None
-        } else {
-            self.package_of(dir[..dir.len() - 1].as_bstr(), known)
+        let (mut dir, mut below) = (super::folder(path), Vec::new());
+        let found = loop {
+            if let Some(found) = known.get(dir) {
+                break found.clone();
+            }
+            below.push(dir);
+            if (MANIFESTS.iter()).any(|m| self.find(&[dir.as_bytes(), m].concat()).is_some()) {
+                break Some(dir.to_owned());
+            }
+            if dir.is_empty() {
+                break None;
+            }
+            dir = super::folder(dir[..dir.len() - 1].as_bstr());
         };
-        known.insert(dir.to_owned(), found.clone());
+        known.extend((below.into_iter()).map(|dir| (dir.to_owned(), found.clone())));
         found
     }
 
@@ -255,9 +295,11 @@ impl Navigator {
         }
         drop(kept);
         let l = self.find(&origin.path)?;
+        let text = self.text(repo, l)?;
         let asking = Arc::new(Asking {
             path: origin.path.clone(),
-            text: self.text(repo, l)?,
+            language: origin.language.of_text(&origin.path, &text).clone(),
+            text,
             tree: OnceLock::new(),
             imports: OnceLock::new(),
         });
@@ -271,17 +313,17 @@ impl Navigator {
 
     /// The candidate the use `at` of `name` in the asking file resolves to
     /// there: a local, a parameter, or a C file-scope variable.
-    pub(super) fn local(
-        &self,
-        repo: &Repo,
-        name: &str,
-        origin: &Origin,
-        at: Use,
-    ) -> Option<Candidate> {
-        let asking = self.asking(repo, origin)?;
-        let tree = asking.tree(&origin.language)?;
+    fn local(&self, ask: &Ask, name: &str, at: Use) -> Option<Candidate> {
+        if ask.stopped() {
+            return None;
+        }
+        let origin = ask.origin;
+        let asking = self.asking(ask.repo, origin)?;
+        let tree = asking.tree()?;
         let range = used(&asking.text, name, at)?;
-        let local = highlight::local_at(&origin.language, tree, &asking.text, range)?;
+        let local = highlight::local_at(&asking.language, tree, &asking.text, range, &|| {
+            ask.stopped()
+        })?;
         let listed = &self.listed[self.find(&origin.path)? as usize];
         Some(Candidate {
             path: listed.path.clone(),
@@ -326,15 +368,11 @@ impl Navigator {
     /// from, through their re-exports; a module's file; or, for an import
     /// from outside the repository, the import. A Go package is its import
     /// where it's used and, at its import, its `package` clause.
-    pub(super) fn imported_definitions(
-        &self,
-        repo: &Repo,
-        cache: &SymbolCache,
-        name: &str,
-        origin: &Origin,
-        at: Option<Use>,
-        cancel: &AtomicBool,
-    ) -> Vec<Candidate> {
+    fn imported_definitions(&self, ask: &Ask, name: &str, at: Option<Use>) -> Vec<Candidate> {
+        let &Ask { repo, origin, .. } = ask;
+        if ask.stopped() {
+            return Vec::new();
+        }
         let Some(asking) = self.imports_of(repo, origin) else {
             return Vec::new();
         };
@@ -345,7 +383,7 @@ impl Navigator {
         // `x.p` and `a::p` name a member, not the `p` imported.
         if let Some(at) = at
             && let Some(range) = used(&asking.text, name, at)
-            && let Some(tree) = asking.tree(&origin.language)
+            && let Some(tree) = asking.tree()
             && highlight::is_member(tree, range)
         {
             return Vec::new();
@@ -407,21 +445,17 @@ impl Navigator {
         } else {
             wanted.push((import.files.clone(), original.clone()));
         }
-        self.followed(repo, cache, wanted, language, cancel)
+        self.followed(ask, wanted)
     }
 
     /// The definitions of each name `wanted` in its files, a re-export
     /// followed to where it's from, up to [`HOPS`] re-exports away.
-    fn followed(
-        &self,
-        repo: &Repo,
-        cache: &SymbolCache,
-        mut wanted: Vec<(Vec<u32>, String)>,
-        language: &str,
-        cancel: &AtomicBool,
-    ) -> Vec<Candidate> {
+    fn followed(&self, ask: &Ask, mut wanted: Vec<(Vec<u32>, String)>) -> Vec<Candidate> {
+        let &Ask { repo, cache, .. } = ask;
+        let language = ask.origin.language.name();
         let (mut seen, mut out) = (FxHashSet::default(), Vec::new());
-        for _ in 0..HOPS {
+        // The files named, then those each re-export names.
+        for _ in 0..=HOPS {
             let mut next = Vec::new();
             for (files, original) in wanted {
                 let indexed: Vec<u32> = files
@@ -429,7 +463,8 @@ impl Navigator {
                     .filter_map(|&l| self.listed[l as usize].indexed)
                     .collect();
                 // Read now when the index hasn't: they're what the name is.
-                if self.fill(repo, cache, &indexed, cancel).is_err() {
+                let until = (None, ask.deadline);
+                if (self.fill(repo, cache, &indexed, until, ask.cancel)).is_err() {
                     return out;
                 }
                 for l in files {
@@ -470,6 +505,89 @@ impl Navigator {
             wanted = next;
         }
         out
+    }
+
+    /// The type the function `call` calls is declared to return, one hop:
+    /// of the functions the asking file imports by the name, or the module
+    /// it's called through has, when there's such an import; else of the
+    /// index's definitions of the name with a return type that the asking
+    /// file's language sees, one on the type it's called on, else one in
+    /// the asking file, else the first.
+    fn returned(&self, ask: &Ask, call: &highlight::Call) -> Option<String> {
+        // Each file defining the name is read: a method on a type known
+        // is looked for only where the type's name is too, and a name
+        // defined in more files than this (`new`, `get`) is given up on.
+        const READ: usize = 64;
+        let origin = ask.origin;
+        if let Some((files, name)) = self.called_import(ask, call) {
+            let defined = self.followed(ask, vec![(files, name)]);
+            return defined.iter().find_map(|c| {
+                let defs = self.definitions_of(self.find(&c.path)?)?;
+                let d = defs
+                    .iter()
+                    .find(|d| (d.start, d.end) == (c.start, c.end) && d.returns.is_some())?;
+                d.returns.map(str::to_owned)
+            });
+        }
+        let language = origin.language.name();
+        let mut files = self.posting(&call.name);
+        if let Some(container) = &call.container {
+            let with = self.posting(container);
+            files.retain(|f| with.binary_search(f).is_ok());
+        }
+        files.retain(|&f| {
+            let of = &self.languages[usize::from(self.indexed[f as usize].language)];
+            shares_definitions(language, of.name())
+        });
+        if files.len() > READ || ask.stopped() {
+            return None;
+        }
+        // (listed file, container, return type)
+        let mut found: Vec<(u32, Option<String>, String)> = Vec::new();
+        for f in files {
+            let l = self.indexed[f as usize].listed;
+            let Some(defs) = self.definitions_of(l) else {
+                continue;
+            };
+            for d in defs.iter().filter(|d| d.name == call.name) {
+                if let Some(returns) = d.returns {
+                    found.push((l, d.container.map(str::to_owned), returns.to_owned()));
+                }
+            }
+        }
+        if let Some(container) = &call.container
+            && found.iter().any(|f| f.1.as_ref() == Some(container))
+        {
+            found.retain(|f| f.1.as_ref() == Some(container));
+        }
+        let own = self.find(&origin.path);
+        found.sort_by_key(|f| Some(f.0) != own);
+        found.into_iter().next().map(|f| f.2)
+    }
+
+    /// The files the function `call` calls comes from, and its name there,
+    /// when the asking file imports it, or the module it's called through.
+    fn called_import(&self, ask: &Ask, call: &highlight::Call) -> Option<(Vec<u32>, String)> {
+        if call.container.is_some() {
+            return None;
+        }
+        let asking = self.imports_of(ask.repo, ask.origin)?;
+        let imports = asking.imports.get()?;
+        let through = call.module.as_ref().unwrap_or(&call.name);
+        let import = imports.iter().find(|i| i.name == *through)?;
+        let name = match (&call.module, &import.original) {
+            (Some(_), _) => call.name.clone(),
+            (None, Some(original)) => original.clone(),
+            (None, None) => return None,
+        };
+        Some((import.files.clone(), name))
+    }
+
+    /// The indexed files the index posts `name` under, ascending; none
+    /// while the postings are being written again.
+    fn posting(&self, name: &str) -> Vec<u32> {
+        let state = self.state();
+        (state.posted(self.shared.store(), super::hash(name))).unwrap_or_default()
     }
 
     /// The files re-export `d` of listed file `l` is from, and the name it
@@ -541,37 +659,49 @@ impl Navigator {
 
 impl Navigator {
     /// Puts first among `candidates` of the member `name` used at `at` in
-    /// the asking file of `origin` those its receiver has: of the type it
-    /// has, else those the module or the namespace it is defines or
-    /// re-exports, followed to where they're defined.
-    pub(super) fn by_receiver(
-        &self,
-        repo: &Repo,
-        cache: &SymbolCache,
-        (name, at): (&str, Use),
-        origin: &Origin,
-        candidates: &mut Vec<Candidate>,
-        cancel: &AtomicBool,
-    ) {
+    /// the asking file of `origin` those its receiver has: of the type the
+    /// file tells it has, else of the type the call it's the value of is
+    /// declared to return, else those the module or the namespace it is
+    /// defines or re-exports, followed to where they're defined.
+    fn by_receiver(&self, ask: &Ask, (name, at): (&str, Use), candidates: &mut Vec<Candidate>) {
+        let &Ask { repo, origin, .. } = ask;
+        if ask.stopped() {
+            return;
+        }
         let Some(asking) = self.asking(repo, origin) else {
             return;
         };
         let Some(range) = used(&asking.text, name, at) else {
             return;
         };
-        let Some(tree) = asking.tree(&origin.language) else {
+        let Some(tree) = asking.tree() else {
             return;
         };
-        let Some(receiver) = highlight::receiver_at(&origin.language, tree, &asking.text, range)
+        let stop = || ask.stopped();
+        let Some(receiver) =
+            highlight::receiver_at(&asking.language, tree, &asking.text, range, &stop)
         else {
             return;
         };
-        if let Some(ty) = receiver.ty.as_deref()
-            && candidates
+        let returned = || {
+            let call = receiver.call.as_ref()?;
+            self.returned(ask, call)
+        };
+        let has = |ty: &str| {
+            candidates
                 .iter()
                 .any(|c| c.container.as_deref() == Some(ty))
-        {
-            candidates.sort_by_key(|c| c.container.as_deref() != Some(ty));
+        };
+        // A declared return type comes before the type `T::f()` is guessed
+        // to give.
+        let guessed = || receiver.ty.clone().filter(|ty| has(ty));
+        let ty = if receiver.call.is_some() {
+            returned().filter(|ty| has(ty)).or_else(guessed)
+        } else {
+            guessed()
+        };
+        if let Some(ty) = ty {
+            candidates.sort_by_key(|c| c.container.as_deref() != Some(ty.as_str()));
             return;
         }
         let module = receiver.name.as_deref().and_then(|receiver| {
@@ -581,13 +711,8 @@ impl Navigator {
             Some(import.files.clone())
         });
         if let Some(files) = module {
-            let language = origin.language.name();
             let wanted = vec![(files, name.to_owned())];
-            for found in self
-                .followed(repo, cache, wanted, language, cancel)
-                .into_iter()
-                .rev()
-            {
+            for found in self.followed(ask, wanted).into_iter().rev() {
                 pin(candidates, found);
             }
         }

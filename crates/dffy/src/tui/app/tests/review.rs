@@ -686,11 +686,11 @@ fn a_local_draft_placed_later_is_planned_again() {
     assert!(due(&app).is_some());
 }
 
-/// On a PR, the local review's drafts that place on its diff show with
-/// a `branch draft` chip and count as drafts; one that doesn't place
-/// stays out of view and of the `i` list, and a posted one isn't brought.
-/// Edits and replies in a local thread go to the local file, a new comment
-/// to the PR's.
+/// On a PR, the local review's drafts show with a `branch draft` chip and
+/// count as drafts; one whose lines aren't found shows under the file's
+/// last row and in the `i` list, saying it stays, and a posted one isn't
+/// brought. Edits and replies in a local thread go to the local file, a new
+/// comment to the PR's.
 #[test]
 fn local_drafts_show_on_a_pr_and_are_written_where_they_live() {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -698,19 +698,32 @@ fn local_drafts_show_on_a_pr_and_are_written_where_they_live() {
     let shown = screen(&mut app);
     assert!(shown.contains("draft · branch draft"), "{shown}");
     assert!(shown.contains("Local reply"), "{shown}");
-    assert!(!shown.contains("Not on this diff") && !shown.contains("Posted from here"));
+    assert!(!shown.contains("Posted from here"), "{shown}");
     assert_eq!(
         app.sending(true),
         session::Sending {
             comments: 3,
             local: 2,
+            staying: 1,
             ..session::Sending::default()
         }
     );
+    assert_eq!(
+        posting(&app, "l9"),
+        Some((
+            Role::Warn,
+            "stays on the branch: its lines aren't here".to_owned()
+        ))
+    );
+    key(&mut app, 'G');
+    let shown = screen(&mut app);
+    assert!(shown.contains("Not on this diff"), "{shown}");
+    assert!(shown.contains("stays on the branch"), "{shown}");
+    key(&mut app, 'g');
     key(&mut app, 'i');
     let list = screen(&mut app);
     assert!(
-        list.contains("Local one") && !list.contains("Not on this diff"),
+        list.contains("4 threads") && list.contains(":30 moved branch dr"),
         "{list}"
     );
     press(&mut app, Key::Esc);
@@ -777,7 +790,8 @@ fn posting_moves_the_local_drafts_into_the_prs_file_first() {
     let shown = screen(&mut app);
     assert!(
         shown.contains("3 comments · 1 as a file comment")
-            && shown.contains("l  [x] with the 2 branch drafts"),
+            && shown.contains("l  [x] with the 2 branch drafts")
+            && shown.contains("! 1 branch draft stays, lines not found · v goes to them"),
         "{shown}"
     );
 

@@ -328,6 +328,21 @@ fn a_request_in_flight_ends_when_cancelled_or_its_helper_dies() {
     assert!(refused.helper_gone(), "{refused:?}");
 }
 
+/// The profile's folder is found wherever cargo puts test binaries in it
+/// and whatever else it keeps there, the folder of `dffy`'s own builds
+/// not taken for the binary.
+#[test]
+fn the_profile_of_a_test_binary_holds_dffy() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let profile = dir.path().join("target/debug");
+    let nested = profile.join("build/dffy/1f/out");
+    std::fs::create_dir_all(&nested).expect("mkdir");
+    std::fs::write(profile.join("dffy"), "").expect("write");
+    for exe in [nested.join("dffy-1f"), profile.join("deps/dffy-1f")] {
+        assert_eq!(super::profile(&exe), Some(profile.as_path()));
+    }
+}
+
 /// After a helper fails, the first host thread to ask starts another; one
 /// still holding the failed one's generation gets the new one, not a third.
 #[test]
@@ -344,4 +359,25 @@ fn a_failed_helper_is_replaced_once() {
     assert_ne!(second, first);
     assert_eq!(again, second, "replaced once");
     helpers.close();
+}
+
+/// Past the restart limit every ask says why the last helper failed, one
+/// that comes with no failure of its own too.
+#[test]
+fn past_the_restart_limit_the_last_failure_is_said() {
+    client::use_program(super::built_program());
+    let dir = tempfile::tempdir().expect("tempdir");
+    let cache = Cache::new(dir.path().join("cache"), 1 << 20);
+    let start = |_| client::Helper::start(dir.path(), &cache, 1, None);
+    let mut helpers = client::Helpers::default();
+    let mut gone = None;
+    let refused = loop {
+        match helpers.get(gone, start) {
+            Ok((generation, _)) => gone = Some((generation, "out of luck")),
+            Err(why) => break why,
+        }
+    };
+    assert!(refused.ends_with("keeps exiting: out of luck"), "{refused}");
+    let later = helpers.get(None, start).err();
+    assert_eq!(later, Some(refused));
 }

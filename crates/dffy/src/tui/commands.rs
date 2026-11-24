@@ -42,9 +42,9 @@ use std::ops::Range;
 use std::time::{Duration, Instant};
 
 use dffy_core::view::Attributes;
-use unicode_width::UnicodeWidthStr;
 
 use super::{fuzzy, help};
+use crate::columns::Columns as _;
 use crate::keys::{Action, Group, Keys, Tab};
 use crate::term::{Grid, Key, Mods};
 use crate::theme::{Role, Style, Theme};

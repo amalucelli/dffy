@@ -1070,10 +1070,14 @@ impl File {
         }
     }
 
-    fn shown_hunks_mut(&mut self, structural: bool) -> (&[Hunk], &mut [HunkView]) {
+    /// [`File::shown_hunks`], its views to change, with the diff.
+    fn shown_hunks_mut(&mut self, structural: bool) -> (&FileDiff, &[Hunk], &mut [HunkView]) {
+        let diff = &*self.diff;
         match &mut self.structural {
-            Some(s) if structural && s.hunks.len() == self.hunks.len() => (&*s.hunks, &mut s.views),
-            _ => (&self.diff.hunks, &mut self.hunks),
+            Some(s) if structural && s.hunks.len() == self.hunks.len() => {
+                (diff, &*s.hunks, &mut s.views)
+            }
+            _ => (diff, &diff.hunks, &mut self.hunks),
         }
     }
 
@@ -1183,7 +1187,7 @@ impl File {
     /// Builds hunk `h`'s rows and block starts in the layout `shape` picks,
     /// unless it has them; a second layout's count toward [`File::bytes`].
     fn ensure_rows(&mut self, shape: &Shape<'_, impl Arrange>, h: usize) {
-        let (cores, views) = self.shown_hunks_mut(shape.structural);
+        let (diff, cores, views) = self.shown_hunks_mut(shape.structural);
         let (core, view) = (&cores[h], &mut views[h]);
         let layout = match shape.reading {
             None => {
@@ -1238,7 +1242,14 @@ impl File {
         };
         match layout {
             Layout::Arranged(arrangement) => rows(arrangement, body.len(), kind, &mut view.rows),
-            Layout::Read(side) => side_rows(side, body.len(), kind, &mut view.rows),
+            Layout::Read(side) => {
+                let text = [&diff.old, &diff.new][side.index()];
+                let ends = |i: usize| {
+                    let l = &core.lines[body[i].line as usize];
+                    l.kind == LineKind::Context && !text.line(line_on(l, side)).ends_with(b"\n")
+                };
+                side_rows(side, body.len(), (kind, ends), &mut view.rows);
+            }
             Layout::Opened => {
                 view.rows.push(Row::Header);
                 rows(Arrangement::Unified, body.len(), kind, &mut view.rows);

@@ -6,9 +6,9 @@
 
 use dffy_core::document::Pos;
 use dffy_core::view::Attributes;
-use unicode_width::UnicodeWidthStr;
 
 use super::help;
+use crate::columns::Columns as _;
 use crate::keys::{Action as Act, Table};
 use crate::term::{Grid, Key, Mods};
 use crate::theme::{Role, Style, Theme};

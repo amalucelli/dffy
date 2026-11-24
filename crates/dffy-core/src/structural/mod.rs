@@ -42,7 +42,7 @@ use crate::diff::{
     Hunk, Line, LineKind, MAX_INTRALINE_LINE_BYTES, Text, Unchanged, common, paired_emphasis,
 };
 use crate::git::ObjectId;
-use crate::highlight::{Registry, parse_tree};
+use crate::highlight::{Registry, SNIFF_BYTES, parse_tree};
 use matcher::{LeafMatch, Mark, Matching, NONE};
 use tree::Tree;
 
@@ -152,7 +152,7 @@ pub fn diff_cached(
         if old.bytes().len().max(new.bytes().len()) < CACHE_MIN_BYTES {
             return None;
         }
-        let head = &new.bytes()[..new.bytes().len().min(256)];
+        let head = &new.bytes()[..new.bytes().len().min(SNIFF_BYTES)];
         let lang = grammars.detect(path, head)?;
         Some((cache, stored::key(lang, [old_id, new_id], hunks)))
     })();
@@ -178,7 +178,7 @@ pub(crate) fn diff_with(
     hunks: &[Hunk],
     budget: Budget,
 ) -> Result<Structural, Unavailable> {
-    let head = &new.bytes()[..new.bytes().len().min(256)];
+    let head = &new.bytes()[..new.bytes().len().min(SNIFF_BYTES)];
     let lang = grammars.detect(path, head).ok_or(Unavailable::Language)?;
     if old.bytes().len() > MAX_BYTES || new.bytes().len() > MAX_BYTES {
         return Err(Unavailable::TooLarge);

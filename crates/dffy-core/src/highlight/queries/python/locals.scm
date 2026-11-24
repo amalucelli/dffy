@@ -1,5 +1,6 @@
 ; Scopes and the names they define, for what a name used in a function
-; names there. A class body is no scope a method sees, so it's none here.
+; names there. A class's body is a scope only what's directly in it sees.
+; `global` and `nonlocal` say whose a name is.
 
 (function_definition) @local.scope
 (lambda) @local.scope
@@ -7,6 +8,10 @@
 (set_comprehension) @local.scope
 (dictionary_comprehension) @local.scope
 (generator_expression) @local.scope
+(class_definition body: (block) @local.scope.class)
+
+(global_statement (identifier) @local.global)
+(nonlocal_statement (identifier) @local.nonlocal)
 
 (parameters (identifier) @local.definition.parameter)
 (parameters (default_parameter name: (identifier) @local.definition.parameter))

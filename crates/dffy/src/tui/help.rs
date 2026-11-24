@@ -12,9 +12,9 @@
 use std::ops::Range;
 
 use dffy_core::view::Attributes;
-use unicode_width::UnicodeWidthStr;
 
 use super::fuzzy;
+use crate::columns::Columns as _;
 use crate::keys::{Action, Chord, Keys, Tab};
 use crate::term::{Grid, Key, Mods};
 use crate::theme::{Role, Style, Theme};

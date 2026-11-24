@@ -1141,7 +1141,7 @@ mod tests {
     fn every_action_has_a_short_label_for_the_overlay() {
         for &action in Action::ALL {
             let short = action.short();
-            let width = unicode_width::UnicodeWidthStr::width(short);
+            let width = crate::columns::Columns::width(short);
             assert!(
                 (1..=24).contains(&width),
                 "{}: '{short}' is {width} columns",

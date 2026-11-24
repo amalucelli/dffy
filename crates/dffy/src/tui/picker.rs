@@ -18,9 +18,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use dffy_core::bstr::BStr;
 use dffy_core::document::{Side, Source};
 use dffy_core::git::{Repo, Snapshot};
-use unicode_width::UnicodeWidthStr;
 
 use super::view::Entry;
+use crate::columns::Columns as _;
 use crate::fuzzy::{rank, score};
 use crate::render::{Canvas, escape, thousands};
 use crate::theme::Role;

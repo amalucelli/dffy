@@ -21,6 +21,7 @@ use dffy_core::view::{
 };
 use unicode_width::UnicodeWidthChar;
 
+use crate::columns::{self, Columns as _};
 use crate::config::Indicators;
 use crate::theme::{Ink, Role, Theme};
 
@@ -111,7 +112,7 @@ impl Canvas {
     fn note_area(&mut self) {
         let row = self.rows.len();
         if let Some(map) = &mut self.map {
-            map.col += str_width(&self.text[map.counted..]);
+            map.col += self.text[map.counted..].width();
             map.counted = self.text.len();
             map.areas.push(Area {
                 row,
@@ -123,12 +124,22 @@ impl Canvas {
 
     /// Records that the glyph written next shows `bytes` and takes
     /// `width` columns; a zero-width one joins the glyph before it.
+    // Split so canvases without a map, all but a few, pay for the check
+    // alone.
+    #[inline]
     fn note_glyph(&mut self, bytes: Range<usize>, width: usize) {
+        if self.map.is_some() {
+            self.note_mapped(bytes, width);
+        }
+    }
+
+    #[inline(never)]
+    fn note_mapped(&mut self, bytes: Range<usize>, width: usize) {
         let row = self.rows.len();
         let Some(map) = &mut self.map else {
             return;
         };
-        map.col += str_width(&self.text[map.counted..]);
+        map.col += self.text[map.counted..].width();
         map.counted = self.text.len();
         if width == 0 {
             if let Some(last) = map.glyphs.last_mut().filter(|g| g.row == row) {
@@ -160,6 +171,63 @@ impl Canvas {
     pub(crate) fn push_char(&mut self, ink: impl Into<Ink>, c: char) {
         self.text.push(c);
         self.close_span(ink.into());
+    }
+
+    /// Takes back the glyph written last on this row, `len` bytes of text.
+    #[cold]
+    #[inline(never)]
+    fn take_back(&mut self, len: usize) {
+        let end = self.text.len() - len;
+        self.end_spans(end);
+        self.text.truncate(end);
+        if let Some(map) = &mut self.map {
+            map.glyphs.pop();
+        }
+    }
+
+    /// Ends the spans at byte `end`, within the last one.
+    fn end_spans(&mut self, end: usize) {
+        let start = match self.spans.as_slice() {
+            [.., before, _] => before.end,
+            _ => 0,
+        };
+        match self.spans.last_mut() {
+            Some(last) if start < end => last.end = end,
+            _ => {
+                self.spans.pop();
+            }
+        }
+    }
+
+    /// Writes a [`Glyph::Selector`], noted already, as part of the glyph
+    /// before it: one cell in one ink, with the role `emph` when either is
+    /// emphasized.
+    #[cold]
+    #[inline(never)]
+    fn push_selector(&mut self, emphasized: bool, emph: Role) {
+        let Some(mut ink) = self.spans.last().map(|s| s.ink) else {
+            return;
+        };
+        if emphasized && ink.role != emph {
+            ink.role = emph;
+            let base = self.text.chars().next_back().map_or(0, char::len_utf8);
+            self.end_spans(self.text.len() - base);
+            self.spans.push(Span {
+                end: self.text.len(),
+                ink,
+            });
+        }
+        self.push_char(ink, columns::SELECTOR);
+        if let Some(map) = &mut self.map
+            && let Some(selector) = map.glyphs.pop()
+            && let Some(base) = map.glyphs.last_mut()
+        {
+            base.width += selector.width;
+            base.bytes.end = selector.bytes.end;
+            // Alone, it wouldn't be counted.
+            map.col += selector.width;
+            map.counted = self.text.len();
+        }
     }
 
     pub(crate) fn push_fmt(&mut self, role: Role, args: std::fmt::Arguments) {
@@ -791,7 +859,7 @@ impl Layout {
         let mut from = Cursor::default();
         let mut start = line.text.len();
         for_each_glyph(line.text, 0, |offset, glyph| {
-            if from.col >= self.scroll {
+            if from.col >= self.scroll && !matches!(glyph, Glyph::Selector) {
                 start = offset;
                 return ControlFlow::Break(());
             }
@@ -1035,6 +1103,9 @@ struct Cursor {
 #[derive(Debug, Clone, Copy)]
 enum Glyph {
     Char(char),
+    /// A [`columns::SELECTOR`] that makes the character before it an emoji:
+    /// the second column of that one's cell, which no row is broken before.
+    Selector,
     Tab,
     /// A C0 control or DEL, shown in caret notation (`^[`).
     Control(u8),
@@ -1053,7 +1124,7 @@ impl Glyph {
             Self::Char(c) => c.width().unwrap_or(0),
             Self::Tab => tab_width - col % tab_width,
             Self::Control(_) => 2,
-            Self::Replacement(_) => 1,
+            Self::Replacement(_) | Self::Selector => 1,
             Self::Bidi(_) => BIDI_WIDTH,
         }
     }
@@ -1062,6 +1133,7 @@ impl Glyph {
     fn len(self) -> usize {
         match self {
             Self::Char(c) | Self::Bidi(c) => c.len_utf8(),
+            Self::Selector => columns::SELECTOR.len_utf8(),
             Self::Tab | Self::Control(_) => 1,
             Self::Replacement(len) => len,
         }
@@ -1136,6 +1208,7 @@ fn for_each_piece(
                 '\0'..='\x1f' | '\x7f' => Glyph::Control(ch as u8),
                 '\u{80}'..='\u{9f}' => Glyph::Replacement(2),
                 c @ ('\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}') => Glyph::Bidi(c),
+                columns::SELECTOR if selected(valid, i) => Glyph::Selector,
                 c => Glyph::Char(c),
             };
             if f(offset + i, Piece::Glyph(glyph)).is_break() {
@@ -1154,9 +1227,22 @@ fn for_each_piece(
     }
 }
 
-/// Columns `s` takes on the grid, which drops characters without a width.
-fn str_width(s: &str) -> usize {
-    s.chars().map(|c| c.width().unwrap_or(0)).sum()
+/// Whether a [`columns::SELECTOR`] at byte `at` of `s` makes the character
+/// before it an emoji.
+#[cold]
+#[inline(never)]
+fn selected(s: &str, at: usize) -> bool {
+    s[..at].chars().next_back().is_some_and(columns::selectable)
+}
+
+/// Where the character before the [`Glyph::Selector`] at byte `at` of `text`
+/// starts.
+#[cold]
+fn base_of(text: &[u8], at: usize) -> usize {
+    text[..at]
+        .iter()
+        .rposition(|b| !matches!(b, 0x80..=0xbf))
+        .unwrap_or(at)
 }
 
 /// Display width of `text` as drawn.
@@ -1219,6 +1305,7 @@ fn word_break(text: &[u8], from: Cursor, tab_width: usize, max: usize) -> usize 
         let width = glyph.width(col, tab_width);
         if let Some((p, p_width, worded)) = prev
             && !space(glyph)
+            && width > 0
         {
             if space(p) {
                 after_space = Some(offset);
@@ -1232,6 +1319,7 @@ fn word_break(text: &[u8], from: Cursor, tab_width: usize, max: usize) -> usize 
                 (Some(at), _) if word_fits(at) => at,
                 (s, Some(at)) if s.is_none_or(|s| at > s) => at,
                 (Some(at), _) => at,
+                (None, _) if matches!(glyph, Glyph::Selector) => base_of(text, offset),
                 (None, _) => offset,
             };
             return ControlFlow::Break(());
@@ -1381,6 +1469,22 @@ fn put_glyphs(
         };
         let width = glyph.width(cursor.col, tab_width);
         if used + width > max {
+            if matches!(glyph, Glyph::Selector) {
+                // Its character goes with it: to the next row, or with a
+                // row of its own too narrow for both, blank.
+                let base = base_of(text, offset);
+                c.take_back(offset - base);
+                if used == 1 {
+                    c.note_glyph(base..offset + glyph.len(), 1);
+                    c.spaces(Ink::from(roles.0), 1);
+                    cursor.col += 1;
+                    return ControlFlow::Continue(1);
+                }
+                used -= 1;
+                cursor.col -= 1;
+                end = base;
+                return ControlFlow::Break(());
+            }
             if used == 0 && max > 0 {
                 // Nothing fits on this row (a wide glyph in a one-column
                 // space); consume it as a blank so wrapping makes progress.
@@ -1402,6 +1506,7 @@ fn put_glyphs(
         c.note_glyph(offset..offset + glyph.len(), width);
         match glyph {
             Glyph::Char(ch) => c.push_char(ink, ch),
+            Glyph::Selector => c.push_selector(role == roles.1, roles.1),
             Glyph::Tab => c.spaces(ink, width),
             Glyph::Control(b) => {
                 c.push_char(ink, '^');
@@ -1480,6 +1585,7 @@ pub(crate) fn escape(bytes: &[u8]) -> String {
     for_each_glyph(bytes, 0, |_, glyph| {
         match glyph {
             Glyph::Char(c) => out.push(c),
+            Glyph::Selector => out.push(columns::SELECTOR),
             Glyph::Tab => out.push('\t'),
             Glyph::Control(b) => {
                 out.push('^');

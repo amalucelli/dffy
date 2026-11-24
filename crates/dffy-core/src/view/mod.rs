@@ -558,10 +558,15 @@ pub fn rows(
 /// over get a [`Row::Hidden`] after the block's lines shown. A no-newline
 /// marker shows when the line it follows does, and is never counted. A
 /// body with any line gets at least one row.
+///
+/// An unchanged line's marker is the new side's in the body; `ends(i)`
+/// says whether unchanged line `i` ends `side` without a newline, which
+/// the sides disagree on when whitespace is ignored. The marker follows it
+/// then, the body's or else a [`Row::Marker`], and not otherwise.
 pub fn side_rows(
     side: Side,
     len: usize,
-    line: impl Fn(usize) -> (Kind, bool),
+    (line, ends): (impl Fn(usize) -> (Kind, bool), impl Fn(usize) -> bool),
     rows: &mut Vec<Row>,
 ) {
     let kind = |i| line(i).0;
@@ -572,6 +577,11 @@ pub fn side_rows(
             Kind::Context => {
                 rows.push(one(i));
                 i += 1;
+                let marker = i < len && kind(i) == Kind::NoNewline;
+                if ends(i - 1) {
+                    rows.push(if marker { one(i) } else { Row::Marker });
+                }
+                i += usize::from(marker);
             }
             Kind::NoNewline => {
                 if matches!(rows.last(), Some(Row::One { line, .. }) if *line + 1 == i) {

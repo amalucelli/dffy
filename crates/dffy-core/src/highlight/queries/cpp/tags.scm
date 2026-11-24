@@ -35,6 +35,19 @@
 
 (class_specifier name: (type_identifier) @name body: (field_declaration_list)) @definition.class
 
+; A class or a struct an export macro names (`class LEVELDB_EXPORT DB {`)
+; parses as a function its name is, of the type the macro's bodiless class
+; is: the function's body is the class's.
+(function_definition
+  type: (class_specifier !body)
+  declarator: (identifier) @name
+  body: (compound_statement)) @definition.class
+
+(function_definition
+  type: (struct_specifier !body)
+  declarator: (identifier) @name
+  body: (compound_statement)) @definition.struct
+
 (namespace_definition name: (namespace_identifier) @name) @definition.module
 
 (alias_declaration name: (type_identifier) @name) @definition.type

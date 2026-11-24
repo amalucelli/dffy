@@ -5782,6 +5782,49 @@ fn back_returns_from_a_definition_and_forward_goes_again() {
     assert!(term.wait_exit().success());
 }
 
+/// A definition in the file shown, far above the line asking, is a jump
+/// too: backspace goes back to the line it was opened from.
+#[test]
+fn back_returns_from_a_definition_in_the_same_file() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let d = dir.path();
+    git(d, &["init", "-q", "-b", "main"]);
+    let file = |call: &str| {
+        let filler = "int filler;\n".repeat(60);
+        format!(
+            "static int helper(void)\n{{\n\treturn 1;\n}}\n{filler}int user(void)\n{{\n\treturn {call};\n}}\n"
+        )
+    };
+    std::fs::write(d.join("x.c"), file("0")).expect("write");
+    git(d, &["add", "-A"]);
+    git(d, &["commit", "-q", "-m", "first"]);
+    std::fs::write(d.join("x.c"), file("helper()")).expect("write");
+    git(d, &["commit", "-q", "-am", "second"]);
+    let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_dffy"));
+    cmd.args(["HEAD~1", "HEAD"]);
+    let mut term = Term::spawn_command(cmd, d, 160, 30, &[]);
+    term.wait_for("the call", |t| t.contains("return helper();"));
+    assert!(!term.contains("static int helper"));
+    term.click("return helper();");
+    term.send("K");
+    term.wait_for("the line's names", |t| t.contains(" go to definition "));
+    term.send("helper\r");
+    term.wait_for("the peek", |t| t.contains("helper · 1 definition · x.c:1"));
+    term.send("\r");
+    term.wait_for("the definition, marked", |t| {
+        let screen = t.vt.screen().contents();
+        screen
+            .lines()
+            .any(|l| l.contains('❯') && l.contains("static int helper(void)"))
+    });
+    term.send("\x7f");
+    term.wait_for("the call again", |t| {
+        t.contains("return helper();") && t.status().contains("back to x.c:")
+    });
+    term.send("q");
+    assert!(term.wait_exit().success());
+}
+
 /// The line a definition opens at is marked, `❯` in its gutter, until the
 /// view moves.
 #[test]
@@ -6002,6 +6045,40 @@ fn a_peek_at_a_use_finds_its_parameter_and_aliased_import() {
         t.contains("z/util.ts:1")
     });
     term.send("\x1b");
+    term.send("q");
+    assert!(term.wait_exit().success());
+}
+
+/// `K` on a line using a name twice lists each use, and the one picked is
+/// looked up where it is: the parameter, then the field of the same name.
+#[test]
+fn k_looks_up_the_use_picked_of_two_on_a_line() {
+    let repo = tempfile::tempdir().expect("tempdir");
+    let d = repo.path();
+    git(d, &["init", "-q", "-b", "main"]);
+    let code = "package p\n\ntype Node struct {\n\tnext *Node\n}\n\n\
+                func f(next *Node) *Node {\n\treturn next.next\n}\n";
+    std::fs::write(d.join("a.go"), code).expect("write");
+    git(d, &["add", "-A"]);
+    git(d, &["commit", "-q", "-m", "first"]);
+    std::fs::write(d.join("a.go"), format!("{code}\nvar _ = f\n")).expect("write");
+    git(d, &["commit", "-q", "-am", "second"]);
+
+    let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_dffy"));
+    cmd.args(["HEAD~1", "HEAD"]);
+    let mut term = Term::spawn_command(cmd, d, 160, 40, &[]);
+    term.wait_for("a.go", |t| t.contains("return next.next"));
+    let pick = |term: &mut Term, keys: &str, at: &str| {
+        term.click("return next.next");
+        term.send("K");
+        term.wait_for("the line's names", |t| t.contains(" go to definition "));
+        term.send(keys);
+        term.wait_for(at, |t| t.contains(&format!("· {at} ·")));
+        term.send("\x1b");
+        term.wait_for("the peek closed", |t| !t.contains(&format!("· {at} ·")));
+    };
+    pick(&mut term, "\r", "a.go:7");
+    pick(&mut term, "\x1b[B\r", "a.go:4");
     term.send("q");
     assert!(term.wait_exit().success());
 }

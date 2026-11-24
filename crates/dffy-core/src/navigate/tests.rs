@@ -1,3 +1,5 @@
+use std::fmt::Write as _;
+
 use super::*;
 
 fn paths(text: &str) -> Vec<String> {
@@ -547,6 +549,133 @@ fn a_store_read_that_fails_reads_the_index_again() {
     assert_eq!(frob(&nav, &repo, &cache), ["src/b.c:0"]);
 }
 
+/// A project of six files with enough definitions that the postings of the
+/// first ones are written to the store before the last is in.
+fn large_project() -> (tempfile::TempDir, Repo, [Snapshot; 2]) {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let d = dir.path();
+    git(d, &["init", "-q", "-b", "main"]);
+    for f in 0..6 {
+        let mut text = String::new();
+        for i in 0..20_000 {
+            writeln!(text, "#define N{f}_{i} 1").expect("writes");
+        }
+        std::fs::write(d.join(format!("f{f}.c")), text).expect("write");
+    }
+    git(d, &["add", "-A"]);
+    git(d, &["commit", "-q", "-m", "first"]);
+    let repo = Repo::discover(d).expect("repo");
+    let spec = repo.resolve(&[], false, false).expect("resolves");
+    let snapshots = spec.snapshots(false).expect("snapshots");
+    (dir, repo, snapshots)
+}
+
+/// A lookup while the index's postings are merged answers from what they
+/// were, and a merge of an index read again meanwhile is dropped.
+#[test]
+fn lookups_answer_while_the_postings_merge() {
+    let (_dir, repo, changes, snapshots) = stored_project();
+    let cache_dir = tempfile::tempdir().expect("tempdir");
+    let cache = crate::cache::Cache::new(cache_dir.path().to_owned(), 1 << 24).symbols();
+    let shared = Shared::new();
+    let side = view::Side::New;
+    let nav = built(&repo, &changes, snapshots, (&shared, &cache), side);
+    let held = nav.state().held;
+    let merge = nav.state().start_merge();
+    assert_eq!(frob(&nav, &repo, &cache), ["src/b.c:0"]);
+    nav.merge(merge);
+    assert!(nav.postings_written());
+    assert_eq!(nav.state().held, held, "the run it replaced isn't held");
+
+    let merge = nav.state().start_merge();
+    nav.reindex(&mut nav.state());
+    nav.merge(merge);
+    assert!(!nav.postings_written(), "of an index read again since");
+    nav.build(&repo, &cache, 1, &AtomicBool::new(false), |_| {})
+        .expect("the queries compile");
+    assert!(nav.postings_written());
+    assert_eq!(frob(&nav, &repo, &cache), ["src/b.c:0"]);
+    assert_eq!(nav.state().held, held);
+}
+
+/// Where the store's file takes writes but can't be read back, an index is
+/// read again once, into memory, and the navigator says so.
+#[test]
+fn a_store_that_cant_be_read_back_is_read_again_once() {
+    let (_dir, repo, snapshots) = large_project();
+    let cache_dir = tempfile::tempdir().expect("tempdir");
+    let cache = crate::cache::Cache::new(cache_dir.path().to_owned(), 1 << 24).symbols();
+    let diff = Diff {
+        snapshots,
+        changes: &[],
+        options: Options::default(),
+    };
+    let shared = Shared::new();
+    let nav = Navigator::new(&repo, &Registry::builtin(), &shared, &diff, view::Side::Old)
+        .expect("lists");
+    let mut chunks = 0;
+    while let Some(chunk) = nav.take_chunk() {
+        chunks += 1;
+        assert!(chunks < 40, "read again without end");
+        let failed = nav.add(chunk.run(&repo, &cache, &AtomicBool::new(false)));
+        assert!(failed.is_none(), "the queries compile");
+        if !nav.state().runs.is_empty() {
+            nav.shared.store().break_reads();
+        }
+    }
+    assert!(chunks > 6, "read again: {chunks} chunks");
+    assert!(nav.progress().complete());
+    let origin = Origin {
+        path: "f0.c".into(),
+        language: Registry::builtin().named("c").expect("bundled").clone(),
+    };
+    for name in ["N0_7", "N5_7"] {
+        let found =
+            (nav.lookup(&repo, &cache, name, &origin, &AtomicBool::new(false))).expect("looks up");
+        assert_eq!(found.total, 1, "{name}");
+        assert!(found.progress.complete(), "{name}: not read again");
+    }
+    let note = nav.note().expect("said");
+    assert!(note.contains("kept in memory"), "{note}");
+}
+
+/// Files of stores a killed process left are removed, and one of the name
+/// the next store takes doesn't keep it from being made.
+#[test]
+fn files_a_killed_process_left_dont_stop_a_store() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = |n: u64| (dir.path()).join(format!("navigate-{}-{n}", std::process::id()));
+    let next = store::next();
+    let hour = Duration::from_secs(60 * 60);
+    let old = std::time::SystemTime::now() - 2 * hour;
+    for (path, modified) in [
+        // As a process of this pid left it a moment ago.
+        (path(next), None),
+        (path(next + 1), None),
+        (dir.path().join("navigate-1-0"), Some(old)),
+        (dir.path().join("navigate-1-1"), None),
+        (dir.path().join("pack"), Some(old)),
+    ] {
+        let file = std::fs::File::create(path).expect("made");
+        if let Some(at) = modified {
+            file.set_modified(at).expect("dated");
+        }
+    }
+    let store = Store::default();
+    let at = store.append(dir.path(), b"held");
+    assert_eq!(store.note(), None);
+    assert_eq!(store.read(at).as_deref(), Some(&b"held"[..]));
+    let mut left: Vec<String> = std::fs::read_dir(dir.path())
+        .expect("reads")
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect();
+    left.sort();
+    assert!(left.contains(&"pack".to_owned()), "{left:?}");
+    assert!(left.contains(&"navigate-1-1".to_owned()), "{left:?}");
+    assert!(!left.contains(&"navigate-1-0".to_owned()), "{left:?}");
+}
+
 /// Where the store's file can't be made, as on a full disk, the
 /// definitions are kept in memory and the navigator says so.
 #[test]
@@ -688,4 +817,22 @@ fn filters_keep_the_calls_and_the_uses_in_the_diff() {
         ..Filter::default()
     };
     assert_eq!(kept(in_diff), ["b.c:1", "b.c:2"]);
+}
+
+/// Each use of a name on a line, with the byte it starts at: a name used
+/// twice is there twice; keywords, comments and strings aren't.
+#[test]
+fn every_use_on_a_line_comes_with_where_it_starts() {
+    let found = names_at(b"\treturn next.next(\"next\") // next", "go");
+    let found: Vec<(&str, usize)> = found.iter().map(|(n, at)| (n.as_str(), *at)).collect();
+    assert_eq!(found, [("next", 8), ("next", 13)]);
+}
+
+/// The read buffers searches keep for the next are given back on asking.
+#[test]
+fn search_buffers_are_released() {
+    references::give_back(Vec::with_capacity(1 << 20));
+    assert!(references::pooled() > 0);
+    release_search_buffers();
+    assert_eq!(references::pooled(), 0);
 }

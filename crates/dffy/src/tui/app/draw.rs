@@ -3,13 +3,12 @@
 
 use std::fmt::Write as _;
 
-use unicode_width::UnicodeWidthStr;
-
 use dffy_core::document::{Side, Source, State};
 use dffy_core::git::{Side as GitSide, Status};
 use dffy_core::view::Attributes;
 
 use super::{App, OnSave, Pane, Watch};
+use crate::columns::Columns as _;
 use crate::config::StatusBar;
 use crate::keys::Action as Act;
 use crate::render::escape;

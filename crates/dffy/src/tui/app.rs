@@ -1688,6 +1688,7 @@ impl App {
             self.doc.document.evict(CACHE_BYTES, &self.visible);
             self.doc.normalize();
             self.conflict_loaded(file, chosen);
+            self.peek_diffed(file);
             self.dirty = true;
         }
     }

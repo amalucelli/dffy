@@ -389,7 +389,8 @@ const TOOLS: &str = r#"[
       "progress": {"type": "object", "properties": {"indexed": {"type": "integer"}, "files": {"type": "integer"}}},
       "partial": {"type": "boolean", "description": "The index isn't complete: a definition may be missing."},
       "references": {"type": ["object", "null"], "properties": {"matches": {"type": "array", "items": {"type": "object", "properties": {"path": {"type": "string"}, "line": {"type": "integer"}, "text": {"type": "string"}, "changed": {"type": "boolean"}}}}, "total": {"type": "integer"}, "files": {"type": "integer"}, "complete": {"type": "boolean"}}},
-      "next_cursor": {"type": ["string", "null"]}
+      "next_cursor": {"type": ["string", "null"]},
+      "note": {"type": "string", "description": "Why the index is kept in memory rather than in the disk cache, when it is."}
     },
     "required": ["name", "side", "candidates", "total", "progress", "partial", "references", "next_cursor"]
   },
@@ -2131,7 +2132,7 @@ impl Answer<'_> {
             lines,
             progress,
             page,
-            ..
+            note,
         } = self;
         let mut s = String::from(r#"{"name":"#);
         string(&mut s, name);
@@ -2172,6 +2173,10 @@ impl Answer<'_> {
         }
         s.push_str(r#","next_cursor":"#);
         optional_string(&mut s, page.as_ref().and_then(|p| p.next.as_deref()));
+        if let Some(note) = note {
+            s.push_str(r#","note":"#);
+            string(&mut s, note);
+        }
         s.push('}');
         s
     }
@@ -2939,6 +2944,13 @@ mod tests {
             members.contains("the definitions index is kept in memory"),
             "{members}"
         );
+        let result = parse(format!("{{{members}}}").as_bytes()).expect("json");
+        let note = (result.get("structuredContent")).and_then(|c| c.get("note"));
+        assert!(
+            note.and_then(Value::as_str)
+                .is_some_and(|n| n.contains("kept in memory")),
+            "{members}"
+        );
     }
 
     #[test]
@@ -3116,6 +3128,31 @@ mod tests {
                 && members.contains(r#""isError":true"#),
             "{members}"
         );
+    }
+
+    /// A lookup the helper dies on is a tool error saying so, and the next
+    /// name is looked up in another.
+    #[cfg(debug_assertions)]
+    #[test]
+    fn a_name_the_helper_dies_on_leaves_the_next_one_working() {
+        let (dir, cache) = (
+            tempfile::tempdir().expect("tempdir"),
+            tempfile::tempdir().expect("tempdir"),
+        );
+        let ctx = navigating(dir.path(), cache.path());
+        let mut server = server(dir.path(), &ctx);
+        let name = crate::navigator::DEADLY;
+        let call =
+            format!(r#"{{"name":"definitions","arguments":{{"name":"{name}","path":"b.c"}}}}"#);
+        let params = parse(call.as_bytes()).expect("json");
+        let members = server.call(Some(&params)).expect("a tool result");
+        assert!(
+            members.contains("the navigator helper exited")
+                && members.contains(r#""isError":true"#),
+            "{members}"
+        );
+        let found = indexed(&mut server, r#"{"name":"frob","path":"b.c"}"#);
+        assert_eq!(found.get("total").and_then(Value::as_usize), Some(1));
     }
 
     /// The list's fingerprint changes when a file appears, goes away or

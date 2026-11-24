@@ -830,7 +830,7 @@ fn language<'a>(grammars: &'a Registry, fd: &FileDiff) -> Option<&'a str> {
     } else {
         (fd.change.path.as_ref(), &fd.new)
     };
-    let head = &text.bytes()[..text.bytes().len().min(256)];
+    let head = &text.bytes()[..text.bytes().len().min(dffy_core::highlight::SNIFF_BYTES)];
     grammars
         .detect(path, head)
         .map(dffy_core::highlight::Language::name)

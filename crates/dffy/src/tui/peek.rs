@@ -13,10 +13,10 @@ use std::sync::Arc;
 use dffy_core::highlight::DefinitionKind;
 use dffy_core::navigate::{self, MAX_REFERENCE_FILES};
 use dffy_core::view::{Attributes, Run};
-use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use super::help;
 use super::worker::{Code, Looked};
+use crate::columns::{Columns as _, added};
 use crate::render::{Canvas, thousands};
 use crate::review::model::snippet::pieces;
 use crate::term::{Grid, Key, Mods};
@@ -37,13 +37,16 @@ const ABOVE: usize = 2;
 pub(crate) enum Picked {
     Stay,
     Close,
-    Name(String),
+    /// The name, and the byte of the line its use starts at.
+    Name(String, usize),
 }
 
-/// The names on a line, to pick the one to look up: typing narrows them
-/// fuzzily, arrows move, `enter` picks, `esc` closes.
+/// The uses of names on a line, to pick the one to look up: typing narrows
+/// them fuzzily, arrows move, `enter` picks, `esc` closes. A name used
+/// more than once is listed at each use, numbered after the first.
 pub(crate) struct Names {
-    all: Vec<String>,
+    /// Each use, where it starts, and how it's listed.
+    all: Vec<(String, usize, String)>,
     query: String,
     shown: Vec<usize>,
     cursor: usize,
@@ -56,11 +59,21 @@ const NAMES_SHOWN: usize = 10;
 const NAMES_TITLE: &str = " go to definition ";
 
 impl Names {
-    /// `names` has at least one.
-    pub(crate) fn new(names: Vec<String>, at: (usize, usize)) -> Self {
+    /// `names`, each use with where it starts, has at least one.
+    pub(crate) fn new(names: Vec<(String, usize)>, at: (usize, usize)) -> Self {
         let shown = (0..names.len()).collect();
+        let mut all: Vec<(String, usize, String)> = Vec::with_capacity(names.len());
+        for (name, column) in names {
+            let before = all.iter().filter(|(n, ..)| *n == name).count();
+            let label = if before == 0 {
+                name.clone()
+            } else {
+                format!("{name} ({})", before + 1)
+            };
+            all.push((name, column, label));
+        }
         Self {
-            all: names,
+            all,
             query: String::new(),
             shown,
             cursor: 0,
@@ -70,7 +83,7 @@ impl Names {
 
     fn narrow(&mut self) {
         let mut scored: Vec<(i64, usize)> = (self.all.iter().enumerate())
-            .filter_map(|(i, n)| Some((crate::fuzzy::score(&self.query, n)?.0, i)))
+            .filter_map(|(i, (n, ..))| Some((crate::fuzzy::score(&self.query, n)?.0, i)))
             .collect();
         if !self.query.is_empty() {
             scored.sort_by_key(|&(score, i)| (std::cmp::Reverse(score), i));
@@ -87,7 +100,7 @@ impl Names {
             Key::Char('c') if ctrl => return Picked::Close,
             Key::Enter => {
                 return match self.shown.get(self.cursor) {
-                    Some(&i) => Picked::Name(self.all[i].clone()),
+                    Some(&i) => self.picked(i),
                     None => Picked::Stay,
                 };
             }
@@ -118,11 +131,16 @@ impl Names {
         let first = self.first_shown();
         match (y - y0).checked_sub(2) {
             Some(row) if y + 1 < y0 + height => match self.shown.get(first + row) {
-                Some(&i) => Picked::Name(self.all[i].clone()),
+                Some(&i) => self.picked(i),
                 None => Picked::Stay,
             },
             _ => Picked::Stay,
         }
+    }
+
+    fn picked(&self, i: usize) -> Picked {
+        let (name, column, _) = &self.all[i];
+        Picked::Name(name.clone(), *column)
     }
 
     fn first_shown(&self) -> usize {
@@ -130,7 +148,7 @@ impl Names {
     }
 
     fn rect(&self, (gw, gh): (usize, usize)) -> (usize, usize, usize, usize) {
-        let widest = (self.all.iter().map(|n| n.width()))
+        let widest = (self.all.iter().map(|(.., label)| label.width()))
             .chain([NAMES_TITLE.width(), self.query.width() + 2])
             .max()
             .unwrap_or(0);
@@ -164,7 +182,7 @@ impl Names {
                 grid.fill(x0 + 1, y, x0 + width - 1, style);
                 style.attributes |= Attributes::BOLD;
             }
-            grid.put_str(x, y, end, &self.all[i], style);
+            grid.put_str(x, y, end, &self.all[i].2, style);
         }
         if self.shown.is_empty() {
             grid.put_str(x, y0 + 2, end, "no name matches", theme.style(Role::Dim));
@@ -281,6 +299,8 @@ struct Cells<'c> {
     origin: usize,
     /// Something didn't fit: nothing more is written but the fill.
     cut: bool,
+    /// The last character written.
+    before: Option<char>,
 }
 
 impl<'c> Cells<'c> {
@@ -292,6 +312,7 @@ impl<'c> Cells<'c> {
             tab: tab.max(1),
             origin: 0,
             cut: false,
+            before: None,
         }
     }
 
@@ -306,18 +327,20 @@ impl<'c> Cells<'c> {
                 let n = (self.tab - at % self.tab).min(self.room - self.used);
                 out.extend(std::iter::repeat_n(' ', n));
                 self.used += n;
+                self.before = Some(' ');
                 continue;
             }
             if ch.is_control() {
                 continue;
             }
-            let w = ch.width().unwrap_or(0);
+            let w = added(self.before, ch);
             if self.used + w > self.room {
                 self.cut = true;
                 break;
             }
             out.push(ch);
             self.used += w;
+            self.before = Some(ch);
         }
         self.c.push_ink(ink.into(), &out);
     }
@@ -857,6 +880,43 @@ impl Peek {
                 cells.fill(ink(Role::Plain), ' ');
             }
             None => cells.fill(Role::Plain, ' '),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::columns::TRICKY;
+
+    /// Every row ends with its border in the last column, whatever the
+    /// name, the code's place and the keys say, cut or not; beside the
+    /// list, the code's divider stays in its column.
+    #[test]
+    fn borders_stay_in_their_columns() {
+        for s in TRICKY {
+            let long = format!("{s}a").repeat(30);
+            for text in [format!("{s}x"), long] {
+                for width in [40, 41, 100, 101] {
+                    let peek = Peek::new(text.clone(), text.clone(), text.clone(), text.clone());
+                    let mut c = Canvas::default();
+                    peek.rows(width, 4, &mut c);
+                    for (y, row) in c.rows().enumerate() {
+                        let mut grid = Grid::new(width + 4, 1);
+                        let mut x = 0;
+                        for (_, piece) in row {
+                            x = grid.put_str(x, 0, width + 4, piece, Style::PLAIN);
+                        }
+                        let shown = grid.row_text(0);
+                        assert_eq!(x, width, "{text:?} at {width}: {shown}");
+                        if let Some((code, _)) = Peek::columns(width)
+                            && (1..=BODY).contains(&y)
+                        {
+                            assert_eq!(grid.row(0)[code + 3].text(), "│", "{shown}");
+                        }
+                    }
+                }
+            }
         }
     }
 }

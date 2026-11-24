@@ -148,7 +148,7 @@ fn painted(path: &[u8], lines: &[&str]) -> Option<Spans> {
         bytes.extend_from_slice(line.as_bytes());
         bytes.push(b'\n');
     }
-    let lang = crate::grammars().detect(path, &bytes[..bytes.len().min(256)])?;
+    let lang = crate::grammars().detect(path, &bytes[..bytes.len().min(highlight::SNIFF_BYTES)])?;
     let text = Text::new(bytes);
     Some(highlight::parse(lang, text.bytes())?.spans(&text, 0..text.len()))
 }

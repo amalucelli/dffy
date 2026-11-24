@@ -24,11 +24,27 @@ pub(crate) fn selectable(c: char) -> bool {
 }
 
 /// The columns `c` adds to text that ends with `before`.
+#[inline]
 pub(crate) fn added(before: Option<char>, c: char) -> usize {
     if c == SELECTOR && before.is_some_and(selectable) {
         return 1;
     }
     UnicodeWidthChar::width(c).unwrap_or(0)
+}
+
+#[inline(never)]
+fn width_by_character(text: &str) -> usize {
+    let mut before = None;
+    let mut width = 0;
+    for c in text.chars() {
+        width += if matches!(c, ' '..='~') {
+            1
+        } else {
+            added(before, c)
+        };
+        before = Some(c);
+    }
+    width
 }
 
 pub(crate) trait Columns {
@@ -41,9 +57,15 @@ pub(crate) trait Columns {
 }
 
 impl Columns for str {
+    // Inlined up to the rest: the renderer measures each glyph it maps.
+    #[inline]
     fn width(&self) -> usize {
-        let mut before = None;
-        self.chars().map(|c| added(before.replace(c), c)).sum()
+        // Printable ASCII takes a column a byte; nearly all text measured is
+        // that, a glyph or a few at a time.
+        if self.bytes().all(|b| matches!(b, b' '..=b'~')) {
+            return self.len();
+        }
+        width_by_character(self)
     }
 
     fn clusters(&self) -> impl Iterator<Item = (usize, &Self, usize)> {

@@ -387,8 +387,19 @@ fn drive(
             params.extend(line.map(|l| ("line", number(l))));
             let result = ask("view/open", params)?;
             let at = line.map_or_else(String::new, |l| format!(":{l}"));
-            let old = if on == Some("old") { " (old side)" } else { "" };
-            let words = format!("view {id} shows {}{at}{old}", escape(&path));
+            let notes: Vec<&str> = [
+                (on == Some("old")).then_some("old side"),
+                (result.get("listed") == Some(&Value::Bool(false))).then_some("not in the diff"),
+            ]
+            .into_iter()
+            .flatten()
+            .collect();
+            let notes = if notes.is_empty() {
+                String::new()
+            } else {
+                format!(" ({})", notes.join(", "))
+            };
+            let words = format!("view {id} shows {}{at}{notes}", escape(&path));
             (result, words)
         }
         CtlAction::Focus { thread } => {
@@ -424,8 +435,13 @@ fn drive(
             ];
             let result = ask("comments/add", params)?;
             let comment = result.get("id").and_then(Value::as_str).unwrap_or_default();
+            let unlisted = if result.get("listed") == Some(&Value::Bool(false)) {
+                " (not in the diff)"
+            } else {
+                ""
+            };
             let words = format!(
-                "comment {comment} on {}:{line}, in view {id}",
+                "comment {comment} on {}:{line}{unlisted}, in view {id}",
                 escape(&path)
             );
             (result, words)

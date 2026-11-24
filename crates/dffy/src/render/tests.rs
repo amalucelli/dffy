@@ -11,7 +11,7 @@ fn layout(split: bool, width: Option<usize>, wrap: bool) -> Layout {
         words: false,
         tab_width: 4,
         indicators: Indicators::Classic,
-        one_sided: false,
+        one_sided: None,
         unmerged: false,
         digits: 0,
         inline_signs: true,
@@ -19,6 +19,7 @@ fn layout(split: bool, width: Option<usize>, wrap: bool) -> Layout {
         line_numbers: true,
         hunk_headers: true,
         modified_lines: true,
+        read_alone: false,
     }
 }
 
@@ -651,7 +652,7 @@ fn traced(layout: Layout, rows: &[(Option<&str>, Option<&str>)]) -> String {
 #[test]
 fn mapped_cells_count_tabs_and_wide_characters() {
     let layout = Layout {
-        one_sided: true,
+        one_sided: Some(Side::New),
         ..layout(false, Some(40), false)
     };
     insta::assert_snapshot!(traced(layout, &[(None, Some("a\t漢x"))]), @r"
@@ -663,12 +664,158 @@ fn mapped_cells_count_tabs_and_wide_characters() {
     ");
 }
 
+/// Each glyph the map has is where the grid draws it, for text whose
+/// measures have disagreed: unified, split, wrapped in any narrow pane and
+/// scrolled through. Wrapped, every byte is drawn, and no pane is overrun.
+#[test]
+fn mapped_cells_are_where_the_grid_draws_them() {
+    for s in columns::TRICKY {
+        let text = format!("a{s}b{s}c");
+        let line = Line {
+            state: LineState::new(Kind::Added, false, Unchanged::No),
+            old: None,
+            new: Some(1),
+            text: text.as_bytes(),
+            emphasis: &[],
+            syntax: None,
+            paint: &[],
+            block_start: false,
+        };
+        let one_sided = Layout {
+            one_sided: Some(Side::New),
+            ..layout(false, Some(40), false)
+        };
+        // From two columns of code: in one, a wide glyph draws blank.
+        let wrapped = (8..16).flat_map(|width| {
+            [false, true].map(|words| Layout {
+                words,
+                ..layout(false, Some(width), true)
+            })
+        });
+        let scrolled = (1..10).map(|scroll| Layout {
+            scroll,
+            ..one_sided
+        });
+        let layouts = [one_sided, layout(true, Some(41), false)]
+            .into_iter()
+            .chain(wrapped)
+            .chain(scrolled);
+        for layout in layouts {
+            let width = layout.width.expect("set");
+            let mut c = Canvas::mapped();
+            if layout.split {
+                split::row(&layout, 1, [None, Some(&line)], &mut c);
+            } else {
+                unified::line(&layout, 1, &line, &mut c);
+            }
+            let map = c.map().expect("mapped");
+            let mut drawn = String::new();
+            for (y, row) in c.rows().enumerate() {
+                // A column past the pane, to see it overrun.
+                let mut grid = crate::term::Grid::new(width + 1, 1);
+                let mut x = 0;
+                for (_, piece) in row {
+                    x = grid.put_str(x, 0, width + 1, piece, crate::theme::Style::PLAIN);
+                }
+                assert!(x <= width, "{layout:?}: {:?}", grid.row_text(0));
+                for g in map.glyphs.iter().filter(|g| g.row == y) {
+                    let source = &text[g.bytes.clone()];
+                    let cells = &grid.row(0)[g.col..g.col + g.width];
+                    let shown: String = cells.iter().flat_map(|c| c.text().chars()).collect();
+                    assert_eq!(shown, source, "{layout:?}: {:?}", grid.row_text(0));
+                    drawn.push_str(source);
+                }
+            }
+            if layout.scroll == 0 {
+                assert_eq!(drawn, text, "{layout:?}");
+            }
+        }
+    }
+}
+
+/// In one column of code an emoji draws blank, as any wide glyph does, and
+/// the line goes on past it.
+#[test]
+fn an_emoji_wider_than_its_row_is_blank() {
+    let line = Line {
+        state: LineState::new(Kind::Added, false, Unchanged::No),
+        old: None,
+        new: Some(1),
+        text: "a\u{26a0}\u{fe0f}b".as_bytes(),
+        emphasis: &[],
+        syntax: None,
+        paint: &[],
+        block_start: false,
+    };
+    let mut c = Canvas::mapped();
+    unified::line(&layout(false, Some(7), true), 1, &line, &mut c);
+    let rows: Vec<String> = c
+        .rows()
+        .map(|row| row.map(|(_, text)| text).collect())
+        .collect();
+    let code: Vec<char> = rows.iter().filter_map(|r| r.chars().last()).collect();
+    assert_eq!(code, ['a', ' ', 'b'], "{rows:?}");
+    let bytes: Vec<_> = (c.map().expect("mapped").glyphs.iter())
+        .map(|g| g.bytes.clone())
+        .collect();
+    assert_eq!(bytes, [0..1, 1..7, 7..8]);
+}
+
+/// Every character U+FE0F widens is one glyph with it, whichever range of
+/// Unicode it's in.
+#[test]
+fn every_selectable_character_takes_its_selector() {
+    let all: Vec<char> = ('\0'..=char::MAX)
+        .filter(|&c| columns::selectable(c))
+        .collect();
+    assert!(all.len() > 200, "{}", all.len());
+    for c in all {
+        let text = format!("{c}\u{fe0f}");
+        assert_eq!(width(text.as_bytes(), 4), 2, "{text:?}");
+    }
+}
+
+/// Printed lines keep every byte: a change that only asks for a
+/// character's emoji form shows, in full, wrapped and in a free line of
+/// text. Emphasis on the selector alone marks the emoji, one cell.
+#[test]
+fn a_selector_is_written_and_its_change_emphasized() {
+    for layout in [
+        layout(false, None, false),
+        layout(false, Some(80), false),
+        layout(false, Some(80), true),
+        layout(true, Some(80), false),
+    ] {
+        let printed = render("warn \u{26a0} foo\n", "warn \u{26a0}\u{fe0f} foo\n", layout);
+        assert_eq!(printed.matches('\u{26a0}').count(), 2, "{printed}");
+        assert_eq!(printed.matches('\u{fe0f}').count(), 1, "{printed}");
+    }
+    let mut c = Canvas::default();
+    layout(false, Some(80), false).text_line(Role::Plain, "1\u{fe0f}\u{20e3}".as_bytes(), &mut c);
+    assert_eq!(c.markup(), "1\u{fe0f}\u{20e3}\n");
+    assert_eq!(escape("\u{26a0}\u{fe0f}".as_bytes()), "\u{26a0}\u{fe0f}");
+    let line = Line {
+        state: LineState::new(Kind::Added, false, Unchanged::No),
+        old: None,
+        new: Some(1),
+        text: "\u{26a0}\u{fe0f}x".as_bytes(),
+        emphasis: std::slice::from_ref(&(3..6)),
+        syntax: None,
+        paint: &[],
+        block_start: false,
+    };
+    let mut c = Canvas::default();
+    unified::line(&layout(false, Some(40), false), 1, &line, &mut c);
+    let emphasized = format!("<{}>\u{26a0}\u{fe0f}</>", Role::AddedEmph.key());
+    assert!(c.markup().contains(&emphasized), "{}", c.markup());
+}
+
 /// Scrolled sideways, cells start after the `…` with the first glyph
 /// still shown; wrapped, the next row goes on from the byte the last left.
 #[test]
 fn mapped_cells_follow_scroll_and_wrapping() {
     let scrolled = Layout {
-        one_sided: true,
+        one_sided: Some(Side::New),
         scroll: 2,
         ..layout(false, Some(40), false)
     };
@@ -680,7 +827,7 @@ fn mapped_cells_follow_scroll_and_wrapping() {
     area 0:4 1
     ");
     let wrapped = Layout {
-        one_sided: true,
+        one_sided: Some(Side::New),
         ..layout(false, Some(8), true)
     };
     insta::assert_snapshot!(traced(wrapped, &[(None, Some("abcde"))]), @r"
@@ -794,4 +941,110 @@ fn line_numbers_and_hunk_numbers_can_be_left_out() {
     <dim> │</><added>+    eprintln!("done");</>
     <dim> │</> }
     "#);
+}
+
+/// In file view, in every indicators style: a changed line of the side
+/// read carries a heavy bar for its rule in its sign's color, an unchanged
+/// line none, and each run of the other side's unpaired lines is a rule
+/// across the pane in the hidden side's color that counts them and names
+/// the key that opens them, or closes them once open. In an opened change
+/// the other side's lines have no bar. The number shown is the side read's.
+#[test]
+fn file_view_marks_changes_and_hidden_runs_in_every_style() {
+    use std::fmt::Write as _;
+    let header = HunkHeader {
+        old_start: 3,
+        old_len: 1,
+        new_start: 4,
+        new_len: 1,
+        heading: b"",
+        hidden: 0,
+    };
+    let kept = Line {
+        state: LineState::Context,
+        old: Some(3),
+        new: Some(4),
+        text: b"kept",
+        emphasis: &[],
+        syntax: None,
+        paint: &[],
+        block_start: false,
+    };
+    // The line an edit was made into, on the new side.
+    let edited = Line {
+        state: LineState::AddedPaired,
+        old: None,
+        new: Some(5),
+        text: b"edited",
+        ..kept
+    };
+    // The line it was edited from, as an opened change shows it.
+    let was = Line {
+        state: LineState::RemovedPaired,
+        old: Some(5),
+        new: None,
+        text: b"was",
+        ..kept
+    };
+    let lines = [kept, edited, was];
+    let mut out = String::new();
+    for indicators in [
+        Indicators::Background,
+        Indicators::Bars,
+        Indicators::Classic,
+        Indicators::None,
+    ] {
+        for side in [Side::New, Side::Old] {
+            let layout = Layout {
+                indicators,
+                inline_signs: false,
+                one_sided: Some(side),
+                read_alone: true,
+                ..layout(false, Some(40), false)
+            };
+            let mut c = Canvas::default();
+            layout.hidden_run(2, false, Some("x"), &mut c);
+            for row in [
+                view::Row::One {
+                    line: 0,
+                    paired: None,
+                },
+                view::Row::One {
+                    line: 1,
+                    paired: Some(2),
+                },
+                view::Row::Hidden { from: 2, n: 1 },
+            ] {
+                layout.hunk_row(&header, row, |i| lines[i], &mut c);
+            }
+            layout.hidden_run(1, true, None, &mut c);
+            layout.hunk_row(&header, view::Row::Line(2), |i| lines[i], &mut c);
+            let _ = writeln!(out, "{indicators:?} {side:?}");
+            out += &c.markup();
+        }
+    }
+    insta::assert_snapshot!(out);
+}
+
+/// In file view, the row above a change at a file's first line shows the
+/// hunk's heading, or nothing: no `⋯`, since nothing is hidden there.
+#[test]
+fn file_view_start_row_is_its_heading_or_blank() {
+    let header = |heading: &'static [u8]| HunkHeader {
+        old_start: 1,
+        old_len: 2,
+        new_start: 1,
+        new_len: 2,
+        heading,
+        hidden: 0,
+    };
+    let layout = Layout {
+        one_sided: Some(Side::New),
+        hunk_headers: false,
+        ..layout(false, Some(40), false)
+    };
+    let mut c = Canvas::default();
+    layout.read_start(&header(b""), &mut c);
+    layout.read_start(&header(b"fn main()"), &mut c);
+    assert_eq!(c.markup(), "\n<dim>fn main()</>\n");
 }

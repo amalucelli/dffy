@@ -1,7 +1,8 @@
 //! What a diff means, for any program that shows one: git access, the line
 //! and intra-line diff, the syntax-aware diff, highlighting, unified-diff
 //! parsing, the diff document model (files, rows, line states, positions,
-//! navigation, search), and annotations placed on its files' lines. The
+//! navigation, search), annotations placed on its files' lines, and where
+//! names are defined. The
 //! `dffy` binary is one host of it.
 //!
 //! Core decides, the host draws. The host supplies the executor, text
@@ -21,7 +22,7 @@
 //! | 0 | [`diff`], [`patch`], [`view`], [`conflict`] | memchr and rustc-hash; no git, no parser, no I/O or threads |
 //! | 1 | [`highlight`], [`structural`] | tree-sitter |
 //! | 2 | [`git`], [`watch`], [`cache`] | gix and the filesystem |
-//! | 3 | [`document`], [`annotation`] | everything below |
+//! | 3 | [`document`], [`annotation`], [`navigate`] | everything below |
 //!
 //! Layer 1 is the exception: it stores results through [`cache`], names
 //! blobs by [`git::ObjectId`], and hashes grammar identities with gix.
@@ -37,6 +38,7 @@ pub mod diff;
 pub mod document;
 pub mod git;
 pub mod highlight;
+pub mod navigate;
 pub mod patch;
 pub mod structural;
 pub mod suggest;

@@ -25,11 +25,11 @@ view 3  kernel/sched/core.c  line 1204  main...HEAD
 | Command | What it does |
 |---|---|
 | `dffy ctl views` | Lists the running viewers: id, pid, what each compares, and its working tree. |
-| `dffy ctl open <path>[:<line>[:old]]` | Shows a file of the diff at a line of its new side, or of its old side with `:old`. Without a line, the file opens as it would from the file tree. |
+| `dffy ctl open <path>[:<line>[:old]]` | Shows a file at a line of its new side, or of its old side with `:old`. Without a line, the file opens as it would from the file tree. A file the diff doesn't change opens whole at that side, as from the [picker](viewer.md#opening-files), and the output says `(not in the diff)`. |
 | `dffy ctl focus <id>` | Shows and focuses the thread holding comment `<id>`. `dffy comments --json` lists ids. |
 | `dffy ctl selection` | Prints where the lines selected with `v` are (`src/lib.rs:12-14 new`), then their text. |
 | `dffy ctl state` | Prints the file shown, the line at the top of the screen, and what the viewer compares. |
-| `dffy ctl comment <path>:<line>[:old] <text>…` | Adds a comment on that line and shows it. The words are joined by spaces. |
+| `dffy ctl comment <path>:<line>[:old] <text>…` | Adds a comment on that line and shows it, opening a file the diff doesn't change as `open` does. The words are joined by spaces. |
 | `dffy ctl apply-suggestion <id>` | Applies the suggestion of comment `<id>`'s thread to the working tree, as `s` on the thread does, and prints which lines it replaced ([Applying suggestions](#applying-suggestions)). |
 | `dffy ctl schema` | Prints the protocol's JSON Schema. Needs no viewer. |
 
@@ -42,7 +42,7 @@ view 3  kernel/sched/core.c  line 1204  main...HEAD
 - Paths are relative to the current directory, as in git, and must be inside the viewer's working tree.
 - `open` and `comment` on a file whose diff isn't loaded yet show the file and answer once the diff is in.
 - A command fails after 5 seconds without an answer. The viewer can't answer while an editor opened with `e` is running.
-- Errors exit with status 128 and say what's wrong: no viewer running, a file not in the diff, a line the file doesn't have.
+- Errors exit with status 128 and say what's wrong: no viewer running, no file at that path and side, a line the file doesn't have.
 
 ## How it works
 
@@ -53,6 +53,24 @@ dffyd, the [watch broker](watch.md#dffyd), serves the API on a second socket, `c
 - dffyd forwards each request to its viewer and the answer back. The viewer runs it between frames, as it would a key press.
 - When a client disconnects before its answer arrives, dffyd tells the viewer, which drops the request. `dffy ctl` disconnects after 5 seconds.
 - Clients never start dffyd. With no dffyd, no viewer is running, and `dffy ctl` and the MCP tools say so.
+
+### Files outside the diff
+
+`view/open` and `comments/add` open any file of the repository, not only the diff's. A path the diff doesn't list is looked up at the diff's side `side` names, and opens whole as it is there, after the diff's files, as the [picker](viewer.md#opening-files) opens it. Asked for at the other side, an open one is replaced. The answer has `"listed":false`, a field older clients ignore, so the protocol version stays 1.
+
+It's `not_found` when:
+
+- no file is at that path at that side: nothing there, a folder, or a submodule;
+- the diff was piped, or compares two files or folders outside git, which have no other files;
+- the viewer is still listing the diff's files, as the path may be among them. Ask again once it's done.
+
+At the working tree, the files are those the index tracks, by their exact path, as the picker lists them: an ignored or untracked file the diff doesn't list isn't found, nor a tracked one named in another case. A path leaving the working tree, or going into `.git`, is never a file there.
+
+A binary or very large file opens, showing why it isn't shown. A line in it is `not_found` (`logo.png is binary; no lines`).
+
+`comments/add` then adds its comment on the file opened, which the comments file keeps as it keeps any comment on a file outside the diff ([viewer.md](viewer.md#files-with-comments)). When the file isn't found, nothing is written.
+
+A file found stays open even when the request then fails: a line it doesn't have, or a comment that couldn't be written. A request waiting for its file fails (`failed`) when the file is opened at the other version before it shows.
 
 ### Comments a client adds
 
@@ -110,9 +128,9 @@ Lines are 1-based. Every request on a view names it with `view`, the id from `vi
 | `views/list` | | `{"views":[{"view","pid","worktree","repository","diff"}]}`. `repository` is the git directory the worktrees share. `diff` is what the view compares. |
 | `view/state` | `view` | `{"view","path","old_path","top":{"old","new"},"files","listing","layout","diff","revisions"}`. `path` is the file shown, null in an empty view. `top` is the line numbers of the first code row on screen. `files` counts the listed files, and `listing` says whether listing is still going. `layout` is `split` or `unified`. |
 | `view/selection` | `view` | `{"view","selection":{"path","side","start","end","text"}}`, or `selection: null` with nothing selected. Only lines selected in code count, not text selected in a comment. |
-| `view/open` | `view`, `path`, `line`?, `side`? (`new`) | `{"view","path","line","side"}`, once the file shows. A line hidden in a gap is revealed with a few lines around it. |
+| `view/open` | `view`, `path`, `line`?, `side`? (`new`) | `{"view","path","line","side","listed"?}`, once the file shows. A line hidden in a gap is revealed with a few lines around it. A file the diff doesn't list opens whole at `side`, and the result then has `"listed":false` ([Files outside the diff](#files-outside-the-diff)). |
 | `view/focusThread` | `view`, `id` | `{"view","thread","path","focused"}`. `thread` is the thread's first comment. `focused` is false until the thread's place in the diff has loaded. |
-| `comments/add` | `view`, `path`, `line`, `side`? (`new`), `text` | `{"view","id","path","line","side"}`. `id` is the new comment's. |
+| `comments/add` | `view`, `path`, `line`, `side`? (`new`), `text` | `{"view","id","path","line","side","listed"?}`. `id` is the new comment's. A file the diff doesn't list opens as for `view/open`, and `listed` says so. |
 | `comments/applySuggestion` | `view`, `id` | `{"view","thread","comment","path","start","end","lines"}`, once written. `comment` is the comment whose suggestion went in. `start` and `end` are the replaced lines as the file was. `lines` is how many lines replaced them, 0 for a deletion. |
 | `subscribe` | `view`, `events` | `{"view","events"}`. The events are pushed to this connection until it closes. |
 
@@ -136,7 +154,7 @@ A subscriber gets each event once right after subscribing, with the current stat
 | `invalid_params` | A param is missing or has the wrong type. The message says which. |
 | `no_view` | No view has that id. |
 | `viewer_gone` | The viewer exited before it answered. |
-| `not_found` | The file isn't in the diff, the line isn't in the file, or the comment isn't among those the view shows. |
+| `not_found` | No file is at that path and side, the line isn't in the file, or the comment isn't among those the view shows. |
 | `failed` | It couldn't be done, for example because the viewer has no comments file. The message says why. |
 
 ### The viewer's side
@@ -155,5 +173,5 @@ The viewer answers the requests and pushes the events listed.
 
 - The runtime directory must be yours and closed to everyone else (mode `0700`), as for the [broker](watch.md#dffyd). The socket is mode `0600`.
 - On Linux (`SO_PEERCRED`) and macOS (`getpeereid`), dffyd also checks each connection's user and hangs up on any other user, or one it can't identify. Elsewhere the file modes are the only check.
-- A client can do what you can do in the viewer: move the view, read what it shows and what's selected, add comments under its own name, and apply a suggestion already in a thread. It can't run programs, write other files or text, post a review, or get its comments posted before you make them yours.
+- A client can do what you can do in the viewer: move the view, open any file of the repository in it, read what it shows and what's selected, add comments under its own name, and apply a suggestion already in a thread. It can't run programs, write other files or text, post a review, or get its comments posted before you make them yours.
 - Nothing is exposed over the network.

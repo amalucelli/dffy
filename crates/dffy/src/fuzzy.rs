@@ -7,16 +7,30 @@
 /// offsets of the matched characters, or `None` when it doesn't. A match
 /// after the last `/` (a path's file name) scores higher.
 pub(crate) fn score(query: &str, text: &str) -> Option<(i64, Vec<usize>)> {
-    if query.is_empty() {
-        return Some((0, Vec::new()));
-    }
     let lower = text.to_ascii_lowercase();
-    let base = lower.rfind('/').map_or(0, |i| i + 1);
-    let shorter = -i64::try_from(text.len() / 4).unwrap_or(0);
-    if let Some((s, positions)) = best(query.as_bytes(), lower.as_bytes(), base) {
-        return Some((s + 100 + shorter, positions));
+    let mut positions = Vec::new();
+    let s = matched(query, &lower, Some(&mut positions))?;
+    Some((s, positions))
+}
+
+/// [`score`]'s score alone, for a text already lowercased (ASCII only, so
+/// byte offsets stay those of the text). It allocates nothing, for lists
+/// scored whole on each keystroke.
+pub(crate) fn rank(query: &str, lower: &str) -> Option<i64> {
+    matched(query, lower, None)
+}
+
+fn matched(query: &str, lower: &str, mut positions: Option<&mut Vec<usize>>) -> Option<i64> {
+    if query.is_empty() {
+        return Some(0);
     }
-    best(query.as_bytes(), lower.as_bytes(), 0).map(|(s, p)| (s + shorter, p))
+    let base = lower.rfind('/').map_or(0, |i| i + 1);
+    let shorter = -i64::try_from(lower.len() / 4).unwrap_or(0);
+    let (query, text) = (query.as_bytes(), lower.as_bytes());
+    if let Some(s) = best(query, text, base, positions.as_deref_mut()) {
+        return Some(s + 100 + shorter);
+    }
+    best(query, text, 0, positions).map(|s| s + shorter)
 }
 
 /// [`score`] for labels and descriptions, where a query's letters strewn
@@ -31,42 +45,61 @@ pub(crate) fn score_close(query: &str, text: &str) -> Option<(i64, Vec<usize>)> 
 }
 
 /// The best alignment of `query` in `text[from..]`: each place the first
-/// character occurs is tried, the rest matched as early as possible.
-fn best(query: &[u8], text: &[u8], from: usize) -> Option<(i64, Vec<usize>)> {
-    let mut found: Option<(i64, Vec<usize>)> = None;
+/// character occurs is tried, the rest matched as early as possible. With
+/// `positions`, the best alignment's offsets go there.
+fn best(query: &[u8], text: &[u8], from: usize, positions: Option<&mut Vec<usize>>) -> Option<i64> {
+    let mut found: Option<(i64, usize)> = None;
     for start in (from..text.len()).filter(|&i| text[i] == query[0]) {
-        let mut positions = vec![start];
-        let mut at = start + 1;
-        for &q in &query[1..] {
-            let Some(i) = text[at..].iter().position(|&b| b == q) else {
-                break;
-            };
-            positions.push(at + i);
-            at += i + 1;
-        }
-        if positions.len() < query.len() {
+        let Some(s) = aligned(query, text, start, None) else {
             // Later starts leave even less text.
             break;
-        }
-        let mut s = 0;
-        for (k, &p) in positions.iter().enumerate() {
-            s += 16;
-            let boundary = p == 0 || matches!(text[p - 1], b'/' | b'_' | b'-' | b'.' | b' ');
-            if boundary {
-                s += 12;
-            }
-            if k > 0 {
-                let gap = p - positions[k - 1] - 1;
-                if gap == 0 {
-                    s += 24;
-                } else {
-                    s -= i64::try_from(gap.min(8)).unwrap_or(8);
-                }
-            }
-        }
-        if found.as_ref().is_none_or(|(f, _)| s > *f) {
-            found = Some((s, positions));
+        };
+        if found.is_none_or(|(f, _)| s > f) {
+            found = Some((s, start));
         }
     }
-    found
+    let (s, start) = found?;
+    if let Some(positions) = positions {
+        positions.clear();
+        aligned(query, text, start, Some(positions));
+    }
+    Some(s)
+}
+
+/// The score of `query` matched from `start` on, each later character as
+/// early as possible; `None` when it runs out of text.
+fn aligned(
+    query: &[u8],
+    text: &[u8],
+    start: usize,
+    mut positions: Option<&mut Vec<usize>>,
+) -> Option<i64> {
+    let mut s = 0;
+    let mut previous: Option<usize> = None;
+    let mut at = start;
+    for (k, &q) in query.iter().enumerate() {
+        let p = if k == 0 {
+            start
+        } else {
+            at + text[at..].iter().position(|&b| b == q)?
+        };
+        at = p + 1;
+        if let Some(positions) = positions.as_deref_mut() {
+            positions.push(p);
+        }
+        s += 16;
+        if p == 0 || matches!(text[p - 1], b'/' | b'_' | b'-' | b'.' | b' ') {
+            s += 12;
+        }
+        if let Some(previous) = previous {
+            let gap = p - previous - 1;
+            if gap == 0 {
+                s += 24;
+            } else {
+                s -= i64::try_from(gap.min(8)).unwrap_or(8);
+            }
+        }
+        previous = Some(p);
+    }
+    Some(s)
 }

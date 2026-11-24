@@ -804,3 +804,18 @@ proptest! {
         }
     }
 }
+
+/// A C++ header's syntax diff is C++'s, though what says so comes past
+/// its licence comment: a raw string's indentation is its content, which C
+/// reads as code.
+#[test]
+fn a_cpp_headers_diff_is_cpps() {
+    let licence = "// A licence that takes a while to read.\n".repeat(20);
+    let source = |indent: &str| {
+        format!("{licence}namespace a {{\nauto s = R\"(\n{indent}one\n{indent}two\n)\";\n}}\n")
+    };
+    let (old, new) = texts(&source("  "), &source("      "));
+    let shown = |path: &str| format!("{:?}", structural(path, &old, &new));
+    assert_ne!(shown("db.c"), shown("db.cpp"));
+    assert_eq!(shown("db.h"), shown("db.cpp"));
+}

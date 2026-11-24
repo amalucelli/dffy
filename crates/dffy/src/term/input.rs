@@ -69,6 +69,12 @@ pub(crate) enum Input {
         x: u16,
         y: u16,
     },
+    /// A left-button press with ctrl or alt held: go to the definition of
+    /// the name under it.
+    PeekClick {
+        x: u16,
+        y: u16,
+    },
     /// The pointer moved with the left button held.
     Drag {
         x: u16,
@@ -509,10 +515,12 @@ fn mouse(button: u16, x: u16, y: u16, press: bool) -> Option<Input> {
     // and the bits between them the modifiers: 4 shift, 8 meta, 16 ctrl.
     // The legacy encoding reports any release as button 3.
     let shift = button & 0b0001_1100 == 4;
+    let ctrl_or_meta = button & 0b0001_1000 != 0;
     match (button & 0b1110_0011, press) {
         (64, true) => Some(Input::Scroll { delta: -1, x, y }),
         (65, true) => Some(Input::Scroll { delta: 1, x, y }),
         (0, true) if shift => Some(Input::ShiftClick { x, y }),
+        (0, true) if ctrl_or_meta => Some(Input::PeekClick { x, y }),
         (0, true) => Some(Input::Click { x, y }),
         (2, true) => Some(Input::RightClick { x, y }),
         (32, true) => Some(Input::Drag { x, y }),
@@ -722,6 +730,16 @@ mod tests {
                 Input::Drag { x: 2, y: 5 },
                 Input::Release { x: 2, y: 5 },
                 Input::ShiftClick { x: 6, y: 7 },
+            ]
+        );
+        // ctrl (16) or alt (8) held: a peek at the name there.
+        assert_eq!(
+            parse_all(&[b"\x1b[<16;3;4M\x1b[<16;3;4m\x1b[<8;5;6M\x1b[<24;1;1M"]),
+            [
+                Input::PeekClick { x: 2, y: 3 },
+                Input::Release { x: 2, y: 3 },
+                Input::PeekClick { x: 4, y: 5 },
+                Input::PeekClick { x: 0, y: 0 },
             ]
         );
         assert_eq!(

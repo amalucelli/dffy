@@ -2594,6 +2594,309 @@ fn gaps_open_with_x_and_a_click_and_x_shows_the_whole_file() {
     assert!(term.wait_exit().success());
 }
 
+/// `l` reads every file in the working tree alone, titled as a file: an
+/// edited line keeps a bar in the gutter, with no rule for the line it was
+/// edited from, and `x` opens it in place to show that line. `s` flips to
+/// HEAD, where the removed line is back and the added one gone. File view
+/// isn't remembered: the next run shows the diff.
+#[test]
+fn file_view_reads_one_side_and_s_flips_it() {
+    let repo = repo();
+    let d = repo.path();
+    let mut term = Term::spawn(d, 100, 45, &[]);
+    term.wait_for("the diffs", |t| t.contains(" +3 -3"));
+    term.send("fn");
+    term.wait_for("the second change", |t| t.contains("line one hundred"));
+    assert!(term.contains("line 100"), "{}", term.vt.screen().contents());
+    term.send("l");
+    assert!(
+        term.status().contains(" reading working tree"),
+        "{}",
+        term.status()
+    );
+    // The whole file shows from the top line kept: on to the second change.
+    for _ in 0..3 {
+        if !term.contains("line one hundred") {
+            term.send("n");
+        }
+    }
+    assert!(
+        !term.contains("line 100"),
+        "{}",
+        term.vt.screen().contents()
+    );
+    let rows: Vec<String> = (0..45).map(|y| term.row(y)).collect();
+    let edited = (rows.iter())
+        .position(|r| r.contains("line one hundred"))
+        .unwrap_or_else(|| panic!("{}", term.vt.screen().contents()));
+    assert!(rows[edited].contains('┃'), "{}", rows[edited]);
+    // An edited line has no rule; `x` opens its change in place.
+    assert!(!term.contains("── 1 line"), "{}", rows[edited - 1]);
+    assert!(
+        rows[0].contains(" file view · src/lib.rs · working tree · 3 changes "),
+        "{}",
+        rows[0]
+    );
+    term.send("x");
+    let rows: Vec<String> = (0..45).map(|y| term.row(y)).collect();
+    let edited = (rows.iter())
+        .position(|r| r.contains("line one hundred"))
+        .unwrap_or_else(|| panic!("{}", term.vt.screen().contents()));
+    assert!(
+        rows[edited - 1].contains(" line 100 "),
+        "{}",
+        rows[edited - 1]
+    );
+    term.send("x");
+    assert!(
+        !term.contains("line 100"),
+        "{}",
+        term.vt.screen().contents()
+    );
+    term.send("s");
+    assert!(term.status().contains(" reading HEAD"), "{}", term.status());
+    assert!(term.contains("line 100"), "{}", term.vt.screen().contents());
+    assert!(
+        !term.contains("line one hundred"),
+        "{}",
+        term.vt.screen().contents()
+    );
+    term.send("q");
+    assert!(term.wait_exit().success());
+    let saved =
+        std::fs::read_to_string(d.join(".git/dffy-test-state/dffy/state")).unwrap_or_default();
+    assert!(!saved.contains("file-view"), "{saved}");
+    assert!(!saved.lines().any(|l| l.starts_with("view =")), "{saved}");
+    // The next run is the diff again.
+    let mut term = Term::spawn(d, 100, 45, &[]);
+    term.wait_for("the diffs", |t| t.contains(" +3 -3"));
+    assert!(!term.status().contains("reading"), "{}", term.status());
+    term.send("q");
+    assert!(term.wait_exit().success());
+}
+
+/// `o` lists the files the diff doesn't touch after its own, under a
+/// divider naming the version they're in. Picking one shows it whole, under
+/// the tree's section for files not in the diff, and tree `x` closes it.
+#[test]
+fn picker_opens_a_file_the_diff_does_not_touch() {
+    let repo = repo();
+    let d = repo.path();
+    std::fs::write(d.join("notes.txt"), "kept notes\n").expect("write");
+    std::fs::write(d.join("logo.bin"), b"\0\x01\x02 not text\0").expect("write");
+    git(d, &["add", "notes.txt", "logo.bin"]);
+    git(
+        d,
+        &["commit", "-q", "-m", "notes", "--", "notes.txt", "logo.bin"],
+    );
+    // Wide enough for the sections' headings whole.
+    let mut term = Term::spawn(d, 140, 30, &[]);
+    term.wait_for("the diffs", |t| t.contains(" +3 -3"));
+    term.send("o");
+    term.wait_for("the other paths", |t| {
+        t.contains("not in the diff · working tree")
+    });
+    term.send("notes");
+    term.wait_for("the match", |t| t.contains("notes.txt"));
+    term.send("\r");
+    term.wait_for("the file, whole", |t| t.contains("kept notes"));
+    assert!(
+        term.contains("Not in this diff (1)"),
+        "{}",
+        term.vt.screen().contents()
+    );
+    assert!(
+        term.contains("Changed in this diff (2)"),
+        "{}",
+        term.vt.screen().contents()
+    );
+    term.send("\t");
+    term.send("x");
+    term.wait_for("the file closed", |t| !t.contains("Not in this diff"));
+    // A binary file says why it shows nothing.
+    term.send("\to");
+    term.wait_for("the other paths", |t| {
+        t.contains("not in the diff · working tree")
+    });
+    term.send("logo\r");
+    term.wait_for("the note", |t| t.contains("binary file, not shown"));
+    term.send("q");
+    assert!(term.wait_exit().success());
+}
+
+/// `tab` in the picker lists HEAD's files; one opened there is tagged
+/// `HEAD`. Once HEAD no longer has it, as after it's deleted in a commit,
+/// the next list closes it and says so.
+#[test]
+fn a_file_opened_at_old_closes_once_the_old_side_drops_it() {
+    let repo = repo();
+    let d = repo.path();
+    std::fs::write(d.join("kept.txt"), "kept\n").expect("write");
+    git(d, &["add", "kept.txt"]);
+    git(d, &["commit", "-q", "-m", "kept", "--", "kept.txt"]);
+    let mut term = Term::spawn(d, 140, 30, &[]);
+    term.wait_for("the diffs", |t| t.contains(" +3 -3"));
+    term.send("o\t");
+    term.wait_for("HEAD's files", |t| t.contains("not in the diff · HEAD"));
+    term.send("kept\r");
+    term.wait_for("the file, whole", |t| t.contains("not in this diff · HEAD"));
+    let row = tree_row(&term, "kept.txt").expect("kept.txt in the tree");
+    assert!(term.row(row).contains(" HEAD "), "{}", term.row(row));
+    git(d, &["rm", "-q", "kept.txt"]);
+    git(d, &["commit", "-q", "-m", "gone"]);
+    // Watching reads the list again.
+    term.send("w");
+    term.wait_for("the note", |t| t.contains("closed, gone: kept.txt (HEAD)"));
+    assert!(tree_row(&term, "kept.txt").is_none());
+    term.send("q");
+    assert!(term.wait_exit().success());
+}
+
+/// `a` in the tree lists every file of the repository, folded: opening
+/// `src/` lists its children, the changed one with its letter, and enter
+/// on one the diff doesn't touch shows it whole. `a` again goes back.
+#[test]
+fn the_all_files_tree_opens_folders_and_files_outside_the_diff() {
+    let repo = repo();
+    let d = repo.path();
+    std::fs::write(d.join("src/util.rs"), "util contents\n").expect("write");
+    std::fs::create_dir(d.join("docs")).expect("mkdir");
+    std::fs::write(d.join("docs/guide.md"), "guide\n").expect("write");
+    git(d, &["add", "src/util.rs", "docs/guide.md"]);
+    git(
+        d,
+        &[
+            "commit",
+            "-q",
+            "-m",
+            "more",
+            "--",
+            "src/util.rs",
+            "docs/guide.md",
+        ],
+    );
+    let mut term = Term::spawn(d, 140, 30, &[]);
+    term.wait_for("the diffs", |t| t.contains(" +3 -3"));
+    term.send("\ta");
+    term.wait_for("every file", |t| {
+        t.contains("All files · working tree") && t.contains("▶ src/")
+    });
+    assert!(term.contains("▶ docs/"), "{}", term.vt.screen().contents());
+    assert!(tree_row(&term, "util.rs").is_none(), "folded");
+    // README.md, docs/, then src/.
+    term.send("ggjjl");
+    term.wait_for("src/'s files", |t| t.contains("util.rs"));
+    let lib = tree_row(&term, "lib.rs").expect("lib.rs");
+    assert!(term.row(lib).contains("M lib.rs"), "{}", term.row(lib));
+    term.send("jj\r");
+    term.wait_for("the file, whole", |t| t.contains("util contents"));
+    term.send("\ta");
+    term.wait_for("the diff's files", |t| !t.contains("All files"));
+    term.send("q");
+    assert!(term.wait_exit().success());
+}
+
+/// An untracked file sits in its folder among the changed ones, in path
+/// order. The changed files get a heading of their own only once a file
+/// outside the diff is opened, whose group comes after them.
+#[test]
+fn untracked_files_sit_in_their_folder_and_the_heading_comes_with_an_opened_file() {
+    let repo = repo();
+    let d = repo.path();
+    std::fs::write(d.join("notes.txt"), "kept notes\n").expect("write");
+    git(d, &["add", "notes.txt"]);
+    git(d, &["commit", "-q", "-m", "notes", "--", "notes.txt"]);
+    std::fs::write(d.join("src/added.rs"), "new\n").expect("write");
+    let mut term = Term::spawn(d, 140, 30, &[]);
+    term.wait_for("the untracked file", |t| t.contains("added.rs"));
+    let row = |term: &Term, label: &str| {
+        (0..30)
+            .find(|&y| term.row(y).contains(label))
+            .unwrap_or_else(|| panic!("{label}: {}", term.vt.screen().contents()))
+    };
+    let (src, added, lib) = (
+        row(&term, "src/"),
+        row(&term, "added.rs"),
+        row(&term, "lib.rs"),
+    );
+    assert!(
+        src < added && added < lib,
+        "{}",
+        term.vt.screen().contents()
+    );
+    assert!(
+        term.row(added).contains("? added.rs"),
+        "{}",
+        term.row(added)
+    );
+    assert!(!term.contains("Changed in this diff"));
+    assert!(!term.contains("Untracked"));
+    term.send("o");
+    term.wait_for("the other paths", |t| {
+        t.contains("not in the diff · working tree")
+    });
+    term.send("notes\r");
+    term.wait_for("the file, whole", |t| t.contains("kept notes"));
+    let (changed, lib, outside) = (
+        row(&term, "Changed in this diff (3)"),
+        row(&term, "lib.rs"),
+        row(&term, "Not in this diff (1)"),
+    );
+    assert!(
+        changed < lib && lib < outside,
+        "{}",
+        term.vt.screen().contents()
+    );
+    term.send("q");
+    assert!(term.wait_exit().success());
+}
+
+/// `e` on a range between commits still opens the working tree's file,
+/// and says so; after an editor exits, a diff of the working tree is read
+/// again, as watch mode, off here, would.
+#[test]
+fn editing_says_which_file_it_opened_and_reads_the_edit_back() {
+    let repo = repo();
+    let d = repo.path();
+    let bin = tempfile::tempdir().expect("tempdir");
+    let editor = bin.path().join("vim");
+    std::fs::write(&editor, include_str!("fixtures/stubs/editor-appends.sh"))
+        .expect("write editor");
+    Command::new("chmod")
+        .arg("+x")
+        .arg(&editor)
+        .status()
+        .expect("chmod");
+    let editor = editor.to_str().expect("utf-8 path").to_owned();
+    let mut term = Term::spawn(d, 100, 30, &[("EDITOR", &editor)]);
+    term.wait_for("the diffs", |t| t.contains("More."));
+    term.send("e");
+    term.wait_for("the edit read back", |t| t.contains("in vim"));
+    term.send("q");
+    assert!(term.wait_exit().success());
+
+    git(d, &["commit", "-q", "-am", "second"]);
+    let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_dffy"));
+    cmd.args(["HEAD~1", "HEAD"]);
+    let mut term = Term::spawn_command(cmd, d, 100, 30, &[("EDITOR", &editor)]);
+    term.wait_for("the diffs", |t| t.contains("More."));
+    term.send("e");
+    term.wait_for("the note", |t| {
+        t.status()
+            .contains("editing the working tree · view: HEAD ")
+    });
+    // Read alone on its old side, the view shows the version before.
+    term.send("ls");
+    term.wait_for("the old side", |t| t.status().contains(" reading HEAD~1"));
+    term.send("e");
+    term.wait_for("the note naming it", |t| {
+        t.status()
+            .contains("editing the working tree · view: HEAD~1")
+    });
+    term.send("q");
+    assert!(term.wait_exit().success());
+}
+
 /// A phone: 50 columns, 15 rows. Letters alone get everywhere; the tree
 /// opens over the diff and closes once a file is picked.
 #[test]
@@ -3450,7 +3753,7 @@ fn the_command_panel_runs_entries_by_key() {
     term.send("s");
     status_shows(&mut term, "layout: auto (split at this width)");
     assert!(term.contains("─ commands ─"), "toggles keep it open");
-    term.send("K");
+    term.send(",");
     assert!(
         term.contains("Indicators ‹ classic ›"),
         "{}",
@@ -4134,8 +4437,11 @@ fn ctl_drives_the_viewer_in_this_working_tree() {
     });
     let missing = term
         .ctl(dir, &["open", "nope.rs"])
-        .expect_err("not in the diff");
-    assert!(missing.contains("nope.rs isn't in this diff"), "{missing}");
+        .expect_err("not in the diff, nor on disk");
+    assert!(
+        missing.contains("nope.rs isn't in this diff, nor at its new side"),
+        "{missing}"
+    );
     let beyond = term
         .ctl(dir, &["open", "src/lib.rs:999"])
         .expect_err("no such line");
@@ -4196,6 +4502,91 @@ fn ctl_drives_the_viewer_in_this_working_tree() {
     term.wait_views(dir, 0);
     let gone = term.ctl(dir, &["state"]).expect_err("no viewer");
     assert!(gone.contains("no dffy viewer is running"), "{gone}");
+}
+
+/// `dffy ctl open` of a file the diff doesn't touch shows it whole at the
+/// side asked for, and says it isn't in the diff. A path with no file
+/// there, a folder or a gitlink, isn't found; a binary file opens, but has
+/// no lines to go to. `dffy ctl comment` opens a file the same way. The
+/// working tree's files are those the index tracks.
+#[test]
+fn ctl_opens_a_file_the_diff_does_not_touch() {
+    let repo = repo();
+    let d = repo.path();
+    let notes = (1..=60).map(|i| format!("note {i}\n")).collect::<Vec<_>>();
+    std::fs::write(d.join("notes.txt"), notes.concat()).expect("write");
+    std::fs::write(d.join("logo.bin"), b"\0\x01\x02 not text\0").expect("write");
+    let head = String::from_utf8(git_out(d, &["rev-parse", "HEAD"])).expect("utf-8");
+    // A submodule not checked out: a gitlink, and an empty folder.
+    std::fs::create_dir_all(d.join("vendor/lib")).expect("mkdir");
+    let gitlink = format!("160000,{},vendor/lib", head.trim());
+    git(d, &["update-index", "--add", "--cacheinfo", &gitlink]);
+    std::fs::write(d.join(".gitignore"), "*.env\n").expect("write");
+    git(d, &["add", "notes.txt", "logo.bin", ".gitignore"]);
+    // The fixture's changes are unstaged: only these go in.
+    git(d, &["commit", "-q", "-m", "notes"]);
+    let mut term = Term::spawn(d, 120, 24, &[]);
+    term.wait_for("the diffs", |t| t.contains("More."));
+    term.wait_views(d, 1);
+
+    let opened = term.ctl(d, &["open", "notes.txt:50"]);
+    assert_eq!(
+        opened.as_deref(),
+        Ok("view 1 shows notes.txt:50 (not in the diff)\n")
+    );
+    term.wait_for("line 50, whole", |t| t.contains("note 50"));
+    let old = term
+        .ctl(d, &["--json", "open", "notes.txt:5:old"])
+        .expect("open at old");
+    assert!(
+        old.contains(r#""side":"old""#) && old.contains(r#""listed":false"#),
+        "{old}"
+    );
+
+    let binary = term.ctl(d, &["open", "logo.bin:1"]).expect_err("no lines");
+    assert!(binary.contains("logo.bin is binary; no lines"), "{binary}");
+    term.ctl(d, &["open", "logo.bin"])
+        .expect("a binary file opens");
+    term.wait_for("the note", |t| t.contains("binary file, not shown"));
+
+    // A comment opens its file the same way.
+    let commented = term
+        .ctl(d, &["comment", "notes.txt:3", "kept", "on", "purpose"])
+        .expect("comment");
+    assert!(
+        commented.ends_with(" on notes.txt:3 (not in the diff), in view 1\n"),
+        "{commented}"
+    );
+    term.wait_for("the comment's box", |t| t.contains("kept on purpose"));
+
+    // Only what the index tracks counts as the working tree's: not an
+    // ignored file, nor a tracked one named in another case, which a
+    // case-insensitive filesystem would find.
+    std::fs::write(d.join("secret.env"), "TOKEN=1\n").expect("write");
+    for (at, missing) in [
+        (
+            "secret.env",
+            "secret.env isn't in this diff, nor at its new side",
+        ),
+        (
+            "NOTES.txt",
+            "NOTES.txt isn't in this diff, nor at its new side",
+        ),
+        ("src", "src isn't in this diff, nor at its new side"),
+        (
+            "vendor/lib",
+            "vendor/lib isn't in this diff, nor at its new side",
+        ),
+        (
+            "vendor/lib:1:old",
+            "vendor/lib isn't in this diff, nor at its old side",
+        ),
+    ] {
+        let fault = term.ctl(d, &["open", at]).expect_err(at);
+        assert!(fault.contains(missing), "{at}: {fault}");
+    }
+    term.send("q");
+    assert!(term.wait_exit().success());
 }
 
 /// A request whose asker gave up waiting, the viewer held by its editor,
@@ -5220,6 +5611,308 @@ fn a_reply_through_mcp_asks_no_agent() {
     assert!(term.wait_exit().success());
 }
 
+/// A C repository of two commits: `include/slab.h` defines
+/// `kmalloc_array`, which the second commit changes, `mm/use.c` calls it
+/// and changes its call, and `tools/include/slab.h` defines another,
+/// unchanged.
+fn definitions_repo() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let d = dir.path();
+    git(d, &["init", "-q", "-b", "main"]);
+    for folder in ["include", "mm", "tools/include"] {
+        std::fs::create_dir_all(d.join(folder)).expect("mkdir");
+    }
+    let slab = |body: &str| {
+        format!(
+            "#ifndef SLAB_H\n#define SLAB_H\n\n\
+             static inline void *kmalloc_array(unsigned long n, unsigned long size)\n\
+             {{\n\treturn {body};\n}}\n\n#endif\n"
+        )
+    };
+    let user = |size: &str| {
+        format!(
+            "#include <slab.h>\n\nint use(void)\n{{\n\tvoid *p = kmalloc_array(4, {size});\n\
+             \treturn p != 0;\n}}\n"
+        )
+    };
+    std::fs::write(d.join("include/slab.h"), slab("alloc(n * size)")).expect("write");
+    std::fs::write(d.join("mm/use.c"), user("8")).expect("write");
+    std::fs::write(
+        d.join("tools/include/slab.h"),
+        "static inline void *kmalloc_array(unsigned long n, unsigned long size)\n\
+         {\n\treturn tools_alloc(n * size);\n}\n",
+    )
+    .expect("write");
+    git(d, &["add", "-A"]);
+    git(d, &["commit", "-q", "-m", "first"]);
+    std::fs::write(d.join("include/slab.h"), slab("alloc_checked(n, size)")).expect("write");
+    std::fs::write(d.join("mm/use.c"), user("16")).expect("write");
+    git(d, &["commit", "-q", "-am", "second"]);
+    dir
+}
+
+/// `K` lists the names on the line tapped, typing narrows them and enter
+/// peeks at the one left: its definitions, nearest first, the code of
+/// the one shown and whether this diff changes it. In the peek `j`/`k`
+/// go between them, `s` shows the other version's, `d` the definition in
+/// the diff and `enter` a file the diff doesn't touch, whole. A ctrl+click
+/// or an alt+click on a name peeks at it at once.
+#[test]
+fn k_lists_a_lines_names_and_peeks_at_a_definition() {
+    let repo = definitions_repo();
+    let d = repo.path();
+    let open = || {
+        let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_dffy"));
+        cmd.args(["HEAD~1", "HEAD"]);
+        Term::spawn_command(cmd, d, 160, 40, &[])
+    };
+    let mut term = open();
+    term.wait_for("the first file", |t| t.contains("alloc_checked(n, size)"));
+    // Defined nowhere: the lines using it, as text matches.
+    term.click("alloc_checked(n, size)");
+    term.send("K");
+    term.wait_for("the line's names", |t| t.contains(" go to definition "));
+    term.send("alloc_c\r");
+    term.wait_for("the text match", |t| {
+        t.contains("alloc_checked · 1 text match · include/slab.h:6 · HEAD")
+            && t.contains("no definition found")
+    });
+    term.send("\x1b");
+    term.wait_for("the peek closed", |t| !t.contains("1 text match"));
+    term.send("f");
+    term.wait_for("the caller", |t| t.contains("kmalloc_array(4, 16)"));
+    term.click("kmalloc_array(4, 16)");
+    term.send("K");
+    term.wait_for("the line's names", |t| t.contains(" go to definition "));
+    let screen = term.vt.screen().contents();
+    let names: Vec<&str> = screen
+        .lines()
+        .flat_map(|l| l.split('│').map(str::trim))
+        .filter(|cell| ["p", "kmalloc_array", "void", "use"].contains(cell))
+        .collect();
+    assert_eq!(names, ["p", "kmalloc_array"], "{screen}");
+    term.send("kmal\r");
+    term.wait_for("the peek", |t| {
+        t.contains("kmalloc_array · 2 definitions · include/slab.h:4 · HEAD")
+            && t.contains("changed in this diff")
+            && t.contains("return alloc_checked(n, size);")
+            && t.contains("tools/include/slab.h")
+    });
+    term.send("j");
+    term.wait_for("the other definition", |t| {
+        t.contains("tools/include/slab.h:1 · HEAD") && t.contains("return tools_alloc(n * size);")
+    });
+    term.send("k");
+    term.wait_for("the first again", |t| {
+        t.contains("include/slab.h:4 · HEAD ")
+    });
+    term.send("s");
+    term.wait_for("the other version", |t| {
+        t.contains("include/slab.h:4 · HEAD~1") && t.contains("return alloc(n * size);")
+    });
+    assert!(
+        term.status().contains("definitions in HEAD~1"),
+        "{}",
+        term.status()
+    );
+    term.send("d");
+    term.wait_for("the definition in the diff", |t| {
+        !t.contains("definitions ·") && t.contains("return alloc(n * size);")
+    });
+
+    term.send("f");
+    term.wait_for("the caller", |t| t.contains("kmalloc_array(4, 16)"));
+    term.press_on(16, "kmalloc_array(4, 16)");
+    term.wait_for("a peek from ctrl+click", |t| {
+        t.contains("kmalloc_array · 2 definitions") && !t.contains(" go to definition ")
+    });
+    term.send("\x1b");
+    term.wait_for("the peek closed", |t| !t.contains("2 definitions"));
+    term.press_on(8, "kmalloc_array(4, 16)");
+    term.wait_for("a peek from alt+click", |t| {
+        t.contains("kmalloc_array · 2 definitions")
+    });
+    term.send("j");
+    term.wait_for("the tools definition", |t| {
+        t.contains("tools/include/slab.h:1")
+    });
+    term.send("\r");
+    term.wait_for("the file opened whole", |t| {
+        t.contains("not in this diff") && t.contains("tools_alloc(n * size)")
+    });
+    term.send("q");
+    assert!(term.wait_exit().success());
+}
+
+/// Opening a definition from a peek is a jump: backspace goes back to the
+/// line it was opened from, `\` forward to the definition again.
+#[test]
+fn back_returns_from_a_definition_and_forward_goes_again() {
+    let repo = definitions_repo();
+    let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_dffy"));
+    cmd.args(["HEAD~1", "HEAD"]);
+    let mut term = Term::spawn_command(cmd, repo.path(), 160, 40, &[]);
+    term.wait_for("the first file", |t| t.contains("alloc_checked(n, size)"));
+    term.send("f");
+    term.wait_for("the caller", |t| t.contains("kmalloc_array(4, 16)"));
+    term.click("kmalloc_array(4, 16)");
+    term.send("K");
+    term.wait_for("the line's names", |t| t.contains(" go to definition "));
+    term.send("kmal\r");
+    term.wait_for("the peek", |t| t.contains("kmalloc_array · 2 definitions"));
+    term.send("j");
+    term.wait_for("the tools definition", |t| {
+        t.contains("tools/include/slab.h:1")
+    });
+    term.send("\r");
+    term.wait_for("the definition's file", |t| {
+        t.contains("not in this diff") && t.contains("tools_alloc(n * size)")
+    });
+    term.send("\x7f");
+    term.wait_for("the caller again", |t| {
+        // Its first line is hidden as unchanged: the second was at the top.
+        t.contains("kmalloc_array(4, 16)") && t.status().contains("back to mm/use.c:2")
+    });
+    term.send("\\");
+    term.wait_for("the definition again", |t| {
+        t.contains("tools_alloc(n * size)")
+            && t.status().contains("forward to tools/include/slab.h:1")
+    });
+    term.send("q");
+    assert!(term.wait_exit().success());
+}
+
+/// A definition in the file shown, far above the line asking, is a jump
+/// too: backspace goes back to the line it was opened from.
+#[test]
+fn back_returns_from_a_definition_in_the_same_file() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let d = dir.path();
+    git(d, &["init", "-q", "-b", "main"]);
+    let file = |call: &str| {
+        let filler = "int filler;\n".repeat(60);
+        format!(
+            "static int helper(void)\n{{\n\treturn 1;\n}}\n{filler}int user(void)\n{{\n\treturn {call};\n}}\n"
+        )
+    };
+    std::fs::write(d.join("x.c"), file("0")).expect("write");
+    git(d, &["add", "-A"]);
+    git(d, &["commit", "-q", "-m", "first"]);
+    std::fs::write(d.join("x.c"), file("helper()")).expect("write");
+    git(d, &["commit", "-q", "-am", "second"]);
+    let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_dffy"));
+    cmd.args(["HEAD~1", "HEAD"]);
+    let mut term = Term::spawn_command(cmd, d, 160, 30, &[]);
+    term.wait_for("the call", |t| t.contains("return helper();"));
+    assert!(!term.contains("static int helper"));
+    term.click("return helper();");
+    term.send("K");
+    term.wait_for("the line's names", |t| t.contains(" go to definition "));
+    term.send("helper\r");
+    term.wait_for("the peek", |t| t.contains("helper · 1 definition · x.c:1"));
+    term.send("\r");
+    term.wait_for("the definition, marked", |t| {
+        let screen = t.vt.screen().contents();
+        screen
+            .lines()
+            .any(|l| l.contains('❯') && l.contains("static int helper(void)"))
+    });
+    term.send("\x7f");
+    term.wait_for("the call again", |t| {
+        t.contains("return helper();") && t.status().contains("back to x.c:")
+    });
+    term.send("q");
+    assert!(term.wait_exit().success());
+}
+
+/// The line a definition opens at is marked, `❯` in its gutter, until the
+/// view moves.
+#[test]
+fn the_line_a_definition_opens_at_is_marked_until_the_view_moves() {
+    let repo = definitions_repo();
+    let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_dffy"));
+    cmd.args(["HEAD~1", "HEAD"]);
+    let mut term = Term::spawn_command(cmd, repo.path(), 160, 40, &[]);
+    term.wait_for("the first file", |t| t.contains("alloc_checked(n, size)"));
+    term.send("f");
+    term.wait_for("the caller", |t| t.contains("kmalloc_array(4, 16)"));
+    assert!(!term.contains("❯"));
+    term.click("kmalloc_array(4, 16)");
+    term.send("K");
+    term.wait_for("the line's names", |t| t.contains(" go to definition "));
+    term.send("kmal\r");
+    term.wait_for("the peek", |t| t.contains("kmalloc_array · 2 definitions"));
+    term.send("j");
+    term.wait_for("the tools definition", |t| {
+        t.contains("tools/include/slab.h:1")
+    });
+    term.send("\r");
+    term.wait_for("the definition's line marked", |t| {
+        let screen = t.vt.screen().contents();
+        screen
+            .lines()
+            .any(|l| l.contains('❯') && l.contains("kmalloc_array(unsigned long n"))
+    });
+    term.send("F");
+    term.wait_for("the caller, unmarked", |t| {
+        t.contains("kmalloc_array(4, 16)") && !t.contains("❯")
+    });
+    term.send("f");
+    term.wait_for("the definition's file, unmarked", |t| {
+        t.contains("tools_alloc(n * size)") && !t.contains("❯")
+    });
+    term.send("q");
+    assert!(term.wait_exit().success());
+}
+
+/// Plain `dffy` peeks into the working tree, whose changed files are read
+/// from disk over HEAD's, and `s` into HEAD.
+#[test]
+fn a_peek_reads_the_working_tree_and_head() {
+    let repo = definitions_repo();
+    let d = repo.path();
+    git(d, &["reset", "-q", "--soft", "HEAD~1"]);
+    let mut term = Term::spawn(d, 160, 40, &[]);
+    term.wait_for("the first file", |t| t.contains("alloc_checked(n, size)"));
+    term.send("f");
+    term.wait_for("the caller", |t| t.contains("kmalloc_array(4, 16)"));
+    term.press_on(16, "kmalloc_array(4, 16)");
+    term.wait_for("the working tree's definition", |t| {
+        t.contains("kmalloc_array · 2 definitions · include/slab.h:4 · working tree")
+            && t.contains("return alloc_checked(n, size);")
+    });
+    term.send("s");
+    term.wait_for("HEAD's", |t| {
+        t.contains("include/slab.h:4 · HEAD") && t.contains("return alloc(n * size);")
+    });
+    term.send("q");
+    term.wait_for("the peek closed", |t| !t.contains("2 definitions"));
+    term.send("q");
+    assert!(term.wait_exit().success());
+}
+
+/// With a path filter, the peek still reads the working tree's version of
+/// a file the filter leaves out of the list.
+#[test]
+fn a_peek_reads_the_working_tree_past_a_path_filter() {
+    let repo = definitions_repo();
+    let d = repo.path();
+    git(d, &["reset", "-q", "--soft", "HEAD~1"]);
+    let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_dffy"));
+    cmd.args(["--", "mm/"]);
+    let mut term = Term::spawn_command(cmd, d, 160, 40, &[]);
+    term.wait_for("the caller", |t| t.contains("kmalloc_array(4, 16)"));
+    assert!(!term.contains("slab.h"), "{}", term.vt.screen().contents());
+    term.press_on(16, "kmalloc_array(4, 16)");
+    term.wait_for("the working tree's body", |t| {
+        t.contains("include/slab.h:4 · working tree")
+            && t.contains("return alloc_checked(n, size);")
+    });
+    term.send("q");
+    term.send("q");
+    assert!(term.wait_exit().success());
+}
+
 /// `f` without the agent plugin, which says what agents there are and how
 /// they start, says so at once: dffy knows none by itself.
 #[test]
@@ -5236,6 +5929,156 @@ fn f_without_the_agent_plugin_says_so() {
         t.status()
             .contains("dffy-agent isn't on PATH, so no agent can take the thread")
     });
+    term.send("q");
+    assert!(term.wait_exit().success());
+}
+
+/// The navigator helpers the viewer `viewer` started: `dffy __navigate`
+/// processes whose parent it is.
+fn helpers_of(viewer: u32) -> Vec<String> {
+    let out = Command::new("ps")
+        .args(["-A", "-o", "pid=,ppid=,command="])
+        .output()
+        .expect("ps runs");
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter(|l| {
+            let mut words = l.split_whitespace();
+            let (_, ppid) = (words.next(), words.next());
+            ppid == Some(viewer.to_string().as_str()) && l.contains("__navigate")
+        })
+        .map(str::to_owned)
+        .collect()
+}
+
+/// A peek asks the navigator helper, a process the viewer starts on the
+/// first `K`; a while after the peek closes, with no `K` since, the viewer
+/// closes it, and the next `K` starts another.
+#[test]
+fn a_peek_starts_the_helper_and_the_idle_drop_ends_it() {
+    let repo = definitions_repo();
+    let d = repo.path();
+    let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_dffy"));
+    cmd.args(["HEAD~1", "HEAD"]);
+    let mut term = Term::spawn_command(cmd, d, 160, 40, &[("DFFY_PEEK_IDLE_SECS", "2")]);
+    let viewer = term.child.process_id().expect("pid");
+    term.wait_for("the first file", |t| t.contains("alloc_checked(n, size)"));
+    assert!(helpers_of(viewer).is_empty(), "none before the first K");
+    term.send("f");
+    term.wait_for("the caller", |t| t.contains("kmalloc_array(4, 16)"));
+    term.click("kmalloc_array(4, 16)");
+    term.send("K");
+    term.wait_for("the line's names", |t| t.contains(" go to definition "));
+    term.send("kmal\r");
+    term.wait_for("the peek", |t| {
+        t.contains("kmalloc_array · 2 definitions") && t.contains("return alloc_checked(n, size);")
+    });
+    assert_eq!(helpers_of(viewer).len(), 1, "one helper");
+    term.send("\x1b");
+    term.wait_for("the peek closed", |t| !t.contains("2 definitions"));
+    let start = Instant::now();
+    while !helpers_of(viewer).is_empty() {
+        assert!(
+            start.elapsed() < Duration::from_secs(20),
+            "the helper outlived the idle drop: {:?}",
+            helpers_of(viewer)
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    term.click("kmalloc_array(4, 16)");
+    term.send("K");
+    term.wait_for("the line's names", |t| t.contains(" go to definition "));
+    term.send("kmal\r");
+    term.wait_for("the peek again", |t| {
+        t.contains("kmalloc_array · 2 definitions")
+    });
+    assert_eq!(helpers_of(viewer).len(), 1, "another helper");
+    term.send("\x1b");
+    term.wait_for("the peek closed again", |t| !t.contains("2 definitions"));
+    term.send("q");
+    assert!(term.wait_exit().success());
+}
+
+/// A ctrl+click on a name peeks at what the use itself names first: a
+/// parameter of the function it's in, and the function an import brings
+/// in under another name.
+#[test]
+fn a_peek_at_a_use_finds_its_parameter_and_aliased_import() {
+    let repo = tempfile::tempdir().expect("tempdir");
+    let d = repo.path();
+    git(d, &["init", "-q", "-b", "main"]);
+    let write = |path: &str, text: &str| {
+        let path = d.join(path);
+        std::fs::create_dir_all(path.parent().expect("a folder")).expect("mkdir");
+        std::fs::write(path, text).expect("write");
+    };
+    let sized = "int size(int count)\n{\n\treturn count + 1;\n}\n";
+    let main = "import { parse as p } from \"../z/util\";\np(\"x\");\n";
+    write("a.c", sized);
+    write("b.c", "int count(void)\n{\n\treturn 0;\n}\n");
+    write("app/main.ts", main);
+    write(
+        "z/util.ts",
+        "export function parse(s: string) {\n  return s;\n}\n",
+    );
+    write("a/util.ts", "export function p() {}\n");
+    git(d, &["add", "-A"]);
+    git(d, &["commit", "-q", "-m", "first"]);
+    write("a.c", &format!("{sized}/* sized */\n"));
+    write("app/main.ts", &format!("{main}p(\"y\");\n"));
+    git(d, &["commit", "-q", "-am", "second"]);
+
+    let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_dffy"));
+    cmd.args(["HEAD~1", "HEAD"]);
+    let mut term = Term::spawn_command(cmd, d, 160, 40, &[]);
+    term.wait_for("a.c", |t| t.contains("return count + 1;"));
+    term.press_on(16, "count + 1");
+    term.wait_for("the parameter", |t| {
+        t.contains("count · 2 definitions · a.c:1") && t.contains("parameter")
+    });
+    term.send("\x1b");
+    term.wait_for("the peek closed", |t| !t.contains("2 definitions"));
+    term.send("f");
+    term.wait_for("main.ts", |t| t.contains("p(\"y\");"));
+    term.press_on(16, "p(\"x\")");
+    term.wait_for("the aliased import's function", |t| {
+        t.contains("z/util.ts:1")
+    });
+    term.send("\x1b");
+    term.send("q");
+    assert!(term.wait_exit().success());
+}
+
+/// `K` on a line using a name twice lists each use, and the one picked is
+/// looked up where it is: the parameter, then the field of the same name.
+#[test]
+fn k_looks_up_the_use_picked_of_two_on_a_line() {
+    let repo = tempfile::tempdir().expect("tempdir");
+    let d = repo.path();
+    git(d, &["init", "-q", "-b", "main"]);
+    let code = "package p\n\ntype Node struct {\n\tnext *Node\n}\n\n\
+                func f(next *Node) *Node {\n\treturn next.next\n}\n";
+    std::fs::write(d.join("a.go"), code).expect("write");
+    git(d, &["add", "-A"]);
+    git(d, &["commit", "-q", "-m", "first"]);
+    std::fs::write(d.join("a.go"), format!("{code}\nvar _ = f\n")).expect("write");
+    git(d, &["commit", "-q", "-am", "second"]);
+
+    let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_dffy"));
+    cmd.args(["HEAD~1", "HEAD"]);
+    let mut term = Term::spawn_command(cmd, d, 160, 40, &[]);
+    term.wait_for("a.go", |t| t.contains("return next.next"));
+    let pick = |term: &mut Term, keys: &str, at: &str| {
+        term.click("return next.next");
+        term.send("K");
+        term.wait_for("the line's names", |t| t.contains(" go to definition "));
+        term.send(keys);
+        term.wait_for(at, |t| t.contains(&format!("· {at} ·")));
+        term.send("\x1b");
+        term.wait_for("the peek closed", |t| !t.contains(&format!("· {at} ·")));
+    };
+    pick(&mut term, "\r", "a.go:7");
+    pick(&mut term, "\x1b[B\r", "a.go:4");
     term.send("q");
     assert!(term.wait_exit().success());
 }

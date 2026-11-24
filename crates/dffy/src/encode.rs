@@ -15,6 +15,7 @@ use dffy_core::diff::{self, Hunk, LineKind, Options, Text, Unchanged, Whitespace
 use dffy_core::document::{self, File, Side};
 use dffy_core::git::{DiffSpec, FileChange, FileDiff, MAX_DIFF_BYTES, Repo, StatStore, Status};
 use dffy_core::highlight::{HunkSyntax, Registry, Source};
+use dffy_core::navigate;
 use dffy_core::structural::{Structural, Unavailable};
 use dffy_core::view::{Heading, Spans, line_bytes};
 
@@ -755,6 +756,45 @@ pub(crate) fn placement(at: &At, root: &review::Comment, reverse: bool, s: &mut 
     true
 }
 
+/// A definition go to definition found, or a text match standing in for
+/// one, its lines 1-based; `line` is its first line's text, trimmed.
+pub(crate) fn candidate(c: &navigate::Candidate, line: Option<&str>, s: &mut String) {
+    s.push_str(r#"{"path":"#);
+    string(s, &c.path.to_string());
+    let _ = write!(s, r#","start":{},"end":{},"kind":"#, c.start + 1, c.end + 1);
+    match c.kind {
+        Some(kind) => string(s, &format!("{kind:?}").to_lowercase()),
+        None => s.push_str("null"),
+    }
+    s.push_str(r#","container":"#);
+    match &c.container {
+        Some(container) => string(s, container),
+        None => s.push_str("null"),
+    }
+    let _ = write!(s, r#","changed":{},"in_hunk":"#, c.changed);
+    optional(s, c.in_hunk);
+    let _ = write!(s, r#","text_match":{},"text":"#, c.kind.is_none());
+    match line {
+        Some(line) => string(s, line),
+        None => s.push_str("null"),
+    }
+    s.push('}');
+}
+
+/// A line using a name, 1-based, with `more`, its file's uses past those
+/// listed, on the file's last one listed.
+pub(crate) fn reference(hit: &navigate::Reference, s: &mut String) {
+    s.push_str(r#"{"path":"#);
+    string(s, &hit.candidate.path.to_string());
+    let _ = write!(s, r#","line":{},"text":"#, hit.candidate.start + 1);
+    string(s, &hit.text);
+    let _ = write!(
+        s,
+        r#","changed":{},"more":{}}}"#,
+        hit.candidate.changed, hit.more
+    );
+}
+
 pub(crate) fn side(side: Side) -> &'static str {
     match side {
         Side::Old => "old",
@@ -790,7 +830,7 @@ fn language<'a>(grammars: &'a Registry, fd: &FileDiff) -> Option<&'a str> {
     } else {
         (fd.change.path.as_ref(), &fd.new)
     };
-    let head = &text.bytes()[..text.bytes().len().min(256)];
+    let head = &text.bytes()[..text.bytes().len().min(dffy_core::highlight::SNIFF_BYTES)];
     grammars
         .detect(path, head)
         .map(dffy_core::highlight::Language::name)

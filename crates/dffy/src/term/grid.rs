@@ -11,6 +11,7 @@ use std::ops::Range;
 use dffy_core::view::Attributes;
 use unicode_width::UnicodeWidthChar;
 
+use crate::columns::{Columns as _, SELECTOR};
 use crate::theme::{ATTRIBUTES, Style};
 
 /// UTF-8 bytes a cell holds: a character plus a few combining marks.
@@ -155,7 +156,8 @@ impl Grid {
 
     /// Writes `c` at column `x` of row `y`, left of column `end`, and
     /// returns the column after it. A zero-width character joins the cell
-    /// before it; a wide character that doesn't fit becomes a blank.
+    /// before it (see [`Grid::join`]); a wide character that doesn't fit
+    /// becomes a blank.
     pub(crate) fn put_char(
         &mut self,
         x: usize,
@@ -172,8 +174,7 @@ impl Grid {
             return x;
         };
         if w == 0 {
-            self.join(x, y, c);
-            return x;
+            return self.join(x, y, c);
         }
         if x + w > end {
             self.set(x, y, Cell::blank(style));
@@ -201,21 +202,35 @@ impl Grid {
         x
     }
 
-    /// Appends a combining character to the cell left of column `x`.
-    fn join(&mut self, x: usize, y: usize, c: char) {
+    /// Appends a zero-width character to the cell left of column `x`, a
+    /// column inside the grid, and returns the column after that cell. One
+    /// that makes the cell two columns wide as terminals draw it, U+FE0F
+    /// asking for a character's emoji form, widens the cell over column `x`:
+    /// kept one wide, everything after it on the row would show a column
+    /// further right than the grid holds it, and the diff would leave text
+    /// behind there.
+    fn join(&mut self, x: usize, y: usize, c: char) -> usize {
         let row = y * self.width;
         let Some(mut p) = x.checked_sub(1) else {
-            return;
+            return x;
         };
         if self.cells[row + p].width == 0 && p > 0 {
             p -= 1;
         }
         let cell = &mut self.cells[row + p];
         let len = usize::from(cell.len);
-        if cell.width > 0 && len + c.len_utf8() <= CELL_BYTES {
-            c.encode_utf8(&mut cell.bytes[len..]);
-            cell.len += utf8_len(c);
+        if cell.width == 0 || len + c.len_utf8() > CELL_BYTES {
+            return x;
         }
+        c.encode_utf8(&mut cell.bytes[len..]);
+        cell.len += utf8_len(c);
+        if c == SELECTOR && cell.width == 1 && cell.text().width() == 2 {
+            cell.width = 2;
+            let style = cell.style;
+            self.set(x, y, Cell::continuation(style));
+            return x + 1;
+        }
+        x
     }
 
     /// Stores a cell, blanking the other half of any wide character it
@@ -699,6 +714,40 @@ mod tests {
         let mut g = Grid::new(5, 1);
         assert_eq!(g.put_str(3, 0, 5, "a日", Style::PLAIN), 5);
         assert_eq!(g.row_text(0), "   a ");
+    }
+
+    /// Terminals draw a character followed by U+FE0F, its emoji form, two
+    /// columns wide. A cell that took one would leave what follows a column
+    /// off on the terminal, and the next frame's diff would skip cells the
+    /// terminal still shows text in.
+    #[test]
+    fn an_emoji_presentation_sequence_takes_two_cells_as_terminals_draw_it() {
+        let (w, h) = (10u16, 1u16);
+        let size = |n| std::num::NonZero::new(n).expect("non-zero");
+        let mut vt = vt100::Parser::new(size(h), size(w), 0);
+        let mut screen = Screen::new(w.into(), h.into());
+        let mut frame = |text: &str, at: usize| {
+            let (grid, _) = screen.frame();
+            let after = grid.put_str(at, 0, w.into(), text, Style::PLAIN);
+            let expected = grid.row_text(0);
+            vt.process(screen.flush(None));
+            let shown: String = (0..w)
+                .filter_map(|x| {
+                    let cell = vt.screen().cell(0, x).expect("in range");
+                    (!cell.is_wide_continuation()).then(|| match cell.contents() {
+                        "" => " ".to_owned(),
+                        text => text.to_owned(),
+                    })
+                })
+                .collect();
+            assert_eq!(shown, expected.replace('\0', ""));
+            after
+        };
+        assert_eq!(frame("\u{26a0}\u{fe0f}ab   z", 0), 8);
+        frame("z", 7);
+        // At the last column there's no room for the second: it stays
+        // narrow, as the selector goes.
+        assert_eq!(frame("\u{26a0}\u{fe0f}", 9), 10);
     }
 
     #[test]

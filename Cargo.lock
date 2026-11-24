@@ -466,6 +466,7 @@ dependencies = [
  "proptest",
  "rustc-hash",
  "rustix",
+ "serde_json",
  "tempfile",
  "thiserror 2.0.21",
  "tree-sitter",
@@ -507,7 +508,6 @@ dependencies = [
  "dffy-render-mermaid",
  "pulldown-cmark",
  "serde_json",
- "unicode-width",
 ]
 
 [[package]]

@@ -10,7 +10,6 @@ use crate::keys::{Action as Act, Table};
 use crate::review::model;
 use crate::term::Input;
 use crate::tui::menu::{self, Menu, Offer, Run};
-use crate::tui::picker::Picker;
 use crate::tui::tree::Item;
 use crate::tui::view::{Block, Doc, Hit};
 
@@ -32,6 +31,7 @@ impl App {
             }
             Input::Click { x, y } => self.click(usize::from(x), usize::from(y)),
             Input::ShiftClick { x, y } => self.shift_click(usize::from(x), usize::from(y)),
+            Input::PeekClick { x, y } => self.peek_click(usize::from(x), usize::from(y)),
             Input::Drag { x, y } => self.drag(usize::from(x), usize::from(y)),
             Input::Release { .. } => return self.release(),
             Input::RightClick { x, y } => self.open_menu(usize::from(x), usize::from(y)),
@@ -75,6 +75,7 @@ impl App {
                         self.doc.aim(separator);
                         self.dispatch(Act::Expand)
                     }
+                    Run::Peek(action) => self.peek_act(action),
                 }
             }
         }
@@ -124,12 +125,24 @@ impl App {
             return Vec::new();
         };
         self.pane = Pane::Tree;
+        // A file outside the diff, in the all-files tree: what enter and
+        // `x` do to it.
+        if let Item::Path(i) = item {
+            let path = self.tree.all_path(i);
+            let opened = path.is_some_and(|p| self.unchanged_file(p.as_ref()).is_some());
+            let mut entries = vec![self.menu_entry(true, "Open whole", Act::Open)];
+            if opened {
+                entries.push(self.menu_entry(true, "Close file", Act::CloseFile));
+            }
+            entries.push(self.menu_entry(true, "Diff's files only", Act::ToggleAllFiles));
+            return entries;
+        }
         let Item::File(file) = item else {
             return Vec::new();
         };
         // `e` would open a line tapped before, maybe in another file.
         self.tapped = None;
-        self.doc.goto_file(file);
+        self.browse(file);
         let entry = &self.doc.document.files()[file];
         let on_disk = !entry.is_commit() && !self.piped;
         let editable = on_disk && entry.change().new.is_some();
@@ -179,6 +192,11 @@ impl App {
                 return self.menu_entries(self.thread_offers(&thread, true));
             }
             Some((Block::New, _)) => return Vec::new(),
+            Some((Block::Peek, _)) => {
+                self.doc.selection = None;
+                self.peek_tap(x, y);
+                return self.peek_menu();
+            }
             None => self.doc.set_focus(None),
         }
         if let Some(separator) = self.doc.separator_at(y - 1) {
@@ -217,6 +235,9 @@ impl App {
         let mut offers = self.edit_offers(pos.file, selected);
         offers.extend(self.conflict_offers(Some(pos)));
         entries.extend(self.menu_entries(offers));
+        if !selected && self.navigation_offered(pos.file, side) {
+            entries.push(self.menu_entry(false, "Go to definition", Act::GoToDefinition));
+        }
         if editable {
             entries.push(self.menu_entry(false, "Open in editor", Act::Edit));
         }
@@ -366,15 +387,37 @@ impl App {
             .then(|| self.side_width().unwrap_or_else(|| self.screen.width()))
     }
 
-    fn over_tree(&self, x: usize) -> bool {
+    pub(super) fn over_tree(&self, x: usize) -> bool {
         self.tree_columns().is_some_and(|w| x < w)
     }
 
     /// The code row at screen cell `x`, `y` and the side it's on there.
-    fn code_at(&mut self, x: usize, y: usize) -> Option<(Pos, Side)> {
+    pub(super) fn code_at(&mut self, x: usize, y: usize) -> Option<(Pos, Side)> {
         let pos = self.doc.row_at(y.checked_sub(1)?)?;
         let side = self.doc.side_at(pos, x.checked_sub(self.content_x())?)?;
         Some((pos, side))
+    }
+
+    /// A tap on the diff's cell `x`, `y` (the `count`th in a row) off a
+    /// box: a separator reveals, and in file view a rule, or an edited
+    /// line's gutter, opens or folds its change. What the cell shows, for a
+    /// press to go on from, unless a change opened or folded there.
+    fn tap_code(&mut self, x: usize, y: usize, count: u8) -> Option<Hit> {
+        // The rows under the tap changed: there's nothing more to hit.
+        if let Some(toggled) = self.doc.click(y - 1, count == 1) {
+            self.say_run(Some(toggled));
+            return None;
+        }
+        let hit = (x.checked_sub(self.content_x()))
+            .and_then(|column| self.doc.hit(y - 1, column, None))?;
+        if let Hit::Gutter { pos, .. } = hit
+            && count == 1
+            && let Some(toggled) = self.doc.gutter_click(pos)
+        {
+            self.say_run(Some(toggled));
+            return None;
+        }
+        Some(hit)
     }
 
     fn click(&mut self, x: usize, y: usize) {
@@ -394,9 +437,7 @@ impl App {
         if !on_tree && (y == 0 || y + 1 >= self.screen.height()) {
             match &self.switcher {
                 Some((row, [prev, ..])) if *row == y && prev.contains(&x) => self.doc.prev_file(),
-                Some((row, [_, name, _])) if *row == y && name.contains(&x) => {
-                    self.picker = Some(Picker::new(self.doc.document.files()));
-                }
+                Some((row, [_, name, _])) if *row == y && name.contains(&x) => self.open_picker(),
                 Some((row, [.., next])) if *row == y && next.contains(&x) => self.doc.next_file(),
                 _ => {}
             }
@@ -426,6 +467,8 @@ impl App {
                     }
                     self.open(file);
                 }
+                // Opened as the tap ends (see `App::release`).
+                Some(Item::Path(i)) => self.tree_tap = Some(i),
                 None => {}
             }
             return;
@@ -463,14 +506,17 @@ impl App {
                 return;
             }
             Some((Block::New, _)) => return,
-            None => self.doc.set_focus(None),
+            Some((Block::Peek, _)) => {
+                self.peek_tap(x, y);
+                return;
+            }
+            None => {
+                self.doc.set_focus(None);
+                self.blur_peek();
+            }
         }
         self.tapped = self.code_at(x, y);
-        self.doc.click(y - 1);
-        let Some(hit) = x
-            .checked_sub(self.content_x())
-            .and_then(|column| self.doc.hit(y - 1, column, None))
-        else {
+        let Some(hit) = self.tap_code(x, y, count) else {
             return;
         };
         // A double click selects the word, a triple click the line.
@@ -598,6 +644,11 @@ impl App {
     /// goes on the clipboard, and stays selected for `y` to copy again.
     fn release(&mut self) -> Option<Action> {
         self.drag_edge = None;
+        // A file outside the diff tapped in the all-files tree opens as the
+        // tap ends, the loop looking it up.
+        if let Some(i) = self.tree_tap.take() {
+            return self.open_all_path(i);
+        }
         let press = self.press.take()?;
         self.anchor = Some((self.doc.document.pos.file, press.hit.clone()));
         if press.selected && (self.doc.selection.is_some() || self.doc.comment_selection.is_some())

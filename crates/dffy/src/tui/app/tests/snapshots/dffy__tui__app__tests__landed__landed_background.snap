@@ -1,0 +1,28 @@
+---
+source: crates/dffy/src/tui/app/tests/landed.rs
+expression: "shown.join(\"\\n\")"
+---
+┌ Files · 2 +2 -2 ─────────┬─ modified · src/some/deeply/nested/module/file.rs · +2 -2 ────────────┐
+│ ▼ src/                   │  35 35 │ line 35                                                      │
+│   ▼ …eply/nested/module/ │  36 36 │ line 36                                                      ▐
+│     M file.rs    +2   -2 │  37 37 │ line 37                                                      │
+│   M zz.rs                │  38 38 │ line 38                                                      │
+│                          │  39 39 │ line 39                                                      │
+│                          │  40 40 │ line 40                                                      │
+│                          │  41 41 │ line 41                                                      │
+│                          │  42 42 │ line 42                                                      │
+│                          │  43 43 │ line 43                                                      │
+│                          │  44 44 │ line 44                                                      │
+│                          │  45 45 │ line 45                                                      │
+│                          │  46 46 │ line 46                                                      │
+│                          │  47 47 │ line 47                                                      ┃
+│                          │  48 48 │ line 48                                                      ┃
+│                          │  49 49 │ line 49                                                      ┃
+│                          │  50    │ line 50                                                      ┃
+│                          │ [    50❯│ line fifty                                                   ]┃
+│                          │  51 51 │ line 51                                                      ┃
+│                          │  52 52 │ line 52                                                      █
+│                          │  53 53 │ line 53                                                      ┃
+│                          │  54 54 │ line 54                                                      ┃
+│                          │  55 55 │ line 55                                                      │
+└«─  working tree  ────────┴─ 1/2 · 1/2 hunk  unified full ─ / search · tab tree · space commands ─┘

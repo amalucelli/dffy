@@ -1,6 +1,8 @@
 //! TUI frame time at 200×60 against the 8ms budget, on the Linux range
 //! v6.0..v6.1: its largest file (too large to highlight), `kernel/sched/fair.c`
-//! with and without highlighting, and the file tree over the whole range.
+//! with and without highlighting, whole and in file view, the file tree
+//! over the whole range, the picker over it and v6.1's other files, and
+//! go to definition's peek.
 //! Needs the kernel clone named by `DFFY_BENCH_REPO`; skipped without it.
 //! Timings are reported, never asserted.
 #![expect(
@@ -12,7 +14,8 @@ use std::ops::ControlFlow;
 use std::path::PathBuf;
 use std::sync::LazyLock;
 
-use dffy::bench::{Frame, Trees};
+use dffy::bench::{AllFiles, Frame, Peeking, Picking, Trees};
+use dffy_core::cache::Cache;
 use dffy_core::diff::Options;
 use dffy_core::git::{FileChange, FileDiff, Repo};
 
@@ -188,6 +191,54 @@ fn full_text_scroll_by_one(bencher: divan::Bencher, case: &str) {
     });
 }
 
+/// A file in file view (`l`), read on its new side, scrolled into it.
+fn file_view(case: &str) -> Frame {
+    let (largest, highlighted) = DIFFS.clone().expect("checked in main");
+    let diff = if case == "table" {
+        largest
+    } else {
+        highlighted
+    };
+    let mut frame = Frame::new(diff, SIZE.0, SIZE.1, false);
+    frame.press('l');
+    for _ in 0..START {
+        frame.scroll(true);
+    }
+    frame.draw();
+    frame
+}
+
+#[divan::bench(args = FULL)]
+fn file_view_frame(bencher: divan::Bencher, case: &str) {
+    let mut frame = file_view(case);
+    bencher.bench_local(|| {
+        frame.invalidate();
+        frame.draw()
+    });
+}
+
+#[divan::bench(args = FULL)]
+fn file_view_scroll_by_one(bencher: divan::Bencher, case: &str) {
+    let mut frame = file_view(case);
+    let mut down = true;
+    bencher.bench_local(|| {
+        frame.scroll(down);
+        down = !down;
+        frame.draw()
+    });
+}
+
+/// `l` in turn, off and on: the rows of the side read or of the diff,
+/// each kept once built, to the frame it draws.
+#[divan::bench(args = FULL)]
+fn file_view_toggle(bencher: divan::Bencher, case: &str) {
+    let mut frame = file_view(case);
+    bencher.bench_local(|| {
+        frame.press('l');
+        frame.draw()
+    });
+}
+
 /// A keystroke in the diff search, to the frame it draws: the pattern
 /// grows to one character, then shrinks back to none; `0` is on nearly
 /// every line of the table, `e` on fewer.
@@ -266,4 +317,193 @@ fn tree_next_file(bencher: divan::Bencher) {
         next = !next;
         frame.draw()
     });
+}
+
+/// The picker over the range's files and v6.1's other files.
+fn picking() -> Picking {
+    let root = PathBuf::from(std::env::var_os("DFFY_BENCH_REPO").expect("checked in main"));
+    let repo = Repo::discover(&root).expect("bench repo opens");
+    let spec = repo
+        .resolve(&["v6.0", "v6.1"], false, false)
+        .expect("tags resolve");
+    let snapshots = spec.snapshots(false).expect("a range has snapshots");
+    let mut picking = Picking::new(CHANGES.clone(), &repo, snapshots, SIZE);
+    picking.draw();
+    picking
+}
+
+/// The picker's first keystroke and the backspace after it, which scores
+/// every file again, each to the frame it draws: the diff's files are
+/// scored on this thread, the others handed to a worker
+/// (`picker_score_78k`). `e` is in nearly every path.
+#[divan::bench]
+fn picker_keystroke_78k(bencher: divan::Bencher) {
+    let mut picking = picking();
+    let mut typed = false;
+    bencher.bench_local(|| {
+        if typed {
+            picking.backspace();
+        } else {
+            picking.press('e');
+        }
+        typed = !typed;
+        picking.draw()
+    });
+}
+
+/// The picker opened, v6.1's files listed under the range's, and closed:
+/// what closing lets go shows as deallocated bytes matching allocated.
+#[divan::bench]
+fn picker_open_close_78k(bencher: divan::Bencher) {
+    let root = PathBuf::from(std::env::var_os("DFFY_BENCH_REPO").expect("checked in main"));
+    let repo = Repo::discover(&root).expect("bench repo opens");
+    let mut picking = picking();
+    picking.close();
+    bencher.bench_local(|| {
+        picking.open(&repo);
+        picking.close();
+        picking.draw()
+    });
+}
+
+/// The worker's share of the first keystroke: scoring v6.1's files the
+/// range doesn't list.
+#[divan::bench]
+fn picker_score_78k(bencher: divan::Bencher) {
+    let mut picking = picking();
+    picking.press('e');
+    let scoring = picking.scoring().expect("the other files wait for a score");
+    eprintln!(
+        "e: {} of {} other files match",
+        scoring.run(),
+        scoring.candidates()
+    );
+    bencher.bench_local(|| scoring.run());
+}
+
+/// The kernel's v6.1 files with the range's changes among them.
+fn all_files() -> AllFiles {
+    let root = PathBuf::from(std::env::var_os("DFFY_BENCH_REPO").expect("checked in main"));
+    let repo = Repo::discover(&root).expect("bench repo opens");
+    let spec = repo
+        .resolve(&["v6.0", "v6.1"], false, false)
+        .expect("tags resolve");
+    let [_, new] = spec.snapshots(false).expect("a range has snapshots");
+    AllFiles::new(CHANGES.clone(), &repo, new)
+}
+
+/// `a` in the tree: every file of v6.1, its top level made from the
+/// cached list with the range's 13k changes merged in.
+#[divan::bench]
+fn tree_all_files_switch(bencher: divan::Bencher) {
+    let all = all_files();
+    eprintln!("all files: {} rows", all.switch());
+    bencher.bench_local(|| all.switch());
+}
+
+/// The switch, then `drivers/` opened: its children made, about 30k
+/// files under it walked. Opening it alone takes the difference.
+#[divan::bench]
+fn tree_open_dir(bencher: divan::Bencher) {
+    let all = all_files();
+    eprintln!("drivers/ open: {} rows", all.open("drivers"));
+    bencher.bench_local(|| all.open("drivers"));
+}
+
+/// The file go to definition asks from, and the name: in its includes.
+const PEEK_FROM: &str = "mm/slab_common.c";
+const PEEK_NAME: &str = "kmalloc_array";
+
+/// A viewer of the range on `PEEK_FROM`, its definitions kept in `cache`,
+/// with `built` v6.1's index built.
+fn peeking(cache: &tempfile::TempDir, built: bool) -> Peeking {
+    let root = PathBuf::from(std::env::var_os("DFFY_BENCH_REPO").expect("checked in main"));
+    let repo = Repo::discover(&root).expect("bench repo opens");
+    let spec = repo
+        .resolve(&["v6.0", "v6.1"], false, false)
+        .expect("tags resolve");
+    let snapshots = spec.snapshots(false).expect("a range has snapshots");
+    let cache = Cache::new(cache.path().to_owned(), 1 << 30);
+    Peeking::new(
+        CHANGES.clone(),
+        (&repo, PathBuf::from(env!("CARGO_BIN_EXE_dffy"))),
+        snapshots,
+        PEEK_FROM,
+        (cache, built),
+        SIZE,
+    )
+}
+
+/// Peeking at `kmalloc_array` from `mm/slab_common.c`, to the frame
+/// showing its definitions and the first one's code, the lookup and the
+/// code's read and highlighting run on this thread. "built" has v6.1's
+/// index built; "cold" starts with no index and an empty symbol cache, so
+/// it lists v6.1's files and parses the asking file's includes.
+#[divan::bench(args = ["built", "cold"], sample_count = 10, sample_size = 1)]
+fn peek_open(bencher: divan::Bencher, case: &str) {
+    let cache = tempfile::tempdir().expect("tempdir");
+    if case == "built" {
+        let mut peeking = peeking(&cache, true);
+        eprintln!("peek: a frame is {} bytes", peeking.peek(PEEK_NAME));
+        bencher.bench_local(|| peeking.peek(PEEK_NAME));
+    } else {
+        bencher
+            .with_inputs(|| {
+                let cache = tempfile::tempdir().expect("tempdir");
+                let peeking = peeking(&cache, false);
+                (cache, peeking)
+            })
+            .bench_local_values(|(_cache, mut peeking)| peeking.peek(PEEK_NAME));
+    }
+}
+
+/// A whole frame with the peek open under the line.
+#[divan::bench]
+fn peek_frame(bencher: divan::Bencher) {
+    let cache = tempfile::tempdir().expect("tempdir");
+    let mut peeking = peeking(&cache, true);
+    peeking.keep_open(PEEK_NAME);
+    bencher.bench_local(|| peeking.full_frame());
+}
+
+/// The tree's count pass over the range on the viewer's pool, from an
+/// empty cache: alone, and while v6.1's definitions index builds from an
+/// empty symbol cache in the navigator helper, as the viewer has it.
+#[divan::bench(args = ["alone", "indexing"], sample_count = 3, sample_size = 1)]
+fn tree_count_pass(bencher: divan::Bencher, case: &str) {
+    let root = PathBuf::from(std::env::var_os("DFFY_BENCH_REPO").expect("checked in main"));
+    let repo = Repo::discover(&root).expect("bench repo opens");
+    let spec = repo
+        .resolve(&["v6.0", "v6.1"], false, false)
+        .expect("tags resolve");
+    let snapshots = spec.snapshots(false).expect("a range has snapshots");
+    bencher
+        .with_inputs(|| {
+            let cache = tempfile::tempdir().expect("tempdir");
+            let at = || Cache::new(cache.path().to_owned(), 1 << 30);
+            let program = PathBuf::from(env!("CARGO_BIN_EXE_dffy"));
+            let navigator =
+                (case == "indexing").then(|| Frame::navigator(program, &repo, snapshots, &at()));
+            (cache, navigator)
+        })
+        .bench_local_values(|(cache, navigator)| {
+            let at = Cache::new(cache.path().to_owned(), 1 << 30);
+            Frame::count_pass_beside(&repo, CHANGES.clone(), navigator.as_ref(), Some(at))
+        });
+}
+
+/// A narrowing keystroke over as many other files as the picker scores
+/// on the keystroke itself (its `SCORE_NOW`): `e` then `r`.
+#[divan::bench]
+fn picker_narrow_16k(bencher: divan::Bencher) {
+    let mut picking = picking();
+    picking.press('e');
+    let first = picking.scoring().expect("the other files wait for a score");
+    let narrowed = first.narrowed('r', 16_384);
+    eprintln!(
+        "er: {} of {} other files match",
+        narrowed.run(),
+        narrowed.candidates()
+    );
+    bencher.bench_local(|| narrowed.run());
 }

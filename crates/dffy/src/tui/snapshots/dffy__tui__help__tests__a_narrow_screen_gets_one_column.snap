@@ -7,9 +7,9 @@ expression: text
 │ j down            scroll down                 ┃│
 │ k up              scroll up                   ┃│
 │ page_down ctrl+f  page down                   ┃│
-│ b page_up         page up                     ┃│
-│ ctrl+d            half page down              ┃│
-│ ctrl+u            half page up                ┃│
+│ b page_up         page up                     ││
+│ ctrl+d            half page down              ││
+│ ctrl+u            half page up                ││
 │ g home            top of file                 ││
 │ G end             bottom of file              ││
 │ n }               next change                 ││

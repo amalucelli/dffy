@@ -51,7 +51,7 @@ A locked GitLab discussion takes no reply, so the plugin's plan skips one and sa
 - A session protocol negotiates capabilities at connect. Each peer states once what it can do, and the other never asks for what wasn't offered.
 - An experimental protocol has one version and changes in place. dffy and the implementer in this repository change together. There's no compatibility layer while there's a single implementer.
 - The model has one JSON encoding. `--json`, MCP and the control API share the encoder's objects and add only their envelopes, so their schemas can't drift. A change that breaks a consumer bumps the schema's version.
-- Each protocol and format has one page in `docs/` that is its contract ([plugins.md](plugins.md), [control.md](control.md), [json.md](json.md), [mcp.md](mcp.md), [comments.md](comments.md)). Tests hold the code to it.
+- Each protocol and format has one page in `docs/` that is its contract ([plugins.md](plugins.md), [control.md](control.md), [json.md](json.md), [mcp.md](mcp.md), [comments.md](comments.md), [navigate.md](navigate.md)). Tests hold the code to it.
 
 ## Performance
 

@@ -8,6 +8,7 @@
 //! can show its source instead.
 
 mod canvas;
+pub mod columns;
 mod flowchart;
 mod sequence;
 
@@ -127,13 +128,12 @@ fn wrap(text: &str, width: usize) -> Vec<String> {
                 line.push(' ');
                 used += 1;
             }
-            for c in word.chars() {
-                let w = canvas::width(c.encode_utf8(&mut [0; 4]));
+            for (piece, w) in columns::clusters(word) {
                 if used > 0 && used + w > width {
                     lines.push(std::mem::take(&mut line));
                     used = 0;
                 }
-                line.push(c);
+                line.push_str(piece);
                 used += w;
             }
         }

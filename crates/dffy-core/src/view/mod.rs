@@ -458,6 +458,37 @@ impl HunkHeader<'_> {
     }
 }
 
+/// A side of a diff: the old text or the new.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Side {
+    /// The text before the change.
+    Old,
+    /// The text after it.
+    New,
+}
+
+impl Side {
+    /// 0 for the old side, 1 for the new, to index per-side pairs.
+    #[inline]
+    #[must_use]
+    pub fn index(self) -> usize {
+        match self {
+            Self::Old => 0,
+            Self::New => 1,
+        }
+    }
+
+    /// The opposite side.
+    #[inline]
+    #[must_use]
+    pub fn other(self) -> Self {
+        match self {
+            Self::Old => Self::New,
+            Self::New => Self::Old,
+        }
+    }
+}
+
 /// How a hunk's lines are arranged into rows: one column, or old and new
 /// side by side. Which one a hunk gets is the frontend's choice; rows for
 /// either are the same whatever the screen.
@@ -482,6 +513,25 @@ pub enum Row {
     Pair(Option<usize>, Option<usize>),
     /// Split: the no-newline marker.
     Marker,
+    /// One side read alone (see [`side_rows`]): body line `line` of that
+    /// side, and on a changed line, the other side's line it pairs with in
+    /// its block, hidden, as split view pairs them.
+    One {
+        /// The body line shown.
+        line: usize,
+        /// The hidden body line it pairs with, if any.
+        paired: Option<usize>,
+    },
+    /// One side read alone: `n` lines of the other side from body line
+    /// `from` on, hidden and paired with no line of the side read: a pure
+    /// removal read on the new side, or what a block removes beyond what
+    /// it adds.
+    Hidden {
+        /// The first body line hidden.
+        from: usize,
+        /// The lines hidden.
+        n: u32,
+    },
 }
 
 /// Appends the rows of a hunk body of `len` lines in `arrangement` to
@@ -497,6 +547,89 @@ pub fn rows(
     match arrangement {
         Arrangement::Split => split_rows(len, line, rows),
         Arrangement::Unified => rows.extend((0..len).map(Row::Line)),
+    }
+}
+
+/// Appends the rows of a hunk body of `len` lines read on `side` alone to
+/// `rows`, given each line's kind and whether it starts a block of rows: a
+/// [`Row::One`] per line of that side, in order. Each block's removed and
+/// added lines pair up in order, as split view pairs them: a changed line
+/// shown carries the hidden line it pairs with, and the hidden lines left
+/// over get a [`Row::Hidden`] after the block's lines shown. A no-newline
+/// marker shows when the line it follows does, and is never counted. A
+/// body with any line gets at least one row.
+///
+/// An unchanged line's marker is the new side's in the body; `ends(i)`
+/// says whether unchanged line `i` ends `side` without a newline, which
+/// the sides disagree on when whitespace is ignored. The marker follows it
+/// then, the body's or else a [`Row::Marker`], and not otherwise.
+pub fn side_rows(
+    side: Side,
+    len: usize,
+    (line, ends): (impl Fn(usize) -> (Kind, bool), impl Fn(usize) -> bool),
+    rows: &mut Vec<Row>,
+) {
+    let kind = |i| line(i).0;
+    let one = |line| Row::One { line, paired: None };
+    let mut i = 0;
+    while i < len {
+        match kind(i) {
+            Kind::Context => {
+                rows.push(one(i));
+                i += 1;
+                let marker = i < len && kind(i) == Kind::NoNewline;
+                if ends(i - 1) {
+                    rows.push(if marker { one(i) } else { Row::Marker });
+                }
+                i += usize::from(marker);
+            }
+            Kind::NoNewline => {
+                if matches!(rows.last(), Some(Row::One { line, .. }) if *line + 1 == i) {
+                    rows.push(one(i));
+                }
+                i += 1;
+            }
+            Kind::Removed | Kind::Added => {
+                let start = i;
+                let continues = |i: usize| i == start || !line(i).1;
+                while i < len && kind(i) == Kind::Removed && continues(i) {
+                    i += 1;
+                }
+                let removed = start..i;
+                // The no-newline markers after the old side's last line and
+                // after the new side's.
+                let mut markers = [None; 2];
+                let mut added = i..i;
+                while i < len && matches!(kind(i), Kind::Added | Kind::NoNewline) && continues(i) {
+                    match kind(i) {
+                        Kind::Added if added.is_empty() => added = i..i + 1,
+                        Kind::Added => added.end = i + 1,
+                        _ => markers[usize::from(!added.is_empty())] = Some(i),
+                    }
+                    i += 1;
+                }
+                let (shown, hidden) = match side {
+                    Side::Old => (removed, added),
+                    Side::New => (added, removed),
+                };
+                for (k, l) in shown.clone().enumerate() {
+                    rows.push(Row::One {
+                        line: l,
+                        paired: hidden.clone().nth(k),
+                    });
+                }
+                if let Some(m) = markers[side.index()].filter(|_| !shown.is_empty()) {
+                    rows.push(one(m));
+                }
+                if hidden.len() > shown.len() {
+                    let n = u32::try_from(hidden.len() - shown.len()).unwrap_or(u32::MAX);
+                    rows.push(Row::Hidden {
+                        from: hidden.start + shown.len(),
+                        n,
+                    });
+                }
+            }
+        }
     }
 }
 

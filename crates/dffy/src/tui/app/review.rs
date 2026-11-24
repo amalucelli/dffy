@@ -7,9 +7,9 @@ use std::time::Instant;
 
 use dffy_core::git::Revisions;
 use dffy_core::view::Attributes;
-use unicode_width::UnicodeWidthStr;
 
 use super::{Action, App, escape};
+use crate::columns::Columns as _;
 use crate::keys::{Action as Act, Keys, Table};
 use crate::plugin::agent::Request as AgentRequest;
 use crate::plugin::review::{Listed, ReviewEvent, ReviewLabel, Said, Session};
@@ -430,7 +430,10 @@ impl App {
             Key::Char('l') => {
                 dialog.local = !dialog.local;
                 let local = dialog.local;
-                if self.sending(true).local == 0 {
+                let sending = self.sending(true);
+                if sending.local == 0 && sending.staying > 0 {
+                    self.message("the branch drafts stay: their lines aren't here");
+                } else if sending.local == 0 {
                     self.message("no branch drafts on this diff");
                 } else {
                     self.message(if local {
@@ -538,10 +541,10 @@ impl Dialog {
             64.min(gw - 4)
         };
         let dim = theme.style(Role::Dim);
-        let warning = sending
-            .warning()
-            .map(|w| model::say(&w, |hint| super::hint_words(keys, hint)));
-        let mut lines = self.heading(theme, mode, (sending, checked, warning));
+        let warnings = (sending.warnings().iter())
+            .map(|w| model::say(w, |hint| super::hint_words(keys, hint)))
+            .collect();
+        let mut lines = self.heading(theme, mode, (sending, checked, warnings));
         lines.push((String::new(), Style::PLAIN));
         let first_event = lines.len();
         for (i, event) in self.events.iter().enumerate() {
@@ -619,29 +622,33 @@ impl Dialog {
         grid.put_str(x, y0 + height - 2, right, footer, dim);
     }
 
-    /// The lines over the events: what goes, the one warning about what
-    /// won't, the review's state, and the local drafts' toggle.
+    /// The lines over the events: what goes, the warnings about what won't,
+    /// the review's state, and the local drafts' toggle.
     fn heading(
         &self,
         theme: &Theme,
         mode: &Mode,
-        (sending, checked, warning): (Sending, Checked, Option<String>),
+        (sending, checked, warnings): (Sending, Checked, Vec<String>),
     ) -> Vec<(String, Style)> {
         let (dim, warn) = (theme.style(Role::Dim), theme.style(Role::Warn));
         let mut lines = vec![(sending.what(&mode.label), Style::PLAIN)];
-        match (warning, checked) {
-            (Some(warning), _) => lines.push((format!("! {warning}"), warn)),
-            (None, Checked::Failed(e)) => lines.push((
+        // Drafts that stay are known without the plan, which may still say
+        // more of the others.
+        let planned = sending.left_out + sending.refused > 0;
+        lines.extend((warnings.iter()).map(|w| (format!("! {w}"), warn)));
+        match checked {
+            _ if planned => {}
+            Checked::Failed(e) => lines.push((
                 format!(
                     "couldn't check what can be posted: {}",
                     escape(e.as_bytes())
                 ),
                 dim,
             )),
-            (None, Checked::Checking) if sending.comments > 0 => {
+            Checked::Checking if sending.comments > 0 => {
                 lines.push(("checking what can be posted…".to_owned(), dim));
             }
-            (None, _) => {}
+            Checked::Checking | Checked::Yes => {}
         }
         if mode.moved.is_some() {
             lines.push((

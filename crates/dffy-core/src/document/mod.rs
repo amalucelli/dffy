@@ -51,7 +51,7 @@ pub use entries::{
 };
 pub use prepare::{Prepare, SyntaxSlot, pair};
 pub use rendered::{Origin, Rendered};
-pub use search::{BlockMatch, Hit, Match, Matches, Needle, find, find_blocks, word};
+pub use search::{BlockMatch, Hit, Match, Matches, Needle, Reading, find, find_blocks, word};
 
 use blocks::{At, Blocks, Key, Placed, order};
 
@@ -60,44 +60,14 @@ use crate::git::{FileChange, FileDiff, Mode, ObjectId, Side as GitSide, Status};
 use crate::highlight::{self, HunkSyntax, MAX_HIGHLIGHT_BYTES, Registry};
 use crate::patch::{self, FileInfo};
 use crate::structural::{Structural, Unavailable};
+pub use crate::view::Side;
 use crate::view::{
     Arrangement, FileHeader, FileStatus, Heading, HunkHeader, Kind, Line, LineState, Row, Spans,
-    display_text, heading_text, line_bytes, no_newline, rows,
+    display_text, heading_text, line_bytes, no_newline, rows, side_rows,
 };
 
 /// Lines one reveal adds to a gap; a gap of up to twice this opens whole.
 const REVEAL_LINES: usize = 20;
-
-/// A side of a diff: the old text or the new.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Side {
-    /// The text before the change.
-    Old,
-    /// The text after it.
-    New,
-}
-
-impl Side {
-    /// 0 for the old side, 1 for the new, to index per-side pairs.
-    #[inline]
-    #[must_use]
-    pub fn index(self) -> usize {
-        match self {
-            Self::Old => 0,
-            Self::New => 1,
-        }
-    }
-
-    /// The opposite side.
-    #[inline]
-    #[must_use]
-    pub fn other(self) -> Self {
-        match self {
-            Self::Old => Self::New,
-            Self::New => Self::Old,
-        }
-    }
-}
 
 /// A file's added and removed lines.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -314,6 +284,25 @@ impl Reveal {
     }
 }
 
+/// What a hunk's rows are built for: an arrangement of both sides, one
+/// side read alone, or a hunk opened in place while a side is read alone:
+/// its header row, which closes it again, then its unified rows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Layout {
+    Arranged(Arrangement),
+    Read(Side),
+    Opened,
+}
+
+/// Line `line`'s number (0-based) on `side`: where it would be there, for
+/// a line only on the other side.
+fn line_on(line: &diff::Line, side: Side) -> usize {
+    match side {
+        Side::Old => line.old,
+        Side::New => line.new,
+    }
+}
+
 /// How a file is shown, which decides its parts' rows: the syntax diff or
 /// the line diff, how much of each gap is revealed, each hunk's
 /// arrangement and the blocks among the rows. Queries that never build a
@@ -321,8 +310,16 @@ impl Reveal {
 struct Shape<'a, A> {
     /// Show the syntax diff where the file has one.
     structural: bool,
-    /// Show every gap whole; a piped file's gaps still never open.
+    /// Show every gap whole; a piped file's gaps still never open. Always
+    /// set while a side is read alone.
     full: bool,
+    /// The side read alone, if any: each hunk shows only its lines, with
+    /// the other side's marked where they're hidden (see [`side_rows`]),
+    /// but for the hunks opened in place, in order (see
+    /// [`Document::set_opened`]).
+    // One field: a shape is built for every row drawn or moved over, and
+    // while both sides show this is a single word to set.
+    reading: Option<(Side, &'a [usize])>,
     /// What's revealed of each gap, by gap; gaps past its end show nothing.
     reveal: &'a [Reveal],
     /// Each hunk's arrangement, from its numbers (and no heading), and the
@@ -396,13 +393,23 @@ pub struct File {
     /// The syntax diff's hunks cover the same lines, so these serve both.
     gaps: Vec<Gap>,
     segments: Vec<Segment>,
-    /// The new side's syntax runs over each gap, once they're set.
-    gap_syntax: Vec<Option<Spans>>,
+    /// Each side's syntax runs over each gap, once they're set. The old
+    /// side's are only wanted while it's read alone, so its list stays
+    /// empty until then.
+    gap_syntax: [Vec<Option<Spans>>; 2],
     /// Made on first use, for the syntax diff or not.
     marks: Option<OverviewMarks>,
     counts: Counts,
+    /// The hunks with a removed line, then those with an added one: the
+    /// changes on each side.
+    changes: [usize; 2],
     note: Option<&'static str>,
     bytes: usize,
+    /// The estimate of the highlighting of a file without hunks, which is
+    /// prepared only once its lines show: it goes into `bytes` when the
+    /// first gap's runs arrive, so a range of renames doesn't count it for
+    /// files never looked at.
+    unparsed: usize,
     /// Each hunk's heading as a piped diff wrote it. Set for a piped file,
     /// which has only its hunks: the text between them is unknown, so its
     /// gaps never open.
@@ -422,7 +429,9 @@ pub struct File {
 /// the line diff's, so a position stays valid across the toggle.
 struct SyntaxDiff {
     /// Empty when the file has no syntax diff; the line diff shows then.
-    hunks: Vec<Hunk>,
+    /// Shared with searches of the file read alone (see
+    /// [`Document::reading_in`]).
+    hunks: Arc<[Hunk]>,
     views: Vec<HunkView>,
     note: Option<String>,
 }
@@ -432,20 +441,25 @@ struct HunkView {
     /// hunk of every file held has a view, so its size counts.
     heading: Option<u32>,
     body: Vec<BodyLine>,
-    /// Rows in `arrangement`, computed when the hunk is first drawn in it.
+    /// Rows in `layout`, computed when the hunk is first drawn in it.
     rows: Vec<Row>,
-    /// The rows that start a block of changed lines.
+    /// The rows that start a block of changed lines, and every row marking
+    /// hidden lines.
     starts: Vec<usize>,
     /// What `rows` and `starts` are for; `None` until the hunk is drawn.
-    arrangement: Option<Arrangement>,
-    /// The other arrangement's rows and starts, once the hunk was drawn in
-    /// both (a resize across the split width, a layout toggle).
-    other: Option<Box<(Vec<Row>, Vec<usize>)>>,
+    layout: Option<Layout>,
+    /// The layout drawn before the one shown, with its rows and starts,
+    /// once the hunk was drawn in two (a resize across the split width, a
+    /// layout toggle, a side read alone).
+    other: Option<Box<Held>>,
     /// Per line of the core hunk, once set.
     emphasis: Option<Vec<Emphasis>>,
     /// Set along with the emphasis, for highlighted files.
     syntax: Option<HunkSyntax>,
 }
+
+/// A layout a hunk was drawn in, with its rows and starts.
+type Held = (Layout, Vec<Row>, Vec<usize>);
 
 // Every hunk of every file held has a view: it stays within its budget.
 const _: () = assert!(size_of::<HunkView>() <= 280);
@@ -503,7 +517,7 @@ fn views(diff: &FileDiff, hunks: &[Hunk]) -> Vec<HunkView> {
                 body,
                 rows: Vec::new(),
                 starts: Vec::new(),
-                arrangement: None,
+                layout: None,
                 other: None,
                 emphasis: None,
                 syntax: None,
@@ -529,7 +543,23 @@ fn line_row(core: &Hunk, view: &HunkView, side: Side, line: usize) -> Option<usi
     view.body
         .get(body)
         .filter(|b| b.state != LineState::NoNewline && key(b) == (line, true))?;
-    row_of(&view.rows, body)
+    match view.layout {
+        Some(Layout::Read(_)) => read_row(&view.rows, body),
+        _ => row_of(&view.rows, body),
+    }
+}
+
+/// The row of `rows`, built by [`side_rows`], showing body line `i`, the
+/// row of the line it pairs with when it's hidden, or the row standing for
+/// it unpaired. `None` for a hidden no-newline marker.
+// Linear in the hunk's rows: a block's leftover hidden lines come after its
+// lines read, out of body order, so the rows can't be searched by line.
+fn read_row(rows: &[Row], i: usize) -> Option<usize> {
+    rows.iter().position(|row| match *row {
+        Row::One { line, paired } => line == i || paired == Some(i),
+        Row::Hidden { from, n } => (from..from + n as usize).contains(&i),
+        _ => false,
+    })
 }
 
 /// The row of `rows`, built by [`rows`], showing body line `i`, which isn't
@@ -544,14 +574,21 @@ fn line_row(core: &Hunk, view: &HunkView, side: Side, line: usize) -> Option<usi
 fn row_of(rows: &[Row], i: usize) -> Option<usize> {
     let first = |mut r: usize| loop {
         match rows[r] {
-            Row::Line(l) | Row::Pair(Some(l), _) | Row::Pair(None, Some(l)) => return Some(l),
-            Row::Header | Row::Marker | Row::Pair(None, None) => r = r.checked_sub(1)?,
+            Row::Line(l)
+            | Row::Pair(Some(l), _)
+            | Row::Pair(None, Some(l))
+            | Row::One { line: l, .. } => {
+                return Some(l);
+            }
+            Row::Header | Row::Marker | Row::Pair(None, None) | Row::Hidden { .. } => {
+                r = r.checked_sub(1)?;
+            }
         }
     };
     let shows = |r: usize| match rows[r] {
-        Row::Line(l) => l == i,
+        Row::Line(l) | Row::One { line: l, .. } => l == i,
         Row::Pair(old, new) => old == Some(i) || new == Some(i),
-        Row::Header | Row::Marker => false,
+        Row::Header | Row::Marker | Row::Hidden { .. } => false,
     };
     // The rows whose first line is at or before `i`, a marker counting as
     // the row above it.
@@ -584,10 +621,20 @@ fn row_of(rows: &[Row], i: usize) -> Option<usize> {
     shows(row).then_some(row)
 }
 
-/// The gaps around `diff`'s hunks; none when it has no hunks.
+/// The gaps around `diff`'s hunks. Without hunks, its lines are one gap
+/// when both sides have them line for line, as a file renamed or with its
+/// mode changed does; none otherwise.
 fn gaps(diff: &FileDiff) -> Vec<Gap> {
     if diff.hunks.is_empty() {
-        return Vec::new();
+        let len = diff.new.len();
+        return (len > 0 && diff.old.len() == len)
+            .then_some(Gap {
+                old: 0,
+                new: 0,
+                len,
+            })
+            .into_iter()
+            .collect();
     }
     let (mut old, mut new) = (0, 0);
     let mut gaps = Vec::with_capacity(diff.hunks.len() + 1);
@@ -613,30 +660,35 @@ impl File {
     /// grammars to highlight with; `None` leaves the file plain.
     fn new(diff: FileDiff, whitespace: Whitespace, highlight: Option<&Registry>) -> Self {
         let gaps = gaps(&diff);
-        Self::with_gaps(diff, gaps, whitespace, highlight)
+        // A file without hunks shows its lines only when asked to.
+        let deferred = diff.hunks.is_empty();
+        Self::with_gaps(diff, gaps, whitespace, (highlight, deferred))
     }
 
     /// `diff`, a file compared with itself (see [`FileChange::unchanged`]),
-    /// as one gap of every line. An empty, binary or too large one has none.
+    /// as one gap of every line, as any file without hunks has. An empty,
+    /// binary or too large one has none, and a note that says why.
     fn unchanged(diff: FileDiff, highlight: Option<&Registry>) -> Self {
-        let len = diff.new.len();
-        let gaps = if len == 0 {
-            Vec::new()
+        let gaps = gaps(&diff);
+        let why = if diff.binary {
+            Some("binary file, not shown")
+        } else if diff.too_large {
+            Some("file too large to show")
         } else {
-            vec![Gap {
-                old: 0,
-                new: 0,
-                len,
-            }]
+            None
         };
-        Self::with_gaps(diff, gaps, Whitespace::Exact, highlight)
+        let mut file = Self::with_gaps(diff, gaps, Whitespace::Exact, (highlight, false));
+        file.note = why.or(file.note);
+        file
     }
 
+    /// With `deferred`, the highlighting's estimate waits for the first
+    /// gap's runs (see [`File::unparsed`]).
     fn with_gaps(
         mut diff: FileDiff,
         gaps: Vec<Gap>,
         whitespace: Whitespace,
-        highlight: Option<&Registry>,
+        (highlight, deferred): (Option<&Registry>, bool),
     ) -> Self {
         // Whether a line is modified decides its color from the first frame
         // on, and the overview marks every hunk, shown or not.
@@ -646,12 +698,18 @@ impl File {
         let hunks = views(&diff, &diff.hunks);
         let lines: usize = hunks.iter().map(|h| h.body.len()).sum();
         let mut counts = Counts::default();
-        for line in diff.hunks.iter().flat_map(|h| &h.lines) {
-            match line.kind {
-                LineKind::Added => counts.added += 1,
-                LineKind::Removed => counts.removed += 1,
-                LineKind::Context => {}
+        let mut changes = [0; 2];
+        for hunk in &diff.hunks {
+            let before = counts;
+            for line in &hunk.lines {
+                match line.kind {
+                    LineKind::Added => counts.added += 1,
+                    LineKind::Removed => counts.removed += 1,
+                    LineKind::Context => {}
+                }
             }
+            changes[0] += usize::from(counts.removed > before.removed);
+            changes[1] += usize::from(counts.added > before.added);
         }
         let note = note(&diff)
             .or_else(|| whitespace_only(&diff, whitespace).then_some("only whitespace changed"));
@@ -689,17 +747,21 @@ impl File {
                 segments.push(Segment::Hunk(i));
             }
         }
+        let unparsed = if deferred { syntax_bytes } else { 0 };
         Self {
-            bytes: diff.old.bytes().len() + diff.new.bytes().len() + lines * 64 + syntax_bytes,
+            bytes: diff.old.bytes().len() + diff.new.bytes().len() + lines * 64 + syntax_bytes
+                - unparsed,
+            unparsed,
             syntax: (syntax_bytes > 0).then(SyntaxSlot::default),
             diff: Arc::new(diff),
             hunks,
             structural: None,
-            gap_syntax: vec![None; gaps.len()],
+            gap_syntax: [Vec::new(), vec![None; gaps.len()]],
             marks: None,
             gaps,
             segments,
             counts,
+            changes,
             note,
             headings: None,
             whole,
@@ -778,6 +840,13 @@ impl File {
         self.counts
     }
 
+    /// The changes on `side`: the hunks with a line only there.
+    #[inline]
+    #[must_use]
+    pub fn changes(&self, side: Side) -> usize {
+        self.changes[side.index()]
+    }
+
     /// Approximate memory held, for a host's cache cap. Grows when the
     /// syntax diff is set or a hunk is drawn in a second arrangement.
     #[inline]
@@ -808,18 +877,25 @@ impl File {
         self.rendered.as_deref()
     }
 
-    /// The gaps, one before each hunk and one after the last; none for a
-    /// file without hunks.
+    /// The gaps, one before each hunk and one after the last. A file
+    /// without hunks has one of every line when its sides have them line
+    /// for line, and none otherwise.
     #[inline]
     #[must_use]
     pub fn gaps(&self) -> &[Gap] {
         &self.gaps
     }
 
-    /// The new-side lines of gap `gap`, for highlighting.
+    /// The lines of `side` in gap `gap`, for highlighting.
     #[must_use]
-    pub fn gap_lines(&self, gap: usize) -> Range<usize> {
-        self.gaps.get(gap).map_or(0..0, |g| g.new..g.new + g.len)
+    pub fn gap_lines(&self, gap: usize, side: Side) -> Range<usize> {
+        self.gaps.get(gap).map_or(0..0, |g| {
+            let start = match side {
+                Side::Old => g.old,
+                Side::New => g.new,
+            };
+            start..start + g.len
+        })
     }
 
     /// Whether hunk `hunk` of the line diff has no emphasis yet.
@@ -829,11 +905,14 @@ impl File {
         self.hunks.get(hunk).is_some_and(|h| h.emphasis.is_none())
     }
 
-    /// Whether gap `gap` is highlighted and has no syntax runs yet.
+    /// Whether gap `gap` is highlighted and has no syntax runs of `side`
+    /// yet.
     #[inline]
     #[must_use]
-    pub fn wants_gap_syntax(&self, gap: usize) -> bool {
-        self.syntax.is_some() && self.gap_syntax.get(gap).is_some_and(Option::is_none)
+    pub fn wants_gap_syntax(&self, gap: usize, side: Side) -> bool {
+        self.syntax.is_some()
+            && gap < self.gaps.len()
+            && (self.gap_syntax[side.index()].get(gap)).is_none_or(Option::is_none)
     }
 
     /// Whether the syntax diff is worth computing: not yet set, and the
@@ -884,15 +963,26 @@ impl File {
         }
     }
 
-    /// Stores gap `gap`'s syntax runs (see [`Prepare::gap_syntax`]), empty
-    /// when there are none, if `diff` is this file's diff and the gap has
-    /// none yet.
-    pub fn set_gap_syntax(&mut self, diff: &Arc<FileDiff>, gap: usize, spans: Option<Spans>) {
-        if !Arc::ptr_eq(&self.diff, diff) {
+    /// Stores the syntax runs of gap `gap`'s lines of `side` (see
+    /// [`Prepare::gap_syntax`]), empty when there are none, if `diff` is
+    /// this file's diff and the gap has none of that side yet.
+    pub fn set_gap_syntax(
+        &mut self,
+        diff: &Arc<FileDiff>,
+        gap: usize,
+        side: Side,
+        spans: Option<Spans>,
+    ) {
+        if !Arc::ptr_eq(&self.diff, diff) || gap >= self.gaps.len() {
             return;
         }
-        if let Some(slot @ None) = self.gap_syntax.get_mut(gap) {
+        let slots = &mut self.gap_syntax[side.index()];
+        if slots.len() < self.gaps.len() {
+            slots.resize(self.gaps.len(), None);
+        }
+        if let Some(slot @ None) = slots.get_mut(gap) {
             *slot = Some(spans.unwrap_or_default());
+            self.bytes += std::mem::take(&mut self.unparsed);
         }
     }
 
@@ -923,8 +1013,20 @@ impl File {
             view.syntax.clone_from(&line_view.syntax);
         }
         self.bytes += views.iter().map(|v| v.body.len() * 96).sum::<usize>();
-        self.structural = Some(SyntaxDiff { hunks, views, note });
+        self.structural = Some(SyntaxDiff {
+            hunks: hunks.into(),
+            views,
+            note,
+        });
         true
+    }
+
+    /// The syntax diff's hunks when they show for `structural`, rather than
+    /// the line diff's.
+    #[must_use]
+    pub(crate) fn shown_structural(&self, structural: bool) -> Option<&Arc<[Hunk]>> {
+        let s = self.structural.as_ref()?;
+        (self.uses_structural(structural)).then_some(&s.hunks)
     }
 
     /// Hunk `h`'s heading: the patch's, for a piped file, else found above
@@ -963,15 +1065,19 @@ impl File {
     #[inline]
     fn shown_hunks(&self, structural: bool) -> (&[Hunk], &[HunkView]) {
         match &self.structural {
-            Some(s) if structural && s.hunks.len() == self.hunks.len() => (&s.hunks, &s.views),
+            Some(s) if structural && s.hunks.len() == self.hunks.len() => (&*s.hunks, &s.views),
             _ => (&self.diff.hunks, &self.hunks),
         }
     }
 
-    fn shown_hunks_mut(&mut self, structural: bool) -> (&[Hunk], &mut [HunkView]) {
+    /// [`File::shown_hunks`], its views to change, with the diff.
+    fn shown_hunks_mut(&mut self, structural: bool) -> (&FileDiff, &[Hunk], &mut [HunkView]) {
+        let diff = &*self.diff;
         match &mut self.structural {
-            Some(s) if structural && s.hunks.len() == self.hunks.len() => (&s.hunks, &mut s.views),
-            _ => (&self.diff.hunks, &mut self.hunks),
+            Some(s) if structural && s.hunks.len() == self.hunks.len() => {
+                (diff, &*s.hunks, &mut s.views)
+            }
+            _ => (diff, &diff.hunks, &mut self.hunks),
         }
     }
 
@@ -1078,29 +1184,55 @@ impl File {
         }
     }
 
-    /// Builds hunk `h`'s rows and block starts in the arrangement `shape`
-    /// picks, unless it has them; a second arrangement's count toward
-    /// [`File::bytes`].
+    /// Builds hunk `h`'s rows and block starts in the layout `shape` picks,
+    /// unless it has them; a second layout's count toward [`File::bytes`].
     fn ensure_rows(&mut self, shape: &Shape<'_, impl Arrange>, h: usize) {
-        let (cores, views) = self.shown_hunks_mut(shape.structural);
+        let (diff, cores, views) = self.shown_hunks_mut(shape.structural);
         let (core, view) = (&cores[h], &mut views[h]);
-        let arrangement = shape.arrange.arrangement(&hunk_header(core, b""));
-        match (view.arrangement, &mut view.other) {
-            (Some(shown), _) if shown == arrangement => return,
-            (Some(_), Some(other)) => {
-                std::mem::swap(&mut view.rows, &mut other.0);
-                std::mem::swap(&mut view.starts, &mut other.1);
-                view.arrangement = Some(arrangement);
+        let layout = match shape.reading {
+            None => {
+                let arrangement = shape.arrange.arrangement(&hunk_header(core, b""));
+                // Asked for every row drawn or moved over: the rows built
+                // while both sides show are found without comparing layouts.
+                if matches!(view.layout, Some(Layout::Arranged(shown)) if shown == arrangement) {
+                    return;
+                }
+                Layout::Arranged(arrangement)
+            }
+            Some((_, opened)) if opened.binary_search(&h).is_ok() => Layout::Opened,
+            Some((side, _)) => Layout::Read(side),
+        };
+        let held = |view: &HunkView| {
+            view.rows.capacity() * size_of::<Row>() + view.starts.capacity() * size_of::<usize>()
+        };
+        match (view.layout, &mut view.other) {
+            (Some(shown), _) if shown == layout => return,
+            (Some(shown), Some(other)) if other.0 == layout => {
+                std::mem::swap(&mut view.rows, &mut other.1);
+                std::mem::swap(&mut view.starts, &mut other.2);
+                other.0 = shown;
+                view.layout = Some(layout);
                 return;
             }
-            (Some(_), other @ None) => {
+            // The other slot goes to the layout shown until now, and its
+            // vectors are reused for the new one.
+            (Some(shown), Some(other)) => {
+                std::mem::swap(&mut view.rows, &mut other.1);
+                std::mem::swap(&mut view.starts, &mut other.2);
+                other.0 = shown;
+                view.rows.clear();
+                view.starts.clear();
+            }
+            (Some(shown), other @ None) => {
                 *other = Some(Box::new((
+                    shown,
                     std::mem::take(&mut view.rows),
                     std::mem::take(&mut view.starts),
                 )));
             }
             (None, _) => {}
         }
+        let reused = held(view);
         let body = &view.body;
         let kind = |i: usize| {
             let BodyLine { line, state } = body[i];
@@ -1108,28 +1240,49 @@ impl File {
                 state != LineState::NoNewline && core.lines[line as usize].block_start;
             (state.kind(), block_start)
         };
-        rows(arrangement, body.len(), kind, &mut view.rows);
+        match layout {
+            Layout::Arranged(arrangement) => rows(arrangement, body.len(), kind, &mut view.rows),
+            Layout::Read(side) => {
+                let text = [&diff.old, &diff.new][side.index()];
+                let ends = |i: usize| {
+                    let l = &core.lines[body[i].line as usize];
+                    l.kind == LineKind::Context && !text.line(line_on(l, side)).ends_with(b"\n")
+                };
+                side_rows(side, body.len(), (kind, ends), &mut view.rows);
+            }
+            Layout::Opened => {
+                view.rows.push(Row::Header);
+                rows(Arrangement::Unified, body.len(), kind, &mut view.rows);
+            }
+        }
         let changed = |row: &Row| match *row {
-            Row::Line(i) | Row::Pair(Some(i), _) | Row::Pair(None, Some(i)) => {
+            Row::Line(i)
+            | Row::Pair(Some(i), _)
+            | Row::Pair(None, Some(i))
+            | Row::One { line: i, .. } => {
                 matches!(body[i].state.kind(), Kind::Removed | Kind::Added)
             }
-            Row::Header | Row::Marker | Row::Pair(None, None) => false,
+            Row::Header | Row::Marker | Row::Pair(None, None) | Row::Hidden { .. } => false,
         };
         view.starts.clear();
         let mut before = false;
         for (r, row) in view.rows.iter().enumerate() {
-            let now = changed(row);
-            if now && !before {
+            // Every hidden run is a stop for moving by change, even beside
+            // changed lines of the side read.
+            let hidden = matches!(*row, Row::Hidden { .. });
+            let now = hidden || changed(row);
+            if now && (!before || hidden) {
                 view.starts.push(r);
             }
             before = now;
         }
-        // The first arrangement's rows are in the estimate the file was
-        // built with; a second one's are on top of it.
+        // The first layout's rows are in the estimate the file was built
+        // with; a second one's are on top of it, and a layout replacing the
+        // second adds only what its vectors grew by. The estimate never
+        // shrinks: callers count what a call added.
         let second = view.other.is_some();
-        let added =
-            view.rows.capacity() * size_of::<Row>() + view.starts.capacity() * size_of::<usize>();
-        view.arrangement = Some(arrangement);
+        let added = held(view).saturating_sub(reused);
+        view.layout = Some(layout);
         if second {
             self.bytes += added;
         }
@@ -1241,8 +1394,8 @@ impl File {
         let key = Key {
             width: shape.arrange.width(),
             structural: self.uses_structural(shape.structural),
-            arrangement: match self.segment(part) {
-                Some(Segment::Hunk(h)) => self.shown_hunks(shape.structural).1[h].arrangement,
+            layout: match self.segment(part) {
+                Some(Segment::Hunk(h)) => self.shown_hunks(shape.structural).1[h].layout,
                 _ => None,
             },
             gap: None,
@@ -1252,8 +1405,7 @@ impl File {
             _ => None,
         };
         let fits = |held: &Key| {
-            (held.width, held.structural, held.arrangement)
-                == (key.width, key.structural, key.arrangement)
+            (held.width, held.structural, held.layout) == (key.width, key.structural, key.layout)
                 && match (&held.gap, gap) {
                     (Some((top, bottom, windows)), Some(shown)) => {
                         (*top, *bottom, &windows[..]) == (shown.top, shown.bottom, shown.windows)
@@ -1372,27 +1524,36 @@ impl File {
     }
 
     /// Each line of `side` hunk `h` shows, with the row showing it, by line.
+    /// While a side is read alone, a hidden line's row is the one of the
+    /// line it pairs with, or else the one standing for it.
     fn line_rows(&self, structural: bool, h: usize, side: Side) -> Vec<(usize, usize)> {
         let (cores, views) = self.shown_hunks(structural);
         let (core, view) = (&cores[h], &views[h]);
         let mut rows = Vec::new();
+        let mut push = |i: usize, r: usize| {
+            let body = view.body[i];
+            if body.state == LineState::NoNewline {
+                return;
+            }
+            let l = &core.lines[body.line as usize];
+            match (side, l.kind) {
+                (Side::Old, LineKind::Added) | (Side::New, LineKind::Removed) => {}
+                _ => rows.push((line_on(l, side), r)),
+            }
+        };
         for (r, row) in view.rows.iter().enumerate() {
             let shows = match *row {
                 Row::Line(i) => [Some(i), None],
                 Row::Pair(old, new) => [old, new],
+                Row::One { line, paired } => [Some(line), paired],
+                Row::Hidden { from, n } => {
+                    (from..from + n as usize).for_each(|i| push(i, r));
+                    [None, None]
+                }
                 Row::Header | Row::Marker => [None, None],
             };
             for i in shows.into_iter().flatten() {
-                let body = view.body[i];
-                if body.state == LineState::NoNewline {
-                    continue;
-                }
-                let l = &core.lines[body.line as usize];
-                match (side, l.kind) {
-                    (Side::Old, LineKind::Added) | (Side::New, LineKind::Removed) => {}
-                    (Side::Old, _) => rows.push((l.old, r)),
-                    (Side::New, _) => rows.push((l.new, r)),
-                }
+                push(i, r);
             }
         }
         rows.sort_unstable();
@@ -1405,13 +1566,18 @@ impl File {
     }
 
     /// The arrangement of part `part`'s rows; `None` for a part that isn't
-    /// a hunk.
+    /// a hunk, and for one read on a side alone. A hunk opened in place is
+    /// unified.
     fn arrangement(&mut self, shape: &Shape<'_, impl Arrange>, part: usize) -> Option<Arrangement> {
         let Some(Segment::Hunk(h)) = self.segment(part) else {
             return None;
         };
         self.ensure_rows(shape, h);
-        self.shown_hunks(shape.structural).1[h].arrangement
+        match self.shown_hunks(shape.structural).1[h].layout? {
+            Layout::Arranged(arrangement) => Some(arrangement),
+            Layout::Opened => Some(Arrangement::Unified),
+            Layout::Read(_) => None,
+        }
     }
 
     /// Moves `pos` to the next row, offset 0; false at the file's end.
@@ -1584,13 +1750,18 @@ impl File {
     }
 
     /// The new-side line number of the first line at or after row `from`
-    /// of hunk `h`. A removed line's is where it would be in the new file.
+    /// of hunk `h`. A removed line's is where it would be in the new file;
+    /// a row standing only for hidden lines counts the first of them.
     fn hunk_line(&self, structural: bool, h: usize, from: usize) -> usize {
         let (cores, views) = self.shown_hunks(structural);
         let (core, view) = (&cores[h], &views[h]);
         let first_body = (from..view.rows.len())
             .find_map(|r| match view.rows[r] {
-                Row::Line(i) | Row::Pair(_, Some(i)) | Row::Pair(Some(i), None) => Some(i),
+                Row::Line(i)
+                | Row::Pair(_, Some(i))
+                | Row::Pair(Some(i), None)
+                | Row::One { line: i, .. }
+                | Row::Hidden { from: i, .. } => Some(i),
                 Row::Header | Row::Marker | Row::Pair(None, None) => None,
             })
             .unwrap_or(0);
@@ -1820,7 +1991,7 @@ impl File {
                     }
                 };
                 match view.rows.get(pos.row) {
-                    Some(&Row::Line(i)) => line(i),
+                    Some(&(Row::Line(i) | Row::One { line: i, .. })) => line(i),
                     Some(&Row::Pair(old, new)) => {
                         [old.and_then(|i| line(i)[0]), new.and_then(|i| line(i)[1])]
                     }
@@ -1838,16 +2009,45 @@ impl File {
         }
     }
 
+    /// The lines of the other side that the row at `pos` marks as hidden,
+    /// while a side is read alone: that side and the lines, in order. `None`
+    /// on any other row.
+    fn mark(&mut self, shape: &Shape<'_, impl Arrange>, pos: Pos) -> Option<(Side, Range<usize>)> {
+        let (side, _) = shape.reading?;
+        let Some(Segment::Hunk(h)) = self.segment(pos.part) else {
+            return None;
+        };
+        self.ensure_rows(shape, h);
+        self.ensure_blocks(shape, pos.part);
+        let At::Own(row) = self.at(shape, pos.part, pos.row) else {
+            return None;
+        };
+        let (cores, views) = self.shown_hunks(shape.structural);
+        let (core, view) = (&cores[h], &views[h]);
+        let Row::Hidden { from, n } = *view.rows.get(row)? else {
+            return None;
+        };
+        let start = line_on(&core.lines[view.body[from].line as usize], side.other());
+        Some((side.other(), start..start + n as usize))
+    }
+
     /// Hunk `h`'s lines as shown (the syntax diff's with `structural`, when
     /// there is one), by line of its body.
     #[inline]
     #[must_use]
     pub fn lines(&self, structural: bool, h: usize) -> HunkLines<'_> {
+        self.lines_read(structural, h, Side::New)
+    }
+
+    /// Hunk `h`'s lines as [`File::lines`] gives them, unchanged lines
+    /// taking `side`'s text.
+    fn lines_read(&self, structural: bool, h: usize, side: Side) -> HunkLines<'_> {
         let (cores, views) = self.shown_hunks(structural);
         HunkLines {
             file: self,
             core: &cores[h],
             view: &views[h],
+            side,
         }
     }
 
@@ -1875,7 +2075,8 @@ impl File {
         Some(match segment {
             Segment::Start => Content::Start(self.header(&cores[0], self.heading(views, 0))),
             Segment::Hunk(h) => {
-                let lines = self.lines(shape.structural, h);
+                let side = shape.reading.map_or(Side::New, |(side, _)| side);
+                let lines = self.lines_read(shape.structural, h, side);
                 Content::Hunk {
                     header: self.header(lines.core, self.heading(views, h)),
                     row: lines.view.rows[pos.row],
@@ -1899,14 +2100,26 @@ impl File {
                     }
                     Some(offset) => {
                         let (old, new) = (span.old + offset, span.new + offset);
-                        let raw = self.diff.new.line(new);
+                        // The sides' unchanged lines may differ where
+                        // whitespace is ignored.
+                        let (side, line) = match shape.reading {
+                            Some((Side::Old, _)) => (Side::Old, old),
+                            Some((Side::New, _)) | None => (Side::New, new),
+                        };
+                        let raw = match side {
+                            Side::Old => self.diff.old.line(old),
+                            Side::New => self.diff.new.line(new),
+                        };
+                        let spans = self.gap_syntax[side.index()]
+                            .get(g)
+                            .and_then(Option::as_ref);
                         let line = Line {
                             state: LineState::Context,
                             old: Some(old + 1),
                             new: Some(new + 1),
                             text: display_text(raw.strip_suffix(b"\n").unwrap_or(raw)),
                             emphasis: &[],
-                            syntax: self.gap_syntax[g].as_ref().map(|s| s.line(new)),
+                            syntax: spans.map(|s| s.line(line)),
                             paint: &[],
                             block_start: false,
                         };
@@ -2014,6 +2227,8 @@ pub struct HunkLines<'a> {
     file: &'a File,
     core: &'a Hunk,
     view: &'a HunkView,
+    /// The side unchanged lines take their text and syntax runs from.
+    side: Side,
 }
 
 impl std::fmt::Debug for HunkLines<'_> {
@@ -2039,6 +2254,17 @@ impl<'a> HunkLines<'a> {
         self.view.body.is_empty()
     }
 
+    /// The hunk's lines only on `side`: removed lines on the old side,
+    /// added ones on the new.
+    #[must_use]
+    pub fn only_on(&self, side: Side) -> usize {
+        let kind = match side {
+            Side::Old => LineKind::Removed,
+            Side::New => LineKind::Added,
+        };
+        self.core.lines.iter().filter(|l| l.kind == kind).count()
+    }
+
     /// Line `i` of the body.
     #[inline]
     #[must_use]
@@ -2054,6 +2280,9 @@ impl<'a> HunkLines<'a> {
             .as_deref()
             .map_or(NO_EMPHASIS, |e| &e[line][..]);
         let core_line = &self.core.lines[line];
+        if self.side == Side::Old && core_line.kind == LineKind::Context {
+            return self.old_context(core_line, state, emphasis);
+        }
         let shown = diff_line(
             &self.file.diff,
             core_line,
@@ -2061,6 +2290,26 @@ impl<'a> HunkLines<'a> {
             emphasis,
             self.view.syntax.as_ref(),
         );
+        rendered::restyle(self.file.rendered.as_deref(), shown)
+    }
+
+    /// [`HunkLines::line`] for an unchanged line read on the old side: the
+    /// sides' unchanged lines may differ where whitespace is ignored.
+    // Out of line, so the path every drawn line takes stays as small.
+    #[inline(never)]
+    fn old_context(
+        &self,
+        core_line: &diff::Line,
+        state: LineState,
+        emphasis: &'a [Range<usize>],
+    ) -> Line<'a> {
+        let syntax = self.view.syntax.as_ref();
+        let raw = self.file.diff.old.line(core_line.old);
+        let shown = Line {
+            text: display_text(raw.strip_suffix(b"\n").unwrap_or(raw)),
+            syntax: (syntax.and_then(|s| s.old.as_ref())).map(|o| o.line(core_line.old)),
+            ..diff_line(&self.file.diff, core_line, state, emphasis, syntax)
+        };
         rendered::restyle(self.file.rendered.as_deref(), shown)
     }
 }

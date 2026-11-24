@@ -24,21 +24,21 @@ expression: screen(&mut app)
 │                                     │                                                                                                    ┃
 │                                     │                                                                                                    ┃
 │                                     │                                                                                                    ┃
-│                                     │                                                                                                    ┃
-│                                     │                                                               ┌─ commands ────────────────────────┐┃
-│                                     │                                                               │                                   │┃
-│                                     │                                                               │  View                             │┃
-│                                     │                                                               │  s  Layout ‹ auto (split here) ›  │┃
-│                                     │                                                               │  W  [ ] Wrap long lines           │┃
-│                                     │                                                               │  d  [ ] Syntax diff               │┃
-│                                     │                                                               │  X  [ ] Whole file                │┃
-│                                     │                                                               │                                   │┃
-│                                     │                                                               │  Go                               │┃
-│                                     │                                                               │  o  Find file…                    │█
-│                                     │                                                               │  i  Comments panel                │┃
-│                                     │                                                               │  w  [ ] Watch for changes         │┃
-│                                     │                                                               │  .  Open terminal here            │┃
-│                                     │                                                               │                                   ││
-│                                     │                                                               │  space more · ? keys · esc close  ││
-│                                     │                                                               └───────────────────────────────────┘│
+│                                     │                                                          ┌─ commands ─────────────────────────────┐┃
+│                                     │                                                          │                                        │┃
+│                                     │                                                          │  View                                  │┃
+│                                     │                                                          │  _  File view ‹ off ›                  │┃
+│                                     │                                                          │  s  Layout ‹ auto (split here) ›       │┃
+│                                     │                                                          │  W  [ ] Wrap long lines                │┃
+│                                     │                                                          │  d  [ ] Syntax diff                    │┃
+│                                     │                                                          │  X  [ ] Whole file                     │┃
+│                                     │                                                          │                                        │┃
+│                                     │                                                          │  Go                                    │┃
+│                                     │                                                          │  o  Find file…                         │█
+│                                     │                                                          │  i  Comments panel                     │┃
+│                                     │                                                          │  w  [ ] Watch for changes              │┃
+│                                     │                                                          │  .  Open terminal here                 │┃
+│                                     │                                                          │                                        ││
+│                                     │                                                          │  space more · ? keys · esc close       ││
+│                                     │                                                          └────────────────────────────────────────┘│
 └──  working tree  1/2 · 1/2 hunk ────┴─ split ───────────────────────────────────────────────────── / search · tab tree · space commands ─┘

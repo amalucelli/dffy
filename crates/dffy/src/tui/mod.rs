@@ -16,7 +16,8 @@ mod fuzzy;
 mod help;
 mod markdown;
 mod menu;
-mod picker;
+mod peek;
+pub(crate) mod picker;
 pub(crate) mod piped;
 mod textbox;
 mod tree;
@@ -41,11 +42,12 @@ use dffy_core::conflict::Choices;
 use dffy_core::diff::Options;
 use dffy_core::git::{
     Applied, ChangeSet, Checkpoint, DiffSpec, Edit, FileChange, FileDiff, NewSide, Picked, Repo,
-    Revisions, Side, Update,
+    Revisions, Side, Snapshot, Update,
 };
 use dffy_core::watch::{Change, Notice, Plain, Root, Watcher};
 
 pub(crate) use app::{Action, App, Checkout, Handed, Handoff, Suggestion, Uncommitted};
+pub(crate) use tree::bench_all_files;
 pub(crate) use worker::Done;
 
 use crate::daemon::client::{self, Subscription};
@@ -76,6 +78,12 @@ pub(crate) enum Event {
     /// bypass the loop.
     Watch(client::Event),
     Diffed(Done),
+    /// How far an index of the navigator helper of generation `generation`
+    /// is built, as it pushed it.
+    IndexBuilt {
+        generation: u64,
+        pushed: crate::navigator::client::Pushed,
+    },
     /// The next commit or file of a piped diff; [`Event::EnumerationDone`]
     /// follows the last.
     Piped(piped::Item),
@@ -219,8 +227,10 @@ fn apply(repo: &Repo, s: &Suggestion) -> Result<dffy_core::annotation::Applied, 
     let at_head = match change.new {
         _ if s.checkout.is_some() => true,
         Some(Side::Object { id, .. }) => {
-            let head = repo.head_blob(change.path.as_ref());
-            head.map_err(|e| e.to_string())? == Some(id)
+            let head = repo
+                .head_tree()
+                .and_then(|tree| repo.side_at(Snapshot::Tree(tree), change.path.as_ref()));
+            head.map_err(|e| e.to_string())?.and_then(|side| side.id()) == Some(id)
         }
         _ => false,
     };
@@ -351,6 +361,7 @@ pub(crate) fn run(
         Some((.., staged)) => *staged,
         None => uncommitted(&plan.spec, &revisions, plan.reverse),
     };
+    let (snapshots, reverse) = (plan.spec.snapshots(plan.reverse), plan.reverse);
     let mut set = ChangeSet::new(plan.repo, plan.spec, revisions, &plan.paths, plan.reverse);
     if ctx.config.renames {
         set = set.with_renames(ctx.cache.clone());
@@ -398,6 +409,8 @@ pub(crate) fn run(
         tty.size(),
         ctx.indicators(),
     );
+    app.versions = plan.versions;
+    app.set_disk_cache(ctx.cache.is_some());
     prepare(&mut app, ctx);
     // Not in `prepare`: a piped diff has no review, so the plugin isn't
     // asked to describe itself for one. Unless parsing needed the
@@ -420,6 +433,11 @@ pub(crate) fn run(
             .map(|name| name.to_string_lossy().into_owned()),
     );
     app.set_worktree(repo.workdir().map(Path::to_owned));
+    app.set_snapshots(snapshots);
+    app.set_reverse(reverse);
+    if ctx.config.all_files {
+        app.start_all_files();
+    }
     if let Some(commit) = commit {
         app.event(Event::Piped(piped::Item::Commit(commit)));
     }
@@ -1180,9 +1198,23 @@ impl Session<'_> {
                         to,
                         open,
                     } => self.start_agent(app, (&seed, open), &dir, to)?,
+                    // The files opened outside the diff are looked up again
+                    // at the sides the new list was taken from.
+                    Event::Refreshed(update) => {
+                        app.set_snapshots(update.snapshots);
+                        let found = self.look_up(app.wanted_lookups(update.rescanned()));
+                        app.event(Event::Refreshed(update));
+                        app.relooked(found);
+                    }
                     event => match app.event(event) {
                         Some(Action::Quit) => return self.quit(app, rx),
                         Some(Action::Edit { path, line }) => self.edit(app, &path, line)?,
+                        Some(Action::OpenOther { path, at, side }) => {
+                            let found = self.look_up(vec![(path, side, at)]);
+                            for (path, side, found) in found {
+                                app.other_found(path.as_ref(), side, found);
+                            }
+                        }
                         Some(Action::Compose(text)) => self.compose(app, &text)?,
                         Some(Action::Browse(url)) => browse(app, &url),
                         Some(Action::OpenTerminal) => self.open_terminal(app),
@@ -1476,7 +1508,61 @@ impl Session<'_> {
         }
     }
 
-    /// Hands the terminal to the editor and takes it back.
+    /// Where each of `paths` is at its snapshot, for the files opened
+    /// outside the diff; on this thread, as a tree's lookup reads a few
+    /// objects and a file's a stat. The working tree's files are those the
+    /// index tracks, by their exact path, as the picker lists them: not an
+    /// ignored file, nor a tracked one named in another case, which a
+    /// case-insensitive filesystem would find.
+    // The index is parsed per path looked up in the index or the working
+    // tree, and the control API's clients, agents among them, may ask often:
+    // take a loaded index if this becomes per file.
+    fn look_up(
+        &self,
+        paths: Vec<(BString, dffy_core::document::Side, Snapshot)>,
+    ) -> Vec<(BString, dffy_core::document::Side, app::Found)> {
+        paths
+            .into_iter()
+            .map(|(path, side, at)| {
+                let Some(repo) = &self.files else {
+                    return (
+                        path,
+                        side,
+                        Err("there's no repository to open it from".into()),
+                    );
+                };
+                let tracked = || {
+                    let mut seen = false;
+                    let only = std::slice::from_ref(&path);
+                    repo.list_paths(Snapshot::Worktree, only, |listed, _| {
+                        seen = listed == path;
+                        if seen {
+                            std::ops::ControlFlow::Break(())
+                        } else {
+                            std::ops::ControlFlow::Continue(())
+                        }
+                    })
+                    .map(|()| seen)
+                };
+                let found = match at {
+                    Snapshot::Worktree => tracked().and_then(|tracked| {
+                        if tracked {
+                            repo.side_at(at, path.as_bstr())
+                        } else {
+                            Ok(None)
+                        }
+                    }),
+                    _ => repo.side_at(at, path.as_bstr()),
+                };
+                (path, side, found.map_err(|e| e.to_string()))
+            })
+            .collect()
+    }
+
+    /// Hands the terminal to the editor and takes it back. Once it exits
+    /// cleanly having changed the file, the file is read again where the
+    /// view shows it from the working tree, as watch mode may not be on to
+    /// do; one left as it was isn't, which would drop what's on it.
     fn edit(&self, app: &mut App, path: &BString, line: usize) -> io::Result<()> {
         let (Some(full), Some(reader)) = (
             self.files.as_ref().and_then(|f| f.on_disk(path.as_bstr())),
@@ -1491,7 +1577,16 @@ impl Session<'_> {
             });
             return Ok(());
         };
-        self.in_editor(app, reader, &full, line)?;
+        let stamp = || {
+            let meta = std::fs::metadata(&full).ok()?;
+            Some((meta.modified().ok(), meta.len()))
+        };
+        let before = stamp();
+        if self.in_editor(app, reader, &full, line)? && app.edited(path, stamp() != before) {
+            self.requests
+                .send(Request::Refresh(vec![path.clone()]))
+                .ok();
+        }
         Ok(())
     }
 

@@ -13,7 +13,9 @@
 //! dropping patterns dffy doesn't draw saves little.
 
 mod lang;
+mod locals;
 mod scope;
+mod tags;
 
 use std::ops::{ControlFlow, Range};
 use std::sync::OnceLock;
@@ -22,8 +24,16 @@ use std::time::{Duration, Instant};
 use rustc_hash::FxHashMap;
 use tree_sitter::{InputEdit, Parser, Point, Query, QueryCursor, StreamingIterator, Tree};
 
-pub use lang::{Grammar, Language, LanguageSource, Registry, Words};
+pub use lang::{Grammar, Language, LanguageSource, Registry, SNIFF_BYTES, Words, reads_as_cpp};
+pub use locals::{Call, Local, Receiver};
 pub use scope::Scopes;
+pub use tags::{
+    Definition, DefinitionKind, Definitions, MAX_TAGS_BYTES, Skipped, TagsError, blob_definitions,
+    definitions,
+};
+pub(crate) use tags::{
+    PACKS, Pack, TAGS_PARSE_BUDGET, cached_definitions, extract_blob, pack_key, pack_of,
+};
 
 use crate::cache::{self, Cache};
 use crate::diff::{Emphasis, Hunk, LineKind, Text, emphasize_with};
@@ -151,6 +161,45 @@ pub fn parse(lang: &Language, source: &[u8]) -> Option<Parsed> {
         tree,
         lang: lang.clone(),
     })
+}
+
+/// Compiles `lang`'s locals query now unless that's done, so the first name
+/// resolved by it doesn't wait for it.
+pub(crate) fn prepare_locals(lang: &Language) {
+    lang.locals_query();
+}
+
+/// The local, the parameter or (for C) the file-scope variable the name
+/// at bytes `at` of `source`, in `lang` and parsed as `tree`, is, by the
+/// language's locals query; `None` for a language without one, or a name
+/// that isn't one, or when `stop` says to before it's found.
+pub(crate) fn local_at(
+    lang: &Language,
+    tree: &Tree,
+    source: &[u8],
+    at: Range<usize>,
+    stop: &dyn Fn() -> bool,
+) -> Option<Local> {
+    locals::resolve(lang.locals_query()?, lang.name(), tree, source, at, stop)
+}
+
+/// The receiver of the member at bytes `at` of `source`, in `lang` and
+/// parsed as `tree`: what the asking file tells of its type; `None` when
+/// the name is no member.
+pub(crate) fn receiver_at(
+    lang: &Language,
+    tree: &Tree,
+    source: &[u8],
+    at: Range<usize>,
+    stop: &dyn Fn() -> bool,
+) -> Option<Receiver> {
+    locals::receiver(lang.locals_query(), lang.name(), tree, source, at, stop)
+}
+
+/// Whether the name at bytes `at` of the source parsed as `tree` is a
+/// member (`x.p`) or a path's last segment (`a::p`).
+pub(crate) fn is_member(tree: &Tree, at: Range<usize>) -> bool {
+    locals::is_member(tree, at)
 }
 
 /// The syntax tree of `source`, or `None` when parsing takes longer than
@@ -670,7 +719,7 @@ impl Highlighter {
         store: bool,
     ) -> Option<Self> {
         let bytes = new.text.bytes();
-        let lang = grammars.detect(new.path, &bytes[..bytes.len().min(256)])?;
+        let lang = grammars.detect(new.path, &bytes[..bytes.len().min(SNIFF_BYTES)])?;
         if new.text.is_empty() {
             return None;
         }
@@ -845,6 +894,12 @@ impl FileSyntax {
     #[must_use]
     pub fn new_spans(&self, new: &Text, lines: Range<usize>) -> Option<Spans> {
         self.new.as_ref().map(|h| h.spans(new, lines))
+    }
+
+    /// The spans of `lines` of the `old` side, if it's highlighted.
+    #[must_use]
+    pub fn old_spans(&self, old: &Text, lines: Range<usize>) -> Option<Spans> {
+        self.old.as_ref().map(|h| h.spans(old, lines))
     }
 
     /// The spans of the lines `hunk` shows on each side of `old` and

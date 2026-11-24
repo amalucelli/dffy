@@ -141,8 +141,9 @@ pub struct Applied {
 ///
 /// `new_side` says whether `shown`'s new side may be a commit's tree: with
 /// [`NewSide::Head`], the caller checked it's HEAD's version of the file
-/// ([`Repo::head_blob`]), so the working tree was made from it. The lines are found in the file on disk
-/// either way, and refused when they no longer match.
+/// ([`Repo::side_at`] `HEAD`'s tree), so the working tree was made from
+/// it. The lines are found in the file on disk either way, and refused
+/// when they no longer match.
 ///
 /// `at` is the first anchored line as recorded on `shown`'s new side. The
 /// file is read now and the lines placed on it as [`Anchor::place`] does:

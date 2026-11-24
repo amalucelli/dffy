@@ -14,9 +14,8 @@
 
 use std::ops::Range;
 
-use unicode_width::UnicodeWidthStr;
-
 use super::tree::{fit_left, fit_right};
+use crate::columns::Columns as _;
 use crate::term::Grid;
 use crate::theme::{Role, Theme};
 

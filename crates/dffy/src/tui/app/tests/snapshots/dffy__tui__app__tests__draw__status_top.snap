@@ -1,6 +1,5 @@
 ---
-source: crates/dffy/src/tui/app.rs
-assertion_line: 2989
+source: crates/dffy/src/tui/app/tests/draw.rs
 expression: chip_markup(&mut app)
 ---
 ┌ Files · 2 +1 -1 ─────────────────────────┬─ modified · src/some/deeply/nested/module/file.rs · +1 -1 ────────── [ v6.0..v6.1 ] 1/2 · 1/1 hunk  space commands ─┐

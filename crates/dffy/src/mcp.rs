@@ -21,12 +21,18 @@ use std::fmt::Write as _;
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::io::{self, BufRead, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::Ordering;
+use std::time::{Duration, Instant};
 
-use dffy_core::diff::Options;
-use dffy_core::git::{FileChange, Repo, Revisions, WhichCheckpoint};
+use dffy_core::bstr::BString;
+use dffy_core::diff::{Options, Text, Whitespace};
+use dffy_core::git::{self, FileChange, Repo, Revisions, WhichCheckpoint};
+use dffy_core::navigate::{self, Origin};
+use dffy_core::view::Side;
 
 use crate::config::{Context, DefaultDiff};
 use crate::encode::{self, Compared, Detail, Files, Window};
+use crate::navigator::client::{Helper, Helpers, Opened};
 use crate::plugin::json::{Value, parse, string, write};
 use crate::print::{Plan, Summary, Target};
 use crate::render::Canvas;
@@ -66,6 +72,8 @@ const INSTRUCTIONS: &str = "dffy shows the changes in the git repository it was 
     only moved code are classified, so you can skip them. list_comments returns the review \
     comments left on the code, with their threads, thread_prompt one thread as a prompt to \
     answer, with its lines and the changes near them, and reply_to_thread answers in a thread. \
+    definitions finds where a C or Rust name is defined at either version of the diff, and \
+    with references: true the lines using it. \
     Results are paged: pass next_cursor \
     back as cursor, with the same arguments, to continue. When the user has the dffy viewer \
     open here, open_in_viewer shows them a file at a line, focus_thread a comment thread, \
@@ -285,13 +293,13 @@ const TOOLS: &str = r#"[
 {
   "name": "open_in_viewer",
   "title": "Show a file in the viewer",
-  "description": "Show a file of the diff in the dffy viewer the user has open in this repository, at a line when given, so the user sees what you're talking about. It answers once the file shows. Fails, saying so, when no viewer runs here, or the file isn't in the diff the viewer shows.",
+  "description": "Show a file in the dffy viewer the user has open in this repository, at a line when given, so the user sees what you're talking about. A file of the diff shows with its changes. Any other file in the repository opens whole, unchanged, at side's version, and the result has listed: false. It answers once the file shows. Fails, saying so, when no viewer runs here, no file is at that path on that side, or the viewer is still listing the diff's files (ask again).",
   "inputSchema": {
     "type": "object",
     "properties": {
-      "path": {"type": "string", "description": "The file, relative to the repository root, as changed_files lists it."},
-      "line": {"type": "integer", "minimum": 1, "description": "The line to show, 1-based, on side's numbering. Omit to show the file from its first change."},
-      "side": {"type": "string", "enum": ["old", "new"], "default": "new", "description": "Which version line numbers: new for the file as changed, old for it before."}
+      "path": {"type": "string", "description": "The file, relative to the repository root, as changed_files lists it, or any other file there."},
+      "line": {"type": "integer", "minimum": 1, "description": "The line to show, 1-based, on side's numbering. Omit to show the file from its first change, or from its top when it has none."},
+      "side": {"type": "string", "enum": ["old", "new"], "default": "new", "description": "Which version: line numbers are on it, and for a file outside the diff it's the version shown. new for the file as changed, old for it before."}
     },
     "required": ["path"],
     "additionalProperties": false
@@ -302,7 +310,8 @@ const TOOLS: &str = r#"[
       "view": {"type": "integer"},
       "path": {"type": "string"},
       "line": {"type": ["integer", "null"]},
-      "side": {"type": "string"}
+      "side": {"type": "string"},
+      "listed": {"type": "boolean", "description": "Present, and false, when the diff doesn't list the file, which opened whole at side."}
     },
     "required": ["view", "path", "line", "side"]
   },
@@ -346,6 +355,46 @@ const TOOLS: &str = r#"[
     "required": ["view", "selection"]
   },
   "annotations": {"readOnlyHint": true, "idempotentHint": false, "openWorldHint": false}
+},
+{
+  "name": "definitions",
+  "title": "Where a name is defined",
+  "description": "Find where a name (a function, macro, type, class, struct, enum, constant, method, field...) is defined, in Bash, C, C++, C#, Elixir, Go, Java, JavaScript, Kotlin, Lua, PHP, Python, Ruby, Rust, Scala, Swift, TypeScript or Zig code, at either version of a diff, without a language server: names are matched, not resolved, so a common name may have several candidates, nearest first (the same file, then the files it includes or imports, then the same folder or crate, then the rest). Each candidate says whether this diff changes its file (changed) and its lines (in_hunk). With path, the asking file and what it includes or imports rank first; without it, every definition of the name counts. With line and column of the use in path as well, the answer is much better: a local variable, a parameter or an import the use refers to comes first, and an imported name under another name finds what it names. The index of the version's definitions builds in the background from the first call: until it's done, partial is true and a definition may be missing; ask again for the full answer. A name with no definition found returns the lines using it, text_match true. references: true adds the lines using the name, past its definitions, comments and strings, in the first 200 files with one, paged: when next_cursor isn't null, call again with it as cursor and the same arguments. Read-only.",
+  "inputSchema": {
+    "type": "object",
+    "properties": {
+      "name": {"type": "string", "description": "The name, as an identifier: letters, digits and _."},
+      "path": {"type": "string", "description": "The file asking, relative to the repository root, a C or Rust file."},
+      "line": {"type": "integer", "minimum": 1, "description": "The line of path the name is used on, 1-based, in the version looked in."},
+      "column": {"type": "integer", "minimum": 1, "description": "Where on line the name starts, 1-based, in bytes; without it, the name's first use in code on the line."},
+      "side": {"type": "string", "enum": ["old", "new"], "default": "new", "description": "Which version of the diff to look in: new for the files as changed, old for them before."},
+      "range": {"type": ["string", "array"], "items": {"type": "string"}, "description": "The diff, as for changed_files. Omit for uncommitted changes: new is then the working tree."},
+      "since_checkpoint": {"type": ["string", "integer"], "description": "As for changed_files, instead of range."},
+      "references": {"type": "boolean", "default": false, "description": "Add the lines using the name."},
+      "calls_only": {"type": "boolean", "default": false, "description": "With references, only the lines calling the name."},
+      "in_diff": {"type": "boolean", "default": false, "description": "With references, only the lines in files this diff changes."},
+      "limit": {"type": "integer", "minimum": 1, "maximum": 1000, "default": 100, "description": "Lines using the name per page."},
+      "cursor": {"type": "string", "description": "next_cursor from the previous page."}
+    },
+    "required": ["name"],
+    "additionalProperties": false
+  },
+  "outputSchema": {
+    "type": "object",
+    "properties": {
+      "name": {"type": "string"},
+      "side": {"type": "string"},
+      "candidates": {"type": "array", "items": {"type": "object", "properties": {"path": {"type": "string"}, "start": {"type": "integer"}, "end": {"type": "integer"}, "kind": {"type": ["string", "null"]}, "container": {"type": ["string", "null"]}, "changed": {"type": "boolean"}, "in_hunk": {"type": ["boolean", "null"]}, "text_match": {"type": "boolean"}, "text": {"type": ["string", "null"]}}}},
+      "total": {"type": "integer", "description": "Definitions found, beyond the 200 listed."},
+      "progress": {"type": "object", "properties": {"indexed": {"type": "integer"}, "files": {"type": "integer"}}},
+      "partial": {"type": "boolean", "description": "The index isn't complete: a definition may be missing."},
+      "references": {"type": ["object", "null"], "properties": {"matches": {"type": "array", "items": {"type": "object", "properties": {"path": {"type": "string"}, "line": {"type": "integer"}, "text": {"type": "string"}, "changed": {"type": "boolean"}}}}, "total": {"type": "integer"}, "files": {"type": "integer"}, "complete": {"type": "boolean"}}},
+      "next_cursor": {"type": ["string", "null"]},
+      "note": {"type": "string", "description": "Why the index is kept in memory rather than in the disk cache, when it is."}
+    },
+    "required": ["name", "side", "candidates", "total", "progress", "partial", "references", "next_cursor"]
+  },
+  "annotations": {"readOnlyHint": true, "idempotentHint": false, "openWorldHint": false}
 }
 ]"#;
 
@@ -363,6 +412,7 @@ pub(crate) fn serve(dir: Option<&Path>, comments: Option<&Path>, ctx: &Ctx) -> R
         ctx,
         legacy: false,
         client: None,
+        navigation: Navigation::default(),
     };
     let mut stdin = io::stdin().lock();
     let mut stdout = io::stdout().lock();
@@ -398,6 +448,8 @@ struct Server<'a> {
     /// The client's name, as `initialize`'s `clientInfo` gives it: who the
     /// replies it writes are by.
     client: Option<String>,
+    /// `definitions`' navigators and the uses it found.
+    navigation: Navigation,
 }
 
 /// A JSON-RPC error.
@@ -563,6 +615,7 @@ impl Server<'_> {
             }
         };
         let args = Args(args);
+        self.navigation.tidy(Instant::now());
         let result = match name {
             "changed_files" => self.changed_files(&args),
             "file_diff" => self.file_diff(&args),
@@ -574,6 +627,7 @@ impl Server<'_> {
             "open_in_viewer" => self.open_in_viewer(&args),
             "focus_thread" => self.focus_thread(&args),
             "viewer_selection" => self.viewer_selection(&args),
+            "definitions" => self.definitions(&args),
             _ => return Err(Fault::new(INVALID_PARAMS, format!("Unknown tool: {name}"))),
         };
         let mut s = String::from(r#""content":[{"type":"text","text":"#);
@@ -787,6 +841,43 @@ impl Args<'_> {
                 .ok_or_else(|| {
                     "since_checkpoint must be \"latest\" or a checkpoint's number".to_owned()
                 }),
+        }
+    }
+
+    /// `definitions`' `line` and `column` of the use, 1-based, as the
+    /// core's 0-based place.
+    fn place(&self) -> Result<Option<navigate::Use>, String> {
+        let most = u32::MAX as usize;
+        match (
+            self.number("line", 0, [1, most])?,
+            self.number("column", 0, [1, most])?,
+        ) {
+            (0, 0) => Ok(None),
+            (0, _) => Err("column needs line".to_owned()),
+            (line, column) => Ok(Some(navigate::Use {
+                line: line - 1,
+                column: column.checked_sub(1),
+            })),
+        }
+    }
+
+    /// `definitions`' `name`: an identifier.
+    fn name(&self) -> Result<String, String> {
+        let name = (self.string("name")?).ok_or("name is required: the name to look up")?;
+        if name.is_empty() || !name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_') {
+            return Err(format!(
+                "{name:?} isn't a name: letters, digits and _ only, as an identifier is"
+            ));
+        }
+        Ok(name.to_owned())
+    }
+
+    /// `side`: the diff's `new` version, or its `old` one.
+    fn side(&self) -> Result<Side, String> {
+        match self.string("side")? {
+            None | Some("new") => Ok(Side::New),
+            Some("old") => Ok(Side::Old),
+            Some(_) => Err("side must be \"old\" or \"new\"".to_owned()),
         }
     }
 
@@ -1600,9 +1691,15 @@ impl Server<'_> {
             params.push(("side", control::text(side)));
         }
         let result = self.viewer("view/open", params)?;
+        let unlisted = if result.get("listed") == Some(&Value::Bool(false)) {
+            let side = result.get("side").and_then(Value::as_str).unwrap_or("new");
+            format!(" It isn't in the diff, so it shows whole at the {side} side.")
+        } else {
+            String::new()
+        };
         let text = match result.get("line").and_then(Value::as_usize) {
-            Some(line) => format!("The viewer shows {path} at line {line}."),
-            None => format!("The viewer shows {path}."),
+            Some(line) => format!("The viewer shows {path} at line {line}.{unlisted}"),
+            None => format!("The viewer shows {path}.{unlisted}"),
         };
         Ok(Output {
             structured: compact(&result),
@@ -1703,6 +1800,704 @@ fn placed_object(placed: &[(String, At)], page: &[&review::Comment], s: &mut Str
     s.push('}');
 }
 
+/// `definitions`' state across calls: the navigator helper of the
+/// repository (docs/navigate.md), which holds the navigators and builds
+/// their index on 2 threads of its own, and the searches it runs, kept for
+/// later pages and continued by the next call while unfinished. The server
+/// runs beside the user's viewer and agent, so the helper is closed, giving
+/// its memory back, once unused for a while.
+struct Navigation {
+    helper: Helpers,
+    /// The generation of the helper the searches were made in.
+    generation: u64,
+    /// The last `definitions` call.
+    used: Option<Instant>,
+    /// Most recent last, at most [`SEARCHES`].
+    searches: Vec<Search>,
+    /// The text searches for names with no definition found, most recent
+    /// last, at most [`SEARCHES`].
+    texts: Vec<TextSearch>,
+    /// How long a call searches before it answers with what it found.
+    budget: Duration,
+    /// How long the helper goes unused before it's closed.
+    idle: Duration,
+}
+
+impl Default for Navigation {
+    fn default() -> Self {
+        Self {
+            helper: Helpers::default(),
+            generation: 0,
+            used: None,
+            searches: Vec::new(),
+            texts: Vec::new(),
+            budget: BUDGET,
+            idle: IDLE,
+        }
+    }
+}
+
+/// What a search is of: the navigator's fingerprint, tagged with its
+/// helper's generation, its id, the asking file and the name.
+type SearchKey = (u64, String, BString, String);
+
+/// A search for a name's uses in the helper and the lines it found so far.
+struct Search {
+    key: SearchKey,
+    /// Which uses it keeps.
+    filter: navigate::Filter,
+    /// Its id in the helper.
+    id: u64,
+    hits: Vec<navigate::Reference>,
+    /// Files with a use so far.
+    files: usize,
+    done: bool,
+    /// The index was complete through every step, so the definitions' own
+    /// lines are left out.
+    indexed: bool,
+}
+
+/// A text search for a name with no definition found, and the lines it
+/// found so far.
+struct TextSearch {
+    key: SearchKey,
+    id: u64,
+    matches: Vec<navigate::Candidate>,
+    done: bool,
+}
+
+/// How long the helper goes unused before it's closed, with its index.
+const IDLE: Duration = Duration::from_secs(10 * 60);
+
+/// How long a call searches for uses or text matches before it answers.
+const BUDGET: Duration = Duration::from_secs(2);
+
+/// Threads the helper builds the index on.
+const BUILD_THREADS: usize = 2;
+
+/// Searches for uses kept for paging or to continue.
+const SEARCHES: usize = 8;
+
+/// Text matches `definitions` returns for a name with no definition found.
+const TEXT_MATCHES: usize = 50;
+
+/// Why `definitions` can't run: its index lives in the disk cache.
+const NO_CACHE: &str = "definitions keeps its index in the disk cache, which is off here \
+    (cache = false or --no-cache)";
+
+impl Navigation {
+    /// Closes the helper once unused for [`Navigation::idle`], with what
+    /// it searched. Checked as each call starts, so nothing runs between
+    /// calls but the helper's build.
+    fn tidy(&mut self, now: Instant) {
+        if self
+            .used
+            .is_some_and(|at| now.saturating_duration_since(at) >= self.idle)
+        {
+            self.helper.close();
+            self.searches.clear();
+            self.texts.clear();
+            self.used = None;
+        }
+    }
+}
+
+impl Drop for Navigation {
+    fn drop(&mut self) {
+        self.helper.close();
+    }
+}
+
+/// When a call's budget is spent.
+struct Deadline(Instant);
+
+impl Deadline {
+    fn start(budget: Duration) -> Self {
+        Self(Instant::now() + budget)
+    }
+
+    /// What's left of it, for a step the helper runs.
+    fn left(&self) -> Duration {
+        self.0.saturating_duration_since(Instant::now())
+    }
+}
+
+/// `definitions`, through the navigator helper (docs/mcp.md).
+impl Server<'_> {
+    /// The navigator of `side` of the diff between `snapshots`, opened in
+    /// the helper, which keeps the one it has while the core says it still
+    /// fits the diff. A helper that isn't running is started, once again
+    /// when it's gone, unless the helpers keep exiting. Its fingerprint is
+    /// tagged with the helper's generation, so no search of a helper gone
+    /// is asked of another.
+    fn navigator(
+        &mut self,
+        repo: &Repo,
+        snapshots: [git::Snapshot; 2],
+        side: Side,
+    ) -> Result<(Helper, Opened), String> {
+        let cache = self.ctx.cache.as_ref().ok_or(NO_CACHE)?;
+        let root = repo
+            .workdir()
+            .or_else(|| repo.git_dir())
+            .ok_or("definitions needs a repository")?;
+        let nav = &mut self.navigation;
+        nav.used = Some(Instant::now());
+        let start = |_| Helper::start(root, cache, BUILD_THREADS, None);
+        let (mut generation, mut helper) = nav.helper.get(None, start)?;
+        let mut opened = helper.open(snapshots, side, Whitespace::Exact);
+        if let Err(refused) = &opened
+            && refused.helper_gone()
+        {
+            let gone = Some((generation, refused.message.as_str()));
+            (generation, helper) = nav.helper.get(gone, start)?;
+            opened = helper.open(snapshots, side, Whitespace::Exact);
+        }
+        if generation != nav.generation {
+            nav.generation = generation;
+            nav.searches.clear();
+            nav.texts.clear();
+        }
+        let mut opened = opened.map_err(|refused| {
+            if refused.helper_gone() {
+                format!("definitions unavailable: {}", refused.message)
+            } else {
+                refused.message
+            }
+        })?;
+        opened.fingerprint = format!("{generation}/{}", opened.fingerprint);
+        Ok((helper, opened))
+    }
+
+    fn definitions(&mut self, args: &Args) -> Result<Output, String> {
+        args.only(&[
+            "name",
+            "path",
+            "line",
+            "column",
+            "side",
+            "range",
+            "since_checkpoint",
+            "references",
+            "calls_only",
+            "in_diff",
+            "limit",
+            "cursor",
+        ])?;
+        let name = args.name()?;
+        let path = args.string("path")?.map(str::to_owned);
+        let side = args.side()?;
+        let with_references = args.bool("references", false)?;
+        let limit = args.number("limit", 100, [1, 1000])?;
+        let cursor = args.cursor()?;
+        let revisions = args.strings("range", true)?;
+        let since = args.checkpoint()?;
+        let range = self.range(revisions, since, &[])?;
+        let snapshots = (range.plan.spec)
+            .snapshots(range.plan.reverse)
+            .ok_or("definitions needs git's versions of the files; two paths compared aren't")?;
+        if self.ctx.cache.is_none() {
+            return Err(NO_CACHE.to_owned());
+        }
+        let repo = range.plan.repo.clone();
+        let asking = path
+            .as_deref()
+            .map(|path| asking_file(&range.plan, path))
+            .transpose()?;
+        let at = args.place()?;
+        if at.is_some() && asking.is_none() {
+            return Err("line and column are of the use in path: give path too".to_owned());
+        }
+        let (helper, opened) = self.navigator(&repo, snapshots, side)?;
+        let origins: Vec<(BString, String)> = asking.map_or_else(
+            || {
+                (opened.languages.iter())
+                    .map(|language| (BString::default(), language.clone()))
+                    .collect()
+            },
+            |origin| vec![(origin.path, origin.language.name().to_owned())],
+        );
+        let origin = origins
+            .first()
+            .ok_or("this version has no files of a language definitions reads")?;
+        let deadline = Deadline::start(self.navigation.budget);
+        let found = found_definitions(
+            (&helper, &opened),
+            (&name, &origins, at),
+            &mut self.navigation.texts,
+            &deadline,
+        )?;
+        let progress = found.progress;
+        let lines = candidate_lines(&repo, &found.candidates);
+
+        let mut h = request_hash("definitions", &range);
+        let filter = navigate::Filter {
+            calls_only: args.bool("calls_only", false)?,
+            in_diff: args.bool("in_diff", false)?,
+        };
+        (
+            &name,
+            &path,
+            side == Side::Old,
+            &opened.fingerprint,
+            limit,
+            filter,
+        )
+            .hash(&mut h);
+        let fingerprint = h.finish();
+        let start = cursor.map_or(Ok((0, 0)), |c| c.check(fingerprint))?.0;
+        let wanted = start.saturating_add(limit);
+        let search = if with_references {
+            let found = (&helper, &opened, progress);
+            Some(self.references(found, origin, (&name, filter), wanted, &deadline)?)
+        } else {
+            None
+        };
+        let page = search.map(|search| Page::of(search, start..wanted, fingerprint));
+        let note = helper
+            .progress(opened.navigator)
+            .ok()
+            .and_then(|built| built.note);
+        let answer = Answer {
+            name: &name,
+            side: if side == Side::Old { "old" } else { "new" },
+            found: &found,
+            lines: &lines,
+            progress,
+            page,
+            note: note.as_deref(),
+        };
+        Ok(Output {
+            structured: answer.object(),
+            text: answer.text(),
+        })
+    }
+}
+
+impl<'a> Page<'a> {
+    /// The lines of `search` at `wanted`, so far, with the cursor to the
+    /// next page of request `fingerprint` while more may come.
+    fn of(search: &'a Search, wanted: std::ops::Range<usize>, fingerprint: u64) -> Self {
+        let end = wanted.end.min(search.hits.len());
+        let rows = wanted.start.min(end)..end;
+        let capped = search.files >= navigate::MAX_REFERENCE_FILES;
+        let more = rows.end < search.hits.len() || (!search.done && !capped);
+        let next = more.then(|| {
+            Cursor {
+                fingerprint,
+                at: (rows.end.max(wanted.start), 0),
+            }
+            .encode()
+        });
+        Self {
+            rows,
+            hits: &search.hits,
+            files: search.files,
+            complete: search.done && search.indexed,
+            next,
+        }
+    }
+}
+
+/// A page of the uses found so far.
+struct Page<'a> {
+    rows: std::ops::Range<usize>,
+    hits: &'a [navigate::Reference],
+    /// Files with a use, so far when not complete.
+    files: usize,
+    /// Every file was searched, with the index whole.
+    complete: bool,
+    next: Option<String>,
+}
+
+/// What `definitions` found, to write as its result.
+struct Answer<'a> {
+    name: &'a str,
+    side: &'static str,
+    found: &'a FoundDefinitions,
+    lines: &'a [Option<String>],
+    progress: navigate::Progress,
+    /// The page of uses, when they were asked for.
+    page: Option<Page<'a>>,
+    /// Why the helper keeps the index in memory, when it does.
+    note: Option<&'a str>,
+}
+
+impl Answer<'_> {
+    fn object(&self) -> String {
+        let Self {
+            name,
+            side,
+            found,
+            lines,
+            progress,
+            page,
+            note,
+        } = self;
+        let mut s = String::from(r#"{"name":"#);
+        string(&mut s, name);
+        s.push_str(r#","side":"#);
+        string(&mut s, side);
+        s.push_str(r#","candidates":["#);
+        for (i, c) in found.candidates.iter().enumerate() {
+            if i > 0 {
+                s.push(',');
+            }
+            encode::candidate(c, lines.get(i).and_then(Option::as_deref), &mut s);
+        }
+        let partial = !progress.complete();
+        let complete = !partial && found.complete;
+        let _ = write!(
+            s,
+            r#"],"total":{},"progress":{{"indexed":{},"files":{}}},"partial":{partial},"complete":{complete},"references":"#,
+            found.total, progress.done, progress.total
+        );
+        match page {
+            Some(page) => {
+                s.push_str(r#"{"matches":["#);
+                for (i, hit) in page.hits[page.rows.clone()].iter().enumerate() {
+                    if i > 0 {
+                        s.push(',');
+                    }
+                    encode::reference(hit, &mut s);
+                }
+                let _ = write!(
+                    s,
+                    r#"],"total":{},"files":{},"complete":{}}}"#,
+                    page.hits.len(),
+                    page.files,
+                    page.complete
+                );
+            }
+            None => s.push_str("null"),
+        }
+        s.push_str(r#","next_cursor":"#);
+        optional_string(&mut s, page.as_ref().and_then(|p| p.next.as_deref()));
+        if let Some(note) = note {
+            s.push_str(r#","note":"#);
+            string(&mut s, note);
+        }
+        s.push('}');
+        s
+    }
+
+    fn text(&self) -> String {
+        let Self {
+            name,
+            side,
+            found,
+            lines,
+            progress,
+            page,
+            note,
+        } = self;
+        let FoundDefinitions {
+            candidates,
+            total,
+            text_match,
+            complete,
+            ..
+        } = found;
+        let mut text = match (text_match, complete) {
+            (true, true) => format!(
+                "No definition of {name} found in the {side} version; {} lines using it:",
+                candidates.len()
+            ),
+            (true, false) => format!(
+                "No definition of {name} found in the {side} version; {} lines using it, \
+                 from the files searched in the time a call has:",
+                candidates.len()
+            ),
+            (false, _) => {
+                let n = if *total == 1 { "" } else { "s" };
+                format!("{total} definition{n} of {name} in the {side} version:")
+            }
+        };
+        if !progress.complete() {
+            let _ = write!(
+                text,
+                " (the index is partial: {} of {} files so far; ask again for the rest)",
+                progress.done, progress.total
+            );
+        }
+        if let Some(note) = note {
+            let _ = write!(text, "\nNote: {note}.");
+        }
+        text.push('\n');
+        for (i, c) in candidates.iter().enumerate() {
+            let what = c.kind.map_or("text match", |k| k.name());
+            let _ = write!(text, "{}:{}", c.path, c.start + 1);
+            if c.end > c.start {
+                let _ = write!(text, "-{}", c.end + 1);
+            }
+            let _ = write!(text, " {what}");
+            if c.in_hunk == Some(true) {
+                text.push_str(", changed in this diff");
+            }
+            if let Some(line) = lines.get(i).and_then(Option::as_deref) {
+                let _ = write!(text, ": {line}");
+            }
+            text.push('\n');
+        }
+        if let Some(page) = page {
+            let capped = page.files >= navigate::MAX_REFERENCE_FILES;
+            let so_far = if page.complete { "" } else { " so far" };
+            let listed = if capped {
+                format!(", the first {} listed", navigate::MAX_REFERENCE_FILES)
+            } else {
+                String::new()
+            };
+            let _ = writeln!(
+                text,
+                "{} lines use it in {} files{so_far}{listed}:",
+                page.hits.len(),
+                page.files,
+            );
+            for hit in &page.hits[page.rows.clone()] {
+                let _ = write!(
+                    text,
+                    "{}:{}: {}",
+                    hit.candidate.path,
+                    hit.candidate.start + 1,
+                    hit.text
+                );
+                if hit.more > 0 {
+                    let _ = write!(text, " (+{} more in this file)", hit.more);
+                }
+                text.push('\n');
+            }
+            if !page.complete && page.next.is_none() {
+                text.push_str(if capped {
+                    "The files past those listed weren't searched.\n"
+                } else {
+                    "The index was partial: some of these lines may be definitions.\n"
+                });
+            }
+        }
+        next_line(
+            page.as_ref().and_then(|p| p.next.as_deref()),
+            "references",
+            &mut text,
+        );
+        text
+    }
+}
+
+impl Server<'_> {
+    /// The search for the uses of `name` seen from `origin`, continued in
+    /// the helper until `deadline`, at least a file, until it has a line
+    /// past the `wanted`, has found every file it lists, or is done. A
+    /// search that finished on a partial index is made again once the
+    /// index is whole.
+    fn references(
+        &mut self,
+        (helper, opened, progress): (&Helper, &Opened, navigate::Progress),
+        (path, language): &(BString, String),
+        (name, filter): (&str, navigate::Filter),
+        wanted: usize,
+        deadline: &Deadline,
+    ) -> Result<&Search, String> {
+        let searches = &mut self.navigation.searches;
+        let key = (
+            opened.navigator,
+            opened.fingerprint.clone(),
+            path.clone(),
+            name.to_owned(),
+        );
+        let kept = (searches.iter())
+            .position(|s| s.key == key && s.filter == filter)
+            .map(|at| searches.remove(at));
+        let kept = kept.filter(|s| s.indexed || !(progress.complete() && s.done));
+        let mut search = match kept {
+            Some(search) => search,
+            None => Search {
+                id: (helper)
+                    .start_search(
+                        opened.navigator,
+                        "references",
+                        name,
+                        (path.as_slice(), language),
+                        (0, filter),
+                    )
+                    .map_err(|e| e.message)?,
+                key,
+                filter,
+                hits: Vec::new(),
+                files: 0,
+                done: false,
+                indexed: true,
+            },
+        };
+        let capped = |s: &Search| s.files >= navigate::MAX_REFERENCE_FILES;
+        if !search.done && !capped(&search) && search.hits.len() <= wanted {
+            let budget = (deadline.left(), Some(wanted + 1), false);
+            match helper.step_references(search.id, budget, None) {
+                Ok(step) => {
+                    search.hits.extend(step.hits);
+                    search.files = step.files;
+                    search.done = step.done;
+                    search.indexed &= step.indexed;
+                }
+                Err(refused) => {
+                    helper.close_search(search.id);
+                    return Err(format!(
+                        "the search for its uses stopped: {}",
+                        refused.message
+                    ));
+                }
+            }
+        }
+        searches.push(search);
+        if searches.len() > SEARCHES {
+            let gone = searches.remove(0);
+            helper.close_search(gone.id);
+        }
+        searches.last().ok_or_else(|| "no search".to_owned())
+    }
+}
+
+/// The asking file `path`, a file of `plan`'s repository in a language with
+/// definitions.
+fn asking_file(plan: &Plan, path: &str) -> Result<Origin, String> {
+    let wanted = plan.relative(Path::new(path)).map_err(message)?;
+    let language = (crate::grammars().detect(&wanted, b""))
+        .filter(|l| l.has_tags())
+        .ok_or_else(|| format!("definitions doesn't read {path}'s language"))?;
+    Ok(Origin {
+        path: wanted,
+        language: language.clone(),
+    })
+}
+
+/// What `definitions` found of a name.
+struct FoundDefinitions {
+    candidates: Vec<navigate::Candidate>,
+    /// Definitions in all, past those listed.
+    total: usize,
+    /// None was found: the candidates are lines using the name.
+    text_match: bool,
+    /// The text search went through every file, or found its cap.
+    complete: bool,
+    /// How far the version's index was built when it answered.
+    progress: navigate::Progress,
+}
+
+/// The definitions of `name` seen from `origins`, as the helper looks them
+/// up: one asking file's, nearest first, or with no asking file one origin
+/// per language, merged by path and cut to the first [`MAX_LISTED`]. With
+/// none found, the lines using it: a text search in the helper kept in
+/// `texts` and gone on with until `deadline`, at least a file a call, until
+/// it has [`TEXT_MATCHES`] lines or every file is searched.
+fn found_definitions(
+    (helper, opened): (&Helper, &Opened),
+    (name, origins, at): (&str, &[(BString, String)], Option<navigate::Use>),
+    texts: &mut Vec<TextSearch>,
+    deadline: &Deadline,
+) -> Result<FoundDefinitions, String> {
+    let mut candidates = Vec::new();
+    let mut total = 0;
+    let mut progress = opened.progress;
+    for (path, language) in origins {
+        let found = helper
+            .lookup(
+                opened.navigator,
+                name,
+                (path.as_slice(), language),
+                at,
+                None,
+            )
+            .map_err(|e| e.message)?;
+        total += found.total;
+        progress = found.progress;
+        candidates.extend(found.candidates);
+    }
+    if origins.len() > 1 {
+        candidates.sort_by(|a, b| (&a.path, a.start).cmp(&(&b.path, b.start)));
+        candidates.truncate(MAX_LISTED);
+    }
+    match origins.first() {
+        Some((path, language)) if candidates.is_empty() => {
+            let key = (
+                opened.navigator,
+                opened.fingerprint.clone(),
+                path.clone(),
+                name.to_owned(),
+            );
+            let kept = (texts.iter().position(|t| t.key == key)).map(|at| texts.remove(at));
+            let mut text = match kept {
+                Some(text) => text,
+                None => TextSearch {
+                    id: helper
+                        .start_search(
+                            opened.navigator,
+                            "text",
+                            name,
+                            (path.as_slice(), language),
+                            (TEXT_MATCHES, navigate::Filter::default()),
+                        )
+                        .map_err(|e| e.message)?,
+                    key,
+                    matches: Vec::new(),
+                    done: false,
+                },
+            };
+            if !text.done {
+                let step = (helper.step_text(text.id, deadline.left(), None))
+                    .map_err(|e| format!("the text search stopped: {}", e.message))?;
+                text.matches.extend(step.hits);
+                text.done = step.done;
+            }
+            let found = FoundDefinitions {
+                total: text.matches.len(),
+                complete: text.done,
+                candidates: text.matches.clone(),
+                text_match: true,
+                progress,
+            };
+            texts.push(text);
+            if texts.len() > SEARCHES {
+                let gone = texts.remove(0);
+                helper.close_search(gone.id);
+            }
+            Ok(found)
+        }
+        _ => Ok(FoundDefinitions {
+            candidates,
+            total,
+            text_match: false,
+            complete: true,
+            progress,
+        }),
+    }
+}
+
+/// Definitions `definitions` lists at most, as a lookup does from one
+/// asking file.
+const MAX_LISTED: usize = 200;
+
+/// The first line of each candidate, trimmed; `None` where its file can't
+/// be read.
+fn candidate_lines(repo: &Repo, candidates: &[navigate::Candidate]) -> Vec<Option<String>> {
+    let mut read: Option<(&BString, Option<Text>)> = None;
+    candidates
+        .iter()
+        .map(|c| {
+            if read.as_ref().is_none_or(|(path, _)| **path != c.path) {
+                read = Some((
+                    &c.path,
+                    repo.load(c.path.as_ref(), &c.side).ok().map(Text::new),
+                ));
+            }
+            let text = read.as_ref()?.1.as_ref()?;
+            (c.start < text.len()).then(|| {
+                String::from_utf8_lossy(text.line(c.start))
+                    .trim()
+                    .to_owned()
+            })
+        })
+        .collect()
+}
+
 /// The text rendering's legend for the syntax diff's marks.
 const MARKS: &str = "marks after the sign: > moved, ~ reformatted (the code wasn't edited)\n";
 
@@ -1766,7 +2561,7 @@ fn each<T: Send>(
                 scope.spawn(move || {
                     let mut done = Vec::new();
                     loop {
-                        let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        let i = next.fetch_add(1, Ordering::Relaxed);
                         let Some(change) = changes.get(i) else {
                             break done;
                         };
@@ -1991,6 +2786,375 @@ mod tests {
         assert_eq!(cursor.check(8), Err(STALE.to_owned()));
     }
 
+    fn git(dir: &Path, args: &[&str]) {
+        let ok = std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(["-c", "user.name=t", "-c", "user.email=t@t"])
+            .args(["-c", "commit.gpgsign=false"])
+            .args(args)
+            .status()
+            .expect("git runs")
+            .success();
+        assert!(ok, "git {args:?}");
+    }
+
+    /// A C repository whose `inc/f.h` defines `frob`, used by four files,
+    /// over two commits, with an uncommitted edit; and the defaults with a
+    /// disk cache in `cache`.
+    fn navigating(dir: &Path, cache: &Path) -> Ctx {
+        crate::navigator::client::use_program(crate::navigator::built_program());
+        git(dir, &["init", "-q", "-b", "main"]);
+        std::fs::create_dir_all(dir.join("inc")).expect("mkdir");
+        std::fs::write(
+            dir.join("inc/f.h"),
+            "static inline int frob(void) { return 0; }\n",
+        )
+        .expect("write");
+        for name in ["a.c", "b.c", "c.c", "d.c"] {
+            let text = format!(
+                "#include <f.h>\nint {}(void) {{ return frob(); }}\n",
+                &name[..1]
+            );
+            std::fs::write(dir.join(name), text).expect("write");
+        }
+        git(dir, &["add", "-A"]);
+        git(dir, &["commit", "-q", "-m", "first"]);
+        std::fs::write(
+            dir.join("inc/f.h"),
+            "static inline int frob(void) { return 1; }\n",
+        )
+        .expect("write");
+        git(dir, &["commit", "-q", "-am", "second"]);
+        std::fs::write(dir.join("a.c"), "int a(void) { return frob() + 1; }\n").expect("write");
+        Ctx {
+            config: crate::config::Config::default(),
+            sources: crate::config::Sources::default(),
+            last_used: Vec::new(),
+            tip_shown: false,
+            context_lines: 3,
+            config_path: None,
+            config_warnings: Vec::new(),
+            theme: crate::theme::Theme::default_theme(),
+            term: crate::output::Term {
+                stdout_tty: false,
+                stderr_tty: false,
+                width: None,
+            },
+            color_out: false,
+            color_err: false,
+            cache: Some(dffy_core::cache::Cache::new(cache.to_owned(), 1 << 24)),
+            review_name: std::sync::OnceLock::new(),
+            review: std::sync::OnceLock::new(),
+            comments: None,
+        }
+    }
+
+    fn server<'a>(dir: &Path, ctx: &'a Ctx) -> Server<'a> {
+        Server {
+            repo: Repo::discover(dir).ok(),
+            comments: None,
+            base: dir.to_owned(),
+            ctx,
+            legacy: false,
+            client: None,
+            navigation: Navigation::default(),
+        }
+    }
+
+    /// `tool`'s structured result for `args`, which must not fail.
+    fn tool(server: &mut Server, tool: &str, args: &str) -> Value {
+        let call = format!(r#"{{"name":"{tool}","arguments":{args}}}"#);
+        let params = parse(call.as_bytes()).expect("json");
+        let members = server.call(Some(&params)).expect("a tool result");
+        let result = parse(format!("{{{members}}}").as_bytes()).expect("json");
+        assert_eq!(
+            result.get("isError"),
+            Some(&Value::Bool(false)),
+            "{members}"
+        );
+        result
+            .get("structuredContent")
+            .cloned()
+            .expect("structured")
+    }
+
+    /// `definitions` once the index is whole.
+    fn indexed(server: &mut Server, args: &str) -> Value {
+        for _ in 0..400 {
+            let found = tool(server, "definitions", args);
+            if found.get("partial") == Some(&Value::Bool(false)) {
+                return found;
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        panic!("the index was never built");
+    }
+
+    /// A call searches for uses for its budget, at least a file, and
+    /// answers with what it found: `complete` false and a cursor that
+    /// continues the same search on the next call, until every file is.
+    /// `in_diff` keeps the uses in the files the diff changes, and
+    /// `calls_only` those calling the name: each a search of its own.
+    #[test]
+    fn uses_are_filtered_to_the_diff_and_to_calls() {
+        let (dir, cache) = (
+            tempfile::tempdir().expect("tempdir"),
+            tempfile::tempdir().expect("tempdir"),
+        );
+        let ctx = navigating(dir.path(), cache.path());
+        let mut server = server(dir.path(), &ctx);
+        indexed(&mut server, r#"{"name":"frob","path":"b.c"}"#);
+        let files = |server: &mut Server, filters: &str| {
+            let ask = format!(r#"{{"name":"frob","path":"b.c","references":true{filters}}}"#);
+            loop {
+                let found = tool(server, "definitions", &ask);
+                let refs = found.get("references").cloned().unwrap_or(Value::Null);
+                if refs.get("complete") == Some(&Value::Bool(true)) {
+                    let paths: Vec<String> = (refs.get("matches").and_then(Value::as_array))
+                        .expect("matches")
+                        .iter()
+                        .filter_map(|m| m.get("path").and_then(Value::as_str).map(str::to_owned))
+                        .collect();
+                    return paths;
+                }
+            }
+        };
+        assert_eq!(files(&mut server, ""), ["b.c", "a.c", "c.c", "d.c"]);
+        assert_eq!(files(&mut server, r#","in_diff":true"#), ["a.c"]);
+        assert_eq!(
+            files(&mut server, r#","calls_only":true"#),
+            ["b.c", "a.c", "c.c", "d.c"]
+        );
+    }
+
+    /// Where the helper can't keep the index in the cache's folder, a full
+    /// disk, the answer's text says it's kept in memory.
+    #[test]
+    fn the_answer_says_when_the_index_is_kept_in_memory() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let blocked = tempfile::NamedTempFile::new().expect("a file where the cache would be");
+        let ctx = navigating(dir.path(), blocked.path());
+        let mut server = server(dir.path(), &ctx);
+        indexed(&mut server, r#"{"name":"frob","path":"b.c"}"#);
+        let call = r#"{"name":"definitions","arguments":{"name":"frob","path":"b.c"}}"#;
+        let members =
+            (server.call(Some(&parse(call.as_bytes()).expect("json")))).expect("a tool result");
+        assert!(
+            members.contains("the definitions index is kept in memory"),
+            "{members}"
+        );
+        let result = parse(format!("{{{members}}}").as_bytes()).expect("json");
+        let note = (result.get("structuredContent")).and_then(|c| c.get("note"));
+        assert!(
+            note.and_then(Value::as_str)
+                .is_some_and(|n| n.contains("kept in memory")),
+            "{members}"
+        );
+    }
+
+    #[test]
+    fn a_search_for_uses_answers_within_its_budget_and_goes_on_next_call() {
+        let (dir, cache) = (
+            tempfile::tempdir().expect("tempdir"),
+            tempfile::tempdir().expect("tempdir"),
+        );
+        let ctx = navigating(dir.path(), cache.path());
+        let mut server = server(dir.path(), &ctx);
+        indexed(&mut server, r#"{"name":"frob","path":"b.c"}"#);
+        server.navigation.budget = Duration::ZERO;
+        let ask = |cursor: Option<&str>| {
+            let cursor = cursor.map_or(String::new(), |c| format!(r#","cursor":"{c}""#));
+            format!(r#"{{"name":"frob","path":"b.c","references":true{cursor}}}"#)
+        };
+        let refs = |found: &Value, key: &str| {
+            (found.get("references").and_then(|r| r.get(key)).cloned()).unwrap_or(Value::Null)
+        };
+        let first = tool(&mut server, "definitions", &ask(None));
+        assert_eq!(
+            refs(&first, "complete"),
+            Value::Bool(false),
+            "one file a call"
+        );
+        let mut lines = refs(&first, "matches").as_array().map_or(0, <[Value]>::len);
+        let mut cursor = first
+            .get("next_cursor")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        let mut calls = 1;
+        while let Some(at) = cursor {
+            let next = tool(&mut server, "definitions", &ask(Some(&at)));
+            lines += refs(&next, "matches").as_array().map_or(0, <[Value]>::len);
+            cursor = next
+                .get("next_cursor")
+                .and_then(Value::as_str)
+                .map(str::to_owned);
+            calls += 1;
+            if cursor.is_none() {
+                assert_eq!(refs(&next, "complete"), Value::Bool(true));
+                assert_eq!(refs(&next, "files").as_usize(), Some(4));
+            }
+        }
+        assert!(calls > 4, "{calls} calls");
+        assert_eq!(lines, 4, "each use once, across the calls");
+    }
+
+    /// A name nothing defines gets its text matches from the files searched
+    /// in the call's budget, at least one, `complete` false; the next call
+    /// with the same arguments goes on with the same search until every
+    /// file is.
+    #[test]
+    fn a_text_search_answers_within_its_budget_and_goes_on_next_call() {
+        let (dir, cache) = (
+            tempfile::tempdir().expect("tempdir"),
+            tempfile::tempdir().expect("tempdir"),
+        );
+        let ctx = navigating(dir.path(), cache.path());
+        for name in ["a.c", "b.c", "c.c", "d.c"] {
+            let text = format!("/* uses zap */\nint {}x;\n", &name[..1]);
+            std::fs::write(dir.path().join(name), text).expect("write");
+        }
+        let mut server = server(dir.path(), &ctx);
+        let ask = r#"{"name":"zap","path":"b.c"}"#;
+        indexed(&mut server, r#"{"name":"frob","path":"b.c"}"#);
+        server.navigation.budget = Duration::ZERO;
+        let first = tool(&mut server, "definitions", ask);
+        assert_eq!(first.get("complete"), Some(&Value::Bool(false)));
+        let count = |found: &Value| {
+            found
+                .get("candidates")
+                .and_then(Value::as_array)
+                .map_or(0, <[Value]>::len)
+        };
+        assert!(count(&first) <= 1, "one file a call");
+        let mut calls = 1;
+        loop {
+            let next = tool(&mut server, "definitions", ask);
+            calls += 1;
+            if next.get("complete") == Some(&Value::Bool(true)) {
+                assert_eq!(count(&next), 4, "every file's line, once");
+                break;
+            }
+            assert!(calls < 20, "never completes");
+        }
+        assert!(calls > 4, "{calls} calls");
+    }
+
+    /// `definitions` asks the navigator helper, one for every version asked
+    /// about, and closes it, with what it searched, once unused for a
+    /// while: checked as the next call of any tool starts. The next ask
+    /// starts another.
+    #[test]
+    fn the_helper_serves_every_version_and_goes_when_idle() {
+        let (dir, cache) = (
+            tempfile::tempdir().expect("tempdir"),
+            tempfile::tempdir().expect("tempdir"),
+        );
+        let ctx = navigating(dir.path(), cache.path());
+        let mut server = server(dir.path(), &ctx);
+        for args in [
+            r#"{"name":"frob","path":"b.c","range":"HEAD~1..HEAD"}"#,
+            r#"{"name":"frob","path":"b.c","range":"HEAD~1..HEAD","side":"old"}"#,
+            r#"{"name":"frob","path":"b.c","references":true}"#,
+        ] {
+            // From the whole index: on a loaded machine a header's parse on
+            // the spot may run out of the time it gets.
+            let found = indexed(&mut server, args);
+            assert_eq!(
+                found.get("total").and_then(Value::as_usize),
+                Some(1),
+                "{args}"
+            );
+        }
+        assert!(server.navigation.helper.current().is_some());
+        assert_eq!(server.navigation.searches.len(), 1);
+
+        let idle = server.navigation.idle + Duration::from_secs(1);
+        server.navigation.used = Instant::now().checked_sub(idle);
+        tool(&mut server, "changed_files", "{}");
+        assert!(
+            server.navigation.helper.current().is_none(),
+            "an idle helper goes"
+        );
+        assert!(server.navigation.searches.is_empty());
+        let found = indexed(&mut server, r#"{"name":"frob","path":"b.c"}"#);
+        assert_eq!(found.get("total").and_then(Value::as_usize), Some(1));
+    }
+
+    /// A helper killed is started again on the next call, a search of the
+    /// one gone dropped; after three starts within a minute the call says
+    /// the helper keeps exiting.
+    #[test]
+    fn a_helper_that_dies_is_started_again_a_few_times() {
+        let (dir, cache) = (
+            tempfile::tempdir().expect("tempdir"),
+            tempfile::tempdir().expect("tempdir"),
+        );
+        let ctx = navigating(dir.path(), cache.path());
+        let mut server = server(dir.path(), &ctx);
+        let args = r#"{"name":"frob","path":"b.c","references":true}"#;
+        let kill = |server: &Server| {
+            let (_, helper) = server.navigation.helper.current().expect("runs");
+            let pid = helper.pid().expect("a process");
+            rustix::process::kill_process(pid, rustix::process::Signal::KILL).ok();
+            let start = Instant::now();
+            while helper.pid().is_some() {
+                assert!(start.elapsed() < Duration::from_secs(10), "it never went");
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        };
+        let before = indexed(&mut server, args);
+        let first = server.navigation.generation;
+        kill(&server);
+        assert_eq!(
+            indexed(&mut server, args),
+            before,
+            "another helper's answer"
+        );
+        assert_ne!(server.navigation.generation, first);
+        assert_eq!(
+            server.navigation.searches.len(),
+            1,
+            "the old search dropped"
+        );
+        kill(&server);
+        indexed(&mut server, args);
+        kill(&server);
+        let call = r#"{"name":"definitions","arguments":{"name":"frob","path":"b.c"}}"#;
+        let params = parse(call.as_bytes()).expect("json");
+        let members = server.call(Some(&params)).expect("a tool result");
+        assert!(
+            members.contains("definitions unavailable: the helper keeps exiting")
+                && members.contains(r#""isError":true"#),
+            "{members}"
+        );
+    }
+
+    /// A lookup the helper dies on is a tool error saying so, and the next
+    /// name is looked up in another.
+    #[cfg(debug_assertions)]
+    #[test]
+    fn a_name_the_helper_dies_on_leaves_the_next_one_working() {
+        let (dir, cache) = (
+            tempfile::tempdir().expect("tempdir"),
+            tempfile::tempdir().expect("tempdir"),
+        );
+        let ctx = navigating(dir.path(), cache.path());
+        let mut server = server(dir.path(), &ctx);
+        let name = crate::navigator::DEADLY;
+        let call =
+            format!(r#"{{"name":"definitions","arguments":{{"name":"{name}","path":"b.c"}}}}"#);
+        let params = parse(call.as_bytes()).expect("json");
+        let members = server.call(Some(&params)).expect("a tool result");
+        assert!(
+            members.contains("the navigator helper exited")
+                && members.contains(r#""isError":true"#),
+            "{members}"
+        );
+        let found = indexed(&mut server, r#"{"name":"frob","path":"b.c"}"#);
+        assert_eq!(found.get("total").and_then(Value::as_usize), Some(1));
+    }
+
     /// The list's fingerprint changes when a file appears, goes away or
     /// changes status, but not when the same files are listed again.
     #[test]
@@ -2037,7 +3201,8 @@ mod tests {
                 "apply_suggestion",
                 "open_in_viewer",
                 "focus_thread",
-                "viewer_selection"
+                "viewer_selection",
+                "definitions"
             ]
         );
     }

@@ -14,10 +14,10 @@ expression: screen(&mut phone)
  7  7  │ line 7                                  ┃
 ⋯ 39 unchanged lines  @@ -47,7 +47,7 @@ line 46  ┃
 47 47  │ line 47                                 ┃
-48 48  │ line 48                                 ┃
 ┌─ commands ─────────────────────────────────────┐
 │                                                │
 │  View                                          │
+│  _  File view ‹ off ›                          │
 │  s  Layout ‹ auto (unified here) ›             │
 │  W  [ ] Wrap long lines                        │
 │  d  [ ] Syntax diff                            │

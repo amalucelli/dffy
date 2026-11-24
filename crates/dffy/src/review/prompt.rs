@@ -379,9 +379,9 @@ impl<'a> Syntax<'a> {
         if self.path.is_empty() {
             return;
         }
-        let start = self
-            .text
-            .map_or(&[][..], |t| &t.bytes()[..t.bytes().len().min(256)]);
+        let start = self.text.map_or(&[][..], |t| {
+            &t.bytes()[..t.bytes().len().min(highlight::SNIFF_BYTES)]
+        });
         let Some(lang) = crate::grammars().detect(self.path, start) else {
             return;
         };

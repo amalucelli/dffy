@@ -18,7 +18,7 @@ const UNIFIED: Layout = Layout {
     words: false,
     tab_width: 4,
     indicators: Indicators::Classic,
-    one_sided: false,
+    one_sided: None,
     unmerged: false,
     digits: 0,
     inline_signs: true,
@@ -26,6 +26,7 @@ const UNIFIED: Layout = Layout {
     line_numbers: true,
     hunk_headers: true,
     modified_lines: true,
+    read_alone: false,
 };
 
 const SPLIT: Layout = Layout {
@@ -35,7 +36,7 @@ const SPLIT: Layout = Layout {
     words: false,
     tab_width: 4,
     indicators: Indicators::Classic,
-    one_sided: false,
+    one_sided: None,
     unmerged: false,
     digits: 0,
     inline_signs: true,
@@ -43,6 +44,7 @@ const SPLIT: Layout = Layout {
     line_numbers: true,
     hunk_headers: true,
     modified_lines: true,
+    read_alone: false,
 };
 
 /// Renders `input` and returns the role markup plus how many times the

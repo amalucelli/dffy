@@ -190,6 +190,33 @@ fn the_tree_widens_with_the_screen_and_keeps_counts_whole() {
         ");
 }
 
+/// The title's totals follow counts that arrive after a frame drew
+/// the ones before.
+#[test]
+fn tree_totals_follow_counts_arriving_between_frames() {
+    let mut app = App::new(
+        &Config::default(),
+        Theme::default_theme(),
+        "range".to_owned(),
+        None,
+        (120, 11),
+        Indicators::Classic,
+    );
+    for path in ["a.rs", "b.rs"] {
+        app.event(Event::Enumerated(diff(path).change));
+    }
+    app.event(Event::EnumerationDone(None));
+    let count = |app: &mut App, file: usize, added: usize, removed: usize| {
+        let counts = vec![(file, app.version(file), Counts { added, removed })];
+        app.event(Event::Diffed(Done::Counts { counts }));
+        screen(app)
+    };
+    let text = count(&mut app, 0, 3, 1);
+    assert!(text.contains("Files · 2 +3 -1"), "{text}");
+    let text = count(&mut app, 1, 2, 0);
+    assert!(text.contains("Files · 2 +5 -1"), "{text}");
+}
+
 /// Additions only, short and long names at several depths: the
 /// counts stand in one column, the long names cut before it.
 #[test]
@@ -241,9 +268,255 @@ fn u_climbs_the_tree_a_folder_at_a_time() {
     assert!(!shown.contains("▼ app/"), "{shown}");
 }
 
+/// A repository with `a.txt` changed in the working tree, its diff's
+/// change set, and a viewer of it with the list read.
+fn worktree_app(d: &Path) -> (Repo, ChangeSet, App) {
+    let git = |args: &[&str]| {
+        let out = std::process::Command::new("git")
+            .current_dir(d)
+            .args(args)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_AUTHOR_NAME", "A")
+            .env("GIT_AUTHOR_EMAIL", "a@example.com")
+            .env("GIT_COMMITTER_NAME", "A")
+            .env("GIT_COMMITTER_EMAIL", "a@example.com")
+            .output()
+            .expect("git runs");
+        assert!(out.status.success(), "git {args:?}");
+    };
+    git(&["init", "-q", "-b", "main"]);
+    std::fs::write(d.join("a.txt"), "a\n").expect("write");
+    git(&["add", "-A"]);
+    git(&["commit", "-q", "-m", "x"]);
+    std::fs::write(d.join("a.txt"), "a2\n").expect("write");
+    let repo = Repo::discover(d).expect("repo");
+    let spec = repo.resolve(&[], false, false).expect("spec");
+    let mut set = ChangeSet::new(repo.clone(), spec, Revisions::default(), &[], false);
+    let mut app = App::new(
+        &Config::default(),
+        Theme::default_theme(),
+        "working tree".to_owned(),
+        None,
+        (100, 20),
+        Indicators::Classic,
+    );
+    set.enumerate(|change| {
+        app.event(Event::Enumerated(change));
+        ControlFlow::Continue(())
+    })
+    .expect("enumerate");
+    app.event(Event::EnumerationDone(None));
+    app.set_snapshots(spec.snapshots(false));
+    (repo, set, app)
+}
+
+/// The picker open, its other files listed as a worker lists them: here
+/// `count` made-up paths.
+fn picker_listing(app: &mut App, count: usize) {
+    key(app, 'o');
+    let (snapshot, id) = (app.jobs().into_iter())
+        .find_map(|job| match job {
+            Job::ListPaths { snapshot, id, .. } => Some((snapshot, id)),
+            _ => None,
+        })
+        .expect("a listing");
+    let mut paths = Paths::default();
+    for i in 0..count {
+        paths.push(format!("dir/file{i}.c").as_bytes());
+    }
+    app.event(Event::Diffed(Done::Listed {
+        snapshot,
+        id,
+        result: Ok(Arc::new(paths)),
+    }));
+}
+
+/// A list read again while the picker waits for a worker to score its
+/// other files asks for the score under the query's id as it is now:
+/// one under the id from before would stop at its first check, and the
+/// score never come.
+#[test]
+fn a_refreshed_list_keeps_the_pickers_score_live() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (_repo, mut set, mut app) = worktree_app(dir.path());
+    picker_listing(&mut app, 5000);
+    key(&mut app, 'f');
+    std::fs::write(dir.path().join("a.txt"), "a3\n").expect("write");
+    let update = set.refresh(&["a.txt".into()]).expect("refresh");
+    app.event(Event::Refreshed(update.expect("changed")));
+    let live = (app.jobs().into_iter()).find_map(|job| match job {
+        Job::Score { id, live, .. } => Some(live.load(Ordering::Relaxed) == id),
+        _ => None,
+    });
+    assert_eq!(live, Some(true), "a score, under the live id");
+}
+
+/// The picker's list of other files goes as it closes, megabytes on a
+/// large repository, unless the all-files tree shows that version.
+#[test]
+fn the_pickers_list_of_files_goes_as_it_closes_unless_the_tree_shows_it() {
+    let mut app = files_app(120, 20);
+    app.set_snapshots(Some([Snapshot::Index, Snapshot::Worktree]));
+    picker_listing(&mut app, 5);
+    assert_eq!(app.listed.len(), 1);
+    press(&mut app, Key::Esc);
+    assert!(app.picker.is_none() && app.listed.is_empty(), "let go");
+
+    key(&mut app, ' ');
+    key(&mut app, '=');
+    let (snapshot, id) = (app.jobs().into_iter())
+        .find_map(|job| match job {
+            Job::ListPaths { snapshot, id, .. } => Some((snapshot, id)),
+            _ => None,
+        })
+        .expect("the tree's listing");
+    let mut paths = Paths::default();
+    paths.push(b"other.txt");
+    app.event(Event::Diffed(Done::Listed {
+        snapshot,
+        id,
+        result: Ok(Arc::new(paths)),
+    }));
+    key(&mut app, 'o');
+    assert!(app.picker.is_some());
+    press(&mut app, Key::Esc);
+    assert_eq!(app.listed.len(), 1, "the tree shows it");
+    // Turning all files off lets it go too.
+    key(&mut app, 'a');
+    assert!(app.all_files.is_none() && app.listed.is_empty());
+}
+
+/// While the diff's files are still being read, a file the picker lists
+/// as outside the diff may be one of them, read later: it doesn't open.
+#[test]
+fn a_file_outside_the_diff_doesnt_open_while_the_diff_is_read() {
+    let mut app = App::new(
+        &Config::default(),
+        Theme::default_theme(),
+        "range".to_owned(),
+        Some(diff("a.rs").change),
+        (100, 20),
+        Indicators::Classic,
+    );
+    app.set_snapshots(Some([Snapshot::Index, Snapshot::Worktree]));
+    picker_listing(&mut app, 1);
+    typed(&mut app, "file0");
+    let action = app.event(Event::Input(Input::Key(Key::Enter, Mods::NONE)));
+    assert_eq!(action, None);
+    assert!(
+        status(&mut app).contains("still reading the diff's files"),
+        "{}",
+        status(&mut app)
+    );
+}
+
+/// A file opened outside the diff that a new list finds where it was
+/// keeps its entry, diff and all.
+#[test]
+fn a_file_opened_outside_the_diff_found_where_it_was_keeps_its_entry() {
+    let mut app = files_app(100, 20);
+    app.set_snapshots(Some([Snapshot::Index, Snapshot::Worktree]));
+    let side = Side::Worktree {
+        mode: Mode::File,
+        id: None,
+    };
+    let path = dffy_core::bstr::BStr::new("notes.txt");
+    app.other_found(path, document::Side::New, Ok(Some(side)));
+    let file = app.doc.document.pos.file;
+    let version = app.version(file);
+    app.relooked(vec![(path.to_owned(), document::Side::New, Ok(Some(side)))]);
+    assert_eq!(app.version(file), version);
+}
+
+/// Switching to all files reveals the file shown: its folders open and
+/// the selection on it. Moving through the diff after that leaves the
+/// tree where it is.
+#[test]
+fn switching_to_all_files_reveals_the_file_shown_once() {
+    let mut app = files_app(120, 20);
+    app.set_snapshots(Some([Snapshot::Index, Snapshot::Worktree]));
+    app.doc.goto_file(3);
+    key(&mut app, ' ');
+    key(&mut app, '=');
+    assert_eq!(app.pane, Pane::Tree);
+    assert_eq!(app.tree.item(), Some(Item::File(3)), "kernel/sched/fair.c");
+    let shown = screen(&mut app);
+    assert!(shown.contains("▼ kernel/sched/"), "{shown}");
+    let selected = app.tree.item();
+    app.event(Event::Input(Input::Key(Key::Tab, Mods::NONE)));
+    assert_eq!(app.pane, Pane::Diff);
+    key(&mut app, 'F');
+    app.draw();
+    assert_eq!(app.doc.document.pos.file, 2, "the diff moved on");
+    assert_eq!(app.tree.item(), selected, "the tree stayed");
+}
+
+/// The all-files filter finds the diff's files the version's list lacks,
+/// as the untracked and the deleted, as well as the version's own.
+#[test]
+fn the_all_files_filter_finds_the_diffs_files_the_list_lacks() {
+    let mut app = files_app(120, 20);
+    app.set_snapshots(Some([Snapshot::Index, Snapshot::Worktree]));
+    key(&mut app, ' ');
+    key(&mut app, '=');
+    let (snapshot, id) = (app.jobs().into_iter())
+        .find_map(|job| match job {
+            Job::ListPaths { snapshot, id, .. } => Some((snapshot, id)),
+            _ => None,
+        })
+        .expect("the working tree's listing");
+    let mut paths = Paths::default();
+    paths.push(b"lib/fairness.rs");
+    app.event(Event::Diffed(Done::Listed {
+        snapshot,
+        id,
+        result: Ok(Arc::new(paths)),
+    }));
+    typed(&mut app, "/fair");
+    let shown = screen(&mut app);
+    assert!(
+        shown.contains("fair.c") && shown.contains("fairness.rs"),
+        "{shown}"
+    );
+    assert!(!shown.contains(".clang-format"), "{shown}");
+}
+
+/// `s` in the all-files tree before the other version's files are listed
+/// shows the diff's files alone under that version's name, never the
+/// first version's files.
+#[test]
+fn the_other_version_shows_the_diffs_files_until_its_list_comes() {
+    let mut app = files_app(120, 20);
+    app.set_snapshots(Some([Snapshot::Index, Snapshot::Worktree]));
+    key(&mut app, ' ');
+    key(&mut app, '=');
+    let (snapshot, id) = (app.jobs().into_iter())
+        .find_map(|job| match job {
+            Job::ListPaths { snapshot, id, .. } => Some((snapshot, id)),
+            _ => None,
+        })
+        .expect("the working tree's listing");
+    let mut paths = Paths::default();
+    paths.push(b"zzz/other.txt");
+    app.event(Event::Diffed(Done::Listed {
+        snapshot,
+        id,
+        result: Ok(Arc::new(paths)),
+    }));
+    assert!(screen(&mut app).contains("▶ zzz/"), "{}", screen(&mut app));
+    key(&mut app, 's');
+    let shown = screen(&mut app);
+    assert!(shown.contains("All files · index · listing…"), "{shown}");
+    assert!(!shown.contains("zzz/"), "{shown}");
+    assert!(shown.contains(".clang-format"), "the diff's files: {shown}");
+}
+
 /// The picker's rows as markup: matched characters are `<hint>`.
 fn picker_markup(app: &mut App) -> String {
     let (width, height) = (app.screen.width(), app.screen.height());
+    let names = [document::Side::Old, document::Side::New]
+        .map(|side| (app.version_name(side), app.version_meaning(side)));
     let picker = app.picker.as_mut().expect("the picker is open");
     picker
         .rows(
@@ -251,6 +524,7 @@ fn picker_markup(app: &mut App) -> String {
             app.doc.document.commits(),
             (width, height - 1),
             picker::Progress::Done,
+            &names,
         )
         .iter()
         .map(|(c, selected)| {
@@ -273,7 +547,7 @@ fn the_picker_filters_as_you_type_and_opens_the_pick() {
         M …ntation/admin-guide/kernel-parameters.txt   +1234    -56
         M …t/wireless/realtek/rtw89/rtw8852c_table.c  +54321 -12345
         M kernel/sched/fair.c                         +98765 -43210
-
+        ── no other files: compared paths have only their files ──
 
 
 
@@ -283,10 +557,12 @@ fn the_picker_filters_as_you_type_and_opens_the_pick() {
     insta::assert_snapshot!(picker_markup(&mut app), @r"
          <hint> > </>fair<hint>▏</>                                          <dim>1/4 files</>
         > <warn>M</> kernel/sched/<hint>fair</>.c                         <added>+98765</> <removed>-43210</>
+         <dim> ── no other files: compared paths have only their files ──</>
         ");
     typed(&mut app, "j");
     insta::assert_snapshot!(picker_markup(&mut app), @r"
          <hint> > </>fairj<hint>▏</>                                         <dim>0/4 files</>
+         <dim> ── no other files: compared paths have only their files ──</>
          <dim>   no file matches</>
         ");
     app.event(Event::Input(Input::Key(Key::Backspace, Mods::NONE)));

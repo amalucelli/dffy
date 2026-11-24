@@ -149,7 +149,7 @@ fn tables_are_boxed_aligned_and_wrapped_to_the_width() {
     );
     for block in render(source, 24) {
         for line in block.lines {
-            let width: usize = line.iter().map(|s| s.text.width()).sum();
+            let width: usize = line.iter().map(|s| columns::width(&s.text)).sum();
             assert!(width <= 24, "{line:?}");
         }
     }
@@ -164,5 +164,30 @@ fn footnotes_and_sources_at_the_end_without_a_newline() {
          gap 1..1 | \n\
          footnote 2..3 | <dim>[^1]: </>The note\n\
          gap 3..3 | "
+    );
+}
+
+/// A table's rows are as wide as its borders by dffy's own measure, which
+/// counts an emoji's U+FE0F as a column and joined emoji one by one; a cell
+/// that wraps is never cut between an emoji and its U+FE0F.
+#[test]
+fn table_cells_are_padded_as_dffy_measures_them() {
+    for (text, columns) in [
+        ("\u{26a0}\u{fe0f}", 2),
+        ("1\u{fe0f}\u{20e3}", 2),
+        ("\u{1f468}\u{200d}\u{1f469}", 4),
+        ("\u{1f1e7}\u{1f1f7}", 2),
+        ("\u{1f44d}\u{1f3fd}", 4),
+        ("e\u{301}", 1),
+    ] {
+        let blocks = render(&format!("| {text} |\n|---|\n| abcdef |\n"), 80);
+        let border: String = blocks[0].lines[0].iter().map(|s| &*s.text).collect();
+        assert_eq!(border, format!("┌{}┐", "─".repeat(8)));
+        let row: String = blocks[1].lines[0].iter().map(|s| &*s.text).collect();
+        assert_eq!(row, format!("│ {text}{} │", " ".repeat(6 - columns)));
+    }
+    assert_eq!(
+        wrap("\u{26a0}\u{fe0f}\u{26a0}\u{fe0f}x", 3),
+        ["\u{26a0}\u{fe0f}", "\u{26a0}\u{fe0f}x"]
     );
 }

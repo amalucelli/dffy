@@ -4,8 +4,7 @@
 
 use std::ops::Range;
 
-use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
-
+use crate::columns::Columns as _;
 use crate::term::{Key, Mods};
 
 #[derive(Debug, Default, Clone)]
@@ -167,13 +166,12 @@ impl TextBox {
         };
         let mut at = range.start;
         let mut used = 0;
-        for (i, c) in self.text[range.start..trailing(&self.text, range)].char_indices() {
-            let w = c.width().unwrap_or(0);
+        for (i, piece, w) in self.text[range.start..trailing(&self.text, range)].clusters() {
             if used + w > column {
                 break;
             }
             used += w;
-            at = range.start + i + c.len_utf8();
+            at = range.start + i + piece.len();
         }
         self.cursor = at;
     }
@@ -213,12 +211,11 @@ impl TextBox {
             let mut row = base;
             let mut used = 0;
             let mut space = None;
-            for (i, c) in line.char_indices() {
+            for (i, piece, w) in line.clusters() {
                 let at = base + i;
-                if c == '\n' {
+                if piece == "\n" {
                     break;
                 }
-                let w = c.width().unwrap_or(0);
                 if used + w > width && at > row {
                     let cut = space.filter(|&s| s > row).unwrap_or(at);
                     rows.push(row..cut);
@@ -227,7 +224,7 @@ impl TextBox {
                     space = None;
                 }
                 used += w;
-                if c == ' ' {
+                if piece == " " {
                     space = Some(at + 1);
                 }
             }

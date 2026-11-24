@@ -46,6 +46,59 @@ const LOG: &[u8] = include_bytes!(concat!(
     "/tests/fixtures/git-log-color.diff"
 ));
 
+/// A piped diff has only its hunks: `l` says why it has no file view, and
+/// one remembered from an earlier run is off, unsaid and not forgotten.
+#[test]
+fn a_piped_diff_has_no_file_view() {
+    let config = Config {
+        file_view: true,
+        ..Config::default()
+    };
+    let mut app = App::new(
+        &config,
+        Theme::default_theme(),
+        "stdin".to_owned(),
+        None,
+        (120, 24),
+        Indicators::Classic,
+    );
+    app.set_piped();
+    assert_eq!(app.doc.document.reading(), None);
+    assert_eq!(note(&mut app), None, "unsaid until l");
+    for item in piped::items(LOG) {
+        app.event(Event::Piped(item));
+    }
+    app.event(Event::EnumerationDone(None));
+    read_back(&mut app);
+    key(&mut app, 'l');
+    assert_eq!(app.doc.document.reading(), None);
+    let said = status(&mut app);
+    assert!(said.contains("a piped diff has only its hunks"), "{said}");
+    assert_eq!(app.pending_remembered(), []);
+}
+
+/// The control API's `view/open` of a path a piped diff doesn't have is
+/// `not_found`: there are no other files to open whole.
+#[test]
+fn a_piped_diff_opens_only_its_own_files_for_the_control_api() {
+    use crate::control::viewer::{Command, Inbound, Reply};
+    let mut app = piped_app(LOG, 120, 24);
+    let (reply, answer) = Reply::channel();
+    let command = Command::Open {
+        path: "nope.rs".to_owned(),
+        line: None,
+        side: document::Side::New,
+    };
+    let action = app.event(Event::Control(Inbound::Command(command, reply)));
+    assert_eq!(action, None);
+    let answer = answer.try_recv().unwrap_or_default();
+    assert!(
+        answer.contains(r#""code":"not_found""#)
+            && answer.contains("nope.rs isn't in this diff; a piped diff has only its files"),
+        "{answer}"
+    );
+}
+
 /// `git log -p` in the viewer: each commit a top-level node of the tree
 /// with its files beneath, its header and file list as its view, and
 /// `n` going on from one commit's changes into the next's.

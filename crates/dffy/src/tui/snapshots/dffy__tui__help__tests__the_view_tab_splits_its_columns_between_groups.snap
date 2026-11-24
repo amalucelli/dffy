@@ -8,11 +8,11 @@ expression: text
        │ Layout                                    Diff                                    │
        │ x                 more context            d                 toggle syntax diff    │
        │ X                 toggle whole file       r                 toggle rendered view  │
+       │ l                 toggle file view                                                │
        │ s                 cycle layout                                                    │
        │ W                 toggle wrap                                                     │
        │ z                 fold thread                                                     │
        │ Z                 fold all threads                                                │
-       │                                                                                   │
        │                                                                                   │
        │                                                                                   │
        │                                                                                   │

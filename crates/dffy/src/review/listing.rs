@@ -145,10 +145,11 @@ impl Comments {
             .into_iter()
             .filter(|c| c.in_reply_to.is_none() && !c.path.is_empty())
         {
-            let path = root.path.as_bytes();
+            let home = self.home(root);
+            let path = home.as_bytes();
             let local = self.from_local.contains(&root.id);
             if local && self.located.contains_key(path) && !self.placed.contains_key(path) {
-                waiting.push(&root.path);
+                waiting.push(home);
             } else if self.hides(root) {
                 // A local draft that isn't on this diff is the local
                 // review's, not this one's.
@@ -158,7 +159,7 @@ impl Comments {
             {
                 out.push(root);
             } else {
-                waiting.push(&root.path);
+                waiting.push(home);
             }
         }
         waiting.sort_unstable();

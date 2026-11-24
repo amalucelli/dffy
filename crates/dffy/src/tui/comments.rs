@@ -11,12 +11,12 @@ use std::ops::Range;
 
 use dffy_core::document::Side;
 use dffy_core::view::{Attributes, Syntax};
-use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use super::markdown::{self, Body};
 use super::textbox::TextBox;
 use super::tree;
 use super::view::paint;
+use crate::columns::Columns as _;
 use crate::keys::{Action as Act, Keys};
 use crate::render::{Canvas, escape, plain};
 use crate::review::listing::{Absent, List, Listing, Row};
@@ -153,13 +153,12 @@ fn cut<I: Into<Ink> + Copy>(c: &mut Canvas, spans: &[(I, &str)], width: usize) -
             continue;
         }
         let mut cut = String::new();
-        for ch in text.chars() {
-            let w = ch.width().unwrap_or(0);
+        for (_, piece, w) in text.clusters() {
             if used + w > width - 1 {
                 break;
             }
             used += w;
-            cut.push(ch);
+            cut.push_str(piece);
         }
         c.push_ink((*ink).into(), &cut);
         break;
@@ -1062,8 +1061,9 @@ fn tail(text: &str, width: usize) -> String {
     }
     let mut used = 1;
     let mut start = text.len();
-    for (i, ch) in text.char_indices().rev() {
-        used += ch.width().unwrap_or(0);
+    let clusters: Vec<_> = text.clusters().collect();
+    for &(i, _, w) in clusters.iter().rev() {
+        used += w;
         if used > width {
             break;
         }

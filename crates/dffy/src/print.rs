@@ -23,8 +23,8 @@ use dffy_core::structural::{Structural, Unavailable};
 use dffy_core::view::{
     self, Arrangement, Attributes, Heading, LineState, Row, Staging, no_newline,
 };
-use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
+use crate::columns::Columns as _;
 use crate::config::DefaultDiff;
 use crate::output::Output;
 use crate::pager::text_role;
@@ -60,6 +60,9 @@ pub(crate) struct Plan {
     pub reverse: bool,
     /// The threads `--show-comments` shows on each file's diff.
     pub comments: Option<Snapshot>,
+    /// For two paths compared outside git, the names the viewer gives the
+    /// diff's old and new versions: the paths as typed.
+    pub versions: Option<[String; 2]>,
     /// The directory pathspecs are relative to.
     base: PathBuf,
 }
@@ -112,6 +115,7 @@ impl Plan {
             summary,
             reverse,
             comments: None,
+            versions: None,
             base,
         })
     }
@@ -127,6 +131,7 @@ impl Plan {
             summary,
             reverse,
             comments: None,
+            versions: None,
             base: base.to_owned(),
         }
     }
@@ -1349,7 +1354,8 @@ fn file_parts(
                         }
                     }
                 }
-                Row::Marker => {}
+                // Printed output never reads one side alone.
+                Row::Marker | Row::One { .. } | Row::Hidden { .. } => {}
             }
             if c.len() >= PART_ROWS {
                 flush(c);
@@ -1639,7 +1645,7 @@ fn thread_box(hung: &Hung, (width, apart): (usize, bool), now: u64, c: &mut Canv
 /// Returns the columns they took.
 fn cut(c: &mut Canvas, spans: &[(Ink, &str)], width: usize) -> usize {
     let mut used = 0;
-    let total: usize = spans.iter().map(|(_, t)| UnicodeWidthStr::width(*t)).sum();
+    let total: usize = spans.iter().map(|(_, t)| t.width()).sum();
     let room = if total > width {
         width.saturating_sub(1)
     } else {
@@ -1647,13 +1653,12 @@ fn cut(c: &mut Canvas, spans: &[(Ink, &str)], width: usize) -> usize {
     };
     for &(ink, text) in spans {
         let mut piece = String::new();
-        for ch in text.chars() {
-            let w = ch.width().unwrap_or(0);
+        for (_, cluster, w) in text.clusters() {
             if used + w > room {
                 break;
             }
             used += w;
-            piece.push(ch);
+            piece.push_str(cluster);
         }
         c.push_ink(ink, &piece);
     }
@@ -1669,20 +1674,22 @@ fn cut(c: &mut Canvas, spans: &[(Ink, &str)], width: usize) -> usize {
 fn wrap(line: &str, width: usize) -> Vec<&str> {
     let mut out = Vec::new();
     let mut rest = line;
-    while UnicodeWidthStr::width(rest) > width {
+    while rest.width() > width {
         let (mut at, mut space, mut used) = (0, None, 0);
-        for (i, ch) in rest.char_indices() {
-            let w = ch.width().unwrap_or(0);
+        for (i, piece, w) in rest.clusters() {
             if used + w > width {
                 break;
             }
             used += w;
-            at = i + ch.len_utf8();
-            if ch == ' ' {
+            at = i + piece.len();
+            if piece == " " {
                 space = Some(at);
             }
         }
-        let first = rest.chars().next().map_or(1, char::len_utf8);
+        let first = rest
+            .clusters()
+            .next()
+            .map_or(1, |(_, piece, _)| piece.len());
         let at = space.unwrap_or(at).max(first);
         let (piece, tail) = rest.split_at(at);
         out.push(piece.trim_end());

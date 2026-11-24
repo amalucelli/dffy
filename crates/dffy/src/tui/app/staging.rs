@@ -58,6 +58,17 @@ impl App {
             self.message(STILL_EDITING);
             return None;
         }
+        // Picked lines come from both sides, and one is hidden but in a
+        // hunk opened in place.
+        let reading = self.doc.document.reading().is_some();
+        let selected = self.doc.selection.is_some();
+        if reading && selected && !self.doc.selection_opened() {
+            let open = (self.key_for(false, Act::Expand))
+                .map(|k| format!("; {k} opens the change in place"))
+                .unwrap_or_default();
+            self.message(format!("staging lines needs both versions{open}"));
+            return None;
+        }
         let tapped = self.take_tapped();
         let target = self.doc.edit_target(tapped);
         self.doc.selection = None;
@@ -86,6 +97,7 @@ impl App {
             self.message(format!("no changed lines here to {}", edit.verb()));
             return None;
         }
+        self.whole_hunk = reading && !selected;
         Some(match edit {
             Edit::Discard => Action::PlanDiscard { diff, picked },
             Edit::Stage | Edit::Unstage => Action::EditLines { diff, picked, edit },
@@ -95,26 +107,32 @@ impl App {
     /// A git operation the loop ran said how it went: the next can run.
     pub(super) fn edit_done(&mut self, event: Event) {
         self.editing = false;
+        let whole = std::mem::take(&mut self.whole_hunk);
         match event {
+            Event::Edited(Ok(note)) if whole => {
+                self.message(format!("{note}: the whole hunk, as file view takes hunks"));
+            }
             Event::Edited(Ok(note)) => self.message(note),
             Event::Edited(Err(why)) => self.failed(why),
             Event::Planned {
                 diff,
                 picked,
                 result,
-            } => self.discard_planned(diff, picked, result),
+            } => self.discard_planned(diff, picked, result, whole),
             Event::Resolved { path, result } => self.resolved(path, result),
             _ => {}
         }
     }
 
     /// What discarding `picked` lines of `diff` takes, as the loop worked
-    /// it out: the question before it, naming the lines that go.
+    /// it out: the question before it, naming the lines that go, and with
+    /// `whole`, that file view took the whole hunk.
     fn discard_planned(
         &mut self,
         diff: Arc<FileDiff>,
         picked: Picked,
         result: Result<Applied, String>,
+        whole: bool,
     ) {
         let applied = match result {
             Ok(applied) => applied,
@@ -137,8 +155,9 @@ impl App {
                 Some((first, last)) => format!(" at lines {first}-{last}"),
                 None => String::new(),
             };
+            let hunk = if whole { "the whole hunk, " } else { "" };
             format!(
-                "discard {}{at} of {path}? y/n",
+                "discard {hunk}{}{at} of {path}? y/n",
                 session::plural(applied.lines, "line")
             )
         };

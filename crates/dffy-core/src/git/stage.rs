@@ -16,7 +16,7 @@ use std::process::{Command, Stdio};
 
 use gix::bstr::{BStr, ByteSlice};
 
-use super::{Error, FileDiff, Mode, Repo, Result, Side, Status};
+use super::{Error, FileDiff, Mode, Repo, Result, Side, Snapshot, Status};
 use crate::diff::{self, Hunk, LineKind, Options, Text, Whitespace};
 use crate::view::Staging;
 
@@ -276,7 +276,10 @@ impl Repo {
         };
         let (old, new) = match edit {
             Edit::Stage | Edit::Discard => (index, self.worktree_version(path, worktree_mode)?),
-            Edit::Unstage => (self.head_version(path)?, index),
+            Edit::Unstage => {
+                let head = self.side_at(Snapshot::Tree(self.head_tree()?), path)?;
+                (head.map(|side| self.blob(side)).transpose()?, index)
+            }
         };
         if let (Some((_, a)), Some((_, b))) = (&old, &new)
             && a != b
@@ -326,22 +329,9 @@ impl Repo {
             }
             found = Some((e.id, Mode::from_index(e.mode).unwrap_or(Mode::File)));
         }
-        found.map(|(id, mode)| self.blob(id, mode)).transpose()
-    }
-
-    /// `HEAD`'s blob at `path`, `None` without one or before the first
-    /// commit.
-    fn head_version(&self, path: &BStr) -> Result<Version> {
-        let repo = self.git()?;
-        let tree = repo.head_tree_id_or_empty()?;
-        let tree = repo.find_object(tree)?.peel_to_tree()?;
-        let Some(entry) = tree.lookup_entry(path.split_str("/"))? else {
-            return Ok(None);
-        };
-        let Some(mode) = Mode::from_tree(entry.mode()) else {
-            return Ok(None);
-        };
-        self.blob(entry.object_id(), mode).map(Some)
+        found
+            .map(|(id, mode)| self.blob(Side::Object { id, mode }))
+            .transpose()
     }
 
     /// The working-tree file at `path` as git would store it, `None` when
@@ -356,9 +346,9 @@ impl Repo {
         }
     }
 
-    fn blob(&self, id: gix::ObjectId, mode: Mode) -> Result<(Text, Mode)> {
-        let bytes = self.load(BStr::new(""), &Side::Object { id, mode })?;
-        Ok((Text::new(bytes), mode))
+    fn blob(&self, side: Side) -> Result<(Text, Mode)> {
+        let bytes = self.load(BStr::new(""), &side)?;
+        Ok((Text::new(bytes), side.mode()))
     }
 }
 

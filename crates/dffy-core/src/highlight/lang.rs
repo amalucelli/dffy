@@ -9,7 +9,9 @@ use std::sync::{Arc, OnceLock};
 use gix::bstr::ByteSlice;
 
 use super::Compiled;
+use super::locals::LocalsQuery;
 use super::scope::ScopeQuery;
+use super::tags::{TagsError, TagsQuery};
 use crate::git::ObjectId;
 
 /// A list of words or query parts: borrowed for text compiled into the
@@ -41,6 +43,14 @@ pub struct Grammar {
     /// definition, for where a line is (see [`super::Scopes`]). Empty
     /// for a language without one.
     pub scopes: Words,
+    /// The definitions query, as parts concatenated in order: what a file
+    /// defines, for go-to-definition (see [`super::definitions`]). Empty
+    /// for a language without one.
+    pub tags: Words,
+    /// The locals query, as parts concatenated in order: the scopes of a
+    /// function and the names they define, for what a name used there
+    /// names. Empty for a language without one.
+    pub locals: Words,
     /// A line's indentation is syntax: changing it can move code into or
     /// out of a block with the same tokens in the same order, so the
     /// syntax diff never calls such a change only reformatting.
@@ -72,7 +82,12 @@ struct Entry {
     loaded: OnceLock<tree_sitter::Language>,
     compiled: OnceLock<Option<Compiled>>,
     scopes: OnceLock<Option<ScopeQuery>>,
+    tags: OnceLock<Option<Result<TagsQuery, TagsError>>>,
+    locals: OnceLock<Option<LocalsQuery>>,
     identity: OnceLock<ObjectId>,
+    tags_identity: OnceLock<ObjectId>,
+    /// For C, C++: what a `.h` whose text reads as C++ is.
+    header: OnceLock<Language>,
     #[cfg(test)]
     compiles: std::sync::atomic::AtomicUsize,
 }
@@ -98,7 +113,11 @@ impl Language {
             loaded: OnceLock::new(),
             compiled: OnceLock::new(),
             scopes: OnceLock::new(),
+            tags: OnceLock::new(),
+            locals: OnceLock::new(),
             identity: OnceLock::new(),
+            tags_identity: OnceLock::new(),
+            header: OnceLock::new(),
             #[cfg(test)]
             compiles: std::sync::atomic::AtomicUsize::new(0),
         }))
@@ -108,6 +127,28 @@ impl Language {
     #[must_use]
     pub fn name(&self) -> &str {
         &self.0.grammar.name
+    }
+
+    /// This language, or for a `.h` file at `path` the name says is C but
+    /// whose `text` reads as C++ ([`reads_as_cpp`]), C++. Every step that
+    /// has a file's text decides by it, as a file's name alone can't.
+    #[must_use]
+    pub fn of_text(&self, path: &[u8], text: &[u8]) -> &Self {
+        match self.0.header.get() {
+            Some(cpp) if self.sniffs(path) && reads_as_cpp(text) => cpp,
+            _ => self,
+        }
+    }
+
+    /// Whether a file at `path` of this language has its language decided
+    /// by its text: a `.h` the name says is C.
+    pub(crate) fn sniffs(&self, path: &[u8]) -> bool {
+        self.0.header.get().is_some() && path.ends_with(b".h")
+    }
+
+    /// What [`Language::of_text`] may give for a file it [`Language::sniffs`].
+    pub(crate) fn header(&self) -> Option<&Self> {
+        self.0.header.get()
     }
 
     /// The [`Grammar::indentation_is_syntax`].
@@ -123,31 +164,46 @@ impl Language {
     /// one. Computed on first use, which loads the grammar.
     #[must_use]
     pub fn identity(&self) -> &ObjectId {
-        self.0.identity.get_or_init(|| {
-            let g = &self.0.grammar;
-            let mut hasher = gix::hash::hasher(gix::hash::Kind::Sha1);
-            let number = |hasher: &mut gix::hash::Hasher, n: usize| {
-                hasher.update(&(n as u64).to_le_bytes());
-            };
-            number(&mut hasher, g.name.len());
-            hasher.update(g.name.as_bytes());
-            let ts = self.grammar();
-            number(&mut hasher, ts.abi_version());
-            let version = ts.metadata().map_or([u8::MAX; 3], |m| {
-                [m.major_version, m.minor_version, m.patch_version]
-            });
-            hasher.update(&version);
-            number(&mut hasher, ts.node_kind_count());
-            number(&mut hasher, ts.parse_state_count());
-            number(&mut hasher, ts.field_count());
-            for part in g.highlights.iter().chain(g.scopes.iter()) {
-                number(&mut hasher, part.len());
-                hasher.update(part.as_bytes());
-            }
-            hasher
-                .try_finalize()
-                .unwrap_or_else(|_| ObjectId::null(gix::hash::Kind::Sha1))
+        let g = &self.0.grammar;
+        (self.0.identity).get_or_init(|| self.digest(g.highlights.iter().chain(g.scopes.iter())))
+    }
+
+    /// [`Language::identity`] for definitions: the grammar, its
+    /// [`Grammar::tags`] and the rules extraction walks it with, so editing
+    /// a highlight or scope query keeps the definitions cached under it,
+    /// and editing the tags query or the rules keeps the highlights.
+    pub(super) fn tags_identity(&self) -> &ObjectId {
+        (self.0.tags_identity).get_or_init(|| {
+            let rules = Cow::Owned(super::tags::rules_identity(self.name()));
+            self.digest(self.0.grammar.tags.iter().chain([&rules]))
         })
+    }
+
+    /// A digest of the grammar's name and tables, then of `queries`.
+    fn digest<'q>(&self, queries: impl Iterator<Item = &'q Cow<'static, str>>) -> ObjectId {
+        let g = &self.0.grammar;
+        let mut hasher = gix::hash::hasher(gix::hash::Kind::Sha1);
+        let number = |hasher: &mut gix::hash::Hasher, n: usize| {
+            hasher.update(&(n as u64).to_le_bytes());
+        };
+        number(&mut hasher, g.name.len());
+        hasher.update(g.name.as_bytes());
+        let ts = self.grammar();
+        number(&mut hasher, ts.abi_version());
+        let version = ts.metadata().map_or([u8::MAX; 3], |m| {
+            [m.major_version, m.minor_version, m.patch_version]
+        });
+        hasher.update(&version);
+        number(&mut hasher, ts.node_kind_count());
+        number(&mut hasher, ts.parse_state_count());
+        number(&mut hasher, ts.field_count());
+        for part in queries {
+            number(&mut hasher, part.len());
+            hasher.update(part.as_bytes());
+        }
+        hasher
+            .try_finalize()
+            .unwrap_or_else(|_| ObjectId::null(gix::hash::Kind::Sha1))
     }
 
     pub(crate) fn grammar(&self) -> &tree_sitter::Language {
@@ -215,6 +271,21 @@ impl Language {
             .as_ref()
     }
 
+    /// The compiled definitions query, compiling it on first use. `None`
+    /// for a language without one; an error, for the host to show, when it
+    /// doesn't compile.
+    pub(super) fn tags_query(&self) -> Option<Result<&TagsQuery, &TagsError>> {
+        let g = &self.0.grammar;
+        self.0
+            .tags
+            .get_or_init(|| {
+                (!g.tags.is_empty())
+                    .then(|| TagsQuery::new(self.grammar(), &g.name, &g.tags.concat()))
+            })
+            .as_ref()
+            .map(Result::as_ref)
+    }
+
     #[cfg(test)]
     pub(super) fn compiles(&self) -> usize {
         self.0.compiles.load(std::sync::atomic::Ordering::Relaxed)
@@ -223,6 +294,32 @@ impl Language {
     /// Whether the query was compiled (or failed to) already.
     pub(super) fn is_compiled(&self) -> bool {
         self.0.compiled.get().is_some()
+    }
+
+    /// The compiled locals query, compiling it on first use. `None` for a
+    /// language without one, or if it doesn't compile.
+    pub(super) fn locals_query(&self) -> Option<&LocalsQuery> {
+        let g = &self.0.grammar;
+        self.0
+            .locals
+            .get_or_init(|| {
+                (!g.locals.is_empty())
+                    .then(|| LocalsQuery::new(self.grammar(), &g.locals.concat()))
+                    .flatten()
+            })
+            .as_ref()
+    }
+
+    /// Whether [`Grammar::locals`] has a query, compiled or not.
+    #[must_use]
+    pub fn has_locals(&self) -> bool {
+        !self.0.grammar.locals.is_empty()
+    }
+
+    /// Whether [`Grammar::tags`] has a query, compiled or not.
+    #[must_use]
+    pub fn has_tags(&self) -> bool {
+        !self.0.grammar.tags.is_empty()
     }
 }
 
@@ -236,16 +333,20 @@ pub struct Registry {
 
 impl Registry {
     /// A registry of `grammars`. When two match the same file the earlier
-    /// one wins.
+    /// one wins. With both a `c` and a `cpp` grammar, a C `.h` that reads as
+    /// C++ is C++.
     #[must_use]
     pub fn new(grammars: impl IntoIterator<Item = Grammar>) -> Self {
-        Self {
-            languages: grammars.into_iter().map(Language::new).collect(),
+        let languages: Vec<Language> = grammars.into_iter().map(Language::new).collect();
+        let named = |name| languages.iter().find(|l| l.name() == name);
+        if let (Some(c), Some(cpp)) = (named("c"), named("cpp")) {
+            c.0.header.get_or_init(|| cpp.clone());
         }
+        Self { languages }
     }
 
     /// The 30 grammars bundled with dffy-core. `.h` counts as C, the common
-    /// case in C codebases.
+    /// case in C codebases, until its text says C++ ([`Language::of_text`]).
     #[must_use]
     pub fn builtin() -> Self {
         Self::new(builtin())
@@ -266,6 +367,8 @@ impl Registry {
     /// The language of the file at `path` (repository-relative), by file
     /// name, then extension, then a `#!` line at the start of `content`.
     /// Each step looks through every language before the next one starts.
+    /// A `.h` is C unless `content` reads as C++ ([`Language::of_text`]):
+    /// give it the file's first [`SNIFF_BYTES`] where they're at hand.
     #[must_use]
     pub fn detect(&self, path: &[u8], content: &[u8]) -> Option<&Language> {
         let name = path.rsplit(|&b| b == b'/').next().unwrap_or(path);
@@ -277,7 +380,223 @@ impl Registry {
         find(|g| &g.file_names, name)
             .or_else(|| find(|g| &g.extensions, name.rsplit_once_str(".")?.1))
             .or_else(|| find(|g| &g.interpreters, interpreter(content)?))
+            .map(|l| l.of_text(path, content))
     }
+}
+
+/// What [`reads_as_cpp`] reads: bump it when that changes, which orphans
+/// the definitions kept for headers read by the rules before.
+pub(super) const SNIFF_VERSION: u8 = 2;
+
+/// How much of a `.h` file's text decides whether it's C++.
+pub const SNIFF_BYTES: usize = 16 * 1024;
+
+/// Whether `text`, a header's, shows within its first [`SNIFF_BYTES`] what
+/// only C++ has, outside comments: `namespace x {`, a `template <`, an access
+/// specifier's line, `class X {` (or `:`, or `final`, past macros between),
+/// `std::`, `extern "C++"`. A bare `class` isn't one (the kernel's `struct
+/// class`), nor `extern "C" {`, which C headers write for C++ to read them,
+/// nor what a C header keeps for C++ alone (`#ifdef __cplusplus`). Allocates
+/// nothing.
+#[must_use]
+pub fn reads_as_cpp(text: &[u8]) -> bool {
+    let text = &text[..text.len().min(SNIFF_BYTES)];
+    // Looked for once rather than on each line, most headers having none.
+    let std = memchr::memmem::find(text, b"std::").is_some();
+    let mut guards = Guards::default();
+    let mut comment = false;
+    for line in text.lines() {
+        let mut rest = line.trim_start();
+        if !comment && rest.first() == Some(&b'#') {
+            guards.directive(rest[1..].trim_start());
+        } else if !comment
+            && guards.cpp == 0
+            && ((matches!(rest.first(), Some(b'n' | b't' | b'c' | b'p' | b'e')) && cpp_line(rest))
+                || (std && names_std(before_comment(rest).0)))
+        {
+            return true;
+        }
+        let directive = !comment && rest.first() == Some(&b'#');
+        if !comment && memchr::memchr(b'/', rest).is_none() {
+            continue;
+        }
+        // The line's parts past its comments, and whether one stays open.
+        loop {
+            if comment {
+                let Some(end) = memchr::memmem::find(rest, b"*/") else {
+                    break;
+                };
+                (rest, comment) = (rest[end + 2..].trim_start(), false);
+                if !directive
+                    && guards.cpp == 0
+                    && (cpp_line(rest) || (std && names_std(before_comment(rest).0)))
+                {
+                    return true;
+                }
+            }
+            match before_comment(rest).1 {
+                Some(after) => (rest, comment) = (after, true),
+                None => break,
+            }
+        }
+    }
+    false
+}
+
+/// The code at the start of `line`, to its first comment, and what's past the
+/// opening of it when it's a block's.
+fn before_comment(line: &[u8]) -> (&[u8], Option<&[u8]>) {
+    let mut i = 0;
+    while let Some(at) = memchr::memchr2(b'/', b'"', &line[i..]) {
+        let at = i + at;
+        match (line[at], line.get(at + 1)) {
+            (b'/', Some(b'/')) => return (&line[..at], None),
+            (b'/', Some(b'*')) => return (&line[..at], Some(&line[at + 2..])),
+            (b'"', _) => {
+                i = at + 1;
+                while line.get(i).is_some_and(|&b| b != b'"') {
+                    i += if line[i] == b'\\' { 2 } else { 1 };
+                }
+                i = (i + 1).min(line.len());
+            }
+            _ => i = at + 1,
+        }
+    }
+    (line, None)
+}
+
+/// Whether `code` names something of C++'s `std`, not in a string.
+fn names_std(code: &[u8]) -> bool {
+    memchr::memmem::find(code, b"std::").is_some_and(|at| {
+        memchr::memchr_iter(b'"', &code[..at])
+            .count()
+            .is_multiple_of(2)
+    })
+}
+
+/// The conditionals open at a place in a header, as deep as code has them:
+/// past that they only count.
+#[derive(Default)]
+struct Guards {
+    open: [Guard; 32],
+    depth: usize,
+    /// How many of them are in a branch only C++ reads.
+    cpp: usize,
+}
+
+#[derive(Clone, Copy, Default)]
+struct Guard {
+    /// The branch it's in is one only C++ reads.
+    cpp: bool,
+    /// A branch before it was C's alone, so those past it are C++'s.
+    c_taken: bool,
+}
+
+impl Guards {
+    /// Goes on past a line's preprocessor `directive`, its `#` left off.
+    fn directive(&mut self, directive: &[u8]) {
+        let word = directive
+            .iter()
+            .position(|b| !b.is_ascii_alphabetic())
+            .unwrap_or(directive.len());
+        let (word, condition) = directive.split_at(word);
+        match word {
+            b"if" | b"ifdef" | b"ifndef" => {
+                self.depth += 1;
+                self.set(Self::branch(word == b"ifndef", condition));
+            }
+            b"elif" | b"elifdef" | b"elifndef" => {
+                let branch = Self::branch(word == b"elifndef", condition);
+                self.set(match self.current() {
+                    Guard { c_taken: true, .. } => Guard {
+                        cpp: true,
+                        c_taken: true,
+                    },
+                    _ => branch,
+                });
+            }
+            b"else" => {
+                let c_taken = self.current().c_taken;
+                self.set(Guard {
+                    cpp: c_taken,
+                    c_taken,
+                });
+            }
+            b"endif" => {
+                self.set(Guard::default());
+                self.depth = self.depth.saturating_sub(1);
+            }
+            _ => {}
+        }
+    }
+
+    /// A branch read on `condition`, or when it fails for an `ifndef`.
+    fn branch(unless: bool, condition: &[u8]) -> Guard {
+        let Some(at) = memchr::memmem::find(condition, b"__cplusplus") else {
+            return Guard::default();
+        };
+        // `!defined(__cplusplus)`, `!__cplusplus`, `__cplusplus == 0`.
+        let before = condition[..at].trim_end_with(|c| c == '(' || c == ' ' || c == '\t');
+        let before = before.strip_suffix(b"defined").unwrap_or(before).trim_end();
+        let after = condition[at + b"__cplusplus".len()..].trim_start();
+        let not = unless || before.ends_with(b"!") || after.starts_with(b"== 0");
+        Guard {
+            cpp: !not,
+            c_taken: not,
+        }
+    }
+
+    fn current(&self) -> Guard {
+        (self.depth.checked_sub(1))
+            .and_then(|i| self.open.get(i))
+            .copied()
+            .unwrap_or_default()
+    }
+
+    fn set(&mut self, guard: Guard) {
+        if let Some(open) = (self.depth.checked_sub(1)).and_then(|i| self.open.get_mut(i)) {
+            self.cpp = self.cpp + usize::from(guard.cpp) - usize::from(open.cpp);
+            *open = guard;
+        }
+    }
+}
+
+/// Past a run of names (`a::b`, `EXPORT Name`): whether there was
+/// one, and what follows, trimmed.
+fn past_names(rest: &[u8], colons: bool) -> (bool, &[u8]) {
+    let is_word = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
+    let end = (rest.iter())
+        .position(|&b| !(is_word(b) || b.is_ascii_whitespace() || (colons && b == b':')))
+        .unwrap_or(rest.len());
+    (rest[..end].iter().any(|&b| is_word(b)), &rest[end..])
+}
+
+/// Whether `line`, trimmed at the start, opens with what only C++ writes.
+fn cpp_line(line: &[u8]) -> bool {
+    let is_word = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
+    if let Some(rest) = line.strip_prefix(b"namespace") {
+        let (_, rest) = past_names(rest, true);
+        return rest.first() == Some(&b'{') && !line[9..].first().is_some_and(|&b| is_word(b));
+    }
+    if let Some(rest) = line.strip_prefix(b"template") {
+        return rest.trim_start().first() == Some(&b'<');
+    }
+    if let Some(rest) = line.strip_prefix(b"class ") {
+        let (named, after) = past_names(rest, false);
+        let final_ =
+            rest.trim_end().ends_with(b" final") || rest.windows(7).any(|w| w == b" final ");
+        return named
+            && (after.first() == Some(&b'{')
+                || (after.first() == Some(&b':') && after.get(1) != Some(&b':'))
+                || final_);
+    }
+    for access in [&b"public:"[..], b"private:", b"protected:"] {
+        if let Some(rest) = line.strip_prefix(access) {
+            let rest = rest.trim_start();
+            return rest.is_empty() || rest.starts_with(b"//") || rest.starts_with(b"/*");
+        }
+    }
+    line.starts_with(b"extern \"C++\"")
 }
 
 /// The interpreter named by a `#!` line, skipping `env` and its options,
@@ -332,6 +651,8 @@ fn builtin() -> [Grammar; 30] {
         language: LanguageSource::Fn(language),
         highlights: words![],
         scopes: words![],
+        tags: words![],
+        locals: words![],
         indentation_is_syntax: false,
     };
     [
@@ -351,12 +672,16 @@ fn builtin() -> [Grammar; 30] {
             extensions: words!["sh", "bash", "zsh", "ksh", "bats", "ebuild"],
             interpreters: words!["sh", "bash", "zsh", "dash", "ksh", "ash"],
             highlights: words![tree_sitter_bash::HIGHLIGHT_QUERY],
+            tags: words![include_str!("queries/bash/tags.scm")],
+            locals: words![include_str!("queries/bash/locals.scm")],
             ..grammar("bash", || tree_sitter_bash::LANGUAGE.into())
         },
         Grammar {
             extensions: words!["c", "h"],
             highlights: words![tree_sitter_c::HIGHLIGHT_QUERY],
             scopes: words![include_str!("queries/c/scopes.scm")],
+            tags: words![include_str!("queries/c/tags.scm")],
+            locals: words![include_str!("queries/c/locals.scm")],
             ..grammar("c", || tree_sitter_c::LANGUAGE.into())
         },
         Grammar {
@@ -371,11 +696,21 @@ fn builtin() -> [Grammar; 30] {
                 include_str!("queries/c/scopes.scm"),
                 include_str!("queries/cpp/scopes.scm")
             ],
+            tags: words![
+                include_str!("queries/cpp/tags.scm"),
+                include_str!("queries/c/tags.scm"),
+            ],
+            locals: words![
+                include_str!("queries/c/locals.scm"),
+                include_str!("queries/cpp/locals.scm")
+            ],
             ..grammar("cpp", || tree_sitter_cpp::LANGUAGE.into())
         },
         Grammar {
             extensions: words!["cs"],
             highlights: words![tree_sitter_c_sharp::HIGHLIGHTS_QUERY],
+            tags: words![include_str!("queries/csharp/tags.scm")],
+            locals: words![include_str!("queries/csharp/locals.scm")],
             ..grammar("csharp", || tree_sitter_c_sharp::LANGUAGE.into())
         },
         Grammar {
@@ -393,12 +728,16 @@ fn builtin() -> [Grammar; 30] {
             extensions: words!["ex", "exs"],
             interpreters: words!["elixir"],
             highlights: words![tree_sitter_elixir::HIGHLIGHTS_QUERY],
+            tags: words![include_str!("queries/elixir/tags.scm")],
+            locals: words![include_str!("queries/elixir/locals.scm")],
             ..grammar("elixir", || tree_sitter_elixir::LANGUAGE.into())
         },
         Grammar {
             extensions: words!["go"],
             highlights: words![tree_sitter_go::HIGHLIGHTS_QUERY],
             scopes: words![include_str!("queries/go/scopes.scm")],
+            tags: words![include_str!("queries/go/tags.scm")],
+            locals: words![include_str!("queries/go/locals.scm")],
             ..grammar("go", || tree_sitter_go::LANGUAGE.into())
         },
         Grammar {
@@ -415,6 +754,8 @@ fn builtin() -> [Grammar; 30] {
             extensions: words!["java"],
             highlights: words![tree_sitter_java::HIGHLIGHTS_QUERY],
             scopes: words![include_str!("queries/java/scopes.scm")],
+            tags: words![include_str!("queries/java/tags.scm")],
+            locals: words![include_str!("queries/java/locals.scm")],
             ..grammar("java", || tree_sitter_java::LANGUAGE.into())
         },
         Grammar {
@@ -425,6 +766,14 @@ fn builtin() -> [Grammar; 30] {
                 tree_sitter_javascript::JSX_HIGHLIGHT_QUERY,
             ],
             scopes: words![include_str!("queries/javascript/scopes.scm")],
+            tags: words![
+                include_str!("queries/javascript/tags.scm"),
+                include_str!("queries/javascript/fields.scm"),
+            ],
+            locals: words![
+                include_str!("queries/javascript/locals.scm"),
+                include_str!("queries/javascript/parameters.scm"),
+            ],
             ..grammar("javascript", || tree_sitter_javascript::LANGUAGE.into())
         },
         Grammar {
@@ -436,12 +785,16 @@ fn builtin() -> [Grammar; 30] {
             extensions: words!["kt", "kts"],
             highlights: words![tree_sitter_kotlin_sg::HIGHLIGHTS_QUERY, KOTLIN_JUMPS],
             scopes: words![include_str!("queries/kotlin/scopes.scm")],
+            tags: words![include_str!("queries/kotlin/tags.scm")],
+            locals: words![include_str!("queries/kotlin/locals.scm")],
             ..grammar("kotlin", || tree_sitter_kotlin_sg::LANGUAGE.into())
         },
         Grammar {
             extensions: words!["lua"],
             interpreters: words!["lua", "luajit"],
             highlights: words![tree_sitter_lua::HIGHLIGHTS_QUERY],
+            tags: words![include_str!("queries/lua/tags.scm")],
+            locals: words![include_str!("queries/lua/locals.scm")],
             ..grammar("lua", || tree_sitter_lua::LANGUAGE.into())
         },
         Grammar {
@@ -460,6 +813,8 @@ fn builtin() -> [Grammar; 30] {
             extensions: words!["php"],
             interpreters: words!["php"],
             highlights: words![tree_sitter_php::HIGHLIGHTS_QUERY],
+            tags: words![include_str!("queries/php/tags.scm")],
+            locals: words![include_str!("queries/php/locals.scm")],
             ..grammar("php", || tree_sitter_php::LANGUAGE_PHP.into())
         },
         Grammar {
@@ -468,6 +823,8 @@ fn builtin() -> [Grammar; 30] {
             highlights: words![tree_sitter_python::HIGHLIGHTS_QUERY],
             indentation_is_syntax: true,
             scopes: words![include_str!("queries/python/scopes.scm")],
+            tags: words![include_str!("queries/python/tags.scm")],
+            locals: words![include_str!("queries/python/locals.scm")],
             ..grammar("python", || tree_sitter_python::LANGUAGE.into())
         },
         Grammar {
@@ -475,17 +832,23 @@ fn builtin() -> [Grammar; 30] {
             extensions: words!["rb", "rake", "gemspec", "ru"],
             interpreters: words!["ruby"],
             highlights: words![tree_sitter_ruby::HIGHLIGHTS_QUERY],
+            tags: words![include_str!("queries/ruby/tags.scm")],
+            locals: words![include_str!("queries/ruby/locals.scm")],
             ..grammar("ruby", || tree_sitter_ruby::LANGUAGE.into())
         },
         Grammar {
             extensions: words!["rs"],
             highlights: words![tree_sitter_rust::HIGHLIGHTS_QUERY],
             scopes: words![include_str!("queries/rust/scopes.scm")],
+            tags: words![include_str!("queries/rust/tags.scm")],
+            locals: words![include_str!("queries/rust/locals.scm")],
             ..grammar("rust", || tree_sitter_rust::LANGUAGE.into())
         },
         Grammar {
             extensions: words!["scala", "sc", "sbt"],
             highlights: words![tree_sitter_scala::HIGHLIGHTS_QUERY],
+            tags: words![include_str!("queries/scala/tags.scm")],
+            locals: words![include_str!("queries/scala/locals.scm")],
             indentation_is_syntax: true,
             ..grammar("scala", || tree_sitter_scala::LANGUAGE.into())
         },
@@ -498,6 +861,8 @@ fn builtin() -> [Grammar; 30] {
             extensions: words!["swift"],
             highlights: words![tree_sitter_swift::HIGHLIGHTS_QUERY],
             scopes: words![include_str!("queries/swift/scopes.scm")],
+            tags: words![include_str!("queries/swift/tags.scm")],
+            locals: words![include_str!("queries/swift/locals.scm")],
             ..grammar("swift", || tree_sitter_swift::LANGUAGE.into())
         },
         Grammar {
@@ -517,6 +882,14 @@ fn builtin() -> [Grammar; 30] {
                 include_str!("queries/javascript/scopes.scm"),
                 include_str!("queries/typescript/scopes.scm")
             ],
+            tags: words![
+                include_str!("queries/javascript/tags.scm"),
+                include_str!("queries/typescript/tags.scm"),
+            ],
+            locals: words![
+                include_str!("queries/javascript/locals.scm"),
+                include_str!("queries/typescript/locals.scm"),
+            ],
             ..grammar("tsx", || tree_sitter_typescript::LANGUAGE_TSX.into())
         },
         Grammar {
@@ -528,6 +901,14 @@ fn builtin() -> [Grammar; 30] {
             scopes: words![
                 include_str!("queries/javascript/scopes.scm"),
                 include_str!("queries/typescript/scopes.scm")
+            ],
+            tags: words![
+                include_str!("queries/javascript/tags.scm"),
+                include_str!("queries/typescript/tags.scm"),
+            ],
+            locals: words![
+                include_str!("queries/javascript/locals.scm"),
+                include_str!("queries/typescript/locals.scm"),
             ],
             ..grammar("typescript", || {
                 tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into()
@@ -547,6 +928,8 @@ fn builtin() -> [Grammar; 30] {
         Grammar {
             extensions: words!["zig", "zon"],
             highlights: words![tree_sitter_zig::HIGHLIGHTS_QUERY],
+            tags: words![include_str!("queries/zig/tags.scm")],
+            locals: words![include_str!("queries/zig/locals.scm")],
             ..grammar("zig", || tree_sitter_zig::LANGUAGE.into())
         },
     ]

@@ -144,15 +144,23 @@ pub(crate) fn selection(selection: Option<&Selection>) -> Value {
 }
 
 /// Where a `view/open` went, or the comment a `comments/add` added there,
-/// the line 0-based.
-pub(crate) fn shown(id: Option<String>, path: String, at: Option<usize>, side: Side) -> Value {
+/// the line 0-based. `listed` is false for a file the diff doesn't list,
+/// opened whole at `side`, and only then on the wire.
+pub(crate) fn shown(
+    id: Option<String>,
+    path: String,
+    at: Option<usize>,
+    side: Side,
+    listed: bool,
+) -> Value {
     let id = id.map(|id| ("id", text(id)));
     let at = [
         ("path", text(path)),
         ("line", one_based(at)),
         ("side", text(encode::side(side))),
     ];
-    object(id.into_iter().chain(at).collect())
+    let unlisted = (!listed).then_some(("listed", Value::Bool(false)));
+    object(id.into_iter().chain(at).chain(unlisted).collect())
 }
 
 /// What `view/focusThread` answers.
@@ -512,12 +520,22 @@ mod tests {
         );
         assert_eq!(selection(None), Value::Null);
         assert_eq!(
-            line(&shown(Some("c1".into()), "a.rs".into(), Some(9), Side::New)),
+            line(&shown(
+                Some("c1".into()),
+                "a.rs".into(),
+                Some(9),
+                Side::New,
+                true
+            )),
             "{\"id\":\"c1\",\"path\":\"a.rs\",\"line\":10,\"side\":\"new\"}\n"
         );
         assert_eq!(
-            line(&shown(None, "a.rs".into(), None, Side::New)),
+            line(&shown(None, "a.rs".into(), None, Side::New, true)),
             "{\"path\":\"a.rs\",\"line\":null,\"side\":\"new\"}\n"
+        );
+        assert_eq!(
+            line(&shown(None, "b.rs".into(), Some(0), Side::Old, false)),
+            "{\"path\":\"b.rs\",\"line\":1,\"side\":\"old\",\"listed\":false}\n"
         );
     }
 

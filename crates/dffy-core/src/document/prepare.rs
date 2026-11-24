@@ -6,7 +6,7 @@ use std::sync::{Arc, OnceLock};
 
 use gix::bstr::ByteSlice;
 
-use super::{File, sources};
+use super::{File, Side, sources};
 use crate::cache::Cache;
 use crate::diff::{Emphasis, Hunk, Text, Whitespace, emphasize};
 use crate::git::FileDiff;
@@ -114,18 +114,22 @@ impl Prepare<'_> {
         (emphasis, syntax)
     }
 
-    /// The syntax runs of the new-side `lines` of a gap of `diff`, filling
-    /// `slot` as [`Prepare::emphasis`] does; `None` when the new side isn't
-    /// highlighted.
+    /// The syntax runs of a gap of `diff`'s `lines` of `side` (see
+    /// [`File::gap_lines`]), filling `slot` as [`Prepare::emphasis`] does;
+    /// `None` when that side isn't highlighted.
     #[must_use]
     pub fn gap_syntax(
         &self,
         diff: &FileDiff,
         slot: &SyntaxSlot,
+        side: Side,
         lines: Range<usize>,
     ) -> Option<Spans> {
-        slot.get_or_init(|| self.syntax(diff, true))
-            .new_spans(&diff.new, lines)
+        let syntax = slot.get_or_init(|| self.syntax(diff, true));
+        match side {
+            Side::Old => syntax.old_spans(&diff.old, lines),
+            Side::New => syntax.new_spans(&diff.new, lines),
+        }
     }
 
     /// Finds the definitions `slot`'s highlighting of `diff` left to find

@@ -24,6 +24,7 @@ pub(crate) const REMEMBERED: &[&str] = &[
     "wrap",
     "tree",
     "tree-width",
+    "all-files",
     "status-bar",
     "indicators",
     "modified-lines",

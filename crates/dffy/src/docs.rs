@@ -32,6 +32,7 @@ pub(crate) fn keys() -> String {
                 (spans(keys.chords(true, action)), " in the tree"),
                 (spans(keys.thread_chords(action)), " on a thread"),
                 (spans(keys.conflict_chords(action)), " in a conflicted file"),
+                (spans(keys.peek_chords(action)), " in a peek"),
             ]
             .into_iter()
             .filter(|(keys, _)| !keys.is_empty())
@@ -74,6 +75,13 @@ pub(crate) fn keys() -> String {
          elsewhere. While a search goes on, `n` and `N` keep stepping through its matches, \
          and past the last conflict that way they go on to the next change.\n\n",
         |action| spans(keys.conflict_chords(action)),
+    );
+    section(
+        &mut out,
+        "\n## In a peek\n\nWhile a go-to-definition peek has the keys, these keys come before \
+         every other table's; the rest do what they do without it. Clicking the code above it \
+         gives the keys back to the diff, and clicking the peek takes them again.\n\n",
+        |action| spans(keys.peek_chords(action)),
     );
     out.push_str(
         "\n## Command panel\n\n`space` opens the panel as a quick popup of what applies to \
@@ -137,6 +145,8 @@ keybind = tree:x=mark_viewed
 keybind = thread:R=reply
 # Only in a file with conflicts to resolve
 keybind = conflict:O=keep_current
+# Only while a go-to-definition peek has the keys
+keybind = peek:o=open
 # A key in the command panel
 keybind = leader:z=toggle_wrap
 ```
@@ -146,10 +156,11 @@ keybind = leader:z=toggle_wrap
 `page_down`, `insert`, `delete`, `f1` to `f12`. `ctrl+` and `alt+` go before the key. \
 `shift+` works with letters (`shift+n` is `N`) and `tab`; for other characters, bind the \
 shifted character itself.
-- **Tables:** there are five. Keys pressed while the tree has focus look in the tree's \
+- **Tables:** there are six. Keys pressed while the tree has focus look in the tree's \
 table (`tree:`) first, then in the main one. Keys pressed on a comment thread look in the \
 thread's table (`thread:`) first, then, in a file with conflicts to resolve, in the \
-conflict's (`conflict:`). The command panel has its own table (`leader:`); rebinding a key \
+conflict's (`conflict:`). Keys pressed while a go-to-definition peek has the keys look in \
+its table (`peek:`) before any other. The command panel has its own table (`leader:`); rebinding a key \
 there keeps the entry's place in the panel. By default a panel key the main table binds \
 too does the same thing there.
 - **Fallbacks:** a key pressed with `alt` or `shift` that has no binding of its own acts \
@@ -214,6 +225,8 @@ fn values(key: &str) -> String {
         "status-bar" => choices::<config::StatusBar>(),
         "modified-lines" => choices::<config::ModifiedLines>(),
         "wrap"
+        | "file-view"
+        | "all-files"
         | "ignore-all-space"
         | "ignore-space-change"
         | "renames"

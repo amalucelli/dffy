@@ -250,7 +250,7 @@ impl At {
 pub(super) struct Key {
     pub width: usize,
     pub structural: bool,
-    pub arrangement: Option<Arrangement>,
+    pub layout: Option<super::Layout>,
     /// For a gap: lines shown from the top, from the bottom, and between.
     pub gap: Option<(usize, usize, Vec<Range<usize>>)>,
 }

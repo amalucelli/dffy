@@ -18,6 +18,7 @@ use std::time::{Duration, Instant};
 use dffy_core::bstr::BString;
 use dffy_core::git::Revisions;
 
+use super::model::drafts::NO_LINES;
 use super::model::reload::{Check, Written};
 use super::model::{self, Comments, Hint, Part, Posting};
 use crate::plugin::agent;
@@ -354,8 +355,11 @@ pub(crate) struct Sending {
     pub left_out: usize,
     /// Of them, refused by the host before.
     pub refused: usize,
-    /// Local drafts in view, whether or not they go.
+    /// Local drafts that can go, whether or not they do.
     pub local: usize,
+    /// Local drafts that can't, as their lines weren't found: not in
+    /// `comments`.
+    pub staying: usize,
     /// Threads resolved or reopened and not sent, once a plan said.
     pub resolves: Option<usize>,
     /// Comments in your pending review on the host, which a submitting
@@ -387,8 +391,9 @@ impl Sending {
         }
     }
 
-    /// The one warning: drafts that won't go up as they are.
-    pub(crate) fn warning(&self) -> Option<Vec<Part>> {
+    /// The warnings about drafts that won't go up as they are, a line each;
+    /// the last names what goes to them.
+    pub(crate) fn warnings(&self) -> Vec<Vec<Part>> {
         let mut parts = Vec::new();
         if self.left_out > 0 {
             let left_out = format!("{} left out", plural(self.left_out, "draft"));
@@ -397,10 +402,20 @@ impl Sending {
         if self.refused > 0 {
             parts.push(Part::Text(format!("{} refused before", self.refused)));
         }
-        (!parts.is_empty()).then(|| {
-            parts.push(Part::Hint(Hint::GoToUnposted));
-            parts
-        })
+        let mut lines = Vec::new();
+        if !parts.is_empty() {
+            lines.push(parts);
+        }
+        if self.staying > 0 {
+            let drafts = plural(self.staying, "branch draft");
+            let stay = if self.staying == 1 { "stays" } else { "stay" };
+            let words = format!("{drafts} {stay}, lines not found");
+            lines.push(vec![Part::Text(words)]);
+        }
+        if let Some(last) = lines.last_mut() {
+            last.push(Part::Hint(Hint::GoToUnposted));
+        }
+        lines
     }
 }
 
@@ -858,7 +873,7 @@ impl Reviewing {
     pub(crate) fn plan_deadline(&self, comments: Option<&Comments>) -> Option<Instant> {
         let plans = &self.mode.as_ref()?.plans;
         let due = plans.due?;
-        let drafts = || comments.is_some_and(|c| c.counts().1 > 0);
+        let drafts = || comments.is_some_and(Comments::any_goes);
         (plans.running.is_none() && !self.posting_now() && drafts()).then_some(due)
     }
 
@@ -973,6 +988,7 @@ impl Reviewing {
         let mut out = Sending {
             pending: known.map_or_else(|| comments.host_pending(), |k| k.pending),
             resolves: known.map(|k| k.resolves),
+            staying: comments.staying().count(),
             ..Sending::default()
         };
         for (id, from_local, refused) in comments.drafts() {
@@ -992,7 +1008,8 @@ impl Reviewing {
     }
 
     /// The drafts that won't go as they are, with why: those the plan
-    /// skips, and those the host refused before.
+    /// skips, those the host refused before, and the local ones whose lines
+    /// weren't found.
     pub(crate) fn wont_go(
         &self,
         comments: Option<&Comments>,
@@ -1013,6 +1030,7 @@ impl Reviewing {
                 };
                 Some((id.to_owned(), why))
             })
+            .chain((comments.staying()).map(|id| (id.to_owned(), NO_LINES.to_owned())))
             .collect()
     }
 
@@ -1630,7 +1648,7 @@ impl Reviewing {
     /// session that weren't posted, `PR #7: 3 drafts not posted`.
     pub(crate) fn unposted_note(&self, comments: Option<&Comments>) -> Option<String> {
         let mode = self.mode.as_ref()?;
-        let drafts = comments?.drafts().count();
+        let (_, drafts) = comments?.counts();
         (drafts > 0).then(|| format!("{}: {} not posted", mode.label, plural(drafts, "draft")))
     }
 

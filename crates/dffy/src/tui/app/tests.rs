@@ -1,9 +1,13 @@
 mod agents;
 mod command_panel;
+mod control;
 mod draw;
 mod jobs;
+mod jumps;
 mod keys;
+mod landed;
 mod mouse;
+mod peek;
 mod piped;
 mod render;
 mod review;

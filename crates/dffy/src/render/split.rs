@@ -42,7 +42,7 @@ pub(super) fn row(layout: &Layout, w: usize, lines: [Option<&Line>; 2], c: &mut 
                 }
                 continue;
             };
-            style.mark(c, layout, first);
+            style.mark(c, layout, first, false);
             c.set_side(side);
             let used = if cursors[side].pos < line.text.len() || first {
                 layout.put_row(

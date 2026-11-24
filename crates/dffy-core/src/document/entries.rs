@@ -15,8 +15,8 @@ use gix::bstr::BString;
 
 use super::blocks::{Arrange, At, Attach, Block, BlockId, Blocks, Placed};
 use super::{
-    Anchor, Content, Context, Counts, File, Headings, Hit, Mark, Match, Matches, Pos, Reveal,
-    Segment, Shape, Shown, Side, file_status,
+    Anchor, Content, Context, Counts, File, Gap, Headings, Hit, Mark, Match, Matches, Pos, Reading,
+    Reveal, Segment, Shape, Shown, Side, file_status,
 };
 use crate::annotation::{Placement, REVEAL_CONTEXT};
 use crate::conflict::{Choice, Choices};
@@ -25,7 +25,7 @@ use crate::git::{FileChange, FileDiff, Status, Update};
 use crate::highlight::HunkSyntax;
 use crate::patch::Commit;
 use crate::structural::{Structural, Unavailable};
-use crate::view::{Arrangement, FileStatus, Spans};
+use crate::view::{Arrangement, FileStatus, Row, Spans};
 
 /// What a row shows, to find it again once rows are laid out anew (see
 /// [`Document::relayout`]).
@@ -39,6 +39,58 @@ enum Spot {
         line: usize,
         down: usize,
     },
+}
+
+/// What a [`Document`] shows of every file, for the [`Shape`] of each.
+#[derive(Clone, Copy)]
+struct Look {
+    structural: bool,
+    full: bool,
+    reading: Option<Side>,
+}
+
+/// The side the entry of `change` from `source` is read on while `reading`
+/// is read alone: its other side where `change` has none on that one, as
+/// an added file has no old side and a deleted file no new one. A file the
+/// diff doesn't list has one side as both: it's read as it shows.
+fn read_side<P>(reading: Side, change: &FileChange, source: &Source<P>) -> Option<Side> {
+    if matches!(source, Source::Unchanged) {
+        return None;
+    }
+    Some(match (reading, &change.old, &change.new) {
+        (Side::Old, None, Some(_)) => Side::New,
+        (Side::New, Some(_), None) => Side::Old,
+        (reading, ..) => reading,
+    })
+}
+
+impl Look {
+    /// How entry `file`, of `change` from `source`, with `reveal`, its
+    /// hunks among `opened` and `blocks`, shows: a file the diff doesn't
+    /// list, or one read on a side alone, shows whole, and on the side it
+    /// has when it lacks the one read.
+    // Built for every row drawn or moved over: while both sides show, it
+    // looks nothing up.
+    fn shape<'a, P, A>(
+        self,
+        (file, change, source): (usize, &FileChange, &Source<P>),
+        (reveal, opened): (&'a [Reveal], &'a [Opened]),
+        blocks: Option<&'a Blocks>,
+        arrange: &'a A,
+    ) -> Shape<'a, A> {
+        // Hunks are opened in place only while a side is read alone.
+        let reading = self
+            .reading
+            .and_then(|side| Some((read_side(side, change, source)?, opened_in(opened, file))));
+        Shape {
+            structural: self.structural,
+            full: self.full || self.reading.is_some() || matches!(source, Source::Unchanged),
+            reading,
+            reveal,
+            arrange,
+            blocks,
+        }
+    }
 }
 
 /// A file of a piped diff as its patch described it. The patch's hunks are
@@ -161,6 +213,29 @@ pub struct Entry<P> {
     /// The host holds blocks for it, given or not (see
     /// [`Document::set_held_blocks`]).
     held_blocks: bool,
+}
+
+// Passes over the whole list go through every entry: state few entries
+// have lives on the document instead.
+const _: () = assert!(size_of::<Entry<()>>() <= 304);
+
+/// A file's hunks opened in place (see [`Document::set_opened`]).
+struct Opened {
+    /// The entry.
+    file: usize,
+    /// In order.
+    hunks: Vec<usize>,
+    /// The gaps around the hunks they were opened among. Kept here, as the
+    /// diff may be evicted before the one a reload brings: the numbers in
+    /// `hunks` are that one's only when its gaps are the same.
+    gaps: Box<[Gap]>,
+}
+
+/// The hunks of entry `file` opened in place, among `opened`.
+fn opened_in(opened: &[Opened], file: usize) -> &[usize] {
+    (opened.iter())
+        .find(|o| o.file == file)
+        .map_or(&[], |o| &o.hunks)
 }
 
 /// A version no entry has had (see [`Entry::version`]).
@@ -409,6 +484,10 @@ pub struct Found {
     /// The version of the file's blocks they were found in (see
     /// [`Document::blocks_version`]): other blocks mean searching again.
     pub blocks_version: u64,
+    /// How the file was read alone when they were found (see
+    /// [`Document::reading_in`]): another side, or other hunks opened,
+    /// means searching again.
+    pub reading: Option<Reading>,
     /// The matches.
     pub matches: Arc<Matches>,
     /// The one the view last went to.
@@ -477,9 +556,10 @@ pub enum Missing {
     /// Hunk `n` of the line diff has no emphasis:
     /// [`super::Prepare::emphasis`], then [`Document::set_emphasis`].
     Emphasis(usize),
-    /// Gap `n` shows lines and has no syntax runs:
+    /// Gap `n` shows lines and has no syntax runs of the side it shows them
+    /// from, the new one unless the old is read alone:
     /// [`super::Prepare::gap_syntax`], then [`Document::set_gap_syntax`].
-    GapSyntax(usize),
+    GapSyntax(usize, Side),
     /// The file's highlighting is prepared and the definitions it leaves
     /// to find, for the scope line, aren't yet: [`super::Prepare::scopes`],
     /// which stores them in the file's syntax slot.
@@ -514,6 +594,13 @@ pub struct Document<P> {
     rendered: bool,
     /// Files show their full text, all but piped ones.
     pub full: bool,
+    /// The side files are read on alone, if any (see
+    /// [`Document::set_reading`]).
+    reading: Option<Side>,
+    /// The hunks opened in place while a side is read alone, by entry (see
+    /// [`Document::set_opened`]). Apart from the entries, which every pass
+    /// over the list goes through: few have any.
+    opened: Vec<Opened>,
     /// The change the view last landed on, and the position it took.
     landed: Option<(Pos, Pos)>,
     /// A file not diffed yet was opened by change at this position (see
@@ -525,6 +612,8 @@ pub struct Document<P> {
     pub search: Option<Found>,
     /// The last heading search for [`Document::context`].
     headings: Headings,
+    /// See [`Document::counts_version`].
+    counts_version: u64,
 }
 
 impl<P> Default for Document<P> {
@@ -537,10 +626,13 @@ impl<P> Default for Document<P> {
             structural: false,
             rendered: false,
             full: false,
+            reading: None,
+            opened: Vec::new(),
             landed: None,
             pending_land: None,
             search: None,
             headings: Headings::default(),
+            counts_version: next_version(),
         }
     }
 }
@@ -567,6 +659,15 @@ impl<P> Document<P> {
         self.rendered
     }
 
+    /// New whenever an entry is added or taken away or its counts change,
+    /// and never the same in two documents, so a host can keep what it
+    /// sums over every entry's counts until it changes.
+    #[inline]
+    #[must_use]
+    pub fn counts_version(&self) -> u64 {
+        self.counts_version
+    }
+
     /// Adds an entry at the end, not diffed yet. A host lists the diff's
     /// files before it adds any [`Source::Unchanged`] entry, which come last.
     pub fn push(&mut self, change: FileChange, source: Source<P>) {
@@ -574,6 +675,7 @@ impl<P> Document<P> {
             self.commits.push(self.files.len());
         }
         self.files.push(Entry::new(change, source));
+        self.counts_version = next_version();
     }
 
     /// The entry of `change`'s path, adding `change`, a file the diff
@@ -590,7 +692,77 @@ impl<P> Document<P> {
             return file;
         }
         self.files.push(Entry::new(change, Source::Unchanged));
+        self.counts_version = next_version();
         self.files.len() - 1
+    }
+
+    /// Puts `change` in place of the [`Source::Unchanged`] entry `file`
+    /// as a new entry, not diffed yet: its path read from another
+    /// snapshot. Returns false when `file` isn't such an entry.
+    pub fn replace_unchanged(&mut self, file: usize, change: FileChange) -> bool {
+        if !self.files.get(file).is_some_and(Entry::is_unchanged) {
+            return false;
+        }
+        let old = std::mem::replace(&mut self.files[file], Entry::new(change, Source::Unchanged));
+        self.release(old);
+        self.counts_version = next_version();
+        self.search.take_if(|found| found.file == file);
+        if self.pos.file == file {
+            self.pos = Pos {
+                file,
+                ..Pos::default()
+            };
+            self.forget_positions();
+        }
+        true
+    }
+
+    /// Takes away the [`Source::Unchanged`] entry `file`. The position
+    /// moves with the entries after it, or from this one to the entry
+    /// before it; the search's file moves too, and other positions held in
+    /// files are dropped ([`Document::forget_positions`]). Returns false
+    /// when `file` isn't such an entry.
+    pub fn close_unchanged(&mut self, file: usize) -> bool {
+        if !self.files.get(file).is_some_and(Entry::is_unchanged) {
+            return false;
+        }
+        let old = self.files.remove(file);
+        self.release(old);
+        self.counts_version = next_version();
+        self.unopen(file);
+        for o in &mut self.opened {
+            o.file -= usize::from(o.file > file);
+        }
+        if self.search.as_ref().is_some_and(|found| found.file == file) {
+            self.search = None;
+        } else if let Some(found) = self.search.as_mut().filter(|found| found.file > file) {
+            found.file -= 1;
+        }
+        if self.pos.file > file {
+            self.pos.file -= 1;
+        } else if self.pos.file == file {
+            let file = file
+                .saturating_sub(1)
+                .min(self.files.len().saturating_sub(1));
+            self.pos = Pos {
+                file,
+                ..self
+                    .files
+                    .get(file)
+                    .and_then(|e| e.saved)
+                    .unwrap_or_default()
+            };
+        }
+        self.forget_positions();
+        true
+    }
+
+    /// Takes what `entry`, gone from the list, held off the loaded bytes.
+    fn release(&mut self, entry: Entry<P>) {
+        self.loaded_bytes -= entry.render_bytes();
+        if let State::Loaded(file) = entry.state {
+            self.loaded_bytes -= file.bytes();
+        }
     }
 
     /// Where the [`Source::Unchanged`] entries after the diff's start.
@@ -668,11 +840,16 @@ impl<P> Document<P> {
                 -1
             }
         };
+        self.counts_version = next_version();
         for c in &mut self.commits {
             *c = c.saturating_add_signed(moved);
         }
         if let Some(found) = &mut self.search {
             found.file = found.file.saturating_add_signed(moved);
+        }
+        // The page has none opened: it's no diff.
+        for o in &mut self.opened {
+            o.file = o.file.saturating_add_signed(moved);
         }
         self.forget_positions();
         moved
@@ -692,21 +869,44 @@ impl<P> Document<P> {
     pub fn sort_by_path(&mut self) -> bool {
         let head = self.head();
         let end = self.listed_end().max(head);
-        let files = &mut self.files[head..end];
-        if files.is_sorted_by(|a, b| a.change.path <= b.change.path) {
+        if (self.files[head..end]).is_sorted_by(|a, b| a.change.path <= b.change.path) {
             return false;
         }
-        let anchor = (self.pos.file >= head)
-            .then(|| files.get(self.pos.file - head))
-            .flatten()
-            .map(|e| e.change.path.clone());
-        files.sort_by(|a, b| a.change.path.cmp(&b.change.path));
-        if let Some(file) = anchor.and_then(|path| files.iter().position(|e| e.change.path == path))
-        {
-            self.pos.file = head + file;
-        }
+        self.keeping_opened(|doc| {
+            let files = &mut doc.files[head..end];
+            let anchor = (doc.pos.file >= head)
+                .then(|| files.get(doc.pos.file - head))
+                .flatten()
+                .map(|e| e.change.path.clone());
+            files.sort_by(|a, b| a.change.path.cmp(&b.change.path));
+            if let Some(file) =
+                anchor.and_then(|path| files.iter().position(|e| e.change.path == path))
+            {
+                doc.pos.file = head + file;
+            }
+        });
         self.forget_positions();
         true
+    }
+
+    /// Runs `reorder`, which moves entries, keeping the hunks opened in
+    /// place with their files, found again by path, which names one entry.
+    fn keeping_opened<R>(&mut self, reorder: impl FnOnce(&mut Self) -> R) -> R {
+        if self.opened.is_empty() {
+            return reorder(self);
+        }
+        let held: Vec<(BString, Opened)> = std::mem::take(&mut self.opened)
+            .into_iter()
+            .filter_map(|o| Some((self.files.get(o.file)?.change.path.clone(), o)))
+            .collect();
+        let result = reorder(self);
+        self.opened = (held.into_iter())
+            .filter_map(|(path, o)| {
+                let file = self.files.iter().position(|e| e.change.path == path)?;
+                Some(Opened { file, ..o })
+            })
+            .collect();
+        result
     }
 
     /// Drops the change landed on and [`Document::pending_land`], which
@@ -727,6 +927,10 @@ impl<P> Document<P> {
     /// the host opens it ([`Settle::Open`]). Positions held in files are
     /// dropped ([`Document::forget_positions`]).
     pub fn replace(&mut self, update: &Update) -> Option<usize> {
+        self.keeping_opened(|doc| doc.replace_list(update))
+    }
+
+    fn replace_list(&mut self, update: &Update) -> Option<usize> {
         let head: Vec<Entry<P>> = self.files.drain(..self.head()).collect();
         let n = head.len();
         let on_head = self.pos.file < n;
@@ -734,6 +938,7 @@ impl<P> Document<P> {
         self.pos.file = self.pos.file.saturating_sub(n);
         let open = self.replace_files(update);
         self.files.splice(0..0, head);
+        self.counts_version = next_version();
         if on_head {
             self.pos = kept;
             // Opened under the commit shown: it opens at its top later.
@@ -790,10 +995,7 @@ impl<P> Document<P> {
             }
         }
         for gone in old.into_values() {
-            self.loaded_bytes -= gone.render_bytes();
-            if let State::Loaded(file) = gone.state {
-                self.loaded_bytes -= file.bytes();
-            }
+            self.release(gone);
         }
         if let Some(file) = anchor.and_then(|path| {
             let files = &self.files;
@@ -822,6 +1024,17 @@ impl<P> Document<P> {
             .then_some(file)
     }
 
+    /// Marks `file` to be diffed and counted again, as after its file on
+    /// disk was written outside a refresh's reach; what's shown stays until
+    /// the new diff is loaded.
+    pub fn reread(&mut self, file: usize) {
+        if let Some(entry) = self.files.get_mut(file) {
+            entry.stale = !matches!(entry.state, State::Pending);
+            entry.recount = true;
+            entry.version = next_version();
+        }
+    }
+
     /// Marks every file to be diffed and counted again, the settings having
     /// changed; what's shown stays until the new diffs are loaded.
     pub fn restale(&mut self) {
@@ -837,7 +1050,8 @@ impl<P> Document<P> {
     /// Stores the host's diff for a file that wants one (see
     /// [`Entry::wants_diff`]); `None` when it doesn't. A file whose hunks
     /// moved loses its revealed lines; one reloaded after eviction keeps
-    /// them. Its rendering, of the diff replaced, is dropped.
+    /// them. Hunks opened in place stay open when the hunks are where they
+    /// were. Its rendering, of the diff replaced, is dropped.
     pub fn load(&mut self, file: usize, result: Result<Box<File>, String>) -> Option<Settle> {
         let entry = self.files.get_mut(file)?;
         if !entry.wants_diff() {
@@ -856,8 +1070,13 @@ impl<P> Document<P> {
             entry.reveal.clear();
             entry.host_reveal.clear();
         }
+        self.opened.retain(|o| {
+            let same = || !rendered && result.as_ref().is_ok_and(|new| *o.gaps == *new.gaps());
+            o.file != file || same()
+        });
         entry.stale = false;
         entry.recount = false;
+        self.counts_version = next_version();
         entry.state = match result {
             Ok(loaded) => {
                 self.loaded_bytes += loaded.bytes();
@@ -993,6 +1212,7 @@ impl<P> Document<P> {
             Some(entry) if entry.wants_counts() => {
                 entry.counts = Some(counts);
                 entry.recount = false;
+                self.counts_version = next_version();
                 true
             }
             _ => false,
@@ -1014,17 +1234,21 @@ impl<P> Document<P> {
         }
     }
 
-    /// Stores gap `gap`'s syntax runs (see [`File::set_gap_syntax`]) if
-    /// `diff` is still the diff loaded for `file`.
+    /// Stores the syntax runs of gap `gap`'s lines of `side` (see
+    /// [`File::set_gap_syntax`]) if `diff` is still the diff loaded for
+    /// `file`.
     pub fn set_gap_syntax(
         &mut self,
         file: usize,
         diff: &Arc<FileDiff>,
         gap: usize,
+        side: Side,
         spans: Option<Spans>,
     ) {
         if let Some(State::Loaded(loaded)) = self.files.get_mut(file).map(|e| &mut e.state) {
-            loaded.set_gap_syntax(diff, gap, spans);
+            let before = loaded.bytes();
+            loaded.set_gap_syntax(diff, gap, side, spans);
+            self.loaded_bytes += loaded.bytes() - before;
         }
     }
 
@@ -1073,6 +1297,21 @@ impl<P> Document<P> {
         Some(Settle::Keep)
     }
 
+    /// No hunk of `file` stays opened in place: the rendered view and the
+    /// line diff number their hunks apart, and an entry gone has none.
+    fn unopen(&mut self, file: usize) {
+        self.opened.retain(|o| o.file != file);
+    }
+
+    /// [`Entry::drop_render`] for `file`, which closes the rendered view's
+    /// opened hunks (see [`Document::unopen`]).
+    fn unrender(&mut self, file: usize) -> usize {
+        if matches!(self.files[file].render.as_deref(), Some(Render::Shown(_))) {
+            self.unopen(file);
+        }
+        self.files[file].drop_render()
+    }
+
     /// Swaps `file` between its line diff and its rendered view. The file
     /// shown opens anew.
     fn show_render(&mut self, file: usize) -> Settle {
@@ -1080,6 +1319,7 @@ impl<P> Document<P> {
             self.search = None;
         }
         self.files[file].swap_render();
+        self.unopen(file);
         if self.pos.file != file {
             return Settle::Keep;
         }
@@ -1130,7 +1370,7 @@ impl<P> Document<P> {
                 Some(Render::Failed(_)) | None => false,
             };
             if stale {
-                self.loaded_bytes -= self.files[file].drop_render();
+                self.loaded_bytes -= self.unrender(file);
                 if shown && self.pos.file == file {
                     self.forget_positions();
                     settle = Settle::Open {
@@ -1152,6 +1392,13 @@ impl<P> Document<P> {
         }
     }
 
+    /// What the loaded files are estimated to hold, which [`Document::evict`]
+    /// keeps under its budget.
+    #[cfg(test)]
+    pub(crate) fn loaded_bytes(&self) -> usize {
+        self.loaded_bytes
+    }
+
     /// Drops the least recently shown diffs outside `keep` until the loaded
     /// ones hold at most `budget` bytes; they're wanted again
     /// ([`Entry::wants_diff`]) if they come back. Entries in `keep` stay
@@ -1169,7 +1416,7 @@ impl<P> Document<P> {
             else {
                 break;
             };
-            self.loaded_bytes -= self.files[i].drop_render();
+            self.loaded_bytes -= self.unrender(i);
             if let State::Loaded(loaded) =
                 std::mem::replace(&mut self.files[i].state, State::Pending)
             {
@@ -1194,14 +1441,52 @@ impl<P> Document<P> {
     }
 
     /// Whether `entry` shows its full text. A piped file never does, and a
-    /// [`Source::Unchanged`] one always does.
+    /// [`Source::Unchanged`] one, or any while a side is read alone, always
+    /// does.
     #[inline]
     #[must_use]
     pub fn is_full(&self, entry: &Entry<P>) -> bool {
         match entry.source {
             Source::Piped(_) => false,
             Source::Unchanged => true,
-            Source::Repo | Source::Commit(_) | Source::Page { .. } => self.full,
+            Source::Repo | Source::Commit(_) | Source::Page { .. } => {
+                self.full || self.reading.is_some()
+            }
+        }
+    }
+
+    /// The side files are read on alone, if any (see
+    /// [`Document::set_reading`]).
+    #[inline]
+    #[must_use]
+    pub fn reading(&self) -> Option<Side> {
+        self.reading
+    }
+
+    /// The side `file` is read on while a side is read alone: the other
+    /// one when the file has none on the side read, as an added file has
+    /// no old side. `None` while both show, for a file the diff doesn't
+    /// list, which shows its one side either way, and past the last entry.
+    #[must_use]
+    pub fn reading_of(&self, file: usize) -> Option<Side> {
+        self.read_on(file, self.reading)
+    }
+
+    /// The side `file` would be read on with `reading` read alone, as
+    /// [`Document::reading_of`] says once it is: for laying its rows out
+    /// before [`Document::set_reading`] switches.
+    #[must_use]
+    pub fn read_on(&self, file: usize, reading: Option<Side>) -> Option<Side> {
+        let reading = reading?;
+        let entry = self.files.get(file)?;
+        read_side(reading, &entry.change, &entry.source)
+    }
+
+    fn look(&self) -> Look {
+        Look {
+            structural: self.structural,
+            full: self.full,
+            reading: self.reading,
         }
     }
 
@@ -1219,13 +1504,12 @@ impl<P> Document<P> {
         let State::Loaded(loaded) = &entry.state else {
             return None;
         };
-        let shape = Shape {
-            structural: self.structural,
-            full: self.full || matches!(entry.source, Source::Unchanged),
-            reveal: &entry.reveal,
-            arrange: &(),
-            blocks: entry.blocks.as_deref(),
-        };
+        let shape = (self.look()).shape(
+            (file, &entry.change, &entry.source),
+            (&entry.reveal, &self.opened),
+            entry.blocks.as_deref(),
+            &(),
+        );
         Some((loaded, shape))
     }
 
@@ -1239,17 +1523,17 @@ impl<P> Document<P> {
         arrange: &A,
         f: impl FnOnce(&mut File, &Shape<'_, A>) -> R,
     ) -> Option<R> {
+        let look = self.look();
         let entry = self.files.get_mut(file)?;
         let State::Loaded(loaded) = &mut entry.state else {
             return None;
         };
-        let shape = Shape {
-            structural: self.structural,
-            full: self.full || matches!(entry.source, Source::Unchanged),
-            reveal: &entry.reveal,
+        let shape = look.shape(
+            (file, &entry.change, &entry.source),
+            (&entry.reveal, &self.opened),
+            entry.blocks.as_deref(),
             arrange,
-            blocks: entry.blocks.as_deref(),
-        };
+        );
         let before = loaded.bytes();
         let result = f(loaded, &shape);
         self.loaded_bytes += loaded.bytes() - before;
@@ -1358,18 +1642,17 @@ impl<P> Document<P> {
                 None => Content::Sheet(pos.row),
             });
         }
-        let (structural, full) = (self.structural, self.full);
+        let look = self.look();
         let entry = self.files.get_mut(pos.file)?;
         let State::Loaded(file) = &mut entry.state else {
             return None;
         };
-        let shape = Shape {
-            structural,
-            full: full || matches!(entry.source, Source::Unchanged),
-            reveal: &entry.reveal,
-            arrange: &arrange,
-            blocks: entry.blocks.as_deref(),
-        };
+        let shape = look.shape(
+            (pos.file, &entry.change, &entry.source),
+            (&entry.reveal, &self.opened),
+            entry.blocks.as_deref(),
+            &arrange,
+        );
         let before = file.bytes();
         file.ensure_part(&shape, pos.part);
         self.loaded_bytes += file.bytes() - before;
@@ -1666,7 +1949,7 @@ impl<P> Document<P> {
     }
 
     /// The arrangement of the rows of the hunk at `pos`; `None` for a part
-    /// that isn't a hunk.
+    /// that isn't a hunk, and while a side is read alone.
     #[inline]
     pub fn arrangement(&mut self, pos: Pos, arrange: impl Arrange) -> Option<Arrangement> {
         self.with_file(pos.file, &arrange, |f, shape| {
@@ -1766,10 +2049,10 @@ impl<P> Document<P> {
         change: impl FnOnce(&mut Self),
     ) {
         let pos = self.pos;
-        let spot = (pos.file < self.files.len()).then(|| self.spot(pos, &before));
+        let spot = (pos.file < self.files.len()).then(|| self.spot(pos, &before, Side::New));
         let landed = (self.landed.take())
             .filter(|(change, view)| change.file == pos.file && *view == pos)
-            .map(|(change, _)| self.spot(change, &before));
+            .map(|(change, _)| self.spot(change, &before, Side::New));
         change(self);
         let Some(entry) = self.files.get_mut(pos.file) else {
             return;
@@ -1793,8 +2076,9 @@ impl<P> Document<P> {
         self.landed = landed.map(|change| (change, self.pos));
     }
 
-    /// What the row at `pos` shows, for [`Document::relayout`].
-    fn spot<A: Arrange>(&mut self, pos: Pos, arrange: &A) -> Option<Spot> {
+    /// What the row at `pos` shows, for [`Document::relayout`]: on a row
+    /// showing both sides, the line of `prefer`.
+    fn spot<A: Arrange>(&mut self, pos: Pos, arrange: &A, prefer: Side) -> Option<Spot> {
         match self.row(pos, *arrange)? {
             Content::Block { id, line } => return Some(Spot::Block { id, line }),
             Content::Parting { id } => return Some(Spot::Block { id, line: 0 }),
@@ -1804,10 +2088,18 @@ impl<P> Document<P> {
         let mut at = pos;
         let mut down = 0;
         while down < 3 {
-            let (side, line) = match self.row_lines(at, *arrange) {
-                [_, Some(new)] => (Side::New, new),
-                [Some(old), None] => (Side::Old, old),
-                [None, None] => {
+            let lines = self.row_lines(at, *arrange);
+            let (side, line) = match (lines[prefer.index()], lines[prefer.other().index()]) {
+                (Some(line), _) => (prefer, line),
+                (None, Some(line)) => (prefer.other(), line),
+                (None, None) => {
+                    if let Some((side, lines)) = self.mark(at, *arrange) {
+                        return Some(Spot::Line {
+                            side,
+                            line: lines.start,
+                            down,
+                        });
+                    }
                     down += usize::from(!self.in_block(at, *arrange));
                     if !self.next_row(&mut at, *arrange) {
                         return None;
@@ -1980,22 +2272,198 @@ impl<P> Document<P> {
         true
     }
 
+    /// Reads every file on `side` alone, or with `None` shows both again.
+    /// Read alone, a file shows whole: each of that side's lines once, in
+    /// order. Each line of the other side a hunk hides pairs with the line
+    /// it was edited into, as split view pairs them, and those left over
+    /// stand in a row of their own, a mark (see [`crate::view::side_rows`]).
+    /// Blocks on a hidden line hang under the row standing for it.
+    ///
+    /// The position stays on the line it showed, the side read's when its
+    /// row shows both, or on the row standing for it once it's hidden; on a
+    /// block's row; or on the header above the line it was over. A mark's
+    /// row goes to the first line it stood for once that side shows, and
+    /// otherwise stays on its line, or on that first line on a row of its
+    /// own. The search's matches are dropped, as they were found on other
+    /// lines. `before` lays rows out as they are, `after` as they'll be
+    /// drawn, as for [`Document::relayout`]. Returns false for an empty
+    /// document; otherwise the host then normalizes the position.
+    pub fn set_reading(
+        &mut self,
+        reading: Option<Side>,
+        before: impl Arrange,
+        after: impl Arrange,
+    ) -> bool {
+        let pos = self.pos;
+        if pos.file >= self.files.len() {
+            self.reading = reading;
+            return false;
+        }
+        if reading == self.reading {
+            return true;
+        }
+        let prefer = reading.or(self.reading).unwrap_or(Side::New);
+        // The lines a mark stood for show above its line once their side
+        // does: the position goes to them, so they're in view.
+        let shown = (self.mark(pos, before))
+            .filter(|(side, _)| reading.is_none_or(|r| r == *side))
+            .map(|(side, lines)| Spot::Line {
+                side,
+                line: lines.start,
+                down: 0,
+            });
+        let spot = shown.or_else(|| self.spot(pos, &before, prefer));
+        self.reading = reading;
+        self.opened.clear();
+        self.search = None;
+        self.landed = None;
+        if let Some(entry) = self.files.get_mut(pos.file)
+            && let Some(blocks) = &mut entry.blocks
+        {
+            blocks.remeasure(None);
+        }
+        if let Some(at) = spot.and_then(|s| self.find_spot(pos.file, s, after)) {
+            // A screen row within a row means nothing on another line's.
+            let same = match spot {
+                Some(Spot::Block { .. }) => true,
+                Some(Spot::Line { side, line, down }) => {
+                    down == 0 && self.row_lines(at, after)[side.index()] == Some(line)
+                }
+                None => false,
+            };
+            self.pos = Pos {
+                offset: if same { pos.offset } else { 0 },
+                ..at
+            };
+        }
+        true
+    }
+
+    /// Opens the hunk of the row at `from`, in the file shown, in place, or
+    /// with `open` false folds it again, while a side is read alone: an
+    /// opened hunk shows its unified rows, both sides' lines, under a
+    /// header row standing for it. The position stays on what it showed, as
+    /// [`Document::relayout`] keeps it, and a hidden line it stood for comes
+    /// to show; opened from an edited line at the top, the line it was
+    /// edited from goes to the top. A screen row within the top row stays
+    /// only on the same line. Hunks open until the side read changes.
+    /// Returns whether anything changed.
+    pub fn set_opened(&mut self, from: Pos, open: bool, arrange: impl Arrange) -> bool {
+        let file = self.pos.file;
+        let Some(Segment::Hunk(hunk)) = self.segment(file, from.part) else {
+            return false;
+        };
+        if self.files.get(file).is_none() || self.reading.is_none() {
+            return false;
+        }
+        let at = opened_in(&self.opened, file).binary_search(&hunk);
+        if from.file != file || at.is_ok() == open {
+            return false;
+        }
+        let top = Pos {
+            offset: 0,
+            ..self.pos
+        };
+        // An edited line opened from the top: the line it was edited from
+        // comes to show above it, and goes to the top so it's in view.
+        let paired = match self.row(from, arrange) {
+            Some(Content::Hunk {
+                row: Row::One {
+                    paired: Some(p), ..
+                },
+                lines,
+                ..
+            }) if open && Pos { offset: 0, ..from } == top => {
+                let l = lines.line(p);
+                (l.old.map(|n| (Side::Old, n - 1))).or_else(|| l.new.map(|n| (Side::New, n - 1)))
+            }
+            _ => None,
+        };
+        let before = self.row_lines(top, arrange);
+        self.relayout(arrange, arrange, |doc| {
+            let held = doc.opened.iter().position(|o| o.file == file);
+            let held = held.unwrap_or_else(|| {
+                let gaps = doc.file(file).map_or(&[][..], File::gaps).into();
+                doc.opened.push(Opened {
+                    file,
+                    hunks: Vec::new(),
+                    gaps,
+                });
+                doc.opened.len() - 1
+            });
+            let opened = &mut doc.opened[held].hunks;
+            match at {
+                Ok(i) => {
+                    opened.remove(i);
+                }
+                Err(i) => opened.insert(i, hunk),
+            }
+            if opened.is_empty() {
+                doc.opened.swap_remove(held);
+            }
+        });
+        let spot = paired.map(|(side, line)| Spot::Line {
+            side,
+            line,
+            down: 0,
+        });
+        if let Some(at) = spot.and_then(|s| self.find_spot(file, s, arrange)) {
+            self.pos = at;
+        }
+        if self.row_lines(self.pos, arrange) != before || before == [None, None] {
+            self.pos.offset = 0;
+        }
+        self.search = None;
+        true
+    }
+
+    /// The hunks of `file` opened in place while a side is read alone, in
+    /// order (see [`Document::set_opened`]).
+    #[must_use]
+    pub fn opened(&self, file: usize) -> &[usize] {
+        opened_in(&self.opened, file)
+    }
+
+    /// How `file` is read alone, for a search of it (see [`find`]): the
+    /// side, as [`Document::reading_of`] says, the hunks opened in place,
+    /// and the syntax diff's hunks while they show. `None` while both sides
+    /// show.
+    ///
+    /// [`find`]: super::find
+    #[must_use]
+    pub fn reading_in(&self, file: usize) -> Option<Reading> {
+        Some(Reading {
+            side: self.reading_of(file)?,
+            opened: self.opened(file).to_vec(),
+            structural: (self.file(file))
+                .and_then(|f| f.shown_structural(self.structural))
+                .map(Arc::clone),
+        })
+    }
+
+    /// The lines of the other side that the row at `pos` marks as hidden
+    /// while a side is read alone: that side, and the lines in order. `None`
+    /// on every other row.
+    pub fn mark(&mut self, pos: Pos, arrange: impl Arrange) -> Option<(Side, Range<usize>)> {
+        self.with_file(pos.file, &arrange, |f, shape| f.mark(shape, pos))?
+    }
+
     /// Where the position is, for a title (see [`Context`]); a block's row
     /// is where the row it hangs under is. `None` before the first hunk and
     /// for a whole added or deleted file.
     pub fn context(&mut self, arrange: impl Arrange) -> Option<Context<'_>> {
         let pos = self.pos;
+        let look = self.look();
         let entry = self.files.get_mut(pos.file)?;
         let State::Loaded(loaded) = &mut entry.state else {
             return None;
         };
-        let shape = Shape {
-            structural: self.structural,
-            full: self.full || matches!(entry.source, Source::Unchanged),
-            reveal: &entry.reveal,
-            arrange: &arrange,
-            blocks: entry.blocks.as_deref(),
-        };
+        let shape = look.shape(
+            (pos.file, &entry.change, &entry.source),
+            (&entry.reveal, &self.opened),
+            entry.blocks.as_deref(),
+            &arrange,
+        );
         let before = loaded.bytes();
         loaded.ensure_part(&shape, pos.part);
         self.loaded_bytes += loaded.bytes() - before;
@@ -2266,7 +2734,8 @@ impl<P> Document<P> {
             let Segment::Gap(g) = file.segment(part)? else {
                 return None;
             };
-            if !file.wants_gap_syntax(g) {
+            let side = shape.reading.map_or(Side::New, |(side, _)| side);
+            if !file.wants_gap_syntax(g, side) {
                 return None;
             }
             let shown = file.shown(shape, g);
@@ -2283,7 +2752,7 @@ impl<P> Document<P> {
                 shown.rows().saturating_sub(1)
             };
             let separator = from == to && shown.line(from).is_none();
-            (from <= to && !separator).then_some(Missing::GapSyntax(g))
+            (from <= to && !separator).then_some(Missing::GapSyntax(g, side))
         });
         let scopes = loaded
             .is_some_and(File::wants_scopes)

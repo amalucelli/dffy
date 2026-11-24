@@ -8,9 +8,12 @@
 //! leave out a row whose key a Here row takes. A screen too short for all
 //! three drops View. Every row shows one key, the one that does the same
 //! outside the panel when there's one, else the panel's; both run it.
-//! `space` or `tab` expands it into the full panel, on Here; `/` into the
-//! full panel's search; a setting's key that the popup doesn't list runs
-//! it and expands onto its tab, as it shows its tab in the full panel.
+//! It opens with no row highlighted, and `space` expands it into the full
+//! panel, on Here; once a row is highlighted, run by its key, moved to or
+//! tapped, `space` and `enter` run it again and the popup stays. `tab`
+//! expands it whenever, `/` into the full panel's search; a setting's key
+//! that the popup doesn't list runs it and expands onto its tab, as it
+//! shows its tab in the full panel.
 //!
 //! The full panel opens on Here, the few actions that apply to what
 //! you're on; the other tabs hold the leader's table by kind, a tab of
@@ -39,9 +42,9 @@ use std::ops::Range;
 use std::time::{Duration, Instant};
 
 use dffy_core::view::Attributes;
-use unicode_width::UnicodeWidthStr;
 
 use super::{fuzzy, help};
+use crate::columns::Columns as _;
 use crate::keys::{Action, Group, Keys, Tab};
 use crate::term::{Grid, Key, Mods};
 use crate::theme::{Role, Style, Theme};
@@ -70,22 +73,29 @@ const TABS: [Place; 6] = [
 const COLUMN_GAP: usize = 4;
 /// Between a row's keys and its label.
 const GAP: usize = 2;
+/// The full panel's columns besides its rows': the borders, the padding
+/// and the scrollbar.
+const CHROME: usize = 5;
 /// The quick popup's groups after Here's, by title, each row as far as
 /// it applies and no Here row has its key.
 const QUICK: [(&str, &[Action]); 2] = [
     (
         "View",
         &[
+            Action::ToggleFileView,
             Action::CycleLayout,
             Action::ToggleWrap,
             Action::ToggleSyntax,
             Action::ToggleFull,
+            Action::ToggleAllFiles,
         ],
     ),
     (
         "Go",
         &[
             Action::OpenPicker,
+            Action::JumpBack,
+            Action::JumpForward,
             Action::Comments,
             Action::ToggleWatch,
             Action::SinceCheckpoint,
@@ -93,11 +103,19 @@ const QUICK: [(&str, &[Action]); 2] = [
         ],
     ),
 ];
-/// The quick popup's footer, the longest that fits.
-const QUICK_FOOTERS: [&str; 3] = [
-    "space more · ? keys · esc close",
-    "space more · esc close",
-    "space more",
+/// The quick popup's footer, the longest that fits, with no row
+/// highlighted, then with one.
+const QUICK_FOOTERS: [[&str; 3]; 2] = [
+    [
+        "space more · ? keys · esc close",
+        "space more · esc close",
+        "space more",
+    ],
+    [
+        "space toggles · tab more · esc close",
+        "space toggles · tab more",
+        "space toggles",
+    ],
 ];
 /// The quick popup's blank columns between its border and its rows.
 const PAD: usize = 2;
@@ -134,6 +152,9 @@ pub(super) struct Entry {
     pub label: String,
     /// A multi-value setting's value (`auto (split here)`).
     pub value: Option<String>,
+    /// Every value it can step to, which the panel is sized for, so the
+    /// box stays put as a value steps; empty for other rows.
+    pub values: Vec<String>,
     /// The key that does the same outside the panel, when it's another;
     /// on Here it runs the row in the panel too.
     pub direct: Option<String>,
@@ -144,9 +165,12 @@ pub(super) struct Entry {
 
 impl Entry {
     /// The one key a Here or quick popup row shows: the one from outside
-    /// the panel when there's one, else the panel's.
+    /// the panel when there's one, else the panel's. `h` and `l` step
+    /// values in the panel, so a row they run outside it shows the panel's.
     fn plain_key(&self) -> &str {
-        self.direct.as_deref().unwrap_or(&self.key)
+        (self.direct.as_deref())
+            .filter(|d| !matches!(*d, "h" | "l"))
+            .unwrap_or(&self.key)
     }
 
     /// Whether `self` and `other` share a key, panel's or plain.
@@ -157,6 +181,17 @@ impl Entry {
                 .filter(|k| !k.is_empty())
         }
         keys(self).any(|k| keys(other).any(|o| o == k))
+    }
+
+    /// The columns its label takes with a toggle's `[x] ` before it and a
+    /// value's ` ‹ value ›` after, at the widest value it can take.
+    fn label_width(&self) -> usize {
+        let state = if self.on.is_some() { 4 } else { 0 };
+        let value = (self.value.iter().chain(&self.values))
+            .map(|v| v.width() + 5)
+            .max()
+            .unwrap_or(0);
+        state + self.label.width() + value
     }
 }
 
@@ -187,8 +222,7 @@ pub(super) enum Outcome {
 pub(super) struct Commands {
     /// Built when the panel opens, and again after a row runs.
     entries: Vec<Entry>,
-    /// The quick popup shows, not the full panel.
-    quick: bool,
+    shown: Shown,
     /// The quick popup's last draw found the screen too short for its
     /// View group, which it leaves out until the next draw says otherwise.
     short: bool,
@@ -219,6 +253,18 @@ pub(super) struct Commands {
     themes: Option<ThemeList>,
 }
 
+/// What the panel shows.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+enum Shown {
+    #[default]
+    Full,
+    /// The quick popup with no row highlighted: `space` expands it.
+    Quick,
+    /// The quick popup with the row at the cursor highlighted, moved to,
+    /// run by its key or tapped: `space` runs it.
+    Picked,
+}
+
 /// A row of the list as drawn: a group's title, or an entry by its index.
 enum Line {
     Title(&'static str),
@@ -233,7 +279,7 @@ impl Commands {
     pub(super) fn new(title: String, entries: Vec<Entry>) -> Self {
         Self {
             entries,
-            quick: true,
+            shown: Shown::Quick,
             title,
             ..Self::default()
         }
@@ -255,7 +301,7 @@ impl Commands {
     /// filter, the best matches of label or key across every tab, an
     /// action in Here and its own tab once.
     fn kept(&self) -> Vec<(&Entry, Vec<usize>)> {
-        if self.quick {
+        if self.quick() {
             return self.in_quick();
         }
         if self.filter.is_empty() {
@@ -397,7 +443,7 @@ impl Commands {
     /// The lines of what's shown: the quick popup's, the tab's, or a
     /// search's matches.
     fn shown_lines(&self, kept: &[(&Entry, Vec<usize>)]) -> Vec<Line> {
-        if self.quick {
+        if self.quick() {
             let mut out = Vec::new();
             let mut i = 0;
             for (title, group) in self.quick_groups() {
@@ -420,14 +466,22 @@ impl Commands {
     /// too: the quick popup's rows, and Here's on Here while no search
     /// hides it.
     fn direct_runs(&self, e: &Entry) -> bool {
-        self.quick
+        self.quick()
             || (e.place == Place::Here && TABS[self.tab] == Place::Here && self.filter.is_empty())
+    }
+
+    /// Puts the cursor on row `i`, which the quick popup highlights.
+    fn pick(&mut self, i: usize) {
+        self.cursor = i;
+        if self.shown == Shown::Quick {
+            self.shown = Shown::Picked;
+        }
     }
 
     /// Shows tab `tab` of the full panel, wrapping round, with the search
     /// cleared.
     fn switch(&mut self, tab: usize) {
-        self.quick = false;
+        self.shown = Shown::Full;
         self.tab = tab % TABS.len();
         self.filter.clear();
         self.editing = false;
@@ -440,9 +494,9 @@ impl Commands {
         self.cursor
     }
 
-    #[cfg(test)]
+    /// The quick popup shows, not the full panel.
     pub(super) fn quick(&self) -> bool {
-        self.quick
+        self.shown != Shown::Full
     }
 
     #[cfg(test)]
@@ -504,12 +558,55 @@ impl Commands {
         }
     }
 
+    /// What `key` does in the quick popup, where that's its own; `None` for
+    /// the keys it shares with the full panel. `space` expands it until a
+    /// row is highlighted and then runs that row, a value stepping forward,
+    /// the popup staying open on its new state; `tab` and `/` expand it
+    /// whenever; the first move highlights the first row, or up the last.
+    fn quick_key(&mut self, key: Key) -> Option<Outcome> {
+        let picked = match self.shown {
+            Shown::Full => return None,
+            Shown::Quick => false,
+            Shown::Picked => true,
+        };
+        let (len, at) = {
+            let kept = self.kept();
+            (kept.len(), kept.get(self.cursor).map(|(e, _)| e.action))
+        };
+        match key {
+            Key::Char(' ') | Key::Enter if picked => {
+                Some(at.map_or(Outcome::Stay, |action| Outcome::Run {
+                    action,
+                    back: false,
+                }))
+            }
+            Key::Enter => Some(Outcome::Stay),
+            Key::Char(' ' | '/') | Key::Tab | Key::BackTab => {
+                self.switch(0);
+                self.editing = matches!(key, Key::Char('/'));
+                Some(Outcome::Stay)
+            }
+            Key::Down | Key::Char('j') | Key::PageDown if !picked && len > 0 => {
+                self.pick(0);
+                Some(Outcome::Stay)
+            }
+            Key::Up | Key::Char('k') | Key::PageUp if !picked && len > 0 => {
+                self.pick(len - 1);
+                Some(Outcome::Stay)
+            }
+            _ => None,
+        }
+    }
+
     pub(super) fn key(&mut self, key: Key, mods: Mods) -> Outcome {
         if let Some(list) = &mut self.themes {
             let outcome = list.key(key, mods);
             if matches!(outcome, Outcome::Theme { keep: true, .. }) || list.closing {
                 self.themes = None;
             }
+            return outcome;
+        }
+        if let Some(outcome) = self.quick_key(key) {
             return outcome;
         }
         let kept: Vec<&Entry> = self.kept().into_iter().map(|(e, _)| e).collect();
@@ -529,14 +626,11 @@ impl Commands {
             self.cursor = 0;
             return Outcome::Stay;
         }
-        if self.quick && matches!(key, Key::Char(' ' | '/') | Key::Tab | Key::BackTab) {
-            self.switch(0);
-            self.editing = matches!(key, Key::Char('/'));
-            return Outcome::Stay;
-        }
         let page = self.page.max(1);
         let len = kept.len();
-        let on_value = kept.get(self.cursor).is_some_and(|e| e.value.is_some());
+        // The quick popup acts on no row until one is highlighted.
+        let on_value =
+            self.shown != Shown::Quick && kept.get(self.cursor).is_some_and(|e| e.value.is_some());
         let step = |back: bool| match kept.get(self.cursor) {
             Some(e) => Outcome::Run {
                 action: e.action,
@@ -564,8 +658,9 @@ impl Commands {
                     .get(self.cursor)
                     .map_or(Outcome::Stay, |e| Self::run(e, false));
             }
-            // Kept from before the `‹ ›` marks, as a hidden alias of `h`.
-            Key::Backspace if on_value => return step(true),
+            // Kept from before the `‹ ›` marks, as a hidden alias of `h`;
+            // the quick popup shows backspace as Back's key.
+            Key::Backspace if on_value && self.shown == Shown::Full => return step(true),
             // Past either end, the cursor goes round.
             Key::Down | Key::Char('j') if len > 0 => self.cursor = (self.cursor + 1) % len,
             Key::Up | Key::Char('k') if len > 0 => self.cursor = (self.cursor + len - 1) % len,
@@ -580,7 +675,7 @@ impl Commands {
                     .or_else(|| kept.iter().position(direct));
                 if let Some(i) = shown {
                     let action = kept[i].action;
-                    self.cursor = i;
+                    self.pick(i);
                     return Outcome::Run {
                         action,
                         back: false,
@@ -621,10 +716,11 @@ impl Commands {
             return list.scroll(rows);
         }
         let len = self.kept().len();
-        self.cursor = self
-            .cursor
-            .saturating_add_signed(rows)
-            .min(len.saturating_sub(1));
+        self.pick(
+            self.cursor
+                .saturating_add_signed(rows)
+                .min(len.saturating_sub(1)),
+        );
         Outcome::Stay
     }
 
@@ -640,7 +736,7 @@ impl Commands {
             return outcome;
         }
         let (titles_y, titles) = &self.titles;
-        if !self.quick && y == *titles_y {
+        if !self.quick() && y == *titles_y {
             if let Some(tab) = titles.iter().position(|r| r.contains(&x)) {
                 self.switch(tab);
             }
@@ -672,7 +768,7 @@ impl Commands {
             },
             None => Self::run(kept[i].0, false),
         };
-        self.cursor = i;
+        self.pick(i);
         outcome
     }
 
@@ -705,11 +801,29 @@ impl Commands {
             list.draw(grid, theme);
             return;
         }
-        if self.quick {
+        if self.quick() {
             self.draw_quick(grid, theme);
             return;
         }
-        let area = help::area(keys, (gw, gh));
+        let mut area = help::area(keys, (gw, gh));
+        // The box is the help overlay's, its columns sized by the help's
+        // rows; a row of the panel's wider than that, a long value, widens
+        // it as far as the screen goes, else the panel takes one column.
+        if area.two {
+            let (_, both) = self.key_widths();
+            let shown = self.entries.iter().filter(|e| e.place != Place::Hidden);
+            let row = shown
+                .map(|e| both + GAP + e.label_width())
+                .max()
+                .unwrap_or(0);
+            let wanted = 2 * row + COLUMN_GAP + CHROME;
+            if wanted > gw.saturating_sub(4) {
+                area.two = false;
+            } else if wanted > area.width {
+                area.width = wanted;
+                area.x0 = (gw - wanted) / 2;
+            }
+        }
         let help::Area {
             x0,
             y0,
@@ -831,13 +945,10 @@ impl Commands {
         let cursor = self.cursor.min(kept.len().saturating_sub(1));
         let widest = |f: &dyn Fn(&Entry) -> usize| kept.iter().map(|(e, _)| f(e)).max();
         let key = widest(&|e| e.plain_key().width()).unwrap_or(0);
-        // A toggle's `[x] `, and a value's ` ‹ value ›`.
-        let label = widest(&|e| {
-            let state = if e.on.is_some() { 4 } else { 0 };
-            state + e.label.width() + e.value.as_ref().map_or(0, |v| v.width() + 5)
-        });
+        let label = widest(&Entry::label_width);
         let inner = (key + GAP + label.unwrap_or(0))
-            .max(QUICK_FOOTERS[0].width())
+            .max(QUICK_FOOTERS[0][0].width())
+            .max(QUICK_FOOTERS[1][0].width())
             .max(TITLE.width())
             .max(self.title.width());
         let (x0, width) = if gw < help::FULL_SCREEN_BELOW {
@@ -877,7 +988,7 @@ impl Commands {
                 Line::Entry(k) => {
                     let (e, matched) = &kept[k];
                     let row = Row {
-                        selected: k == cursor,
+                        selected: self.shown == Shown::Picked && k == cursor,
                         flashing: flashing == Some(e.action),
                         direct_runs: self.direct_runs(e),
                     };
@@ -897,9 +1008,10 @@ impl Commands {
             }
         }
         help::scrollbar(grid, (end - 2, top, rows), (lines.len(), scroll), dim);
-        let footer = (QUICK_FOOTERS.iter())
+        let footers = &QUICK_FOOTERS[usize::from(self.shown == Shown::Picked)];
+        let footer = (footers.iter())
             .find(|f| f.width() <= right - x)
-            .unwrap_or(&QUICK_FOOTERS[QUICK_FOOTERS.len() - 1]);
+            .unwrap_or(&footers[footers.len() - 1]);
         grid.put_str(x, y0 + height - 2, right, footer, dim);
         let columns = vec![(x - 1..right + 1, 0..lines.len())];
         drop(kept);
@@ -988,7 +1100,10 @@ impl Row {
         let arrows = e.value.as_ref().map(|value| {
             let left = at + e.label.width() + 1;
             let after = grid.put_str(left, y, right, "‹ ", dim);
-            let after = grid.put_str(after, y, right, value, mark(style));
+            // Cut to leave room for the closing mark, never silently.
+            let room = right.saturating_sub(after + 2);
+            let value = super::tree::fit_right(value, room);
+            let after = grid.put_str(after, y, right, &value, mark(style));
             written = grid.put_str(after, y, right, " ›", dim);
             (left, written - 1)
         });

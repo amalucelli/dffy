@@ -4,8 +4,8 @@
 //! whatever order they were drawn in. Text written over a cell replaces
 //! its line.
 
-use unicode_width::UnicodeWidthChar as _;
-
+use crate::columns::clusters;
+pub(crate) use crate::columns::width;
 use crate::{Line, Span};
 
 /// Style names from the protocol's vocabulary.
@@ -54,11 +54,6 @@ struct Cell {
     /// character.
     text: Option<String>,
     style: Style,
-}
-
-/// The display width of `text`, as the canvas lays it out.
-pub(crate) fn width(text: &str) -> usize {
-    text.chars().map(|c| c.width().unwrap_or(0)).sum()
 }
 
 #[derive(Default)]
@@ -148,18 +143,17 @@ impl Canvas {
     /// Writes `text` from `(x, y)` on; returns the columns it took.
     pub(crate) fn text(&mut self, (x, y): (usize, usize), text: &str, style: Style) -> usize {
         let mut at = x;
-        for c in text.chars() {
-            let w = c.width().unwrap_or(0);
+        for (piece, w) in clusters(text) {
             if w == 0 {
                 if at > x
                     && let Some(previous) = self.cell(at - 1, y).text.as_mut()
                 {
-                    previous.push(c);
+                    previous.push_str(piece);
                 }
                 continue;
             }
             let cell = self.cell(at, y);
-            cell.text = Some(c.to_string());
+            cell.text = Some(piece.to_owned());
             cell.style = style;
             for k in 1..w {
                 self.cell(at + k, y).text = Some(String::new());
@@ -266,5 +260,28 @@ mod tests {
             plain(&canvas),
             ["┌────┐", "│ 漢 │", "└─┬──┘", "  ┃", "┄┄┴┄┄"]
         );
+    }
+
+    /// A label takes the columns it's measured at, so what's drawn after it
+    /// is where the layout put it; an emoji's U+FE0F takes a column, which
+    /// is dffy's rule for the rows it's sent.
+    #[test]
+    fn text_takes_the_columns_it_measures() {
+        for (text, columns) in [
+            ("\u{26a0}\u{fe0f}", 2),
+            ("1\u{fe0f}\u{20e3}", 2),
+            ("\u{2705}\u{fe0f}", 2),
+            ("x\u{fe0f}", 1),
+            ("e\u{301}", 1),
+            ("\u{1f468}\u{200d}\u{1f469}", 4),
+            ("\u{1f1e7}\u{1f1f7}", 2),
+            ("\u{1f44d}\u{1f3fd}", 4),
+        ] {
+            assert_eq!(width(text), columns, "{text:?}");
+            let mut canvas = Canvas::default();
+            assert_eq!(canvas.text((0, 0), text, PLAIN), columns, "{text:?}");
+            canvas.text((columns, 0), "|", PLAIN);
+            assert_eq!(plain(&canvas), [format!("{text}|")]);
+        }
     }
 }

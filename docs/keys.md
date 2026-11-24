@@ -19,12 +19,14 @@ keybind = tree:x=mark_viewed
 keybind = thread:R=reply
 # Only in a file with conflicts to resolve
 keybind = conflict:O=keep_current
+# Only while a go-to-definition peek has the keys
+keybind = peek:o=open
 # A key in the command panel
 keybind = leader:z=toggle_wrap
 ```
 
 - **Keys:** a character as typed (`n`, `N`, `<`, `?`) or a name: `space`, `enter`, `tab`, `shift+tab`, `esc`, `backspace`, `up`, `down`, `left`, `right`, `home`, `end`, `page_up`, `page_down`, `insert`, `delete`, `f1` to `f12`. `ctrl+` and `alt+` go before the key. `shift+` works with letters (`shift+n` is `N`) and `tab`; for other characters, bind the shifted character itself.
-- **Tables:** there are five. Keys pressed while the tree has focus look in the tree's table (`tree:`) first, then in the main one. Keys pressed on a comment thread look in the thread's table (`thread:`) first, then, in a file with conflicts to resolve, in the conflict's (`conflict:`). The command panel has its own table (`leader:`); rebinding a key there keeps the entry's place in the panel. By default a panel key the main table binds too does the same thing there.
+- **Tables:** there are six. Keys pressed while the tree has focus look in the tree's table (`tree:`) first, then in the main one. Keys pressed on a comment thread look in the thread's table (`thread:`) first, then, in a file with conflicts to resolve, in the conflict's (`conflict:`). Keys pressed while a go-to-definition peek has the keys look in its table (`peek:`) before any other. The command panel has its own table (`leader:`); rebinding a key there keeps the entry's place in the panel. By default a panel key the main table binds too does the same thing there.
 - **Fallbacks:** a key pressed with `alt` or `shift` that has no binding of its own acts as the plain key.
 - **`esc`:** it always backs out first (closes a panel, ends a search or filter, cancels a selection, leaves the tree). Bound to another action, as in `keybind = esc=quit`, it runs that action only when there's nothing left to back out of.
 - **Mistakes:** a line with an unknown key or action is skipped with a warning that suggests the closest name.
@@ -36,8 +38,8 @@ keybind = leader:z=toggle_wrap
 
 | Action | Keys | Command panel | Description |
 |---|---|---|---|
-| `scroll_down` | `j` `down` `enter` `ctrl+e` `ctrl+n` |  | Scroll down a line; in the tree, move down |
-| `scroll_up` | `k` `up` `ctrl+y` `ctrl+p` |  | Scroll up a line; in the tree, move up |
+| `scroll_down` | `j` `down` `enter` `ctrl+e` `ctrl+n`; `j` `down` in a peek |  | Scroll down a line; in the tree, move down; in a peek, the next definition |
+| `scroll_up` | `k` `up` `ctrl+y` `ctrl+p`; `k` `up` in a peek |  | Scroll up a line; in the tree, move up; in a peek, the definition before |
 | `page_down` | `page_down` `ctrl+f` |  | Scroll down a screen |
 | `page_up` | `b` `page_up` `ctrl+b` |  | Scroll up a screen |
 | `half_page_down` | `ctrl+d` |  | Scroll down half a screen |
@@ -49,8 +51,23 @@ keybind = leader:z=toggle_wrap
 | `scroll_right` | `>` `L` |  | Scroll the code right, without wrapping |
 | `scroll_left` | `<` `H` |  | Scroll the code left |
 | `scroll_reset` | `0` |  | Scroll the code back to its first column |
+| `go_to_definition` | `K` | `K` | List the names on the line last tapped, else the top line; type to narrow them, and enter shows where the one picked is defined, in the line's version, in a peek under the line. ctrl+click or alt+click on a name peeks it at once |
+| `jump_back` | `backspace` | `(` | Back to where the last jump left, with the line that was at the top at the top again: a jump is a definition opened from a peek, or a file opened from find file, the tree or the control API. The last 100 places are kept; one whose file isn't shown any more is skipped |
+| `jump_forward` | `\` | `\` | Forward again, to where jump back left |
 | `next_thread` | `m` |  | Next comment thread, on into the next file with comments; it takes the focus, where r replies, e edits, x resolves, d deletes and o opens it on its host |
 | `prev_thread` | `M` |  | Previous comment thread, back into the previous file with comments |
+
+### In a peek
+
+| Action | Keys | Command panel | Description |
+|---|---|---|---|
+| `show_in_diff` | `d` in a peek |  | In a peek: the definition's lines in the diff, where the diff changes its file |
+| `other_version` | `s` in a peek |  | In a peek: the name's definitions in the diff's other version |
+| `references` | `r` in a peek |  | In a peek: jump between the name's definitions and the lines using it, which the peek lists below them as they're found, closest files first |
+| `more_uses` | `m` in a peek |  | In a peek: go on past the first 200 files using the name, counting the rest |
+| `calls_only` | `c` in a peek |  | In a peek: list only the uses calling the name, or every use again |
+| `uses_in_diff` | `i` in a peek |  | In a peek: list only the uses in files the diff changes, or those in every file again |
+| `close_peek` | `esc` `q` in a peek |  | Close the peek |
 
 ### Files/tree
 
@@ -63,10 +80,11 @@ keybind = leader:z=toggle_wrap
 | `open_picker` | `o` | `o` | Find a file: type part of its path, enter opens it |
 | `search` | `/` |  | Search the diff's text; n/N then go between matches, esc clears |
 | `filter_tree` | `/` in the tree | `\|` | Filter the file tree, fuzzily; f/F and n/N keep to the files it keeps, esc clears |
-| `open` | `enter` `l` `right` in the tree |  | Open a file, or open or close a folder, in the tree |
+| `open` | `enter` `l` `right` in the tree; `enter` in a peek |  | Open a file, or open or close a folder, in the tree; in a peek, the definition's file at its line: its entry in the diff, else the whole file |
 | `collapse` | `h` `left` in the tree |  | Collapse a folder in the tree |
 | `parent_folder` | `u` |  | Go to the folder holding the file, in the tree |
 | `mark_viewed` | `v` in the tree |  | Mark a file in the tree viewed |
+| `close_file` | `x` in the tree | `)` | Close a file opened outside the diff (from find file), the one selected in the tree or else the one shown; one with comments stays |
 | `tree_wider` | `+` in the tree |  | Widen the tree |
 | `tree_narrower` | `-` in the tree |  | Narrow the tree |
 | `commented_files` | `c` in the tree | `!` | The tree shows only the files with comments, or every file; f/F and n/N keep to them. In the comments panel, it steps through all threads, open ones, drafts and resolved ones, and its capital steps back |
@@ -77,7 +95,9 @@ keybind = leader:z=toggle_wrap
 |---|---|---|---|
 | `expand` | `x` | `x` | Show more of the highlighted ⋯ gap |
 | `toggle_full` | `X` | `X` | Whole files or changes only, for every file |
-| `cycle_layout` | `s` | `s` | Layout: split, unified, then auto (split on wide screens); while selecting, the side copied |
+| `toggle_file_view` | `l` | `_` | File view, or the diff again: every file whole as it is in one version, the newer first, with a mark in the gutter where the other version's lines were; s then flips the version |
+| `toggle_all_files` | `a` in the tree | `=` | The tree lists every file of the repository, the diff's changes colored among them, or the diff's files again; s in the tree then shows the other version. Folders open as you go, enter on a file outside the diff shows it whole |
+| `cycle_layout` | `s` | `s` | Layout: split, unified, then auto (split on wide screens); while selecting, the side copied; in file view, the side read |
 | `toggle_wrap` | `W` | `W` | Wrap or truncate long lines |
 | `toggle_status_bar` |  | `B` | The status bar in the frame's bottom border or its top one |
 | `toggle_thread` | `z` |  | Fold or unfold the focused comment thread, or the first on screen |
@@ -95,7 +115,7 @@ keybind = leader:z=toggle_wrap
 
 | Action | Keys | Command panel | Description |
 |---|---|---|---|
-| `cycle_indicators` |  | `K` | How changed lines are marked: background, bars, classic signs or none |
+| `cycle_indicators` |  | `,` | How changed lines are marked: background, bars, classic signs or none |
 | `cycle_modified_lines` |  | `%` | A line and its edit in the modified color with red and green tokens, or red and green lines |
 | `toggle_highlight` |  | `*` | Syntax highlighting on or off |
 | `toggle_line_numbers` |  | `#` | Show or hide line numbers |
@@ -194,9 +214,11 @@ While the file tree has focus, these keys come first; every other key does what 
 | Keys | Action | Description |
 |---|---|---|
 | `/` | `filter_tree` | Filter the file tree, fuzzily; f/F and n/N keep to the files it keeps, esc clears |
-| `enter` `l` `right` | `open` | Open a file, or open or close a folder, in the tree |
+| `enter` `l` `right` | `open` | Open a file, or open or close a folder, in the tree; in a peek, the definition's file at its line: its entry in the diff, else the whole file |
 | `h` `left` | `collapse` | Collapse a folder in the tree |
 | `v` | `mark_viewed` | Mark a file in the tree viewed |
+| `x` | `close_file` | Close a file opened outside the diff (from find file), the one selected in the tree or else the one shown; one with comments stays |
+| `a` | `toggle_all_files` | The tree lists every file of the repository, the diff's changes colored among them, or the diff's files again; s in the tree then shows the other version. Folders open as you go, enter on a file outside the diff shows it whole |
 | `+` | `tree_wider` | Widen the tree |
 | `-` | `tree_narrower` | Narrow the tree |
 | `c` | `commented_files` | The tree shows only the files with comments, or every file; f/F and n/N keep to them. In the comments panel, it steps through all threads, open ones, drafts and resolved ones, and its capital steps back |
@@ -232,6 +254,23 @@ While the file at the cursor has conflicts to resolve, these keys come after a t
 | `a` | `take_base` | Resolve the conflict to the common ancestor's lines, when git wrote them (merge.conflictStyle diff3 or zdiff3); again takes the choice back |
 | `w` | `write_resolution` | Write the conflicted file as the choices resolve it, asking first when some conflicts have none; then git add it after a y/n |
 
+## In a peek
+
+While a go-to-definition peek has the keys, these keys come before every other table's; the rest do what they do without it. Clicking the code above it gives the keys back to the diff, and clicking the peek takes them again.
+
+| Keys | Action | Description |
+|---|---|---|
+| `j` `down` | `scroll_down` | Scroll down a line; in the tree, move down; in a peek, the next definition |
+| `k` `up` | `scroll_up` | Scroll up a line; in the tree, move up; in a peek, the definition before |
+| `enter` | `open` | Open a file, or open or close a folder, in the tree; in a peek, the definition's file at its line: its entry in the diff, else the whole file |
+| `d` | `show_in_diff` | In a peek: the definition's lines in the diff, where the diff changes its file |
+| `s` | `other_version` | In a peek: the name's definitions in the diff's other version |
+| `r` | `references` | In a peek: jump between the name's definitions and the lines using it, which the peek lists below them as they're found, closest files first |
+| `m` | `more_uses` | In a peek: go on past the first 200 files using the name, counting the rest |
+| `c` | `calls_only` | In a peek: list only the uses calling the name, or every use again |
+| `i` | `uses_in_diff` | In a peek: list only the uses in files the diff changes, or those in every file again |
+| `esc` `q` | `close_peek` | Close the peek |
+
 ## Command panel
 
 `space` opens the panel as a quick popup of what applies to what you're on; `space` or `tab` again shows the whole panel. These keys run its entries from the popup and from any tab; within a group, the panel lists them in this order. On a setting with values (`Layout ‹ auto ›`), `h`/`l` and `left`/`right` step back and forward; on other rows they do nothing, so a `leader:h` or `leader:l` binding never runs, and `tab` and `shift+tab` switch tabs. `enter` on Theme opens the theme list.
@@ -241,19 +280,25 @@ While the file at the cursor has conflicts to resolve, these keys come after a t
 | `s` | Layout | `cycle_layout` |
 | `W` | Wrap long lines | `toggle_wrap` |
 | `X` | Whole file | `toggle_full` |
+| `_` | File view | `toggle_file_view` |
 | `x` | More context | `expand` |
 | `B` | Status bar | `toggle_status_bar` |
+| `=` | All files | `toggle_all_files` |
 | `d` | Syntax diff | `toggle_syntax` |
 | `r` | Rendered view | `toggle_rendered` |
 | `I` | Ignore whitespace | `toggle_whitespace` |
 | `*` | Syntax highlighting | `toggle_highlight` |
-| `K` | Indicators | `cycle_indicators` |
+| `,` | Indicators | `cycle_indicators` |
 | `%` | Modified lines | `cycle_modified_lines` |
 | `#` | Line numbers | `toggle_line_numbers` |
 | `@` | Hunk headers | `toggle_hunk_headers` |
 | `o` | Find file… | `open_picker` |
+| `K` | Go to definition… | `go_to_definition` |
+| `(` | Back | `jump_back` |
+| `\` | Forward | `jump_forward` |
 | `\|` | Filter tree… | `filter_tree` |
 | `!` | Files with comments | `commented_files` |
+| `)` | Close file | `close_file` |
 | `t` | File tree | `toggle_tree` |
 | `f` | Next file | `next_file` |
 | `F` | Previous file | `prev_file` |

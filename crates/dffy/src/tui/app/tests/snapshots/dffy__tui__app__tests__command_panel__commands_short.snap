@@ -3,16 +3,16 @@ source: crates/dffy/src/tui/app/tests/command_panel.rs
 expression: screen(&mut short)
 ---
  modified · src/some/deeply/nested/module/file.rs · +2 -2                                                                   @@ -1,7 +1,7 @@
-┌ Files · 2 +2 -2 ─────────┌─ commands ──────────────────────────────────────────────────────────── esc close ─┐                           █
-│ ▼ src/                   │  Here  View  Files  Review  Git  Copy                                             │                           ┃
-│   ▼ some/deeply/nested/mo│ Layout                                    Display                                ┃│                           ┃
-│     M file.rs            │ s    Layout ‹ auto (split here) ›         *    [x] Syntax highlighting           ┃│                           ┃
-│   M zz.rs                │ W    [ ] Wrap long lines                  K    Indicators ‹ classic ›            ┃│                           ┃
-│                          │ X    [ ] Whole file                       %    Modified lines ‹ changed ›        ┃│                           ┃
-│                          │ x    More context                         #    [x] Line numbers                  ││                           ┃
-│                          │ B    Status bar ‹ bottom ›                @    [x] Hunk headers                  ││                           ┃
-│                          │                                           ~    Theme ‹ default ›                 ││                           ┃
-│                          │ key or enter runs · j/k move · h/l step a value                                   │                           █
-│                          │ tab section · / search · esc close                                                │
-└──────────────────────────└───────────────────────────────────────────────────────────────────────────────────┘
+┌ Files · 2 +2 -2 ──────┌─ commands ────────────────────────────────────────────────────────────────── esc close ─┐                        █
+│ ▼ src/                │  Here  View  Files  Review  Git  Copy                                                   │                        ┃
+│   ▼ some/deeply/nested│ Layout                                       Display                                   ┃│                        ┃
+│     M file.rs         │ s    Layout ‹ auto (split here) ›            *    [x] Syntax highlighting              ┃│                        ┃
+│   M zz.rs             │ W    [ ] Wrap long lines                     ,    Indicators ‹ classic ›               ┃│                        ┃
+│                       │ X    [ ] Whole file                          %    Modified lines ‹ changed ›           ┃│                        ┃
+│                       │ _ l  File view ‹ off ›                       #    [x] Line numbers                     ││                        ┃
+│                       │ x    More context                            @    [x] Hunk headers                     ││                        ┃
+│                       │ B    Status bar ‹ bottom ›                   ~    Theme ‹ default ›                    ││                        ┃
+│                       │ key or enter runs · j/k move · h/l step a value                                         │                        █
+│                       │ tab section · / search · esc close                                                      │
+└───────────────────────└─────────────────────────────────────────────────────────────────────────────────────────┘
    working tree  1/2 · 1/2 hunk  split                                                                 / search · tab tree · space commands

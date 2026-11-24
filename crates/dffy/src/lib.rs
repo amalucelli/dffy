@@ -3,6 +3,7 @@
 
 mod agents;
 mod cli;
+mod columns;
 mod config;
 mod control;
 mod daemon;
@@ -13,6 +14,7 @@ mod fuzzy;
 mod json;
 mod keys;
 mod mcp;
+mod navigator;
 mod no_index;
 mod output;
 mod pager;
@@ -229,7 +231,7 @@ impl Ctx {
             words: false,
             tab_width: self.config.tab_width,
             indicators: self.indicators(),
-            one_sided: false,
+            one_sided: None,
             unmerged: false,
             digits: 0,
             inline_signs: !self.color_out,
@@ -237,6 +239,7 @@ impl Ctx {
             line_numbers: self.config.line_numbers,
             hunk_headers: self.config.hunk_headers,
             modified_lines: self.config.modified_lines == ModifiedLines::Changed,
+            read_alone: false,
         }
     }
 
@@ -313,11 +316,29 @@ impl Ctx {
     }
 }
 
+/// A hidden command dffy runs for itself, before any config is read: a
+/// plugin detached from the terminal, or the navigator helper.
+fn hidden() -> Option<ExitCode> {
+    let mut raw = std::env::args_os();
+    let first = raw.nth(1)?;
+    if first == plugin::rpc::DETACH {
+        Some(plugin::rpc::exec_detached(raw))
+    } else if first == navigator::COMMAND {
+        // `--build` says which build this is, for the tests that run it.
+        if raw.next().is_some_and(|a| a == "--build") {
+            println!("{BUILD}");
+            return Some(ExitCode::SUCCESS);
+        }
+        Some(navigator::server::serve())
+    } else {
+        None
+    }
+}
+
 /// Runs dffy with the process's arguments.
 pub fn main() -> ExitCode {
-    let mut raw = std::env::args_os();
-    if raw.nth(1).is_some_and(|a| a == plugin::rpc::DETACH) {
-        return plugin::rpc::exec_detached(raw);
+    if let Some(code) = hidden() {
+        return code;
     }
     let raw: Vec<_> = std::env::args_os().collect();
     // Read before parsing: the review plugin they name adds a subcommand.
@@ -1281,7 +1302,7 @@ fn compare(
 ) -> Result<ExitCode, Error> {
     let c = &args.common;
     let difftool = no_index::Difftool::from_env();
-    let (repo, description) = no_index::open(base, operands, args, &difftool)?;
+    let (repo, description, versions) = no_index::open(base, operands, args, &difftool)?;
     if args.json {
         let mut plan = print::Plan::compare(repo, base, print::Summary::Diff, c.view.reverse);
         if let Some(focus) = &c.focus {
@@ -1298,7 +1319,8 @@ fn compare(
         && ctx.config.paging != Paging::Never
         && !(args.exit_code || c.stat || c.name_only || c.name_status);
     if viewer && let Ok(tty) = term::Tty::open() {
-        let plan = print::Plan::compare(repo, base, print::Summary::Diff, c.view.reverse);
+        let mut plan = print::Plan::compare(repo, base, print::Summary::Diff, c.view.reverse);
+        plan.versions = Some(versions);
         let focus = c.focus.as_deref().map(|f| plan.relative(f)).transpose()?;
         let revisions = git::Revisions::default();
         return tui::run(

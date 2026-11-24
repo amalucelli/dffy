@@ -75,6 +75,20 @@ fn eviction_drops_the_least_recently_used_down_to_the_target() {
     }
 }
 
+/// The symbol cache's few large packs are counted by the blocks they take
+/// on disk, so its budget holds on disk; the shared cache counts lengths.
+#[test]
+fn the_symbol_cache_counts_blocks_on_disk() {
+    let (_dir, cache) = cache(1 << 20);
+    let symbols = cache.symbols();
+    symbols.as_cache().put(Kind::Symbols, b"k", &[1; 100]);
+    let (bytes, n) = symbols.usage().expect("usage");
+    assert_eq!(n, 1);
+    assert!(bytes >= 512 && bytes % 512 == 0, "{bytes}");
+    cache.put(Kind::Renames, b"k", &[1; 100]);
+    assert_eq!(cache.usage().expect("usage"), (100 + HEADER as u64, 1));
+}
+
 const CHILD_DIR: &str = "DFFY_CACHE_TEST_WRITER_DIR";
 const CHILD_SEED: &str = "DFFY_CACHE_TEST_WRITER_SEED";
 const ROUNDS: usize = 200;

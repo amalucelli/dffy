@@ -4,5 +4,5 @@
 kernel-heavy = { max-threads = 1 }
 
 [[profile.default.overrides]]
-filter = "test(=structural_research_files) | test(=two_copies_of_a_kernel_folder_match_git_no_index)"
+filter = "test(=structural_research_files) | test(=two_copies_of_a_kernel_folder_match_git_no_index) | test(=kernel_definitions_fit_the_symbol_budget) | test(=kernel_symbols_resolve_at_both_tags)"
 test-group = "kernel-heavy"

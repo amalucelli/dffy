@@ -984,6 +984,7 @@ const KIND: rpc::Kind<Init, PluginState, Ask> = rpc::Kind {
     init_params: |_| String::new(),
     // What it starts is in its group.
     grace: Duration::ZERO,
+    restarts: true,
     initialized,
     answered: response,
     notified,

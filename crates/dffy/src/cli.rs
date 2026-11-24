@@ -436,7 +436,7 @@ pub(crate) struct CtlArgs {
 pub(crate) enum CtlAction {
     /// List the running viewers
     Views,
-    /// Show a file of the diff, at a new-side line or, with :old, an old-side one
+    /// Show a file, at a new-side line or, with :old, an old-side one; one the diff doesn't change opens whole
     Open {
         #[arg(value_name = "path[:line[:old]]")]
         at: String,

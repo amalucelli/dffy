@@ -11,7 +11,7 @@
 //! them, and how, is its own, as are the keys its words name (see [`Hint`]).
 
 pub(crate) mod compose;
-mod drafts;
+pub(crate) mod drafts;
 pub(crate) mod reload;
 pub(crate) mod snapshot;
 pub(crate) mod snippet;
@@ -323,15 +323,17 @@ pub(super) struct Placed {
     placements: Vec<Placement>,
     painted: Option<HashMap<String, Spans>>,
     pub(super) threads: Arc<[Thread]>,
-    /// Local drafts whose anchor matched nowhere, or not placed yet: out of
-    /// view.
+    /// Local drafts not placed yet: out of view.
     hidden: Vec<String>,
+    /// Local drafts whose lines weren't found: shown, but not posted, as the
+    /// review's diff has no lines to put them on.
+    lost_local: Vec<String>,
 }
 
 /// The comments file shown and, on a review session's, the drafts of the
 /// local review's file (your comments without a ref, and their threads).
-/// A local draft shows only where it places on this diff, marked `branch
-/// draft`;
+/// A local draft shows on this diff where it places, else lost under its
+/// file's last row, marked `branch draft`;
 /// edits, replies and deletes in its thread go to the local file, and
 /// posting moves it to the session's first (see [`Comments::move_local`]).
 ///
@@ -394,9 +396,9 @@ pub(crate) struct Comments {
     conversation: OnceCell<Arc<[Thread]>>,
     /// See [`Comments::drafts_key`].
     drafts_key: u64,
-    /// [`Comments::counts`] at the generation it was counted at: the status
+    /// [`Comments::count`] at the generation it was counted at: the status
     /// bar asks every frame.
-    counted: Cell<Option<(u64, (usize, usize))>>,
+    counted: Cell<Option<(u64, [usize; 3])>>,
     /// [`Comments::host_pending`] at the generation it was counted at: the
     /// status bar asks every frame.
     pending_counted: Cell<Option<(u64, usize)>>,
@@ -468,16 +470,32 @@ impl Comments {
             .collect()
     }
 
-    /// Whether `c` is a local draft that didn't place, or isn't placed
-    /// yet: out of view.
+    /// Whether `c` is a local draft that isn't placed yet: out of view.
     pub(super) fn hides(&self, c: &Comment) -> bool {
         // Checked per comment as the status bar draws.
         !self.from_local.is_empty()
             && self.from_local.contains(&c.id)
-            && self
-                .placed
-                .get(c.path.as_bytes())
-                .is_none_or(|p| p.hidden.contains(c.in_reply_to.as_ref().unwrap_or(&c.id)))
+            && (self.placed_thread(c)).is_none_or(|(root, p)| p.hidden.contains(root))
+    }
+
+    /// Whether `c` is a local draft whose lines weren't found: in view, but
+    /// posting leaves it in the local file, as the review's diff has no
+    /// lines to put it on.
+    pub(super) fn lost_local(&self, c: &Comment) -> bool {
+        !self.from_local.is_empty()
+            && self.from_local.contains(&c.id)
+            && (self.placed_thread(c)).is_some_and(|(root, p)| p.lost_local.contains(root))
+    }
+
+    /// The id of the first comment of `c`'s thread, and where the file that
+    /// shows the thread was placed, once it is. A reply names no old path,
+    /// so the file is its root's to say.
+    fn placed_thread<'a>(&'a self, c: &'a Comment) -> Option<(&'a String, &'a Placed)> {
+        let root = match &c.in_reply_to {
+            Some(id) => self.find(id)?,
+            None => c,
+        };
+        Some((&root.id, self.placed.get(self.home(root).as_bytes())?))
     }
 
     pub(crate) fn notice(&self) -> Option<&str> {
@@ -759,6 +777,7 @@ impl Comments {
                 painted,
                 threads: Arc::new([]),
                 hidden: Vec::new(),
+                lost_local: Vec::new(),
             },
         );
         self.remake(&[path.into()]);
@@ -777,7 +796,7 @@ impl Comments {
         (self.by_path.get(path).into_iter().flatten())
             .map(|&i| &self.review.comments[i])
             .filter(|c| c.in_reply_to.is_none() && self.from_local.contains(&c.id))
-            .filter(|c| !self.hides(c))
+            .filter(|c| !self.hides(c) && !self.lost_local(c))
             .map(|c| c.id.clone())
             .collect()
     }
@@ -818,7 +837,7 @@ impl Comments {
             let found: HashMap<&str, &Placement> =
                 placed.placements.iter().map(|p| (p.id(), p)).collect();
             let mut threads = Vec::new();
-            let mut hidden = Vec::new();
+            let (mut hidden, mut lost_local) = (Vec::new(), Vec::new());
             let indices = self.by_path.get(path).map_or(&[][..], Vec::as_slice);
             let roots = review::threads(indices.iter().map(|&i| &self.review.comments[i]));
             for comment in roots
@@ -832,7 +851,14 @@ impl Comments {
                         side: *side,
                         lines: lines.clone(),
                     },
-                    (Some(_), Some(Placement::Lost { .. })) if !local => At::Lost,
+                    // A branch draft's lines too: changed since, as when a
+                    // fix rewrites the code the thread was on.
+                    (Some(_), Some(Placement::Lost { .. })) => {
+                        if local {
+                            lost_local.push(comment.id.clone());
+                        }
+                        At::Lost
+                    }
                     (Some(_), None) if !local => continue,
                     (Some(_), _) => {
                         hidden.push(comment.id.clone());
@@ -847,6 +873,7 @@ impl Comments {
             if let Some(placed) = self.placed.get_mut(path) {
                 placed.threads = threads.into();
                 placed.hidden = hidden;
+                placed.lost_local = lost_local;
             }
         }
         if !paths.is_empty() {
@@ -868,6 +895,8 @@ impl Comments {
         at: At,
         painted: Option<&Spans>,
     ) -> Thread {
+        let local = self.from_local.contains(&root.id);
+        let lost = local && at == At::Lost;
         Thread {
             root: root.id.clone(),
             look: self.look(root),
@@ -886,7 +915,7 @@ impl Comments {
                     label: c.label.clone().filter(|_| !c.path.is_empty()),
                     standing: self.standing(c),
                     pending: c.pending,
-                    posting: self.posting(c),
+                    posting: self.posting(c, lost),
                     applied: c.applied.is_some(),
                 })
                 .collect(),
@@ -896,7 +925,7 @@ impl Comments {
                 .map(|a| a.lines.clone())
                 .unwrap_or_default(),
             snippet: (at == At::Lost).then(|| snippet(root, painted)).flatten(),
-            local: self.from_local.contains(&root.id),
+            local,
             branch: None,
             at,
         }
@@ -1013,20 +1042,30 @@ impl Comments {
     /// Threads in the file shown and the local drafts in view, and the
     /// drafts among their comments. General comments aren't threads.
     pub(crate) fn counts(&self) -> (usize, usize) {
+        let [threads, drafts, _] = self.count();
+        (threads, drafts)
+    }
+
+    /// Whether posting has drafts to send.
+    pub(crate) fn any_goes(&self) -> bool {
+        self.count()[2] > 0
+    }
+
+    /// [`Comments::counts`], then how many of the drafts posting sends.
+    fn count(&self) -> [usize; 3] {
         if let Some((generation, counts)) = self.counted.get()
             && generation == self.generation
         {
             return counts;
         }
-        let shown = || self.review.comments.iter().filter(|c| !self.hides(c));
-        let counts = (
-            shown()
+        let counts = [
+            (self.review.comments.iter())
+                .filter(|c| !self.hides(c))
                 .filter(|c| c.in_reply_to.is_none() && !c.path.is_empty())
                 .count(),
-            shown()
-                .filter(|c| self.standing(c) == Standing::Draft)
-                .count(),
-        );
+            self.drafts_shown().count(),
+            self.drafts().count(),
+        ];
         self.counted.set(Some((self.generation, counts)));
         counts
     }
@@ -1210,8 +1249,8 @@ mod tests {
 
     /// On a review session's diff, a thread places on the lines its anchor
     /// finds, a draft in it makes it a draft, and one whose lines are gone
-    /// shows where it was with its code; a local draft that finds no line
-    /// isn't shown, nor counted, and the rest are.
+    /// shows where it was with its code; so does a local draft that finds
+    /// no line, counted but left out of what posting sends.
     #[test]
     fn threads_place_by_their_anchors_and_merge_the_local_drafts() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -1256,6 +1295,7 @@ mod tests {
             [
                 ("p1".to_owned(), line(1..2), Look::Draft, false),
                 ("l1".to_owned(), line(2..3), Look::Draft, true),
+                ("l2".to_owned(), At::Lost, Look::Draft, true),
                 ("p2".to_owned(), At::Lost, Look::Open, false),
             ]
         );
@@ -1267,10 +1307,10 @@ mod tests {
                 .collect::<Vec<_>>(),
             [Standing::Posted, Standing::Draft]
         );
-        let snippet = threads[2].snippet.as_ref().expect("its code");
+        let snippet = threads[3].snippet.as_ref().expect("its code");
         assert_eq!(snippet.heading, "line 8 not found");
-        assert_eq!(comments.counts(), (3, 2), "l2 is out of view");
-        assert_eq!(comments.local_drafts(), 1);
+        assert_eq!(comments.counts(), (4, 3));
+        assert_eq!(comments.local_drafts(), 1, "l2 has no lines to post on");
     }
 
     /// A lost thread's code is highlighted where it's placed, off the
@@ -1297,6 +1337,140 @@ mod tests {
         let code = &threads[0].snippet.as_ref().expect("its code").rows[0];
         assert!(code.pieces.iter().any(|(s, _)| s.is_some()), "{code:?}");
         assert_eq!(painted_count(), before);
+    }
+
+    /// A branch draft whose lines the code changed since shows as lost,
+    /// under its file's last row as a review's own thread does, and counts:
+    /// the record of a range picked across both sides, with a reply, as the
+    /// viewer and MCP wrote them.
+    #[test]
+    fn a_branch_draft_whose_lines_changed_shows_lost_and_counts() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (path, local) = (dir.path().join("7.json"), dir.path().join("local.json"));
+        let branch = "amalucelli/eng-8180-lookup-for-groups-for-google-calendar";
+        std::fs::write(&path, r#"{"version":1,"comments":[]}"#).expect("write");
+        let draft = r#"{"id":"4d9ab2cd9bd04fab","path":"pkg/go/domains/integrations/google/verify.go","side":"new","start":{"old":null,"new":225},"end":{"old":226,"new":229},"text":"this should be used sqldb here too","author":"","resolved":false,"anchor":{"before":["\t}","\tupd.Set(sqldb.NewField(\"scope_gap_at\", svc.clock.Now()))"],"lines":["\tupd.SetExpr(","\t\t\"scope_gap_scopes\",","\t\t\"ARRAY(SELECT DISTINCT unnest(COALESCE(scope_gap_scopes, '{}'::text[]) || ?::text[]) ORDER BY 1)\",","\t\tpq.Array(scopes),","\t)"],"after":["\tif _, err := tx.ExecContext(ctx, upd.Stmt(), upd.Args()...); err != nil {","\t\treturn svc.wrapWrite(err, \"google_integration.record_scope_gap.exec\")"]},"distance":0,"branch":"amalucelli/eng-8180-lookup-for-groups-for-google-calendar"}"#;
+        let reply = r#"{"id":"5e1","path":"pkg/go/domains/integrations/google/verify.go","text":"Done. No raw SQL now.","author":"dffy mcp","created":"2026-11-24T10:00:00Z","in_reply_to":"4d9ab2cd9bd04fab"}"#;
+        std::fs::write(
+            &local,
+            format!(r#"{{"version":1,"comments":[{draft},{reply}]}}"#),
+        )
+        .expect("write");
+        let file = "pkg/go/domains/integrations/google/verify.go";
+        let mut comments = Comments::new(path, Some(local), true, Some(branch.to_owned()));
+        comments.reload().expect("read");
+        // The code as the fix left it: the commented block is now a locked
+        // read and a plain field.
+        let mut code = "// pad\n".repeat(220);
+        code.push_str(
+            "\t}\n\tupd.Set(sqldb.NewField(\"scope_gap_at\", svc.clock.Now()))\n\
+             \tupd.Set(sqldb.NewField(\"scope_gap_scopes\", pq.Array(merged)))\n\
+             \tif _, err := tx.ExecContext(ctx, upd.Stmt(), upd.Args()...); err != nil {\n\
+             \t\treturn svc.wrapWrite(err, \"google_integration.record_scope_gap.exec\")\n\t}\n",
+        );
+        let mut diff = new_file(&code);
+        diff.change.path = file.into();
+        let annotated = comments.annotated(file.as_bytes()).expect("commented");
+        let landed = land(&annotated, &diff, false);
+        assert!(
+            comments.place(file.as_bytes(), 1, landed).is_some(),
+            "current"
+        );
+        let threads = comments.threads(file.as_bytes()).expect("placed");
+        let shown: Vec<_> = threads.iter().map(|t| (t.root.as_str(), &t.at)).collect();
+        assert_eq!(shown, [("4d9ab2cd9bd04fab", &At::Lost)]);
+        assert_eq!(threads[0].comments.len(), 2, "with its reply");
+        assert_eq!(comments.counts().0, 1, "counted");
+        let tally = comments.tally(file.as_bytes()).map(|(n, _)| n);
+        assert_eq!(tally, Some(2), "the tree counts it");
+        assert_eq!(comments.local_drafts(), 0, "no lines here to post it on");
+    }
+
+    /// A branch draft on a renamed file's old side, in a diff listing the
+    /// rename as a deletion and an addition, is the old path's: out of view
+    /// until that file is placed, and kept from posting, its replies too,
+    /// when its lines aren't there.
+    #[test]
+    fn a_lost_branch_draft_on_a_renames_old_side_stays_local() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (path, local) = (dir.path().join("7.json"), dir.path().join("local.json"));
+        std::fs::write(&path, r#"{"version":1,"comments":[]}"#).expect("write");
+        let draft = |id: &str, line: usize, text: &str| {
+            format!(
+                r#"{{"id":"{id}","path":"new.rs","old_path":"old.rs","side":"old","start":{{"old":{line},"new":null}},"end":{{"old":{line},"new":null}},"text":"x","author":"","created":"2026-11-17T10:00:00Z","anchor":{{"before":[],"lines":["{text}"],"after":[]}}}}"#
+            )
+        };
+        let reply = r#"{"id":"r","path":"new.rs","text":"y","author":"","created":"2026-11-17T10:00:00Z","in_reply_to":"lost"}"#;
+        let drafts = [
+            draft("here", 1, "one"),
+            draft("lost", 2, "gone"),
+            reply.to_owned(),
+        ];
+        let json = format!(r#"{{"version":1,"comments":[{}]}}"#, drafts.join(","));
+        std::fs::write(&local, json).expect("write");
+        let mut comments = Comments::new(path, Some(local), true, None);
+        comments.reload().expect("read");
+        let file = |path: &str, status: Status, old: &str, new: &str| {
+            let (old, new) = (text(old), text(new));
+            FileDiff {
+                change: FileChange {
+                    path: path.into(),
+                    status,
+                    old: None,
+                    new: None,
+                    staging: None,
+                },
+                hunks: hunks(&old, &new, &Options::default()),
+                old,
+                new,
+                binary: false,
+                too_large: false,
+                note: None,
+            }
+        };
+        let files = [
+            file("new.rs", Status::Added, "", "one\ntwo\n"),
+            file("old.rs", Status::Deleted, "one\ntwo\n", ""),
+        ];
+        let mut doc = document::Document::<()>::default();
+        for diff in &files {
+            doc.push(diff.change.clone(), document::Source::Repo);
+        }
+        comments.locate(doc.files());
+        let place = |comments: &mut Comments, diff: &FileDiff| {
+            let path = diff.change.path.as_slice();
+            let landed = land(&comments.annotated(path).expect("commented"), diff, false);
+            assert!(comments.place(path, 1, landed).is_some(), "current");
+        };
+        let sent = |comments: &Comments| -> Vec<String> {
+            comments.drafts().map(|(id, ..)| id.to_owned()).collect()
+        };
+        place(&mut comments, &files[0]);
+        assert_eq!(comments.counts(), (0, 0), "old.rs isn't placed yet");
+        assert_eq!(sent(&comments), [""; 0]);
+
+        place(&mut comments, &files[1]);
+        let threads = comments.threads(b"old.rs").expect("placed");
+        let shown: Vec<_> = (threads.iter())
+            .map(|t| (t.root.as_str(), t.at == At::Lost))
+            .collect();
+        assert_eq!(shown, [("here", false), ("lost", true)]);
+        let says = |t: &Thread| -> Vec<Option<(bool, String)>> {
+            (t.comments.iter())
+                .map(|c| c.posting.clone().map(|p| (p.warn, p.words)))
+                .collect()
+        };
+        let lost = Some((
+            true,
+            "stays on the branch: its lines aren't here".to_owned(),
+        ));
+        assert_eq!(says(&threads[0]), [None]);
+        assert_eq!(says(&threads[1]), [lost.clone(), lost]);
+        assert_eq!(comments.counts(), (2, 3));
+        assert_eq!(sent(&comments), ["here"]);
+        assert_eq!(comments.local_drafts(), 1);
+        assert_eq!(comments.local_roots(), ["here"]);
+        assert_eq!(comments.local_in_view(b"old.rs"), ["here"]);
     }
 
     /// `a.rs`, added with `new`.

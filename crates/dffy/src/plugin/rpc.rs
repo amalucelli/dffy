@@ -175,6 +175,10 @@ pub(crate) struct Kind<I, S, R> {
     /// killing its group: a plugin that starts processes in groups of
     /// their own must stop them itself, as killing its group misses them.
     pub grace: Duration,
+    /// A process that exits is started again, as a plugin that crashed;
+    /// without, the client fails with why it exited, for its owner to start
+    /// another when it wants one.
+    pub restarts: bool,
     /// Reads `initialize`'s result, or refuses it. What it sends goes
     /// before the requests that waited.
     pub initialized: Initialized<I, S, R>,
@@ -337,6 +341,12 @@ impl<I: Send + 'static, S: Send + 'static, R: Send + 'static> Client<I, S, R> {
 
     pub(crate) fn lock(&self) -> Guard<'_, I, S, R> {
         self.0.lock()
+    }
+
+    /// The running process's group leader, for tests that stop it.
+    #[cfg(test)]
+    pub(crate) fn leader(&self) -> Option<Pid> {
+        self.0.lock().process.as_ref().map(|p| p.leader)
     }
 
     /// Hands what `initialize` said to `ready` once the plugin has
@@ -806,6 +816,13 @@ fn exited<I: Send + 'static, S: Send + 'static, R: Send + 'static>(
     let uptime = inner.process.take().map(|p| p.started.elapsed());
     inner.fail_all(shared.kind.failed, why);
     if !matches!(inner.phase, Phase::Starting | Phase::Ready) || running().stopped {
+        return;
+    }
+    if !shared.kind.restarts {
+        inner.phase = Phase::Failed(why.to_owned());
+        for ready in std::mem::take(&mut inner.on_ready) {
+            ready(Err(why.to_owned()));
+        }
         return;
     }
     inner.crashes = if uptime.is_some_and(|up| up >= STEADY) {

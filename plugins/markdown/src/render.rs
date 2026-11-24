@@ -5,8 +5,8 @@
 
 use std::ops::Range;
 
+use dffy_render_mermaid::columns;
 use pulldown_cmark::{Alignment, CodeBlockKind, Event, Options, Parser, Tag, TagEnd};
-use unicode_width::{UnicodeWidthChar as _, UnicodeWidthStr as _};
 
 /// A stretch of a line in one style.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -223,7 +223,7 @@ impl Renderer {
         let mut first = self.bars();
         let mut rest = self.bars();
         if !lead.is_empty() {
-            rest.push(Span::plain(" ".repeat(lead.width())));
+            rest.push(Span::plain(" ".repeat(columns::width(&lead))));
             first.push(Span::styled(lead, &["dim"]));
         }
         let kind = match (depth, self.footnote) {
@@ -610,7 +610,7 @@ fn column_widths(rows: &[Row], columns: usize, width: usize) -> Vec<usize> {
     let mut widths = vec![1; columns];
     for row in rows {
         for (i, cell) in row.cells.iter().enumerate() {
-            widths[i] = widths[i].max(cell.width());
+            widths[i] = widths[i].max(columns::width(cell));
         }
     }
     let frame = 3 * columns + 1;
@@ -632,20 +632,19 @@ fn wrap(text: &str, width: usize) -> Vec<String> {
     let mut line = String::new();
     let mut used = 0;
     for word in text.split_whitespace() {
-        if used > 0 && used + 1 + word.width() > width {
+        if used > 0 && used + 1 + columns::width(word) > width {
             lines.push(std::mem::take(&mut line));
             used = 0;
         } else if used > 0 {
             line.push(' ');
             used += 1;
         }
-        for c in word.chars() {
-            let w = c.width().unwrap_or(0);
+        for (piece, w) in columns::clusters(word) {
             if used > 0 && used + w > width {
                 lines.push(std::mem::take(&mut line));
                 used = 0;
             }
-            line.push(c);
+            line.push_str(piece);
             used += w;
         }
     }
@@ -667,7 +666,7 @@ fn row_lines(row: &Row, widths: &[usize], aligns: &[Alignment]) -> Vec<Line> {
             let mut line = vec![Span::styled("│", &["dim"])];
             for (i, &w) in widths.iter().enumerate() {
                 let text = cells[i].get(k).map_or("", String::as_str);
-                let pad = w.saturating_sub(text.width());
+                let pad = w.saturating_sub(columns::width(text));
                 let (left, right) = match aligns.get(i) {
                     Some(Alignment::Right) => (pad, 0),
                     Some(Alignment::Center) => (pad / 2, pad - pad / 2),

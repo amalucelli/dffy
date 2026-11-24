@@ -2,6 +2,7 @@
 //! where each is listed, and its keys.
 
 use dffy_core::diff::Whitespace;
+use dffy_core::document::Side;
 
 use super::{Action, App, Pane, Watch};
 use crate::config::{self, View};
@@ -115,6 +116,15 @@ impl App {
                 let mut done = None;
                 if action == Act::CycleTheme {
                     self.step_theme(back);
+                } else if action == Act::ToggleFileView {
+                    // `l` toggles; the row steps through the versions too.
+                    self.cycle_file_view(back);
+                } else if action == Act::CycleLayout {
+                    // In file view the layout's key flips the version read;
+                    // its row sets the layout file view leaves for.
+                    for _ in 0..times.max(1) {
+                        done = self.set_view(action);
+                    }
                 } else {
                     for _ in 0..times.max(1) {
                         done = self.act(action);
@@ -181,18 +191,30 @@ impl App {
     ) -> commands::Entry {
         let (on, title, value) = self.panel_state(action);
         let setting = on.is_some() || value.is_some();
+        // Outside Here, whose keys come first, a key of the tree's that the
+        // panel binds to something else would run that here.
+        let theirs = |d: &String| {
+            place != Place::Here
+                && (self.keys.leader_entries().iter()).any(|(c, a)| c.name() == *d && *a != action)
+        };
         commands::Entry {
             action,
-            direct: direct.filter(|d| *d != key),
+            direct: direct.filter(|d| *d != key && !theirs(d)),
             key,
             on,
             label: label.unwrap_or(title),
+            values: if value.is_some() {
+                self.panel_values(action)
+            } else {
+                Vec::new()
+            },
             value,
             // These go somewhere, rather than set a look.
             stays: setting
                 && !matches!(
                     action,
                     Act::ToggleTree
+                        | Act::ToggleAllFiles
                         | Act::CommentedFiles
                         | Act::SinceLastReview
                         | Act::SinceCheckpoint
@@ -268,6 +290,40 @@ impl App {
             .collect();
         ("Here".to_owned(), offers)
     }
+
+    /// Every value multi-value setting `action` can step to, as
+    /// [`App::panel_state`] words them.
+    fn panel_values(&self, action: Act) -> Vec<String> {
+        fn every<T: clap::ValueEnum>(_: &T) -> Vec<String> {
+            T::value_variants()
+                .iter()
+                .map(config::choice_name)
+                .collect()
+        }
+        match action {
+            // A layout that's what shows here is said once (see
+            // `panel_state`): never `split (split here)`.
+            Act::CycleLayout => (every(&self.view).iter())
+                .flat_map(|view| {
+                    let here = (["split", "unified"].into_iter())
+                        .filter(move |h| h != view)
+                        .map(move |h| format!("{view} ({h} here)"));
+                    std::iter::once(view.clone()).chain(here)
+                })
+                .collect(),
+            Act::ToggleFileView => std::iter::once("off".to_owned())
+                .chain([Side::New, Side::Old].map(|side| self.version_choice(side)))
+                .collect(),
+            Act::CycleIndicators => every(&self.indicators),
+            Act::CycleModifiedLines => every(&self.modified_lines),
+            Act::ToggleStatusBar => every(&self.status_bar),
+            Act::CycleTheme => (crate::theme::builtin_names().map(str::to_owned))
+                .chain(self.themes.iter().map(|(name, _)| name.clone()))
+                .collect(),
+            _ => Vec::new(),
+        }
+    }
+
     /// A panel row's checkbox, if it's a toggle, its text, and a
     /// multi-value setting's value (`auto (split here)`).
     fn panel_state(&self, action: Act) -> (Option<bool>, String, Option<String>) {
@@ -284,6 +340,15 @@ impl App {
                     value(format!("{view} ({here} here)"))
                 }
             }
+            // Off, or the version read.
+            Act::ToggleFileView => (
+                None,
+                "File view".to_owned(),
+                Some(match self.doc.document.reading() {
+                    Some(side) => self.version_choice(side),
+                    None => "off".to_owned(),
+                }),
+            ),
             Act::CycleIndicators => value(config::choice_name(&self.indicators)),
             Act::CycleModifiedLines => value(config::choice_name(&self.modified_lines)),
             Act::CycleTheme => value(self.theme_name.clone()),
@@ -299,11 +364,16 @@ impl App {
             Act::ToggleMouse => toggle(self.mouse),
             Act::ToggleWatch => toggle(self.watch != Watch::Off),
             Act::ToggleTree => toggle(self.tree_shown),
+            Act::ToggleAllFiles => toggle(self.all_files.is_some()),
             Act::CommentedFiles => toggle(self.tree.commented()),
             Act::SinceLastReview => toggle(self.reviewing.since_review()),
             Act::SinceCheckpoint => toggle(self.since_checkpoint.is_some()),
             Act::WholeReview => (None, self.reviewing.whole_title(), None),
             Act::OpenReview => (None, format!("Open {}…", self.reviewing.noun(false)), None),
+            // In file view, what applies once it's off.
+            Act::ToggleFull if self.doc.document.reading().is_some() => {
+                toggle(self.doc.document.full)
+            }
             Act::ToggleFull => toggle(
                 self.doc
                     .document
@@ -321,6 +391,12 @@ impl App {
         let on = |on: bool| if on { "on" } else { "off" };
         let label = action.label();
         Some(match action {
+            // A piped diff said why it has none.
+            Act::ToggleFileView if self.piped => return None,
+            Act::ToggleFileView => match self.doc.document.reading() {
+                Some(side) => format!("file view · reading {}", self.version_name(side)),
+                None => "file view off: the diff again".to_owned(),
+            },
             Act::CycleLayout => {
                 let now = if self.splits() { "split" } else { "unified" };
                 match self.view {

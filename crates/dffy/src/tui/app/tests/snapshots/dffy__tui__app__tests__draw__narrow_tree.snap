@@ -1,5 +1,5 @@
 ---
-source: crates/dffy/src/tui/app.rs
+source: crates/dffy/src/tui/app/tests/draw.rs
 expression: screen(&mut app)
 ---
  ‹ 1/2 file.rs › +2 -2

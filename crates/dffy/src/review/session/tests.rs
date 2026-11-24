@@ -230,6 +230,87 @@ fn an_update_shows_a_new_head_or_says_nothing_changed() {
     assert_eq!(*moved, Some((HEAD.to_owned(), "cccc333".to_owned())));
 }
 
+/// A branch draft whose lines weren't found doesn't go: alone, it asks for
+/// no plan; the dialog counts it apart, whether or not the branch drafts go
+/// along, and goes to it with why; and quitting counts it as not posted.
+#[test]
+fn a_branch_draft_without_lines_is_counted_as_staying() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (file, local) = (dir.path().join("7.json"), dir.path().join("local.json"));
+    std::fs::write(&file, r#"{"version":1,"comments":[]}"#).expect("write");
+    std::fs::write(
+        &local,
+        r#"{"version":1,"comments":[
+{"id":"l1","path":"src/lib.rs","side":"new","start":{"old":null,"new":3},"end":{"old":null,"new":3},"text":"Tidy this","author":"","created":"2026-11-17T10:00:00Z","anchor":{"before":[],"lines":["gone"],"after":[]}}
+]}"#,
+    )
+    .expect("write");
+    let mut comments = Comments::new(file.clone(), Some(local), true, None);
+    comments.reload().expect("read");
+    comments.place_without_diff(b"src/lib.rs", 1);
+    assert_eq!(comments.counts(), (1, 1), "in view");
+
+    let mut r = plugged();
+    let now = Instant::now();
+    let (prepare, _) = r.start(
+        ("test".to_owned(), session(&file, HEAD)),
+        Some(&mut comments),
+        now,
+    );
+    r.said(
+        (prepare, Said::Done(Ok(()))),
+        Some(&mut comments),
+        &shown(),
+        now,
+    );
+    r.plan_soon(now);
+    assert_eq!(r.plan_deadline(Some(&comments)), None, "nothing to plan");
+
+    let why = "its lines aren't here";
+    for local in [false, true] {
+        let sending = r.sending(Some(&comments), local);
+        assert_eq!(
+            sending,
+            Sending {
+                staying: 1,
+                ..Sending::default()
+            }
+        );
+        let warnings = sending.warnings();
+        assert_eq!(
+            warnings.iter().map(|w| words(w)).collect::<Vec<_>>(),
+            ["1 branch draft stays, lines not found · <GoToUnposted>"]
+        );
+        assert_eq!(
+            r.wont_go(Some(&comments), local),
+            [("l1".to_owned(), why.to_owned())]
+        );
+    }
+    assert_eq!(
+        Reviewing::go_to_unposted(Some(&comments), &r.wont_go(Some(&comments), true)),
+        Effect::Focus {
+            root: "l1".to_owned(),
+            note: vec![Part::Text(format!("not posted: {why}"))]
+        }
+    );
+    assert_eq!(
+        r.unposted_note(Some(&comments)).as_deref(),
+        Some("review 7: 1 draft not posted")
+    );
+    let all = Sending {
+        left_out: 2,
+        staying: 2,
+        ..Sending::default()
+    };
+    assert_eq!(
+        all.warnings().iter().map(|w| words(w)).collect::<Vec<_>>(),
+        [
+            "2 drafts left out",
+            "2 branch drafts stay, lines not found · <GoToUnposted>"
+        ]
+    );
+}
+
 /// The drafts' plan is asked for a moment after they change, never while
 /// a post runs; its answer heads each draft and counts what the dialog
 /// sends, and a post can't be asked for while one runs.
@@ -283,9 +364,10 @@ fn the_drafts_plan_runs_when_due_and_heads_the_drafts() {
     assert_eq!(r.checked(), Checked::Yes);
     let sending = r.sending(Some(&comments), true);
     assert_eq!((sending.comments, sending.left_out), (1, 1));
+    let warnings = sending.warnings();
     assert_eq!(
-        sending.warning().as_deref().map(words).as_deref(),
-        Some("1 draft left out · <GoToUnposted>")
+        warnings.iter().map(|w| words(w)).collect::<Vec<_>>(),
+        ["1 draft left out · <GoToUnposted>"]
     );
     assert_eq!(
         r.wont_go(Some(&comments), true),

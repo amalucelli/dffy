@@ -39,31 +39,11 @@ impl ScopeQuery {
     /// `@scope` capture.
     pub(super) fn new(grammar: &tree_sitter::Language, source: &str) -> Option<Self> {
         let query = Query::new(grammar, source).ok()?;
-        let mut names = Vec::new();
-        for i in 0..query.pattern_count() {
-            let name = source[query.start_byte_for_pattern(i)..]
-                .strip_prefix('(')
-                .map(|s| s.split(|c: char| !c.is_alphanumeric() && c != '_').next());
-            names.push(name.flatten().filter(|n| !n.is_empty() && *n != "_"));
-        }
-        // Grammars give several kinds one name (aliases); a pattern names
-        // them all.
-        let roots = names.into_iter().collect::<Option<Vec<_>>>().map(|names| {
-            (0..grammar.node_kind_count())
-                .map(|id| {
-                    let id = u16::try_from(id).unwrap_or(u16::MAX);
-                    grammar.node_kind_is_named(id)
-                        && grammar
-                            .node_kind_for_id(id)
-                            .is_some_and(|kind| names.contains(&kind))
-                })
-                .collect()
-        });
         Some(Self {
             scope: query.capture_index_for_name("scope")?,
             kind: query.capture_index_for_name("kind"),
             name: query.capture_index_for_name("name"),
-            roots,
+            roots: roots(grammar, &query, source),
             query,
         })
     }
@@ -73,6 +53,39 @@ impl ScopeQuery {
             .as_ref()
             .is_none_or(|roots| roots.get(usize::from(kind)).copied().unwrap_or(false))
     }
+}
+
+/// Whether a pattern of `query` (compiled from `source`) starts at a node
+/// of each kind, by kind id; `None` when a pattern's first node isn't a
+/// named kind, so any may start one.
+pub(super) fn roots(
+    grammar: &tree_sitter::Language,
+    query: &Query,
+    source: &str,
+) -> Option<Vec<bool>> {
+    let mut names = Vec::new();
+    for i in 0..query.pattern_count() {
+        let name = source[query.start_byte_for_pattern(i)..]
+            .strip_prefix('(')
+            .map(|s| s.split(|c: char| !c.is_alphanumeric() && c != '_').next());
+        names.push(name.flatten().filter(|n| !n.is_empty() && *n != "_"));
+    }
+    let names = names.into_iter().collect::<Option<Vec<_>>>()?;
+    Some(kinds_named(grammar, &names))
+}
+
+/// Whether each kind, by kind id, is a named kind called one of `names`.
+/// Grammars give several kinds one name (aliases); this marks them all.
+pub(super) fn kinds_named(grammar: &tree_sitter::Language, names: &[&str]) -> Vec<bool> {
+    (0..grammar.node_kind_count())
+        .map(|id| {
+            let id = u16::try_from(id).unwrap_or(u16::MAX);
+            grammar.node_kind_is_named(id)
+                && grammar
+                    .node_kind_for_id(id)
+                    .is_some_and(|kind| names.contains(&kind))
+        })
+        .collect()
 }
 
 /// No parent.

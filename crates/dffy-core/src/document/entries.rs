@@ -53,11 +53,11 @@ struct Look {
 /// is read alone: its other side where `change` has none on that one, as
 /// an added file has no old side and a deleted file no new one. A file the
 /// diff doesn't list has one side as both: it's read as it shows.
-fn read_side<P>(reading: Option<Side>, change: &FileChange, source: &Source<P>) -> Option<Side> {
+fn read_side<P>(reading: Side, change: &FileChange, source: &Source<P>) -> Option<Side> {
     if matches!(source, Source::Unchanged) {
         return None;
     }
-    Some(match (reading?, &change.old, &change.new) {
+    Some(match (reading, &change.old, &change.new) {
         (Side::Old, None, Some(_)) => Side::New,
         (Side::New, Some(_), None) => Side::Old,
         (reading, ..) => reading,
@@ -65,22 +65,27 @@ fn read_side<P>(reading: Option<Side>, change: &FileChange, source: &Source<P>) 
 }
 
 impl Look {
-    /// How the entry of `change` from `source`, with `reveal`, the hunks
-    /// `opened` and `blocks`, shows: a file the diff doesn't list, or one
-    /// read on a side alone, shows whole, and on the side it has when it
-    /// lacks the one read.
+    /// How entry `file`, of `change` from `source`, with `reveal`, its
+    /// hunks among `opened` and `blocks`, shows: a file the diff doesn't
+    /// list, or one read on a side alone, shows whole, and on the side it
+    /// has when it lacks the one read.
+    // Built for every row drawn or moved over: while both sides show, it
+    // looks nothing up.
     fn shape<'a, P, A>(
         self,
-        (change, source): (&FileChange, &Source<P>),
-        (reveal, opened): (&'a [Reveal], &'a [usize]),
+        (file, change, source): (usize, &FileChange, &Source<P>),
+        (reveal, opened): (&'a [Reveal], &'a [(usize, Vec<usize>)]),
         blocks: Option<&'a Blocks>,
         arrange: &'a A,
     ) -> Shape<'a, A> {
+        // Hunks are opened in place only while a side is read alone.
+        let reading = self
+            .reading
+            .and_then(|side| Some((read_side(side, change, source)?, opened_in(opened, file))));
         Shape {
             structural: self.structural,
             full: self.full || self.reading.is_some() || matches!(source, Source::Unchanged),
-            reading: read_side(self.reading, change, source),
-            opened,
+            reading,
             reveal,
             arrange,
             blocks,
@@ -1461,6 +1466,7 @@ impl<P> Document<P> {
     /// before [`Document::set_reading`] switches.
     #[must_use]
     pub fn read_on(&self, file: usize, reading: Option<Side>) -> Option<Side> {
+        let reading = reading?;
         let entry = self.files.get(file)?;
         read_side(reading, &entry.change, &entry.source)
     }
@@ -1488,8 +1494,8 @@ impl<P> Document<P> {
             return None;
         };
         let shape = (self.look()).shape(
-            (&entry.change, &entry.source),
-            (&entry.reveal, opened_in(&self.opened, file)),
+            (file, &entry.change, &entry.source),
+            (&entry.reveal, &self.opened),
             entry.blocks.as_deref(),
             &(),
         );
@@ -1512,8 +1518,8 @@ impl<P> Document<P> {
             return None;
         };
         let shape = look.shape(
-            (&entry.change, &entry.source),
-            (&entry.reveal, opened_in(&self.opened, file)),
+            (file, &entry.change, &entry.source),
+            (&entry.reveal, &self.opened),
             entry.blocks.as_deref(),
             arrange,
         );
@@ -1631,8 +1637,8 @@ impl<P> Document<P> {
             return None;
         };
         let shape = look.shape(
-            (&entry.change, &entry.source),
-            (&entry.reveal, opened_in(&self.opened, pos.file)),
+            (pos.file, &entry.change, &entry.source),
+            (&entry.reveal, &self.opened),
             entry.blocks.as_deref(),
             &arrange,
         );
@@ -2437,8 +2443,8 @@ impl<P> Document<P> {
             return None;
         };
         let shape = look.shape(
-            (&entry.change, &entry.source),
-            (&entry.reveal, opened_in(&self.opened, pos.file)),
+            (pos.file, &entry.change, &entry.source),
+            (&entry.reveal, &self.opened),
             entry.blocks.as_deref(),
             &arrange,
         );
@@ -2712,7 +2718,7 @@ impl<P> Document<P> {
             let Segment::Gap(g) = file.segment(part)? else {
                 return None;
             };
-            let side = shape.reading.unwrap_or(Side::New);
+            let side = shape.reading.map_or(Side::New, |(side, _)| side);
             if !file.wants_gap_syntax(g, side) {
                 return None;
             }

@@ -851,44 +851,70 @@ impl LineStyle {
     /// number cell's padding, the rule, then a cell of the line's tint.
     /// Classic signs sit left of the rule, so everything right of it is
     /// code; without color they go right before the text instead. With
-    /// `bar`, in file view, a changed line's rule is a heavy bar in its
-    /// sign's color in every style, as gitsigns marks changed lines, the
-    /// gutter's tint and the classic sign kept.
+    /// `bar`, in file view, a changed line takes [`LineStyle::bar`].
     fn mark(&self, c: &mut Canvas, layout: &Layout, first: bool, bar: bool) {
         let sign = if first { self.sign_char } else { ' ' };
-        let bar = bar && self.changed;
-        let rule = |c: &mut Canvas, role: Role| {
-            if bar {
-                c.push(role, "┃");
-            } else {
-                c.push(Role::Dim, "│");
-            }
-        };
+        if bar && self.changed {
+            self.bar(c, layout, sign);
+            return;
+        }
         match layout.indicators {
             Indicators::Background if self.changed => {
                 c.spaces(self.number, 1);
-                c.push(self.number, if bar { "┃" } else { "│" });
+                c.push(self.number, "│");
                 c.spaces(self.text, 1);
             }
             Indicators::Bars if self.changed => {
                 c.push(Role::Plain, " ");
-                c.push(self.sign, if bar { "┃" } else { "▌" });
+                c.push(self.sign, "▌");
                 c.push(Role::Plain, " ");
             }
             Indicators::Classic if layout.inline_signs => {
-                c.spaces(Role::Dim, 1);
-                rule(c, self.sign);
+                c.push(Role::Dim, " │");
                 c.push_char(self.sign, sign);
             }
             Indicators::Classic => {
                 c.push(Role::Plain, " ");
                 c.push_char(self.sign, sign);
-                rule(c, self.sign);
+                c.push(Role::Dim, "│");
                 c.push(Role::Plain, " ");
             }
             Indicators::Auto | Indicators::Background | Indicators::Bars | Indicators::None => {
+                c.push(Role::Dim, " │");
+                c.push(Role::Plain, " ");
+            }
+        }
+    }
+
+    /// [`LineStyle::mark`] of a changed line in file view: its rule is a
+    /// heavy bar in its sign's color in every style, as gitsigns marks
+    /// changed lines, the gutter's tint and the classic sign kept.
+    fn bar(&self, c: &mut Canvas, layout: &Layout, sign: char) {
+        match layout.indicators {
+            Indicators::Background => {
+                c.spaces(self.number, 1);
+                c.push(self.number, "┃");
+                c.spaces(self.text, 1);
+            }
+            Indicators::Bars => {
+                c.push(Role::Plain, " ");
+                c.push(self.sign, "┃");
+                c.push(Role::Plain, " ");
+            }
+            Indicators::Classic if layout.inline_signs => {
                 c.spaces(Role::Dim, 1);
-                rule(c, self.sign);
+                c.push(self.sign, "┃");
+                c.push_char(self.sign, sign);
+            }
+            Indicators::Classic => {
+                c.push(Role::Plain, " ");
+                c.push_char(self.sign, sign);
+                c.push(self.sign, "┃");
+                c.push(Role::Plain, " ");
+            }
+            Indicators::Auto | Indicators::None => {
+                c.spaces(Role::Dim, 1);
+                c.push(self.sign, "┃");
                 c.push(Role::Plain, " ");
             }
         }

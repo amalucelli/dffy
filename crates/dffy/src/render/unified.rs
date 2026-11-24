@@ -43,12 +43,11 @@ pub(super) fn line(layout: &Layout, w: usize, line: &Line, c: &mut Canvas) {
     // In a change opened in place, the bar marks the side read's lines
     // alone, and the other side's numbers are dim, so they read apart even
     // without change marks.
-    let read = layout.one_sided.is_none_or(|read| read == side);
-    let bar = layout.read_alone && read;
-    let number = if layout.read_alone && !read {
-        Role::Dim
+    let (bar, number) = if layout.read_alone {
+        let read = layout.one_sided.is_none_or(|read| read == side);
+        (read, if read { style.number } else { Role::Dim })
     } else {
-        style.number
+        (false, style.number)
     };
     let mut cursor = Cursor::default();
     let mut first = true;

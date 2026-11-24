@@ -315,11 +315,11 @@ struct Shape<'a, A> {
     full: bool,
     /// The side read alone, if any: each hunk shows only its lines, with
     /// the other side's marked where they're hidden (see [`side_rows`]),
-    /// but for the hunks `opened`.
-    reading: Option<Side>,
-    /// The hunks opened in place while a side is read alone, in order (see
+    /// but for the hunks opened in place, in order (see
     /// [`Document::set_opened`]).
-    opened: &'a [usize],
+    // One field: a shape is built for every row drawn or moved over, and
+    // while both sides show this is a single word to set.
+    reading: Option<(Side, &'a [usize])>,
     /// What's revealed of each gap, by gap; gaps past its end show nothing.
     reveal: &'a [Reveal],
     /// Each hunk's arrangement, from its numbers (and no heading), and the
@@ -1186,9 +1186,17 @@ impl File {
         let (cores, views) = self.shown_hunks_mut(shape.structural);
         let (core, view) = (&cores[h], &mut views[h]);
         let layout = match shape.reading {
-            Some(_) if shape.opened.binary_search(&h).is_ok() => Layout::Opened,
-            Some(side) => Layout::Read(side),
-            None => Layout::Arranged(shape.arrange.arrangement(&hunk_header(core, b""))),
+            None => {
+                let arrangement = shape.arrange.arrangement(&hunk_header(core, b""));
+                // Asked for every row drawn or moved over: the rows built
+                // while both sides show are found without comparing layouts.
+                if matches!(view.layout, Some(Layout::Arranged(shown)) if shown == arrangement) {
+                    return;
+                }
+                Layout::Arranged(arrangement)
+            }
+            Some((_, opened)) if opened.binary_search(&h).is_ok() => Layout::Opened,
+            Some((side, _)) => Layout::Read(side),
         };
         let held = |view: &HunkView| {
             view.rows.capacity() * size_of::<Row>() + view.starts.capacity() * size_of::<usize>()
@@ -1994,7 +2002,7 @@ impl File {
     /// while a side is read alone: that side and the lines, in order. `None`
     /// on any other row.
     fn mark(&mut self, shape: &Shape<'_, impl Arrange>, pos: Pos) -> Option<(Side, Range<usize>)> {
-        let side = shape.reading?;
+        let (side, _) = shape.reading?;
         let Some(Segment::Hunk(h)) = self.segment(pos.part) else {
             return None;
         };
@@ -2056,7 +2064,7 @@ impl File {
         Some(match segment {
             Segment::Start => Content::Start(self.header(&cores[0], self.heading(views, 0))),
             Segment::Hunk(h) => {
-                let side = shape.reading.unwrap_or(Side::New);
+                let side = shape.reading.map_or(Side::New, |(side, _)| side);
                 let lines = self.lines_read(shape.structural, h, side);
                 Content::Hunk {
                     header: self.header(lines.core, self.heading(views, h)),
@@ -2084,8 +2092,8 @@ impl File {
                         // The sides' unchanged lines may differ where
                         // whitespace is ignored.
                         let (side, line) = match shape.reading {
-                            Some(Side::Old) => (Side::Old, old),
-                            Some(Side::New) | None => (Side::New, new),
+                            Some((Side::Old, _)) => (Side::Old, old),
+                            Some((Side::New, _)) | None => (Side::New, new),
                         };
                         let raw = match side {
                             Side::Old => self.diff.old.line(old),
@@ -2261,21 +2269,36 @@ impl<'a> HunkLines<'a> {
             .as_deref()
             .map_or(NO_EMPHASIS, |e| &e[line][..]);
         let core_line = &self.core.lines[line];
-        let mut shown = diff_line(
+        if self.side == Side::Old && core_line.kind == LineKind::Context {
+            return self.old_context(core_line, state, emphasis);
+        }
+        let shown = diff_line(
             &self.file.diff,
             core_line,
             state,
             emphasis,
             self.view.syntax.as_ref(),
         );
-        // The sides' unchanged lines may differ where whitespace is ignored.
-        if self.side == Side::Old && core_line.kind == LineKind::Context {
-            let raw = self.file.diff.old.line(core_line.old);
-            shown.text = display_text(raw.strip_suffix(b"\n").unwrap_or(raw));
-            shown.syntax = (self.view.syntax.as_ref())
-                .and_then(|s| s.old.as_ref())
-                .map(|o| o.line(core_line.old));
-        }
+        rendered::restyle(self.file.rendered.as_deref(), shown)
+    }
+
+    /// [`HunkLines::line`] for an unchanged line read on the old side: the
+    /// sides' unchanged lines may differ where whitespace is ignored.
+    // Out of line, so the path every drawn line takes stays as small.
+    #[inline(never)]
+    fn old_context(
+        &self,
+        core_line: &diff::Line,
+        state: LineState,
+        emphasis: &'a [Range<usize>],
+    ) -> Line<'a> {
+        let syntax = self.view.syntax.as_ref();
+        let raw = self.file.diff.old.line(core_line.old);
+        let shown = Line {
+            text: display_text(raw.strip_suffix(b"\n").unwrap_or(raw)),
+            syntax: (syntax.and_then(|s| s.old.as_ref())).map(|o| o.line(core_line.old)),
+            ..diff_line(&self.file.diff, core_line, state, emphasis, syntax)
+        };
         rendered::restyle(self.file.rendered.as_deref(), shown)
     }
 }

@@ -218,6 +218,36 @@ fn space_toggles_the_quick_popups_highlighted_row() {
     assert_eq!((quick(&app), tab(&app)), (false, "Here"));
 }
 
+/// The quick popup's View group starts with file view, stepped like the
+/// full panel's row: its panel key turns it on and highlights it, then `l`
+/// steps to the older version.
+#[test]
+fn the_quick_popup_steps_file_view() {
+    let mut app = app(140, 40);
+    app.set_snapshots(Some([Snapshot::Index, Snapshot::Worktree]));
+    key(&mut app, ' ');
+    let popup = boxed(&mut app, "commands");
+    let view = popup.find("View").expect("the View group");
+    assert!(
+        popup[view..]
+            .lines()
+            .nth(1)
+            .unwrap_or_default()
+            .contains("_  File view ‹ off ›"),
+        "{popup}"
+    );
+    key(&mut app, '_');
+    assert!(quick(&app));
+    assert_eq!(app.doc.document.reading(), Some(document::Side::New));
+    let popup = boxed(&mut app, "commands");
+    assert!(
+        popup.contains("File view ‹ working tree · your files now ›"),
+        "{popup}"
+    );
+    key(&mut app, 'l');
+    assert_eq!(app.doc.document.reading(), Some(document::Side::Old));
+}
+
 /// The quick popup's View group has the all-files tree's checkbox, from
 /// the diff too: it shows the tree, lists every file and gives it the
 /// keys, and the row shows it's on.

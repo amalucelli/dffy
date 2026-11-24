@@ -13,6 +13,7 @@ expression: popup
 │  ^  Send open threads to agent         │
 │                                        │
 │  View                                  │
+│  _  File view ‹ off ›                  │
 │  s  Layout ‹ auto (split here) ›       │
 │  W  [ ] Wrap long lines                │
 │  d  [ ] Syntax diff                    │

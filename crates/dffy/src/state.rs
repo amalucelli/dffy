@@ -37,7 +37,6 @@ pub(crate) const REMEMBERED: &[&str] = &[
     "hunk-headers",
     "copy-decorations",
     "context",
-    "file-view",
     "ignore-all-space",
     "ignore-space-change",
     "watch",

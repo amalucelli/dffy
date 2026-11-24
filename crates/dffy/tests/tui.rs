@@ -2598,7 +2598,7 @@ fn gaps_open_with_x_and_a_click_and_x_shows_the_whole_file() {
 /// edited line keeps a bar in the gutter, with no rule for the line it was
 /// edited from, and `x` opens it in place to show that line. `s` flips to
 /// HEAD, where the removed line is back and the added one gone. File view
-/// is remembered; the version read isn't.
+/// isn't remembered: the next run shows the diff.
 #[test]
 fn file_view_reads_one_side_and_s_flips_it() {
     let repo = repo();
@@ -2633,7 +2633,7 @@ fn file_view_reads_one_side_and_s_flips_it() {
     // An edited line has no rule; `x` opens its change in place.
     assert!(!term.contains("── 1 line"), "{}", rows[edited - 1]);
     assert!(
-        rows[0].contains(" src/lib.rs · working tree · 3 changes "),
+        rows[0].contains(" file view · src/lib.rs · working tree · 3 changes "),
         "{}",
         rows[0]
     );
@@ -2663,13 +2663,14 @@ fn file_view_reads_one_side_and_s_flips_it() {
     );
     term.send("q");
     assert!(term.wait_exit().success());
-    let saved = std::fs::read_to_string(d.join(".git/dffy-test-state/dffy/state")).expect("state");
-    assert!(saved.contains("file-view = true"), "{saved}");
+    let saved =
+        std::fs::read_to_string(d.join(".git/dffy-test-state/dffy/state")).unwrap_or_default();
+    assert!(!saved.contains("file-view"), "{saved}");
     assert!(!saved.lines().any(|l| l.starts_with("view =")), "{saved}");
+    // The next run is the diff again.
     let mut term = Term::spawn(d, 100, 45, &[]);
-    term.wait_for("file view, on the working tree", |t| {
-        t.status().contains(" reading working tree")
-    });
+    term.wait_for("the diffs", |t| t.contains(" +3 -3"));
+    assert!(!term.status().contains("reading"), "{}", term.status());
     term.send("q");
     assert!(term.wait_exit().success());
 }

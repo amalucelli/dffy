@@ -46,7 +46,7 @@ These keys change what the diff shows:
 
 ### File view
 
-`l` shows every file as it is in one version of the diff, whole, as plain code: the newer version first, and `s` flips to the older one. The title reads as a file's, not a diff's: `src/lib.rs · working tree · 3 changes`, the version named as you gave it (`working tree`, `index`, `HEAD`, `v6.1`, a short id) and the changes counted in it, or `no changes`. The status bar says which version (`reading working tree`). File view is remembered (`file-view`); the version read isn't.
+`l` shows every file as it is in one version of the diff, whole, as plain code: the newer version first, and `s` flips to the older one. The title reads as a file's, not a diff's: `file view · src/lib.rs · working tree · 3 changes`, the version named as you gave it (`working tree`, `index`, `HEAD`, `v6.1`, a short id) and the changes counted in it, or `no changes`. The status bar says which version (`reading working tree`). File view isn't remembered: the next run shows the diff, unless `file-view = true` is set in the config.
 
 In the [command panel](#the-command-panel) one row picks among the three: `File view ‹ off ›`, `‹ working tree · your files now ›` and `‹ HEAD · last commit ›`, stepped with `h`/`l`. Where a version is picked, it says what it is: `your files now` for the working tree, `staged` for the index, `last commit` for HEAD, and `before` or `after` for the older or newer revision of a range. Two paths compared outside git go by their names alone.
 
@@ -56,7 +56,7 @@ The other version's lines don't show. A line edited into another has no row of i
 
 `x` opens a change in place, as Zed does: its lines show as the diff shows them, removed lines on their red background and added ones on their green, under a rule that closes it again (`── 2 lines removed · x hides them ──`). It acts on the rule or edited line last tapped, else the first on screen, and on an opened change it closes it. A tap on a rule, or on an edited line's bar, does the same. In an opened change only the lines of the version read carry the bar, the other version's numbers are dim, and lines select, copy, stage and search as in the diff. Changes stay open until `s` flips the version, file view ends, or a reload moves the hunks.
 
-A file the version read doesn't have shows the other version, and its title says so: an added file read in HEAD is `src/new.rs · working tree · not in HEAD`, a deleted one read in the working tree `src/gone.rs · HEAD · deleted in working tree`. A file the diff doesn't list is titled with the version it's from: `notes.md · v6.1 · not in this diff`. A renamed file, or one whose mode alone changed, shows whole too. Two files or folders compared outside git are named as you typed them: `dffy old/ new/` reads `old/` and `new/`, a long path cut from the left with `…`.
+A file the version read doesn't have shows the other version, and its title says so: an added file read in HEAD is `file view · src/new.rs · working tree · not in HEAD`, a deleted one read in the working tree `file view · src/gone.rs · HEAD · deleted in working tree`. A file the diff doesn't list is titled with the version it's from: `file view · notes.md · v6.1 · not in this diff`. A renamed file, or one whose mode alone changed, shows whole too. Two files or folders compared outside git are named as you typed them: `dffy old/ new/` reads `old/` and `new/`, a long path cut from the left with `…`.
 
 What changes in file view:
 
@@ -499,12 +499,12 @@ Some files can't be resolved by conflict: a binary file, a symbolic link or subm
 It lists one row per line, in three titled groups:
 
 1. Here's rows, under what they act on: `On this thread`, `On these lines`, `In this conflict`, `On this pull request` in the review plugin's word, else `Here`.
-2. View: the layout, wrapping, syntax diff and whole files.
+2. View: file view first (`File view ‹ off ›`, stepping to each version as the full panel's row does), then the layout, wrapping, syntax diff and whole files.
 3. Go: finding a file, the comments panel, watching, since checkpoint once there's one, and opening a terminal.
 
 View and Go own their rows, so Here's group leaves out what they list. They in turn leave out a row whose key a Here row takes. A screen too short for all three leaves out View.
 
-Each row shows one key. It's the key that does the same outside the panel when there is one, such as `f` for fix with agent on a thread. Otherwise it's the panel's, such as `&` with lines selected. The popup has the full panel's keys on Here. A row's key runs it, whether shown or the panel's, and any other entry's key runs that entry. `h`/`l` on a value and a tap work the same.
+Each row shows one key. It's the key that does the same outside the panel when there is one, such as `f` for fix with agent on a thread. Otherwise it's the panel's, such as `&` with lines selected, or `_` for file view, whose `l` steps values in the panel. The popup has the full panel's keys on Here. A row's key runs it, whether shown or the panel's, and any other entry's key runs that entry. `h`/`l` on a value and a tap work the same.
 
 The popup opens with no row highlighted, and `space` shows the full panel on Here (`space more`). A row run by its key, moved to with `j`/`k`, or tapped is highlighted; then `space` and `enter` run it again, a value stepping forward, and the popup stays open on the new state (`space toggles`). `tab` shows the full panel at any time. `/` starts its search, `?` lists all keys, and `esc` closes. A setting's key the popup doesn't list shows the full panel on that setting's tab.
 

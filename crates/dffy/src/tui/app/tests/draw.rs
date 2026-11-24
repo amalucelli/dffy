@@ -584,7 +584,10 @@ fn file_view_titles_name_the_side_as_given() {
     };
     let at = [tree(1), tree(2)];
     let row = title("show", show.clone(), at, false);
-    assert!(row.contains("a.rs · 0123456 · 2 changes"), "{row}");
+    assert!(
+        row.contains("file view · src/a.rs · 0123456 · 2 changes"),
+        "{row}"
+    );
     let row = title("show", show, at, true);
     assert!(row.contains("a.rs · 0123456^ · "), "{row}");
     assert!(!row.contains("FILE") && !row.contains("side"), "{row}");

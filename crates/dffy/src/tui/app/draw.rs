@@ -213,7 +213,15 @@ impl App {
                 if self.pane == Pane::Diff && !files.is_empty() && self.all_files.is_none() {
                     self.tree.follow(self.doc.document.pos.file);
                 }
-                let totals = Totals::of(files, self.enumerating);
+                let key = (self.doc.document.counts_version(), self.enumerating);
+                let totals = match self.totals {
+                    Some((version, listing, totals)) if (version, listing) == key => totals,
+                    _ => {
+                        let totals = Totals::of(files, self.enumerating);
+                        self.totals = Some((key.0, key.1, totals));
+                        totals
+                    }
+                };
                 self.tree.draw(
                     grid,
                     place,
@@ -592,7 +600,7 @@ fn heading(app: &App) -> Option<Heading> {
 }
 
 /// The title of a file in file view, read as a file rather than a diff:
-/// `src/lib.rs · working tree · 3 changes`, the version shown and its
+/// `file view · src/lib.rs · working tree · 3 changes`, the version shown and its
 /// changes; for a file the diff doesn't list, `not in this diff`; for one
 /// the version read hasn't, the other version, and `not in HEAD` (added) or
 /// `deleted in working tree`.
@@ -632,7 +640,7 @@ fn file_title(app: &App, entry: &view::Entry, dir: String, name: String) -> Titl
         (app.version_name(side), tail)
     };
     Title {
-        head: Vec::new(),
+        head: vec![("file view".to_owned(), Role::Plain), dim(" · ")],
         flex: (dir, Role::Dim, Cut::Left),
         name: (name, Role::FileHeader),
         tail: vec![dim(" · "), (version, Role::Plain), dim(" · "), dim(&tail)],

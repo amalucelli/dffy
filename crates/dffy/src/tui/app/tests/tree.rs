@@ -190,6 +190,33 @@ fn the_tree_widens_with_the_screen_and_keeps_counts_whole() {
         ");
 }
 
+/// The title's totals follow counts that arrive after a frame drew
+/// the ones before.
+#[test]
+fn tree_totals_follow_counts_arriving_between_frames() {
+    let mut app = App::new(
+        &Config::default(),
+        Theme::default_theme(),
+        "range".to_owned(),
+        None,
+        (120, 11),
+        Indicators::Classic,
+    );
+    for path in ["a.rs", "b.rs"] {
+        app.event(Event::Enumerated(diff(path).change));
+    }
+    app.event(Event::EnumerationDone(None));
+    let count = |app: &mut App, file: usize, added: usize, removed: usize| {
+        let counts = vec![(file, app.version(file), Counts { added, removed })];
+        app.event(Event::Diffed(Done::Counts { counts }));
+        screen(app)
+    };
+    let text = count(&mut app, 0, 3, 1);
+    assert!(text.contains("Files · 2 +3 -1"), "{text}");
+    let text = count(&mut app, 1, 2, 0);
+    assert!(text.contains("Files · 2 +5 -1"), "{text}");
+}
+
 /// Additions only, short and long names at several depths: the
 /// counts stand in one column, the long names cut before it.
 #[test]

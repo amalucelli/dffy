@@ -82,6 +82,7 @@ const QUICK: [(&str, &[Action]); 2] = [
     (
         "View",
         &[
+            Action::ToggleFileView,
             Action::CycleLayout,
             Action::ToggleWrap,
             Action::ToggleSyntax,
@@ -164,9 +165,12 @@ pub(super) struct Entry {
 
 impl Entry {
     /// The one key a Here or quick popup row shows: the one from outside
-    /// the panel when there's one, else the panel's.
+    /// the panel when there's one, else the panel's. `h` and `l` step
+    /// values in the panel, so a row they run outside it shows the panel's.
     fn plain_key(&self) -> &str {
-        self.direct.as_deref().unwrap_or(&self.key)
+        (self.direct.as_deref())
+            .filter(|d| !matches!(*d, "h" | "l"))
+            .unwrap_or(&self.key)
     }
 
     /// Whether `self` and `other` share a key, panel's or plain.

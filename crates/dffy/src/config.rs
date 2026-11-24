@@ -262,7 +262,7 @@ pub(crate) const KEYS: &[Key] = &[
     },
     Key {
         name: "file-view",
-        doc: "Start the viewer in file view: every file whole as it is in the diff's newer version, with a mark in the gutter where removed lines were. `l` toggles it and `s` flips to the older version, which isn't remembered. A piped diff has only its hunks, so it opens as the diff.",
+        doc: "Start the viewer in file view: every file whole as it is in the diff's newer version, with a mark in the gutter where removed lines were. `l` toggles it and `s` flips to the older version; neither is remembered, so without this key every run starts on the diff. A piped diff has only its hunks, so it opens as the diff.",
         default: "false",
     },
     Key {
@@ -357,7 +357,7 @@ pub(crate) const KEYS: &[Key] = &[
     },
     Key {
         name: "remember",
-        doc: "Remember the view choices made in the viewer (layout, wrap, the tree, its width and whether it lists all files, the status bar, indicators, modified lines, syntax diff, rendered view, highlighting, theme, mouse, line numbers, hunk headers, copy decorations, whole files, file view, ignored whitespace, watch mode) for the next run, in $XDG_STATE_HOME/dffy/state. A choice made in the viewer beats this file in the viewer; a flag beats both, for that run only. Printed output never takes them. A remembered split layout shows unified under 100 columns; --split doesn't.",
+        doc: "Remember the view choices made in the viewer (layout, wrap, the tree, its width and whether it lists all files, the status bar, indicators, modified lines, syntax diff, rendered view, highlighting, theme, mouse, line numbers, hunk headers, copy decorations, whole files, ignored whitespace, watch mode) for the next run, in $XDG_STATE_HOME/dffy/state. A choice made in the viewer beats this file in the viewer; a flag beats both, for that run only. Printed output never takes them. A remembered split layout shows unified under 100 columns; --split doesn't.",
         default: "true",
     },
     Key {

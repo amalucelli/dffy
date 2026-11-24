@@ -146,6 +146,17 @@ The group needs the kernel clone. Its files and line numbers are the range's. It
 
 A full run takes about an hour, half of it `difftastic` on the whole range.
 
+### Go to definition against a language server
+
+The `hit_rate` example measures go-to-definition's precision, not its speed. It counts how often the first candidate is where a language server says a name is defined. It's for checking a change to the tags queries, the names tokenizer or the ranking for a drop. Nothing runs it automatically, because it needs the server installed.
+
+```sh
+cargo run --release -p dffy-core --example hit_rate -- <repo> <language> [uses] [seed] -- <server> [args…]
+cargo run --release -p dffy-core --example hit_rate -- ~/src/cobra go 300 1 -- gopls
+```
+
+Keep the seed and the repository fixed between runs. Set `HIT_RATE_CASES` to a file, and the first run writes the sampled uses and the server's answers to it. Later runs score those same uses without asking the server. The example's top comment lists its other settings and how it counts.
+
 ## Reading the tables
 
 The comparison tables have these columns:

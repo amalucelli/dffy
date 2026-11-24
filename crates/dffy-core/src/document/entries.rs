@@ -190,9 +190,6 @@ pub struct Entry<P> {
     /// gaps, kept apart from `reveal`: a swap back to the line diff shows
     /// these again without what the user revealed.
     host_reveal: Vec<Reveal>,
-    /// The hunks opened in place while a side is read alone, in order (see
-    /// [`Document::set_opened`]).
-    opened: Vec<usize>,
     /// Where the file was left when another was shown.
     saved: Option<Pos>,
     /// Shown with a diff since it arrived: opened at its first change, or
@@ -211,6 +208,18 @@ pub struct Entry<P> {
     /// The host holds blocks for it, given or not (see
     /// [`Document::set_held_blocks`]).
     held_blocks: bool,
+}
+
+// Passes over the whole list go through every entry: state few entries
+// have lives on the document instead.
+const _: () = assert!(size_of::<Entry<()>>() <= 304);
+
+/// The hunks of entry `file` opened in place, among `opened` (see
+/// [`Document::set_opened`]).
+fn opened_in(opened: &[(usize, Vec<usize>)], file: usize) -> &[usize] {
+    (opened.iter())
+        .find(|&&(f, _)| f == file)
+        .map_or(&[], |(_, hunks)| hunks)
 }
 
 /// A version no entry has had (see [`Entry::version`]).
@@ -237,7 +246,6 @@ impl<P> Entry<P> {
             viewed: false,
             reveal: Vec::new(),
             host_reveal: Vec::new(),
-            opened: Vec::new(),
             saved: None,
             placed: false,
             last_shown: 0,
@@ -433,8 +441,6 @@ impl<P> Entry<P> {
                 _ => self.reveal.clear(),
             }
         }
-        // The rendered view and the line diff number their hunks apart.
-        self.opened.clear();
         self.saved = None;
         self.placed = false;
     }
@@ -575,6 +581,10 @@ pub struct Document<P> {
     /// The side files are read on alone, if any (see
     /// [`Document::set_reading`]).
     reading: Option<Side>,
+    /// The hunks opened in place while a side is read alone, by entry, each
+    /// list in order (see [`Document::set_opened`]). Apart from the
+    /// entries, which every pass over the list goes through: few have any.
+    opened: Vec<(usize, Vec<usize>)>,
     /// The change the view last landed on, and the position it took.
     landed: Option<(Pos, Pos)>,
     /// A file not diffed yet was opened by change at this position (see
@@ -586,6 +596,8 @@ pub struct Document<P> {
     pub search: Option<Found>,
     /// The last heading search for [`Document::context`].
     headings: Headings,
+    /// See [`Document::counts_version`].
+    counts_version: u64,
 }
 
 impl<P> Default for Document<P> {
@@ -599,10 +611,12 @@ impl<P> Default for Document<P> {
             rendered: false,
             full: false,
             reading: None,
+            opened: Vec::new(),
             landed: None,
             pending_land: None,
             search: None,
             headings: Headings::default(),
+            counts_version: next_version(),
         }
     }
 }
@@ -629,6 +643,15 @@ impl<P> Document<P> {
         self.rendered
     }
 
+    /// New whenever an entry is added or taken away or its counts change,
+    /// and never the same in two documents, so a host can keep what it
+    /// sums over every entry's counts until it changes.
+    #[inline]
+    #[must_use]
+    pub fn counts_version(&self) -> u64 {
+        self.counts_version
+    }
+
     /// Adds an entry at the end, not diffed yet. A host lists the diff's
     /// files before it adds any [`Source::Unchanged`] entry, which come last.
     pub fn push(&mut self, change: FileChange, source: Source<P>) {
@@ -636,6 +659,7 @@ impl<P> Document<P> {
             self.commits.push(self.files.len());
         }
         self.files.push(Entry::new(change, source));
+        self.counts_version = next_version();
     }
 
     /// The entry of `change`'s path, adding `change`, a file the diff
@@ -652,6 +676,7 @@ impl<P> Document<P> {
             return file;
         }
         self.files.push(Entry::new(change, Source::Unchanged));
+        self.counts_version = next_version();
         self.files.len() - 1
     }
 
@@ -664,6 +689,7 @@ impl<P> Document<P> {
         }
         let old = std::mem::replace(&mut self.files[file], Entry::new(change, Source::Unchanged));
         self.release(old);
+        self.counts_version = next_version();
         self.search.take_if(|found| found.file == file);
         if self.pos.file == file {
             self.pos = Pos {
@@ -686,6 +712,11 @@ impl<P> Document<P> {
         }
         let old = self.files.remove(file);
         self.release(old);
+        self.counts_version = next_version();
+        self.unopen(file);
+        for (f, _) in &mut self.opened {
+            *f -= usize::from(*f > file);
+        }
         if self.search.as_ref().is_some_and(|found| found.file == file) {
             self.search = None;
         } else if let Some(found) = self.search.as_mut().filter(|found| found.file > file) {
@@ -793,11 +824,16 @@ impl<P> Document<P> {
                 -1
             }
         };
+        self.counts_version = next_version();
         for c in &mut self.commits {
             *c = c.saturating_add_signed(moved);
         }
         if let Some(found) = &mut self.search {
             found.file = found.file.saturating_add_signed(moved);
+        }
+        // The page has none opened: it's no diff.
+        for (f, _) in &mut self.opened {
+            *f = f.saturating_add_signed(moved);
         }
         self.forget_positions();
         moved
@@ -817,21 +853,46 @@ impl<P> Document<P> {
     pub fn sort_by_path(&mut self) -> bool {
         let head = self.head();
         let end = self.listed_end().max(head);
-        let files = &mut self.files[head..end];
-        if files.is_sorted_by(|a, b| a.change.path <= b.change.path) {
+        if (self.files[head..end]).is_sorted_by(|a, b| a.change.path <= b.change.path) {
             return false;
         }
-        let anchor = (self.pos.file >= head)
-            .then(|| files.get(self.pos.file - head))
-            .flatten()
-            .map(|e| e.change.path.clone());
-        files.sort_by(|a, b| a.change.path.cmp(&b.change.path));
-        if let Some(file) = anchor.and_then(|path| files.iter().position(|e| e.change.path == path))
-        {
-            self.pos.file = head + file;
-        }
+        self.keeping_opened(|doc| {
+            let files = &mut doc.files[head..end];
+            let anchor = (doc.pos.file >= head)
+                .then(|| files.get(doc.pos.file - head))
+                .flatten()
+                .map(|e| e.change.path.clone());
+            files.sort_by(|a, b| a.change.path.cmp(&b.change.path));
+            if let Some(file) =
+                anchor.and_then(|path| files.iter().position(|e| e.change.path == path))
+            {
+                doc.pos.file = head + file;
+            }
+        });
         self.forget_positions();
         true
+    }
+
+    /// Runs `reorder`, which moves entries, keeping the hunks opened in
+    /// place with their files, found again by path, which names one entry.
+    fn keeping_opened<R>(&mut self, reorder: impl FnOnce(&mut Self) -> R) -> R {
+        if self.opened.is_empty() {
+            return reorder(self);
+        }
+        let held: Vec<(BString, Vec<usize>)> = std::mem::take(&mut self.opened)
+            .into_iter()
+            .filter_map(|(f, hunks)| Some((self.files.get(f)?.change.path.clone(), hunks)))
+            .collect();
+        let result = reorder(self);
+        self.opened = (held.into_iter())
+            .filter_map(|(path, hunks)| {
+                Some((
+                    self.files.iter().position(|e| e.change.path == path)?,
+                    hunks,
+                ))
+            })
+            .collect();
+        result
     }
 
     /// Drops the change landed on and [`Document::pending_land`], which
@@ -852,6 +913,10 @@ impl<P> Document<P> {
     /// the host opens it ([`Settle::Open`]). Positions held in files are
     /// dropped ([`Document::forget_positions`]).
     pub fn replace(&mut self, update: &Update) -> Option<usize> {
+        self.keeping_opened(|doc| doc.replace_list(update))
+    }
+
+    fn replace_list(&mut self, update: &Update) -> Option<usize> {
         let head: Vec<Entry<P>> = self.files.drain(..self.head()).collect();
         let n = head.len();
         let on_head = self.pos.file < n;
@@ -859,6 +924,7 @@ impl<P> Document<P> {
         self.pos.file = self.pos.file.saturating_sub(n);
         let open = self.replace_files(update);
         self.files.splice(0..0, head);
+        self.counts_version = next_version();
         if on_head {
             self.pos = kept;
             // Opened under the commit shown: it opens at its top later.
@@ -988,10 +1054,13 @@ impl<P> Document<P> {
         if !keep_reveal {
             entry.reveal.clear();
             entry.host_reveal.clear();
-            entry.opened.clear();
+        }
+        if !keep_reveal || rendered {
+            self.opened.retain(|&(f, _)| f != file);
         }
         entry.stale = false;
         entry.recount = false;
+        self.counts_version = next_version();
         entry.state = match result {
             Ok(loaded) => {
                 self.loaded_bytes += loaded.bytes();
@@ -1127,6 +1196,7 @@ impl<P> Document<P> {
             Some(entry) if entry.wants_counts() => {
                 entry.counts = Some(counts);
                 entry.recount = false;
+                self.counts_version = next_version();
                 true
             }
             _ => false,
@@ -1211,6 +1281,21 @@ impl<P> Document<P> {
         Some(Settle::Keep)
     }
 
+    /// No hunk of `file` stays opened in place: the rendered view and the
+    /// line diff number their hunks apart, and an entry gone has none.
+    fn unopen(&mut self, file: usize) {
+        self.opened.retain(|&(f, _)| f != file);
+    }
+
+    /// [`Entry::drop_render`] for `file`, which closes the rendered view's
+    /// opened hunks (see [`Document::unopen`]).
+    fn unrender(&mut self, file: usize) -> usize {
+        if matches!(self.files[file].render.as_deref(), Some(Render::Shown(_))) {
+            self.unopen(file);
+        }
+        self.files[file].drop_render()
+    }
+
     /// Swaps `file` between its line diff and its rendered view. The file
     /// shown opens anew.
     fn show_render(&mut self, file: usize) -> Settle {
@@ -1218,6 +1303,7 @@ impl<P> Document<P> {
             self.search = None;
         }
         self.files[file].swap_render();
+        self.unopen(file);
         if self.pos.file != file {
             return Settle::Keep;
         }
@@ -1268,7 +1354,7 @@ impl<P> Document<P> {
                 Some(Render::Failed(_)) | None => false,
             };
             if stale {
-                self.loaded_bytes -= self.files[file].drop_render();
+                self.loaded_bytes -= self.unrender(file);
                 if shown && self.pos.file == file {
                     self.forget_positions();
                     settle = Settle::Open {
@@ -1314,7 +1400,7 @@ impl<P> Document<P> {
             else {
                 break;
             };
-            self.loaded_bytes -= self.files[i].drop_render();
+            self.loaded_bytes -= self.unrender(i);
             if let State::Loaded(loaded) =
                 std::mem::replace(&mut self.files[i].state, State::Pending)
             {
@@ -1403,7 +1489,7 @@ impl<P> Document<P> {
         };
         let shape = (self.look()).shape(
             (&entry.change, &entry.source),
-            (&entry.reveal, &entry.opened),
+            (&entry.reveal, opened_in(&self.opened, file)),
             entry.blocks.as_deref(),
             &(),
         );
@@ -1427,7 +1513,7 @@ impl<P> Document<P> {
         };
         let shape = look.shape(
             (&entry.change, &entry.source),
-            (&entry.reveal, &entry.opened),
+            (&entry.reveal, opened_in(&self.opened, file)),
             entry.blocks.as_deref(),
             arrange,
         );
@@ -1546,7 +1632,7 @@ impl<P> Document<P> {
         };
         let shape = look.shape(
             (&entry.change, &entry.source),
-            (&entry.reveal, &entry.opened),
+            (&entry.reveal, opened_in(&self.opened, pos.file)),
             entry.blocks.as_deref(),
             &arrange,
         );
@@ -2211,9 +2297,7 @@ impl<P> Document<P> {
             });
         let spot = shown.or_else(|| self.spot(pos, &before, prefer));
         self.reading = reading;
-        for entry in &mut self.files {
-            entry.opened.clear();
-        }
+        self.opened.clear();
         self.search = None;
         self.landed = None;
         if let Some(entry) = self.files.get_mut(pos.file)
@@ -2252,10 +2336,10 @@ impl<P> Document<P> {
         let Some(Segment::Hunk(hunk)) = self.segment(file, from.part) else {
             return false;
         };
-        let Some(entry) = self.files.get(file).filter(|_| self.reading.is_some()) else {
+        if self.files.get(file).is_none() || self.reading.is_none() {
             return false;
-        };
-        let at = entry.opened.binary_search(&hunk);
+        }
+        let at = opened_in(&self.opened, file).binary_search(&hunk);
         if from.file != file || at.is_ok() == open {
             return false;
         }
@@ -2280,12 +2364,20 @@ impl<P> Document<P> {
         };
         let before = self.row_lines(top, arrange);
         self.relayout(arrange, arrange, |doc| {
-            let opened = &mut doc.files[file].opened;
+            let held = doc.opened.iter().position(|&(f, _)| f == file);
+            let held = held.unwrap_or_else(|| {
+                doc.opened.push((file, Vec::new()));
+                doc.opened.len() - 1
+            });
+            let opened = &mut doc.opened[held].1;
             match at {
                 Ok(i) => {
                     opened.remove(i);
                 }
                 Err(i) => opened.insert(i, hunk),
+            }
+            if opened.is_empty() {
+                doc.opened.swap_remove(held);
             }
         });
         let spot = paired.map(|(side, line)| Spot::Line {
@@ -2307,7 +2399,7 @@ impl<P> Document<P> {
     /// order (see [`Document::set_opened`]).
     #[must_use]
     pub fn opened(&self, file: usize) -> &[usize] {
-        self.files.get(file).map_or(&[], |e| &e.opened)
+        opened_in(&self.opened, file)
     }
 
     /// How `file` is read alone, for a search of it (see [`find`]): the
@@ -2346,7 +2438,7 @@ impl<P> Document<P> {
         };
         let shape = look.shape(
             (&entry.change, &entry.source),
-            (&entry.reveal, &entry.opened),
+            (&entry.reveal, opened_in(&self.opened, pos.file)),
             entry.blocks.as_deref(),
             &arrange,
         );

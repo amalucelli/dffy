@@ -637,6 +637,10 @@ pub(crate) struct App {
     /// The note is the first-run tip, which any key dismisses.
     tip: bool,
     enumerating: bool,
+    /// The tree's totals, with the document's counts version and
+    /// `enumerating` they're of: summing them on each frame is a pass over
+    /// every entry, which a large range makes slow.
+    totals: Option<(u64, bool, tree::Totals)>,
     /// A finished post or a failure the terminal reports until the next
     /// key or click, which means the user has seen it.
     unseen: Option<term::Status>,
@@ -873,6 +877,7 @@ impl App {
             message: None,
             tip: false,
             enumerating: true,
+            totals: None,
             unseen: None,
             reported: None,
             titled: None,
@@ -2974,8 +2979,8 @@ impl App {
         }
     }
 
-    /// `l`: file view on, reading the new side, or off. Remembered; the
-    /// side isn't.
+    /// `l`: file view on, reading the new side, or off. Not remembered:
+    /// the next run, perhaps in another repository, shows the diff.
     fn toggle_file_view(&mut self) {
         if self.piped {
             self.message(NO_FILE_VIEW);
@@ -2983,7 +2988,6 @@ impl App {
         }
         let on = self.doc.document.reading().is_none();
         self.read(on.then_some(Side::New));
-        self.remember("file-view", on.to_string());
         if on {
             let flip = (self.key_for(false, Act::CycleLayout))
                 .map(|k| format!(" · {k} shows {}", self.version_name(Side::Old)))
@@ -3044,7 +3048,7 @@ impl App {
 
     /// The command panel's file view row stepped forward, or with `back`
     /// backward, round the diff, file view at the newer version and at the
-    /// older one. Remembered as `l` remembers it.
+    /// older one.
     pub(super) fn cycle_file_view(&mut self, back: bool) {
         if self.piped {
             self.message(NO_FILE_VIEW);
@@ -3055,7 +3059,6 @@ impl App {
         let at = order.iter().position(|&r| r == now).unwrap_or(0);
         let next = order[(at + if back { 2 } else { 1 }) % 3];
         self.read(next);
-        self.remember("file-view", next.is_some().to_string());
     }
 
     /// Reads every file on `side` alone, or both sides again. The search's

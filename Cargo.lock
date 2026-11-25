@@ -423,7 +423,7 @@ dependencies = [
 
 [[package]]
 name = "dffy"
-version = "0.4.1"
+version = "0.5.0"
 dependencies = [
  "clap",
  "clap_complete",
@@ -444,7 +444,7 @@ dependencies = [
 
 [[package]]
 name = "dffy-agent"
-version = "0.4.1"
+version = "0.5.0"
 dependencies = [
  "rustix",
  "serde_json",
@@ -453,7 +453,7 @@ dependencies = [
 
 [[package]]
 name = "dffy-core"
-version = "0.4.1"
+version = "0.5.0"
 dependencies = [
  "divan",
  "gix",
@@ -503,7 +503,7 @@ dependencies = [
 
 [[package]]
 name = "dffy-render-markdown"
-version = "0.4.1"
+version = "0.5.0"
 dependencies = [
  "dffy-render-mermaid",
  "pulldown-cmark",
@@ -512,7 +512,7 @@ dependencies = [
 
 [[package]]
 name = "dffy-render-mermaid"
-version = "0.4.1"
+version = "0.5.0"
 dependencies = [
  "insta",
  "serde_json",
@@ -521,7 +521,7 @@ dependencies = [
 
 [[package]]
 name = "dffy-review-github"
-version = "0.4.1"
+version = "0.5.0"
 dependencies = [
  "serde_json",
  "tempfile",
@@ -2764,7 +2764,7 @@ dependencies = [
 
 [[package]]
 name = "xtask"
-version = "0.4.1"
+version = "0.5.0"
 dependencies = [
  "perf-event2",
  "portable-pty",

@@ -15,6 +15,6 @@ categories = ["command-line-utilities", "development-tools"]
 workspace = true
 
 [dependencies]
-dffy-render-mermaid = { version = "0.4.1", path = "../mermaid" }
+dffy-render-mermaid = { version = "0.5.0", path = "../mermaid" }
 pulldown-cmark = { version = "0.13.6", default-features = false }
 serde_json = "1.0.154"

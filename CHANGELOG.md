@@ -2,7 +2,7 @@
 
 The big changes in each release. Plugins and features marked experimental can still change between releases.
 
-## 0.5.0 (2026-11-24)
+## 0.5.0 (2026-11-25)
 
 ### Added
 

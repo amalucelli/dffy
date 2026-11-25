@@ -1,0 +1,14 @@
+{
+  "name": "dffy",
+  "description": "dffy's plugin for Claude Code",
+  "owner": {
+    "name": "Alexandre Guimarães Malucelli"
+  },
+  "plugins": [
+    {
+      "name": "dffy",
+      "source": "./integrations/claude-code",
+      "description": "Hands dffy review threads to a running Claude Code session"
+    }
+  ]
+}

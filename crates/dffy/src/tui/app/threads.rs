@@ -14,7 +14,7 @@ use dffy_core::document::{Side, Source, State};
 
 use super::{
     Action, App, Applying, Checkout, Confirmed, Handed, Handoff, OnSave, POSTING, Pane,
-    STILL_EDITING, Seek, Suggestion, WHEEL_ROWS, Watch,
+    STILL_EDITING, Seek, Suggestion, To, WHEEL_ROWS, Watch,
 };
 use crate::control::Fault;
 use crate::control::viewer::Reply;
@@ -461,7 +461,7 @@ impl App {
         self.doc.selection = None;
         let enter = match on_save {
             OnSave::Ask => Enter::Asks(self.asking.default_agent().map(str::to_owned)),
-            OnSave::Fix => Enter::Fixes,
+            OnSave::Fix => Enter::Fixes(self.hands_to()),
             OnSave::Nothing | OnSave::Keep => Enter::Saves,
         };
         self.doc.write(Writing {
@@ -1002,22 +1002,26 @@ impl App {
         let (compose, at) = self.new_comment()?;
         self.doc.set_focus(None);
         self.open_box(compose, at, "", OnSave::Fix);
-        self.message("what should change here · enter sends it and starts your agent");
+        let sends = self.hands_to().map_or_else(
+            || "enter sends it and starts your agent".to_owned(),
+            |name| format!("enter sends it to {name}"),
+        );
+        self.message(format!("what should change here · {sends}"));
         None
     }
 
     /// Hands the thread with first comment `root` to the user's coding
-    /// agent, which the loop starts once a frame is out.
+    /// agent, once a frame is out.
     fn fix(&mut self, root: &str) {
         let Some(comments) = &self.comments else {
             return;
         };
-        let (file, session) = comments.file_with(root);
         self.handoff = Some(Handoff {
             what: Handed::Thread(root.to_owned()),
-            file: file.to_owned(),
-            session,
+            file: comments.file_with(root).to_owned(),
             checkout: self.checkout(),
+            to: To::Anyone,
+            checkpointed: false,
         });
     }
 
@@ -1029,28 +1033,35 @@ impl App {
     }
 
     /// `send_open_threads`: hands every open thread of yours to your
-    /// coding agent at once, which the loop starts once a frame is out,
-    /// taking a checkpoint first as for one thread. The agent reads one
+    /// coding agent at once, once a frame is out, the loop taking a
+    /// checkpoint first as for one thread.
+    pub(super) fn send_open_threads(&mut self) {
+        match self.open_to_send() {
+            Some(handoff) => self.handoff = Some(handoff),
+            None => self.message("no open threads of yours to send"),
+        }
+    }
+
+    /// Your open threads as they'd be handed over. The agent reads one
     /// comments file: on a review, of the review's file and the local
     /// review's drafts beside it, the one with more of yours, or as many,
-    /// the one new threads go to; the other's are counted as left.
-    pub(super) fn send_open_threads(&mut self) {
-        let Some(comments) = self.comments.as_ref().filter(|_| self.open_threads() > 0) else {
-            self.message("no open threads of yours to send");
-            return;
-        };
+    /// the one new threads go to; the other's are counted as left. `None`
+    /// with none.
+    pub(super) fn open_to_send(&self) -> Option<Handoff> {
+        let comments = self.comments.as_ref().filter(|_| self.open_threads() > 0)?;
         let (in_file, in_local) = comments.open_threads_of_yours();
         let local_first = in_local > in_file || (in_local == in_file && comments.branched());
-        let ((file, session), count, left) = match comments.local_file() {
-            Some(local) if local_first => ((local, false), in_local, in_file),
+        let (file, count, left) = match comments.local_file() {
+            Some(local) if local_first => (local, in_local, in_file),
             _ => (comments.file(), in_file, in_local),
         };
-        self.handoff = Some(Handoff {
+        Some(Handoff {
             what: Handed::Open { count, left },
             file: file.to_owned(),
-            session,
             checkout: self.checkout(),
-        });
+            to: To::Anyone,
+            checkpointed: false,
+        })
     }
 
     /// The threads handed to the user's coding agent, for the loop.
@@ -1058,15 +1069,28 @@ impl App {
         self.handoff.take()
     }
 
-    /// The agent the loop handed threads to started, or why not; `left`,
-    /// when it was handed your open threads, is how many of yours in the
-    /// other comments file it wasn't. The checkpoint taken before it shows
-    /// its turn.
-    pub(crate) fn handed_off(&mut self, started: Result<String, String>, left: Option<usize>) {
+    /// The session the loop handed threads to got them, or the agent
+    /// started on them, or why not; `left`, when it was handed your open
+    /// threads, is how many of yours in the other comments file it wasn't.
+    /// The checkpoint taken before it shows its turn, unless it's `unmarked`,
+    /// which is why.
+    pub(crate) fn handed_off(
+        &mut self,
+        started: Result<String, String>,
+        left: Option<usize>,
+        unmarked: Option<&str>,
+    ) {
+        self.listeners_settled();
+        let started = match (started, unmarked) {
+            (Ok(note), Some(why)) => Ok(format!("{note}, but couldn't take a checkpoint: {why}")),
+            (started, _) => started,
+        };
         match (started, left) {
             (Ok(mut note), Some(left)) => {
-                let since = self.checkpoint_key(Act::SinceCheckpoint);
-                let _ = write!(note, " · {since} shows its turn");
+                if unmarked.is_none() {
+                    let since = self.checkpoint_key(Act::SinceCheckpoint);
+                    let _ = write!(note, " · {since} shows its turn");
+                }
                 if left > 0 {
                     let _ = write!(
                         note,

@@ -126,8 +126,8 @@ actions! {
     ToggleStatusBar Layout "toggle_status_bar" "move status bar" "the status bar in the frame's bottom border or its top one",
     CycleTheme Display "cycle_theme" "next theme" "the next theme, built-in or yours",
     ToggleWatch Modes "toggle_watch" "toggle watch" "watch for changes",
-    TakeCheckpoint Modes "take_checkpoint" "take checkpoint" "take a checkpoint of the working tree: its files as plain dffy lists them, staged or not and untracked, kept under a local ref of this worktree, the last 5 of them; starting Fix with agent takes one too",
-    SinceCheckpoint Modes "since_checkpoint" "since checkpoint" "show only what changed since the latest checkpoint, such as an agent's turn since Fix with agent started it, or the diff shown before again; the status bar says how long ago it was taken",
+    TakeCheckpoint Modes "take_checkpoint" "take checkpoint" "take a checkpoint of the working tree: its files as plain dffy lists them, staged or not and untracked, kept under a local ref of this worktree, the last 5 of them; handing threads to an agent takes one too",
+    SinceCheckpoint Modes "since_checkpoint" "since checkpoint" "show only what changed since the latest checkpoint, such as an agent's turn since threads were handed to it, or the diff shown before again; the status bar says how long ago it was taken",
     ToggleMouse Copy "toggle_mouse" "toggle mouse" "take mouse input, or leave it to the terminal's own selection (many terminals select natively with shift held while dragging)",
     ToggleCopyDecorations Copy "toggle_copy_decorations" "copy decorations" "copies include line numbers and +/- signs, or only the code",
     Stage Changes "stage" "stage lines" "stage the selected lines, else the hunk of the line last tapped or the first on screen: their working-tree version goes in the index (uncommitted changes only)",
@@ -158,8 +158,9 @@ actions! {
     Resolve Comments "resolve" "resolve thread" "on a thread: resolve it, or reopen it",
     Adopt Comments "adopt" "make it yours" "on a thread: someone else's comments in it not posted, as an agent's, become your drafts, which posting sends under your name",
     ApplySuggestion Comments "apply_suggestion" "apply suggestion" "on a thread: put its suggestion, the one last clicked or else its last, in place of the lines it's on in the working tree, refused when they changed since; an unstaged change, which discard undoes. On one applied already, put back the lines it replaced",
-    FixWithAgent Agents "fix_with_agent" "fix with agent" "on a thread, or the selected lines with a note you write first: start your coding agent in a new tab, or here until it exits, pointed at the thread to change what it asks and reply in it",
-    SendOpenThreads Agents "send_open_threads" "send open threads" "take a checkpoint, then start your coding agent as fix with agent does, pointed at every open thread of yours in view (those you started or replied in) to change what each asks and reply in each; since checkpoint then shows its turn",
+    FixWithAgent Agents "fix_with_agent" "fix with agent" "on a thread, or the selected lines with a note you write first: send it to the coding agent's session listening in this working tree, else start your coding agent in a new tab, or here until it exits, pointed at the thread to change what it asks and reply in it",
+    SendOpenThreads Agents "send_open_threads" "send open threads" "take a checkpoint, then hand over as fix with agent does, to a listening session or your coding agent, every open thread of yours in view (those you started or replied in) to change what each asks and reply in each; since checkpoint then shows its turn",
+    ConfirmSendOpenThreads Agents "confirm_send_open_threads" "send open threads…" "send open threads, asking first and naming the session or the new agent they go to: enter sends, any other key keeps them. With several sessions and none of them clear, the list to pick from opens instead",
     OpenOnHost Comments "open_on_host" "open thread on host" "on a thread: open it on its code host, in the browser",
     ClearResolved Comments "clear_resolved" "delete resolved threads" "delete the resolved threads shown, after a y/n; on a code host's review only what isn't posted, as the host's threads would come back",
     CommentInEditor Comments "comment_in_editor" "continue in editor" "write in $EDITOR: your draft in the focused thread, else a reply to it, else a comment on the line; ctrl+g does it from the text box",
@@ -323,6 +324,7 @@ const DEFAULTS: &[(Table, &str, Action)] = &[
     (M, "Z", Action::ToggleThreads),
     (M, "V", Action::MoveThread),
     (M, "a", Action::AskAgent),
+    (M, "h", Action::ConfirmSendOpenThreads),
     (M, "E", Action::CommentInEditor),
     // In the order of the actions, as `dffy config --default` lists them.
     (Th, "y", Action::CopyPrompt),
@@ -669,6 +671,7 @@ impl Action {
             Self::ApplySuggestion => "apply suggestion",
             Self::FixWithAgent => "fix with agent",
             Self::SendOpenThreads => "send open threads",
+            Self::ConfirmSendOpenThreads => "send open threads, asking first",
             Self::OpenOnHost => "open on host",
             Self::ClearResolved => "delete resolved threads",
             Self::CommentInEditor => "continue in editor",
@@ -1116,6 +1119,29 @@ mod tests {
             (conflict('O'), conflict('o'), conflict('t')),
             (Some(Action::KeepCurrent), None, Some(Action::TakeIncoming))
         );
+    }
+
+    /// `h` asks to send your open threads on a thread, in a conflict and in
+    /// a peek, whose tables leave it to the diff's; with alt too, as any key
+    /// without a binding of its own. The tree's is its own, and `H`'s, and
+    /// the panel's steps values.
+    #[test]
+    fn h_is_the_diffs_wherever_no_table_has_it() {
+        let keys = Keys::default();
+        let (h, none) = (Key::Char('h'), Mods::NONE);
+        assert_eq!(keys.thread_action(h, none), None);
+        assert_eq!(keys.conflict_action(h, none), None);
+        assert_eq!(keys.peek_action(h, none), None);
+        assert!(keys.leader_entries().iter().all(|(c, _)| c.key != h));
+        for (tree, key, mods, action) in [
+            (false, h, none, Some(Action::ConfirmSendOpenThreads)),
+            (false, h, Mods::ALT, Some(Action::ConfirmSendOpenThreads)),
+            (false, h, Mods::CTRL, None),
+            (false, Key::Char('H'), none, Some(Action::ScrollLeft)),
+            (true, h, none, Some(Action::Collapse)),
+        ] {
+            assert_eq!(keys.action(tree, key, mods), action, "{key:?} {mods:?}");
+        }
     }
 
     /// Within a table, no key means two things.

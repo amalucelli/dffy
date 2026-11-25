@@ -50,8 +50,9 @@ pub(crate) enum Enter {
     /// Saves it and asks this agent about it; `None` before the agent
     /// plugin named its default one.
     Asks(Option<String>),
-    /// Saves it and hands its thread to your coding agent.
-    Fixes,
+    /// Saves it and hands its thread to your coding agent: the session it
+    /// names, safe to draw, or with none a new one.
+    Fixes(Option<String>),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -613,7 +614,8 @@ pub(crate) fn new_rows(writing: &mut Writing, width: usize, c: &mut Canvas) {
             });
             Cow::Owned(format!(" · question for {agent}"))
         }
-        Enter::Fixes => Cow::Borrowed(" · fix with agent"),
+        Enter::Fixes(None) => Cow::Borrowed(" · fix with agent"),
+        Enter::Fixes(Some(session)) => Cow::Owned(format!(" · for {session}")),
     };
     let lines = match &writing.at {
         Writes::New { lines, .. } if lines.len() > 1 => {
@@ -626,7 +628,7 @@ pub(crate) fn new_rows(writing: &mut Writing, width: usize, c: &mut Canvas) {
     let enter = match &writing.enter {
         Enter::Saves => " · enter saves",
         Enter::Asks(_) => " · enter asks",
-        Enter::Fixes => " · enter sends it",
+        Enter::Fixes(_) => " · enter sends it",
     };
     let dim: Ink = Role::Dim.into();
     let mut spans = vec![
@@ -1113,9 +1115,10 @@ mod tests {
             lines,
         };
         let claude = || Enter::Asks(Some("claude".to_owned()));
+        let fixes = |session: Option<&str>| Enter::Fixes(session.map(str::to_owned));
         // Parts go whole: only a box too narrow for `▾ you` cuts.
         for width in 9..120 {
-            for enter in [claude(), Enter::Asks(None), Enter::Saves, Enter::Fixes] {
+            for enter in [claude(), Enter::Asks(None), Enter::Saves, fixes(None)] {
                 let heading = top(lines(318..331), enter, width);
                 assert!(!heading.contains('…'), "{width}: {heading}");
             }
@@ -1126,11 +1129,12 @@ mod tests {
             top(lines(318..331), Enter::Saves, 100),
             top(lines(41..42), Enter::Saves, 100),
             top(Writes::File, Enter::Saves, 100),
-            top(lines(41..42), Enter::Fixes, 100),
+            top(lines(41..42), fixes(None), 100),
+            top(lines(41..42), fixes(Some("claude · edited 3h ago")), 100),
             top(lines(318..331), claude(), 80),
             top(lines(318..331), claude(), 50),
             top(lines(318..331), claude(), 30),
-            top(lines(318..331), Enter::Fixes, 24),
+            top(lines(318..331), fixes(Some("claude")), 24),
         ];
         insta::assert_snapshot!(shown.join("\n"), @"
         ┏ ▾ you · question for claude · lines 319–331 · enter asks · alt+enter new line · ctrl+g editor ━━━┓
@@ -1139,10 +1143,11 @@ mod tests {
         ┏ ▾ you · new comment · line 42 · enter saves · alt+enter new line · ctrl+g editor ━━━━━━━━━━━━━━━━┓
         ┏ ▾ you · new comment · whole file · enter saves · alt+enter new line · ctrl+g editor ━━━━━━━━━━━━━┓
         ┏ ▾ you · fix with agent · line 42 · enter sends it · alt+enter new line · ctrl+g editor ━━━━━━━━━━┓
+        ┏ ▾ you · for claude · edited 3h ago · line 42 · enter sends it · alt+enter new line ━━━━━━━━━━━━━━┓
         ┏ ▾ you · question for claude · lines 319–331 · enter asks ━━━━━━━━━━━━━━━━━━━━┓
         ┏ ▾ you · question for claude · lines 319–331 ━━━┓
         ┏ ▾ you · question ━━━━━━━━━━┓
-        ┏ ▾ you ━━━━━━━━━━━━━━━┓
+        ┏ ▾ you · for claude ━━┓
         ");
     }
 }

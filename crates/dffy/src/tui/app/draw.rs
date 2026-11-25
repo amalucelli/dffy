@@ -166,6 +166,7 @@ impl App {
             || self.help.is_some()
             || self.commands.is_some()
             || self.reviews.is_some()
+            || self.listeners.picking.is_some()
             || self.posting.is_some()
             || self.menu.is_some()
             || self.navigation.names().is_some();
@@ -289,6 +290,9 @@ impl App {
         }
         if let Some(names) = self.navigation.names() {
             names.draw(grid, &self.theme);
+        }
+        if let Some(picker) = &mut self.listeners.picking {
+            picker.draw(grid, &self.theme);
         }
         self.kept = !overlays && !chrome.overlay;
         // The terminal scrolls whole rows, so the cell diff sends the tree's
@@ -697,6 +701,7 @@ pub(super) fn note(app: &mut App) -> Option<String> {
             let resolve = if thread.resolved { "reopen" } else { "resolve" };
             let reverts = thread.reverts();
             let apply = if reverts { "revert" } else { "apply" };
+            let fix = if app.listeners.any { "send" } else { "fix" };
             // Most used first, as a narrow status bar cuts the end.
             let thread_keys = [
                 (Act::Reply, "reply", open),
@@ -707,7 +712,7 @@ pub(super) fn note(app: &mut App) -> Option<String> {
                     open && thread.suggestion().is_some(),
                 ),
                 (Act::Resolve, resolve, open),
-                (Act::FixWithAgent, "fix", open),
+                (Act::FixWithAgent, fix, open),
                 (Act::EditDraft, "edit", drafts),
                 (Act::DeleteDraft, "delete", drafts),
                 (Act::OpenOnHost, "open", thread.url.is_some()),

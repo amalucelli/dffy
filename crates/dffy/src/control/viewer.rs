@@ -1,9 +1,10 @@
 //! A viewer's registration with dffyd: its connection, held for the
-//! viewer's life, on threads of its own. Requests come in parsed, as
-//! [`Command`]s with the [`Reply`] that answers them; the viewer's loop
-//! answers when it's done, and a writer thread sends it, so the loop never
-//! waits on the socket. A viewer with nobody subscribed to its events pushes
-//! nothing.
+//! viewer's life, on threads of its own, and made again when dffyd goes.
+//! Requests come in parsed, as [`Command`]s with the [`Reply`] that answers
+//! them; the viewer's loop answers when it's done, and a writer thread sends
+//! it, so the loop never waits on the socket. A viewer with nobody
+//! subscribed to its events pushes nothing. A session listening for threads
+//! is a request too, answered whenever some are handed to it.
 
 use std::collections::HashMap;
 use std::io::{self, BufReader, Write};
@@ -13,10 +14,11 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Sender};
 use std::sync::{Arc, Mutex, PoisonError, Weak};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use dffy_core::document::Side;
 
+use super::listen::BACKOFF;
 use super::{Fault, VERSION, answer, line, notification, number, object, text};
 use crate::encode;
 use crate::plugin::json::Value;
@@ -41,11 +43,74 @@ pub(crate) enum Inbound {
         view: bool,
         push: Push,
     },
+    /// A session listens for threads: the reply hands it some.
+    Listens(Listens, Reply),
+    /// What the session holding request `request` did since.
+    Listened {
+        request: u64,
+        facts: Facts,
+    },
     /// The viewer couldn't register, for this reason: nothing can drive it.
     Unreachable(String),
+    /// dffyd is gone, and everyone who asked for something through it: every
+    /// [`Reply::cancelled`] says so.
+    Gone,
     /// A request's asker left, which [`Reply::cancelled`] now says: what
     /// waits on it goes undone.
     Cancelled,
+}
+
+/// A session listening for threads in the view's working tree.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Listens {
+    /// dffyd's id for the request.
+    pub request: u64,
+    /// The session, the same each time it asks again.
+    pub listener: u64,
+    /// What it's called, as it says.
+    pub client: Option<String>,
+    pub facts: Facts,
+}
+
+/// When a listening session did things, in seconds since 1970.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Facts {
+    pub started: u64,
+    pub edited: Option<u64>,
+    pub prompted: Option<u64>,
+}
+
+impl Facts {
+    fn parse(params: Option<&Value>) -> Result<Self, Fault> {
+        let get = |key| seconds(params, key);
+        Ok(Self {
+            started: get("started")?.ok_or_else(|| Fault::invalid("started is needed"))?,
+            edited: get("edited")?,
+            prompted: get("prompted")?,
+        })
+    }
+}
+
+impl Listens {
+    fn parse(request: &Value, params: Option<&Value>, client: Option<&str>) -> Result<Self, Fault> {
+        let request = request.as_usize().map(|id| id as u64);
+        Ok(Self {
+            request: request.ok_or_else(|| Fault::invalid("the id must be a number"))?,
+            listener: seconds(params, "listener")?
+                .ok_or_else(|| Fault::invalid("listener is needed"))?,
+            client: client.map(str::to_owned),
+            facts: Facts::parse(params)?,
+        })
+    }
+}
+
+/// The whole number `key` of `params`, `None` when it's null or not there.
+fn seconds(params: Option<&Value>, key: &str) -> Result<Option<u64>, Fault> {
+    match params.and_then(|p| p.get(key)) {
+        None | Some(Value::Null) => Ok(None),
+        Some(n) => (n.as_usize().map(|n| Some(n as u64)))
+            .ok_or_else(|| Fault::invalid(format!("{key} must be a whole number"))),
+    }
 }
 
 /// A request to the view, its lines 0-based.
@@ -266,6 +331,12 @@ impl Reply {
         self.cancelled.load(Ordering::Relaxed)
     }
 
+    /// Whether its asker left, for as long as it's held: gone once it's
+    /// answered or dropped.
+    pub(crate) fn watch(&self) -> Weak<AtomicBool> {
+        Arc::downgrade(&self.cancelled)
+    }
+
     /// A reply whose answer comes out of the receiver, as its line.
     #[cfg(test)]
     pub(crate) fn channel() -> (Self, mpsc::Receiver<String>) {
@@ -315,9 +386,16 @@ impl Drop for Registration {
     }
 }
 
+impl Shared {
+    fn stopped(&self) -> bool {
+        self.stopped.load(Ordering::Relaxed)
+    }
+}
+
 /// Registers the view described by `info`, starting dffyd when none
 /// serves the control socket, and hands what comes for it to `sink` until
-/// that returns false. Returns at once; the rest happens on a thread.
+/// that returns false. It tries again while it can't, and whenever dffyd
+/// goes. Returns at once; the rest happens on a thread.
 ///
 /// # Errors
 ///
@@ -330,14 +408,44 @@ pub(crate) fn register(
     let state = Arc::clone(&shared);
     thread::Builder::new()
         .name("dffy-control".into())
-        .spawn(move || {
-            if let Err(e) = serve(&info, &state, &sink)
-                && !state.stopped.load(Ordering::Relaxed)
-            {
-                sink(Inbound::Unreachable(e.to_string()));
-            }
-        })?;
+        .spawn(move || stay_registered(&info, &state, &sink))?;
     Ok(Registration { shared })
+}
+
+fn stay_registered(info: &Info, shared: &Shared, sink: &dyn Fn(Inbound) -> bool) {
+    let mut wait = BACKOFF.start;
+    // An outage is said once, however many tries it takes to end it.
+    let mut unsaid = true;
+    loop {
+        let since = Instant::now();
+        let served = serve(info, shared, sink);
+        if shared.stopped() {
+            return;
+        }
+        match served {
+            Ok(Served::Over) => return,
+            Ok(Served::Lost) => {
+                unsaid = true;
+                if !sink(Inbound::Gone) {
+                    return;
+                }
+            }
+            Err(e) => {
+                let says = std::mem::take(&mut unsaid);
+                if says && !sink(Inbound::Unreachable(e.to_string())) {
+                    return;
+                }
+            }
+        }
+        if since.elapsed() >= BACKOFF.end {
+            wait = BACKOFF.start;
+        }
+        thread::sleep(wait);
+        wait = (wait * 2).min(BACKOFF.end);
+        if shared.stopped() {
+            return;
+        }
+    }
 }
 
 /// Connects to dffyd and registers as `info` describes.
@@ -392,12 +500,42 @@ fn join(info: &Info) -> io::Result<(UnixStream, BufReader<UnixStream>)> {
     Ok((stream, reader))
 }
 
-fn serve(info: &Info, shared: &Shared, sink: &dyn Fn(Inbound) -> bool) -> io::Result<()> {
+/// Request `id` for `method`, answered through `tx`, and what calls it off.
+fn requested(
+    (id, method): (&Value, &str),
+    message: &Value,
+    tx: &Sender<String>,
+) -> Result<(Inbound, Weak<AtomicBool>), Fault> {
+    let client = message.get("client").and_then(Value::as_str);
+    let params = message.get("params");
+    let reply = Reply {
+        id: id.clone(),
+        tx: tx.clone(),
+        cancelled: Arc::default(),
+    };
+    let cancelled = reply.watch();
+    let inbound = if method == "comments/listen" {
+        Inbound::Listens(Listens::parse(id, params, client)?, reply)
+    } else {
+        Inbound::Command(Command::parse(method, params, client)?, reply)
+    };
+    Ok((inbound, cancelled))
+}
+
+/// How a registration ended.
+enum Served {
+    /// The viewer is stopping.
+    Over,
+    /// dffyd is gone.
+    Lost,
+}
+
+fn serve(info: &Info, shared: &Shared, sink: &dyn Fn(Inbound) -> bool) -> io::Result<Served> {
     let (stream, mut reader) = join(info)?;
     {
         let mut held = shared.stream.lock().unwrap_or_else(PoisonError::into_inner);
-        if shared.stopped.load(Ordering::Relaxed) {
-            return Ok(());
+        if shared.stopped() {
+            return Ok(Served::Over);
         }
         *held = Some(stream.try_clone()?);
     }
@@ -420,35 +558,42 @@ fn serve(info: &Info, shared: &Shared, sink: &dyn Fn(Inbound) -> bool) -> io::Re
         let message = match super::read(&mut reader, &mut buf) {
             Ok(Some(Ok(message))) => message,
             Ok(Some(Err(_))) => continue,
-            Ok(None) | Err(_) => return Ok(()),
+            Ok(None) | Err(_) => {
+                for cancelled in asked.into_values().filter_map(|c| c.upgrade()) {
+                    cancelled.store(true, Ordering::Relaxed);
+                }
+                return Ok(Served::Lost);
+            }
         };
         let method = message
             .get("method")
             .and_then(Value::as_str)
             .unwrap_or_default();
-        let client = message.get("client").and_then(Value::as_str);
+        let params = message.get("params");
         let inbound = match message.get("id") {
-            Some(id) => match Command::parse(method, message.get("params"), client) {
-                Ok(command) => {
-                    let cancelled = Arc::new(AtomicBool::new(false));
+            Some(id) => match requested((id, method), &message, &tx) {
+                Ok((inbound, cancelled)) => {
                     asked.retain(|_, c| c.strong_count() > 0);
                     if let Some(id) = id.as_usize() {
-                        asked.insert(id as u64, Arc::downgrade(&cancelled));
+                        asked.insert(id as u64, cancelled);
                     }
-                    Inbound::Command(
-                        command,
-                        Reply {
-                            id: id.clone(),
-                            tx: tx.clone(),
-                            cancelled,
-                        },
-                    )
+                    inbound
                 }
                 Err(fault) => {
                     tx.send(answer(id, Err(fault))).ok();
                     continue;
                 }
             },
+            None if method == "listener/changed" => {
+                let request = params.and_then(|p| p.get("id")).and_then(Value::as_usize);
+                let (Some(request), Ok(facts)) = (request, Facts::parse(params)) else {
+                    continue;
+                };
+                Inbound::Listened {
+                    request: request as u64,
+                    facts,
+                }
+            }
             None if method == "$/cancelRequest" => {
                 let id = message.get("params").and_then(|p| p.get("id"));
                 let Some(cancelled) = (id.and_then(Value::as_usize))
@@ -476,10 +621,11 @@ fn serve(info: &Info, shared: &Shared, sink: &dyn Fn(Inbound) -> bool) -> io::Re
             None => continue,
         };
         if !sink(inbound) {
-            return Ok(());
+            return Ok(Served::Over);
         }
     }
 }
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -541,6 +687,33 @@ mod tests {
 
     fn parse_command(method: &str, params: &str) -> Result<Command, Fault> {
         Command::parse(method, Some(&parse(params.as_bytes()).expect("JSON")), None)
+    }
+
+    /// A listening session comes with what it did, and one that doesn't say
+    /// which it is isn't held.
+    #[test]
+    fn a_listening_session_parses_with_its_facts() {
+        let listens = |params: &str| {
+            let params = parse(params.as_bytes()).expect("JSON");
+            Listens::parse(&number(9), Some(&params), Some("claude"))
+        };
+        assert_eq!(
+            listens(
+                r#"{"worktree":"/w","key":"7","listener":3,"started":100,"edited":120,"prompted":null}"#
+            ),
+            Ok(Listens {
+                request: 9,
+                listener: 3,
+                client: Some("claude".into()),
+                facts: Facts {
+                    started: 100,
+                    edited: Some(120),
+                    prompted: None,
+                },
+            })
+        );
+        let fault = listens(r#"{"started":100}"#).expect_err("no listener");
+        assert_eq!(fault.code, "invalid_params");
     }
 
     /// Lines come 1-based and go 0-based; the side is new unless given,

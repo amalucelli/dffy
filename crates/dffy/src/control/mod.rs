@@ -16,13 +16,15 @@
 //! To add a message:
 //! 1. name it in [`METHODS`] (or [`EVENTS`] for a notification) and give it
 //!    a definition in [`SCHEMA`];
-//! 2. route it in [`server`]: dffyd's own, or forwarded to the view;
+//! 2. route it in [`server`]: dffyd's own, forwarded to the view, or, like
+//!    `comments/listen`, parked for any view of a working tree;
 //! 3. for a view's, parse it into a [`viewer::Command`], encode its result
 //!    in [`viewer`] (with [`crate::encode`] for what the core model has),
 //!    and answer it in the viewer's `tui::app::control`;
 //! 4. document it in docs/control.md.
 
 pub(crate) mod client;
+pub(crate) mod listen;
 pub(crate) mod server;
 pub(crate) mod viewer;
 
@@ -36,7 +38,7 @@ use crate::plugin::json::{self, Value};
 pub(crate) const VERSION: usize = 1;
 
 /// Every request dffyd answers, itself or through a view.
-pub(crate) const METHODS: [&str; 9] = [
+pub(crate) const METHODS: [&str; 11] = [
     "views/list",
     "views/register",
     "subscribe",
@@ -46,6 +48,8 @@ pub(crate) const METHODS: [&str; 9] = [
     "view/focusThread",
     "comments/add",
     "comments/applySuggestion",
+    "comments/listen",
+    "comments/listening",
 ];
 
 /// The notifications a client can subscribe to.
@@ -197,11 +201,14 @@ pub(crate) const SCHEMA: &str = r##"{
     "view/focusThread": {"description": "Shows and focuses a comment thread, named by any of its comments' ids.", "properties": {"params": {"type": "object", "properties": {"view": {"type": "integer"}, "id": {"type": "string"}}, "required": ["view", "id"]}, "result": {"type": "object", "properties": {"view": {"type": "integer"}, "thread": {"type": "string"}, "path": {"type": "string"}, "focused": {"type": "boolean", "description": "false while its file's diff or the thread's place is on its way: it's focused once there."}}, "required": ["view", "thread", "path", "focused"]}}},
     "comments/add": {"description": "Adds a comment on a line, as the viewer's c would, to the comments file the view shows; the view shows it.", "properties": {"params": {"type": "object", "properties": {"view": {"type": "integer"}, "path": {"type": "string"}, "line": {"type": "integer", "minimum": 1}, "side": {"$ref": "#/$defs/side", "default": "new"}, "text": {"type": "string", "minLength": 1}}, "required": ["view", "path", "line", "text"]}, "result": {"type": "object", "properties": {"view": {"type": "integer"}, "id": {"type": "string"}, "path": {"type": "string"}, "line": {"type": "integer"}, "side": {"$ref": "#/$defs/side"}, "listed": {"const": false, "description": "Present only when the diff doesn't list the file, which opened whole at side."}}, "required": ["view", "id", "path", "line", "side"]}}},
     "comments/applySuggestion": {"description": "Puts a suggestion in place of its thread's lines in the working tree, as the viewer's s would: the suggestion of comment id, or of the last comment with one in the thread it names. Answered once it's written, or with why it was refused.", "properties": {"params": {"type": "object", "properties": {"view": {"type": "integer"}, "id": {"type": "string"}}, "required": ["view", "id"]}, "result": {"type": "object", "properties": {"view": {"type": "integer"}, "thread": {"type": "string"}, "comment": {"type": "string", "description": "The comment whose suggestion went in."}, "path": {"type": "string"}, "start": {"type": "integer", "description": "The first line replaced, as the file was."}, "end": {"type": "integer", "description": "The last line replaced, as the file was."}, "lines": {"type": "integer", "description": "How many lines went in their place; 0 deleted them."}}, "required": ["view", "thread", "comment", "path", "start", "end", "lines"]}}},
+    "comments/listen": {"description": "Waits for a hand-over of comment threads from a viewer of worktree: answered by the first view there that hands over, whenever that is. A connection waits for one at a time, and asks again after each.", "properties": {"params": {"type": "object", "properties": {"worktree": {"type": "string", "description": "The working tree's canonical root, as views/list has it."}, "key": {"type": "string", "description": "The client's own name for the session that listens, which comments/listening names it by."}, "listener": {"type": "integer", "description": "On the request dffyd hands a viewer: the listener's connection, the same on each of its requests."}, "started": {"type": "integer", "description": "On the request dffyd hands a viewer: when the connection first listened, in seconds since 1970."}, "edited": {"type": ["integer", "null"], "description": "On the request dffyd hands a viewer: when its session last edited, as comments/listening said."}, "prompted": {"type": ["integer", "null"], "description": "On the request dffyd hands a viewer: when its session was last prompted, as comments/listening said."}}, "required": ["worktree"]}, "result": {"type": "object", "properties": {"view": {"type": "integer"}, "prompt": {"type": "string", "description": "What to do, as the user would say it to an agent."}}, "required": ["view", "prompt"]}}},
+    "comments/listening": {"description": "Says that the session listening with key just edited a file, or was just prompted.", "properties": {"params": {"type": "object", "properties": {"key": {"type": "string", "minLength": 1}, "edited": {"type": "boolean", "description": "false when it was prompted."}}, "required": ["key", "edited"]}, "result": {"type": "object", "properties": {"listeners": {"type": "integer", "description": "How many listeners have that key."}}, "required": ["listeners"]}}},
     "selection/changed": {"description": "Pushed to subscribers, debounced.", "properties": {"params": {"type": "object", "properties": {"view": {"type": "integer"}, "selection": {"$ref": "#/$defs/selection"}}, "required": ["view", "selection"]}}},
     "view/changed": {"description": "Pushed to subscribers, debounced: the state when the file or the top row moved.", "properties": {"params": {"$ref": "#/$defs/state"}}},
     "view/closed": {"description": "Pushed to subscribers when their view's viewer leaves.", "properties": {"params": {"type": "object", "properties": {"view": {"type": "integer"}}, "required": ["view"]}}},
     "subscriptions": {"description": "dffyd to a viewer: the events someone subscribes to now.", "properties": {"params": {"type": "object", "properties": {"events": {"type": "array", "items": {"type": "string"}}}, "required": ["events"]}}},
-    "$/cancelRequest": {"description": "dffyd to a viewer: the client that asked request id left before its answer, so it's not to be done.", "properties": {"params": {"type": "object", "properties": {"id": {"type": "integer"}}, "required": ["id"]}}}
+    "listener/changed": {"description": "dffyd to a viewer: what the session of the listener it holds as request id did, with the fields of comments/listen.", "properties": {"params": {"type": "object", "properties": {"id": {"type": "integer"}, "started": {"type": "integer"}, "edited": {"type": ["integer", "null"]}, "prompted": {"type": ["integer", "null"]}}, "required": ["id", "started", "edited", "prompted"]}}},
+    "$/cancelRequest": {"description": "dffyd to a viewer: the client that asked request id left before its answer, or another view answered it, so it's not to be done.", "properties": {"params": {"type": "object", "properties": {"id": {"type": "integer"}}, "required": ["id"]}}}
   }
 }
 "##;
@@ -221,6 +228,7 @@ mod tests {
             "welcome",
             "view/closed",
             "subscriptions",
+            "listener/changed",
             "$/cancelRequest",
         ]) {
             assert!(defs.get(name).is_some(), "{name}");

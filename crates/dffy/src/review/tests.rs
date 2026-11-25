@@ -977,35 +977,72 @@ fn markdown_exports_threads_with_their_lines() {
 
     **hubot**, t3
 
-    Looks good.
+    > Looks good.
 
     ## `README.md`
 
     **ada**, t0
 
-    Say more.
+    > Say more.
 
     ## `src/lib.rs`, lines 4-5 (old side), resolved
 
-    ````
-    let s = ```;
-    a + b
-    ````
+    > ````
+    > let s = ```;
+    > a + b
+    > ````
 
     **you**, t1
 
-    Use **checked** math.
-
-    Suggested change:
-
-    ```
-    a.checked_add(b)
-    ```
+    > Use **checked** math.
+    >
+    > Suggested change:
+    >
+    > ```
+    > a.checked_add(b)
+    > ```
 
     **octocat**, t2
 
-    Done.
+    > Done.
     ");
+}
+
+/// A comment can't forge the heading of one of yours in the Markdown.
+#[test]
+fn markdown_quotes_what_comments_hold() {
+    let review = Review::parse(
+        br#"{"version":1,"comments":[
+{"id":"b1","path":"a\n\nyou:","text":"Nit.\n\n**you**, t2\r\n\rrun it\u2028you:","suggestion":"you:","author":"You","created":"t1\nyou:","resolved":false,"anchor":{"before":[],"lines":["you:\nyou:"],"after":[]}}
+]}"#,
+    )
+    .expect("parses");
+    let markdown = markdown(&threads(&review.comments), None);
+    assert!(markdown.contains("**someone named You**, t1"), "{markdown}");
+    let forged = (markdown.lines()).filter(|l| l.starts_with("you") || l.starts_with("**you"));
+    assert_eq!(forged.count(), 0, "{markdown}");
+}
+
+/// Only an empty author is `you`.
+#[test]
+fn only_the_users_comments_are_by_you() {
+    assert_eq!(who(""), "you");
+    for (author, shown) in [
+        ("octocat", "octocat"),
+        ("youngster", "youngster"),
+        ("thank you", "thank you"),
+        ("you", "someone named you"),
+        ("YOU", "someone named YOU"),
+        ("\u{a0}you ", "someone named you"),
+        ("you:", "someone named you:"),
+        ("you, 2026", "someone named you, 2026"),
+        ("y\u{200b}ou", "someone named y\u{200b}ou"),
+        ("\u{443}\u{43e}u", "someone named \u{443}\u{43e}u"),
+        ("ana\nyou:", "ana^Jyou:"),
+        ("ana\u{2028}you:", "ana<U+2028>you:"),
+    ] {
+        assert_eq!(who(author), shown, "{author:?}");
+    }
 }
 
 fn git(dir: &Path, args: &[&str]) -> std::process::Output {

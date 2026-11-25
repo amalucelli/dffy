@@ -7,7 +7,7 @@ use std::ops::Range;
 use pulldown_cmark::{Event, Options, Parser, TagEnd};
 
 use super::Thread;
-use crate::render::plain;
+use crate::render::{escape, plain};
 use crate::review::who;
 
 /// The Markdown comments are written in: `CommonMark` with GitHub's
@@ -148,6 +148,24 @@ pub(crate) fn plain_text(text: &str) -> Vec<String> {
         l.out.pop();
     }
     l.out.iter().map(|line| plain(line)).collect()
+}
+
+/// `text` on one line, whatever its reader takes for a line break: controls
+/// and the separators Unicode has beside them are shown by name.
+pub(crate) fn one_line(text: &str) -> String {
+    let mut out = escape(text.as_bytes());
+    if out.contains(['\u{2028}', '\u{2029}']) {
+        out = out
+            .replace('\u{2028}', "<U+2028>")
+            .replace('\u{2029}', "<U+2029>");
+    }
+    out
+}
+
+/// The lines of `text`, each [`one_line`], for an agent to read: indented
+/// under its author's name, none passes for a heading.
+pub(crate) fn lines(text: &str) -> impl Iterator<Item = String> {
+    (text.split('\n')).map(|line| one_line(line.strip_suffix('\r').unwrap_or(line)))
 }
 
 /// The lines [`plain_text`] makes, the one being written last.

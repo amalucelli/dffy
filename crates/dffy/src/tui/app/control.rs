@@ -93,8 +93,16 @@ impl App {
             Inbound::Unreachable(why) => {
                 self.message(format!("dffy ctl can't reach this viewer: {why}"));
             }
+            Inbound::Listens(listens, reply) => self.listens(listens, reply),
+            Inbound::Listened { request, facts } => self.listened(request, facts),
             // What waits for it goes as the event settles.
-            Inbound::Cancelled => {}
+            Inbound::Cancelled => self.listeners_settled(),
+            Inbound::Gone => {
+                let c = &mut self.control;
+                (c.push, c.selection, c.view, c.due) = (None, false, false, None);
+                c.waiting.retain(|w| !w.reply.cancelled());
+                self.listeners_gone();
+            }
         }
         None
     }

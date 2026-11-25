@@ -2,6 +2,35 @@
 
 The big changes in each release. Plugins and features marked experimental can still change between releases.
 
+## 0.5.0 (2026-11-24)
+
+### Added
+
+- **Go to definition**, at either version of the diff, in 18 languages and without a language server. `K` lists the names on a line, or ctrl/alt+click one, and a peek under the line shows its definitions and, below them, the lines using it: `c` keeps only calls, `i` only files in the diff, `s` looks in the other version, all remappable in the `peek:` table. Names are matched and resolved as far as imports, locals and receiver types tell, and several definitions are all listed. The index is kept in the disk cache and lives in a helper process that exits after 10 idle minutes. See [docs/viewer.md](docs/viewer.md#go-to-definition).
+- **File view**: `l` shows each file whole at one version, with changed lines marked `┃` and removed lines folded into a row that `x` opens in place. `s` flips the version, and `file-view = true` starts in it. See [docs/viewer.md](docs/viewer.md#file-view).
+- **Files outside the diff**: `o` finds any file of the repository at either version (`tab` switches), and `a` in the tree lists them all, with the diff's changes colored among them (`all-files`). See [docs/viewer.md](docs/viewer.md#opening-files).
+- **Back and forward**: `backspace` goes back to where the last jump left and `\` forward again. The line a jump lands on is marked `❯` until you move, in the theme's new `landed` style. See [docs/viewer.md](docs/viewer.md#jumping-back).
+- The MCP tool `definitions` gives agents the same lookup, and with `references` the lines using a name. See [docs/mcp.md](docs/mcp.md#definitions).
+- **Send threads to a running agent** (experimental). With a coding agent's session listening in the working tree, `f` (one thread) and `h` (all your open threads) send to it instead of starting a new agent, and the menu and command panel name it. With several, they go to the one you picked before, else the only one that edited files, else dffy asks. The dffy plugin for Claude Code makes its sessions listen: `claude plugin marketplace add amalucelli/dffy`, then `claude plugin install dffy@dffy`, for sessions started after. Any agent that can run a command in the background and act on its lines can listen with `dffy comments listen --as <name>`, and report its prompts and edits with `dffy comments listening`. After upgrading, run `dffy daemon stop` and reopen your viewers and sessions. See [docs/viewer.md](docs/viewer.md#sending-to-a-running-session) and [docs/agents.md](docs/agents.md#claude-code).
+- **`h`** sends every open thread of yours, to a listening session or a new agent, after asking (`confirm_send_open_threads`).
+- The control API's `comments/listen`, which waits for threads a viewer hands over, and `comments/listening`, which reports what the waiting session last did. See [docs/control.md](docs/control.md#listening-for-threads).
+
+### Changed
+
+- A hand-over from a code host's review names the review's comments file, so with several reviews open the agent reads the one you sent from.
+- Viewers register with dffyd again when it goes, so `dffy ctl` keeps reaching them after `dffy daemon stop`.
+- dffyd stays running while an agent's session listens.
+- What dffy prints for agents tells your comments from anyone else's: prompts indent comments and their suggestions, `dffy comments --markdown` quotes them, and an author whose name reads as `you` shows as `someone named …`. See [docs/comments.md](docs/comments.md#who-you-is).
+- `dffy ctl open` and `comment`, the control API's `view/open` and `comments/add`, and the MCP tool `open_in_viewer` open files the diff doesn't change, whole, with `"listed":false` in the result.
+- In the command panel, indicators moved from `K` to `,`.
+- The command panel's popup opens with no row highlighted, so `space` again shows the whole panel. Once a row is highlighted, `space` and `enter` run it.
+- Files opened outside the diff, those with comments included, are listed in the tree under `Not in this diff`, and `x` in the tree closes one without comments.
+
+### Fixed
+
+- Comments on lines that no longer exist show at the end of their file and stay local.
+- Emoji with a variation selector take the same number of columns everywhere.
+
 ## 0.4.1 (2026-11-22)
 
 ### Changed

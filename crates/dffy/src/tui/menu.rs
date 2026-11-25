@@ -80,6 +80,15 @@ impl Menu {
         }
     }
 
+    /// Gives the entries `label` has new words for those.
+    pub(super) fn relabel(&mut self, label: impl Fn(Run) -> Option<String>) {
+        for entry in &mut self.entries {
+            if let Some(label) = label(entry.run) {
+                entry.label = label;
+            }
+        }
+    }
+
     #[cfg(test)]
     pub(super) fn entries(&self) -> &[Entry] {
         &self.entries

@@ -413,15 +413,15 @@ The control API's `comments/applySuggestion` ([control.md](control.md)) and MCP'
 
 ## Fixing with an agent
 
-`f` on a focused thread, or one selected in the comments panel, hands the thread to your own coding agent. `space` then `&` does the same from the command panel, and so does `Fix with agent` in the menu. dffy starts the agent interactively, as you'd start it, with none of its own flags. So the agent asks before it edits, as it always does. It starts on one line, never the thread's text:
+`f` on a focused thread, or one selected in the comments panel, hands the thread to your own coding agent. `space` then `&` does the same from the command panel, and so does `Fix with agent` in the menu. When a session of your agent listens in this working tree, it gets the thread ([below](#sending-to-a-running-session)). Otherwise dffy starts the agent interactively, as you'd start it, with none of its own flags. So the agent asks before it edits, as it always does. It starts on one line, never the thread's text:
 
 ```
 Address dffy review thread <id>: run dffy comments prompt <id> (or the thread_prompt MCP tool), change only what the thread asks, then reply in the thread with what you changed.
 ```
 
-On a review from a code host the line says `dffy comments --session prompt`.
+For a thread in another comments file, such as a code host's review's, the line names it: `run dffy --comments <file> comments prompt <id>`. So it's the review this viewer shows, whichever review another viewer opened since.
 
-On selected lines, `space` then `&` or the menu's `Fix with agent` first opens the text box for what should change there. `f` moves to the next file while lines are selected. `enter` saves the note as a new thread, kept [private](comments.md#drafts) since it's an instruction to your agent, then hands it over.
+On selected lines, `space` then `&` or the menu's `Fix with agent` first opens the text box for what should change there. `f` moves to the next file while lines are selected. `enter` saves the note as a new thread, kept [private](comments.md#drafts) since it's an instruction to your agent, then hands it over. The status bar says where: `what should change here · enter sends it and starts your agent`, or with a session listening `what should change here · enter sends it to claude`, and the box's heading says `for claude`.
 
 The agent plugin, `dffy-agent`, lists the agents a thread can go to and how each starts ([plugins.md](plugins.md#the-agent-protocol-version-1)): Claude Code, Codex, Pi and Amp, those on `PATH`. dffy picks the one the `agent` setting names, else the first listed. A setting that names none of them is refused. A command of yours takes no thread, so it leaves the pick to the list. Without the plugin, `f` says so. While the plugin starts, the status bar says `starting dffy-agent…`. If the plugin hasn't said which agents there are within 2 seconds, the status bar says that instead and the thread goes to none. Amp takes its first message only from you, so it starts bare and the line goes on the clipboard to paste.
 
@@ -433,15 +433,37 @@ On someone else's review it works only once the review is checked out, as for `s
 
 ### Every open thread at once
 
-`space` then `^` (`send_open_threads`) takes a [checkpoint](#checkpoints), then starts the agent as `f` does, on one line that points at all your open threads:
+`h` (`confirm_send_open_threads`) asks first: `send 5 threads to claude? enter sends · esc keeps` with a session listening, else `start your agent on 5 threads? enter starts · esc keeps`. `enter` sends. Any other key, a click or a paste sends nothing (`nothing sent`) and does nothing else, and so does an `enter` typed before the question shows. When where they go, or how many, changed since it asked, `enter` asks again. With several sessions and none of them clear, the list to pick from opens instead. In the tree `h` collapses a folder, and lines selected stay selected.
+
+Sending takes a [checkpoint](#checkpoints), then hands your open threads over as `f` does, to the session that listens or a new agent, on one line that points at them all:
 
 ```
 Address the open dffy review threads: run dffy comments prompt --open, change only what each thread asks, reply in each thread with what you changed (dffy comments apply --as <you>).
 ```
 
-[comments.md](comments.md#as-a-prompt-dffy-comments-prompt) has the prompt. Yours are the open threads you started or replied in. The command panel's Here offers it while you have some, except with lines selected or in a conflict.
+Threads in another comments file than the local review's are named by it here too, in both commands: `dffy --comments <file> comments`. [comments.md](comments.md#as-a-prompt-dffy-comments-prompt) has the prompt. Yours are the open threads you started or replied in. The command panel's Here offers it while you have some, except with lines selected or in a conflict. Its row, run with `enter` or its key `^` (`send_open_threads`), sends at once.
 
 The agent reads one comments file. On a review with your branch drafts beside it, that's the file with more of yours, or with as many, the one new threads go to. The status bar says how many went, the key that shows the agent's turn, and how many of yours in the other file weren't sent: `sent 5 threads to claude · ' shows its turn`. When the agent runs in dffy's own terminal, the status bar says it exited instead.
+
+### Sending to a running session
+
+A coding agent's session can listen for threads with `dffy comments listen` ([comments.md](comments.md#listening-dffy-comments-listen)), as every Claude Code session does with dffy's plugin ([agents.md](agents.md#claude-code)). While one listens in the viewer's working tree, the keys above send to it and start no agent. It works in its own terminal, under its own permissions, and the agent plugin isn't needed. The refusals are the same: without a working tree, and on someone else's review until it's checked out.
+
+Where threads go shows before the key is pressed. The command panel and the menu say `Send to claude` in place of `Fix with agent`, and `Send open threads to claude` in place of `Send open threads to agent`, with the name the session listens as, or `a session` while there's one to pick. While several listen, what it last did tells it apart, as of when they last changed: `Send to claude · edited 3h ago`. An open panel or menu follows the sessions. On a focused thread the status bar says `f send` in place of `f fix`.
+
+With several sessions listening:
+
+1. The one you picked before gets the threads, until it ends.
+2. Otherwise the only one that edited files does.
+3. Otherwise a list opens, titled `send to`: the last to edit first, then the last prompted, then the newest. Each row says what it knows of the session: `claude · started 2h ago · edited 3m ago`, or `· prompted 5m ago` for one that hasn't edited.
+
+`enter` sends to the row it's on, and that pick holds for this viewer. A tap on a row sends to it. `j`/`k`, the arrows and the wheel move. `esc` and `q` close the list, with `nothing sent`. The list's footer says `enter sends · j/k move · esc sends nothing`. A session that ends leaves the list, and when none is left it closes with `the sessions stopped listening; send again`. Sessions count an edit only when they report it, so one made through a shell may not count.
+
+dffy takes a [checkpoint](#checkpoints), then sends. The status bar says `sent the thread to claude`, or `sent 5 threads to claude · ' shows its turn` (`sent 1 thread to claude` for one), with the same notes as for a new agent, and what told the session apart while several listen. Without its checkpoint they still go: `sent 5 threads to claude, but couldn't take a checkpoint: …`. `couldn't send to claude: …` gives the reason nothing went.
+
+A session asks again after each hand-over. Until it does, for at most 1 second, it still counts as listening, and what's sent to it waits: `waiting for claude…`. A further send says `still sending to claude; wait`. When another viewer hands the session something as this one takes its checkpoint, this one's wait for it the same way. A session that doesn't ask again in that second gets nothing: `claude stopped listening; send again`. Sending again then goes to another session or a new agent.
+
+Only sessions in the viewer's own working tree count, from any directory in it. A session in another worktree of the repository isn't sent to, as it would change the wrong files. A diff piped on stdin and files compared outside git have no sessions. When dffyd goes, sessions and the viewer come back by themselves once it runs again. A pick is forgotten then, and each session's start, edits and prompts count from there.
 
 ## Staging
 
@@ -514,11 +536,11 @@ The full panel holds every setting with its state and key, and the actions, in t
 
 Here, where the full panel opens, has the few actions that apply to what you're on:
 
-- On a focused thread: ask an agent, fix with an agent, apply or revert its suggestion, copy it as a prompt, resolve or reopen it, and reply.
+- On a focused thread: ask an agent, fix with an agent or send it to a listening session, apply or revert its suggestion, copy it as a prompt, resolve or reopen it, and reply.
 - With lines selected: comment, suggest a change, ask, fix, copy them, or copy them as a prompt. On uncommitted changes it adds stage, unstage and discard.
 - In a conflict on screen: its choices, and once one is made, writing the file.
 - On a review: posting it, pulling its updates and showing what changed since your last review. On the review plain `dffy` found for the branch, it adds the whole review.
-- Otherwise: sending your open threads to your agent while you have some, then showing what changed since the latest [checkpoint](#checkpoints) and taking another once one exists, then finding a file, the layout, wrapping, watching and opening a terminal.
+- Otherwise: sending your open threads to your agent or a listening session while you have some, then showing what changed since the latest [checkpoint](#checkpoints) and taking another once one exists, then finding a file, the layout, wrapping, watching and opening a terminal.
 
 On a thread and on a review, sending your open threads follows while you have some ([Fixing with an agent](#fixing-with-an-agent)). All keys (`?`) is last.
 
@@ -639,7 +661,7 @@ The file stays for the session, or until the diff lists it. A suggestion applied
 
 A checkpoint keeps the working tree as plain `dffy` shows it. The diff can then show only what changed after it, such as what a coding agent did in its turn after you reviewed the rest. [git.md](git.md#checkpoints) has what a checkpoint holds and where it's kept.
 
-Fix with agent (`f` on a thread) and sending your open threads (`space` then `^`) take one before they start the agent. `space` then `;` (`take_checkpoint`) takes one by hand, and the status bar says `checkpoint 3 taken · ' shows what changes since`. `dffy checkpoint` takes one from a shell. Taking one runs off the screen's thread, and a failure shows in the status bar. A Fix with agent goes on without one.
+Fix with agent (`f` on a thread) and sending your open threads (`h`) take one before they start the agent or send to a listening session. `space` then `;` (`take_checkpoint`) takes one by hand, and the status bar says `checkpoint 3 taken · ' shows what changes since`. `dffy checkpoint` takes one from a shell. Taking one runs off the screen's thread, and a failure shows in the status bar. A Fix with agent goes on without one.
 
 `'` shows the latest checkpoint against the working tree, with `since checkpoint · 3m ago` in the status bar. `'` again shows the diff from before. A viewer started with `dffy --since-checkpoint` shows the same, with the checkpoint's age in the status bar, and there `'` goes to plain `dffy`'s diff. A checkpoint taken while it shows becomes the one it's since. Threads stay on the lines they're anchored to. Lines can't be staged here, since a hunk since a checkpoint isn't the index's.
 ## Code host reviews

@@ -1,7 +1,7 @@
 //! The broker process, `dffy daemon run`: one [`Watcher`] per subscribed
 //! repository, its notices fanned out to every subscriber, the control
-//! API's socket, and an exit once nobody has subscribed or registered for a
-//! while.
+//! API's socket, and an exit once nobody has subscribed, registered or
+//! listened for a while.
 //!
 //! Each connection gets a thread reading it (to notice the hang-up) and,
 //! for subscribers, a thread writing to it from an unbounded queue, so a
@@ -53,10 +53,10 @@ struct Broker {
 #[derive(Default)]
 struct State {
     roots: HashMap<PathBuf, Watched>,
-    /// Views registered with the control API.
-    views: usize,
-    /// Since when nobody is subscribed or registered; `None` while
-    /// somebody is.
+    /// Views registered with the control API and listeners parked there.
+    attached: usize,
+    /// Since when nobody is subscribed or attached; `None` while somebody
+    /// is.
     idle_since: Option<Instant>,
     next_id: u64,
 }
@@ -64,7 +64,7 @@ struct State {
 impl State {
     /// Starts the idle wait if nobody is left.
     fn left(&mut self, idled: &Condvar) {
-        if self.roots.is_empty() && self.views == 0 && self.idle_since.is_none() {
+        if self.roots.is_empty() && self.attached == 0 && self.idle_since.is_none() {
             self.idle_since = Some(Instant::now());
             idled.notify_all();
         }
@@ -150,8 +150,8 @@ pub(crate) fn run() -> io::Result<()> {
         thread::Builder::new()
             .name("dffyd-control-accept".into())
             .spawn(move || {
-                crate::control::server::serve(&listener, owner, move |views| {
-                    counted.set_views(views);
+                crate::control::server::serve(&listener, owner, move |attached| {
+                    counted.set_attached(attached);
                 });
             })?;
     }
@@ -206,7 +206,7 @@ impl Broker {
         self.state.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// Exits once nobody has subscribed or registered for [`Broker::idle`].
+    /// Exits once nobody has subscribed or attached for [`Broker::idle`].
     /// It waits without waking while somebody is there.
     fn exit_when_idle(&self) -> ! {
         let mut state = self.state();
@@ -229,10 +229,10 @@ impl Broker {
         }
     }
 
-    fn set_views(&self, views: usize) {
+    fn set_attached(&self, attached: usize) {
         let mut state = self.state();
-        state.views = views;
-        if views > 0 {
+        state.attached = attached;
+        if attached > 0 {
             state.came(&self.idled);
         } else {
             state.left(&self.idled);

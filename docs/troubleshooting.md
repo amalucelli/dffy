@@ -80,7 +80,7 @@ dffy takes mouse input for clicks, the wheel, and dragging to select and copy co
 
 On Linux the usual cause is the inotify limit. `dffy doctor` shows it, and [watch.md](watch.md#linux-the-inotify-limit) shows how to raise it. When the limit runs out, dffy polls once a second and says so in the status bar.
 
-`dffy daemon stop` stops a broken `dffyd`. Viewers keep watching on their own, and the next one to watch starts a new broker. A broker that doesn't answer at all leaves a stale socket in `$XDG_RUNTIME_DIR/dffy`, which you can delete.
+`dffy daemon stop` stops a broken `dffyd`. Viewers keep watching on their own. While a viewer or a listening session is open it starts again at once, from the `dffy` that process runs, else with the next one. A broker that doesn't answer at all leaves a stale socket in `$XDG_RUNTIME_DIR/dffy`, which you can delete.
 
 ## Git shows `difftastic`'s output, or no diff
 
@@ -134,4 +134,4 @@ As in `git status`, a file staged and then changed again counts as staged and un
 
 ### An old broker
 
-An old broker keeps running old code after a rebuild or reinstall. `dffy daemon stop` stops it, and the next `dffy --watch` starts the new one ([watch.md](watch.md#dffyd)).
+An old broker keeps running old code after a rebuild or reinstall. `dffy daemon stop` stops it. Each open viewer and listening session then starts dffyd from the `dffy` it runs, whichever is first, so a program still running from another path starts that one. After an upgrade, stop dffyd and reopen viewers and sessions ([watch.md](watch.md#dffyd)).

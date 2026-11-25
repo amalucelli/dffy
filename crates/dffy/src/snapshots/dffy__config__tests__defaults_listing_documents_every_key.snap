@@ -355,10 +355,10 @@ expression: text
 <hint>keybind</><dim> = </>w=toggle_watch
 <hint>keybind</><dim> = </>leader:w=toggle_watch
 
-<dim># take_checkpoint: take a checkpoint of the working tree: its files as plain dffy lists them, staged or not and untracked, kept under a local ref of this worktree, the last 5 of them; starting Fix with agent takes one too</>
+<dim># take_checkpoint: take a checkpoint of the working tree: its files as plain dffy lists them, staged or not and untracked, kept under a local ref of this worktree, the last 5 of them; handing threads to an agent takes one too</>
 <hint>keybind</><dim> = </>leader:;=take_checkpoint
 
-<dim># since_checkpoint: show only what changed since the latest checkpoint, such as an agent's turn since Fix with agent started it, or the diff shown before again; the status bar says how long ago it was taken</>
+<dim># since_checkpoint: show only what changed since the latest checkpoint, such as an agent's turn since threads were handed to it, or the diff shown before again; the status bar says how long ago it was taken</>
 <hint>keybind</><dim> = </>'=since_checkpoint
 <hint>keybind</><dim> = </>leader:'=since_checkpoint
 
@@ -459,12 +459,15 @@ expression: text
 <dim># apply_suggestion: on a thread: put its suggestion, the one last clicked or else its last, in place of the lines it's on in the working tree, refused when they changed since; an unstaged change, which discard undoes. On one applied already, put back the lines it replaced</>
 <hint>keybind</><dim> = </>thread:s=apply_suggestion
 
-<dim># fix_with_agent: on a thread, or the selected lines with a note you write first: start your coding agent in a new tab, or here until it exits, pointed at the thread to change what it asks and reply in it</>
+<dim># fix_with_agent: on a thread, or the selected lines with a note you write first: send it to the coding agent's session listening in this working tree, else start your coding agent in a new tab, or here until it exits, pointed at the thread to change what it asks and reply in it</>
 <hint>keybind</><dim> = </>thread:f=fix_with_agent
 <hint>keybind</><dim> = </>leader:&=fix_with_agent
 
-<dim># send_open_threads: take a checkpoint, then start your coding agent as fix with agent does, pointed at every open thread of yours in view (those you started or replied in) to change what each asks and reply in each; since checkpoint then shows its turn</>
+<dim># send_open_threads: take a checkpoint, then hand over as fix with agent does, to a listening session or your coding agent, every open thread of yours in view (those you started or replied in) to change what each asks and reply in each; since checkpoint then shows its turn</>
 <hint>keybind</><dim> = </>leader:^=send_open_threads
+
+<dim># confirm_send_open_threads: send open threads, asking first and naming the session or the new agent they go to: enter sends, any other key keeps them. With several sessions and none of them clear, the list to pick from opens instead</>
+<hint>keybind</><dim> = </>h=confirm_send_open_threads
 
 <dim># open_on_host: on a thread: open it on its code host, in the browser</>
 <hint>keybind</><dim> = </>thread:o=open_on_host

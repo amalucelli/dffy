@@ -265,7 +265,8 @@ impl App {
             offers.push(main("Suggest change", Act::SuggestChange));
             if selected {
                 offers.push(main(&self.ask_label(), Act::AskAgent));
-                offers.push(main("Fix with agent", Act::FixWithAgent));
+                let fix = self.hand_over_title(Act::FixWithAgent);
+                offers.push(main(&fix, Act::FixWithAgent));
             }
         }
         if selected {
@@ -302,7 +303,8 @@ impl App {
         } else if thread.suggestion().is_some() {
             offers.push(key("Apply suggestion", Act::ApplySuggestion));
         }
-        offers.push(key("Fix with agent", Act::FixWithAgent));
+        let fix = self.hand_over_title(Act::FixWithAgent);
+        offers.push(key(&fix, Act::FixWithAgent));
         if thread.comments.iter().any(|n| !n.posted()) {
             offers.push(key("Edit draft", Act::EditDraft));
             offers.push(key("Delete draft", Act::DeleteDraft));

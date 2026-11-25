@@ -317,7 +317,8 @@ impl Ctx {
 }
 
 /// A hidden command dffy runs for itself, before any config is read: a
-/// plugin detached from the terminal, or the navigator helper.
+/// plugin detached from the terminal, the navigator helper, or dffyd's
+/// start.
 fn hidden() -> Option<ExitCode> {
     let mut raw = std::env::args_os();
     let first = raw.nth(1)?;
@@ -330,6 +331,8 @@ fn hidden() -> Option<ExitCode> {
             return Some(ExitCode::SUCCESS);
         }
         Some(navigator::server::serve())
+    } else if first == daemon::START {
+        Some(daemon::client::start())
     } else {
         None
     }
@@ -376,6 +379,10 @@ pub fn main() -> ExitCode {
             };
         }
     };
+
+    if report(&cli) {
+        return ExitCode::SUCCESS;
+    }
 
     let mut config = loaded.config;
     let mut sources = loaded.sources;
@@ -427,19 +434,37 @@ pub fn main() -> ExitCode {
         Err(Error::BrokenPipe) => ExitCode::SUCCESS,
         Err(Error::Interrupted) => ExitCode::from(INTERRUPTED),
         Err(Error::Fatal { message, hint }) => {
-            let mut c = Canvas::default();
-            c.push(Role::Error, "error:");
-            c.push(Role::Plain, " ");
-            c.line(Role::Plain, &render::escape_lines(&message));
-            if let Some(hint) = hint {
-                c.push(Role::Hint, "hint:");
-                c.push(Role::Plain, " ");
-                c.line(Role::Plain, &render::escape_lines(&hint));
-            }
-            print_err(&ctx, &c);
+            print_fatal(&ctx, &message, hint.as_deref());
             ExitCode::from(FATAL)
         }
     }
+}
+
+fn print_fatal(ctx: &Ctx, message: &str, hint: Option<&str>) {
+    let mut c = Canvas::default();
+    c.push(Role::Error, "error:");
+    c.push(Role::Plain, " ");
+    c.line(Role::Plain, &render::escape_lines(message));
+    if let Some(hint) = hint {
+        c.push(Role::Hint, "hint:");
+        c.push(Role::Plain, " ");
+        c.line(Role::Plain, &render::escape_lines(hint));
+    }
+    print_err(ctx, &c);
+}
+
+/// Runs `dffy comments listening`, if `cli` is that: an agent's hook, which
+/// takes no setting and says nothing, the config's warnings included.
+fn report(cli: &Cli) -> bool {
+    let Some(Command::Comments(CommentsArgs {
+        action: Some(CommentsAction::Listening { key, edited }),
+        ..
+    })) = &cli.command
+    else {
+        return false;
+    };
+    control::listen::listening(key, *edited);
+    true
 }
 
 /// The review plugin `name`, described from the cache unless `fresh`; see
@@ -654,10 +679,14 @@ fn comments(
     if args.action.is_some() && args.lists() {
         return Err(Error::Fatal {
             message: "--json, --markdown, --open, --resolved, --path, --branch and \
-                --all-branches are for listing, not for apply, import, prompt or rm"
+                --all-branches are for listing, not for apply, import, prompt, rm or listen"
                 .to_owned(),
             hint: Some("rm takes --resolved, --branch and --all-branches after it".to_owned()),
         });
+    }
+    // It has no comments file, and runs outside a repository too.
+    if let Some(CommentsAction::Listen { name, key }) = &args.action {
+        return control::listen::listen(dir, name, key.as_deref());
     }
     // An integration's `apply` on its own file, each batch, needs neither
     // the repository nor the branch.
@@ -779,6 +808,9 @@ fn comments(
             io::stdout().lock().write_all(prompt.text.as_bytes())?;
             Ok(ExitCode::SUCCESS)
         }
+        Some(CommentsAction::Listen { .. } | CommentsAction::Listening { .. }) => {
+            unreachable!("run before the comments file was looked for")
+        }
         None => list_comments(&path, &args, scope(&args.branches), current.as_deref(), ctx),
     }
 }
@@ -818,15 +850,15 @@ fn list_comments(
         c.push(Role::Warn, "notice:");
         c.line(
             Role::Plain,
-            &format!(" {}", render::escape(notice.as_bytes())),
+            &format!(" {}", review::model::text::one_line(notice)),
         );
         c.end_line();
     }
     if let Some(summary) = &file.summary {
         c.line(Role::FileHeader, "summary, not posted yet");
-        for line in summary.lines() {
+        for line in review::model::text::lines(summary.trim_end_matches('\n')) {
             c.spaces(Role::Plain, 4);
-            c.line(Role::Plain, &render::escape(line.as_bytes()));
+            c.line(Role::Plain, &line);
         }
         c.end_line();
     }

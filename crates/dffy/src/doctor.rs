@@ -761,8 +761,12 @@ impl Facts {
         let label = "dffyd";
         match &self.dffyd {
             Ok(None) => checks.push(
-                Check::new(Mark::Info, label, "not running; the first viewer starts it")
-                    .brief("not running"),
+                Check::new(
+                    Mark::Info,
+                    label,
+                    "not running; the first viewer or listening session starts it",
+                )
+                .brief("not running"),
             ),
             Ok(Some(report)) => {
                 let subscribers: u32 = report.roots.iter().map(|root| root.subscribers).sum();
@@ -788,7 +792,10 @@ impl Facts {
                         "running (pid {}), another dffy's build",
                         report.pid
                     ))
-                    .hint("dffy daemon stop; the next dffy --watch starts this build's broker")
+                    .hint(
+                        "dffy daemon stop; each viewer and session starts dffyd from the dffy it \
+                         runs, so reopen those of another build",
+                    )
                 };
                 for root in report.roots.iter().filter(|root| root.polling.is_some()) {
                     check = check.note(format!(

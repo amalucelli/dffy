@@ -17,13 +17,13 @@ expression: "shown(&mut help, &keys, 100, 30)"
        │                                           A                 make it yours         │
        │ Agents                                    s                 apply suggestion      │
        │ a                 ask agent               f                 fix with agent        │
-       │                                           o                 open thread on host   │
+       │ h                 send open threads…      o                 open thread on host   │
+       │                                                                                   │
        │ Review                                                                            │
        │ p                 update the review                                               │
        │ P                 post the review                                                 │
        │ O                 open a review…                                                  │
        │ R                 since last review                                               │
-       │                                                                                   │
        │                                                                                   │
        │                                                                                   │
        │ more settings: space · all keys: docs/keys.md                                     │

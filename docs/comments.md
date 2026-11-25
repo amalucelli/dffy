@@ -14,6 +14,7 @@ dffy comments --session           # the review session the viewer has open
 dffy --comments pr.json comments  # another file
 dffy comments rm --resolved       # remove this branch's resolved threads
 dffy comments prompt 9f3c2a71b04e5d18  # one thread as a prompt for a coding agent
+dffy comments listen --as claude       # print what viewers hand over, for a running agent
 ```
 
 The viewer draws the comments. Printed output and `--json` show them with `--show-comments` ([usage.md](usage.md#review-comments-in-printed-output)). A [review plugin](plugins.md#review-plugins) keeps the file in step with a code host.
@@ -39,7 +40,7 @@ src/lib.rs:12-14
 - The file's `notice` comes first, then its `summary`, when they exist.
 - [General comments](#general-comments) come next, each headed `conversation` with its `kind` and `label` (`conversation, review, approved`).
 - Threads follow, by path, then by first line. A thread's heading is its file and lines (`src/lib.rs:12-14`), plus `(old side)` for old-side lines. A file comment's heading is just the file. The heading adds `branch <name>` for a thread on another branch than the one listed, and `resolved` when it is.
-- Each comment shows its `id`, its author (`you` when empty), its time, `posted` when it has a `ref`, and `pending` when it's `pending`. Its text follows. A comment with a `post_error` adds `not posted:` and the reason.
+- Each comment shows its `id`, its author ([`you`](#who-you-is) when empty), its time, `posted` when it has a `ref`, and `pending` when it's `pending`. Its text follows, indented, control characters and Unicode's line separators shown by name. A comment with a `post_error` adds `not posted:` and the reason.
 
 Filters judge a thread by its first comment, so a thread is listed or left out whole:
 
@@ -56,7 +57,7 @@ Other forms:
 | Command | Output |
 |---|---|
 | `dffy comments --json` | The whole file in [its format](#the-file-version-1), as dffy would write it, every branch included. Never colored or paged. Takes none of the filter flags. A missing file prints as `{"version":1,"comments":[]}` (with a line break in the list). Scripts should read the file this way, not open it: a version dffy doesn't know exits with status 128. |
-| `dffy comments --markdown` | The threads the listing would show, as Markdown, never colored or paged. The `summary` comes first under `## Summary`. Each thread gets a `##` heading with its file, lines and state, then its `anchor` lines in a code block, then each comment as its author and time in bold over its text, with any suggestion in a code block. Every fence is longer than any run of backticks inside it. |
+| `dffy comments --markdown` | The threads the listing would show, as Markdown, never colored or paged. The `summary` comes first under `## Summary`. Each thread gets a `##` heading with its file, lines and state, then its `anchor` lines in a code block, then each comment as its author in bold and its time over its text, with any suggestion in a code block. The lines and the comments are quoted (`>`). Every fence is longer than any run of backticks inside it. |
 | `dffy comments --session` | The file the [session pointer](#the-session-pointer) names, instead of the local one: what the review plugin last wrote, without asking the host. Can't be combined with `--comments`. Fails when no session was opened in the repository. |
 | `dffy comments rm --resolved` | Removes the resolved threads the listing would show, with their replies, under the file's lock, and prints how many comments went. Takes `--branch <name>` and `--all-branches` like the listing. `--resolved` is required, so a bare `rm` removes nothing. It removes posted threads too, unlike the viewer's `clear_resolved` ([viewer.md](viewer.md#writing)), which leaves them because a review plugin's next update would bring them back. |
 
@@ -73,7 +74,7 @@ The prompt holds, in order:
 1. Where the thread is: file, lines and side (`src/lib.rs:12-14 (the new version of the file)`), plus `resolved` or `outdated on its host` when it is.
    - The file's language, as dffy highlights it: `Language: rust`.
    - The definitions around all of the lines, outermost first, as the viewer's scope line names them: `In: mod tests > fn parse`. Only for lines placed on the diff, in a language with scopes ([viewer.md](viewer.md#the-scope-line)). The viewer leaves it out while it's still finding the file's definitions, and in a rendered view, rather than hold up the screen to find them.
-2. Each comment under its author (`you` for yours, drafts included), with its suggestion in a `suggestion` fenced block.
+2. Each comment under its author, as `octocat:`, or `you:` for yours, drafts included. Its text is indented by two spaces, and so is its suggestion, in a `suggestion` fenced block.
 3. The commented lines, numbered and marked `>`, with up to 5 lines around them.
 4. The file's nearby changes, as a unified diff in a `diff` fenced block.
 5. The ask: answer the thread's last comment, and end with any change to the commented lines in a fenced block opened with ```` ```suggestion ````.
@@ -94,11 +95,50 @@ The location, language and definitions, the first comment, the last two comments
 
 An `id` no comment has exits with status 128.
 
-`dffy comments prompt --open` prints every open thread of yours on the current branch in one prompt: threads you started and threads you replied in. Each comes under its first comment's id (`## Thread 9f3c2a71b04e5d18`), as `dffy comments prompt <id>` gives it without its own ask. One ask for all follows: change only what each thread's last comment asks, and reply in each with what you changed. A line counts your open threads on other branches, which are left out. The viewer's `send_open_threads` points an agent at this prompt ([viewer.md](viewer.md#fixing-with-an-agent)).
+`dffy comments prompt --open` prints every open thread of yours on the current branch in one prompt: threads you started and threads you replied in. Each comes under its first comment's id (`## Thread 9f3c2a71b04e5d18`), as `dffy comments prompt <id>` gives it without its own ask. One ask for all follows: change only what each thread's last comment asks, and reply in each with what you changed. A line counts your open threads on other branches, which are left out. The viewer's `h` points an agent at this prompt ([viewer.md](viewer.md#fixing-with-an-agent)).
 
 - The budget is 32 KiB for each of the first four threads, shared evenly. Up to four threads get 32 KiB each, eight get 16 KiB each. Each thread is cut alone, as above.
 - `--json` prints one object: `{"threads":["9f3c2a71b04e5d18",…],"elsewhere":1,"prompt":"…","trimmed":false}`. `threads` is the ids in prompt order, `elsewhere` the count left out on other branches, and `trimmed` whether anything was cut.
 - With no open thread of yours, it says so and exits 0.
+
+### Who `you` is
+
+In what dffy prints for an agent, only your comments are by `you`: those with no author.
+
+- An author whose name starts with a word that reads as `you`, in any case, with invisible characters or common lookalike letters, shows as `someone named …`. A name is always one line.
+- In a prompt, only dffy's own lines start at the margin. Comments are indented, and quoted code lines start with their mark, number or sign. Control characters and Unicode's line separators are shown by name (`^M`, `<U+2028>`), so no text passes for a `you:` line. Trimming keeps or drops a comment whole.
+- The listing, the Markdown and MCP's text keep comments apart from their headings the same way. `--show-comments` draws them in boxes, where a comment's text can look like another's heading: agents read the prompt.
+
+### What's handed over
+
+A thread handed to an agent from the viewer ([viewer.md](viewer.md#fixing-with-an-agent)) goes as one line that says how to read it, never as its text. It starts `Address dffy review thread <id>:`, or `Address the open dffy review threads:` for all of them, and names the commands to run. For a thread in the local review's file those are `dffy comments …`. For one in any other file they name it, `dffy --comments <file> comments …`, with an absolute path quoted for a shell. The file is named instead of `--session` because the [session pointer](#the-session-pointer) is whichever review any viewer of the repository opened last.
+
+A reply belongs in the same file: `dffy --comments <file> comments apply --as <name>`.
+
+## Listening: `dffy comments listen`
+
+```sh
+dffy comments listen --as claude --key $PPID
+```
+
+`dffy comments listen` is for a coding agent's session to run and read for as long as it lasts. It prints one line for each hand-over from a viewer in the working tree it runs in (or `-C`'s), [as above](#whats-handed-over). Viewers may open before or after it. [viewer.md](viewer.md#sending-to-a-running-session) has how the viewer picks among several sessions. Control characters in a line are escaped, so a hand-over is always one line.
+
+| Option | Effect |
+|---|---|
+| `--as <name>` | The agent's name, which viewers show. Required, with the same rules as for `apply`. |
+| `--key <key>` | The session's own name, which `dffy comments listening` reports by. Any string, such as the agent's process id. |
+
+It ends when it's killed, when the reader of its stdout goes, or when the process that started it exits, so an agent's end doesn't leave it behind. Run it directly or with a shell's `exec`: a shell that stays between it and the agent may outlive the agent, and one that starts it with `&` and ends takes it along. On systems other than macOS and Linux (5.3 or later) it doesn't see the process that started it exit.
+
+It waits out everything else, since an agent may act on its exit:
+
+- Outside a working tree it stays and prints nothing.
+- It starts dffyd when none runs ([watch.md](watch.md#dffyd)). When dffyd goes or can't be reached, it tries again, waiting longer each time, up to 30 seconds.
+- With a dffyd too old to know it, it waits until that one is gone. `dffy daemon stop` replaces it.
+
+What goes wrong is said on stderr, once each.
+
+`dffy comments listening --key <key>` says that the session listening with that key was just prompted, or with `--edited` that it just edited a file. An agent's hooks run it. It starts nothing, prints nothing, not even what's wrong with the config, waits at most a second for each answer from dffyd, and exits 0 whether or not a session listens.
 
 ## Writing: `dffy comments apply`
 
@@ -110,7 +150,7 @@ echo '[{"op":"add","comment":{"path":"README.md","text":"Typo in the title."}}]'
 
 It holds an advisory lock, `flock` on `<file>.lock` beside the file, waiting while another writer has it. Under the lock it reads the file as it is now, applies the operations in order, writes a temporary file in the same directory, and renames it over the file. Operations are all or nothing: when one fails, nothing is written. Put everything one change needs in one call, such as a page of imported threads, so other writers see it whole.
 
-`--as <name>` sets the author of every `add` that has no `author` or an empty one. A coding agent passes its own name (`dffy comments apply --as claude`), so its replies are never yours. Without `--as`, they would be yours and, in a review session, [drafts](#drafts) that post under your name. The name is up to 64 characters, with no control characters, and can't be empty or `you`.
+`--as <name>` sets the author of every `add` that has no `author` or an empty one. A coding agent passes its own name (`dffy comments apply --as claude`), so its replies are never yours. Without `--as`, they would be yours and, in a review session, [drafts](#drafts) that post under your name. The name is up to 64 characters, with no control characters, and can't be empty or read as [`you`](#who-you-is).
 
 While a review is being posted, a `set` of a comment's `text` or `suggestion` is refused, since the post already read its drafts. The post holds `<file>.post` beside the file from reading the drafts until it ends. A batch with such a `set` holds it too while it writes.
 

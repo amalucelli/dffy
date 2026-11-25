@@ -155,8 +155,8 @@ keybind = leader:z=toggle_wrap
 | Action | Keys | Command panel | Description |
 |---|---|---|---|
 | `toggle_watch` | `w` | `w` | Watch for changes |
-| `take_checkpoint` |  | `;` | Take a checkpoint of the working tree: its files as plain dffy lists them, staged or not and untracked, kept under a local ref of this worktree, the last 5 of them; starting Fix with agent takes one too |
-| `since_checkpoint` | `'` | `'` | Show only what changed since the latest checkpoint, such as an agent's turn since Fix with agent started it, or the diff shown before again; the status bar says how long ago it was taken |
+| `take_checkpoint` |  | `;` | Take a checkpoint of the working tree: its files as plain dffy lists them, staged or not and untracked, kept under a local ref of this worktree, the last 5 of them; handing threads to an agent takes one too |
+| `since_checkpoint` | `'` | `'` | Show only what changed since the latest checkpoint, such as an agent's turn since threads were handed to it, or the diff shown before again; the status bar says how long ago it was taken |
 
 ### Comments
 
@@ -185,8 +185,9 @@ keybind = leader:z=toggle_wrap
 |---|---|---|---|
 | `open_terminal` |  | `.` | Open a new tab in your terminal, or a window where that's all it offers, at the working tree's root; where dffy can't, it copies a cd there instead |
 | `ask_agent` | `a`; `a` on a thread | `a` | Ask a coding agent, through the agent plugin dffy-agent, about the focused thread: write your question in a reply box, which enter sends with the thread to the agent that answered last, else the default one; enter on the empty box asks about the thread as it is, and esc keeps the question without asking. Elsewhere, write the question on the selected lines, or the line v would start on, in a text box, and enter asks. The answer comes as the agent's reply, with a suggestion when it proposes a change; esc on the thread stops it. A comment you write starting @ and an agent's name, as @name, asks that agent too (experimental, see agent) |
-| `fix_with_agent` | `f` on a thread | `&` | On a thread, or the selected lines with a note you write first: start your coding agent in a new tab, or here until it exits, pointed at the thread to change what it asks and reply in it |
-| `send_open_threads` |  | `^` | Take a checkpoint, then start your coding agent as fix with agent does, pointed at every open thread of yours in view (those you started or replied in) to change what each asks and reply in each; since checkpoint then shows its turn |
+| `fix_with_agent` | `f` on a thread | `&` | On a thread, or the selected lines with a note you write first: send it to the coding agent's session listening in this working tree, else start your coding agent in a new tab, or here until it exits, pointed at the thread to change what it asks and reply in it |
+| `send_open_threads` |  | `^` | Take a checkpoint, then hand over as fix with agent does, to a listening session or your coding agent, every open thread of yours in view (those you started or replied in) to change what each asks and reply in each; since checkpoint then shows its turn |
+| `confirm_send_open_threads` | `h` |  | Send open threads, asking first and naming the session or the new agent they go to: enter sends, any other key keeps them. With several sessions and none of them clear, the list to pick from opens instead |
 
 ### Review
 
@@ -237,7 +238,7 @@ While a comment thread is focused in the diff, or selected in the comments panel
 | `x` | `resolve` | On a thread: resolve it, or reopen it |
 | `A` | `adopt` | On a thread: someone else's comments in it not posted, as an agent's, become your drafts, which posting sends under your name |
 | `s` | `apply_suggestion` | On a thread: put its suggestion, the one last clicked or else its last, in place of the lines it's on in the working tree, refused when they changed since; an unstaged change, which discard undoes. On one applied already, put back the lines it replaced |
-| `f` | `fix_with_agent` | On a thread, or the selected lines with a note you write first: start your coding agent in a new tab, or here until it exits, pointed at the thread to change what it asks and reply in it |
+| `f` | `fix_with_agent` | On a thread, or the selected lines with a note you write first: send it to the coding agent's session listening in this working tree, else start your coding agent in a new tab, or here until it exits, pointed at the thread to change what it asks and reply in it |
 | `o` | `open_on_host` | On a thread: open it on its code host, in the browser |
 
 ## In a conflicted file

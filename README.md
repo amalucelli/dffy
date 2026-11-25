@@ -23,6 +23,23 @@ brew install --cask amalucelli/tap/dffy
 curl -fsSL https://raw.githubusercontent.com/amalucelli/dffy/main/install.sh | sh
 ```
 
+With every [plugin](#plugins):
+
+```sh
+brew install --cask \
+  amalucelli/tap/dffy \
+  amalucelli/tap/dffy-render-markdown \
+  amalucelli/tap/dffy-render-mermaid \
+  amalucelli/tap/dffy-review-github \
+  amalucelli/tap/dffy-agent
+# or
+curl -fsSL https://raw.githubusercontent.com/amalucelli/dffy/main/install.sh | sh -s -- \
+  --plugin markdown \
+  --plugin mermaid \
+  --plugin review-github \
+  --plugin agent
+```
+
 Then try it in any repository: `dffy HEAD~10`. [install.md](docs/install.md) has mise, building from source and shell completions.
 
 ## Usage
@@ -66,9 +83,7 @@ Plugins are separate programs that dffy runs. All are experimental.
 | `dffy-review-github` | GitHub pull request reviews: `dffy pr 123`, threads inline, post your review. Needs [`gh`](https://cli.github.com), logged in. | `brew install --cask amalucelli/tap/dffy-review-github` |
 | `dffy-agent` | Ask (`a`): Claude Code, Codex or Pi answers a review thread as a reply in it, read-only, with a suggestion when it proposes a change. Needs `claude`, `codex` or `pi`, logged in. | `brew install --cask amalucelli/tap/dffy-agent` |
 
-Or with the install script: `… | sh -s -- --plugin markdown --plugin mermaid --plugin review-github --plugin agent`.
-
-Then turn the renderers on in `~/.config/dffy/config`:
+[Install](#install) has one command for all of them. Then turn the renderers on in `~/.config/dffy/config`:
 
 ```
 render = md:markdown mmd:mermaid mermaid:mermaid
@@ -77,7 +92,7 @@ render = md:markdown mmd:mermaid mermaid:mermaid
 - `r` switches a Markdown or Mermaid file between its lines and its rendered form.
 - `dffy-review-github` needs no config line. Once it's the only review plugin on `PATH`, `dffy pr 123` opens a pull request, and plain `dffy` on a branch with an open PR brings in its comments. `review = none` turns it off.
 - `dffy-agent` needs no config line. Once it's on `PATH`, `a` on a thread asks.
-- Fix with agent (`f` on a thread) needs no plugin. It hands the thread to Claude Code, Codex, Pi or Amp in a new tab, or to a session already running and [listening](docs/viewer.md#sending-to-a-running-session). `h` does it with all your open threads.
+- Fix with agent (`f` on a thread) hands the thread to Claude Code, Codex, Pi or Amp in a new tab with `dffy-agent`, or without it to a session already running and [listening](docs/viewer.md#sending-to-a-running-session). `h` does it with all your open threads.
 - `dffy doctor` checks that each plugin is found, and that `gh` and the agents are logged in.
 
 [plugins.md](docs/plugins.md) has the details.

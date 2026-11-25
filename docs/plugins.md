@@ -30,11 +30,16 @@ A renderer draws a file in its rendered form, such as Markdown with its headings
    Each dffy release ships both as separate downloads:
 
    ```sh
-   brew install --cask amalucelli/tap/dffy-render-markdown amalucelli/tap/dffy-render-mermaid     # or:
-   curl -fsSL https://raw.githubusercontent.com/amalucelli/dffy/main/install.sh | sh -s -- --plugin markdown --plugin mermaid
+   brew install --cask \
+     amalucelli/tap/dffy-render-markdown \
+     amalucelli/tap/dffy-render-mermaid
+   # or
+   curl -fsSL https://raw.githubusercontent.com/amalucelli/dffy/main/install.sh | sh -s -- \
+     --plugin markdown \
+     --plugin mermaid
    ```
 
-   The program must be on `PATH`. [install.md](install.md#plugins) also covers `cargo install --git`. From a clone, `task install:plugins` puts both in `~/.local/bin`.
+   The program must be on `PATH`. [install.md](install.md#plugins) also covers `cargo install --git`. From a clone, `task install:plugins` puts every plugin in `~/.local/bin`.
 
 2. Map file types to it by extension in the config file:
 
@@ -260,7 +265,14 @@ dffy runs one plugin process in the background for as long as it shows the repos
 
 ### Enabling one
 
-1. Install it. `dffy-review-github` comes from this repository, and [install.md](install.md#plugins) covers it. It needs [`gh`](https://cli.github.com), logged in.
+1. Install it. `dffy-review-github` comes from this repository, and [install.md](install.md#plugins) has every way to install it. It needs [`gh`](https://cli.github.com), logged in.
+
+   ```sh
+   brew install --cask amalucelli/tap/dffy-review-github
+   # or
+   curl -fsSL https://raw.githubusercontent.com/amalucelli/dffy/main/install.sh | sh -s -- --plugin review-github
+   ```
+
 2. Open a review with the plugin's command: `dffy pr <number>` for dffy-review-github, or `dffy pr` for the current branch's. [viewer.md](viewer.md#code-host-reviews) covers reviewing it.
 
 With `review` unset, or `review = auto`, dffy uses the only `dffy-review-<name>` program on `PATH`. With several installed it uses none, and `dffy doctor` lists them. `review = <name>` picks one, `review = none` turns review plugins off, and `--review <name|auto|none>` does either for one run. The flag wins over the config.
@@ -567,7 +579,15 @@ The agent can read and search, but can't write, run arbitrary commands or reach 
 
 For [Fix with agent](viewer.md#fixing-with-an-agent), the plugin also says how to start each installed agent interactively on a thread, in its normal mode. Claude Code, Codex and Pi get the thread's prompt as their argument, and Amp gets it on the clipboard. dffy knows no agent by name, so Fix with agent needs the plugin too.
 
-`dffy-agent` comes from this repository, and [install.md](install.md#plugins) covers it. It needs `claude`, `codex` or `pi` on `PATH`, logged in, and nothing else: no SDK, no Node.
+`dffy-agent` comes from this repository, and [install.md](install.md#plugins) has every way to install it:
+
+```sh
+brew install --cask amalucelli/tap/dffy-agent
+# or
+curl -fsSL https://raw.githubusercontent.com/amalucelli/dffy/main/install.sh | sh -s -- --plugin agent
+```
+
+It needs `claude`, `codex` or `pi` on `PATH`, logged in, and nothing else: no SDK, no Node.
 
 ### The agents and their recipes
 

@@ -8,6 +8,23 @@ brew install --cask amalucelli/tap/dffy
 curl -fsSL https://raw.githubusercontent.com/amalucelli/dffy/main/install.sh | sh
 ```
 
+With every [plugin](#plugins):
+
+```sh
+brew install --cask \
+  amalucelli/tap/dffy \
+  amalucelli/tap/dffy-render-markdown \
+  amalucelli/tap/dffy-render-mermaid \
+  amalucelli/tap/dffy-review-github \
+  amalucelli/tap/dffy-agent
+# or
+curl -fsSL https://raw.githubusercontent.com/amalucelli/dffy/main/install.sh | sh -s -- \
+  --plugin markdown \
+  --plugin mermaid \
+  --plugin review-github \
+  --plugin agent
+```
+
 ## Install script
 
 The script downloads the release archive for your OS and architecture, checks it against the release's `checksums.txt`, and puts `dffy` in `~/.local/bin`. It needs `curl` or `wget`, and `sha256sum` or `shasum`. It never asks for root.
@@ -31,7 +48,7 @@ The Linux binaries link glibc, so the script stops on musl systems such as Alpin
 mise use -g github:amalucelli/dffy
 ```
 
-mise installs from the same GitHub release archives.
+mise installs from the same GitHub release archives. [Plugins](#plugins) has the config that adds the plugins.
 
 ## From source
 
@@ -48,10 +65,43 @@ That puts `dffy` in `~/.cargo/bin`. From a clone, `task install` runs `cargo ins
 The experimental plugins are separate binaries: the renderers `dffy-render-markdown` and `dffy-render-mermaid`, the review plugin `dffy-review-github`, and the agent plugin `dffy-agent`. Each dffy release ships them at the same version, outside dffy's archive and cask. Install the ones you want:
 
 ```sh
-brew install --cask amalucelli/tap/dffy-render-markdown amalucelli/tap/dffy-render-mermaid amalucelli/tap/dffy-review-github amalucelli/tap/dffy-agent
-curl -fsSL https://raw.githubusercontent.com/amalucelli/dffy/main/install.sh | sh -s -- --plugin markdown --plugin mermaid --plugin review-github --plugin agent
-cargo install --locked --git https://github.com/amalucelli/dffy dffy-render-markdown dffy-render-mermaid dffy-review-github dffy-agent
+brew install --cask \
+  amalucelli/tap/dffy-render-markdown \
+  amalucelli/tap/dffy-render-mermaid \
+  amalucelli/tap/dffy-review-github \
+  amalucelli/tap/dffy-agent
+# or
+curl -fsSL https://raw.githubusercontent.com/amalucelli/dffy/main/install.sh | sh -s -- \
+  --plugin markdown \
+  --plugin mermaid \
+  --plugin review-github \
+  --plugin agent
+# or
+cargo install --locked --git https://github.com/amalucelli/dffy \
+  dffy-render-markdown \
+  dffy-render-mermaid \
+  dffy-review-github \
+  dffy-agent
 ```
+
+With mise, each plugin gets a name of its own for dffy's repository, in `~/.config/mise/config.toml`, then `mise install`:
+
+```toml
+[tool_alias]
+dffy-render-markdown = "github:amalucelli/dffy"
+dffy-render-mermaid = "github:amalucelli/dffy"
+dffy-review-github = "github:amalucelli/dffy"
+dffy-agent = "github:amalucelli/dffy"
+
+[tools]
+"github:amalucelli/dffy" = { version = "latest", matching = "dffy_" }
+dffy-render-markdown = { version = "latest", matching = "dffy-render-markdown_" }
+dffy-render-mermaid = { version = "latest", matching = "dffy-render-mermaid_" }
+dffy-review-github = { version = "latest", matching = "dffy-review-github_" }
+dffy-agent = { version = "latest", matching = "dffy-agent_" }
+```
+
+From a clone, `task install:plugins` puts all four in `~/.local/bin`.
 
 - The script installs the plugins next to dffy and checks them against the release's `checksums.txt`.
 - dffy finds plugins on your `PATH`.
@@ -59,6 +109,15 @@ cargo install --locked --git https://github.com/amalucelli/dffy dffy-render-mark
 - `dffy-agent` needs Claude Code (`claude`), Codex (`codex`) or Pi (`pi`), logged in.
 
 [plugins.md](plugins.md) covers turning them on.
+
+### Claude Code
+
+dffy's plugin for Claude Code is a plugin of Claude Code's, installed with its CLI. It makes each session listen for the threads you send from the viewer ([agents.md](agents.md#claude-code)):
+
+```sh
+claude plugin marketplace add amalucelli/dffy
+claude plugin install dffy@dffy
+```
 
 ## Shell completions
 

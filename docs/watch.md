@@ -47,13 +47,21 @@ $ dffy daemon stop
 stopped dffyd (pid 2048555)
 ```
 
-The first viewer or `dffy comments listen` starts dffyd, with nothing to set up. It stays while a viewer watches or is registered with the control API, or a session listens there for threads, and exits a minute after the last one leaves. It's detached from whoever starts it: it runs in a session of its own and isn't their descendant, so closing a terminal, or an agent that ends by killing every process it started, leaves it running. Only the watcher is shared: each viewer reads git and computes diffs on its own, and printed output and the pager never contact the broker.
+The first viewer or `dffy comments listen` starts dffyd, with nothing to set up. It stays while a viewer watches or is registered with the control API, or a session listens there for threads. It exits a minute after the last one leaves.
+
+It's detached from whoever starts it: it runs in a session of its own and isn't their descendant. Closing a terminal leaves it running, and so does an agent that ends by killing every process it started.
+
+Only the watcher is shared. Each viewer reads git and computes diffs on its own, and printed output and the pager never contact the broker.
 
 The socket is `$XDG_RUNTIME_DIR/dffy/broker-v<N>.sock`, or under `$TMPDIR/dffy-<uid>/` when `XDG_RUNTIME_DIR` isn't set. The directory must belong to you and be closed to everyone else (mode `0700`). If it isn't, for instance because another user created `/tmp/dffy-<uid>` first, each viewer watches by itself and the status bar says why.
 
 `<N>` is the protocol version, so dffy only talks to a broker that speaks its protocol. After an upgrade, old and new brokers run side by side until the old one goes idle. If the broker can't be started or reached, or goes away, each viewer watches by itself and the status bar notes it. A viewer the broker can't keep up with is dropped and watches by itself too.
 
-`dffy daemon stop` is for debugging, or for replacing a broker left over from an older build. Viewers watching through it carry on by themselves. While a viewer is open in a working tree or a session listens, dffyd starts again within moments, as each registers or listens again and starts the `dffy` it runs: the program at its own path, which an upgrade in place replaced. So after an upgrade, stop dffyd and reopen viewers and sessions. A viewer from a dffy that doesn't register again can't be driven until it's reopened. `dffy doctor` reports whether the broker runs, whether it's from the same build as the `dffy` asking, and whether any repository is being polled.
+`dffy daemon stop` is for debugging, or for replacing a broker left over from an older build. Viewers watching through it carry on by themselves. While a viewer is open in a working tree or a session listens, dffyd starts again within moments, because each registers or listens again and starts the `dffy` it runs. That's the program at its own path, which an upgrade in place replaced.
+
+So after an upgrade, stop dffyd and reopen viewers and sessions. A viewer from a dffy that doesn't register again can't be driven until it's reopened.
+
+`dffy doctor` reports whether the broker runs, whether it's from the same build as the `dffy` asking, and whether any repository is being polled.
 
 ## Linux: the inotify limit
 

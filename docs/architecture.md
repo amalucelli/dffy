@@ -39,7 +39,7 @@ Layer 1 is the exception. `highlight` and `structural` store results through `ca
 | `highlight` | tree-sitter highlighting of the requested lines, and a file's two sides prepared for it. The grammar registry (`Registry`) is a value the host builds and passes in, with the 30 bundled grammars as `Registry::builtin`. Matching a file to a language reads only names and extensions. A grammar loads on its language's first parse or query compile. Each grammar has an identity that goes into cache keys. |
 | `structural` | The syntax-aware diff: anchoring, per-region matching, the result cache. |
 | `conflict` | Merge conflicts in a conflicted file: the marker rule, the regions the markers bound (settled by the index's sides where they read two ways), a choice per region, the text the choices resolve to, and the preview's hunks. |
-| `git` | Revision resolution (through gix), streaming change enumeration, content loading. A `Snapshot` is one side of a diff as a whole: a tree, the index or the working tree. `Repo::list_paths` lists its files in git's order, and `Repo::side_at` finds one path in it. `DiffSpec::snapshots` gives a diff's two. `FileChange::unchanged` is one side compared with itself, which `Repo::file_diff` reads once and finds no hunks in. `git::worktree_file` gives the mode of a repository-relative path in the working tree, or `None` where git wouldn't track a file: a missing path or a directory, a path under a directory that is a symbolic link, an absolute path, one with an empty, `.` or `..` component, or one inside `.git` in any case. A path from outside git, such as a comment's, is safe to read and write once it passes. |
+| `git` | Revision resolution (through gix), streaming change enumeration, content loading, and one side of a diff as a whole ([below](#git)). |
 | `git::spec` | `git diff`-style arguments resolved to the two sides of a diff. |
 | `git::tree` | Tree-to-tree and tree-to-index diffs as ordered merge-joins that skip equal subtrees. |
 | `git::status` | The working-tree side: a parallel stat scan of the index in index order, and the untracked walk. |
@@ -50,11 +50,92 @@ Layer 1 is the exception. `highlight` and `structural` store results through `ca
 | `git::paths` | Two files or folders compared outside git, behind the same `Repo` handle. It walks both trees in step. A worker per core stats and compares files, and results come back in path order. |
 | `watch` | The file watcher: inotify and FSEvents backends, coalescing, ignore rules, polling. |
 | `cache` | The content-addressed disk cache shared by every dffy process. |
-| `document` | A diff as a frontend shows it, one file at a time. `Document` holds every entry (files, and a piped log's commits) with its prepared diff, revealed lines, counts, version, saved position and rendered view. It owns the position and navigation by row, change and file, and the syntax-diff, full-text and rendered toggles. It keeps the choices on a conflicted file's regions, which the diff then previews, evicts the least recently shown diffs, and holds the search's matches. `Document::missing` is the work the rows about to be shown still lack. A move that needs the host's screen returns a `Settle` the host finishes. `File` is one entry's diff: its parts (hunks and gaps of unchanged lines), rows per arrangement or side read, gap reveal, the overview's marks, search, and a rendered view's mapping to its source. `File::prepare` is the per-file work, split per file, hunk and gap so a host runs only what it draws. It reads no files but the cache's and starts no threads. The host fetches content and schedules the work. An entry's `Source::Unchanged` is a file the diff doesn't list, shown whole for what's on it, such as a file with comments: `Document::show_unchanged` adds it after the diff's files, its change is `FileChange::unchanged`, and `Prepare::unchanged` builds it as one gap of every line, always shown. It stays through `Document::replace` until a refreshed list has its path, and then it's that file's entry. |
-| `document::blocks` | Rows a host inserts among a file's rows. A block is an id, where it hangs (under the first row, under the row showing a line of one side, or under the last row) and plain text. Blocks are rows of the row model, so `Pos`, movement, `Document::missing`, revealing and the full-text toggle count them, and a position on one stays put when rows change around it. Blocks hung at one place are parted by the blank rows `Arrange::parting` asks for. A block on a hidden line hangs under its gap's separator. Heights come from the host through `Arrange::measure`, asked only for the parts a call touches and kept per block and width until the host calls `Document::remeasure`. `Document::relayout` keeps the position on the line or block row it showed. Search reads block text as a second list of matches placed among the lines' (`Matches::get` goes through both in order), and `Document::step_block` walks blocks across files. What a block shows is the host's. |
-| `annotation` | Ranges of a file's lines that something outside the diff holds on to (the viewer's comments are one source). Each is recorded with its side, its lines and the text around them. On a version of the file it lands at its recorded lines when the text still matches, else where its lines and context appear once within 1,000 lines, else it's lost. `AnnotationSet` stamps each path with the generation its annotations last changed at, so a stale placement is detected and a change to one path re-places that path alone. Placement reads only the diff's two sides, so the host runs it off its main thread. `Document::reveal_annotations` then opens the gap lines around each placed one. What an annotation says is the host's. |
-| `navigate` | Go-to-definition at one side of a diff, by matching names, resolved as far as the asking file tells. A `Navigator` lists the side's files (for the working tree, the diff's other snapshot with its changes laid over it) and answers a lookup from the asking file, what it includes or `use`s and the diff's nearest files of its language, read from the symbol cache or parsed on demand, the asking file always and first, the rest within 100ms in all (what's left, and a file too slow to parse, go first in the index build), then from the index of every file of a language with a tags query, read through a posting of each name to the files defining it. A lookup can be cancelled between files. An `#include` resolves where a compiler of the asking file looks first: next to the including file, the `include/` of each folder above it, the asking file's architecture's headers (x86's outside `arch/`), then `include/`. Other languages' imports are mapped onto the side's paths by each one's convention (`navigate::imports`), and followed through the imported files' re-exports. The host builds the index a chunk at a time on its own threads, one chunk per symbol cache pack, so a build resumes where it stopped, and a lookup answers from what's built so far and says how far that is. Navigators made with one `Shared` store, both sides of a diff and those made again after a reload, hold each blob's definitions once. Candidates rank by the same file, then included or imported files, then the same folder or crate, then the rest, a member of a type the asking file names first within each, other architectures after the asking file's, re-exports after every definition, and say whether their file changed in the range and whether the diff touches their lines; a lookup lists the best 200. Within a rank, vendored and generated code goes last, a test's after other code unless the asking file is a test's, and the asking file's package (by its nearest manifest) first. `navigate::resolve` then orders a lookup's candidates by what the asking file says of the name: an import of it pins the definition it names, by the name it had where a renamed import or re-export (whose original name the symbol cache keeps) changed it, through up to 4 re-exports; a module or a namespace imported is its file; a Rust `mod x;` is its file. Given the use's place (`Navigator::lookup_at`), which tells a member from a name of its own: a local or a parameter it names in the asking file comes first (`highlight::locals`, by each language's `locals.scm`); a member is looked for first in the type its receiver has there (declared, constructed, `self`'s or `this`'s, or for a call's value the type the index has the called function declared to return, one hop) or in the module it names; a Go package is its import line, and from the import, or from a `package` clause, its clause with the package's doc comment; a JavaScript package or a Go package outside the module is its import line; and a Rust `name!` is a macro. The asking file is parsed only for a lookup with a place, once, and the last 4 are kept. A whole-word text search at the side is the fallback for names with no definition found. The working tree's changed files are extracted in memory and never cached. Whether a navigator still answers for a diff read again is the core's call, `Navigator::refit`, which every host uses: it compares a fingerprint of what the navigator answers from (the snapshots, each change's ids, and a stat of each working-tree file without one), keeps a tree's or an unmoved index's navigator by taking the changes in place, and otherwise says to make another. `navigate::names` gives the names on a line of code for a frontend to offer, past each language's keywords, literals, comments and an `#include`'s file. `Navigator::references` searches a side for a name's uses, a step of files at a time so a host streams them and stops between files: closest files first, past comments and strings (those over several lines too, followed per language by `navigate::names::Comments`) and the line inside each definition that names it, the lines of the first 200 files with one listed, at most 1000 a file, and the rest counted. A search steps only with the navigator that made it. |
+| `document` | A diff as a frontend shows it, one file at a time ([below](#document)). |
+| `document::blocks` | Rows a host inserts among a file's rows ([below](#documentblocks)). |
+| `annotation` | Ranges of a file's lines that something outside the diff holds on to, and where they land on a version of the file ([below](#annotation)). The viewer's comments are one source. |
+| `navigate` | Go-to-definition at one side of a diff, by matching names, resolved as far as the asking file tells ([below](#navigate)). |
 | `suggest` | Closest-name suggestions for "did you mean" hints. |
+
+#### `git`
+
+- A `Snapshot` is one side of a diff as a whole: a tree, the index or the working tree. `DiffSpec::snapshots` gives a diff's two. `Repo::list_paths` lists a snapshot's files in git's order, and `Repo::side_at` finds one path in it.
+- `FileChange::unchanged` is one side compared with itself, which `Repo::file_diff` reads once and finds no hunks in.
+- `git::worktree_file` gives the mode of a repository-relative path in the working tree, or `None` where git wouldn't track a file: a missing path or a directory, a path under a directory that is a symbolic link, an absolute path, one with an empty, `.` or `..` component, or one inside `.git` in any case. A path from outside git, such as a comment's, is safe to read and write once it passes.
+
+#### `document`
+
+`Document` holds every entry (files, and a piped log's commits) with its prepared diff, revealed lines, counts, version, saved position and rendered view.
+
+- It owns the position and navigation by row, change and file, and the syntax-diff, full-text and rendered toggles.
+- It keeps the choices on a conflicted file's regions, which the diff then previews.
+- It evicts the least recently shown diffs, and holds the search's matches.
+- `Document::missing` is the work the rows about to be shown still lack.
+- A move that needs the host's screen returns a `Settle` the host finishes.
+
+`File` is one entry's diff: its parts (hunks and gaps of unchanged lines), rows per arrangement or side read, gap reveal, the overview's marks, search, and a rendered view's mapping to its source. `File::prepare` is the per-file work, split per file, hunk and gap so a host runs only what it draws. It reads no files but the cache's and starts no threads. The host fetches content and schedules the work.
+
+An entry's `Source::Unchanged` is a file the diff doesn't list, shown whole for what's on it, such as a file with comments. `Document::show_unchanged` adds it after the diff's files. Its change is `FileChange::unchanged`, and `Prepare::unchanged` builds it as one gap of every line, always shown. It stays through `Document::replace` until a refreshed list has its path, and then it's that file's entry.
+
+#### `document::blocks`
+
+A block is an id, where it hangs (under the first row, under the row showing a line of one side, or under the last row) and plain text. What a block shows is the host's.
+
+- Blocks are rows of the row model, so `Pos`, movement, `Document::missing`, revealing and the full-text toggle count them. A position on one stays put when rows change around it.
+- Blocks hung at one place are parted by the blank rows `Arrange::parting` asks for. A block on a hidden line hangs under its gap's separator.
+- Heights come from the host through `Arrange::measure`, asked only for the parts a call touches. They're kept per block and width until the host calls `Document::remeasure`. `Document::relayout` keeps the position on the line or block row it showed.
+- Search reads block text as a second list of matches placed among the lines' (`Matches::get` goes through both in order).
+- `Document::step_block` walks blocks across files.
+
+#### `annotation`
+
+Each annotation is recorded with its side, its lines and the text around them. What it says is the host's. On a version of the file it lands at its recorded lines when the text still matches, else where its lines and context appear once within 1,000 lines, else it's lost.
+
+- `AnnotationSet` stamps each path with the generation its annotations last changed at. A stale placement is detected, and a change to one path re-places that path alone.
+- Placement reads only the diff's two sides, so the host runs it off its main thread. `Document::reveal_annotations` then opens the gap lines around each placed one.
+
+#### `navigate`
+
+**Where a lookup reads.** A `Navigator` lists the side's files. For the working tree, that's the diff's other snapshot with its changes laid over it. It answers a lookup from two places, in order:
+
+1. The asking file, what it includes or `use`s, and the diff's nearest files of its language, read from the symbol cache or parsed on demand. The asking file is always read, and first. The rest get 100ms in all. What's left, and a file too slow to parse, go first in the index build.
+2. The index of every file of a language with a tags query, read through a posting of each name to the files defining it.
+
+A lookup can be cancelled between files. The working tree's changed files are extracted in memory and never cached. A whole-word text search at the side is the fallback for names with no definition found.
+
+**Imports.** An `#include` resolves where a compiler of the asking file looks first: next to the including file, the `include/` of each folder above it, the asking file's architecture's headers (x86's outside `arch/`), then `include/`. Other languages' imports are mapped onto the side's paths by each one's convention (`navigate::imports`), and followed through the imported files' re-exports.
+
+**The index.** The host builds it a chunk at a time on its own threads, one chunk per symbol cache pack, so a build resumes where it stopped. A lookup answers from what's built so far and says how far that is. Navigators made with one `Shared` store, both sides of a diff and those made again after a reload, hold each blob's definitions once.
+
+**Ranking.** Candidates rank by the same file, then included or imported files, then the same folder or crate, then the rest. Re-exports come after every definition. Within a rank:
+
+1. Vendored and generated code goes last.
+2. A member of a type the asking file names goes first.
+3. A test's goes after other code, unless the asking file is a test's.
+4. The asking file's package (by its nearest manifest) goes first.
+5. Other architectures go after the asking file's.
+
+Candidates say whether their file changed in the range and whether the diff touches their lines. A lookup lists the best 200.
+
+**What the asking file says.** `navigate::resolve` then orders a lookup's candidates by what the asking file says of the name:
+
+- An import of it pins the definition it names, by the name it had where a renamed import or re-export changed it, through up to 4 re-exports. The symbol cache keeps a renamed re-export's original name.
+- A module or a namespace imported is its file, and a Rust `mod x;` is its file.
+
+Given the use's place (`Navigator::lookup_at`), it tells a member from a name of its own:
+
+- A local or a parameter it names in the asking file comes first (`highlight::locals`, by each language's `locals.scm`).
+- A member is looked for first in the type its receiver has there, or in the module it names. The type is declared, constructed, `self`'s or `this`'s, or for a call's value the type the index has the called function declared to return, one hop.
+- A Go package is its import line, and from the import, or from a `package` clause, its clause with the package's doc comment.
+- A JavaScript package or a Go package outside the module is its import line.
+- A Rust `name!` is a macro.
+
+The asking file is parsed only for a lookup with a place, once, and the last 4 are kept.
+
+**Reloads.** Whether a navigator still answers for a diff read again is the core's call, `Navigator::refit`, which every host uses. It compares a fingerprint of what the navigator answers from: the snapshots, each change's ids, and a stat of each working-tree file without one. It keeps a tree's or an unmoved index's navigator by taking the changes in place, and otherwise says to make another.
+
+**Names and references.** `navigate::names` gives the names on a line of code for a frontend to offer, past each language's keywords, literals, comments and an `#include`'s file.
+
+`Navigator::references` searches a side for a name's uses, a step of files at a time, so a host streams them and stops between files. It goes closest files first. It skips comments and strings (those over several lines too, followed per language by `navigate::names::Comments`) and the line inside each definition that names it. It lists the lines of the first 200 files with one, at most 1000 a file, and counts the rest. A search steps only with the navigator that made it.
 
 ### `dffy`
 
@@ -108,15 +189,41 @@ The viewer's submodules, under `tui`:
 
 | Submodule | What it owns |
 |---|---|
-| `app` | State and event handling. Input reaches the overlays, the panels and the key tables in a fixed order, and each action is dispatched from here. `app::threads` is the comment threads (the comments file, placing threads, writing comments, the thread's keys, the comments panel). `app::search` is the diff's search, `app::mouse` clicks, drags and the right-click menu, `app::command_panel` the leader key's panel, and `app::draw` a frame's chrome and status bar. `app::staging` hands the lines of uncommitted changes to the loop to stage, unstage or discard, and asks before a discard. `app::checkpoint` has the loop take a checkpoint on its own thread, including before threads are handed to an agent. It switches the list to the changes since the latest checkpoint and back, as a new range. `app::review` is review mode's keys and overlays, the review picker and the post dialog, over `review::session`, whose effects it carries out. Updating a review or opening another goes through the change-set thread as a new range, the way watch mode's refreshes do. `app::control` carries out the control API's commands, which arrive as `Event::Control`. It answers requests waiting for a file's diff once the diff is in, and pushes subscribed events. `app::listeners` is the sessions listening for threads in the view's working tree, which of them a hand-over goes to, and the list to pick from. `app::peek` is go to definition: a navigator per version of the diff, made on the first ask about it from everything that differs between the diff's snapshots, whatever paths the view lists, the definitions read shared between them; after a refresh, the peek's version brought up to date at once (a moved version made again, the old navigator kept until the new one's index is built; one that stayed taking the changes again) and the other's on its next ask; the index build, one pool job at a time behind every other; the lookup, cancelled by the next; the peek's keys; and dropping the navigators ten minutes after the last peek, on a deadline the loop sleeps until. |
+| `app` | State and event handling ([below](#the-viewers-app)). |
 | `comments` | Drawing comment threads' boxes, and the comments panel over `review::listing`'s list. |
-| `view` | The screen layer over the core's `Document`: row heights when wrapping, scrolling and keeping the screen full, opening a file a few rows above its first change, drawing, the overview column, selections and the mouse. The shown file's threads, the text box and the go-to-definition peek are core blocks. `view::Boxes` measures each box by width (folded or not, with the text box in it) for the core and draws it a row at a time, so a frame with boxes on screen is copied until a box's displayed age changes. It reports what `Document::missing` names for the rows drawn in the last frame. `view::select` is the selections: lines, text in a comment, what's under the pointer, and copies. `view::rendered` turns a renderer's blocks into a rendered `File`. |
+| `view` | The screen layer over the core's `Document` ([below](#the-viewers-view)). |
 | `worker` | The change-set thread, and the pool that runs diffs, annotation placement, renderings, the core's `File::prepare` steps and go to definition's requests to the navigator helper off the UI thread. `app` turns the screen's `missing()` into the pool's jobs. The definitions index is built in the helper's process, not on the pool, and the helper pushes how far it is, an event the viewer takes like any other. |
 | `tree`, `picker`, `commands`, `help` | The file tree, the file picker, the command panel, the key list. |
 | `peek` | Go to definition on screen: the list of names on a line, and the peek, a block of fixed height under the line with a definition's code beside the name's definitions. |
 | `chrome` | The frame. |
 | `piped` | Diffs from a pipe: the reader thread, its backpressure, and the spill file that keeps patches out of memory until drawn. |
 | `editor` | Opening `$VISUAL` or `$EDITOR` at a line. |
+
+#### The viewer's `app`
+
+Input reaches the overlays, the panels and the key tables in a fixed order, and each action is dispatched from here.
+
+- `app::threads` is the comment threads: the comments file, placing threads, writing comments, the thread's keys, the comments panel.
+- `app::search` is the diff's search, `app::mouse` clicks, drags and the right-click menu, `app::command_panel` the leader key's panel, and `app::draw` a frame's chrome and status bar.
+- `app::staging` hands the lines of uncommitted changes to the loop to stage, unstage or discard, and asks before a discard.
+- `app::checkpoint` has the loop take a checkpoint on its own thread, including before threads are handed to an agent. It switches the list to the changes since the latest checkpoint and back, as a new range.
+- `app::review` is review mode's keys and overlays, the review picker and the post dialog, over `review::session`, whose effects it carries out. Updating a review or opening another goes through the change-set thread as a new range, the way watch mode's refreshes do.
+- `app::control` carries out the control API's commands, which arrive as `Event::Control`. It answers requests waiting for a file's diff once the diff is in, and pushes subscribed events.
+- `app::listeners` is the sessions listening for threads in the view's working tree, which of them a hand-over goes to, and the list to pick from.
+- `app::peek` is go to definition:
+  - It keeps a navigator per version of the diff, made on the first ask about it from everything that differs between the diff's snapshots, whatever paths the view lists. The definitions read are shared between them.
+  - After a refresh, the peek's version is brought up to date at once and the other's on its next ask. A version that moved is made again, with the old navigator kept until the new one's index is built. One that stayed takes the changes again.
+  - The index build is one pool job at a time, behind every other.
+  - It owns the lookup, which the next one cancels, and the peek's keys.
+  - It drops the navigators ten minutes after the last peek, on a deadline the loop sleeps until.
+
+#### The viewer's `view`
+
+It owns row heights when wrapping, scrolling and keeping the screen full, opening a file a few rows above its first change, drawing, the overview column, selections and the mouse. It reports what `Document::missing` names for the rows drawn in the last frame.
+
+- The shown file's threads, the text box and the go-to-definition peek are core blocks. `view::Boxes` measures each box by width (folded or not, with the text box in it) for the core and draws it a row at a time, so a frame with boxes on screen is copied until a box's displayed age changes.
+- `view::select` is the selections: lines, text in a comment, what's under the pointer, and copies.
+- `view::rendered` turns a renderer's blocks into a rendered `File`.
 
 ### `plugins/markdown`
 
@@ -222,7 +329,9 @@ Top-level nodes are anchored by hash first, then matching recurses only inside t
   - Highlighting doesn't wait for the walk. Until the walk is done, the title shows the hunk's heading, as it does before highlighting arrives.
   - A side whose spans come from the disk cache has its definitions stored beside them, computed when the spans were stored.
   - Scope queries compile in the background with the highlight query, in 0.3ms (Go) to 20ms (C++).
-- Definitions, for go-to-definition: a tags query dffy writes per language (`crates/dffy-core/src/highlight/queries/<language>/tags.scm`, for the 18 languages [viewer.md](viewer.md#go-to-definition) lists), with its members' containers and its re-exports, plus a table of definition macros per language in `highlight/tags.rs` (for C, `SYSCALL_DEFINE0` to `SYSCALL_DEFINE6`, `TRACE_EVENT`, `DEFINE_EVENT`, `DEFINE_FREE` and `DEFINE_*`), read from the macro's arguments because the grammar parses those uses in many shapes. A macro's definition runs to its closing parenthesis, or over the body that follows it. Attribute macros with arguments that the grammar can't parse before a function's type (for C, `__alloc_size`, `__realloc_size`, `__printf` and `__scanf`) are read as spaces for this parse only, so the function around them is found.
+- Definitions, for go-to-definition: a tags query dffy writes per language (`crates/dffy-core/src/highlight/queries/<language>/tags.scm`, for the 18 languages [viewer.md](viewer.md#go-to-definition) lists), with its members' containers and its re-exports.
+  - A table of definition macros per language in `highlight/tags.rs` adds to it (for C, `SYSCALL_DEFINE0` to `SYSCALL_DEFINE6`, `TRACE_EVENT`, `DEFINE_EVENT`, `DEFINE_FREE` and `DEFINE_*`). These are read from the macro's arguments because the grammar parses those uses in many shapes. A macro's definition runs to its closing parenthesis, or over the body that follows it.
+  - Attribute macros with arguments that the grammar can't parse before a function's type (for C, `__alloc_size`, `__realloc_size`, `__printf` and `__scanf`) are read as spaces for this parse only, so the function around them is found.
   - Each blob is parsed once for them and its definitions stored by blob id, so two revisions share their unchanged files. The walk skips function bodies, and a macro inside one that a parse error left as loose braces.
   - Sides over 512KB, judged by the object's size before it's read, have none and are stored as such. Those whose parse takes over 2s have none and are tried again. Either is reported as the reason. A tags query that doesn't compile is an error the host shows, not an empty result.
 
@@ -264,7 +373,8 @@ Top-level nodes are anchored by hash first, then matching recurses only inside t
 dffy has its own terminal layer (`term`) and uses no TUI library.
 
 - Cell grid: the screen is a double-buffered grid of styled cells. Each flush sends only the cells that changed since the last frame.
-- Scrolling: when only the diff's position changed since the last frame, the rows still on screen are copied from it, and only the rows that came into view are laid out. The terminal moves the copied rows itself with a scroll region (`CSI t;b r`) and deleted or inserted lines (`CSI n M` / `CSI n L`), so only the new rows and other changes are sent. A scroll region spans whole rows, so with the tree beside the diff, the tree's columns move too and must be sent again. The terminal scrolls only while those cells, counted a third more, are fewer than the diff's cells that moved.
+- Scrolling: when only the diff's position changed since the last frame, the rows still on screen are copied from it, and only the rows that came into view are laid out. The terminal moves the copied rows itself with a scroll region (`CSI t;b r`) and deleted or inserted lines (`CSI n M` / `CSI n L`), so only the new rows and other changes are sent.
+  - A scroll region spans whole rows, so with the tree beside the diff, the tree's columns move too and must be sent again. The terminal scrolls only while those cells, counted a third more, are fewer than the diff's cells that moved.
 - Synchronized output: every flush is wrapped in `CSI ? 2026 h` / `l`, so terminals that support it never show half a frame.
 - Input: raw termios and dffy's own parser, for input that every terminal and multiplexer passes through. The one extension is the kitty keyboard protocol's disambiguate flag, on while dffy has the terminal, so the text box can tell `shift+enter` from `enter`. Its keys read as their legacy forms, and every action has a key that works without it.
 - The one query: the background color (OSC 11), with a 200ms timeout and a dark fallback.
@@ -284,7 +394,11 @@ dffy has its own terminal layer (`term`) and uses no TUI library.
 - Keys: an entry's name hashes the dffy-core version, its kind and every input (blob ids, the grammar's identity, options), so entries never need invalidating. A grammar's identity digests its name, ABI and metadata versions, table sizes and query text. Line counts are the exception. Their records are spread over 16 entries per whitespace mode. Each entry is read once per process and rewritten with the records counted since, keeping its newest 256KB. A record never changes meaning, so losing a rewrite to another process costs only a recount.
 - Writes go through a temporary file renamed into place. Each entry has a length and a checksum.
 - Trimming: down to `cache-size` (256MB), by removing the oldest entries until 80% is left, at most every 10 minutes across processes.
-- Definitions: in `symbols/` inside the cache (`SymbolCache`, a type of its own so the shared cache can't be passed for it), with its own 128MB (or `cache-size`, if smaller), so they never evict highlight spans. It counts the blocks its entries take on disk. `dffy doctor` reports both together. A blob's definitions are kept under a digest of the blob id and the grammar's identity with the tags query, so editing a highlight query keeps them. They're packed into 256 entries by the digest's first byte, since most blobs' definitions take a few hundred bytes and an entry of their own would take a disk block. A pack is rewritten whole when something was added, merged with what other processes stored in it since it was read, with the blobs read meanwhile moved to the back. Past its share of 90% of the budget it drops its least recently used blobs, and a blob larger than the share isn't kept, so the packs stay within the budget.
+- Definitions: in `symbols/` inside the cache (`SymbolCache`, a type of its own so the shared cache can't be passed for it), with its own 128MB (or `cache-size`, if smaller), so they never evict highlight spans. It counts the blocks its entries take on disk. `dffy doctor` reports both together.
+  - A blob's definitions are kept under a digest of the blob id and the grammar's identity with the tags query, so editing a highlight query keeps them.
+  - They're packed into 256 entries by the digest's first byte, since most blobs' definitions take a few hundred bytes and an entry of their own would take a disk block.
+  - A pack is rewritten whole when something was added, merged with what other processes stored in it since it was read, with the blobs read meanwhile moved to the back.
+  - Past its share of 90% of the budget a pack drops its least recently used blobs, and a blob larger than the share isn't kept, so the packs stay within the budget.
 - Speed: a hit is 200 to 500 times faster than recomputing a syntax diff.
 
 ### State (`$XDG_STATE_HOME/dffy/state`)

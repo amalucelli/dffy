@@ -111,7 +111,9 @@ In what dffy prints for an agent, only your comments are by `you`: those with no
 
 ### What's handed over
 
-A thread handed to an agent from the viewer ([viewer.md](viewer.md#fixing-with-an-agent)) goes as one line that says how to read it, never as its text. It starts `Address dffy review thread <id>:`, or `Address the open dffy review threads:` for all of them, and names the commands to run. For a thread in the local review's file those are `dffy comments …`. For one in any other file they name it, `dffy --comments <file> comments …`, with an absolute path quoted for a shell. The file is named instead of `--session` because the [session pointer](#the-session-pointer) is whichever review any viewer of the repository opened last.
+A thread handed to an agent from the viewer ([viewer.md](viewer.md#fixing-with-an-agent)) goes as one line that says how to read it, never as its text. It starts `Address dffy review thread <id>:`, or `Address the open dffy review threads:` for all of them, and names the commands to run.
+
+For a thread in the local review's file those are `dffy comments …`. For one in any other file they name it, `dffy --comments <file> comments …`, with an absolute path quoted for a shell. The file is named instead of `--session` because the [session pointer](#the-session-pointer) is whichever review any viewer of the repository opened last.
 
 A reply belongs in the same file: `dffy --comments <file> comments apply --as <name>`.
 
@@ -278,7 +280,9 @@ It's for comments kept outside dffy's files, such as those dffy-review-github ke
 - A missing file reads as no comments. The first write creates it and its directory. The viewer creates the directory on start, to watch it.
 - A diff piped to dffy has no comments. It has only hunks, not the file text a thread is placed on, so `--show-comments` reads the repository instead.
 
-When the viewer has a code host's review open ([viewer.md](viewer.md#code-host-reviews)), it shows the review's file and also your drafts from the local file that place on the review's diff: your comments without a `ref`, with their replies. Edits to those drafts stay in the local file. So do new comments on a review that plain `dffy` found for the branch, until posted. Posting (`l` in the post dialog) moves them into the review's file first. Each gets a new `id`, keeps its replies, loses its `branch`, and is removed from the local file once the review's file has it.
+When the viewer has a code host's review open ([viewer.md](viewer.md#code-host-reviews)), it shows the review's file and also your drafts from the local file that place on the review's diff: your comments without a `ref`, with their replies. Edits to those drafts stay in the local file. So do new comments on a review that plain `dffy` found for the branch, until posted.
+
+Posting (`l` in the post dialog) moves them into the review's file first. Each gets a new `id`, keeps its replies, loses its `branch`, and is removed from the local file once the review's file has it.
 
 ### Branches
 

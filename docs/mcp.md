@@ -215,13 +215,13 @@ Writes a reply in a thread, as `dffy comments apply` does ([comments.md](comment
 
 ### `definitions`
 
-Finds where a name is defined, as the viewer's go to definition does ([viewer.md](viewer.md#go-to-definition)), through the same lookup in dffy-core. It needs no viewer. Names are matched, and resolved where the asking file's imports tell: a name defined in several places has several candidates, nearest the asking file first. Read-only.
+Finds where a name is defined, as the viewer's go to definition does ([viewer.md](viewer.md#go-to-definition)), through the same lookup in dffy-core. It needs no viewer. Names are matched, then resolved where the asking file's imports say what they mean. A name defined in several places has several candidates, nearest the asking file first. Read-only.
 
 | Input | Default | Meaning |
 |---|---|---|
 | `name` | required | The name: letters, digits and `_`. |
-| `path` | | The asking file, relative to the repository root, in a language go to definition reads ([viewer.md](viewer.md#go-to-definition) lists them): its own definitions, then what it includes or imports, then its folder or crate rank first. Without it, every definition of the name counts, by path, the first 200 listed. Another language's file is a tool error, and so is a version with no file of those languages. |
-| `line`, `column` | | Where the name is used in `path`, 1-based, in the version looked in; `column` is a byte of the line, and without it the name's first use in code on the line counts. With them the answer is much better: what the use itself names comes first, a local variable, a parameter or the import that brings the name in, and an import under another name finds what it names. They need `path`. |
+| `path` | | The asking file, relative to the repository root, in a language go to definition reads ([viewer.md](viewer.md#go-to-definition) lists them). Its own definitions rank first, then what it includes or imports, then its folder or crate. Without it, every definition of the name counts, by path, the first 200 listed. Another language's file is a tool error, and so is a version with no file of those languages. |
+| `line`, `column` | | Where the name is used in `path`, 1-based, in the version looked in. `column` is a byte of the line. Without it, the name's first use in code on the line counts. They need `path`, and make the answer much better ([below](#giving-the-place)). |
 | `side` | `new` | Which version of the diff to look in: `new` or `old`. |
 | `range`, `since_checkpoint` | uncommitted changes | The diff, as for `file_diff`. Without them, `new` is the working tree and `old` is `HEAD`. |
 | `references` | `false` | Add the lines using the name. |
@@ -236,17 +236,47 @@ Finds where a name is defined, as the viewer's go to definition does ([viewer.md
 
 | Field | Meaning |
 |---|---|
-| `candidates` | The definitions found, best first, at most 200. `start` and `end` are the definition's first and last lines, 1-based. `kind` is `function`, `method`, `macro`, `type`, `struct`, `union`, `enum`, `enumerator`, `trait`, `constant`, `static`, `variable`, `module`, or, with `line`, `local`, `parameter` or `import` for what the asking file itself defines the name as. `container` is the type a method or an item of an impl or trait is on. `changed` says the diff changes the file; `in_hunk` says it adds or removes lines inside the definition, null where that wasn't worked out (past the first few candidates). `text` is the first line. |
+| `candidates` | The definitions found, best first, at most 200 ([below](#candidates)). |
 | `total` | Definitions found, beyond those listed. |
-| `progress`, `partial` | How far the version's index of definitions is built. The first call starts the navigator helper ([navigate.md](navigate.md)), which builds it on 2 threads at a nice of 10 and keeps it in the disk cache for later runs; a helper that exits is started again on the next call, at most 3 times a minute, and one that can't start, or keeps exiting, is a tool error, `definitions unavailable: …`. While `partial` is true, a definition may be missing: the answer comes from the files built so far and from the asking file's own includes and uses, read on the spot. Ask again for the full answer. |
-| `text_match` | No definition was found, so `candidates` are up to 50 lines using the name as a whole word, `kind` null, closest files first. A call searches for about 2 seconds; the next call with the same arguments goes on with the same search. |
+| `progress`, `partial` | How far the version's index of definitions is built. While `partial` is true, a definition may be missing: the answer comes from the files built so far and from the asking file's own includes and uses, read on the spot. Ask again for the full answer. |
+| `text_match` | No definition was found, so `candidates` are up to 50 lines using the name as a whole word, `kind` null, closest files first. A call searches for about 2 seconds. The next call with the same arguments goes on with the same search. |
 | `complete` | False while asking again could list more: the index is `partial`, or the text search hasn't been through every file nor found its 50 lines. |
-| `references` | With `references`, `{"matches","total","files","complete"}`: a page of the lines using the name as a whole word, each `{"path","line","text","changed","more"}`, closest files first, in the first 200 files with one and the first 1000 lines of each; `more` counts a file's lines past those, on its last one listed. In files of the languages go to definition reads, a use in a comment or string doesn't count, a block comment over several lines included, nor the line inside each definition of the name that names it, once the index has its file. A call searches for about 2 seconds, until it has a line past the page, or until it has found the 200 files; the next call's cursor goes on with the same search. `total` and `files` count the lines and the files found so far. `complete` is true once every file was searched with the index whole; past the 200 files the rest isn't searched, so `complete` stays false and `files` is a lower bound. Null without `references`. |
+| `references` | With `references`, a page of the lines using the name ([below](#references)). Null without it. |
 | `note` | Only there when the helper couldn't keep the index in the disk cache and keeps it in memory: why. |
 
-The helper keeps the navigators of the two versions asked about last, and builds only the index of the one used last; another's build goes on once it's asked about again. After 10 minutes without a `definitions` call, the server closes the helper, which gives its memory back, as the next call of any tool starts; the next `definitions` starts another. A version is read again when the core says what it answers from moved: another revision, a file of the diff edited again, the index staged to.
-
 Two paths compared outside git, and a disk cache turned off (`cache = false`, `--no-cache`), are tool errors: the index lives in the cache.
+
+#### Giving the place
+
+With `line`, what the use itself names comes first: a local variable, a parameter or the import that brings the name in. An import under another name finds what it names.
+
+#### Candidates
+
+| Field | Meaning |
+|---|---|
+| `start`, `end` | The definition's first and last lines, 1-based. |
+| `kind` | `function`, `method`, `macro`, `type`, `struct`, `union`, `enum`, `enumerator`, `trait`, `constant`, `static`, `variable` or `module`. With `line`, also `local`, `parameter` or `import` for what the asking file itself defines the name as. |
+| `container` | The type a method or an item of an impl or trait is on. |
+| `changed` | The diff changes the file. |
+| `in_hunk` | The diff adds or removes lines inside the definition. Null where that wasn't worked out (past the first few candidates). |
+| `text` | The first line. |
+
+#### References
+
+`references` is `{"matches","total","files","complete"}`. `matches` is a page of the lines using the name as a whole word, each `{"path","line","text","changed","more"}`, closest files first. They come from the first 200 files with one and the first 1000 lines of each. `more` counts a file's lines past those, on its last one listed.
+
+- In files of the languages go to definition reads, a use in a comment or string doesn't count, a block comment over several lines included. Nor does the line inside each definition of the name that names it, once the index has its file.
+- A call searches for about 2 seconds, until it has a line past the page, or until it has found the 200 files. The next call's cursor goes on with the same search.
+- `total` and `files` count the lines and the files found so far.
+- `complete` is true once every file was searched with the index whole. Past the 200 files the rest isn't searched, so `complete` stays false and `files` is a lower bound.
+
+#### The helper
+
+The first call starts the navigator helper ([navigate.md](navigate.md)), which builds the index on 2 threads at a nice of 10 and keeps it in the disk cache for later runs. A helper that exits is started again on the next call, at most 3 times a minute. One that can't start, or keeps exiting, is a tool error, `definitions unavailable: …`.
+
+The helper keeps the navigators of the two versions asked about last, and builds only the index of the one used last. Another's build goes on once it's asked about again. A version is read again when the core says what it answers from moved: another revision, a file of the diff edited again, the index staged to.
+
+After 10 minutes without a `definitions` call, the server closes the helper, which gives its memory back, as the next call of any tool starts. The next `definitions` starts another.
 
 ### Viewer tools
 

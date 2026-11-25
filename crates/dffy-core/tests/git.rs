@@ -1179,7 +1179,15 @@ fn untouched(dir: &Path) -> (Vec<u8>, String, String) {
         git(dir, &["rev-parse", "HEAD"]),
         git(
             dir,
-            &["status", "--porcelain=v1", "-z", "-uall", "--ignored"],
+            // Without it, status may refresh the index it's read beside.
+            &[
+                "--no-optional-locks",
+                "status",
+                "--porcelain=v1",
+                "-z",
+                "-uall",
+                "--ignored",
+            ],
         ),
     )
 }

@@ -200,7 +200,7 @@ impl StatStore {
     }
 
     /// Writes the shards that gained records since they were last written,
-    /// a thread per core, once those records took [`WORTH_WRITING`] to
+    /// a thread per core, once those records took `WORTH_WRITING` to
     /// count; until then they're kept for a later flush.
     pub fn flush(&self) {
         let _flushing = self.flushing.lock().unwrap_or_else(PoisonError::into_inner);

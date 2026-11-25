@@ -336,7 +336,7 @@ impl Parsed {
     /// an error as another kind, or end top-level nodes elsewhere. So `new`
     /// is parsed from scratch when this tree has an error, when the result
     /// has one, and when `hunks` don't account for every byte of `new` (see
-    /// [`edit`]).
+    /// `edit`).
     #[must_use]
     pub fn reparse(&self, old: &Text, new: &Text, hunks: &[Hunk]) -> Option<Self> {
         if new.bytes().len() > MAX_HIGHLIGHT_BYTES {

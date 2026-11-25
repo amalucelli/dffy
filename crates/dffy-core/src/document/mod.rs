@@ -2210,7 +2210,7 @@ pub enum Content<'a> {
         line: usize,
     },
     /// A blank row parting block `id` from the block above it, both hung
-    /// at one place (see [`super::Arrange::parting`]). It's neither's.
+    /// at one place (see [`Arrange::parting`]). It's neither's.
     Parting {
         /// The block below it.
         id: BlockId,

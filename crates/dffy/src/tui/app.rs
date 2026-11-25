@@ -21,6 +21,7 @@ mod conflict;
 mod control;
 mod draw;
 mod jumps;
+mod listeners;
 mod mouse;
 mod opening;
 mod peek;
@@ -48,6 +49,7 @@ use dffy_core::git::{
 use dffy_core::highlight::Language;
 use dffy_core::watch::Notice;
 
+pub(crate) use listeners::{HandTo, Listening};
 pub(crate) use opening::Found;
 
 use super::chrome::{self};
@@ -222,6 +224,10 @@ enum Confirmed {
     Run(Action),
     /// Delete what clearing the resolved threads found when it asked.
     Clear(model::Cleared),
+    /// Send the open threads, `count` of them when it asked, to `to`:
+    /// `enter`'s to answer, once the question showed in a frame after
+    /// `frame`.
+    Send { to: To, count: usize, frame: u64 },
 }
 
 /// A suggestion being applied: what's said of it once it is, and the
@@ -258,16 +264,42 @@ pub(crate) enum Handed {
     Open { count: usize, left: usize },
 }
 
-/// Threads handed to the user's own coding agent, which the loop starts
-/// interactively.
+/// Threads handed to the user's own coding agent: a session of it that
+/// listens, else one the loop starts interactively.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Handoff {
     pub what: Handed,
     /// The comments file it's in.
     pub file: PathBuf,
-    /// That file is the review session's.
-    pub session: bool,
     pub checkout: Option<Checkout>,
+    pub to: To,
+    /// Its checkpoint is taken.
+    pub checkpointed: bool,
+}
+
+impl Handoff {
+    /// It, for `session` alone.
+    fn to(self, session: &Listening) -> Self {
+        Self {
+            to: To::Session {
+                number: session.number,
+                name: session.name.clone(),
+            },
+            ..self
+        }
+    }
+}
+
+/// Whom threads are handed to.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub(crate) enum To {
+    /// The session that listens, whichever it is, else a new agent.
+    #[default]
+    Anyone,
+    /// This session or nobody.
+    Session { number: u64, name: String },
+    /// A new agent, as the user was asked.
+    NewAgent,
 }
 
 /// What saving the text box does after, with the thread it's in.
@@ -702,6 +734,8 @@ pub(crate) struct App {
     /// The control API's requests waiting on this view, and its
     /// subscribers.
     control: control::Control,
+    /// The sessions listening for threads.
+    listeners: listeners::Listeners,
     /// Go to definition: the navigators, the lookup and the peek's state.
     navigation: peek::Navigation,
 }
@@ -903,6 +937,7 @@ impl App {
             kept: false,
             scrolled: false,
             control: control::Control::default(),
+            listeners: listeners::Listeners::default(),
             navigation: peek::Navigation::default(),
         };
         app.relayout();
@@ -1305,6 +1340,7 @@ impl App {
             .chain(self.reviewing.reload_deadline())
             .chain(self.reviewing.plan_deadline(self.comments.as_ref()))
             .chain(self.control.deadline())
+            .chain(self.listeners.deadline())
             .chain(self.checkpoint_deadline())
             .chain(self.navigation_deadline())
             .min()
@@ -1362,6 +1398,7 @@ impl App {
         self.sync_threads();
         self.arrive_conflicts();
         self.control_settle();
+        self.listeners_settle();
         self.peek_settle();
         self.jump_settle();
         self.peek_sync();
@@ -1571,7 +1608,12 @@ impl App {
             Event::AgentStarting => {
                 self.message(format!("starting {}…", plugin::agent::PROGRAM));
             }
-            Event::HandedOff { started, left } => self.handed_off(started, left),
+            Event::HandedOff {
+                started,
+                left,
+                unmarked,
+            } => self.handed_off(started, left, unmarked.as_deref()),
+            Event::HandedBack(handoff) => self.handed_back(*handoff),
             Event::Terminal { dir, opened } => return self.terminal_opened(&dir, opened),
             // The loop handles these: they need the terminal, or may start
             // the plugin's `detect`.
@@ -1962,20 +2004,26 @@ impl App {
         self.asked = Some(Instant::now());
     }
 
-    /// The input after a question in the status bar: `y` does what it
-    /// asked about, and anything else keeps things as they are.
+    /// The input after a question in the status bar: `y`, or `enter` where
+    /// it says so, does what it asked about, and anything else keeps things
+    /// as they are.
     fn answer(&mut self, input: &Input, then: Confirmed, declined: &str) -> Option<Action> {
-        if *input != Input::Key(Key::Char('y'), Mods::NONE) {
+        let yes = match then {
+            // An `enter` typed before the question showed isn't its answer.
+            Confirmed::Send { frame, .. } if frame == self.frame => None,
+            Confirmed::Send { .. } => Some(Key::Enter),
+            Confirmed::Run(_) | Confirmed::Clear(_) => Some(Key::Char('y')),
+        };
+        if yes.is_none_or(|yes| *input != Input::Key(yes, Mods::NONE)) {
             self.message(declined);
             return None;
         }
         match then {
-            Confirmed::Run(action) => Some(action),
-            Confirmed::Clear(cleared) => {
-                self.cleared(cleared);
-                None
-            }
+            Confirmed::Run(action) => return Some(action),
+            Confirmed::Clear(cleared) => self.cleared(cleared),
+            Confirmed::Send { to, count, .. } => self.send_asked(&to, count),
         }
+        None
     }
 
     #[expect(
@@ -2023,6 +2071,9 @@ impl App {
         }
         if self.navigation.names().is_some() {
             return self.names_input(&input);
+        }
+        if self.listeners.picking.is_some() {
+            return self.sessions_input(&input);
         }
         if let ControlFlow::Break(done) = self.review_input(&input) {
             return done;
@@ -2313,6 +2364,7 @@ impl App {
             Act::Comment
             | Act::AskAgent
             | Act::FixWithAgent
+            | Act::ConfirmSendOpenThreads
             | Act::Stage
             | Act::Unstage
             | Act::Discard
@@ -2343,7 +2395,9 @@ impl App {
             Act::WholeReview => self.reviewing.found_plain(),
             Act::OpenTerminal | Act::TakeCheckpoint | Act::GoToDefinition => !self.piped,
             Act::ToggleAllFiles => self.snapshot(Side::New).is_ok(),
-            Act::SendOpenThreads => !self.piped && self.open_threads() > 0,
+            Act::SendOpenThreads | Act::ConfirmSendOpenThreads => {
+                !self.piped && self.open_threads() > 0
+            }
             Act::SinceCheckpoint => {
                 !self.piped && (self.checkpoint.is_some() || self.since_checkpoint.is_some())
             }
@@ -2371,6 +2425,7 @@ impl App {
             Act::AskAgent => return self.ask_agent(),
             Act::FixWithAgent => return self.fix_with_agent(),
             Act::SendOpenThreads => self.send_open_threads(),
+            Act::ConfirmSendOpenThreads => self.ask_to_send(),
             Act::ScrollDown
             | Act::ScrollUp
             | Act::PageDown

@@ -46,26 +46,52 @@ These keys change what the diff shows:
 
 ### File view
 
-`l` shows every file as it is in one version of the diff, whole, as plain code: the newer version first, and `s` flips to the older one. The title reads as a file's, not a diff's: `file view · src/lib.rs · working tree · 3 changes`, the version named as you gave it (`working tree`, `index`, `HEAD`, `v6.1`, a short id) and the changes counted in it, or `no changes`. The status bar says which version (`reading working tree`). File view isn't remembered: the next run shows the diff, unless `file-view = true` is set in the config.
+`l` shows every file whole, as plain code, in one version of the diff. It starts on the newer version, and `s` flips to the older one.
 
-In the [command panel](#the-command-panel) one row picks among the three: `File view ‹ off ›`, `‹ working tree · your files now ›` and `‹ HEAD · last commit ›`, stepped with `h`/`l`. Where a version is picked, it says what it is: `your files now` for the working tree, `staged` for the index, `last commit` for HEAD, and `before` or `after` for the older or newer revision of a range. Two paths compared outside git go by their names alone.
+The title is a file's, not a diff's: `file view · src/lib.rs · working tree · 3 changes`. It names the version as you gave it (`working tree`, `index`, `HEAD`, `v6.1`, a short id) and counts the changes in it, or says `no changes`. The status bar says which version you're reading (`reading working tree`).
 
-Changed lines in the version read have a heavy bar, `┃`, in the gutter, as gitsigns marks them: green for added lines, blue for modified ones, red for removed ones in the older version. Unchanged lines have none.
+File view isn't remembered. The next run shows the diff, unless `file-view = true` is set in the config.
 
-The other version's lines don't show. A line edited into another has no row of its own: its bar marks the edit, and a comment on the old line hangs under the new one. The lines that pair with none, as split view pairs them, stand in a rule across the pane, in their place: `── 2 lines removed · x shows them ──` in the newer version for lines removed outright, `── 3 lines added · x shows them ──` in the older. `n` and `N` stop at every change and every rule, and a comment on a hidden line hangs under its rule.
+In the [command panel](#the-command-panel) one row steps through the three states with `h`/`l`: `File view ‹ off ›`, `‹ working tree · your files now ›` and `‹ HEAD · last commit ›`. Beside each version it says what that version is:
 
-`x` opens a change in place, as Zed does: its lines show as the diff shows them, removed lines on their red background and added ones on their green, under a rule that closes it again (`── 2 lines removed · x hides them ──`). It acts on the rule or edited line last tapped, else the first on screen, and on an opened change it closes it. A tap on a rule, or on an edited line's bar, does the same. In an opened change only the lines of the version read carry the bar, the other version's numbers are dim, and lines select, copy, stage and search as in the diff. Changes stay open until `s` flips the version, file view ends, or a reload moves the hunks.
+- `your files now` for the working tree;
+- `staged` for the index;
+- `last commit` for HEAD;
+- `before` or `after` for the older or newer revision of a range;
+- nothing for two paths compared outside git, which go by their names alone.
 
-A file the version read doesn't have shows the other version, and its title says so: an added file read in HEAD is `file view · src/new.rs · working tree · not in HEAD`, a deleted one read in the working tree `file view · src/gone.rs · HEAD · deleted in working tree`. A file the diff doesn't list is titled with the version it's from: `file view · notes.md · v6.1 · not in this diff`. A renamed file, or one whose mode alone changed, shows whole too. Two files or folders compared outside git are named as you typed them: `dffy old/ new/` reads `old/` and `new/`, a long path cut from the left with `…`.
+Changed lines in the version you're reading have a heavy bar, `┃`, in the gutter, as gitsigns marks them. It's green for added lines, blue for modified ones, and red for removed ones in the older version. Unchanged lines have none.
+
+The other version's lines don't show:
+
+- A line edited into another has no row of its own. Its bar marks the edit, and a comment on the old line hangs under the new one.
+- Lines that pair with none, as split view pairs them, are replaced by a rule across the pane. The newer version has `── 2 lines removed · x shows them ──` for lines removed outright. The older one has `── 3 lines added · x shows them ──`.
+
+`n` and `N` stop at every change and every rule. A comment on a hidden line hangs under its rule.
+
+`x` opens a change in place, as Zed does. Its lines show as the diff shows them, removed lines on their red background and added ones on their green, under a rule that closes it again (`── 2 lines removed · x hides them ──`). `x` acts on the rule or edited line last tapped, else on the first on screen. On an opened change it closes it. A tap on a rule, or on an edited line's bar, does the same.
+
+In an opened change, only the lines of the version you're reading carry the bar, and the other version's numbers are dim. Lines select, copy, stage and search as in the diff. Changes stay open until `s` flips the version, file view ends, or a reload moves the hunks.
+
+These files show differently:
+
+| File | Shows |
+|---|---|
+| Added, read in HEAD | The other version, titled `file view · src/new.rs · working tree · not in HEAD` |
+| Deleted, read in the working tree | The other version, titled `file view · src/gone.rs · HEAD · deleted in working tree` |
+| Not listed by the diff | The file, titled with the version it's from: `file view · notes.md · v6.1 · not in this diff` |
+| Renamed, or with only its mode changed | The file, whole too |
+
+Two files or folders compared outside git are named as you typed them: `dffy old/ new/` reads `old/` and `new/`. A long path is cut from the left with `…`.
 
 What changes in file view:
 
-- Search goes through the version read and the changes opened. Matches on the other version's hidden lines are counted, not gone to: `match 3/12 · 2 more in HEAD (s)`.
-- `A`, `U` and `D` with nothing selected take the whole hunk of the line, and say so. With lines selected they're refused unless the lines are in an opened change: `staging lines needs both versions; x opens the change in place`.
-- A comment, a suggestion and a copy take the version read. `s` while selecting says `file view copies the version shown`.
-- The scope line reads the version read, and a hunk's `@@` numbers don't show.
-- `X` switches whole files anyway, for when file view is off, and says so.
-- `d` and `r` work as elsewhere, on the version read.
+- Search goes through the version you're reading and the changes you opened. Matches on the other version's hidden lines are counted, but `n` and `N` don't go to them: `match 3/12 · 2 more in HEAD (s)`.
+- `A`, `U` and `D` with nothing selected take the line's whole hunk, and say so. With lines selected they're refused unless the lines are in an opened change: `staging lines needs both versions; x opens the change in place`.
+- A comment, a suggestion and a copy take the version you're reading. `s` while selecting says `file view copies the version shown`.
+- The scope line follows the version you're reading, and a hunk's `@@` numbers don't show.
+- `X` still switches whole files, for when file view is off, and says so.
+- `d` and `r` work as elsewhere, on the version you're reading.
 
 A piped diff has only its hunks, so it has no file view, and `l` says why.
 
@@ -127,17 +153,48 @@ Code and paths never reach the terminal raw. Control characters show in caret no
 
 ### Jumping back
 
-Opening a definition from a peek or a file from the picker, the tree or the all-files tree is a jump, and so is a control API request that shows a file (`view/open`, MCP's `open_in_viewer`, `comments/add`). Each one keeps the place it leaves: the file and the line at the top of the screen. `backspace` goes back there with that line at the top again, and `\` goes forward again. Moving through the tree shows the files it passes, so a file opened from the tree goes back to where the tree was entered from, and so does leaving the tree for the diff on another file than that. `n`, `f`, `g`, threads and search are moves, not jumps.
+A jump opens a file from somewhere else. These are jumps:
 
-The status bar says where each jump lands and how many places are left that way: `back to fs/namei.c:120 · 3 more`. Opening the file already shown is no jump, unless it goes to a line in it. A place whose file isn't shown any more, such as a file opened outside the diff and closed since, or whose version is another one now, is skipped and counted: `skipped 1 no longer shown`. A place is its file's path and version, so it holds when the diff's list is read again. The last 100 places are kept. A commit's page and the conversation have no path, and jumps from them aren't kept. The command panel lists `Back` and `Forward` under Go while there's somewhere to go.
+- opening a definition from a peek;
+- opening a file from the picker, the tree or the all-files tree;
+- a control API request that shows a file (`view/open`, MCP's `open_in_viewer`, `comments/add`).
 
-A jump that lands on a line marks it: the row in the theme's `landed` style and `❯` in its gutter, on every row of a wrapped line. A definition, a use and a `view/open` line show a quarter of the screen down, with the lines before it above; back and forward show the screen as it was, marking the line that was marked when it was left, else the top line. The mark stays until the view moves: a key that scrolls or goes elsewhere, a click or the wheel, or the next jump.
+`n`, `f`, `g`, threads and search are moves, not jumps. Opening the file already shown isn't a jump either, unless it goes to a line in it.
+
+Each jump keeps the place it leaves: the file and the line at the top of the screen. `backspace` goes back there with that line at the top again, and `\` goes forward again. The status bar says where you landed and how many places are left that way: `back to fs/namei.c:120 · 3 more`.
+
+- Moving through the tree shows the files it passes. A file opened from the tree goes back to where you entered the tree from. So does leaving the tree for the diff on another file than that.
+- A place whose file isn't shown any more, such as a file opened outside the diff and closed since, or whose version is another one now, is skipped and counted: `skipped 1 no longer shown`.
+- A place is its file's path and version, so it holds when the diff's list is read again.
+- The last 100 places are kept. A commit's page and the conversation have no path, so jumps from them aren't kept.
+- The command panel lists `Back` and `Forward` under Go while there's somewhere to go.
+
+A jump that lands on a line marks it: the row is in the theme's `landed` style with `❯` in its gutter, on every row of a wrapped line. A definition, a use and a `view/open` line show a quarter of the screen down, with the lines before it above. Back and forward show the screen as it was. They mark the line that was marked when you left, else the top line. The mark stays until the view moves: a key that scrolls or goes elsewhere, a click or the wheel, or the next jump.
 
 ### Go to definition
 
-`K` lists the names on the line last tapped, else the top line of code, in a small list under it, a name used more than once at each use (`next`, `next (2)`). Typing narrows them, the arrows move, and `enter` peeks at the one picked. A ctrl+click or an alt+click on a name peeks at it at once, and on a line of code the right-click menu has `Go to definition`. It works in the version of the diff the line is in, old or new alike, in files of these languages: Bash, C, C++, C#, Elixir, Go, Java, JavaScript (with JSX), Kotlin, Lua, PHP, Python, Ruby, Rust, Scala, Swift, TypeScript (with TSX) and Zig. TypeScript, TSX and JavaScript files see each other's definitions, and so do C and C++ files (a `.h` header is read as C, unless its first 16 KB show what only C++ writes, such as a `namespace`, a `template`, a `class` with a body or `std::`, outside an `#ifdef __cplusplus`: then it's C++, for its highlighting and its definitions).
+`K` lists the names on the line last tapped, else on the top line of code, in a small list under it. A name used more than once is listed at each use (`next`, `next (2)`). Type to narrow the list, move with the arrows, and press `enter` to peek at the name you picked.
 
-The peek hangs under the line, as a comment thread does, and has the keys until you click the code above it; a click on the peek gives them back. Its top edge reads `kmalloc_array · 3 definitions · include/linux/slab.h:612 · v6.1`, with `changed in this diff` when this diff changes the definition's lines. On the left is the code of the line the cursor is on, highlighted, a few lines above it and the rest of the body below; on the right the name's definitions, grouped by file, each with its line, and below them the lines using it ([References](#references)). Each group shows as soon as what it holds is known and fills in as more comes, the cursor staying where it is; asked from the line defining the name, the peek opens on its uses. On a narrow screen the list goes above the code. While the code above has the keys and the peek is on screen, `j`, `k`, `enter`, `d`, `s` and `r` give them back to the peek and do their work there; a focused comment thread keeps them.
+A ctrl+click or an alt+click on a name peeks at it at once. The right-click menu on a line of code has `Go to definition`.
+
+It works in the version of the diff the line is in, old or new, in files of these languages: Bash, C, C++, C#, Elixir, Go, Java, JavaScript (with JSX), Kotlin, Lua, PHP, Python, Ruby, Rust, Scala, Swift, TypeScript (with TSX) and Zig.
+
+- TypeScript, TSX and JavaScript files see each other's definitions, and so do C and C++ files.
+- A `.h` header is read as C, unless its first 16 KB show what only C++ writes, such as a `namespace`, a `template`, a `class` with a body or `std::`, outside an `#ifdef __cplusplus`. Then it's C++, for its highlighting and its definitions.
+
+Go to definition needs git's versions of the files and the disk cache. A piped diff, two paths compared outside git and `cache = false` say why it's off.
+
+#### The peek
+
+The peek hangs under the line, as a comment thread does. It has the keys until you click the code above it, and a click on the peek gives them back. While the code above has the keys and the peek is on screen, `j`, `k`, `enter`, `d`, `s` and `r` also give them back and do their work in the peek, unless a comment thread is focused. A focused thread keeps them.
+
+Its top edge reads `kmalloc_array · 3 definitions · include/linux/slab.h:612 · v6.1`, with `changed in this diff` when this diff changes the definition's lines.
+
+- The left side shows the code of the line the cursor is on, highlighted: a few lines above it and the rest of the body below.
+- The right side lists the name's definitions, grouped by file, each with its line. Below them are the lines using it ([References](#references)).
+- On a narrow screen the list goes above the code.
+
+Each group shows as soon as what it holds is known, and fills in as more comes. The cursor stays where it is. When you ask from the line defining the name, the peek opens on its uses.
 
 | Key in the peek | Does |
 |---|---|
@@ -151,17 +208,83 @@ The peek hangs under the line, as a comment thread does, and has the keys until 
 | `m` | The uses past the first 200 files, counted |
 | `esc` `q` | Closes the peek |
 
-Names are matched, and resolved where the asking file's imports tell. The definitions are functions, types, constants and module-level variables, and the members a reader jumps to: methods, fields and properties, enum members, and the members of interfaces, traits and protocols, each with the type it's in. A Python module's name finds its file. Definitions are listed nearest first: the same file, then files it imports, then the same folder or Rust crate, then the rest; within each, vendored and generated code last (in a `vendor/`, `third_party/` or `node_modules/` folder, a Protocol Buffers file, or one marked `Code generated`, `@generated` or `DO NOT EDIT` at its top), a member of a type the file names first, a test's after other code unless the asking file is a test's, and the asking file's own package, by the manifest nearest above it (`Cargo.toml`, `go.mod`, `package.json`, `pyproject.toml`, …), before another. What counts as an import is each language's: C and C++ `#include`s, Rust `use`, relative JavaScript and TypeScript imports, Python modules, the Go module's own packages, Java, Kotlin, Scala, C# and PHP imports by the folder their package starts in, and Ruby, Lua, Elixir, Zig and Bash files by their convention. An import is followed through a re-export (a Rust `pub use`, a JavaScript or TypeScript `export … from`, a Python package's `__init__.py`) to the file defining the name; the re-export is listed after the definitions. A name the file imports comes first as what the import names, under another name too (`import { a as b }`, `use a::b as c`, `from a import b as c`, Kotlin's `import … as`, C#'s `using X = …`) and through a renamed re-export: a JavaScript default import as the module's default export, and a module or a namespace imported as its file. A Rust `mod x;` is its file, `x.rs` or `x/mod.rs`, and a TypeScript function's overload signatures give way to its implementation. A method call lists every method of that name with the type each is on. The use itself is read too: a ctrl+click or alt+click knows the name's place on its line, and so does the use picked from `K`'s list, so a local variable, a parameter or the import the name comes in by is listed first, marked `local`, `parameter` or `import` after its line.
+#### What counts as a definition
 
-The first `K` starts the navigator helper, a process of its own ([navigate.md](navigate.md)), which builds the asked version's index of definitions on one thread at a lower priority and keeps it in the disk cache for the next run. Until it's done a lookup answers from what's indexed, the files near the asking one read on the spot, and says how far it got: `partial: 12,000 of 55,191 files indexed`. It looks again once the index is complete, and again when the diff's list is read again (in watch mode, after a refresh), with the files as they are then: the peek follows its line, found by its text, wherever that went. A line changed where it was keeps the peek, which then looks the name up without its place on the line; when the line is gone, the peek closes and the status bar says so. Ten minutes after the last peek closed, with no `K` since, the viewer closes the helper, which gives its memory back, and the next `K` starts another that reads the index back from the disk cache. A helper that exits is started again on the next ask, at most 3 times a minute; one that can't start, or keeps exiting, is said in the peek: `definitions unavailable: …`. A name with no definition found falls back to the lines that use it as a whole word, labelled as text matches: `no definition of foo indexed yet (12,000 of 55,191 files) · searching text…`. A tags query that doesn't compile is said in the status bar. Files over 512KB, and those too slow to parse, have no definitions indexed; a lookup that finds nothing says how many there are.
+Names are matched, then resolved where the asking file's imports say what they mean. The asking file is the one you asked from.
+
+The definitions are functions, types, constants and module-level variables, and the members a reader jumps to: methods, fields and properties, enum members, and the members of interfaces, traits and protocols. Each member shows the type it's in. A method call lists every method of that name with the type each is on. A Python module's name finds its file.
+
+The use itself is read too. A ctrl+click or an alt+click knows the name's place on its line, and so does the use picked from `K`'s list. So a local variable, a parameter or the import the name comes in by is listed first, marked `local`, `parameter` or `import` after its line.
+
+Definitions are listed nearest first:
+
+1. the same file;
+2. the files it imports;
+3. the same folder or Rust crate;
+4. the rest.
+
+Within each of these, the first rule that tells two definitions apart decides:
+
+1. Vendored and generated code comes last: code in a `vendor/`, `third_party/` or `node_modules/` folder, a Protocol Buffers file, or a file marked `Code generated`, `@generated` or `DO NOT EDIT` at its top.
+2. A member of a type the file names comes first.
+3. A test's definition comes after other code, unless the asking file is a test's.
+4. The asking file's own package comes before another, by the manifest nearest above it (`Cargo.toml`, `go.mod`, `package.json`, `pyproject.toml`, …).
+
+#### Imports
+
+What counts as an import depends on the language:
+
+| Language | Imports |
+|---|---|
+| C, C++ | `#include`s |
+| Rust | `use` |
+| JavaScript, TypeScript | Relative imports |
+| Python | Modules |
+| Go | The Go module's own packages |
+| Java, Kotlin, Scala, C#, PHP | Imports, by the folder their package starts in |
+| Ruby, Lua, Elixir, Zig, Bash | Files, by the language's convention |
+
+- An import is followed through a re-export (a Rust `pub use`, a JavaScript or TypeScript `export … from`, a Python package's `__init__.py`) to the file defining the name. The re-export is listed after the definitions.
+- A name the file imports comes first as what the import names. That holds under another name too (`import { a as b }`, `use a::b as c`, `from a import b as c`, Kotlin's `import … as`, C#'s `using X = …`) and through a renamed re-export.
+- A JavaScript default import is the module's default export. A module or a namespace imported is its file.
+- A Rust `mod x;` is its file, `x.rs` or `x/mod.rs`.
+- A TypeScript function's overload signatures give way to its implementation.
+
+#### The index
+
+The first `K` starts the navigator helper, a process of its own ([navigate.md](navigate.md)). It builds the asked version's index of definitions on one thread at a lower priority, and keeps it in the disk cache for the next run.
+
+Until the index is done, a lookup answers from what's indexed, with the files near the asking one read on the spot. It says how far the index got: `partial: 12,000 of 55,191 files indexed`. It looks again once the index is complete.
+
+It also looks again when the diff's list is read again (in watch mode, after a refresh), with the files as they are then. The peek follows its line, found by its text, wherever that went. If the line changed where it was, the peek stays and looks the name up without its place on the line. If the line is gone, the peek closes and the status bar says so.
+
+Ten minutes after the last peek closed, with no `K` since, the viewer closes the helper, which gives its memory back. The next `K` starts another, which reads the index back from the disk cache. A helper that exits is started again on the next ask, at most 3 times a minute. When one can't start, or keeps exiting, the peek says `definitions unavailable: …`.
+
+- A name with no definition found falls back to the lines that use it as a whole word, labelled as text matches: `no definition of foo indexed yet (12,000 of 55,191 files) · searching text…`.
+- Files over 512KB, and those too slow to parse, have no definitions indexed. A lookup that finds nothing says how many there are.
+- The status bar says when a tags query doesn't compile.
 
 #### References
 
-The peek lists the lines using the name in its version below the definitions, with no key, as a whole-word search finds them, closest files first: the asking file, what it includes or imports, its folder or crate, then the rest. Lines stream in while the search goes, and the group's heading says how far it is (`Uses · 37 files so far · searching 12,000 of 78,019`), then how many files use the name (`Uses · 12 files`). The search stops at the first 200 files with a use (`Uses · first 200 files · m more`); `m` goes on, counting the rest. Each file lists at most 1000 lines (the last says `+N more in this file`). `c` keeps only the uses calling the name: followed by its arguments, past a Rust macro's `!` or type arguments, a definition's own name not counted, read from the line rather than the file's syntax tree. `i` keeps only the uses in files the diff changes. Each filter searches again, and the heading names those on. In files of the languages go to definition reads, a use inside a comment or a string doesn't count, nor the use inside each definition of the name that names it, once the index has its file: a line that uses the name again, a recursive call on it, still counts. A comment or string over several lines is followed to where it closes, in each language's forms: block comments, strings of three quotes, JavaScript templates (their `${…}` parts are code), raw strings, heredocs, Ruby's `=begin` and Lua's long brackets; what opens one inside another, as `/*` in a string, opens nothing. A search that ran while the index was still being built says `index partial: definitions may show`. `enter` opens a use as it opens a definition.
+The peek lists the lines using the name in its version below the definitions, with no key to press. They're found by a whole-word search, closest files first: the asking file, what it includes or imports, its folder or crate, then the rest.
 
-One search runs at a time: asking for another name's uses, another version's, or closing the peek stops it. It runs after the work on screen, a little at a time, and gives way to any other work waiting. Its answer is kept for the version, the asking file, the name and the filters, so a peek at them again shows it at once, unless it ran on a partial index; the working tree's and the index's answers are dropped when the diff's list is read again, and a search of a version that moved stops and starts over.
+Lines stream in while the search goes. The group's heading says how far it is (`Uses · 37 files so far · searching 12,000 of 78,019`), then how many files use the name (`Uses · 12 files`).
 
-Go to definition needs git's versions of the files and the disk cache. A piped diff, two paths compared outside git and `cache = false` say why it's off.
+- The search stops at the first 200 files with a use (`Uses · first 200 files · m more`). `m` goes on, counting the rest.
+- Each file lists at most 1000 lines. The last says `+N more in this file`.
+- `c` keeps only the uses calling the name: those followed by its arguments, past a Rust macro's `!` or type arguments. A definition's own name doesn't count. This is read from the line, not from the file's syntax tree.
+- `i` keeps only the uses in files the diff changes.
+- `c` and `i` each search again, and the heading names those that are on.
+- `enter` opens a use as it opens a definition.
+
+In files of the languages go to definition reads, these don't count as uses:
+
+- A use inside a comment or a string. One over several lines is followed to where it closes, in each language's forms: block comments, strings of three quotes, JavaScript templates (their `${…}` parts are code), raw strings, heredocs, Ruby's `=begin` and Lua's long brackets. What opens one inside another, as `/*` in a string, opens nothing.
+- The use inside each definition of the name that names it, once the index has its file. A line that uses the name again, such as a recursive call on it, still counts. A search that ran while the index was still being built says `index partial: definitions may show`.
+
+One search runs at a time. Asking for another name's uses, asking for another version's, or closing the peek stops it. It runs after the work on screen, a little at a time, and gives way to any other work waiting.
+
+Its answer is kept for the version, the asking file, the name and the filters, so a peek at them again shows it at once. An answer from a partial index isn't kept. The working tree's and the index's answers are dropped when the diff's list is read again, and a search of a version that moved stops and starts over.
 
 ## Search
 
@@ -233,9 +356,19 @@ Comments render as Markdown, the way code hosts draw them, within the box:
 
 A comment on a whole file sits under the file's first row, marked `on the file`.
 
-A comment whose lines weren't found sits under the file's last row, marked with the lines it was on: `line 145 not found`, or `old lines 140–141 not found` on the old side. The top of its box shows that code as it was, with its line numbers. The commented lines are highlighted in the file's language when highlighting is on, between up to two lines of dimmed context. A commented line's sign is its side's (`+` new, `-` old), or blank when dffy recorded it unchanged. A host's threads record one side only, so theirs always carry the side's sign. Long lines are cut with `…`, as a suggestion's are, whether or not code wraps.
+A comment whose lines weren't found sits under the file's last row, marked with the lines it was on: `line 145 not found`, or `old lines 140–141 not found` on the old side. The top of its box shows that code as it was, with its line numbers:
 
-Commented lines keep a mark after their line numbers, on their side of a split, in the color of their thread: yellow for a thread with a draft in it, the hint color open, dim resolved. A single line shows `◆` draft, `●` open or `○` resolved. Several lines show a rail, `┌` on the first, `│` down to `└` on the last, unbroken by removed lines between them, and overlapping threads share one. With color off the rail starts on the thread's `◆`, `●` or `○` instead of `┌`, so the shape still says which it is. The tree shows each file's comment count beside its line counts, in the color of its most pressing thread.
+- The commented lines are highlighted in the file's language when highlighting is on, between up to two lines of dimmed context.
+- A commented line's sign is its side's (`+` new, `-` old), or blank when dffy recorded it unchanged. A host's threads record one side only, so theirs always carry the side's sign.
+- Long lines are cut with `…`, as a suggestion's are, whether or not code wraps.
+
+Commented lines keep a mark after their line numbers, on their side of a split. The mark has the color of their thread: yellow for a thread with a draft in it, the hint color for an open one, dim for a resolved one.
+
+- A single line shows `◆` draft, `●` open or `○` resolved.
+- Several lines show a rail, `┌` on the first and `│` down to `└` on the last. Removed lines between them don't break it, and overlapping threads share one.
+- With color off the rail starts on the thread's `◆`, `●` or `○` instead of `┌`, so the shape still says which it is.
+
+The tree shows each file's comment count beside its line counts, in the color of its most pressing thread.
 
 #### Drafts
 
@@ -260,13 +393,22 @@ Resolved threads start folded. So do outdated ones with no comment that isn't po
 
 #### Copying a thread
 
-A drag over a comment's text, or a double or triple click on it, copies its Markdown ([Copying from a comment](#copying-from-a-comment)). The menu on a thread copies the comment right-clicked, or the whole thread as text. The whole thread puts each comment under a line like `ana · 2026-11-17`, with its author (`you` for your own) and the day it was written, a blank line apart. Keys bound to `copy_comment` and `copy_thread` act on the focused thread, or the one selected in the comments panel. They copy its comment last clicked in the diff, else its first.
+A drag over a comment's text, or a double or triple click on it, copies its Markdown ([Copying from a comment](#copying-from-a-comment)).
 
-`y` copies the focused thread as a prompt for a coding agent, or the one selected in the comments panel, when no text is selected in it. `space` then `"` (`copy_prompt`) and the menu's `Copy as prompt` copy the focused thread, else the selected lines. The prompt holds where they are with the file's language and the definitions around them, the thread's comments and suggestions, the lines with those around them, and the file's changes near them. It's at most 32 KiB, laid out as in [comments.md](comments.md#as-a-prompt-dffy-comments-prompt). The status bar says what was copied (`copied a thread as a prompt`, `copied 3 lines as a prompt`), and adds `cut to fit 32KB` when something was cut. A thread on another branch is moved here first (`V`).
+The menu on a thread copies the comment right-clicked, or the whole thread as text. The whole thread puts each comment under a line like `ana · 2026-11-17`, with its author (`you` for your own) and the day it was written, a blank line apart. Keys bound to `copy_comment` and `copy_thread` act on the focused thread, or the one selected in the comments panel. `copy_comment` takes the comment last clicked in the diff, else the thread's first.
+
+Two keys copy a prompt for a coding agent:
+
+- `y` copies the focused thread, or the one selected in the comments panel, when no text is selected in it.
+- `space` then `"` (`copy_prompt`) and the menu's `Copy as prompt` copy the focused thread, else the selected lines.
+
+The prompt holds where they are with the file's language and the definitions around them, the thread's comments and suggestions, the lines with those around them, and the file's changes near them. It's at most 32 KiB, laid out as in [comments.md](comments.md#as-a-prompt-dffy-comments-prompt). The status bar says what was copied (`copied a thread as a prompt`, `copied 3 lines as a prompt`), and adds `cut to fit 32KB` when something was cut. A thread on another branch is moved here first (`V`).
 
 ### Finding
 
-`m` and `M` go to the next and previous thread, on into the next or previous file with comments, the way `n` and `N` go between changes. The thread they land on takes the focus. Its box goes a third of the way down the diff, with the code it's on above it, unless all of the box shows already. Near the top or the end of the file the diff stops there. Past the diff's last thread, `m` goes on to the next file with threads that the diff doesn't list and that's on disk ([Files outside the diff](#files-outside-the-diff)).
+`m` and `M` go to the next and previous thread, the way `n` and `N` go between changes, and on into the next or previous file with comments. The thread they land on takes the focus.
+
+Its box goes a third of the way down the diff, with the code it's on above it, unless the whole box shows already. Near the top or the end of the file the diff stops there. Past the diff's last thread, `m` goes on to the next file with threads that the diff doesn't list and that's on disk ([Files outside the diff](#files-outside-the-diff)).
 
 The status bar counts the comments file's threads: `18 threads · 2 drafts`. Drafts are counted on a review from a code host, with the branch drafts shown there.
 
@@ -282,7 +424,9 @@ The status bar counts the comments file's threads: `18 threads · 2 drafts`. Dra
 
 In the box every key types but `enter`, which saves, as in the Claude Code and Codex CLIs. The status bar says `enter saves · alt+enter new line · esc keeps it`.
 
-While the box for a new thread is open, a rail in the gutter, in the box's border color, marks its lines until it's saved or left: `┌` on the first, `│` down to `└` on the last, `[` for a single line. Their gutter is tinted and their code keeps its colors. The box's heading says what it writes, where, and what `enter` does: `you · new comment · lines 319–331 · enter saves`, or for a question (`a`) `you · question for claude · lines 319–331 · enter asks`, then the other keys. A single line reads `line 42`, a comment on the file `whole file`. On a narrow pane whole parts go from the right: the keys first, then the lines, then the agent's name.
+While the box for a new thread is open, a rail in the gutter marks its lines until it's saved or left. The rail is in the box's border color: `┌` on the first line, `│` down to `└` on the last, `[` for a single line. The lines' gutter is tinted and their code keeps its colors.
+
+The box's heading says what it writes, where, what `enter` does, then the other keys: `you · new comment · lines 319–331 · enter saves`. For a question (`a`) it's `you · question for claude · lines 319–331 · enter asks`. A single line reads `line 42`, and a comment on the file `whole file`. On a narrow pane whole parts go from the right: the keys first, then the lines, then the agent's name.
 
 | Keys | Do |
 |---|---|
@@ -328,7 +472,11 @@ Other keys keep their meaning. `r`, `x`, `e`, `d`, `o`, `s`, `f`, `y` and `A` ac
 
 Posted comments, those with a `ref`, belong to the host. Only resolving changes them.
 
-Delete resolved threads (`space` then `-`, `clear_resolved`) asks first and names what goes: `delete 4 resolved threads? y/n`. `y` deletes the resolved threads shown, replies included. Any other key keeps them. On a review from a code host, a resolved thread on the host stays, since the next update would bring it back. Only its comments that aren't posted go, your drafts and those kept `private`, and the status bar says `host threads stay; resolve hides them`. Threads on other branches and branch drafts out of view stay. `dffy comments rm --resolved` does the same from a shell ([comments.md](comments.md#reading-dffy-comments)).
+Delete resolved threads (`space` then `-`, `clear_resolved`) asks first and names what goes: `delete 4 resolved threads? y/n`. `y` deletes the resolved threads shown, replies included. Any other key keeps them.
+
+- On a review from a code host, a resolved thread on the host stays, since the next update would bring it back. Only its comments that aren't posted go, your drafts and those kept `private`, and the status bar says `host threads stay; resolve hides them`.
+- Threads on other branches and branch drafts out of view stay.
+- `dffy comments rm --resolved` does the same from a shell ([comments.md](comments.md#reading-dffy-comments)).
 
 ### Placing and reloading
 
@@ -393,7 +541,9 @@ It writes nothing and says why in the status bar:
 
 A range ending at HEAD, such as `dffy main..HEAD`, `main...HEAD` or `dffy show HEAD`, shows HEAD's version of its files. The working tree was made from that version, so the suggestion's lines are found in the file on disk, uncommitted edits included.
 
-On someone else's review it works only once the review is checked out, with HEAD on the review's head. Until then it says `check out PR #7 first: gh pr checkout 7`, with the command the review plugin gives, else `check out PR #7 first: HEAD isn't its head`. A review opened with `dffy pr 7` shows its head's commits, not the working tree. Once that head is HEAD, the working tree was made from them, so the suggestion's lines are found in the file on disk, as always, uncommitted edits included. The review plain `dffy` found for the branch is yours and checked out already.
+On someone else's review it works only once the review is checked out, with HEAD on the review's head. Until then it says `check out PR #7 first: gh pr checkout 7`, with the command the review plugin gives, else `check out PR #7 first: HEAD isn't its head`.
+
+A review opened with `dffy pr 7` shows its head's commits, not the working tree. Once that head is HEAD, the working tree was made from them, so the suggestion's lines are found in the file on disk, as always, uncommitted edits included. The review plain `dffy` found for the branch is yours and checked out already.
 
 The status bar says what changed, and which key resolves the thread while it's open: `applied the suggestion to src/lib.rs:12-14 · x resolves`, with the lines the suggestion put there. A deleting suggestion says `deleted src/lib.rs:12-14, as suggested`. The list is read again, so the change shows at once. The thread stays open, and resolving it is yours.
 
@@ -413,19 +563,28 @@ The control API's `comments/applySuggestion` ([control.md](control.md)) and MCP'
 
 ## Fixing with an agent
 
-`f` on a focused thread, or one selected in the comments panel, hands the thread to your own coding agent. `space` then `&` does the same from the command panel, and so does `Fix with agent` in the menu. dffy starts the agent interactively, as you'd start it, with none of its own flags. So the agent asks before it edits, as it always does. It starts on one line, never the thread's text:
+`f` on a focused thread, or one selected in the comments panel, hands the thread to your own coding agent. `space` then `&` in the command panel does the same, and so does `Fix with agent` in the menu.
+
+When a session of your agent listens in this working tree, it gets the thread ([below](#sending-to-a-running-session)). Otherwise dffy starts the agent interactively, as you'd start it, with none of its own flags. So the agent asks before it edits, as it always does. It starts on one line, never the thread's text:
 
 ```
 Address dffy review thread <id>: run dffy comments prompt <id> (or the thread_prompt MCP tool), change only what the thread asks, then reply in the thread with what you changed.
 ```
 
-On a review from a code host the line says `dffy comments --session prompt`.
+For a thread in another comments file, such as a code host's review's, the line names it: `run dffy --comments <file> comments prompt <id>`. So it's the review this viewer shows, whichever review another viewer opened since.
 
-On selected lines, `space` then `&` or the menu's `Fix with agent` first opens the text box for what should change there. `f` moves to the next file while lines are selected. `enter` saves the note as a new thread, kept [private](comments.md#drafts) since it's an instruction to your agent, then hands it over.
+On selected lines, `space` then `&` or the menu's `Fix with agent` first opens the text box for what should change there. `f` doesn't, since it moves to the next file while lines are selected. `enter` saves the note as a new thread, kept [private](comments.md#drafts) since it's an instruction to your agent, then hands it over. The status bar says where it goes: `what should change here · enter sends it and starts your agent`, or with a session listening `what should change here · enter sends it to claude`. The box's heading then says `for claude`.
 
-The agent plugin, `dffy-agent`, lists the agents a thread can go to and how each starts ([plugins.md](plugins.md#the-agent-protocol-version-1)): Claude Code, Codex, Pi and Amp, those on `PATH`. dffy picks the one the `agent` setting names, else the first listed. A setting that names none of them is refused. A command of yours takes no thread, so it leaves the pick to the list. Without the plugin, `f` says so. While the plugin starts, the status bar says `starting dffy-agent…`. If the plugin hasn't said which agents there are within 2 seconds, the status bar says that instead and the thread goes to none. Amp takes its first message only from you, so it starts bare and the line goes on the clipboard to paste.
+The agent plugin, `dffy-agent`, lists the agents a thread can go to and how each starts ([plugins.md](plugins.md#the-agent-protocol-version-1)): Claude Code, Codex, Pi and Amp, those on `PATH`.
 
-The agent starts at the working tree's root in a new tab of your terminal, or a window where that's all it offers, as `open_terminal` opens one. That works in tmux, zellij, WezTerm, kitty with remote control on, Rex, and Ghostty and iTerm2 on macOS. In herdr, Ghostty on Linux, Terminal.app, Alacritty and terminals dffy doesn't know, the agent runs here instead. The viewer is suspended until it exits, as for the editor, and the list is read again after.
+- dffy picks the one the `agent` setting names, else the first listed. A setting that names none of them is refused. A command of yours takes no thread, so it leaves the pick to the list.
+- Without the plugin, `f` says so.
+- While the plugin starts, the status bar says `starting dffy-agent…`. If the plugin hasn't said which agents there are within 2 seconds, the status bar says that instead and the thread goes to none.
+- Amp takes its first message only from you, so it starts bare and the line goes on the clipboard to paste.
+
+The agent starts at the working tree's root in a new tab of your terminal, or a window where that's all it offers, as `open_terminal` opens one. That works in tmux, zellij, WezTerm, kitty with remote control on, Rex, and Ghostty and iTerm2 on macOS.
+
+In herdr, Ghostty on Linux, Terminal.app, Alacritty and terminals dffy doesn't know, the agent runs here instead. The viewer is suspended until it exits, as for the editor, and the list is read again after.
 
 The agent's edits are unstaged changes like yours. With `--watch` (`w`) they show as it makes them, and the status bar says so when watch is off. `A`, `U` and `D` keep or undo them per hunk. Its reply comes by `dffy comments apply` or MCP's `reply_to_thread`, under its name, not yours. Resolving the thread is yours.
 
@@ -433,15 +592,69 @@ On someone else's review it works only once the review is checked out, as for `s
 
 ### Every open thread at once
 
-`space` then `^` (`send_open_threads`) takes a [checkpoint](#checkpoints), then starts the agent as `f` does, on one line that points at all your open threads:
+`h` (`confirm_send_open_threads`) asks first. With a session listening it asks `send 5 threads to claude? enter sends · esc keeps`, else `start your agent on 5 threads? enter starts · esc keeps`.
+
+- `enter` sends. Any other key, a click or a paste sends nothing (`nothing sent`) and does nothing else, and so does an `enter` typed before the question shows.
+- When where they go, or how many, changed since it asked, `enter` asks again.
+- With several sessions and none of them clear, the list to pick from opens instead.
+- In the tree `h` collapses a folder, and lines selected stay selected.
+
+Sending takes a [checkpoint](#checkpoints), then hands your open threads over as `f` does, to the session that listens or a new agent. It's one line that points at them all:
 
 ```
 Address the open dffy review threads: run dffy comments prompt --open, change only what each thread asks, reply in each thread with what you changed (dffy comments apply --as <you>).
 ```
 
-[comments.md](comments.md#as-a-prompt-dffy-comments-prompt) has the prompt. Yours are the open threads you started or replied in. The command panel's Here offers it while you have some, except with lines selected or in a conflict.
+When the threads are in another comments file than the local review's, the line names the file in both commands: `dffy --comments <file> comments`. [comments.md](comments.md#as-a-prompt-dffy-comments-prompt) has the prompt.
 
-The agent reads one comments file. On a review with your branch drafts beside it, that's the file with more of yours, or with as many, the one new threads go to. The status bar says how many went, the key that shows the agent's turn, and how many of yours in the other file weren't sent: `sent 5 threads to claude · ' shows its turn`. When the agent runs in dffy's own terminal, the status bar says it exited instead.
+Yours are the open threads you started or replied in. While you have some, the command panel's Here offers to send them, except with lines selected or in a conflict. Its row, run with `enter` or its key `^` (`send_open_threads`), sends at once.
+
+The agent reads one comments file. On a review with your branch drafts beside it, that's the file with more of yours. When both have as many, it's the one new threads go to.
+
+The status bar says how many went, the key that shows the agent's turn, and how many of yours in the other file weren't sent: `sent 5 threads to claude · ' shows its turn`. When the agent runs in dffy's own terminal, the status bar says it exited instead.
+
+### Sending to a running session
+
+A coding agent's session can listen for threads with `dffy comments listen` ([comments.md](comments.md#listening-dffy-comments-listen)), as every Claude Code session does with dffy's plugin ([agents.md](agents.md#claude-code)). While one listens in the viewer's working tree, the keys above send to it and start no agent. It works in its own terminal, under its own permissions, and the agent plugin isn't needed. The refusals are the same: without a working tree, and on someone else's review until it's checked out.
+
+You can see where threads go before you press the key. The command panel and the menu say `Send to claude` in place of `Fix with agent`, and `Send open threads to claude` in place of `Send open threads to agent`. The name is the one the session listens as, or `a session` while there's one to pick. On a focused thread the status bar says `f send` in place of `f fix`.
+
+While several listen, the label says what the session last did, as of when they last changed: `Send to claude · edited 3h ago`. An open panel or menu follows the sessions.
+
+With several sessions listening:
+
+1. The one you picked before gets the threads, until it ends.
+2. Otherwise the only one that edited files does.
+3. Otherwise a list opens, titled `send to`: the last to edit first, then the last prompted, then the newest. Each row says what it knows of the session: `claude · started 2h ago · edited 3m ago`, or `· prompted 5m ago` for one that hasn't edited.
+
+The list works as follows:
+
+- `enter` sends to the row it's on, and that pick holds for this viewer. A tap on a row sends to it.
+- `j`/`k`, the arrows and the wheel move.
+- `esc` and `q` close the list, with `nothing sent`.
+- Its footer says `enter sends · j/k move · esc sends nothing`.
+- A session that ends leaves the list. When none is left it closes with `the sessions stopped listening; send again`.
+
+Sessions count an edit only when they report it, so one made through a shell may not count.
+
+dffy takes a [checkpoint](#checkpoints), then sends. The status bar says one of these:
+
+| Status bar | When |
+|---|---|
+| `sent the thread to claude` | One thread went. |
+| `sent 5 threads to claude · ' shows its turn` (`sent 1 thread to claude` for one) | Your open threads went. |
+| `sent 5 threads to claude, but couldn't take a checkpoint: …` | They went without a checkpoint. |
+| `couldn't send to claude: …` | Nothing went, and why. |
+
+The first two carry the same notes as for a new agent, and what told the session apart while several listen.
+
+A session asks again after each hand-over. Until it does, for at most 1 second, it still counts as listening, and what's sent to it waits: `waiting for claude…`. Sending more meanwhile says `still sending to claude; wait`. When another viewer hands the session something while this one takes its checkpoint, this one waits for it the same way.
+
+A session that doesn't ask again in that second gets nothing: `claude stopped listening; send again`. Sending again then goes to another session or a new agent.
+
+Only sessions in the viewer's own working tree count, from any directory in it. A session in another worktree of the repository isn't sent to, as it would change the wrong files. A diff piped on stdin and files compared outside git have no sessions.
+
+When dffyd goes, sessions and the viewer come back by themselves once it runs again. A pick is forgotten then, and each session's start, edits and prompts count from there.
 
 ## Staging
 
@@ -469,7 +682,9 @@ A discard never takes working-tree lines edited after the diff was shown. It's r
 
 A file a merge, rebase or cherry-pick stopped on (`U`, `conflicted`) shows as its working-tree file against `HEAD`, with the conflict markers highlighted. You resolve each conflict, from `<<<<<<<` to `>>>>>>>`, in the viewer. [git.md](git.md#merge-conflicts) has how the conflicts are read and the file written.
 
-While the file at the cursor has conflicts to resolve, `n`/`N`, `o`, `t`, `b`, `a` and `w` mean what they do here. They come ahead of their meaning elsewhere and after a focused thread's. A search going on keeps `n`/`N` for its matches. Every other key does what it does anywhere, including `f`/`F` to leave the file. These keys are the `conflict:` table of [keys.md](keys.md#in-a-conflicted-file). Arriving in such a file says them once: `conflict 1/5 · o ours · t theirs · b both · w writes`, with the conflict on screen and how many there are. The status bar keeps `conflicts` while the cursor is in the file.
+While the file at the cursor has conflicts to resolve, `n`/`N`, `o`, `t`, `b`, `a` and `w` mean what they do here. They come ahead of their meaning elsewhere, and after a focused thread's. A search going on keeps `n`/`N` for its matches. Every other key does what it does anywhere, including `f`/`F` to leave the file. These keys are the `conflict:` table of [keys.md](keys.md#in-a-conflicted-file).
+
+Arriving in such a file shows the keys once, with the conflict on screen and how many there are: `conflict 1/5 · o ours · t theirs · b both · w writes`. The status bar keeps `conflicts` while the cursor is in the file.
 
 `n` and `N` go to the next and previous conflict of the file, with `conflict 2/5 · o keeps current · t takes incoming · b both` in the status bar. Past the last one that way, they go on to the next or previous change as elsewhere.
 
@@ -484,7 +699,13 @@ A choice applies to the conflict of the line last tapped. Without one, it applie
 
 The same key again takes the choice back. The status bar says what was chosen and how many are left: `conflict 2/5: incoming taken · 3 left · w writes`. The right-click menu on a conflict's line has the same choices.
 
-Once a conflict has a choice, the file shows as what writing it would do: the diff from the working-tree file to the resolved one. A chosen conflict's lines, markers and all, show as removed, and the lines it keeps show as added. A conflict without a choice shows unchanged, markers highlighted. The file's counts stay those of its diff against `HEAD`. Taking the last choice back shows that diff again. Choices live until written or until you quit. When the file changes on disk so its conflicts no longer match, they're dropped and the status bar says so.
+Once a conflict has a choice, the file shows as what writing it would do: the diff from the working-tree file to the resolved one.
+
+- A chosen conflict's lines, markers and all, show as removed, and the lines it keeps show as added.
+- A conflict without a choice shows unchanged, markers highlighted.
+- The file's counts stay those of its diff against `HEAD`. Taking the last choice back shows that diff again.
+
+Choices live until written or until you quit. When the file changes on disk so its conflicts no longer match, they're dropped and the status bar says so.
 
 `w` writes the file as the choices resolve it. With conflicts left without a choice it asks first, `write with 2 of 5 conflicts unchosen, markers kept? y/n`, and those keep their markers. Once every conflict is resolved, it offers `wrote src/app.rs; git add it to mark it resolved? y/n`. `y` runs `git add`, and any other key leaves the file unstaged.
 
@@ -504,9 +725,13 @@ It lists one row per line, in three titled groups:
 
 View and Go own their rows, so Here's group leaves out what they list. They in turn leave out a row whose key a Here row takes. A screen too short for all three leaves out View.
 
-Each row shows one key. It's the key that does the same outside the panel when there is one, such as `f` for fix with agent on a thread. Otherwise it's the panel's, such as `&` with lines selected, or `_` for file view, whose `l` steps values in the panel. The popup has the full panel's keys on Here. A row's key runs it, whether shown or the panel's, and any other entry's key runs that entry. `h`/`l` on a value and a tap work the same.
+Each row shows one key. It's the key that does the same outside the panel when there is one, such as `f` for fix with agent on a thread. Otherwise it's the panel's, such as `&` with lines selected, or `_` for file view, since `l` steps values in the panel. The popup has the full panel's keys on Here.
 
-The popup opens with no row highlighted, and `space` shows the full panel on Here (`space more`). A row run by its key, moved to with `j`/`k`, or tapped is highlighted; then `space` and `enter` run it again, a value stepping forward, and the popup stays open on the new state (`space toggles`). `tab` shows the full panel at any time. `/` starts its search, `?` lists all keys, and `esc` closes. A setting's key the popup doesn't list shows the full panel on that setting's tab.
+A row's key runs it, whether it's the one shown or the panel's. Any other entry's key runs that entry. `h`/`l` on a value and a tap work as in the full panel.
+
+The popup opens with no row highlighted, and `space` shows the full panel on Here (`space more`). A row run by its key, moved to with `j`/`k`, or tapped is highlighted. After that `space` and `enter` run it again, a value stepping forward, and the popup stays open on the new state (`space toggles`).
+
+`tab` shows the full panel at any time. `/` starts its search, `?` lists all keys, and `esc` closes. A setting's key the popup doesn't list shows the full panel on that setting's tab.
 
 ### The command panel
 
@@ -514,17 +739,21 @@ The full panel holds every setting with its state and key, and the actions, in t
 
 Here, where the full panel opens, has the few actions that apply to what you're on:
 
-- On a focused thread: ask an agent, fix with an agent, apply or revert its suggestion, copy it as a prompt, resolve or reopen it, and reply.
+- On a focused thread: ask an agent, fix with an agent or send it to a listening session, apply or revert its suggestion, copy it as a prompt, resolve or reopen it, and reply.
 - With lines selected: comment, suggest a change, ask, fix, copy them, or copy them as a prompt. On uncommitted changes it adds stage, unstage and discard.
 - In a conflict on screen: its choices, and once one is made, writing the file.
 - On a review: posting it, pulling its updates and showing what changed since your last review. On the review plain `dffy` found for the branch, it adds the whole review.
-- Otherwise: sending your open threads to your agent while you have some, then showing what changed since the latest [checkpoint](#checkpoints) and taking another once one exists, then finding a file, the layout, wrapping, watching and opening a terminal.
+- Otherwise: sending your open threads to your agent or a listening session while you have some, then showing what changed since the latest [checkpoint](#checkpoints) and taking another once one exists, then finding a file, the layout, wrapping, watching and opening a terminal.
 
 On a thread and on a review, sending your open threads follows while you have some ([Fixing with an agent](#fixing-with-an-agent)). All keys (`?`) is last.
 
 The other tabs list the panel's entries by kind, in the same groups as [keys.md](keys.md). A tab of several kinds titles each. View holds the layout, the diff and the display. Review holds comments, agents and the review. Git holds staging, watching and checkpoints. Copy holds copying and handing the mouse back. Entries that can't apply aren't listed: staging off uncommitted changes, the review's entries off a review, opening a review without a review plugin, and since checkpoint before there's one.
 
-The full panel looks as `?` does. It's the same box, sized and placed on the screen as `?`'s whatever the tab holds, with the same tab strip and two footer rows. Each row shows its keys first, in the keys' color, then its label: `o   Find file…`, `W   [x] Wrap long lines`, `s   Layout ‹ unified ›`. The key that does the same outside the panel follows the panel's, dimmed. On Here a row shows one key, as the quick popup's rows do. `tab` and `shift+tab` switch tabs, as does a tap on a title. A tab takes one column while its rows fit the box's height, else two where the box is as wide as `?`'s two. On a narrow screen the panel takes the whole screen in one column.
+The full panel looks as `?` does. It's the same box, sized and placed on the screen as `?`'s whatever the tab holds, with the same tab strip and two footer rows.
+
+Each row shows its keys first, in the keys' color, then its label: `o   Find file…`, `W   [x] Wrap long lines`, `s   Layout ‹ unified ›`. The key that does the same outside the panel follows the panel's, dimmed. On Here a row shows one key, as the quick popup's rows do.
+
+`tab` and `shift+tab` switch tabs, as does a tap on a title. A tab takes one column while its rows fit the box's height, else two where the box is as wide as `?`'s two. On a narrow screen the panel takes the whole screen in one column.
 
 A row's key runs it at once, from any tab, whether its row shows or not. When it can't run, it says why. A setting's key shows its tab with the cursor on it. `j`/`k` and `enter` run the row under the cursor. `/` searches every tab, each match with its tab's name. Searching the diff is its own `/`.
 
@@ -538,7 +767,9 @@ A setting with values shows as `Layout ‹ auto ›`. On its row, `h`/`l` or `�
 
 ### The key list
 
-`?` shows the keys in effect, one short label each, in seven tabs: Move, Files, View, Git, Copy, Review and General. A tab of several kinds titles each, as in [keys.md](keys.md). The tree's keys are a group of the Files tab. A thread's keys are a group of the Review tab, "on a thread", and a conflict's are a group of the Git tab, "in a conflict". `tab`, `←`/`→` or `1`–`7` switch tabs, and `/` searches all of them. Settings without a key are in the command panel. [keys.md](keys.md) has the full list.
+`?` shows the keys in effect, one short label each, in seven tabs: Move, Files, View, Git, Copy, Review and General. A tab of several kinds titles each, as in [keys.md](keys.md). The tree's keys are a group of the Files tab, a thread's are a group of the Review tab ("on a thread"), and a conflict's are a group of the Git tab ("in a conflict").
+
+`tab`, `←`/`→` or `1`–`7` switch tabs, and `/` searches all of them. Settings without a key are in the command panel. [keys.md](keys.md) has the full list.
 
 ### The comments panel
 
@@ -562,7 +793,9 @@ The other branches' threads come last, folded to one row. `b` shows or folds the
 
 The thread in the diff is a preview. A folded one shows whole while it's selected. It folds again once the selection moves on, `m`/`M` or a tap focus another thread, or the panel closes. `z` on it keeps what it sets, as on any thread, and so does replying in it.
 
-`r`, `e`, `x`, `d` (twice) and `o` act on the selected thread as on a focused one, whether or not the diff shows it. So do `a`, `s`, `f`, `y` and `A`. The status bar lists those that apply. On a thread the diff shows, `r` and `e` open the text box there, and the diff takes the keys. On one it doesn't show, such as a thread on a file not in this diff, they write in `$VISUAL` or `$EDITOR`. While a thread is selected these letters act on it rather than as they do in the diff.
+`r`, `e`, `x`, `d` (twice) and `o` act on the selected thread as on a focused one, whether or not the diff shows it. So do `a`, `s`, `f`, `y` and `A`. While a thread is selected these letters act on it rather than as they do in the diff. The status bar lists those that apply.
+
+On a thread the diff shows, `r` and `e` open the text box there, and the diff takes the keys. On one it doesn't show, such as a thread on a file not in this diff, they write in `$VISUAL` or `$EDITOR`.
 
 `enter` or `tab` gives the diff the keys, on the focused thread, where the same keys act on it. `enter` on a thread on a file not in this diff opens the file first. `tab` comes back to the comments. `esc` in the panel gives the diff the keys too, as it does from the tree.
 
@@ -580,13 +813,16 @@ In the tree, `enter` or `l` opens, `h` collapses, and `u` goes to the parent fol
 
 ### All files
 
-`a` in the tree, or the command panel's All files row, lists every file of the repository instead, as Zed's project panel does: one tree, the title naming the version (`All files · working tree`, `All files · v6.1`). From the diff it shows the tree and gives it the keys. It opens on the file shown, its folders opened to it, once: after that the tree stays where you leave it as you move through the diff. `a` again goes back to the diff's files, and the choice is remembered (`all-files`); coming back to all files finds its folders and place as they were.
+`a` in the tree, or the command panel's All files row, lists every file of the repository instead, as Zed's project panel does. It's one tree, and the title names the version (`All files · working tree`, `All files · v6.1`). From the diff, the row shows the tree and gives it the keys.
 
-- Folders start folded and open as you go, each made from the version's list of files, read once the tree shows and kept. Until the list comes, the diff's files alone show, and the title says `listing…`. Folded and opened folders stay so across rebuilds.
-- The diff's files keep their status letter and counts, their names in their change's color, the files the version lacks included: a deleted one in the newer version, an added or untracked one in the older. A renamed file is at its path in each version. A folder with changes inside takes the color of the strongest of them: a conflict, then a deletion, an edit, an addition, an untracked file. Files without changes are plain.
+It opens on the file shown, with the folders down to it open. It does that once: after that the tree stays where you leave it as you move through the diff. `a` again goes back to the diff's files. The choice is remembered (`all-files`), and coming back to all files finds its folders and place as they were.
+
+- Folders start folded and open as you go. They're made from the version's list of files, which is read once the tree shows and kept. Until the list comes, the diff's files alone show, and the title says `listing…`. Folded and opened folders stay so across rebuilds.
+- The diff's files keep their status letter and counts, and their names are in their change's color. That includes the files the version lacks: a deleted one in the newer version, an added or untracked one in the older. A renamed file is at its path in each version. Files without changes are plain.
+- A folder with changes inside takes the color of the strongest of them: a conflict, then a deletion, an edit, an addition, an untracked file.
 - `enter` or a tap on a changed file goes to its diff. On another it shows the file whole, as the [picker](#opening-files) does, and `x` closes it again.
 - `s` in the tree shows the repository at the other version of the diff.
-- `/` filters every file, the diff's included, scored as the picker scores them: in the background on a large repository, the matches shown staying until the new ones come. The best 1,000 show, with their folders, and the title counts them all.
+- `/` filters every file, the diff's included, scored as the picker scores them. On a large repository this runs in the background, and the matches shown stay until the new ones come. The best 1,000 show, with their folders, and the title counts them all.
 
 A piped diff and two paths compared have only their files, so `a` says why and the panel leaves the row out.
 
@@ -602,12 +838,39 @@ A right click opens a menu of what the keys do to what was clicked, each entry w
 
 A right click aims first, as a click does, but without opening, folding or revealing anything. It selects a file in the tree or a thread in the comments panel, focuses a thread, or marks the line `v` and `e` start from. A click inside the selection keeps it.
 
-| On | Entries |
-|---|---|
-| A file in the tree | Copy its path (`Y`) or its absolute path (`copy_absolute_path`, no key by default). Open it in the editor (`e`). Open a terminal at the working tree's root ([`open_terminal`](#opening-a-terminal)). Mark it viewed or not (`v`). Comment on the whole file (`C`). Show only files with comments, or every file (`c`). |
-| A line of code | Comment on it, or on the selection (`c`). Copy it (`v` then `y`) or the selection (`y`), or the selection as a prompt for a coding agent (`copy_prompt`). On uncommitted changes, stage, unstage or discard its hunk or the selection (`A`, `U`, `D`), as far as the file's staging leaves them to do. In a conflict, its choices (`o`, `t`, `b`, `a`), the one made reading `Undo: …`, and once a choice is made, writing the file (`w`). Open the editor at it (`e`). Open a terminal at the working tree's root (`open_terminal`). |
-| A `⋯` separator | Reveal more of the lines it hides (`x`), on that separator rather than the highlighted one. |
-| A thread, in the diff or the comments panel | Reply (`r`). Ask an agent about it (`a`, `Ask agent`, or `Ask claude` once the plugin named the default). Apply its suggestion (`s`), or take an applied one back (`Revert suggestion`). Fix it with your agent (`f`). Edit or delete your last draft in it (`e`, `d`, which asks for a second `d`). Make its comments that aren't posted yours (`A`, `Make it yours`), when it has some. Move it to the current branch (`V`), when it's on another. Resolve or reopen it (`x`). Fold or unfold it (`z`), when the diff shows it. Open it on its host (`o`), when it has a link. Copy the comment right-clicked as written (`copy_comment`), the whole thread with each comment under a line of its author and date (`copy_thread`), or the thread as a prompt for a coding agent (`y`). `copy_comment` and `copy_thread` have no key by default. |
+On a file in the tree:
+
+- copy its path (`Y`) or its absolute path (`copy_absolute_path`, no key by default);
+- open it in the editor (`e`);
+- open a terminal at the working tree's root ([`open_terminal`](#opening-a-terminal));
+- mark it viewed or not (`v`);
+- comment on the whole file (`C`);
+- show only files with comments, or every file (`c`).
+
+On a line of code:
+
+- comment on it, or on the selection (`c`);
+- copy it (`v` then `y`) or the selection (`y`), or the selection as a prompt for a coding agent (`copy_prompt`);
+- on uncommitted changes, stage, unstage or discard its hunk or the selection (`A`, `U`, `D`), as far as the file's staging leaves them to do;
+- in a conflict, its choices (`o`, `t`, `b`, `a`), the one made reading `Undo: …`, and once a choice is made, writing the file (`w`);
+- open the editor at it (`e`);
+- open a terminal at the working tree's root (`open_terminal`).
+
+On a `⋯` separator: reveal more of the lines it hides (`x`), on that separator rather than the highlighted one.
+
+On a thread, in the diff or the comments panel:
+
+- reply (`r`);
+- ask an agent about it (`a`, `Ask agent`, or `Ask claude` once the plugin named the default);
+- apply its suggestion (`s`), or take an applied one back (`Revert suggestion`);
+- fix it with your agent (`f`);
+- edit or delete your last draft in it (`e`, `d`, which asks for a second `d`);
+- make its comments that aren't posted yours (`A`, `Make it yours`), when it has some;
+- move it to the current branch (`V`), when it's on another;
+- resolve or reopen it (`x`);
+- fold or unfold it (`z`), when the diff shows it;
+- open it on its host (`o`), when it has a link;
+- copy the comment right-clicked as written (`copy_comment`), the whole thread with each comment under a line of its author and date (`copy_thread`), or the thread as a prompt for a coding agent (`y`). `copy_comment` and `copy_thread` have no key by default.
 
 `j`/`k` or the arrows move, `enter` or a tap runs an entry, and `esc` or a tap outside closes the menu. A right click elsewhere opens the menu there instead.
 
@@ -615,17 +878,24 @@ A right click aims first, as a click does, but without opening, folding or revea
 
 ### Opening files
 
-The [picker](#the-file-picker) opens any file in either version of the diff, not only the ones it changes. Below the diff's files it lists the others in the newer version, or after `tab` in the older one: for `v6.0..v6.1` the files of `v6.0` or `v6.1`, for plain `dffy` HEAD's or the working tree's tracked files. The list is read the first time `o` opens and kept. Each keystroke scores the diff's files at once and the others in the background, so typing doesn't wait.
+The [picker](#the-file-picker) opens any file in either version of the diff, not only the ones it changes. Below the diff's files it lists the others in the newer version, or after `tab` in the older one. For `v6.0..v6.1` those are the files of `v6.0` or `v6.1`. For plain `dffy` they're HEAD's or the working tree's tracked files. The list is read the first time `o` opens and kept. Each keystroke scores the diff's files at once and the others in the background, so typing doesn't wait.
 
-`enter` on one of them shows it whole after the diff's files, as it is in that version. The tree lists it under `Not in this diff`, tagged with the version's name (`v6.0`) when it's from the older one, and the title says `not in this diff`. A file the diff does list goes to its own entry. Opening an open file in the other version replaces it. A binary or very large file shows why it isn't shown, as in the diff.
+`enter` on one of them shows it whole after the diff's files, as it is in that version. The tree lists it under `Not in this diff`, tagged with the version's name (`v6.0`) when it's from the older one, and the title says `not in this diff`.
 
-When the diff's sides move, as watch mode reloads, a checkpoint or a review's update, each opened file is looked up again: it shows as its version has it now, or it closes, and the status bar says so (`closed, gone: kept.txt (v6.0)`). Tree `x`, or `space` then `)`, closes one. A file with comments stays, and `x` says so.
+- A file the diff does list goes to its own entry.
+- Opening an open file in the other version replaces it.
+- A binary or very large file shows why it isn't shown, as in the diff.
+- Tree `x`, or `space` then `)`, closes one. A file with comments stays, and `x` says so.
+
+When the diff's sides move, as when watch mode reloads or on a checkpoint or a review's update, each opened file is looked up again. It shows as its version has it now, or it closes and the status bar says so (`closed, gone: kept.txt (v6.0)`).
 
 A piped diff and two files compared outside git list no other files, and the picker says why.
 
 `dffy ctl open`, and the MCP tool `open_in_viewer`, open a file the same way, at the side asked for ([control.md](control.md#dffy-ctl)).
 
-`e` opens the working tree's copy of a file. When the view shows another version of it, as a range between commits, a review or file view on the old side does, the status bar names that version: `editing the working tree · view: v6.1`. On a row of the old side alone in one of the diff's files, the editor opens at the line the change maps it to on the new side. When the view shows the file from the working tree, on either side, the file is read again once the editor exits, watch mode on or not.
+`e` opens the working tree's copy of a file. When the view shows another version of it, as a range between commits, a review or file view on the old side does, the status bar names that version: `editing the working tree · view: v6.1`.
+
+On a row of the old side alone in one of the diff's files, the editor opens at the line the change maps it to on the new side. When the view shows the file from the working tree, on either side, the file is read again once the editor exits, watch mode on or not.
 
 ### Files with comments
 
@@ -639,14 +909,19 @@ The file stays for the session, or until the diff lists it. A suggestion applied
 
 A checkpoint keeps the working tree as plain `dffy` shows it. The diff can then show only what changed after it, such as what a coding agent did in its turn after you reviewed the rest. [git.md](git.md#checkpoints) has what a checkpoint holds and where it's kept.
 
-Fix with agent (`f` on a thread) and sending your open threads (`space` then `^`) take one before they start the agent. `space` then `;` (`take_checkpoint`) takes one by hand, and the status bar says `checkpoint 3 taken · ' shows what changes since`. `dffy checkpoint` takes one from a shell. Taking one runs off the screen's thread, and a failure shows in the status bar. A Fix with agent goes on without one.
+Fix with agent (`f` on a thread) and sending your open threads (`h`) take one before they start the agent or send to a listening session. `space` then `;` (`take_checkpoint`) takes one by hand, and the status bar says `checkpoint 3 taken · ' shows what changes since`. `dffy checkpoint` takes one from a shell. Taking one runs off the screen's thread, and a failure shows in the status bar. A Fix with agent goes on without one.
 
-`'` shows the latest checkpoint against the working tree, with `since checkpoint · 3m ago` in the status bar. `'` again shows the diff from before. A viewer started with `dffy --since-checkpoint` shows the same, with the checkpoint's age in the status bar, and there `'` goes to plain `dffy`'s diff. A checkpoint taken while it shows becomes the one it's since. Threads stay on the lines they're anchored to. Lines can't be staged here, since a hunk since a checkpoint isn't the index's.
+`'` shows the latest checkpoint against the working tree, with `since checkpoint · 3m ago` in the status bar. `'` again shows the diff from before. A viewer started with `dffy --since-checkpoint` shows the same, with the checkpoint's age in the status bar, and there `'` goes to plain `dffy`'s diff.
+
+A checkpoint taken while it shows becomes the one it's since. Threads stay on the lines they're anchored to. Lines can't be staged here, since a hunk since a checkpoint isn't the index's.
+
 ## Code host reviews
 
 Experimental. A review plugin brings a code host's reviews into the viewer: a pull request, a merge request, a change. dffy uses the only one installed, unless `review = <name>` or `--review <name>` names one or `review = none` turns them off. [plugins.md](plugins.md#review-plugins) has `dffy-review-github`. The plugin runs in the background and has no screen. Everything happens in the viewer.
 
-The command and the words are the plugin's. It names its command, what it reviews, how a review reads, and the events a review can be posted with. They show in the command panel, the picker, the status bar and the post dialog. The examples here are dffy-review-github's: `dffy pr`, "pull request", `PR #6064`. A GitLab plugin could make them `dffy mr`, "merge request", `MR !6064`. Without a description, a review is `review 6064`. Without a review plugin that describes itself there's no such command, and plain `dffy` doesn't ask for the branch's review.
+The command and the words are the plugin's. It names its command, what it reviews, how a review reads, and the events a review can be posted with. They show in the command panel, the picker, the status bar and the post dialog. The examples here are dffy-review-github's: `dffy pr`, "pull request", `PR #6064`. A GitLab plugin could make them `dffy mr`, "merge request", `MR !6064`.
+
+Without a description, a review is `review 6064`. Without a review plugin that describes itself there's no such command, and plain `dffy` doesn't ask for the branch's review.
 
 ### Opening a review
 
@@ -654,7 +929,9 @@ The command and the words are the plugin's. It names its command, what it review
 
 `dffy pr` opens the current branch's review. With none, it opens the usual diff with the picker open.
 
-Plain `dffy` on a branch, with no revisions or paths, opens as usual and asks the plugin in the background for the branch's review. When there is one, what's shown stays plain `dffy`'s: your changes not committed. The review adds its comments file, its part of the status bar, `p`, `P`, and the checks for new commits. Threads on the files shown are placed by their anchors, and the rest are in the comments panel (`i`). A clean working tree still prints `no changes` without waiting for the answer.
+Plain `dffy` on a branch, with no revisions or paths, opens as usual and asks the plugin in the background for the branch's review. When there is one, what's shown stays plain `dffy`'s: your changes not committed. The review adds its comments file, its part of the status bar, `p`, `P`, and the checks for new commits.
+
+Threads on the files shown are placed by their anchors, and the rest are in the comments panel (`i`). A clean working tree still prints `no changes` without waiting for the answer.
 
 Show whole pull request (`space` then `Q`) switches to the review's base against the working tree (`--merge-base <base>`), titled `PR #6064 + working tree`. That's the review's changes with your fixes not pushed yet. The entry is named in the plugin's words, or "Show whole review" without them. The same entry, then "Show working tree changes", goes back. `dffy pr` always shows the whole review.
 
@@ -666,7 +943,9 @@ Opening or finding a review writes the session pointer, which `dffy comments --s
 
 ### Branch drafts
 
-On a review, your drafts in plain `dffy`'s comments file on the current branch show too, on the files of the review's diff. That file is `--comments`, or `dffy/comments.json` in the shared git directory. They're marked `branch draft`, with what posting would do with them. One whose lines aren't found, as when a fix rewrote them, shows under its file's last row as any thread whose lines are gone, and counts in the tree and the status bar. Posting leaves it in the local file, since the review's diff has no lines to put it on, and its heading says so: `stays on the branch: its lines aren't here`.
+On a review, your drafts in plain `dffy`'s comments file on the current branch show too, on the files of the review's diff. That file is `--comments`, or `dffy/comments.json` in the shared git directory. They're marked `branch draft`, with what posting would do with them.
+
+One whose lines aren't found, as when a fix rewrote them, shows under its file's last row as any thread whose lines are gone, and counts in the tree and the status bar. Posting leaves it in the local file, since the review's diff has no lines to put it on, and its heading says so: `stays on the branch: its lines aren't here`.
 
 Editing, replying, resolving or deleting in a branch draft's thread writes the local file. A new comment goes to the review's file. On the review plain `dffy` found, it goes to the local file instead, on the branch, since it's the working tree's until it's posted. Both files are watched.
 
@@ -674,18 +953,30 @@ Editing, replying, resolving or deleting in a branch draft's thread writes the l
 
 The status bar starts with the review: `PR #6064 · 18 threads · 2 drafts`. It adds `closed` or `merged` when the host says so, and what the plugin is doing while it runs. Comments waiting in your pending review on the host add `2 pending · P submits`.
 
-A plugin that watches tells dffy when the review's head moved or new comments came, on its own cadence ([review-github.md](review-github.md#watching) has dffy-review-github's). dffy never asks on a timer. When the plugin has news, the status bar says `PR #6064 updated · new commits · p to update`, or `PR #6064 · new comments · p to update`. After 10 minutes without a key, dffy tells the plugin you're idle, and it stops asking until the next key. Why asking failed is said once, until it fails another way.
+A plugin that watches tells dffy when the review's head moved or new comments came, on its own cadence ([review-github.md](review-github.md#watching) has dffy-review-github's). dffy never asks on a timer. When the plugin has news, the status bar says `PR #6064 updated · new commits · p to update`, or `PR #6064 · new comments · p to update`.
 
-`p` fetches the head and the threads and shows them in place. You stay where you are, threads move with their lines, and your drafts stay. Once the threads are in, the note counts the new commits and the new comments, or says it's up to date. New comments read `3 new comments · m goes to them`, and `m` goes to each of them in turn first. A review reopened from before counts the comments its threads bring the same way. A first open doesn't.
+After 10 minutes without a key, dffy tells the plugin you're idle, and it stops asking until the next key. Why asking failed is said once, until it fails another way.
 
-Since last review (`R`, or `space` then `R`) shows only what changed from the head your last review was on to the head. Pressed again, it shows the whole review. That head is the review plugin's to say. dffy-review-github keeps the head of your last review posted from dffy. Until there's one, it takes the head of your last review on GitHub. With neither, there's nothing to show since. When the review was rebased since, the range still runs from that head, so it takes in what the base gained too. The note says so: `rebased since your last review; showing 9999aaa..bbbb222, the base's changes since included`.
+`p` fetches the head and the threads and shows them in place. You stay where you are, threads move with their lines, and your drafts stay.
+
+Once the threads are in, the note counts the new commits and the new comments, or says it's up to date. New comments read `3 new comments · m goes to them`, and `m` goes to each of them in turn first. A review reopened from before counts the comments its threads bring the same way. A first open doesn't.
+
+Since last review (`R`, or `space` then `R`) shows only what changed from the head your last review was on to the head. Pressed again, it shows the whole review.
+
+That head is the review plugin's to say. dffy-review-github keeps the head of your last review posted from dffy. Until there's one, it takes the head of your last review on GitHub. With neither, there's nothing to show since.
+
+When the review was rebased since, the range still runs from that head, so it takes in what the base gained too. The note says so: `rebased since your last review; showing 9999aaa..bbbb222, the base's changes since included`.
 
 ### Posting
 
 `P` opens a dialog, like a code host's "Finish your review". It holds:
 
-- What goes: your drafts as comments, replies included, those on the whole file, the threads resolved or reopened and not sent, and what's pending on the host, which an event that submits sends with them. It reads like `12 comments · 1 as a file comment · 1 resolve change · 2 pending on PR #6064`. Comments by others without a `ref` don't go. The counts are the plugin's plan, asked for in the background without reaching the host. Until the plugin answers, the dialog says `checking what can be posted…`, and `couldn't check what can be posted: …` when that failed.
-- A warning when something won't go up: `2 drafts left out · 1 refused before · v goes to them`. Branch drafts whose lines aren't found are counted on a line of their own, `1 branch draft stays, lines not found`, whether or not the others go. `v` closes the dialog on the first of them, its thread focused, with why in the status bar. `m`/`M` go on through the threads from there. Sending anyway sends the review without them, and they stay drafts.
+- What goes: your drafts as comments, replies included, those on the whole file, the threads resolved or reopened and not sent, and what's pending on the host, which an event that submits sends with them. It reads like `12 comments · 1 as a file comment · 1 resolve change · 2 pending on PR #6064`. Comments by others without a `ref` don't go.
+
+  The counts are the plugin's plan, asked for in the background without reaching the host. Until the plugin answers, the dialog says `checking what can be posted…`, and `couldn't check what can be posted: …` when that failed.
+- A warning when something won't go up: `2 drafts left out · 1 refused before · v goes to them`. Branch drafts whose lines aren't found are counted on a line of their own, `1 branch draft stays, lines not found`, whether or not the others go.
+
+  `v` closes the dialog on the first of them, its thread focused, with why in the status bar. `m`/`M` go on through the threads from there. Sending anyway sends the review without them, and they stay drafts.
 - A warning when the review moved since what's shown, since the review goes on the head shown. Another when the host says it's closed or merged.
 - With branch drafts on the diff, `l  [x] with the 3 branch drafts on this diff`. `l` sends them with the review or keeps them on the branch. It's on when they were all written since the review opened, else off.
 - The plugin's events, each with its key. The cursor starts on the first that submits, else on the one the last post sent. dffy-review-github's are `p` pending (kept as your draft on GitHub), `c` comment, `a` approve and `r` request changes. A plugin that names none has one, `p` post. `j`/`k` move too. An event that submits goes with no new drafts as well, submitting what's pending.
@@ -700,7 +991,9 @@ Drafts the host refuses don't hold the review back. It's sent without them, and 
 
 ### Quitting a review
 
-Quitting stops the plugin and anything it started. While a post runs, the first `q` (or `ctrl+c`) says `still posting 37/200 · q again stops it`, since stopping halfway leaves the review half sent until the next post. The second asks the plugin to stop the post and waits up to 30 seconds for it to end, so what it posted keeps its refs and isn't posted again. A signal to stop, or the terminal closing, does the same. Leaving a review with drafts not posted says so once the screen is back: `PR #6064: 3 drafts not posted`.
+Quitting stops the plugin and anything it started. While a post runs, the first `q` (or `ctrl+c`) says `still posting 37/200 · q again stops it`, since stopping halfway leaves the review half sent until the next post. The second asks the plugin to stop the post and waits up to 30 seconds for it to end, so what it posted keeps its refs and isn't posted again. A signal to stop, or the terminal closing, does the same.
+
+Leaving a review with drafts not posted says so once the screen is back: `PR #6064: 3 drafts not posted`.
 
 ### Conversation
 
@@ -731,7 +1024,14 @@ The status bar's and the panel title's counts are threads, without the general c
 | Terminal.app | `TERM_PROGRAM=Apple_Terminal` | a window (`open -a Terminal`) |
 | Alacritty | `ALACRITTY_SOCKET` or `ALACRITTY_WINDOW_ID` | a window (`alacritty msg create-window`) |
 
-The innermost terminal gets the tab, since a multiplexer's variables sit beside those of the terminal it runs in. A `TERM_PROGRAM` of Rex, herdr or tmux comes first. Then comes `ZELLIJ`, since zellij leaves the outer terminal's `TERM_PROGRAM` in place. Then come the other terminals' `TERM_PROGRAM`, then each one's own variables in the table's order. tmux in zellij and zellij in tmux look the same, and get a tmux window.
+The innermost terminal gets the tab, since a multiplexer's variables sit beside those of the terminal it runs in. dffy looks in this order:
+
+1. A `TERM_PROGRAM` of Rex, herdr or tmux.
+2. `ZELLIJ`, since zellij leaves the outer terminal's `TERM_PROGRAM` in place.
+3. The other terminals' `TERM_PROGRAM`.
+4. Each terminal's own variables, in the table's order.
+
+tmux in zellij and zellij in tmux look the same, and get a tmux window.
 
 Otherwise `cd <the working tree>` goes on the clipboard, and the status bar says why: a terminal dffy doesn't know, one it can't drive from outside (kitty without remote control), or a command that failed.
 
@@ -745,6 +1045,7 @@ Most actions have a plain-letter key, and the command panel (`space`) reaches th
 - `o` finds a file by typing part of its name, without opening the tree.
 - The command panel and the key list take the whole screen on narrow terminals.
 - A remembered split layout shows unified there, without forgetting the split.
+
 ## Watch mode
 
 `--watch` (or `w`) refreshes the view as files, the index or refs change. Every dffy process watching a repository shares one file watcher through `dffyd`, which starts on first use and exits when idle. Changes in directories git ignores that hold no tracked files never cause a refresh. [watch.md](watch.md) covers what's watched, the broker and the Linux watch limit.

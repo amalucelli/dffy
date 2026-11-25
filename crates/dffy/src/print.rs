@@ -31,7 +31,7 @@ use crate::pager::text_role;
 use crate::render::stat::{self, StatEntry};
 use crate::render::{Canvas, escape, plain};
 use crate::review::model::snapshot::{Hung, Snapshot};
-use crate::review::model::text::age;
+use crate::review::model::text::{age, lines, one_line};
 use crate::review::model::{self, At};
 use crate::review::{self, prompt, who};
 use crate::theme::{Ink, Role};
@@ -1460,9 +1460,13 @@ pub(crate) fn comments(
         place
     };
     let text = |c: &mut Canvas, indent: usize, text: &str| {
-        for line in text.lines() {
+        let text = text.strip_suffix('\n').unwrap_or(text);
+        if text.is_empty() {
+            return;
+        }
+        for line in lines(text) {
             c.spaces(Role::Plain, indent);
-            c.line(Role::Plain, &escape(line.as_bytes()));
+            c.line(Role::Plain, &line);
         }
     };
     let placed: HashMap<&str, &At> = placed.iter().map(|(id, at)| (id.as_str(), at)).collect();
@@ -1476,16 +1480,22 @@ pub(crate) fn comments(
             if comment.path.is_empty() {
                 c.push(Role::FileHeader, "conversation");
                 for word in [&comment.kind, &comment.label].into_iter().flatten() {
-                    c.push(Role::Dim, &format!(", {}", escape(word.as_bytes())));
+                    c.push(Role::Dim, &format!(", {}", one_line(word)));
                 }
             } else {
-                c.push(Role::FileHeader, &escape(comment.path.as_bytes()));
+                // A file named `you:` would head its threads as yours.
+                let here = if review::reads_as_you(&comment.path) {
+                    "./"
+                } else {
+                    ""
+                };
+                let path = format!("{here}{}", one_line(&comment.path));
+                c.push(Role::FileHeader, &path);
             }
             match (&comment.in_reply_to, comment.range()) {
-                (Some(root), _) => c.push(
-                    Role::Dim,
-                    &format!(", reply in thread {}", escape(root.as_bytes())),
-                ),
+                (Some(root), _) => {
+                    c.push(Role::Dim, &format!(", reply in thread {}", one_line(root)));
+                }
                 (None, Some((side, lines))) => {
                     let side = match side {
                         review::Side::Old => Side::Old,
@@ -1503,10 +1513,7 @@ pub(crate) fn comments(
                 _ => {}
             }
             if let Some(branch) = comment.branch.as_deref().filter(|b| Some(*b) != here) {
-                c.push(
-                    Role::Dim,
-                    &format!(", branch {}", escape(branch.as_bytes())),
-                );
+                c.push(Role::Dim, &format!(", branch {}", one_line(branch)));
             }
             if comment.resolved {
                 c.push(Role::Dim, ", resolved");
@@ -1514,13 +1521,10 @@ pub(crate) fn comments(
             c.end_line();
         }
         c.spaces(Role::Plain, 2);
-        c.push(Role::Dim, &escape(comment.id.as_bytes()));
+        c.push(Role::Dim, &one_line(&comment.id));
         c.push(Role::Plain, " ");
-        c.push(Role::Plain, &escape(who(&comment.author).as_bytes()));
-        c.push(
-            Role::Dim,
-            &format!(", {}", escape(comment.created.as_bytes())),
-        );
+        c.push(Role::Plain, &who(&comment.author));
+        c.push(Role::Dim, &format!(", {}", one_line(&comment.created)));
         if comment.reference.is_some() {
             c.push(Role::Dim, ", posted");
         }
@@ -1536,10 +1540,7 @@ pub(crate) fn comments(
         }
         if let Some(error) = &comment.post_error {
             c.spaces(Role::Plain, 4);
-            c.line(
-                Role::Warn,
-                &format!("not posted: {}", escape(error.as_bytes())),
-            );
+            c.line(Role::Warn, &format!("not posted: {}", one_line(error)));
         }
     }
 }

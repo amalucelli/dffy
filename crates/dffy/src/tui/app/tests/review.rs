@@ -1463,12 +1463,13 @@ fn on_a_detected_review_new_comments_go_to_the_local_file() {
     key(&mut app, '^');
     let handoff = app.take_handoff().expect("handed");
     assert_eq!(
-        (handoff.what, handoff.file, handoff.session),
-        (Handed::Open { count: 1, left: 1 }, local, false)
+        (handoff.what, handoff.file),
+        (Handed::Open { count: 1, left: 1 }, local)
     );
     app.event(Event::HandedOff {
         started: Ok("sent 1 thread to claude".to_owned()),
         left: Some(1),
+        unmarked: None,
     });
     app.resize(200, 30);
     assert!(

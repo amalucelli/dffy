@@ -6,17 +6,17 @@ A review thread on src/lib.rs:5-6 (the new version of the file).
 Language: rust
 
 ana:
-Why edit these?
+  Why edit these?
 
 you:
-Use `line 5` as it was.
+  Use `line 5` as it was.
 
-Suggested change, in place of the commented lines:
+  Suggested change, in place of the commented lines, indented as this comment is:
 
-````suggestion
-line 5
-line 6 ```
-````
+  ````suggestion
+  line 5
+  line 6 ```
+  ````
 
 The commented lines, marked >, and the lines around them:
 

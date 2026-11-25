@@ -418,6 +418,31 @@ pub(crate) enum CommentsAction {
         #[arg(long, requires = "open")]
         json: bool,
     },
+    /// Print a line for each hand-over from a viewer in this working tree, until it's killed or the process that started it exits
+    #[command(
+        long_about = "Print a line for each hand-over from a viewer in this working \
+        tree: what to do, as a new agent would be told. It's for a coding agent's session \
+        to read while it runs, and goes on until it's killed, its stdout's reader is gone \
+        or the process that started it exits. So don't start it with & from a shell that \
+        then ends: run it in the foreground of a process that lasts as long as the session."
+    )]
+    Listen {
+        /// The agent's name, which viewers show
+        #[arg(long = "as", value_name = "name", value_parser = author_name)]
+        name: String,
+        /// The session's own name, for `dffy comments listening` to name it by
+        #[arg(long, value_name = "key")]
+        key: Option<String>,
+    },
+    /// Say that a listening session was just prompted or, with --edited, edited a file; never fails
+    Listening {
+        /// The key its `dffy comments listen` was given
+        #[arg(long, value_name = "key")]
+        key: String,
+        /// It edited a file; without it, it was prompted
+        #[arg(long)]
+        edited: bool,
+    },
 }
 
 #[derive(Debug, Args)]
@@ -473,7 +498,7 @@ pub(crate) enum CtlAction {
 /// own comments show.
 fn author_name(name: &str) -> Result<String, String> {
     let name = name.trim();
-    if name.is_empty() || name.eq_ignore_ascii_case("you") {
+    if name.is_empty() || crate::review::reads_as_you(name) {
         return Err("give your own name, not empty or `you`, which means the user".to_owned());
     }
     if name.chars().any(char::is_control) {

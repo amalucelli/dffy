@@ -1,7 +1,9 @@
-//! Watching through dffyd end to end. Subscribers are `dffy daemon watch`
-//! processes, which go through the same client code as the viewer: connect,
-//! start the broker if needed, fall back to watching alone. Each test gets
-//! its own runtime directory, so its own broker.
+//! Watching and listening through dffyd end to end. Subscribers are `dffy
+//! daemon watch` processes, which go through the same client code as the
+//! viewer: connect, start the broker if needed, fall back to watching
+//! alone. Listeners are `dffy comments listen`, and the viewer handing over
+//! to them a connection of the test's. Each test gets its own runtime
+//! directory, so its own broker.
 //!
 //! Gated tests: `DFFY_BENCH_REPO` (the kernel clone) runs the checkout
 //! storm; `DFFY_SYSCTL_TESTS=1` runs the watch-limit test, which lowers
@@ -13,7 +15,8 @@
 )]
 
 use std::collections::BTreeSet;
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Write};
+use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc;
@@ -108,6 +111,29 @@ impl Runtime {
 
     fn socket(&self) -> PathBuf {
         self.dir.path().join("dffy/broker-v1.sock")
+    }
+
+    fn control(&self) -> PathBuf {
+        self.dir.path().join("dffy/control-v1.sock")
+    }
+
+    /// An older dffyd's control socket, for a test to answer on.
+    fn older(&self) -> UnixListener {
+        use std::os::unix::fs::DirBuilderExt as _;
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(self.dir.path().join("dffy"))
+            .expect("mkdir");
+        UnixListener::bind(self.control()).expect("bind")
+    }
+
+    #[track_caller]
+    fn wait_gone(&self) {
+        let start = Instant::now();
+        while !self.status().contains("isn't running") {
+            assert!(start.elapsed() < TIMEOUT, "the broker never exited");
+            std::thread::sleep(Duration::from_millis(100));
+        }
     }
 }
 
@@ -237,10 +263,7 @@ fn the_broker_exits_once_idle() {
     assert!(runtime.socket().exists());
     drop(subscriber);
     let start = Instant::now();
-    while !runtime.status().contains("isn't running") {
-        assert!(start.elapsed() < TIMEOUT, "the broker never exited");
-        std::thread::sleep(Duration::from_millis(100));
-    }
+    runtime.wait_gone();
     eprintln!(
         "idle exit {:?} after the last subscriber left (idle time 1s)",
         start.elapsed()
@@ -579,4 +602,387 @@ fn running_out_of_watches_falls_back_to_polling() {
     eprintln!("polling saw the edit after {:?}", at - written);
     mirror.set.refresh(&["src/lib.rs".into()]).expect("refresh");
     assert_eq!(mirror.listed(), git_status(&root));
+}
+
+/// A `dffy comments listen` process, and its lines on stdout and stderr.
+struct Listener {
+    child: Child,
+    lines: mpsc::Receiver<String>,
+    errors: mpsc::Receiver<String>,
+}
+
+fn lines_of(from: impl std::io::Read + Send + 'static) -> mpsc::Receiver<String> {
+    let (tx, lines) = mpsc::channel();
+    std::thread::spawn(move || {
+        for line in BufReader::new(from).lines() {
+            let Ok(line) = line else { break };
+            if tx.send(line).is_err() {
+                break;
+            }
+        }
+    });
+    lines
+}
+
+impl Listener {
+    fn spawn(runtime: &Runtime, dir: &Path) -> Self {
+        let mut child = runtime
+            .dffy(&["comments", "listen", "--as", "claude", "--key", "7"])
+            .current_dir(dir)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn listener");
+        let lines = lines_of(child.stdout.take().expect("stdout"));
+        let errors = lines_of(child.stderr.take().expect("stderr"));
+        Self {
+            child,
+            lines,
+            errors,
+        }
+    }
+
+    #[track_caller]
+    fn line(&self) -> String {
+        self.lines.recv_timeout(TIMEOUT).expect("a line")
+    }
+
+    #[track_caller]
+    fn wait_exit(&mut self) {
+        let start = Instant::now();
+        while self.child.try_wait().expect("wait").is_none() {
+            assert!(start.elapsed() < TIMEOUT, "it never ended");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+}
+
+impl Drop for Listener {
+    fn drop(&mut self) {
+        self.child.kill().ok();
+        self.child.wait().ok();
+    }
+}
+
+/// A connection to the control API.
+struct Raw {
+    reader: BufReader<UnixStream>,
+    writer: UnixStream,
+}
+
+impl Raw {
+    /// Connected once dffyd is there.
+    #[track_caller]
+    fn connect(runtime: &Runtime) -> Self {
+        let start = Instant::now();
+        let stream = loop {
+            match UnixStream::connect(runtime.control()) {
+                Ok(stream) => break stream,
+                Err(e) => assert!(start.elapsed() < TIMEOUT, "no dffyd: {e}"),
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        let mut raw = Self::on(stream);
+        raw.send(r#"{"version":1}"#);
+        assert!(raw.recv().contains(r#""capabilities""#));
+        raw
+    }
+
+    fn on(stream: UnixStream) -> Self {
+        stream.set_read_timeout(Some(TIMEOUT)).expect("timeout");
+        Self {
+            writer: stream.try_clone().expect("clone"),
+            reader: BufReader::new(stream),
+        }
+    }
+
+    /// Registered as a viewer of `worktree`.
+    #[track_caller]
+    fn view(runtime: &Runtime, worktree: &Path) -> Self {
+        let worktree = worktree.canonicalize().expect("canonical");
+        let mut raw = Self::connect(runtime);
+        raw.send(&format!(
+            r#"{{"id":1,"method":"views/register","params":{{"pid":1,"worktree":"{}","repository":"","diff":""}}}}"#,
+            worktree.display()
+        ));
+        assert!(raw.recv().contains(r#""result""#));
+        raw
+    }
+
+    fn send(&mut self, line: &str) {
+        self.writer
+            .write_all(format!("{line}\n").as_bytes())
+            .expect("send");
+    }
+
+    fn recv(&mut self) -> String {
+        let mut line = String::new();
+        self.reader.read_line(&mut line).expect("a line");
+        line
+    }
+
+    /// The id of the listener handed to this view next.
+    #[track_caller]
+    fn handed(&mut self) -> String {
+        let message = self.recv();
+        assert!(
+            message.contains(r#""method":"comments/listen""#),
+            "{message}"
+        );
+        assert!(message.contains(r#""client":"claude""#), "{message}");
+        id_of(&message)
+    }
+
+    fn hand_over(&mut self, id: &str, prompt: &str) {
+        self.send(&format!(
+            r#"{{"id":{id},"result":{{"prompt":"{prompt}"}}}}"#
+        ));
+    }
+}
+
+/// The request id of `message`, which opens with it.
+fn id_of(message: &str) -> String {
+    message
+        .strip_prefix(r#"{"id":"#)
+        .and_then(|rest| rest.split_once(','))
+        .map_or_else(|| panic!("no id in {message}"), |(id, _)| id.to_owned())
+}
+
+/// A listener keeps the dffyd it started, as a viewer does.
+#[test]
+fn a_listener_keeps_the_broker_until_it_leaves() {
+    let repo = repo();
+    let runtime = Runtime::new();
+    let listener = Listener::spawn(&runtime, repo.path());
+    let mut view = Raw::view(&runtime, repo.path());
+    view.handed();
+    drop(view);
+    let pid = runtime.broker_pid();
+    std::thread::sleep(Duration::from_secs(2));
+    assert_eq!(runtime.broker_pid(), pid, "not started again");
+    drop(listener);
+    runtime.wait_gone();
+}
+
+/// An agent ends a session by killing its processes' descendants, and the
+/// listener's dffyd serves everyone: it's nobody's descendant.
+#[test]
+fn the_broker_is_not_its_starter_s_descendant() {
+    let repo = repo();
+    let runtime = Runtime::new();
+    let listener = Listener::spawn(&runtime, repo.path());
+    Raw::view(&runtime, repo.path()).handed();
+    let starter = listener.child.id().to_string();
+    let broker = runtime.broker_pid();
+    let start = Instant::now();
+    loop {
+        let line = ancestors(&broker);
+        if !line.contains(&starter) {
+            break;
+        }
+        assert!(start.elapsed() < TIMEOUT, "{starter} among {line:?}");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+/// The pids above `pid`, its parent first.
+fn ancestors(pid: &str) -> Vec<String> {
+    let parent = |pid: &String| {
+        let out = Command::new("ps")
+            .args(["-o", "ppid=", "-p", pid])
+            .output()
+            .expect("ps");
+        let parent = String::from_utf8_lossy(&out.stdout).trim().to_owned();
+        (!parent.is_empty() && parent != "0").then_some(parent)
+    };
+    std::iter::successors(parent(&pid.to_owned()), parent).collect()
+}
+
+/// From a directory of the working tree; each hand-over is a line of its
+/// own, whatever the prompt holds, and the listener is there for the next.
+#[test]
+fn a_listener_prints_each_prompt_as_a_line() {
+    let repo = repo();
+    let runtime = Runtime::new();
+    let listener = Listener::spawn(&runtime, &repo.path().join("src"));
+    let mut view = Raw::view(&runtime, repo.path());
+    let id = view.handed();
+    view.hand_over(&id, "thread 1\\nand\\u001b[2J more\\ttoo");
+    assert_eq!(listener.line(), "thread 1^Jand^[[2J more    too");
+    let id = view.handed();
+    view.hand_over(&id, "thread 2");
+    assert_eq!(listener.line(), "thread 2");
+}
+
+#[test]
+fn a_listener_starts_dffyd_again_when_it_goes() {
+    let repo = repo();
+    let runtime = Runtime::new();
+    let listener = Listener::spawn(&runtime, repo.path());
+    let mut view = Raw::view(&runtime, repo.path());
+    view.handed();
+    let stopped = runtime.dffy(&["daemon", "stop"]).output().expect("stop");
+    assert!(stopped.status.success());
+    while !view.recv().is_empty() {}
+    let mut view = Raw::view(&runtime, repo.path());
+    let id = view.handed();
+    view.hand_over(&id, "thread 1");
+    assert_eq!(listener.line(), "thread 1");
+}
+
+/// It says so once, stays connected, and listens once the dffyd that
+/// doesn't know how is gone.
+#[test]
+fn a_listener_says_once_that_dffyd_is_older() {
+    let repo = repo();
+    let runtime = Runtime::new();
+    let older = runtime.older();
+    let mut listener = Listener::spawn(&runtime, repo.path());
+    let mut said = Vec::new();
+    for _ in 0..2 {
+        let mut raw = Raw::on(older.accept().expect("accept").0);
+        raw.recv();
+        raw.send(r#"{"version":1,"capabilities":{"methods":[],"events":[]}}"#);
+        let id = id_of(&raw.recv());
+        raw.send(&format!(
+            r#"{{"id":{id},"error":{{"code":"unknown_method","message":"no method"}}}}"#
+        ));
+        said.extend(listener.errors.recv_timeout(Duration::from_millis(500)));
+        assert!(listener.child.try_wait().expect("wait").is_none());
+    }
+    drop(older);
+    let mut view = Raw::view(&runtime, repo.path());
+    view.handed();
+    said.extend(listener.errors.try_iter());
+    said.retain(|line| line.contains("dffy daemon stop"));
+    assert_eq!(said.len(), 1, "{said:?}");
+}
+
+/// Nothing is there to listen for, and no dffyd is started to wait on.
+#[test]
+fn a_listener_outside_a_repository_stays_idle() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let runtime = Runtime::new();
+    let mut listener = Listener::spawn(&runtime, dir.path());
+    std::thread::sleep(Duration::from_secs(1));
+    assert!(listener.child.try_wait().expect("wait").is_none());
+    assert!(runtime.status().contains("isn't running"));
+    assert_eq!(listener.lines.try_recv().ok(), None);
+    assert_eq!(listener.errors.try_recv().ok(), None);
+}
+
+/// No delivery is needed for it to notice.
+#[test]
+fn a_listener_ends_when_nobody_reads_it() {
+    let repo = repo();
+    let runtime = Runtime::new();
+    let mut child = runtime
+        .dffy(&["comments", "listen", "--as", "claude"])
+        .current_dir(repo.path())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("spawn listener");
+    let stdout = child.stdout.take();
+    let (_lines, lines) = mpsc::channel();
+    let (_errors, errors) = mpsc::channel();
+    let mut listener = Listener {
+        child,
+        lines,
+        errors,
+    };
+    let mut view = Raw::view(&runtime, repo.path());
+    view.handed();
+    drop(stdout);
+    listener.wait_exit();
+    assert!(view.recv().contains("$/cancelRequest"));
+}
+
+/// A session killed hard leaves no ghost, even one whose listener writes
+/// to a file, which has no reader to miss.
+#[test]
+fn a_listener_ends_with_its_parent() {
+    let repo = repo();
+    let runtime = Runtime::new();
+    let stub = runtime.dir.path().join("listener-parent.sh");
+    std::fs::write(&stub, include_str!("fixtures/stubs/listener-parent.sh")).expect("write");
+    let mut dffy = runtime.dffy(&[]);
+    let mut parent = Command::new("sh");
+    for (key, value) in dffy.current_dir(repo.path()).get_envs() {
+        parent.env(key, value.expect("set"));
+    }
+    let mut parent = parent
+        .arg(&stub)
+        .arg(env!("CARGO_BIN_EXE_dffy"))
+        .current_dir(repo.path())
+        .stdin(Stdio::null())
+        .spawn()
+        .expect("spawn parent");
+    let mut view = Raw::view(&runtime, repo.path());
+    view.handed();
+    parent.kill().expect("kill");
+    parent.wait().expect("wait");
+    assert!(view.recv().contains("$/cancelRequest"));
+}
+
+#[test]
+fn a_listener_dies_on_each_signal_to_end() {
+    let repo = repo();
+    let runtime = Runtime::new();
+    for name in ["-TERM", "-INT", "-HUP"] {
+        let mut listener = Listener::spawn(&runtime, repo.path());
+        let mut view = Raw::view(&runtime, repo.path());
+        view.handed();
+        signal(&listener.child.id().to_string(), name);
+        listener.wait_exit();
+    }
+}
+
+/// Hooks run it on every edit, so it never fails, says nothing, a config's
+/// problems included, and starts nothing, with no dffyd, an older one, or
+/// one that knows the listener.
+#[test]
+fn listening_reports_activity_and_never_fails() {
+    let repo = repo();
+    let report = |runtime: &Runtime| {
+        let config = runtime.dir.path().join("config/dffy");
+        std::fs::create_dir_all(&config).expect("mkdir");
+        std::fs::write(config.join("config"), "no-such-key = 1\ntheme = no-such\n").expect("write");
+        let out = runtime
+            .dffy(&["comments", "listening", "--key", "7", "--edited"])
+            .current_dir("/")
+            .output()
+            .expect("listening");
+        assert!(out.status.success());
+        assert_eq!((out.stdout, out.stderr), (Vec::new(), Vec::new()));
+    };
+    let runtime = Runtime::new();
+    report(&runtime);
+    assert!(runtime.status().contains("isn't running"));
+
+    let _listener = Listener::spawn(&runtime, repo.path());
+    let mut view = Raw::view(&runtime, repo.path());
+    let id = view.handed();
+    report(&runtime);
+    let changed = view.recv();
+    let edited = format!(r#"{{"method":"listener/changed","params":{{"id":{id},"#);
+    assert!(changed.starts_with(&edited), "{changed}");
+    assert!(changed.contains(r#""prompted":null"#), "{changed}");
+
+    let runtime = Runtime::new();
+    let older = runtime.older();
+    let answering = std::thread::spawn(move || {
+        let mut raw = Raw::on(older.accept().expect("accept").0);
+        raw.recv();
+        raw.send(r#"{"version":1,"capabilities":{"methods":[],"events":[]}}"#);
+        raw.send(r#"{"id":1,"error":{"code":"unknown_method","message":"no method"}}"#);
+        raw.recv()
+    });
+    report(&runtime);
+    assert!(
+        answering
+            .join()
+            .expect("asked")
+            .contains("comments/listening")
+    );
 }

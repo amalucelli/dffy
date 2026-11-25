@@ -1,0 +1,41 @@
+{
+  "description": "Tells Claude how to take dffy hand-overs, and dffy which session was last prompted or edited",
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "cat",
+            "args": [
+              "${CLAUDE_PLUGIN_ROOT}/hooks/session-start.json"
+            ]
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Write|Edit|NotebookEdit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "dffy comments listening --key $PPID --edited >/dev/null 2>&1 || true",
+            "async": true
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "dffy comments listening --key $PPID >/dev/null 2>&1 || true",
+            "async": true
+          }
+        ]
+      }
+    ]
+  }
+}

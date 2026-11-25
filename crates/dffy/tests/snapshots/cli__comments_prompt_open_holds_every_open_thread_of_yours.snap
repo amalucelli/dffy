@@ -10,7 +10,7 @@ A review thread on README.md:3 (the new version of the file), as written.
 Language: markdown
 
 you:
-Say more.
+  Say more.
 
 The commented lines, marked >, and the lines around them:
 
@@ -27,10 +27,10 @@ Language: rust
 In: fn add
 
 ana:
-Overflow?
+  Overflow?
 
 you:
-Use checked_add.
+  Use checked_add.
 
 The commented lines, marked >, and the lines around them:
 

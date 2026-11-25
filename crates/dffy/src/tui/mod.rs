@@ -46,10 +46,14 @@ use dffy_core::git::{
 };
 use dffy_core::watch::{Change, Notice, Plain, Root, Watcher};
 
-pub(crate) use app::{Action, App, Checkout, Handed, Handoff, Suggestion, Uncommitted};
+pub(crate) use app::{
+    Action, App, Checkout, HandTo, Handed, Handoff, Listening, Suggestion, To, Uncommitted,
+};
 pub(crate) use tree::bench_all_files;
 pub(crate) use worker::Done;
 
+use crate::control::viewer::Reply;
+use crate::control::{object, text};
 use crate::daemon::client::{self, Subscription};
 use crate::pager::stdin::Stdin;
 use crate::plugin::agent;
@@ -173,13 +177,19 @@ pub(crate) enum Event {
     /// The agent plugin hasn't initialized, so a thread handed to it waits
     /// for it.
     AgentStarting,
-    /// The coding agent threads were handed to started, as the note says,
-    /// or why not; `left`, when it was handed your open threads, how many
-    /// stay in the other comments file.
+    /// A session got the threads handed to it, or the coding agent they
+    /// were handed to started, as the note says, or why not; `left`, when
+    /// it was handed your open threads, how many stay in the other comments
+    /// file.
     HandedOff {
         started: Result<String, String>,
         left: Option<usize>,
+        /// Why a session's hand-over has no checkpoint to show its turn.
+        unmarked: Option<String>,
     },
+    /// The session it was handed to was called away as its checkpoint was
+    /// taken.
+    HandedBack(Box<Handoff>),
     /// Nothing happened before the app's deadline.
     Tick,
 }
@@ -199,6 +209,65 @@ fn checkpoint(repo: Option<&Repo>, handoff: bool) -> Event {
         |repo| repo.take_checkpoint().map_err(|e| e.to_string()),
     );
     Event::Checkpointed { taken, handoff }
+}
+
+/// How many of your open threads stay in the other comments file, when
+/// `handoff` is of them all.
+fn left_of(handoff: &Handoff) -> Option<usize> {
+    match handoff.what {
+        Handed::Thread(_) => None,
+        Handed::Open { left, .. } => Some(left),
+    }
+}
+
+/// Answers `session` with `seed`, the prompt of `handoff`, once its
+/// checkpoint of `repo` is taken; hands it back when the session was called
+/// away meanwhile. Its checkpoint then stands: the turn it starts is the
+/// session's, whichever view's threads it's for.
+fn deliver(
+    (reply, session): (Reply, &Listening),
+    repo: &Repo,
+    (handoff, seed): (Handoff, String),
+    events: &mpsc::Sender<Event>,
+) {
+    let mut unmarked = None;
+    if !handoff.checkpointed {
+        let taken = checkpoint(Some(repo), true);
+        if let Event::Checkpointed {
+            taken: Err(why), ..
+        } = &taken
+        {
+            unmarked = Some(why.clone());
+        }
+        events.send(taken).ok();
+    }
+    if reply.cancelled() {
+        let back = Handoff {
+            to: To::Session {
+                number: session.number,
+                name: session.name.clone(),
+            },
+            checkpointed: unmarked.is_none(),
+            ..handoff
+        };
+        events.send(Event::HandedBack(Box::new(back))).ok();
+        return;
+    }
+    reply.send(Ok(object(vec![("prompt", text(seed))])));
+    let what = match handoff.what {
+        Handed::Open { count: 1, .. } => "1 thread".to_owned(),
+        Handed::Open { count, .. } => format!("{count} threads"),
+        Handed::Thread(_) => "the thread".to_owned(),
+    };
+    let handed = Event::HandedOff {
+        started: Ok(format!(
+            "sent {what} to {}{}",
+            session.name, session.told_apart
+        )),
+        left: left_of(&handoff),
+        unmarked,
+    };
+    events.send(handed).ok();
 }
 
 /// Why the working tree isn't for changing on `checkout`'s behalf: HEAD
@@ -1103,7 +1172,7 @@ impl Session<'_> {
     /// plugin, and asks for the agent plugin.
     fn hand_off(&mut self, app: &mut App) {
         if let Some(handoff) = app.take_handoff() {
-            self.hand_to_agent(&handoff);
+            self.hand_to_agent(app, &handoff);
         }
         let (asks, stops) = app.take_agent_work();
         for id in stops {
@@ -1659,10 +1728,11 @@ impl Session<'_> {
         }
     }
 
-    /// Hands `handoff`'s thread to the user's coding agent, which the
-    /// agent plugin names and says how to start: once it has, the loop
-    /// starts it from [`Event::Handoff`].
-    fn hand_to_agent(&mut self, handoff: &Handoff) {
+    /// Hands `handoff`'s threads to the session that listens for them, if
+    /// one does, else to the user's coding agent, which the agent plugin
+    /// names and says how to start: once it has, the loop starts it from
+    /// [`Event::Handoff`].
+    fn hand_to_agent(&mut self, app: &mut App, handoff: &Handoff) {
         // Through the channel: the frame is out, and the loop waits next.
         let open = match handoff.what {
             Handed::Thread(_) => None,
@@ -1671,7 +1741,14 @@ impl Session<'_> {
         let refuse = |events: &mpsc::Sender<Event>, why: String| {
             let started = Err(why);
             let left = open.map(|(_, left)| left);
-            events.send(Event::HandedOff { started, left }).ok();
+            let unmarked = None;
+            events
+                .send(Event::HandedOff {
+                    started,
+                    left,
+                    unmarked,
+                })
+                .ok();
         };
         let Some((repo, root)) = (self.files.as_ref()).and_then(|r| Some((r, r.workdir()?))) else {
             return refuse(
@@ -1684,17 +1761,29 @@ impl Session<'_> {
         }
         let local = crate::review::local_file(repo).ok().flatten();
         let local = local.map(|l| std::path::absolute(&l).unwrap_or(l));
-        let kept = if handoff.session {
-            prompt::Kept::Session
-        } else if local.as_deref() == Some(&*handoff.file) {
+        // Absolute: a session that listens may be in another directory.
+        let file = std::path::absolute(&handoff.file).unwrap_or_else(|_| handoff.file.clone());
+        let kept = if local.as_deref() == Some(&*file) {
             prompt::Kept::Local
         } else {
-            prompt::Kept::File(&handoff.file)
+            prompt::Kept::File(&file)
         };
         let seed = match &handoff.what {
             Handed::Thread(root) => prompt::handoff(root, kept),
             Handed::Open { .. } => prompt::open_handoff(kept),
         };
+        match app.hand_over(handoff) {
+            HandTo::Agent => {}
+            HandTo::Session(reply, session) => {
+                let repo = repo.without_object_cache();
+                return self.hand_to_session((reply, session), repo, (handoff.clone(), seed));
+            }
+            HandTo::Later => {
+                // Wakes the loop to draw what the app shows meanwhile.
+                self.events.send(Event::Tick).ok();
+                return;
+            }
+        }
         let dir = std::path::absolute(root).unwrap_or_else(|_| root.to_owned());
         let (config, events) = (self.agent_config.clone(), self.events.clone());
         match self.agent() {
@@ -1729,6 +1818,29 @@ impl Session<'_> {
         }
     }
 
+    /// Hands `handoff`, whose prompt is `seed`, to `session`, on a thread of
+    /// its own.
+    fn hand_to_session(
+        &self,
+        (reply, session): (Reply, Listening),
+        repo: Repo,
+        (handoff, seed): (Handoff, String),
+    ) {
+        let (events, name) = (self.events.clone(), session.name.clone());
+        let left = left_of(&handoff);
+        let started = std::thread::Builder::new()
+            .name("dffy-hand-over".into())
+            .spawn(move || deliver((reply, &session), &repo, (handoff, seed), &events));
+        if let Err(e) = started {
+            let handed = Event::HandedOff {
+                started: Err(format!("couldn't send to {name}: {e}")),
+                left,
+                unmarked: None,
+            };
+            self.events.send(handed).ok();
+        }
+    }
+
     /// Starts the agent `to` says on `seed`, the threads' prompt, as the
     /// user would run it, with none of dffy's flags: in a new tab of their
     /// terminal at `dir`, the working tree, or where it can't open one
@@ -1745,7 +1857,7 @@ impl Session<'_> {
         let handoff = match to {
             Ok(handoff) => handoff,
             Err(why) => {
-                app.handed_off(Err(why), open.map(|(_, left)| left));
+                app.handed_off(Err(why), open.map(|(_, left)| left), None);
                 return Ok(());
             }
         };
@@ -1806,13 +1918,17 @@ impl Session<'_> {
                         (Ok(status), _) => Err(format!("{program} failed ({status})")),
                         (Err(e), _) => Err(format!("couldn't run {program}: {e}")),
                     };
-                    let left = open.map(|(_, left)| left);
-                    events.send(Event::HandedOff { started, left }).ok();
+                    let handed = Event::HandedOff {
+                        started,
+                        left: open.map(|(_, left)| left),
+                        unmarked: None,
+                    };
+                    events.send(handed).ok();
                 }
             });
         if let Err(e) = started {
             let left = open.map(|(_, left)| left);
-            app.handed_off(Err(format!("couldn't start {name}: {e}")), left);
+            app.handed_off(Err(format!("couldn't start {name}: {e}")), left, None);
         }
         Ok(())
     }
@@ -1833,6 +1949,7 @@ impl Session<'_> {
             let handed = Event::HandedOff {
                 started,
                 left: None,
+                unmarked: None,
             };
             self.events.send(handed).ok();
             return Ok(());
@@ -2226,6 +2343,122 @@ mod tests {
             checked_out(&repo, Some(&elsewhere)),
             Err("check out PR #7 first: gh pr checkout 7".to_owned())
         );
+    }
+
+    /// `handoff` of your open threads, 2 of them with 3 more in the other
+    /// file, delivered to claude in a new repository, or outside one: the
+    /// answer and the events.
+    fn delivered(
+        in_repo: bool,
+        checkpointed: bool,
+        meanwhile: impl FnOnce(&Reply),
+    ) -> (Option<String>, Vec<Event>) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let git = |args: &[&str]| {
+            let out = Command::new("git")
+                .current_dir(dir.path())
+                .args(args)
+                .output();
+            assert!(out.expect("git runs").status.success(), "git {args:?}");
+        };
+        if in_repo {
+            git(&["init", "-q"]);
+            std::fs::write(dir.path().join("a"), "a\n").expect("write");
+        } else {
+            git(&["init", "-q", "--bare"]);
+        }
+        let repo = Repo::discover(dir.path()).expect("repo");
+        let (reply, answer) = Reply::channel();
+        meanwhile(&reply);
+        let claude = Listening {
+            number: 4,
+            name: "claude".to_owned(),
+            told_apart: " · edited 3h ago".to_owned(),
+        };
+        let handoff = Handoff {
+            what: Handed::Open { count: 2, left: 3 },
+            file: PathBuf::new(),
+            checkout: None,
+            to: To::Anyone,
+            checkpointed,
+        };
+        let (tx, rx) = mpsc::channel();
+        deliver((reply, &claude), &repo, (handoff, "Go".to_owned()), &tx);
+        drop(tx);
+        (answer.recv().ok(), rx.into_iter().collect())
+    }
+
+    /// A session gets the prompt after the checkpoint, and what's said counts
+    /// the threads left in the other file.
+    #[test]
+    fn a_session_gets_the_threads_after_the_checkpoint() {
+        let (answer, events) = delivered(true, false, |_| {});
+        assert_eq!(
+            answer.as_deref(),
+            Some("{\"id\":1,\"result\":{\"prompt\":\"Go\"}}\n")
+        );
+        assert!(
+            matches!(
+                &events[..],
+                [
+                    Event::Checkpointed {
+                        taken: Ok(_),
+                        handoff: true
+                    },
+                    Event::HandedOff { started: Ok(note), left: Some(3), unmarked: None }
+                ] if note == "sent 2 threads to claude · edited 3h ago"
+            ),
+            "{} events",
+            events.len()
+        );
+    }
+
+    /// Called away as the checkpoint is taken, the hand-over comes back to
+    /// wait for that session, its checkpoint taken once.
+    #[test]
+    fn a_session_called_away_during_the_checkpoint_hands_back() {
+        let call_off = |reply: &Reply| {
+            let flag = reply.watch().upgrade().expect("held");
+            flag.store(true, Ordering::Relaxed);
+        };
+        let (answer, events) = delivered(true, false, call_off);
+        assert_eq!(answer, None);
+        let [
+            Event::Checkpointed { taken: Ok(_), .. },
+            Event::HandedBack(back),
+        ] = &events[..]
+        else {
+            panic!("{} events", events.len());
+        };
+        assert!(back.checkpointed);
+        assert!(matches!(&back.to, To::Session { number: 4, name } if name == "claude"));
+        let (_, events) = delivered(true, true, |_| {});
+        assert!(
+            matches!(events[..], [Event::HandedOff { .. }]),
+            "no second one"
+        );
+    }
+
+    /// Without its checkpoint, the threads still go, and what's said doesn't
+    /// offer to show the turn since it.
+    #[test]
+    fn a_hand_over_without_its_checkpoint_says_so() {
+        let (answer, events) = delivered(false, false, |_| {});
+        assert!(answer.is_some());
+        let [
+            Event::Checkpointed {
+                taken: Err(why), ..
+            },
+            Event::HandedOff {
+                started: Ok(_),
+                unmarked: Some(unmarked),
+                ..
+            },
+        ] = &events[..]
+        else {
+            panic!("{} events", events.len());
+        };
+        assert_eq!(why, unmarked);
     }
 
     /// A review shows its head's tree, not the working tree; once its head

@@ -3,7 +3,7 @@
 - [install.md](install.md): Homebrew, the install script, mise, building from source, plugins, shell completions, the man page, supported platforms.
 - [usage.md](usage.md): what to compare, paths, comparing files and folders outside git, a diff on stdin, every flag and subcommand, exit codes.
 - [json.md](json.md): `--json` output for scripts and agents, and the versioned schema of its header, file, hunk and line objects.
-- [agents.md](agents.md): coding agents and dffy: the skill `dffy agents setup` installs, the guide it points to, what an agent can do and the rules it follows, and when to use MCP instead.
+- [agents.md](agents.md): coding agents and dffy: the skill `dffy agents setup` installs, the guide it points to, the Claude Code plugin that takes threads in a running session, what an agent can do and the rules it follows, and when to use MCP instead.
 - [mcp.md](mcp.md): `dffy mcp`, the Model Context Protocol server for coding agents: registering it, its tools, paging and truncation.
 - [control.md](control.md): driving a running viewer with `dffy ctl` and the control API: the protocol, the commands and the security model.
 - [viewer.md](viewer.md): the full-screen viewer: layout, panels, search, selection and copy, comments, asking an agent, applying a suggestion, fixing with an agent, phones.
@@ -14,7 +14,7 @@
 - [watch.md](watch.md): watch mode, the `dffyd` broker, the Linux inotify limit, macOS.
 - [plugins.md](plugins.md): experimental plugins. Renderers, the rendered view and the Markdown plugin, review plugins, the agent plugin and its recipes, their protocols, and writing your own.
 - [review-github.md](review-github.md): `dffy-review-github`, the experimental review plugin for GitHub pull requests: how it opens, imports, posts and watches a PR, and what it keeps.
-- [comments.md](comments.md): experimental review comments: the comments file's format, anchors and placement, and the operations of `dffy comments apply` and `import`.
+- [comments.md](comments.md): experimental review comments: the comments file's format, anchors and placement, and the operations of `dffy comments apply` and `import`, and `dffy comments listen` for a running agent.
 - [navigate.md](navigate.md): `dffy __navigate`, the helper process go to definition runs in for the viewer and the MCP server, and its protocol.
 - [troubleshooting.md](troubleshooting.md): `dffy doctor` and its checks, copying, the mouse, colors, watch mode, a garbled terminal.
 - [architecture.md](architecture.md): crates and modules, data flow, the engine, performance, testing and releases.

@@ -38,6 +38,7 @@ use crate::print::{Plan, Summary, Target};
 use crate::render::Canvas;
 use crate::review::model::At;
 use crate::review::model::snapshot::Snapshot;
+use crate::review::model::text::{lines, one_line};
 use crate::{Ctx, Error, control, review};
 
 /// The revision with per-request metadata.
@@ -72,8 +73,9 @@ const INSTRUCTIONS: &str = "dffy shows the changes in the git repository it was 
     only moved code are classified, so you can skip them. list_comments returns the review \
     comments left on the code, with their threads, thread_prompt one thread as a prompt to \
     answer, with its lines and the changes near them, and reply_to_thread answers in a thread. \
-    definitions finds where a C or Rust name is defined at either version of the diff, and \
-    with references: true the lines using it. \
+    definitions finds where a name is defined at either version of the diff, in C, C++, Go, \
+    Java, JavaScript, Python, Rust, TypeScript and the other languages it lists, and with \
+    references: true the lines using it. \
     Results are paged: pass next_cursor \
     back as cursor, with the same arguments, to continue. When the user has the dffy viewer \
     open here, open_in_viewer shows them a file at a line, focus_thread a comment thread, \
@@ -364,7 +366,7 @@ const TOOLS: &str = r#"[
     "type": "object",
     "properties": {
       "name": {"type": "string", "description": "The name, as an identifier: letters, digits and _."},
-      "path": {"type": "string", "description": "The file asking, relative to the repository root, a C or Rust file."},
+      "path": {"type": "string", "description": "The file asking, relative to the repository root, in one of those languages."},
       "line": {"type": "integer", "minimum": 1, "description": "The line of path the name is used on, 1-based, in the version looked in."},
       "column": {"type": "integer", "minimum": 1, "description": "Where on line the name starts, 1-based, in bytes; without it, the name's first use in code on the line."},
       "side": {"type": "string", "enum": ["old", "new"], "default": "new", "description": "Which version of the diff to look in: new for the files as changed, old for them before."},
@@ -522,7 +524,7 @@ impl Server<'_> {
             self.client = (info.and_then(|i| i.get("name")).and_then(Value::as_str))
                 .map(|n| n.chars().filter(|c| !c.is_control()).collect::<String>())
                 .map(|n| n.trim().chars().take(64).collect::<String>())
-                .filter(|n| !n.is_empty() && !n.eq_ignore_ascii_case("you"));
+                .filter(|n| !n.is_empty() && !review::reads_as_you(n));
             return Ok(self.initialize(params));
         }
         let era = era(params, self.legacy || method == "ping")?;
@@ -1525,7 +1527,7 @@ impl Server<'_> {
         }
         text.push('\n');
         if let Some(notice) = &file.notice {
-            let _ = writeln!(text, "notice: {notice}");
+            let _ = writeln!(text, "notice: {}", one_line(notice));
         }
         let mut canvas = Canvas::default();
         crate::print::comments(page, here, &placed, &mut canvas);
@@ -2633,9 +2635,9 @@ fn summary_line(file: &Value, text: &mut String) {
     let status = field(file, "status").as_str().unwrap_or_default();
     text.push_str(letter(status));
     text.push(' ');
-    text.push_str(field(file, "path").as_str().unwrap_or_default());
+    text.push_str(&one_line(field(file, "path").as_str().unwrap_or_default()));
     if status == "renamed" {
-        let from = field(file, "old_path").as_str().unwrap_or_default();
+        let from = one_line(field(file, "old_path").as_str().unwrap_or_default());
         let similarity = field(file, "similarity").as_usize().unwrap_or_default();
         let _ = write!(text, " (from {from}, {similarity}%)");
     }
@@ -2680,7 +2682,7 @@ fn file_text(file: &Value, text: &mut String) {
         );
         if let Some(heading) = field(hunk, "heading").as_str() {
             text.push(' ');
-            text.push_str(heading);
+            text.push_str(&one_line(heading));
         }
         text.push('\n');
         for line in field(hunk, "lines").as_array().unwrap_or_default() {
@@ -2694,7 +2696,8 @@ fn file_text(file: &Value, text: &mut String) {
                 Some("reformatted") => '~',
                 _ => ' ',
             });
-            text.push_str(field(line, "text").as_str().unwrap_or_default());
+            let code = field(line, "text").as_str().unwrap_or_default();
+            text.push_str(&one_line(code.strip_suffix('\r').unwrap_or(code)));
             text.push('\n');
             if field(line, "no_newline") == &Value::Bool(true) {
                 text.push_str("\\ No newline at end of file\n");
@@ -2706,7 +2709,7 @@ fn file_text(file: &Value, text: &mut String) {
         text.push_str("comments:\n");
     }
     for annotation in annotations {
-        let id = field(annotation, "id").as_str().unwrap_or_default();
+        let id = one_line(field(annotation, "id").as_str().unwrap_or_default());
         let side = field(annotation, "side").as_str().unwrap_or_default();
         let _ = match (
             field(annotation, "start").as_usize(),
@@ -2719,12 +2722,9 @@ fn file_text(file: &Value, text: &mut String) {
             _ => writeln!(text, "  {id} on the {side} side, lines not found:"),
         };
         for comment in field(annotation, "thread").as_array().unwrap_or_default() {
-            let author = match field(comment, "author").as_str().unwrap_or_default() {
-                "" => "you",
-                author => author,
-            };
-            let created = field(comment, "created").as_str().unwrap_or_default();
-            let mut lines = field(comment, "text").as_str().unwrap_or_default().lines();
+            let said = |key| field(comment, key).as_str().unwrap_or_default();
+            let (author, created) = (review::who(said("author")), one_line(said("created")));
+            let mut lines = lines(said("text").trim_end());
             let _ = writeln!(
                 text,
                 "    {author}, {created}: {}",

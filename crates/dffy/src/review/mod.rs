@@ -14,6 +14,7 @@ pub(crate) mod model;
 pub(crate) mod prompt;
 pub(crate) mod session;
 
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
 use std::fs::{self, File};
@@ -27,7 +28,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use dffy_core::annotation::Anchor;
 use dffy_core::diff::{Hunk, LineKind};
 use dffy_core::git::{Head, Repo};
+use unicode_width::UnicodeWidthChar as _;
 
+use self::model::text::{lines, one_line};
 use crate::plugin::json::{self, Value};
 
 const VERSION: usize = 1;
@@ -1832,15 +1835,51 @@ pub(crate) fn threads<'a>(comments: impl IntoIterator<Item = &'a Comment>) -> Ve
         .collect()
 }
 
-/// A comment's author as said: `you` for an empty one.
-pub(crate) fn who(author: &str) -> &str {
-    if author.is_empty() { "you" } else { author }
+/// A comment's author as said, on one line: `you` for an empty one, and for
+/// no other, as agents take what's headed `you` for the user's words.
+pub(crate) fn who(author: &str) -> Cow<'_, str> {
+    if author.is_empty() {
+        return Cow::Borrowed("you");
+    }
+    let shown = one_line(author);
+    if reads_as_you(author) {
+        Cow::Owned(format!("someone named {}", shown.trim()))
+    } else if shown == author {
+        Cow::Borrowed(author)
+    } else {
+        Cow::Owned(shown)
+    }
+}
+
+/// Whether `name`'s first word reads as `you`: in any case, with characters
+/// that don't show, or with letters of other alphabets that look the same.
+pub(crate) fn reads_as_you(name: &str) -> bool {
+    let shows = |c: &char| {
+        // Takes columns, though there's nothing to see.
+        let blank = matches!(c, '\u{115f}' | '\u{1160}' | '\u{3164}' | '\u{ffa0}');
+        c.width().is_some_and(|w| w > 0) && !blank
+    };
+    // Cyrillic's, Greek's, Armenian's and the fullwidth letters; not every
+    // lookalike Unicode has.
+    let mut letters = (name.chars().filter(shows)).map(|c| match c {
+        'Y' | '\u{443}' | '\u{423}' | '\u{4af}' | '\u{4ae}' | '\u{3a5}' | '\u{ff39}'
+        | '\u{ff59}' => 'y',
+        'O' | '0' | '\u{43e}' | '\u{41e}' | '\u{3bf}' | '\u{39f}' | '\u{585}' | '\u{555}'
+        | '\u{ff2f}' | '\u{ff4f}' => 'o',
+        'U' | '\u{3c5}' | '\u{57d}' | '\u{54d}' | '\u{ff35}' | '\u{ff55}' => 'u',
+        c => c,
+    });
+    letters.find(|c| c.is_alphanumeric()) == Some('y')
+        && letters.next() == Some('o')
+        && letters.next() == Some('u')
+        && letters.next().is_none_or(|c| !c.is_alphanumeric())
 }
 
 /// `comments`, in [`threads`] order, as Markdown: `summary` first when
 /// there's one, then a heading per thread with its place, the commented
 /// lines as they were in a code block, and each comment's author and time
-/// over its text, which is Markdown already.
+/// over its text, which is Markdown already. The lines and the comments are
+/// quoted, so nothing in them reads as a heading of dffy's.
 pub(crate) fn markdown(comments: &[&Comment], summary: Option<&str>) -> String {
     let mut out = String::new();
     if let Some(summary) = summary {
@@ -1857,20 +1896,21 @@ pub(crate) fn markdown(comments: &[&Comment], summary: Option<&str>) -> String {
                 out.push_str("Conversation");
                 for word in [&comment.kind, &comment.label].into_iter().flatten() {
                     out.push_str(", ");
-                    out.push_str(word);
+                    out.push_str(&one_line(word));
                 }
             } else {
-                let ticks = fence(&comment.path, 1);
-                let pad = if comment.path.starts_with('`') || comment.path.ends_with('`') {
+                let path = one_line(&comment.path);
+                let ticks = fence(&path, 1);
+                let pad = if path.starts_with('`') || path.ends_with('`') {
                     " "
                 } else {
                     ""
                 };
-                let _ = write!(out, "{ticks}{pad}{}{pad}{ticks}", comment.path);
+                let _ = write!(out, "{ticks}{pad}{path}{pad}{ticks}");
             }
             match (&comment.in_reply_to, comment.range()) {
                 (Some(root), _) => {
-                    let _ = write!(out, ", reply in thread {root}");
+                    let _ = write!(out, ", reply in thread {}", one_line(root));
                 }
                 (None, Some((side, lines))) => {
                     let (first, last) = (lines.start + 1, lines.end);
@@ -1892,21 +1932,16 @@ pub(crate) fn markdown(comments: &[&Comment], summary: Option<&str>) -> String {
             if comment.in_reply_to.is_none()
                 && let Some(anchor) = &comment.anchor
             {
-                code_block(&mut out, &anchor.lines.join("\n"));
+                quoted(&mut out, &code_block(&anchor.lines.join("\n")));
             }
         }
-        let author = if comment.author.is_empty() {
-            "you"
-        } else {
-            &comment.author
-        };
-        let _ = write!(out, "**{author}**, {}\n\n", comment.created);
-        out.push_str(comment.text.trim_end());
-        out.push_str("\n\n");
+        let (author, created) = (who(&comment.author), one_line(&comment.created));
+        let _ = write!(out, "**{author}**, {created}\n\n");
+        let mut body = comment.text.trim_end().to_owned();
         if let Some(suggestion) = &comment.suggestion {
-            out.push_str("Suggested change:\n\n");
-            code_block(&mut out, suggestion);
+            let _ = write!(body, "\n\nSuggested change:\n\n{}", code_block(suggestion));
         }
+        quoted(&mut out, &body);
     }
     out.truncate(out.trim_end().len());
     if !out.is_empty() {
@@ -1917,9 +1952,23 @@ pub(crate) fn markdown(comments: &[&Comment], summary: Option<&str>) -> String {
 
 /// A fenced code block of `text`, its fence longer than any run of
 /// backticks in it.
-fn code_block(out: &mut String, text: &str) {
+fn code_block(text: &str) -> String {
     let ticks = fence(text, 3);
-    let _ = write!(out, "{ticks}\n{text}\n{ticks}\n\n");
+    format!("{ticks}\n{text}\n{ticks}")
+}
+
+/// Pushes `text` as a Markdown quote.
+fn quoted(out: &mut String, text: &str) {
+    if text.is_empty() {
+        return;
+    }
+    for line in lines(text) {
+        let _ = match line.as_str() {
+            "" => out.write_str(">\n"),
+            line => writeln!(out, "> {line}"),
+        };
+    }
+    out.push('\n');
 }
 
 /// Backticks, at least `min` and one more than the longest run in `text`.

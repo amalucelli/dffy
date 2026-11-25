@@ -53,7 +53,7 @@ git config --global core.pager dffy
 git config --global interactive.diffFilter "dffy --color-only"
 ```
 
-In the viewer, `n`/`N` move between changes, `f`/`F` between files, `/` searches, `o` finds a file, `space` lists commands and `q` quits. Settings go in `~/.config/dffy/config` as `key = value` lines. `dffy config --default` lists every key with its default.
+In the viewer, `n`/`N` move between changes, `f`/`F` between files, `/` searches, `o` finds any file, `l` shows files whole, `K` goes to a definition, `space` lists commands and `q` quits. Settings go in `~/.config/dffy/config` as `key = value` lines. `dffy config --default` lists every key with its default.
 
 ## Plugins
 
@@ -77,7 +77,7 @@ render = md:markdown mmd:mermaid mermaid:mermaid
 - `r` switches a Markdown or Mermaid file between its lines and its rendered form.
 - `dffy-review-github` needs no config line. Once it's the only review plugin on `PATH`, `dffy pr 123` opens a pull request, and plain `dffy` on a branch with an open PR brings in its comments. `review = none` turns it off.
 - `dffy-agent` needs no config line. Once it's on `PATH`, `a` on a thread asks.
-- Fix with agent (`f` on a thread) needs no plugin. It hands the thread to Claude Code, Codex, Pi or Amp in a new tab.
+- Fix with agent (`f` on a thread) needs no plugin. It hands the thread to Claude Code, Codex, Pi or Amp in a new tab, or to a session already running and [listening](docs/viewer.md#sending-to-a-running-session). `h` does it with all your open threads.
 - `dffy doctor` checks that each plugin is found, and that `gh` and the agents are logged in.
 
 [plugins.md](docs/plugins.md) has the details.
@@ -91,6 +91,15 @@ dffy agents setup    # a skill for Claude Code, Codex, Pi and Amp
 ```
 
 The skill tells the agent to run `dffy agents show`, which prints how to use the installed dffy. It also tells the agent to reply in your threads under its own name and never resolve or post them. Agents without a shell use [`dffy mcp`](docs/mcp.md) instead. [agents.md](docs/agents.md) has the details.
+
+To send threads to the Claude Code session you already have open, install dffy's plugin for it:
+
+```sh
+claude plugin marketplace add amalucelli/dffy
+claude plugin install dffy@dffy
+```
+
+`f` on a thread in dffy, or `h` for all your open threads, then wakes that session, which makes the change and replies in the thread ([agents.md](docs/agents.md#claude-code)).
 
 <p align="center"><img src="assets/ai.png" alt="Claude Code answering a review thread inline in dffy"></p>
 
@@ -110,8 +119,14 @@ The skill tells the agent to run `dffy agents show`, which prints how to use the
 - 🌳 [A syntax-aware diff](docs/architecture.md#the-engine) (`d`) that marks reformatted (`~`) and moved (`»`) code.
 - 🔁 Renames detected the way git detects them.
 
+**Reading code**
+- 📖 [File view](docs/viewer.md#file-view) (`l`) shows each file whole at either version, with its changes marked and opened in place.
+- 🔎 [Go to definition](docs/viewer.md#go-to-definition) (`K`) at either version, with the lines using a name, in 18 languages and without a language server.
+- 🗃️ [Any file of the repository](docs/viewer.md#opening-files), from the picker or [a tree of all files](docs/viewer.md#all-files), at either version.
+
 **Navigation**
 - 🗂️ [A file tree](docs/viewer.md#panels), a fuzzy file picker and [search across the diff](docs/viewer.md#search).
+- ↩️ [Back and forward](docs/viewer.md#jumping-back) (`backspace`, `\`) between the places you jumped from.
 - 🎯 [Each file opens at its first change](docs/viewer.md#where-a-file-opens), and `n`/`N` jump between changes.
 - ⌨️ [Single-key actions](docs/keys.md), with a [command panel](docs/viewer.md#panels) on `space`.
 
@@ -120,7 +135,7 @@ The skill tells the agent to run `dffy agents show`, which prints how to use the
 - 🗒️ A [Comments panel](docs/viewer.md#the-comments-panel) beside the file tree. Picking a thread takes the diff to it.
 - 🔀 [Code host reviews](docs/viewer.md#code-host-reviews) (experimental). With the `dffy-review-github` plugin, `dffy pr 123` opens a GitHub pull request with its threads, posts your review, and follows new pushes.
 - 🤝 [Ask](docs/viewer.md#asking-an-agent) a coding agent (experimental). With the `dffy-agent` plugin, `a` on a thread has Claude Code, Codex or Pi answer in it, read-only. [Apply suggestion](docs/viewer.md#applying-a-suggestion) (`s`) puts a thread's suggestion in the working tree.
-- 🛠️ [Fix with agent](docs/viewer.md#fixing-with-an-agent) (`f`) hands a thread to your own agent session in a new tab, or every open thread at once. [Copy as prompt](docs/viewer.md#copying-a-thread) and [Open terminal here](docs/viewer.md#opening-a-terminal) are in the command panel.
+- 🛠️ [Fix with agent](docs/viewer.md#fixing-with-an-agent) (`f`) hands a thread to your own agent, in a new tab or [a session already running](docs/viewer.md#sending-to-a-running-session), or every open thread at once (`h`). [Copy as prompt](docs/viewer.md#copying-a-thread) and [Open terminal here](docs/viewer.md#opening-a-terminal) are in the command panel.
 - 📍 [Checkpoints](docs/git.md#checkpoints) save the working tree, so the next diff shows only what changed since, such as your agent's last turn.
 
 **Git**
@@ -138,7 +153,7 @@ The skill tells the agent to run `dffy agents show`, which prints how to use the
 **Scripts and agents**
 - 🧱 [`--json`](docs/json.md): the diff as JSON Lines, with each line's kind and whether it moved or was only reformatted.
 - 🧠 [`dffy agents setup`](docs/agents.md): a skill that teaches Claude Code, Codex, Pi and Amp to read changes and answer your threads with dffy's CLI.
-- 🤖 [`dffy mcp`](docs/mcp.md): an MCP server. Coding agents list a change's files, read its diffs a page at a time, read your review comments, and reply in a thread or apply its suggestion.
+- 🤖 [`dffy mcp`](docs/mcp.md): an MCP server. Coding agents list a change's files, read its diffs a page at a time, find where a name is defined and used, read your review comments, and reply in a thread or apply its suggestion.
 - ✍️ [`dffy comments`](docs/comments.md): review comments as JSON. Scripts and agents add their own with `dffy comments apply`, shown inline with their author.
 
 ## Comparison

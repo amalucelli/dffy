@@ -1,0 +1,7 @@
+[
+  {
+    "name": "dffy",
+    "description": "dffy review threads handed to this session",
+    "command": "if dffy comments listen --help 2>/dev/null | grep -q -e --key; then exec dffy comments listen --as claude --key $PPID 2>/dev/null; else exec sleep 2147483647; fi"
+  }
+]

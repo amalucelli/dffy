@@ -2,10 +2,12 @@
 //! reachable (starting it if needed), by itself otherwise. Either way the
 //! caller sees the same events, and at most a note about watching alone.
 
+use std::ffi::OsStr;
 use std::io::{self, Write};
+use std::os::unix::ffi::OsStrExt as _;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Command, ExitCode, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::thread;
@@ -142,15 +144,13 @@ pub(crate) fn connect_or_spawn(socket: fn(&Path) -> PathBuf) -> io::Result<UnixS
     if let Ok(stream) = super::connect(&path) {
         return Ok(stream);
     }
-    let mut child = Command::new(std::env::current_exe()?)
-        .args(["daemon", "run"])
+    let mut child = Command::new(dffy()?)
+        .arg(super::START)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .current_dir("/")
         .spawn()?;
-    // Reaped here should it exit while this view runs; once this process
-    // exits, init inherits it.
     thread::Builder::new()
         .name("dffy-reap".into())
         .spawn(move || child.wait())?;
@@ -163,5 +163,52 @@ pub(crate) fn connect_or_spawn(socket: fn(&Path) -> PathBuf) -> io::Result<UnixS
             Err(e) if start.elapsed() >= SPAWN_WAIT => return Err(e),
             Err(_) => wait = (wait * 2).min(Duration::from_millis(40)),
         }
+    }
+}
+
+/// `dffy __dffyd`: starts dffyd and exits, so dffyd is no descendant of
+/// whoever wanted it, and outlives an agent ending its session by killing
+/// all it started.
+pub(crate) fn start() -> ExitCode {
+    let started = dffy().and_then(|dffy| Command::new(dffy).args(["daemon", "run"]).spawn());
+    match started {
+        Ok(_) => ExitCode::SUCCESS,
+        Err(_) => ExitCode::FAILURE,
+    }
+}
+
+/// The program this process runs, where it is now.
+fn dffy() -> io::Result<PathBuf> {
+    std::env::current_exe().map(in_place)
+}
+
+/// `exe`, or what replaced it: Linux names the program of a process whose
+/// file was replaced, as by an upgrade, with ` (deleted)` after it.
+fn in_place(exe: PathBuf) -> PathBuf {
+    let replaced = (exe.as_os_str().as_bytes().strip_suffix(b" (deleted)"))
+        .map(|path| PathBuf::from(OsStr::from_bytes(path)))
+        .filter(|path| path.exists());
+    match replaced {
+        Some(path) if !exe.exists() => path,
+        _ => exe,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// After an upgrade, dffyd starts from the new program.
+    #[test]
+    fn a_replaced_program_is_run_from_its_path() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("dffy");
+        let deleted = dir.path().join("dffy (deleted)");
+        assert_eq!(in_place(deleted.clone()), deleted, "nothing in its place");
+        std::fs::write(&path, "").expect("write");
+        assert_eq!(in_place(deleted.clone()), path);
+        assert_eq!(in_place(path.clone()), path);
+        std::fs::write(&deleted, "").expect("write");
+        assert_eq!(in_place(deleted.clone()), deleted, "its own name");
     }
 }

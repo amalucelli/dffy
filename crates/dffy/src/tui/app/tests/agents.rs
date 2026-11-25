@@ -650,10 +650,9 @@ fn f_hands_a_thread_or_a_selection_to_your_agent() {
     key(&mut app, 'f');
     let handoff = app.take_handoff().expect("handed");
     assert_eq!(
-        (&handoff.what, handoff.session, &handoff.checkout),
-        (&Handed::Thread("d1".to_owned()), false, &None)
+        (&handoff.what, &handoff.file, &handoff.checkout),
+        (&Handed::Thread("d1".to_owned()), &path, &None)
     );
-    assert_eq!(handoff.file, path);
 
     esc(&mut app);
     key(&mut app, 'v');
@@ -677,7 +676,7 @@ fn f_hands_a_thread_or_a_selection_to_your_agent() {
     app.follow_thread("d1");
     key(&mut app, 'f');
     let handoff = app.take_handoff().expect("handed");
-    assert!(handoff.session && handoff.checkout.is_some_and(|c| c.head == HEAD));
+    assert!(handoff.checkout.is_some_and(|c| c.head == HEAD));
 }
 
 /// A comment that starts `@claude` but wasn't written in this viewer, as
@@ -919,12 +918,13 @@ fn send_open_threads_hands_every_open_thread_of_yours_over() {
     // d1 and its reply, the whole-file f1, g1 and m1: not octocat's p1 or
     // the resolved r1.
     assert_eq!(
-        (handoff.what, handoff.file, handoff.session),
-        (Handed::Open { count: 4, left: 0 }, path, false)
+        (handoff.what, handoff.file),
+        (Handed::Open { count: 4, left: 0 }, path)
     );
     app.event(Event::HandedOff {
         started: Ok("sent 4 threads to claude".to_owned()),
         left: Some(0),
+        unmarked: None,
     });
     assert!(
         status(&mut app).contains("sent 4 threads to claude · ' shows its turn"),

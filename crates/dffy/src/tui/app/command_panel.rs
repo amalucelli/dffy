@@ -255,7 +255,7 @@ impl App {
         }
         let send = (self.applies(Act::SendOpenThreads)).then(|| {
             Offer::new(
-                Act::SendOpenThreads.title(),
+                &self.hand_over_title(Act::SendOpenThreads),
                 Act::SendOpenThreads,
                 Table::Main,
             )
@@ -286,7 +286,7 @@ impl App {
             .chain(checkpoints.into_iter().flatten())
             .chain(ANYWHERE)
             .filter(|&a| self.applies(a))
-            .map(|a| Offer::new(a.title(), a, Table::Main))
+            .map(|a| Offer::new(&self.hand_over_title(a), a, Table::Main))
             .collect();
         ("Here".to_owned(), offers)
     }
@@ -370,6 +370,7 @@ impl App {
             Act::SinceCheckpoint => toggle(self.since_checkpoint.is_some()),
             Act::WholeReview => (None, self.reviewing.whole_title(), None),
             Act::OpenReview => (None, format!("Open {}…", self.reviewing.noun(false)), None),
+            Act::FixWithAgent | Act::SendOpenThreads => (None, self.hand_over_title(action), None),
             // In file view, what applies once it's off.
             Act::ToggleFull if self.doc.document.reading().is_some() => {
                 toggle(self.doc.document.full)

@@ -5469,6 +5469,501 @@ fn sending_open_threads_takes_a_checkpoint_and_points_the_agent_at_them() {
     assert!(term.wait_exit().success());
 }
 
+/// Where the viewers and the sessions listening to them meet, with the test
+/// plugin as `dffy-agent` on PATH.
+struct Sessions {
+    runtime: tempfile::TempDir,
+    bin: tempfile::TempDir,
+}
+
+/// `dffy comments listen`, as a coding agent's session runs it, and the
+/// lines it printed; killed on drop.
+struct Listening {
+    child: std::process::Child,
+    lines: Arc<Mutex<Vec<String>>>,
+}
+
+impl Drop for Listening {
+    fn drop(&mut self) {
+        self.child.kill().ok();
+        self.child.wait().ok();
+    }
+}
+
+impl Listening {
+    fn lines(&self) -> Vec<String> {
+        self.lines.lock().expect("lock").clone()
+    }
+
+    /// The `n`th line, once it printed that many.
+    #[track_caller]
+    fn line(&self, n: usize) -> String {
+        let start = Instant::now();
+        loop {
+            let lines = self.lines();
+            if lines.len() >= n {
+                assert_eq!(lines.len(), n, "{lines:?}");
+                return lines[n - 1].clone();
+            }
+            assert!(start.elapsed() < TIMEOUT, "never {n} lines: {lines:?}");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+}
+
+impl Sessions {
+    fn new() -> Self {
+        use std::os::unix::fs::PermissionsExt as _;
+        let sessions = Self {
+            runtime: tempfile::tempdir().expect("tempdir"),
+            bin: tempfile::tempdir().expect("tempdir"),
+        };
+        for (name, script) in [
+            (
+                "dffy-agent",
+                include_str!("fixtures/stubs/review-plugin.sh"),
+            ),
+            ("agent-turn", include_str!("fixtures/stubs/agent-turn.sh")),
+        ] {
+            let path = sessions.bin.path().join(name);
+            std::fs::write(&path, script).expect("write");
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        }
+        std::fs::write(
+            sessions.bin.path().join("initialize.out"),
+            format!(
+                "{{\"jsonrpc\":\"2.0\",\"id\":@ID@,\"result\":{{\"protocol\":1,\"agents\":[],\"handoffs\":[{{\"name\":\"agent-turn\",\"program\":\"{}\",\"args\":[\"{{prompt}}\"]}}]}}}}\n",
+                sessions.bin.path().join("agent-turn").display()
+            ),
+        )
+        .expect("write");
+        sessions
+    }
+
+    fn dffy(&self, dir: &Path, args: &[&str]) -> Command {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_dffy"));
+        cmd.args(args)
+            .current_dir(dir)
+            .env("XDG_RUNTIME_DIR", self.runtime.path())
+            .env("XDG_CONFIG_HOME", dir.join(".no-config"))
+            .env("DFFY_DAEMON_IDLE_SECS", "1");
+        cmd
+    }
+
+    fn view(&self, dir: &Path, args: &[&str]) -> Term {
+        let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_dffy"));
+        cmd.args(args);
+        let search = format!("{}:/usr/bin:/bin", path(&self.bin));
+        let runtime = path(&self.runtime);
+        let stub = path(&self.bin);
+        let mut env = vec![
+            ("PATH", search.as_str()),
+            ("XDG_RUNTIME_DIR", runtime.as_str()),
+            ("STUB", stub.as_str()),
+        ];
+        env.extend(NO_TERMINAL);
+        Term::spawn_command(cmd, dir, 120, 30, &env)
+    }
+
+    /// A session in `dir` that gave its name and key.
+    fn listen(&self, dir: &Path, name: &str) -> Listening {
+        let mut child = self
+            .dffy(dir, &["comments", "listen", "--as", name, "--key", name])
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("dffy comments listen runs");
+        let out = std::io::BufReader::new(child.stdout.take().expect("stdout"));
+        let lines = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&lines);
+        std::thread::spawn(move || {
+            use std::io::BufRead as _;
+            for line in out.lines().map_while(Result::ok) {
+                sink.lock().expect("lock").push(line);
+            }
+        });
+        Listening { child, lines }
+    }
+
+    /// The session listening as `name` edited a file.
+    fn edited(&self, dir: &Path, name: &str) {
+        let out = self
+            .dffy(dir, &["comments", "listening", "--key", name, "--edited"])
+            .output()
+            .expect("dffy comments listening runs");
+        assert!(out.status.success(), "{out:?}");
+    }
+
+    /// The agent plugin was started.
+    fn started(&self) -> bool {
+        self.bin.path().join("started").exists()
+    }
+}
+
+/// Writes a comment on the line at the top, its thread focused after.
+fn write_thread(term: &mut Term, text: &str) {
+    term.wait_for("the diffs", |t| t.contains("More."));
+    term.send("c");
+    term.send(text);
+    term.send("\x1b");
+    term.wait_for("the thread", |t| t.contains("you · just now"));
+}
+
+/// Waits until the command panel says `label`, as it does for where the keys
+/// would send threads, and closes it.
+#[track_caller]
+fn panel_says(term: &mut Term, label: &str) {
+    term.send(" ");
+    term.wait_for(&format!("the panel to say {label}"), |t| t.contains(label));
+    term.send("\x1b");
+}
+
+/// With a session listening in the working tree, `f`, Send open threads and
+/// `h`, once its question is answered, hand over to it, each after a
+/// checkpoint, and no agent starts.
+#[test]
+fn every_key_hands_over_to_a_listening_session() {
+    let repo = repo();
+    let dir = repo.path();
+    let sessions = Sessions::new();
+    let mut term = sessions.view(dir, &[]);
+    write_thread(&mut term, "Spell it out");
+    let claude = sessions.listen(dir, "claude");
+    panel_says(&mut term, "Send open threads to claude");
+    let id = first_comment(dir);
+    let checkpoints = || {
+        let refs = git_out(dir, &["for-each-ref", "refs/worktree/dffy/checkpoints/"]);
+        String::from_utf8_lossy(&refs).lines().count()
+    };
+    term.send("f");
+    assert_eq!(
+        claude.line(1),
+        format!(
+            "Address dffy review thread {id}: run dffy comments prompt {id} (or the \
+             thread_prompt MCP tool), change only what the thread asks, then reply in the \
+             thread with what you changed."
+        )
+    );
+    status_shows(&mut term, "sent the thread to claude");
+    assert_eq!(checkpoints(), 1);
+    term.send(" ^");
+    assert!(
+        claude
+            .line(2)
+            .starts_with("Address the open dffy review threads: run dffy comments prompt --open, "),
+        "{:?}",
+        claude.lines()
+    );
+    status_shows(&mut term, "sent 1 thread to claude · ' shows its turn");
+    assert_eq!(checkpoints(), 2);
+    term.send("h");
+    status_shows(
+        &mut term,
+        "send 1 thread to claude? enter sends · esc keeps",
+    );
+    term.send("\r");
+    assert_eq!(claude.line(3), claude.lines()[1]);
+    assert!(!sessions.started(), "an agent started");
+    term.send("q");
+    assert!(term.wait_exit().success());
+}
+
+/// A session listens to the viewers of its own working tree only: from the
+/// main checkout's viewer nothing reaches one in a linked worktree, and the
+/// other way around.
+#[test]
+fn a_session_gets_nothing_from_another_worktrees_viewer() {
+    let repo = repo();
+    let outside = tempfile::tempdir().expect("tempdir");
+    let linked = outside.path().join("wt");
+    let wt = linked.to_str().expect("utf-8");
+    git(repo.path(), &["worktree", "add", "-q", wt, "-b", "wt"]);
+    std::fs::write(linked.join("README.md"), "# demo\n\nMore.\n").expect("write");
+    for (here, there) in [(repo.path(), &*linked), (&*linked, repo.path())] {
+        let sessions = Sessions::new();
+        let claude = sessions.listen(there, "claude");
+        let mut elsewhere = sessions.view(here, &[]);
+        let mut beside = sessions.view(there, &[]);
+        write_thread(&mut beside, "Spell it out");
+        panel_says(&mut beside, "Send open threads to claude");
+        write_thread(&mut elsewhere, "Say why");
+        elsewhere.send("f");
+        status_shows(&mut elsewhere, "agent-turn exited");
+        assert_eq!(claude.lines(), Vec::<String>::new());
+        beside.send("f");
+        assert!(claude.line(1).starts_with("Address dffy review thread "));
+        for mut term in [elsewhere, beside] {
+            term.send("q");
+            assert!(term.wait_exit().success());
+        }
+    }
+}
+
+/// Two viewers in one working tree hold the same session, and each hands
+/// over to it.
+#[test]
+fn each_viewer_of_a_worktree_hands_over_to_its_session() {
+    let repo = repo();
+    let dir = repo.path();
+    let sessions = Sessions::new();
+    let claude = sessions.listen(dir, "claude");
+    let mut first = sessions.view(dir, &[]);
+    write_thread(&mut first, "Spell it out");
+    let mut second = sessions.view(dir, &[]);
+    second.wait_for("the thread", |t| t.contains("Spell it out"));
+    second.send("m");
+    let mut terms = [first, second];
+    for (n, at) in [0, 1, 0].into_iter().enumerate() {
+        panel_says(&mut terms[at], "Send open threads to claude");
+        terms[at].send("f");
+        claude.line(n + 1);
+        status_shows(&mut terms[at], "sent the thread to claude");
+    }
+    assert!(!sessions.started());
+    for mut term in terms {
+        term.send("q");
+        assert!(term.wait_exit().success());
+    }
+}
+
+/// The session pointer names the review opened last, whichever viewer sends:
+/// the line a session gets, and the one a new agent starts on, name the
+/// sending viewer's file, where the thread is read and replied to.
+#[test]
+fn a_hand_over_names_the_sending_viewers_review() {
+    let pull = Pull::new();
+    let dir = pull.repo.path();
+    let sessions = Sessions::new();
+    std::fs::copy(
+        pull.stub.path().join("dffy-review-test"),
+        sessions.bin.path().join("dffy-review-test"),
+    )
+    .expect("copy");
+    let session = |number: u64| pull.session(number, &pull.head);
+    // The review plugin answers from the agent's directory: the one
+    // `initialize` describes both.
+    let describe = DESCRIBE.trim_end_matches("}}").to_owned();
+    std::fs::write(
+        sessions.bin.path().join("initialize.out"),
+        format!(
+            "{describe},\"agents\":[],\"handoffs\":[{{\"name\":\"agent-turn\",\"program\":\"{}\",\"args\":[\"{{prompt}}\"]}}]}}}}\n",
+            sessions.bin.path().join("agent-turn").display()
+        ),
+    )
+    .expect("write");
+    for number in [7, 8] {
+        std::fs::write(
+            pull.comments().with_file_name(format!("{number}.json")),
+            format!(
+                r#"{{"version":1,"comments":[{{"id":"mine{number}","path":"README.md","text":"Say more in {number}","author":"","created":"2026-11-17T10:00:00Z"}}]}}"#
+            ),
+        )
+        .expect("write");
+    }
+    let open = |number: u64| {
+        let prepared = format!("{}\n{DONE}\n", session_note(&session(number)));
+        std::fs::write(sessions.bin.path().join("prepare.out"), prepared).expect("write");
+        let mut term = sessions.view(dir, &["--review", "test", "pr", &number.to_string()]);
+        term.wait_for("its thread", |t| {
+            t.contains(&format!("Say more in {number}"))
+        });
+        term
+    };
+    let mut seven = open(7);
+    let eight = open(8);
+    let file = pull.comments().canonicalize().expect("canonical");
+    let file_in = |line: &str| {
+        let (_, rest) = line.split_once("dffy --comments ").expect("a file");
+        let (path, _) = rest.split_once(" comments ").expect("a command");
+        Path::new(path).canonicalize().expect("canonical")
+    };
+
+    seven.send("m");
+    seven.send("f");
+    status_shows(&mut seven, "agent-turn exited");
+    let prompt = std::fs::read_to_string(sessions.bin.path().join("prompt")).expect("read");
+    assert_eq!(file_in(&prompt), file, "{prompt}");
+    std::fs::remove_file(sessions.bin.path().join("prompt")).expect("remove");
+
+    let claude = sessions.listen(dir, "claude");
+    panel_says(&mut seven, "Send open threads to claude");
+    seven.send("f");
+    let line = claude.line(1);
+    assert_eq!(file_in(&line), file, "{line}");
+    assert!(line.contains(" comments prompt mine7,"), "{line}");
+    seven.send(" ^");
+    let line = claude.line(2);
+    assert_eq!(file_in(&line), file, "{line}");
+    assert!(
+        line.contains(" comments prompt --open,") && line.contains(" comments apply --as <you>"),
+        "{line}"
+    );
+
+    // What the line says to run.
+    let named = file.to_str().expect("utf-8");
+    for (which, says) in [("mine7", "Say more in 7"), ("--open", "## Thread mine7")] {
+        let prompt = sessions
+            .dffy(dir, &["--comments", named, "comments", "prompt", which])
+            .output()
+            .expect("dffy comments prompt runs");
+        let prompt = String::from_utf8_lossy(&prompt.stdout).into_owned();
+        assert!(prompt.contains(says), "{prompt}");
+    }
+    let mut apply = sessions
+        .dffy(
+            dir,
+            &["--comments", named, "comments", "apply", "--as", "claude"],
+        )
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .spawn()
+        .expect("dffy comments apply runs");
+    apply
+        .stdin
+        .take()
+        .expect("stdin")
+        .write_all(br#"[{"op":"add","comment":{"in_reply_to":"mine7","text":"Said more."}}]"#)
+        .expect("write");
+    assert!(apply.wait().expect("waits").success());
+    seven.wait_for("the reply", |t| {
+        t.contains("Said more.") && t.contains("claude · just now")
+    });
+    let other = std::fs::read_to_string(file.with_file_name("8.json")).expect("read");
+    assert!(!other.contains("Said more."), "{other}");
+    for mut term in [seven, eight] {
+        term.send("q");
+        assert!(term.wait_exit().success());
+    }
+}
+
+/// With several sessions, the only one that edited gets the threads; else a
+/// list of them opens, `esc` sending nothing, and the one picked is the
+/// viewer's from then on.
+#[test]
+fn several_sessions_are_picked_from_unless_one_edited() {
+    let repo = repo();
+    let dir = repo.path();
+    let sessions = Sessions::new();
+    let mut term = sessions.view(dir, &[]);
+    write_thread(&mut term, "Spell it out");
+    let claude = sessions.listen(dir, "claude");
+    panel_says(&mut term, "Send open threads to claude");
+    let codex = sessions.listen(dir, "codex");
+    panel_says(&mut term, "Send open threads to a session");
+    term.send("f");
+    term.wait_for("the sessions", |t| {
+        t.contains("claude · started just now") && t.contains("codex · started just now")
+    });
+    term.send("\x1b");
+    status_shows(&mut term, "nothing sent");
+
+    sessions.edited(dir, "claude");
+    panel_says(&mut term, "Send open threads to claude");
+    term.send("f");
+    claude.line(1);
+    sessions.edited(dir, "codex");
+    panel_says(&mut term, "Send open threads to a session");
+    term.send("f");
+    term.wait_for("the sessions", |t| {
+        t.contains("codex · started just now · edited just now")
+    });
+    term.send("\r");
+    codex.line(1);
+    status_shows(&mut term, "sent the thread to codex");
+    sessions.edited(dir, "claude");
+    panel_says(&mut term, "Send open threads to codex");
+    term.send("f");
+    codex.line(2);
+    assert_eq!(claude.lines().len(), 1);
+    assert!(!sessions.started());
+    term.send("q");
+    assert!(term.wait_exit().success());
+}
+
+/// A viewer whose dffyd stops registers with another, started again, and
+/// holds the session that came back too.
+#[test]
+fn a_viewer_registers_again_once_dffyd_stops() {
+    let repo = repo();
+    let dir = repo.path();
+    let sessions = Sessions::new();
+    let mut term = sessions.view(dir, &[]);
+    write_thread(&mut term, "Spell it out");
+    let claude = sessions.listen(dir, "claude");
+    panel_says(&mut term, "Send open threads to claude");
+    let daemon = |action: &str| {
+        let out = sessions.dffy(dir, &["daemon", action]).output();
+        String::from_utf8_lossy(&out.expect("dffy daemon runs").stdout).into_owned()
+    };
+    let stopped = daemon("stop");
+    let (_, pid) = stopped.split_once("(pid ").expect("a pid");
+    let gone = format!("pid {},", pid.trim_end().trim_end_matches(')'));
+    term.wait_for("another dffyd", |_| {
+        let status = daemon("status");
+        status.contains("  pid ") && !status.contains(&gone)
+    });
+    term.wait_views(dir, 1);
+    panel_says(&mut term, "Send open threads to claude");
+    term.send("f");
+    claude.line(1);
+    term.send("q");
+    assert!(term.wait_exit().success());
+}
+
+/// A viewer that can't register says so once, and registers once it can.
+#[test]
+fn a_viewer_registers_once_it_can() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let repo = repo();
+    let sessions = Sessions::new();
+    let dir = sessions.runtime.path().join("dffy");
+    std::fs::create_dir(&dir).expect("mkdir");
+    let mode = |mode| {
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(mode)).expect("chmod");
+    };
+    mode(0o755);
+    let mut term = sessions.view(repo.path(), &[]);
+    status_shows(&mut term, "dffy ctl can't reach this viewer");
+    mode(0o700);
+    term.wait_views(repo.path(), 1);
+    term.send("q");
+    assert!(term.wait_exit().success());
+}
+
+/// Someone else's review isn't sent to a session before it's checked out,
+/// as it isn't to a new agent: the session would change other files.
+#[test]
+fn a_review_not_checked_out_isnt_sent_to_a_session() {
+    let pull = Pull::new();
+    let dir = pull.repo.path();
+    let sessions = Sessions::new();
+    for name in ["dffy-review-test", "initialize.out"] {
+        let to = sessions.bin.path().join(name);
+        std::fs::copy(pull.stub.path().join(name), to).expect("copy");
+    }
+    std::fs::write(
+        pull.comments(),
+        r#"{"version":1,"comments":[{"id":"mine","path":"README.md","text":"Say more","author":"","created":"2026-11-17T10:00:00Z"}]}"#,
+    )
+    .expect("write");
+    let prepared = format!("{}\n{DONE}\n", session_note(&pull.session(7, &pull.head)));
+    std::fs::write(sessions.bin.path().join("prepare.out"), prepared).expect("write");
+    git(dir, &["checkout", "-q", "HEAD~1"]);
+    let claude = sessions.listen(dir, "claude");
+    let mut term = sessions.view(dir, &["--review", "test", "pr", "7"]);
+    term.wait_for("its thread", |t| t.contains("Say more"));
+    panel_says(&mut term, "Send open threads to claude");
+    for keys in ["mf", " ^"] {
+        term.send(keys);
+        status_shows(&mut term, "check out PR #7 first");
+        term.settle();
+        term.send("\x1b");
+    }
+    assert_eq!(claude.lines(), Vec::<String>::new());
+    term.send("q");
+    assert!(term.wait_exit().success());
+}
+
 /// `dffy --since-checkpoint` names the checkpoint's age as `'` does, and
 /// `'` goes to plain `dffy`'s diff.
 #[test]

@@ -20,6 +20,7 @@ Hosts with no shell, and sandboxes that block what the CLI needs, use [the MCP s
 | Read its own turn | `--since-checkpoint` shows what changed since your latest [checkpoint](git.md#checkpoints), `--since-checkpoint=3` since checkpoint 3. |
 | Read review threads | `dffy comments --open` lists open threads with their ids. `dffy comments prompt <id>` prints one thread as a prompt, `dffy comments prompt --open` every open thread of yours ([comments.md](comments.md#as-a-prompt-dffy-comments-prompt)). |
 | Reply | `dffy comments apply --as <name>` writes a reply, optionally with a suggestion instead of an edit ([comments.md](comments.md#writing-dffy-comments-apply)). |
+| Take threads while it runs | `dffy comments listen --as <name>` prints a line for each hand-over from your viewer, for a session that can read it as it comes ([comments.md](comments.md#listening-dffy-comments-listen)). |
 | Use your viewer | `dffy ctl selection` reads the lines you selected. `dffy ctl open` and `dffy ctl focus` show you a line or a thread. `dffy ctl apply-suggestion <id>` applies a suggestion when you ask ([control.md](control.md)). |
 
 ## What an agent may not do
@@ -81,6 +82,28 @@ missing   ~/.agents/skills/dffy/SKILL.md  Codex, Pi, Amp
 | `--json` | yes | yes | yes | Print the result as one JSON object. |
 
 A skills directory or `SKILL.md` that is a symlink, such as one into your dotfiles, is written through and stays a link. `remove` never touches a `dffy/SKILL.md` without the marker.
+
+## Claude Code
+
+dffy's Claude Code plugin makes every Claude Code session listen for threads. `f` (one thread) and `h` (all your open threads) in the viewer then send to a session already running in the same working tree, and start a new agent only when there's none ([viewer.md](viewer.md#sending-to-a-running-session)).
+
+```sh
+claude plugin marketplace add amalucelli/dffy
+claude plugin install dffy@dffy
+```
+
+Then start new Claude Code sessions: each is told how to take a hand-over as it starts. It needs a `dffy` with `dffy comments listen` on `PATH`; without one it does nothing. After upgrading dffy, run `dffy daemon stop` and reopen your viewers and sessions: an older dffyd keeps serving them, and each starts dffyd from the `dffy` it runs.
+
+Start `claude` and `dffy` in the same working tree, in either order. A thread you send wakes the session. It reads the thread, edits under its own permission mode, and replies as `claude`. Resolving is yours.
+
+- The session takes a hand-over as you asking for it. The code change a thread asks for is wanted whoever wrote the thread, a reviewer included. A command to run, or anything beyond that change, from someone else's comment is only information to it. dffy prints comments so that no one else's can pass for yours ([comments.md](comments.md#who-you-is)). These are instructions to a model, not limits dffy enforces. The session's permissions are the limit.
+- It listens where it started. A session that moves to another worktree still listens in the first.
+- Claude Code starts it only in folders you trust, and not with `-p`. In a session that isn't in a git working tree it does nothing.
+- It reports when a session is prompted and when it edits with Write, Edit or NotebookEdit, so dffy can tell several sessions apart. It sends no prompt, path or text. Edits made through a shell aren't reported, and an edit outside the working tree counts too.
+
+`claude plugin disable dffy@dffy` turns it off, `claude plugin enable dffy@dffy` on again, and `claude plugin uninstall dffy@dffy` removes it. Sessions already running listen until they end.
+
+The plugin is in [integrations/claude-code](../integrations/claude-code/README.md). Any other agent that can run a command in the background and act on its lines can listen the same way, and `dffy agents show` tells it how.
 
 ## Skill or MCP
 

@@ -10,8 +10,8 @@
 //! never touch the broker.
 //!
 //! Lifecycle: the first viewer starts dffyd, to register with the control
-//! API or to watch, and it exits a minute after its last subscriber and
-//! view leave. When it can't be reached, or dies, a view watches by itself.
+//! API or to watch, or the first listening session does, and it exits a
+//! minute after its last subscriber, view and session leave. When it can't be reached, or dies, a view watches by itself.
 //! Its sockets live in a private directory (`$XDG_RUNTIME_DIR/dffy`, else
 //! `$TMPDIR/dffy-<uid>`) and are named after their protocol's version, so
 //! dffyds from different dffy versions never meet; each socket is served
@@ -33,6 +33,9 @@ use protocol::{Message, Report, VERSION};
 
 use crate::render::{Canvas, escape};
 use crate::theme::Role;
+
+/// The first argument that makes `dffy` start dffyd (see [`client::start`]).
+pub(crate) const START: &str = "__dffyd";
 
 /// The broker's private directory, created if needed. Refuses one that
 /// isn't a directory owned by this user and closed to everyone else, since
@@ -178,7 +181,10 @@ fn unexpected(message: &Message) -> io::Error {
 fn not_running(c: &mut Canvas) {
     c.push(Role::Plain, "dffyd");
     c.push(Role::Dim, " isn't running");
-    c.line(Role::Dim, "; the first viewer starts it");
+    c.line(
+        Role::Dim,
+        "; the first viewer or listening session starts it",
+    );
 }
 
 fn render(report: &Report, c: &mut Canvas) {

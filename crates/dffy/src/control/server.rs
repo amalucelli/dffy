@@ -1,5 +1,6 @@
-//! dffyd's side of the control API: who's registered, and requests for a
-//! view handed to its viewer and answered back.
+//! dffyd's side of the control API: who's registered, requests for a view
+//! handed to its viewer and answered back, and the listeners waiting for
+//! what a viewer hands over.
 //!
 //! A viewer's registration is its connection: closing it, or the viewer
 //! dying, unregisters it. Each connection gets a thread reading it and one
@@ -18,6 +19,7 @@ use std::time::Duration;
 
 use super::{EVENTS, Fault, METHODS, VERSION, answer, line, notification, number, object, text};
 use crate::plugin::json::Value;
+use crate::review::model::text::now;
 
 const WRITE_TIMEOUT: Duration = Duration::from_secs(1);
 /// How long a connection may stay silent before its hello: one that never
@@ -36,14 +38,15 @@ const FORWARDED: [&str; 6] = [
     "comments/applySuggestion",
 ];
 
-type Views = Box<dyn Fn(usize) + Send + Sync>;
+type Attached = Box<dyn Fn(usize) + Send + Sync>;
 
 struct Server {
     /// The only user whose connections are served.
     owner: u32,
     registry: Mutex<Registry>,
-    /// Told how many views are registered whenever that changes.
-    on_views: Views,
+    /// Told how many views are registered and listeners parked whenever that
+    /// changes, under the registry's lock: an older count can't come last.
+    on_attached: Attached,
 }
 
 #[derive(Default)]
@@ -54,6 +57,15 @@ struct Registry {
     views: BTreeMap<u64, View>,
     /// Requests handed to a view, by the id they went to it with.
     waiting: HashMap<u64, Waiting>,
+    /// In the order of their last request.
+    listeners: Vec<Listener>,
+}
+
+impl Registry {
+    fn attached(&self) -> usize {
+        let parked = self.listeners.iter().filter(|l| l.parked.is_some());
+        self.views.len() + parked.count()
+    }
 }
 
 struct View {
@@ -83,7 +95,72 @@ struct Waiting {
     id: Value,
 }
 
+/// A connection that asks for hand-overs, from its first request until it
+/// closes: between an answer and its next request, it's parked nowhere but
+/// what it did is kept.
+struct Listener {
+    conn: u64,
+    client: Option<String>,
+    worktree: String,
+    key: Option<String>,
+    started: u64,
+    edited: Option<u64>,
+    prompted: Option<u64>,
+    parked: Option<Parked>,
+}
+
+/// A listener's request, until a view answers it.
+struct Parked {
+    tx: Sender<String>,
+    id: Value,
+    /// The views it was handed to, and the id it went to each with.
+    held: Vec<(u64, u64)>,
+}
+
+impl Listener {
+    /// Seconds since 1970.
+    fn facts(&self) -> [(&'static str, Value); 3] {
+        let at = |t: Option<u64>| t.map_or(Value::Null, number);
+        [
+            ("started", number(self.started)),
+            ("edited", at(self.edited)),
+            ("prompted", at(self.prompted)),
+        ]
+    }
+
+    /// Hands its parked request to `view`, by its id.
+    fn hand_to(&mut self, (id, view): (u64, &View), next_forward: &mut u64) {
+        let mut params = vec![("worktree", text(self.worktree.clone()))];
+        params.extend(self.key.clone().map(|k| ("key", text(k))));
+        params.push(("listener", number(self.conn)));
+        params.extend(self.facts());
+        let Some(parked) = &mut self.parked else {
+            return;
+        };
+        *next_forward += 1;
+        let mut request = vec![
+            ("id", number(*next_forward)),
+            ("method", text("comments/listen")),
+            ("params", object(params)),
+        ];
+        request.extend(self.client.clone().map(|c| ("client", text(c))));
+        if view.tx.send(line(&object(request))).is_ok() {
+            parked.held.push((id, *next_forward));
+        }
+    }
+}
+
 impl View {
+    fn is_in(&self, worktree: &str) -> bool {
+        self.info.get("worktree").and_then(Value::as_str) == Some(worktree)
+    }
+
+    /// Calls off the request it was handed as `forward`.
+    fn cancel(&self, forward: u64) {
+        let cancel = object(vec![("id", number(forward))]);
+        self.tx.send(notification("$/cancelRequest", cancel)).ok();
+    }
+
     /// The events any subscriber wants, in [`EVENTS`] order.
     fn wanted(&self) -> Vec<&'static str> {
         EVENTS
@@ -109,17 +186,17 @@ impl View {
 }
 
 /// Serves `listener` until the process exits, to connections of user
-/// `owner` only; `on_views` hears how many views are registered whenever
-/// that changes.
+/// `owner` only; `on_attached` hears how many views are registered and
+/// listeners parked whenever that changes.
 pub(crate) fn serve(
     listener: &UnixListener,
     owner: u32,
-    on_views: impl Fn(usize) + Send + Sync + 'static,
+    on_attached: impl Fn(usize) + Send + Sync + 'static,
 ) {
     let server = Arc::new(Server {
         owner,
         registry: Mutex::default(),
-        on_views: Box::new(on_views),
+        on_attached: Box::new(on_attached),
     });
     let mut backoff = ACCEPT_BACKOFF.start;
     for stream in listener.incoming() {
@@ -326,7 +403,15 @@ impl Server {
                         .collect(),
                 ),
             )])),
-            "views/register" => self.register(conn, tx, &param),
+            "views/register" => match self.register(conn, tx, id, &param) {
+                Ok(()) => return None,
+                Err(e) => Err(e),
+            },
+            "comments/listen" => match self.listen((conn, client), tx, id, &param) {
+                Ok(()) => return None,
+                Err(e) => Err(e),
+            },
+            "comments/listening" => self.listening(&param),
             "subscribe" => {
                 match view().and_then(|v| self.subscribe(conn, tx, v, param("events"))) {
                     // The answer goes first, then what's there now.
@@ -354,12 +439,15 @@ impl Server {
         })
     }
 
+    /// Answers request `id` itself: the answer comes before the listeners
+    /// handed to the view, which waits for it before anything else.
     fn register<'a>(
         &self,
         conn: u64,
         tx: &Sender<String>,
+        id: &Value,
         param: &dyn Fn(&str) -> Option<&'a Value>,
-    ) -> Result<Value, Fault> {
+    ) -> Result<(), Fault> {
         let string = |key: &str| {
             param(key)
                 .and_then(Value::as_str)
@@ -398,10 +486,116 @@ impl Server {
                 last: Vec::new(),
             },
         );
-        let count = registry.views.len();
-        drop(registry);
-        (self.on_views)(count);
-        Ok(object(vec![("view", number(view))]))
+        (self.on_attached)(registry.attached());
+        tx.send(answer(id, Ok(object(vec![("view", number(view))]))))
+            .ok();
+        let Registry {
+            views,
+            listeners,
+            next_forward,
+            ..
+        } = &mut *registry;
+        if let Some(entry) = views.get(&view) {
+            for listener in listeners.iter_mut().filter(|l| entry.is_in(&l.worktree)) {
+                listener.hand_to((view, entry), next_forward);
+            }
+        }
+        Ok(())
+    }
+
+    /// Parks request `id`, for the first view of its worktree to answer:
+    /// those registered and those that register later.
+    fn listen<'a>(
+        &self,
+        (conn, client): (u64, Option<&str>),
+        tx: &Sender<String>,
+        id: &Value,
+        param: &dyn Fn(&str) -> Option<&'a Value>,
+    ) -> Result<(), Fault> {
+        let worktree = (param("worktree").and_then(Value::as_str))
+            .filter(|w| !w.is_empty())
+            .ok_or_else(|| Fault::invalid("worktree must be a string, not empty"))?;
+        let key = match param("key") {
+            None | Some(Value::Null) => None,
+            Some(Value::String(key)) => Some(key.clone()).filter(|k| !k.is_empty()),
+            Some(_) => return Err(Fault::invalid("key must be a string")),
+        };
+        let mut registry = self.registry();
+        let Registry {
+            views,
+            listeners,
+            next_forward,
+            ..
+        } = &mut *registry;
+        let mut listener = match listeners.iter().position(|l| l.conn == conn) {
+            Some(at) if listeners[at].parked.is_some() => {
+                return Err(Fault::new(
+                    "invalid_request",
+                    "this connection is listening already",
+                ));
+            }
+            Some(at) => listeners.remove(at),
+            None => Listener {
+                conn,
+                client: client.map(str::to_owned),
+                worktree: String::new(),
+                key: None,
+                started: now(),
+                edited: None,
+                prompted: None,
+                parked: None,
+            },
+        };
+        worktree.clone_into(&mut listener.worktree);
+        listener.key = key;
+        listener.parked = Some(Parked {
+            tx: tx.clone(),
+            id: id.clone(),
+            held: Vec::new(),
+        });
+        for (&id, view) in views.iter().filter(|(_, v)| v.is_in(worktree)) {
+            listener.hand_to((id, view), next_forward);
+        }
+        listeners.push(listener);
+        (self.on_attached)(registry.attached());
+        Ok(())
+    }
+
+    /// Stamps what the listeners with `key` just did, and tells the views
+    /// holding them.
+    fn listening<'a>(&self, param: &dyn Fn(&str) -> Option<&'a Value>) -> Result<Value, Fault> {
+        let key = (param("key").and_then(Value::as_str))
+            .filter(|k| !k.is_empty())
+            .ok_or_else(|| Fault::invalid("key must be a string, not empty"))?;
+        let Some(&Value::Bool(edited)) = param("edited") else {
+            return Err(Fault::invalid("edited must be true or false"));
+        };
+        let at = Some(now());
+        let mut registry = self.registry();
+        let Registry {
+            views, listeners, ..
+        } = &mut *registry;
+        let mut stamped = 0;
+        for listener in listeners
+            .iter_mut()
+            .filter(|l| l.key.as_deref() == Some(key))
+        {
+            stamped += 1;
+            if edited {
+                listener.edited = at;
+            } else {
+                listener.prompted = at;
+            }
+            for (view, forward) in listener.parked.iter().flat_map(|p| &p.held) {
+                if let Some(view) = views.get(view) {
+                    let mut params = vec![("id", number(*forward))];
+                    params.extend(listener.facts());
+                    let changed = notification("listener/changed", object(params));
+                    view.tx.send(changed).ok();
+                }
+            }
+        }
+        Ok(object(vec![("listeners", number(stamped))]))
     }
 
     fn subscribe(
@@ -492,6 +686,9 @@ impl Server {
         let Some(forward) = id.as_usize().map(|f| f as u64) else {
             return;
         };
+        if self.handed_over(&mut registry, conn, forward, message) {
+            return;
+        }
         let from_view = registry
             .waiting
             .get(&forward)
@@ -527,6 +724,51 @@ impl Server {
         waiting.tx.send(line(&reply)).ok();
     }
 
+    /// A view's answer to a listener's request it holds as `forward`: with a
+    /// prompt it's the listener's, and the other views' copies are called
+    /// off. With anything else, as from a viewer older than listeners, the
+    /// listener waits for another view. False when no listener's request
+    /// went to that view with that id.
+    fn handed_over(
+        &self,
+        registry: &mut Registry,
+        conn: u64,
+        forward: u64,
+        message: &Value,
+    ) -> bool {
+        let Registry {
+            views, listeners, ..
+        } = registry;
+        let Some((&view, _)) = views.iter().find(|(_, v)| v.conn == conn) else {
+            return false;
+        };
+        let Some(slot) = (listeners.iter_mut().map(|l| &mut l.parked)).find(|parked| {
+            (parked.iter().flat_map(|p| &p.held)).any(|held| *held == (view, forward))
+        }) else {
+            return false;
+        };
+        let prompt = (message.get("result"))
+            .and_then(|r| r.get("prompt"))
+            .and_then(Value::as_str);
+        let Some(prompt) = prompt else {
+            if let Some(parked) = slot {
+                parked.held.retain(|held| *held != (view, forward));
+            }
+            return true;
+        };
+        if let Some(parked) = slot.take() {
+            for (id, forward) in parked.held.into_iter().filter(|(id, _)| *id != view) {
+                if let Some(other) = views.get(&id) {
+                    other.cancel(forward);
+                }
+            }
+            let result = object(vec![("view", number(view)), ("prompt", text(prompt))]);
+            parked.tx.send(answer(&parked.id, Ok(result))).ok();
+            (self.on_attached)(registry.attached());
+        }
+        true
+    }
+
     /// A notification from a viewer, pushed to the subscribers of its
     /// event with the view's id in its params.
     fn notified(&self, conn: u64, method: &str, params: &[(String, Value)]) {
@@ -553,10 +795,10 @@ impl Server {
     }
 
     /// Connection `conn` is gone: its view leaves, its requests' answers
-    /// are dropped and its subscriptions end.
+    /// are dropped, its subscriptions end and it listens no more.
     fn closed(&self, conn: u64) {
         let mut registry = self.registry();
-        let mut left = None;
+        let before = registry.attached();
         if let Some(view) = registry
             .views
             .iter()
@@ -581,7 +823,9 @@ impl Server {
                 ))
                 .ok();
             }
-            left = Some(registry.views.len());
+            for parked in registry.listeners.iter_mut().flat_map(|l| &mut l.parked) {
+                parked.held.retain(|(v, _)| *v != view);
+            }
         }
         for view in registry.views.values_mut() {
             view.subscribers.retain(|s| s.conn != conn);
@@ -596,13 +840,19 @@ impl Server {
         for (forward, view) in asked {
             registry.waiting.remove(&forward);
             if let Some(view) = registry.views.get(&view) {
-                let cancel = object(vec![("id", number(forward))]);
-                view.tx.send(notification("$/cancelRequest", cancel)).ok();
+                view.cancel(forward);
             }
         }
-        drop(registry);
-        if let Some(count) = left {
-            (self.on_views)(count);
+        if let Some(at) = registry.listeners.iter().position(|l| l.conn == conn) {
+            let gone = registry.listeners.remove(at);
+            for (view, forward) in gone.parked.into_iter().flat_map(|p| p.held) {
+                if let Some(view) = registry.views.get(&view) {
+                    view.cancel(forward);
+                }
+            }
+        }
+        if registry.attached() != before {
+            (self.on_attached)(registry.attached());
         }
     }
 }

@@ -1,0 +1,10 @@
+{
+  "name": "dffy",
+  "description": "Hands dffy review threads to a running Claude Code session",
+  "author": {
+    "name": "Alexandre Guimarães Malucelli"
+  },
+  "homepage": "https://github.com/amalucelli/dffy/blob/main/docs/agents.md#claude-code",
+  "repository": "https://github.com/amalucelli/dffy",
+  "license": "MIT"
+}

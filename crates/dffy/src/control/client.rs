@@ -1,6 +1,6 @@
 //! The control API from the outside: a connection to dffyd, finding the
-//! view a command means, and `dffy ctl`. Clients never start dffyd: when
-//! none runs, no viewer does.
+//! view a command means, and `dffy ctl`. Only a listener starts dffyd, to
+//! wait for viewers: for the others, when none runs, no viewer does.
 
 use std::io::{self, BufReader, Write as _};
 use std::os::unix::net::UnixStream;
@@ -40,11 +40,30 @@ pub(crate) struct Client {
 ///
 /// When dffyd refuses the handshake or the socket fails.
 pub(crate) fn connect(name: &str) -> io::Result<Option<Client>> {
+    connect_within(name, ANSWER)
+}
+
+/// [`connect`], waiting at most `wait` for each answer.
+pub(super) fn connect_within(name: &str, wait: Duration) -> io::Result<Option<Client>> {
     let path = super::socket_path(&crate::daemon::runtime_path());
-    let Ok(stream) = crate::daemon::connect(&path) else {
-        return Ok(None);
-    };
-    stream.set_read_timeout(Some(ANSWER))?;
+    match crate::daemon::connect(&path) {
+        Ok(stream) => greet(stream, name, wait).map(Some),
+        Err(_) => Ok(None),
+    }
+}
+
+/// [`connect`], starting dffyd when none runs; its calls wait for their
+/// answers however long they take.
+pub(super) fn connect_or_start(name: &str) -> io::Result<Client> {
+    let stream = crate::daemon::client::connect_or_spawn(super::socket_path)?;
+    let client = greet(stream, name, ANSWER)?;
+    client.reader.get_ref().set_read_timeout(None)?;
+    Ok(client)
+}
+
+/// The handshake on `stream`, with each answer within `wait`.
+fn greet(stream: UnixStream, name: &str, wait: Duration) -> io::Result<Client> {
+    stream.set_read_timeout(Some(wait))?;
     let mut client = Client {
         writer: stream.try_clone()?,
         reader: BufReader::new(stream),
@@ -63,7 +82,7 @@ pub(crate) fn connect(name: &str) -> io::Result<Option<Client>> {
             .unwrap_or("refused");
         return Err(io::Error::other(format!("dffyd: {message}")));
     }
-    Ok(Some(client))
+    Ok(client)
 }
 
 impl Client {
@@ -113,6 +132,11 @@ impl Client {
                 .cloned()
                 .ok_or_else(|| Fault::new("failed", "dffyd's answer has no result"));
         }
+    }
+
+    /// Waits until dffyd hangs up.
+    pub(super) fn wait_gone(&mut self) {
+        while self.receive().is_ok() {}
     }
 
     /// Asks `view` `method`, its id added to `params`.

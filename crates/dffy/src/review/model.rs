@@ -551,20 +551,19 @@ impl Comments {
         self.find(root).map(|c| self.home(c))
     }
 
-    /// The file the thread with root `root` is in, and whether that's a
-    /// review session's.
-    pub(crate) fn file_with(&self, root: &str) -> (&Path, bool) {
+    /// The file the thread with root `root` is in.
+    pub(crate) fn file_with(&self, root: &str) -> &Path {
         match &self.local {
             Some(local) if self.from_local.contains(root) || self.others_local.contains(root) => {
-                (local, false)
+                local
             }
-            _ => (&self.path, self.session),
+            _ => &self.path,
         }
     }
 
-    /// The comments file, and whether it's a review session's.
-    pub(crate) fn file(&self) -> (&Path, bool) {
-        (&self.path, self.session)
+    /// The comments file.
+    pub(crate) fn file(&self) -> &Path {
+        &self.path
     }
 
     /// The local review's file, when it's read beside [`Comments::file`].

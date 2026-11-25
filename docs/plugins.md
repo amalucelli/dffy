@@ -703,7 +703,9 @@ The plugin looks for the agents again on each `doctor`.
 {"name":"amp","program":"/usr/local/bin/amp","args":[],"prompt":"clipboard"}
 ```
 
-A handoff says how to hand a thread to an agent for Fix with agent: start it as you'd start it, in its normal interactive mode with none of a recipe's flags, in a terminal tab at the working tree or in dffy's own terminal. The plugin lists the agents found on `PATH`, in its order of preference. dffy runs the one the config's `agent` names, else the first, and refuses a name that isn't listed. A command of yours in `agent` takes no thread, so dffy runs the first then.
+A handoff says how to hand a thread to an agent for Fix with agent. dffy starts the agent as you'd start it, in its normal interactive mode with none of a recipe's flags, in a terminal tab at the working tree or in dffy's own terminal.
+
+The plugin lists the agents found on `PATH`, in its order of preference. dffy runs the one the config's `agent` names, else the first, and refuses a name that isn't listed. A command of yours in `agent` takes no thread, so dffy runs the first then.
 
 | Field | Meaning |
 |---|---|

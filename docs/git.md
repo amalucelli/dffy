@@ -111,7 +111,7 @@ dffy --since-checkpoint     # changes since the latest one
 dffy --since-checkpoint=3   # changes since checkpoint 3
 ```
 
-Fix with agent takes one too, and so does the command panel's checkpoint action.
+Handing threads to an agent takes one too, and so does the command panel's checkpoint action.
 
 A checkpoint holds every file plain `dffy` would compare: tracked files as they are in the working tree, staged or not, through the same filters as a diff ([Line endings and filters](#line-endings-and-filters)), and untracked files git doesn't ignore. Deleted files and untracked nested repositories aren't in it. A file of 64 MiB or more isn't copied: a tracked one keeps `HEAD`'s version in the checkpoint, an untracked one is left out, and either lists as changed for as long as it differs from `HEAD`.
 

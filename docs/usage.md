@@ -22,6 +22,7 @@ dffy config [--default]
 dffy comments [--json | --markdown] [--session] [--open | --resolved] [--path <path>] [--branch <name> | --all-branches]
 dffy comments apply [--as <name>] | comments import <file> | comments rm --resolved [--branch <name> | --all-branches]
 dffy comments prompt [<id> | --open [--json]]
+dffy comments listen --as <name> [--key <key>] | comments listening --key <key> [--edited]
 dffy <review-command> [<number>]    # e.g. dffy pr, with a review plugin set
 dffy mcp
 dffy ctl views | open <path>[:<line>[:old]] | focus <id> | selection | state | comment <path>:<line> <text> | apply-suggestion <id> | schema
@@ -47,7 +48,7 @@ Without a subcommand dffy runs `diff`, so `dffy main..HEAD` is `dffy diff main..
 | `dffy <rev>^!` | The first parent of `<rev>` with `<rev>` |
 | `dffy show <rev>` | Same as `<rev>^!`, plus the commit header |
 | `dffy a.txt b.txt`, `dffy old/ new/` | Two files or folders, see [Comparing files and folders](#comparing-files-and-folders) |
-| `dffy --since-checkpoint` | The latest checkpoint with the working tree: only what changed since `dffy checkpoint`, or since Fix with agent started the agent |
+| `dffy --since-checkpoint` | The latest checkpoint with the working tree: only what changed since `dffy checkpoint`, or since your threads were last handed to an agent |
 | `dffy --since-checkpoint=<n>` | Checkpoint `<n>`, the number `dffy checkpoint` printed, with the working tree |
 
 Revisions use git's syntax: branch and tag names, short ids, `HEAD~3`, `@{u}` and so on. An empty side of a range means `HEAD`, so `dffy main..` compares `main` with `HEAD`. More than two revisions is an error, and so is `--staged` with two.
@@ -255,7 +256,7 @@ Colors a diff read from stdin and changes nothing else: one output line per inpu
 |---|---|
 | `diff` | Changes between the working tree, the index and revisions. The default. |
 | `show [<rev>]` | A commit against its first parent, with the commit header. `<rev>` defaults to `HEAD`. A root commit is compared with the empty tree. |
-| `comments` | Lists the review comments as threads, prints them as Markdown or JSON, and changes them with `apply`, `import`, `rm --resolved` and `prompt`. See [comments.md](comments.md#reading-dffy-comments). |
+| `comments` | Lists the review comments as threads, prints them as Markdown or JSON, and changes them with `apply`, `import` and `rm --resolved`. `prompt` prints threads as a prompt for a coding agent, and `listen` prints what viewers hand to a running one. See [comments.md](comments.md#reading-dffy-comments). |
 | `<review command> [<id>]` | Experimental. Opens one of a code host's reviews in the viewer, such as `dffy pr 123` with `dffy-review-github`. The plugin names the command, and it exists only while there's a review plugin: the only one on `PATH`, or the one `review` or `--review` names. Without an id it opens the current branch's review, or a list to pick from. Needs a terminal. Without such a plugin, `pr` is a revision like any other. See [viewer.md](viewer.md#code-host-reviews) and [plugins.md](plugins.md#the-review-command). |
 | `config` | The effective settings, each marked with where its value comes from. `--default` prints every key with its documentation and default. See [config.md](config.md). |
 | `themes` | The available themes, with a preview. `--dump <name>` prints a built-in theme as a file to copy and edit. See [themes.md](themes.md). |

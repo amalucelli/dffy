@@ -6,24 +6,24 @@ A review thread on src/lib.rs:12-20 (the new version of the file).
 Language: rust
 
 ana:
-First.
+  First.
 
 [1 reply omitted]
 
 you:
-Kept for its suggestion.
+  Kept for its suggestion.
 
-Suggested change, in place of the commented lines:
+  Suggested change, in place of the commented lines, indented as this comment is:
 
-```suggestion
-line 12
-```
+  ```suggestion
+  line 12
+  ```
 
 bo:
-Another middle reply.
+  Another middle reply.
 
 ana:
-Last.
+  Last.
 
 The commented lines, marked >, and the lines around them:
 

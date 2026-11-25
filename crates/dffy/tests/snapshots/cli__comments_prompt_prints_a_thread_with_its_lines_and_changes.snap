@@ -7,16 +7,16 @@ Language: rust
 In: fn add
 
 ana:
-Overflow?
+  Overflow?
 
 you:
-Checked now.
+  Checked now.
 
-Suggested change, in place of the commented lines:
+  Suggested change, in place of the commented lines, indented as this comment is:
 
-```suggestion
-    a.checked_add(b)
-```
+  ```suggestion
+      a.checked_add(b)
+  ```
 
 The commented lines, marked >, and the lines around them:
 

@@ -21,6 +21,7 @@ use dffy_core::git::FileDiff;
 use dffy_core::highlight::{self, Scopes};
 
 use super::model::At;
+use super::model::text::{lines, one_line};
 use super::{Comment, fence, who};
 
 /// A ceiling on a prompt's size, in bytes. Over it, a prompt is trimmed,
@@ -88,9 +89,8 @@ pub(crate) fn selection(
 pub(crate) enum Kept<'a> {
     /// The local review's file, which it reads by default.
     Local,
-    /// The review session's, which `--session` reads.
-    Session,
-    /// A file `--comments` names.
+    /// A file `--comments` names, a review's too: `--session` reads
+    /// whichever review any viewer of the repository opened last.
     File(&'a Path),
 }
 
@@ -102,10 +102,6 @@ pub(crate) fn handoff(id: &str, kept: Kept) -> String {
         Kept::Local => {
             format!("run dffy comments prompt {id} (or the thread_prompt MCP tool)")
         }
-        Kept::Session => format!(
-            "run dffy comments --session prompt {id} (or the thread_prompt MCP tool with \
-             session: true)"
-        ),
         Kept::File(path) => {
             let file = crate::terminal::quote(path.as_os_str().as_bytes());
             format!(
@@ -125,7 +121,6 @@ pub(crate) fn handoff(id: &str, kept: Kept) -> String {
 pub(crate) fn open_handoff(kept: Kept) -> String {
     let comments = match kept {
         Kept::Local => "dffy comments".to_owned(),
-        Kept::Session => "dffy comments --session".to_owned(),
         Kept::File(path) => {
             let file = crate::terminal::quote(path.as_os_str().as_bytes());
             format!(
@@ -173,7 +168,7 @@ pub(crate) fn open_threads(threads: &[Open], others: usize, elsewhere: bool) -> 
         let Some(root) = comments.first() else {
             continue;
         };
-        let _ = write!(text, "## Thread {}\n\n", root.id);
+        let _ = write!(text, "## Thread {}\n\n", one_line(&root.id));
         let mut parts = thread_parts(false, comments, at, diff, Definitions::Parse);
         parts.tail = String::new();
         let one = parts.fit(share);
@@ -237,7 +232,7 @@ fn thread_parts<'a>(
             syntax.path = b"";
         }
         (At::File, _) => {
-            let _ = write!(head, "the whole file {}", root.path);
+            let _ = write!(head, "the whole file {}", one_line(&root.path));
             hunks = diff.map(|d| all_hunks(d, None)).unwrap_or_default();
         }
         (At::Line { side, lines }, Some(diff)) => {
@@ -261,7 +256,7 @@ fn thread_parts<'a>(
                         .as_ref()
                         .map(|a| Code::from_anchor(a, lines.start));
                 }
-                None => head.push_str(&root.path),
+                None => head.push_str(&one_line(&root.path)),
             }
             hunks = diff.map(|d| all_hunks(d, None)).unwrap_or_default();
         }
@@ -335,6 +330,7 @@ fn selection_within(
 /// `path:12-14 (the new version of the file)`, from 0-based `lines`.
 fn place(out: &mut String, path: &str, side: Side, lines: &Range<usize>) {
     let (first, last) = (lines.start + 1, lines.end.max(lines.start + 1));
+    let path = one_line(path);
     let _ = if first == last {
         write!(out, "{path}:{first}")
     } else {
@@ -404,7 +400,7 @@ impl<'a> Syntax<'a> {
         let last = scopes.at(lines.end.max(lines.start + 1) - 1);
         let common = first.iter().zip(&last).take_while(|(a, b)| a == b).count();
         if common > 0 {
-            let _ = writeln!(out, "In: {}", first[..common].join(" > "));
+            let _ = writeln!(out, "In: {}", one_line(&first[..common].join(" > ")));
         }
     }
 }
@@ -431,11 +427,10 @@ fn side_text(diff: &FileDiff, side: Side) -> &Text {
     }
 }
 
-/// Line `i` of `text` without its line break, invalid UTF-8 replaced.
+/// Line `i` of `text` without its line break, on one line, invalid UTF-8
+/// replaced.
 fn line(text: &Text, i: usize) -> String {
-    String::from_utf8_lossy(text.line(i))
-        .trim_end_matches(['\n', '\r'])
-        .to_owned()
+    one_line(String::from_utf8_lossy(text.line(i)).trim_end_matches(['\n', '\r']))
 }
 
 /// `n` and `word`, plural unless one.
@@ -495,7 +490,7 @@ impl Code {
             } else {
                 (i + 1).saturating_sub(marked)
             };
-            (number(i), far, text.clone())
+            (number(i), far, one_line(text))
         })
         .collect();
         Self { lines }
@@ -611,6 +606,20 @@ fn header(h: &Hunk) -> String {
     )
 }
 
+/// A comment's `text` under its author's name, each line indented, as only
+/// dffy's own lines start at the margin: an agent takes an unindented
+/// `you:` for the user.
+fn indented(out: &mut String, text: &str) {
+    for line in lines(text) {
+        if !line.is_empty() {
+            out.push_str("  ");
+            out.push_str(&line);
+        }
+        out.push('\n');
+    }
+    out.push('\n');
+}
+
 /// A fenced block of `text`, with `info` after its opening fence.
 fn block(out: &mut String, info: &str, text: &str) {
     let ticks = fence(text, 3);
@@ -720,11 +729,16 @@ impl Parts<'_> {
                 skipped = 0;
             }
             let _ = writeln!(out, "{}:", who(&comment.author));
-            out.push_str(comment.text.trim_end());
-            out.push_str("\n\n");
+            indented(&mut out, comment.text.trim_end());
             if let Some(suggestion) = &comment.suggestion {
-                out.push_str("Suggested change, in place of the commented lines:\n\n");
-                block(&mut out, "suggestion", suggestion);
+                let ticks = fence(suggestion, 3);
+                indented(
+                    &mut out,
+                    &format!(
+                        "Suggested change, in place of the commented lines, indented as this \
+                         comment is:\n\n{ticks}suggestion\n{suggestion}\n{ticks}"
+                    ),
+                );
             }
         }
         if let Some((intro, code)) = &self.code {
